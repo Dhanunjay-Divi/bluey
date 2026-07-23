@@ -710,11 +710,26 @@ fn is_near_duplicate_transcript(
     }
 
     let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
+    // Cross-channel echo guard: when the mic and system-audio channels both
+    // capture the same sound (speakers bleeding into the mic, no AEC), the SAME
+    // words arrive twice with DIFFERENT sources/speakers (mic="You",
+    // system="Speaker N"), tearing the transcript into alternating fragments.
+    // So a duplicate is a recent, same-text segment REGARDLESS of speaker —
+    // BUT a cross-speaker match must be distinctive enough not to drop two
+    // different people legitimately saying a short shared phrase ("yes",
+    // "okay"), so cross-speaker requires a longer normalized match.
+    const CROSS_SPEAKER_MIN_LEN: usize = 12;
     meeting.transcript.iter().rev().take(8).any(|segment| {
-        segment.is_final
-            && segment.speaker == speaker
-            && normalize_transcript_text(&segment.text) == normalized
-            && transcript_age_ms(&segment.created_at, now_ms) <= 8_000
+        if !segment.is_final || transcript_age_ms(&segment.created_at, now_ms) > 8_000 {
+            return false;
+        }
+        let prior = normalize_transcript_text(&segment.text);
+        if prior != normalized {
+            return false;
+        }
+        // Same speaker: any exact repeat is a dup. Different speaker (the echo
+        // case): only when the shared text is long enough to be distinctive.
+        segment.speaker == speaker || normalized.len() >= CROSS_SPEAKER_MIN_LEN
     })
 }
 
@@ -1037,15 +1052,68 @@ pub(crate) async fn push_transcript_speaker(
     daemon: &Arc<Daemon>,
     segment_id: String,
     speaker: String,
+    speaker_id: Option<i64>,
 ) {
     let _ = send_overlay(
         daemon,
         OverlayCommand::TranscriptSpeaker {
             id: segment_id,
             speaker,
+            speaker_id,
         },
     )
     .await;
+}
+
+/// Prettify a bare email into a display name when the calendar gave none:
+/// `jane.doe@acme.com` → "Jane Doe", `msreddy2658@x.com` → "Msreddy2658".
+/// Falls back to the whole email if there's nothing usable before the `@`.
+fn name_from_email(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email).trim();
+    if local.is_empty() {
+        return email.to_string();
+    }
+    local
+        .split(['.', '_', '-'])
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut c = p.chars();
+            match c.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Push the active meeting's calendar attendees to the overlay so the speaker-
+/// rename input can offer them as tap-to-pick candidates. Uses the calendar
+/// `displayName` when present (Workspace/Directory), else a prettified email.
+/// Best-effort: an empty roster just clears the candidate list.
+pub(crate) async fn push_meeting_candidates(
+    daemon: &Arc<Daemon>,
+    participants: &[cue_core::calendar::Participant],
+) {
+    let mut seen = std::collections::HashSet::new();
+    let candidates: Vec<cue_core::overlay::SpeakerCandidate> = participants
+        .iter()
+        .filter_map(|p| {
+            let name = if p.name.trim().is_empty() {
+                name_from_email(&p.email)
+            } else {
+                p.name.trim().to_string()
+            };
+            if name.is_empty() || !seen.insert(name.to_ascii_lowercase()) {
+                return None;
+            }
+            Some(cue_core::overlay::SpeakerCandidate {
+                name,
+                email: p.email.trim().to_string(),
+            })
+        })
+        .collect();
+    let _ = send_overlay(daemon, OverlayCommand::SetMeetingCandidates { candidates }).await;
 }
 
 #[cfg(feature = "diarize")]
@@ -1066,6 +1134,23 @@ pub(crate) fn broadcast_speaker_update(
             u8::try_from(speaker_id).ok(),
             ts_ms,
         ));
+}
+
+/// The active microphone capture backend. On macOS the preferred path is the
+/// Handle to the running microphone capture (raw cpal). Held on the daemon so
+/// stop can tear it down. (An AEC helper backend was tried and reverted — see the
+/// mic capture path in `start_microphone_capture_task`.)
+pub(crate) enum MicCaptureHandle {
+    Cpal(crate::audio::capture::MicrophoneCapture),
+}
+
+impl MicCaptureHandle {
+    /// Stop the capture.
+    async fn stop(self) {
+        match self {
+            MicCaptureHandle::Cpal(cap) => cap.stop(),
+        }
+    }
 }
 
 pub(crate) struct Daemon {
@@ -1103,6 +1188,10 @@ pub(crate) struct Daemon {
     /// (sharing corrupts transcript text + mislabels speakers). Toggled by the
     /// composer's mic button (`enable_microphone`); `None` when mic is off.
     microphone: Mutex<Option<crate::audio::capture::MicrophoneCapture>>,
+    /// The active mic capture handle — either the AEC'd native helper (macOS,
+    /// preferred) or the raw cpal fallback. Held so `stop_microphone_capture`
+    /// can tear it down regardless of which path started it.
+    microphone_helper: Mutex<Option<MicCaptureHandle>>,
     /// JoinHandle for the mic STT + ordered-sink task (mirrors
     /// `system_audio_task`). Awaited on stop so trailing mic finals commit before
     /// any auto-end archives the meeting.
@@ -1452,6 +1541,7 @@ pub async fn run() -> Result<()> {
         system_audio: Mutex::new(None),
         system_audio_task: Mutex::new(None),
         microphone: Mutex::new(None),
+        microphone_helper: Mutex::new(None),
         microphone_task: Mutex::new(None),
         ledger: Mutex::new(cue_core::LedgerState::default()),
         last_ledger_words: std::sync::atomic::AtomicUsize::new(0),
@@ -1613,6 +1703,9 @@ pub async fn run() -> Result<()> {
                         Ok(WarmupOutcome::Ready(_)) => {
                             fired.insert(crate::calendar::fired_key(&event));
                             info!(title = %event.title, "warm meeting backend ready");
+                            // Feed the invitee roster to the overlay so the
+                            // speaker-rename input can suggest real attendees.
+                            push_meeting_candidates(&daemon_cal, &event.participants).await;
 
                             // Auto-spawn the overlay even in --no-overlay (background)
                             // mode — the user still needs the UI when a meeting fires.
@@ -3239,6 +3332,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::RemoveContextRequested { id } => {
             handle_remove_context_requested(daemon, id).await?;
+        }
+        OverlayEvent::RenameSpeakerRequested { speaker_id, name } => {
+            handle_rename_speaker_requested(daemon, speaker_id, &name).await;
         }
         OverlayEvent::AgentListRequested => {
             refresh_overlay_agents_swr(daemon).await;
@@ -5498,20 +5594,43 @@ async fn start_microphone_capture_task(daemon: &Arc<Daemon>) -> Result<()> {
         }
     }
 
-    let mic_device = {
-        let db_path = daemon.paths.data_dir.join("sessions.db");
-        crate::audio::capture::load_mic_device_setting(db_path.to_str().unwrap_or("sessions.db"))
+    // MIC CAPTURE PATH — raw cpal (no native helper).
+    //
+    // An AEC path (a second `BlueyAudio` helper in `--source microphone` mode with
+    // VoiceProcessingIO echo cancellation) was tried, but running two BlueyAudio
+    // helpers at once broke the system-audio helper's capture-permission
+    // attribution and crash-looped it (regression 2026-07-23; system audio worked
+    // 2026-07-22 with cpal). That path is reverted until the helper can be spawned
+    // as a single process emitting both streams. cpal has no AEC, so on speakers
+    // (no headphones) the mic may pick up system audio — the cross-channel dedup
+    // mitigates that downstream.
+    let (mut mic_rx, device_hz, mic_handle): (
+        tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+        u32,
+        MicCaptureHandle,
+    ) = {
+        let mic_device = {
+            let db_path = daemon.paths.data_dir.join("sessions.db");
+            crate::audio::capture::load_mic_device_setting(
+                db_path.to_str().unwrap_or("sessions.db"),
+            )
+        };
+        let opts = crate::audio::capture::CaptureOptions {
+            source: AudioSource::Microphone,
+            chunk_ms: 20,
+            device_name: mic_device,
+        };
+        let (handle, rx) = crate::audio::capture::MicrophoneCapture::start(opts)
+            .context("start microphone capture")?;
+        let hz = handle.sample_rate().hz();
+        info!(
+            device_hz = hz,
+            "microphone continuous capture started (raw cpal, no AEC)"
+        );
+        (rx, hz, MicCaptureHandle::Cpal(handle))
     };
-    let opts = crate::audio::capture::CaptureOptions {
-        source: AudioSource::Microphone,
-        chunk_ms: 20,
-        device_name: mic_device,
-    };
-    let (handle, mut mic_rx) = crate::audio::capture::MicrophoneCapture::start(opts)
-        .context("start microphone capture")?;
-    let device_hz = handle.sample_rate().hz();
-    info!(device_hz, "microphone continuous capture started");
-    *daemon.microphone.lock().await = Some(handle);
+    // Keep the capture handle alive on the daemon so stop() can reach it.
+    daemon.microphone_helper.lock().await.replace(mic_handle);
 
     let daemon_mic = daemon.clone();
     let task = tokio::spawn(async move {
@@ -5616,8 +5735,14 @@ async fn start_microphone_capture_task(daemon: &Arc<Daemon>) -> Result<()> {
 /// Stop the microphone capture (if running) and await its STT/sink drain, so
 /// trailing mic finals commit before any auto-end archives the meeting.
 async fn stop_microphone_capture(daemon: &Arc<Daemon>) {
+    // Legacy field (kept for the raw-cpal path if it ever sets it directly).
     if let Some(mic) = daemon.microphone.lock().await.take() {
         mic.stop();
+    }
+    // The active capture backend (AEC helper OR cpal fallback) started by
+    // `start_microphone_capture` and stored here.
+    if let Some(handle) = daemon.microphone_helper.lock().await.take() {
+        handle.stop().await;
     }
     if let Some(task) = daemon.microphone_task.lock().await.take() {
         let _ = task.await;
@@ -8993,6 +9118,65 @@ async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Resul
     Ok(())
 }
 
+/// Persist a user's speaker rename (the "Reassign Speaker" flow) to the
+/// diarization store for the ACTIVE meeting. This is the human-correction path
+/// that fixes the transcript's speaker label immediately (writes a `user_set=1`
+/// `speakers` row keyed by `(session_id, speaker_id)`).
+///
+/// Cross-meeting recognition of the renamed voice is established at meeting end
+/// by [`persist_diarization`], which reconciles the post-process speaker
+/// centroids against the user-named rows by voice similarity and carries the
+/// name onto the matching voiceprint — so the name follows the VOICE even though
+/// the post-pass may assign it a different integer id than the live gid the user
+/// renamed against. (This function itself does NOT enrol a voiceprint — no
+/// embedding is available on the event-handler task; the binding happens in the
+/// post-pass where the centroids live.) Best-effort: no active meeting or a DB
+/// hiccup is logged, never fatal.
+async fn handle_rename_speaker_requested(daemon: &Arc<Daemon>, speaker_id: i64, name: &str) {
+    let Some(meeting_id) = daemon
+        .meeting
+        .lock()
+        .await
+        .as_ref()
+        .map(|m| m.id.to_string())
+    else {
+        debug!("rename-speaker: no active meeting; ignoring");
+        return;
+    };
+    let db_path = daemon.paths.data_dir.join("sessions.db");
+    let db = match crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            warn!("rename-speaker: open db failed: {e:#}");
+            return;
+        }
+    };
+    // The diarization FK requires a sessions row for the meeting id (a meeting is
+    // a JSON file, not a sessions row) — ensure it, same discipline as persist.
+    if let Ok(uuid) = uuid::Uuid::parse_str(&meeting_id) {
+        let _ = db.ensure_meeting_session(uuid, None);
+    }
+    if let Err(e) = db.set_speaker_name_by_user(&meeting_id, speaker_id as i32, name.trim(), None) {
+        warn!("rename-speaker: set_speaker_name failed: {e:#}");
+        return;
+    }
+    info!(speaker_id, name = %name.trim(), "rename-speaker: persisted user speaker name (voice binding deferred to post-process)");
+    // Push the updated label to the overlay so the transcript reflects it live.
+    // `id` empty = the UI applies the rename to the speaker it currently has
+    // selected (it initiated the reassign), rather than a specific segment.
+    let _ = send_overlay(
+        daemon,
+        OverlayCommand::TranscriptSpeaker {
+            id: String::new(),
+            speaker: name.trim().to_string(),
+            // The UI initiated this rename for a known speaker_id; echo carries
+            // the id so the UI can update every line of that speaker at once.
+            speaker_id: Some(speaker_id),
+        },
+    )
+    .await;
+}
+
 async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
     let Some((meeting_snapshot, removed_title)) = ({
         let mut meeting_guard = daemon.meeting.lock().await;
@@ -10905,6 +11089,13 @@ async fn push_agent_install_offer(daemon: &Arc<Daemon>, kind: &cue_agent_bridge:
 /// counts as ready. The agent is the attached one when there is one, else the
 /// best discovered candidate — so a signed-out CLI reports `needs_login` here
 /// rather than failing later on the first ask.
+/// Eagerly prepare the on-device memory embedder (the "Preparing memory"
+/// onboarding step) and store it on the daemon. While the download runs, a
+/// lightweight poller re-pushes the setup status so the onboarding row animates
+/// with the percent published by the memory download loop. Best-effort: any
+/// failure leaves memory off (the row reports it) and never affects the meeting
+/// loop.
+#[cfg(feature = "local-memory")]
 /// Eagerly prepare the on-device memory embedder (the "Preparing memory"
 /// onboarding step) and store it on the daemon. While the download runs, a
 /// lightweight poller re-pushes the setup status so the onboarding row animates
@@ -15254,6 +15445,19 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_from_email_prettifies_common_shapes() {
+        // Dotted / underscored handles → Title Case words.
+        assert_eq!(name_from_email("jane.doe@acme.com"), "Jane Doe");
+        assert_eq!(name_from_email("first_last@x.io"), "First Last");
+        assert_eq!(name_from_email("sarah-jenkins@co.com"), "Sarah Jenkins");
+        // A single token capitalizes (best-effort; the user can correct it).
+        assert_eq!(name_from_email("msreddy2658@x.com"), "Msreddy2658");
+        // Degenerate inputs don't panic and fall back sanely.
+        assert_eq!(name_from_email("@nolocal.com"), "@nolocal.com");
+        assert_eq!(name_from_email(""), "");
+    }
 
     #[test]
     fn resample_to_16k_passes_through_at_16k_and_downsamples_by_rate() {

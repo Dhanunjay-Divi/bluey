@@ -293,8 +293,12 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   // (stale id / label unchanged) skips the re-render.
   useEffect(
     () =>
-      client.onSpeakerUpdate((segmentId, speaker) => {
-        const next = grouperRef.current?.setSpeaker(segmentId, speaker);
+      client.onSpeakerUpdate((segmentId, speaker, speakerId) => {
+        const next = grouperRef.current?.setSpeaker(
+          segmentId,
+          speaker,
+          speakerId,
+        );
         if (next) setHistory(next);
       }),
     [client],
@@ -308,10 +312,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   // propose-only mode (the reply to a requestFix). Store it in shared state so
   // it survives a collapse/tab switch and there's no double-subscribe. In beta
   // this is preview-only; the card's Apply is disabled.
-  useEffect(
-    () => client.onFixProposal((p) => setFixProposal(p)),
-    [client],
-  );
+  useEffect(() => client.onFixProposal((p) => setFixProposal(p)), [client]);
 
   // ---- continue-past-meeting reseed (single owner) ----
   // Apply a daemon-pushed active reseed ONLY after the initial rehydrate seed

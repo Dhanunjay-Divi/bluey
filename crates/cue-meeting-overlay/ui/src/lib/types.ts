@@ -73,6 +73,12 @@ export type ListeningState =
   | "permission_denied";
 
 /** A normalized transcript line surfaced during a live meeting. */
+/** A calendar attendee offered as a tap-to-pick name in the speaker-rename UI. */
+export interface SpeakerCandidate {
+  name: string;
+  email: string;
+}
+
 export interface TranscriptLine {
   /** The daemon's stable per-segment id (a Uuid string), carried on the live
    *  push path so a live line can be reconciled by id against the same segment
@@ -83,6 +89,9 @@ export interface TranscriptLine {
   source: string;
   /** optional speaker label, when diarization provides one. */
   speaker?: string;
+  /** The numeric diarized speaker index behind `speaker`, when known — used to
+   *  offer inline rename (click the label → `renameSpeaker(speakerId, name)`). */
+  speakerId?: number | null;
   text: string;
   /** true once the line is finalized (not a partial). */
   final: boolean;

@@ -115,6 +115,25 @@ impl Database {
         }
         self.ensure_cue_response_billing_columns()
             .context("failed to ensure cue_response billing columns")?;
+        self.ensure_speaker_user_set_column()
+            .context("failed to ensure speakers.user_set column")?;
+        Ok(())
+    }
+
+    /// Idempotently add `speakers.user_set` (migration 013). `ALTER TABLE ADD
+    /// COLUMN` errors if the column already exists, so gate on a PRAGMA check —
+    /// same discipline as `ensure_cue_response_billing_columns`.
+    fn ensure_speaker_user_set_column(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare("PRAGMA table_info(speakers)")?;
+        let has_col = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<std::collections::HashSet<_>, _>>()?
+            .contains("user_set");
+        if !has_col {
+            self.conn.execute_batch(
+                "ALTER TABLE speakers ADD COLUMN user_set INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
         Ok(())
     }
 

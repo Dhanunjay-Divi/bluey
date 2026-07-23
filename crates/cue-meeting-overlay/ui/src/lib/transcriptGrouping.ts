@@ -75,7 +75,11 @@ export interface TranscriptGrouper {
    *  tick pushes upgrades by segment id). Returns the fresh history, or null
    *  when no line contains that id (stale id, line rotated out) or the label
    *  is already set — callers skip the re-render then. */
-  setSpeaker(segmentId: string, speaker: string): TranscriptLine[] | null;
+  setSpeaker(
+    segmentId: string,
+    speaker: string,
+    speakerId?: number | null,
+  ): TranscriptLine[] | null;
   /** The current grouped history projected to the render shape. */
   history(): TranscriptLine[];
 }
@@ -132,11 +136,36 @@ export function createTranscriptGrouper(): TranscriptGrouper {
   const setSpeaker = (
     segmentId: string,
     speaker: string,
+    speakerId?: number | null,
   ): TranscriptLine[] | null => {
+    // Rename echo: empty segmentId + a speakerId → relabel EVERY line of that
+    // speaker at once (a user rename applies to the whole person, not one line).
+    if (!segmentId && speakerId != null) {
+      let changed = false;
+      const next = lines.map((l) => {
+        if (l.speakerId === speakerId && l.speaker !== speaker) {
+          changed = true;
+          return { ...l, speaker };
+        }
+        return l;
+      });
+      if (!changed) return null;
+      lines = next;
+      return toHistory(next);
+    }
+    // Live diarize upgrade: relabel the single line holding this segment id, and
+    // record its numeric speakerId so the label becomes clickable-to-rename.
     const idx = lines.findIndex((l) => l.ids.includes(segmentId));
-    if (idx < 0 || lines[idx].speaker === speaker) return null;
+    if (idx < 0) return null;
+    if (lines[idx].speaker === speaker && lines[idx].speakerId === speakerId) {
+      return null;
+    }
     const next = [...lines];
-    next[idx] = { ...next[idx], speaker };
+    next[idx] = {
+      ...next[idx],
+      speaker,
+      speakerId: speakerId ?? next[idx].speakerId,
+    };
     lines = next;
     return toHistory(next);
   };

@@ -152,13 +152,19 @@ impl TranscriptSegment {
 /// `TranscriptSegment::context_label` (AI), the daemon's live overlay upgrade,
 /// and `to_wire_line` (snapshot) — one place to change the format.
 pub fn speaker_display_label(primary: i64, secondary: &[i64]) -> String {
-    let mut label = format!("Speaker {}", primary + 1);
-    if !secondary.is_empty() {
-        let others: Vec<String> = secondary.iter().map(|s| (s + 1).to_string()).collect();
-        label.push_str(" + ");
-        label.push_str(&others.join(" + "));
+    if secondary.is_empty() {
+        return format!("Speaker {}", primary + 1);
     }
-    label
+    // Talk-over: list all speaker numbers comma-separated ("Speaker 2, 1"),
+    // not "Speaker 2 + 1" (which reads like arithmetic).
+    let mut nums: Vec<i64> = std::iter::once(primary).chain(secondary.iter().copied()).collect();
+    nums.dedup();
+    let joined = nums
+        .iter()
+        .map(|s| (s + 1).to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("Speaker {joined}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

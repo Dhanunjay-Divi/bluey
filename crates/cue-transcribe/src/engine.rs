@@ -153,7 +153,14 @@ impl SttEngine {
             .transcribe_chunk(pcm)
             .map_err(|e| anyhow!("Nemotron transcribe_chunk failed: {e:?}"))?;
         if text.is_empty() {
-            return Ok(None);
+            // Silence chunk = a VAD pause: speech just stopped. The tip is held
+            // ONLY to reunite a word split across the NEXT chunk — but on a pause
+            // no next chunk is coming, so a held word would otherwise sit and get
+            // prepended to the NEXT sentence (the "last word bleeds into the next
+            // segment" bug). Flush it NOW so the sentence ends where the speaker
+            // stopped. This is standard endpointing: emit the final word on
+            // silence rather than waiting for more audio.
+            return Ok(self.finalize_tip());
         }
 
         // Hold-the-tip: reunite the previously-held fragment with this chunk's
@@ -162,17 +169,29 @@ impl SttEngine {
         // ("month" held + "ly" -> "monthly") before anything downstream sees it.
         let mut combined = std::mem::take(&mut self.tip);
         combined.push_str(&text);
-        let emit = match combined.rfind(char::is_whitespace) {
-            // Confirmed = everything up to (and incl.) the last space; hold the rest.
-            Some(idx) => {
-                let (confirmed, tip) = combined.split_at(idx + 1);
-                self.tip = tip.to_string();
-                confirmed.to_string()
-            }
-            // No space yet — the whole thing is still one unfinished word; keep holding.
-            None => {
-                self.tip = combined;
-                String::new()
+        // Sentence-endpoint flush: the tip is held ONLY to guard against a word
+        // split across a chunk boundary. A token ending in sentence-final
+        // punctuation (. ? !) cannot be mid-word — the punctuation IS the end —
+        // so holding it would strand the last word of a sentence at the START of
+        // the next segment (the "Friday." → next line" bug). When the combined
+        // text ends in such punctuation, emit ALL of it now and hold nothing.
+        // This mirrors production endpointing (flush on end-of-sentence).
+        let emit = if ends_sentence(&combined) {
+            self.tip.clear();
+            std::mem::take(&mut combined)
+        } else {
+            match combined.rfind(char::is_whitespace) {
+                // Confirmed = everything up to (and incl.) the last space; hold the rest.
+                Some(idx) => {
+                    let (confirmed, tip) = combined.split_at(idx + 1);
+                    self.tip = tip.to_string();
+                    confirmed.to_string()
+                }
+                // No space yet — the whole thing is still one unfinished word; keep holding.
+                None => {
+                    self.tip = combined;
+                    String::new()
+                }
             }
         };
         if emit.trim().is_empty() {
@@ -184,19 +203,56 @@ impl SttEngine {
     /// Flush the held tip (the last provisional word). Call this when speech ends
     /// / on close, so a final word isn't stranded in the buffer. Returns the held
     /// text (may be empty).
+    ///
+    /// WORD-BOUNDARY: the held tip is the trailing token split off AFTER the last
+    /// space (see `push`), so it carries NO surrounding space. Normally it is
+    /// reunited by prepending it to the next chunk's text (which brings its own
+    /// leading space), preserving boundaries. But a flush emits the tip as a
+    /// STANDALONE chunk — downstream simply concatenates chunk texts, so a bare
+    /// "main" flushed here would glue to the next segment's first word
+    /// ("because ") as "mainbecause". Emit the tip with ONE trailing space so the
+    /// word boundary survives the concatenation. Nemotron spaces its own output,
+    /// so a single trailing space matches its convention and never double-spaces.
     pub fn finalize_tip(&mut self) -> Option<TranscriptChunk> {
         let held = std::mem::take(&mut self.tip);
-        if held.trim().is_empty() {
-            return None;
-        }
+        let text = flush_boundary(&held)?;
         let at = self.samples_seen as f64 / SAMPLE_RATE;
-        Some(TranscriptChunk { text: held, at })
+        Some(TranscriptChunk { text, at })
     }
 
     /// The full accumulated transcript so far.
     pub fn full_transcript(&self) -> String {
         self.asr.get_transcript()
     }
+}
+
+/// Normalize a flushed tip so it preserves the trailing word boundary.
+///
+/// The held tip is the trailing token split off AFTER the last space in `push`,
+/// so it carries no surrounding space. A flush emits it as a STANDALONE chunk,
+/// and downstream simply concatenates chunk texts — so a bare "main" flushed at
+/// an utterance end would glue to the next segment's first word ("because ") as
+/// "mainbecause". Return the tip trimmed with exactly ONE trailing space so the
+/// boundary survives concatenation; return `None` for an empty/whitespace tip so
+/// nothing is emitted. Nemotron spaces its own output, so one trailing space
+/// matches its convention and never double-spaces.
+fn flush_boundary(tip: &str) -> Option<String> {
+    let trimmed = tip.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{trimmed} "))
+}
+
+/// Whether `text` ends a sentence — its last non-space, non-closing character is
+/// sentence-final punctuation (`.`, `?`, `!`), allowing trailing closers like a
+/// quote or paren (`."`, `?)`). Such a token cannot be a mid-word split, so the
+/// hold-the-tip guard is unnecessary and would only strand the final word.
+fn ends_sentence(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    // Peel trailing closing quotes/brackets so `he said "go."` still counts.
+    let core = trimmed.trim_end_matches(['"', '\'', ')', ']', '}', '»', '”', '’']);
+    matches!(core.chars().next_back(), Some('.') | Some('?') | Some('!'))
 }
 
 /// A piece of streamed transcript text plus the stream time (seconds) it landed.
@@ -206,4 +262,47 @@ pub struct TranscriptChunk {
     pub text: String,
     /// Stream time in seconds at which this text was emitted.
     pub at: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ends_sentence, flush_boundary};
+
+    #[test]
+    fn flush_boundary_preserves_word_boundary() {
+        // The bug: a tip flushed on a VAD pause was emitted bare ("main"), then
+        // the next segment's first word ("because ") concatenated → "mainbecause".
+        // A single trailing space keeps them apart: "main " + "because ".
+        assert_eq!(flush_boundary("main").as_deref(), Some("main "));
+        assert_eq!(flush_boundary("calendar").as_deref(), Some("calendar "));
+        // Already-spaced input normalizes to exactly one trailing space (no double).
+        assert_eq!(flush_boundary("main ").as_deref(), Some("main "));
+        assert_eq!(flush_boundary(" things ").as_deref(), Some("things "));
+        // Empty / whitespace-only → nothing to flush.
+        assert_eq!(flush_boundary(""), None);
+        assert_eq!(flush_boundary("   "), None);
+    }
+
+    #[test]
+    fn sentence_final_punctuation_flushes() {
+        // The bug: "Friday." was held as the tip and stranded onto the next line.
+        assert!(ends_sentence("the deadline is Friday."));
+        assert!(ends_sentence("are we agreed?"));
+        assert!(ends_sentence("ship it!"));
+        // Trailing whitespace is tolerated (the model spaces its own output).
+        assert!(ends_sentence("done. "));
+        // Closing quote/paren after the punctuation still counts as sentence-end.
+        assert!(ends_sentence(r#"he said "go.""#));
+        assert!(ends_sentence("(see note.)"));
+    }
+
+    #[test]
+    fn mid_utterance_text_is_not_flushed() {
+        // No terminal punctuation → keep holding the tip (guards word splits).
+        assert!(!ends_sentence("the deadline is"));
+        assert!(!ends_sentence("monthly recurring"));
+        assert!(!ends_sentence("hello wor")); // a word split mid-boundary
+        assert!(!ends_sentence("a comma, then more"));
+        assert!(!ends_sentence(""));
+    }
 }

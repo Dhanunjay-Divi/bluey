@@ -206,6 +206,16 @@ pub enum AnswerStatusStep {
     },
 }
 
+/// One candidate name the speaker-rename input offers (a calendar attendee).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SpeakerCandidate {
+    /// Display name — the calendar `displayName` when present, else a
+    /// prettified email local-part (e.g. `jane.doe@x.com` → "Jane Doe").
+    pub name: String,
+    /// The attendee's email (a secondary label / disambiguator; may be empty).
+    pub email: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayCommand {
@@ -336,6 +346,17 @@ pub enum OverlayCommand {
     TranscriptSpeaker {
         id: String,
         speaker: String,
+        /// The numeric diarized speaker index this label belongs to, so the UI
+        /// can offer inline rename (→ `RenameSpeakerRequested { speaker_id }`).
+        /// `None` for a rename echo where the UI already knows the target.
+        #[serde(default)]
+        speaker_id: Option<i64>,
+    },
+    /// The active meeting's calendar attendees, so the speaker-rename input can
+    /// offer them as tap-to-pick candidates (an invitee is far likelier to be a
+    /// speaker than a random name). Empty when no meeting / no roster.
+    SetMeetingCandidates {
+        candidates: Vec<SpeakerCandidate>,
     },
     /// Snapshot of the active meeting for rehydration (Fix B). `transcript` is
     /// the finalized spoken lines; `conversation` is the prior Q&A turns. Both
@@ -471,6 +492,15 @@ pub enum OverlayEvent {
     },
     RemoveContextRequested {
         id: uuid::Uuid,
+    },
+    /// UI renamed a speaker in the active meeting (the "Reassign Speaker" flow).
+    /// Persists to the diarization store so the name shows on the transcript AND
+    /// enrolls the speaker's voiceprint for cross-meeting recognition. `speaker_id`
+    /// is the per-meeting diarized speaker index; `name` is the user's chosen
+    /// display name (empty clears it back to a fallback label).
+    RenameSpeakerRequested {
+        speaker_id: i64,
+        name: String,
     },
     /// UI asked for the current discovered-agent list (agent-bridge Slice 5a).
     AgentListRequested,

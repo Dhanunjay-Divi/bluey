@@ -133,6 +133,10 @@ interface WireCueCard {
 type OverlayCommand =
   | { type: "set_agents"; agents: WireAgentSummary[] }
   | {
+      type: "set_meeting_candidates";
+      candidates: { name: string; email: string }[];
+    }
+  | {
       type: "set_agent_sessions";
       kind: string;
       sessions: WireAgentSessionSummary[];
@@ -159,7 +163,12 @@ type OverlayCommand =
   // Diarization resolved a speaker for an already-pushed transcript line
   // (labels lag lines by up to one live-diarize tick). `id` is the segment id
   // the transcript card was pushed with; `speaker` is the display label.
-  | { type: "transcript_speaker"; id: string; speaker: string }
+  | {
+      type: "transcript_speaker";
+      id: string;
+      speaker: string;
+      speaker_id?: number | null;
+    }
   | {
       type: "update_card";
       id: string;
@@ -582,6 +591,16 @@ export function createTauriClient(): MeetingClient {
       return Promise.resolve();
     },
 
+    renameSpeaker: (speakerId, name) => {
+      // Fire-and-forget: the daemon persists the name + enrolls the voiceprint,
+      // then pushes the updated label back via onSpeakerUpdate.
+      sendEvent({
+        type: "rename_speaker_requested",
+        speaker_id: speakerId,
+        name,
+      });
+    },
+
     onListeningState(cb) {
       // The daemon pushes listening_state_changed with the full pipeline state
       // (idle | connecting | listening | paused | failed). Pass it through so
@@ -683,6 +702,21 @@ export function createTauriClient(): MeetingClient {
       return () => handlers.delete(handler);
     },
 
+    onMeetingCandidates(cb) {
+      // Daemon-pushed calendar attendees for the active meeting; the speaker-
+      // rename input offers them as tap-to-pick names. Pure subscribe.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "set_meeting_candidates") return;
+        const c = cmd as Extract<
+          OverlayCommand,
+          { type: "set_meeting_candidates" }
+        >;
+        cb(c.candidates);
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
     onTranscript(cb) {
       // Transcript lines arrive as push_card with kind "transcript".
       const handler = (cmd: OverlayCommand) => {
@@ -719,8 +753,13 @@ export function createTauriClient(): MeetingClient {
       // the text was pushed; this patches the label in place by segment id.
       const handler = (cmd: OverlayCommand) => {
         if (cmd.type !== "transcript_speaker") return;
-        const c = cmd as Extract<OverlayCommand, { type: "transcript_speaker" }>;
-        if (c.id && c.speaker) cb(c.id, c.speaker);
+        const c = cmd as Extract<
+          OverlayCommand,
+          { type: "transcript_speaker" }
+        >;
+        // `id` empty = a rename echo for a whole speaker (by speaker_id), not a
+        // single segment. Pass both through; the grouper decides how to apply.
+        if (c.speaker) cb(c.id, c.speaker, c.speaker_id ?? null);
       };
       handlers.add(handler);
       return () => handlers.delete(handler);

@@ -12,7 +12,7 @@
 import { useEffect, useRef, useState } from "react";
 import { getClient } from "../lib";
 import { useMeetingState } from "../lib/meetingState";
-import type { TranscriptLine } from "../lib/types";
+import type { SpeakerCandidate, TranscriptLine } from "../lib/types";
 import { ChevronIcon, MicIcon, SystemAudioIcon } from "./icons";
 
 /** Max height of the expanded scroller — tall enough to read a few exchanges,
@@ -32,6 +32,11 @@ export function LiveTranscriptBar() {
     return client.onListeningState((s) => setListening(s === "listening"));
   }, []);
   const [expanded, setExpanded] = useState(false);
+  // Which speaker id is currently being renamed inline (null = none editing).
+  const [editingSpeaker, setEditingSpeaker] = useState<number | null>(null);
+  // Calendar attendees for the active meeting — tap-to-pick names in rename.
+  const [candidates, setCandidates] = useState<SpeakerCandidate[]>([]);
+  useEffect(() => getClient().onMeetingCandidates(setCandidates), []);
   const scrollRef = useRef<HTMLDivElement>(null);
   // Auto-follow the newest line while pinned to the bottom; stop yanking the
   // user back down once they scroll up to read earlier speech (same discipline
@@ -122,7 +127,9 @@ export function LiveTranscriptBar() {
           title={current?.text ?? undefined}
         >
           {current?.text?.trim() ||
-            (listening ? "Listening…" : "Not listening — start audio to transcribe")}
+            (listening
+              ? "Listening…"
+              : "Not listening — start audio to transcribe")}
         </span>
         {/* ALWAYS-visible chevron affordance (decorative — the whole row is the
             toggle via its pointer handlers, so this is just a pointer-events:none
@@ -163,11 +170,21 @@ export function LiveTranscriptBar() {
           }}
         >
           {history.length === 0 ? (
-            <div style={{ fontSize: 12, color: "var(--ink-4)", padding: "6px 0" }}>
+            <div
+              style={{ fontSize: 12, color: "var(--ink-4)", padding: "6px 0" }}
+            >
               Nothing transcribed yet.
             </div>
           ) : (
-            history.map((line, i) => (
+            (() => {
+              // The FIRST line index of the speaker being edited. Only that one
+              // line renders the input — otherwise every line of that speaker
+              // renders an editor and each blur re-fires the rename (the 4× bug).
+              const editIdx =
+                editingSpeaker == null
+                  ? -1
+                  : history.findIndex((l) => l.speakerId === editingSpeaker);
+              return history.map((line, i) => (
               <div
                 key={line.id ?? `${i}-${line.text.slice(0, 12)}`}
                 style={{
@@ -180,23 +197,21 @@ export function LiveTranscriptBar() {
                   color: "var(--ink-2)",
                 }}
               >
-                <span
-                  style={{
-                    flexShrink: 0,
-                    color:
-                      line.source === "mic"
-                        ? "var(--tint-ink)"
-                        : "var(--ink-4)",
-                    fontWeight: 540,
-                  }}
-                >
-                  {speakerLabel(line)}
-                </span>
+                <EditableSpeaker
+                  line={line}
+                  candidates={candidates}
+                  editing={i === editIdx}
+                  onStartEdit={() =>
+                    line.speakerId != null && setEditingSpeaker(line.speakerId)
+                  }
+                  onDone={() => setEditingSpeaker(null)}
+                />
                 <span style={{ minWidth: 0, wordBreak: "break-word" }}>
                   {line.text}
                 </span>
               </div>
-            ))
+              ));
+            })()
           )}
         </div>
       )}
@@ -211,6 +226,145 @@ export function LiveTranscriptBar() {
 function speakerLabel(line: TranscriptLine): string {
   if (line.speaker && line.speaker.trim()) return line.speaker;
   return line.source === "mic" ? "You" : "They";
+}
+
+/** The speaker label before a transcript line. When the line has a numeric
+ *  `speakerId` (a diarized call speaker, not "You"/"They"), the label is
+ *  click-to-rename inline: clicking swaps it for a small text field; Enter or
+ *  blur persists via `renameSpeaker(speakerId, name)` — which relabels every
+ *  line of that speaker AND enrolls their voiceprint for future meetings. */
+function EditableSpeaker({
+  line,
+  candidates,
+  editing,
+  onStartEdit,
+  onDone,
+}: {
+  line: TranscriptLine;
+  candidates: SpeakerCandidate[];
+  editing: boolean;
+  onStartEdit: () => void;
+  onDone: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const inputRef = useRef<HTMLInputElement>(null);
+  const renameable = line.speakerId != null;
+  const label = speakerLabel(line);
+  const color = line.source === "mic" ? "var(--tint-ink)" : "var(--ink-4)";
+
+  useEffect(() => {
+    if (editing) {
+      setDraft(line.speaker ?? "");
+      inputRef.current?.focus();
+      inputRef.current?.select();
+    }
+  }, [editing, line.speaker]);
+
+  const apply = (name: string) => {
+    const trimmed = name.trim();
+    if (renameable && trimmed && trimmed !== line.speaker) {
+      getClient().renameSpeaker(line.speakerId as number, trimmed);
+    }
+    onDone();
+  };
+
+  if (editing) {
+    // Candidates matching what's typed (empty draft shows all) — the invitee
+    // list narrows as the user types, and a custom name is always allowed.
+    const q = draft.trim().toLowerCase();
+    const matches = candidates
+      .filter((c) => !q || c.name.toLowerCase().includes(q))
+      .slice(0, 5);
+    return (
+      <span
+        style={{ position: "relative", flexShrink: 0, display: "inline-flex" }}
+      >
+        <input
+          ref={inputRef}
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") apply(draft);
+            if (e.key === "Escape") onDone();
+          }}
+          // Delay blur so a candidate click registers before the input closes.
+          onBlur={() => setTimeout(() => apply(draft), 120)}
+          placeholder="Name this speaker"
+          style={{
+            width: 130,
+            fontSize: 12,
+            fontWeight: 540,
+            color,
+            background: "var(--glass)",
+            border: "1px solid var(--tint)",
+            borderRadius: "var(--r-pill)",
+            padding: "1px 7px",
+            outline: "none",
+          }}
+        />
+        {matches.length > 0 && (
+          <div
+            style={{
+              position: "absolute",
+              top: "calc(100% + 4px)",
+              left: 0,
+              zIndex: 10000,
+              display: "flex",
+              flexDirection: "column",
+              minWidth: 130,
+              background: "var(--glass)",
+              border: "1px solid var(--tint)",
+              borderRadius: 8,
+              padding: 4,
+              boxShadow: "0 4px 16px rgba(0,0,0,0.18)",
+            }}
+          >
+            {matches.map((c) => (
+              <button
+                key={c.email || c.name}
+                // onMouseDown (not onClick) so it fires before the input's blur.
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  apply(c.name);
+                }}
+                title={c.email || undefined}
+                style={{
+                  textAlign: "left",
+                  background: "transparent",
+                  border: "none",
+                  color: "var(--ink-2)",
+                  fontSize: 12,
+                  padding: "4px 8px",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                }}
+              >
+                {c.name}
+              </button>
+            ))}
+          </div>
+        )}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      onClick={renameable ? onStartEdit : undefined}
+      title={renameable ? "Click to name this speaker" : undefined}
+      style={{
+        flexShrink: 0,
+        color,
+        fontWeight: 540,
+        cursor: renameable ? "pointer" : "default",
+        borderBottom: renameable
+          ? "1px dashed var(--ink-5, transparent)"
+          : "none",
+      }}
+    >
+      {label}
+    </span>
+  );
 }
 
 /** Which source Bluey heard this line from — speaker (the call) vs mic (you). */

@@ -7,6 +7,21 @@ use rusqlite::params;
 
 use super::Database;
 
+/// Cap on how many recent named voiceprints cross-meeting matching scans. A
+/// user has at most a few dozen recurring named colleagues; bounding the scan
+/// (newest-first) keeps matching O(recent) rather than O(all speakers ever), so
+/// a heavy user with thousands of past meetings still matches in microseconds.
+const MAX_HISTORICAL_VOICEPRINTS: i64 = 200;
+
+/// Minimum speaking time (ms) a prior-meeting speaker must have accrued for its
+/// centroid to be a reliable, matchable voiceprint. MEASURED on real audio
+/// (VoxConverse, `examples/cross_meeting_real.rs`): speakers with ample speech
+/// self-match at 0.87–0.99, but a centroid from only a second or two of speech
+/// is noisy and scores 0.2–0.7 even against the same voice — so enrolling it
+/// would cause both misses and false matches. 3s mirrors the diarizer's own
+/// `min_enroll_secs` (ProfileBank).
+const MIN_VOICEPRINT_SPEECH_MS: i64 = 3000;
+
 /// A stored utterance embedding (one speaker's speech span).
 #[derive(Debug, Clone)]
 pub struct UtteranceRow {
@@ -133,6 +148,15 @@ impl Database {
     }
 
     /// Load all historical speaker centroids that have user-assigned names.
+    /// Load REAL named voiceprints from prior meetings, for cross-meeting
+    /// matching. Bounded and filtered for production:
+    /// - excludes the current session (`session_id != ?1`),
+    /// - requires a real user-assigned name — NOT the auto-fallback `Speaker N`
+    ///   labels (matching those would propagate meaningless names across
+    ///   meetings),
+    /// - newest-first and capped at `MAX_HISTORICAL_VOICEPRINTS`, so the scan
+    ///   stays O(recent colleagues) instead of O(all speakers ever), which keeps
+    ///   a heavy user with thousands of past meetings fast.
     pub fn load_historical_voiceprints(
         &self,
         current_session_id: &str,
@@ -141,18 +165,30 @@ impl Database {
             "SELECT ms.session_id, ms.speaker_final, s.name, ms.centroid \
              FROM meeting_speaker ms \
              JOIN speakers s ON ms.session_id = s.session_id AND ms.speaker_final = s.speaker_id \
-             WHERE ms.session_id != ?1 AND s.name != ''",
+             WHERE ms.session_id != ?1 \
+               AND s.name != '' \
+               AND s.name NOT GLOB 'Speaker [0-9]*' \
+               AND ms.total_ms >= ?3 \
+             ORDER BY ms.updated_at DESC \
+             LIMIT ?2",
         )?;
         let rows = stmt
-            .query_map(params![current_session_id], |r| {
-                let blob: Vec<u8> = r.get(3)?;
-                Ok(HistoricalVoiceprint {
-                    session_id: r.get(0)?,
-                    speaker_id: r.get(1)?,
-                    name: r.get(2)?,
-                    centroid: blob_to_embedding(&blob),
-                })
-            })?
+            .query_map(
+                params![
+                    current_session_id,
+                    MAX_HISTORICAL_VOICEPRINTS,
+                    MIN_VOICEPRINT_SPEECH_MS
+                ],
+                |r| {
+                    let blob: Vec<u8> = r.get(3)?;
+                    Ok(HistoricalVoiceprint {
+                        session_id: r.get(0)?,
+                        speaker_id: r.get(1)?,
+                        name: r.get(2)?,
+                        centroid: blob_to_embedding(&blob),
+                    })
+                },
+            )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -319,6 +355,157 @@ mod tests {
         let incoming = vec![0.81_f32, 0.19, 0.1];
         let matched = db.match_speaker_voiceprint(&s2, &incoming, 0.80);
         assert_eq!(matched, Some("Sarah Jenkins".to_string()));
+    }
+
+    /// Harder cross-meeting test: several PRIOR meetings each enroll a named
+    /// speaker; a new meeting must (1) pick the RIGHT name among distractors,
+    /// (2) NOT match an unnamed speaker, (3) NOT match a genuinely different
+    /// voice, (4) never match a speaker from the CURRENT session. This exercises
+    /// the real failure modes the near-identical single-speaker test can't.
+    #[test]
+    fn cross_meeting_voiceprint_picks_right_name_among_distractors() {
+        let db = Database::open(":memory:").unwrap();
+        // A helper to make a normalized-ish 8-dim voiceprint (closer to the real
+        // WeSpeaker embedding shape than a 3-vector, so cosine behaves realistically).
+        let vp = |seed: [f32; 8]| seed.to_vec();
+
+        let m1 = uuid::Uuid::new_v4();
+        let m2 = uuid::Uuid::new_v4();
+        let m3 = uuid::Uuid::new_v4();
+        let now = uuid::Uuid::new_v4(); // the CURRENT meeting
+        for id in [m1, m2, m3, now] {
+            db.ensure_meeting_session(id, None).unwrap();
+        }
+        let (m1, m2, m3, cur) = (
+            m1.to_string(),
+            m2.to_string(),
+            m3.to_string(),
+            now.to_string(),
+        );
+
+        // Meeting 1: Sarah (named).
+        let sarah = vp([0.90, 0.10, 0.05, 0.02, 0.01, 0.00, 0.00, 0.00]);
+        db.upsert_meeting_speaker(&m1, 1, &sarah, 12, 6000, 100)
+            .unwrap();
+        db.set_speaker_name(&m1, 1, "Sarah Jenkins", None).unwrap();
+
+        // Meeting 2: Alex (named), clearly different voice.
+        let alex = vp([0.05, 0.05, 0.90, 0.10, 0.02, 0.00, 0.00, 0.00]);
+        db.upsert_meeting_speaker(&m2, 1, &alex, 20, 9000, 200)
+            .unwrap();
+        db.set_speaker_name(&m2, 1, "Alex Vance", None).unwrap();
+
+        // Meeting 3: an UNNAMED speaker (still "Speaker 2" — no real name). Must
+        // never be returned even if the voice is close, because the JOIN requires
+        // s.name != ''.
+        let unnamed = vp([0.88, 0.12, 0.06, 0.03, 0.00, 0.00, 0.00, 0.00]);
+        db.upsert_meeting_speaker(&m3, 2, &unnamed, 5, 2500, 300)
+            .unwrap();
+        // deliberately NOT set_speaker_name → stays unnamed.
+
+        // (1) A voice close to Sarah, queried from the CURRENT meeting → Sarah,
+        // NOT the near-identical unnamed speaker from meeting 3.
+        let incoming_sarah = vp([0.89, 0.11, 0.05, 0.02, 0.01, 0.00, 0.00, 0.00]);
+        assert_eq!(
+            db.match_speaker_voiceprint(&cur, &incoming_sarah, 0.80),
+            Some("Sarah Jenkins".to_string()),
+            "must match the NAMED Sarah, not the unnamed near-identical voice"
+        );
+
+        // (2) A voice close to Alex → Alex (right pick among distractors).
+        let incoming_alex = vp([0.06, 0.05, 0.89, 0.11, 0.02, 0.00, 0.00, 0.00]);
+        assert_eq!(
+            db.match_speaker_voiceprint(&cur, &incoming_alex, 0.80),
+            Some("Alex Vance".to_string()),
+        );
+
+        // (3) A genuinely different voice → no match (below threshold).
+        let stranger = vp([0.00, 0.00, 0.00, 0.00, 0.10, 0.90, 0.30, 0.20]);
+        assert_eq!(
+            db.match_speaker_voiceprint(&cur, &stranger, 0.80),
+            None,
+            "an unknown voice must not be forced onto a known name"
+        );
+
+        // (4) The SAME voice, but querying from Sarah's OWN meeting (m1), must
+        // NOT self-match (the query excludes the current session).
+        assert_eq!(
+            db.match_speaker_voiceprint(&m1, &incoming_sarah, 0.80),
+            None,
+            "a speaker must not match themselves within their own meeting"
+        );
+    }
+
+    /// Production guard: a speaker carrying only the AUTO-FALLBACK label
+    /// ("Speaker 3") must NOT be matched cross-meeting — inheriting a fallback
+    /// label across meetings would propagate meaningless names. Only real,
+    /// user-assigned names are matchable.
+    #[test]
+    fn fallback_speaker_labels_are_never_matched_cross_meeting() {
+        let db = Database::open(":memory:").unwrap();
+        let prior = uuid::Uuid::new_v4();
+        let cur = uuid::Uuid::new_v4();
+        db.ensure_meeting_session(prior, None).unwrap();
+        db.ensure_meeting_session(cur, None).unwrap();
+        let (p, c) = (prior.to_string(), cur.to_string());
+
+        // A prior meeting where the speaker was only auto-labelled (never named
+        // by the user) — exactly what the live path writes for unmatched voices.
+        let voice = vec![0.90_f32, 0.10, 0.05, 0.02, 0.01, 0.00, 0.00, 0.00];
+        db.upsert_meeting_speaker(&p, 3, &voice, 8, 4000, 100)
+            .unwrap();
+        db.set_speaker_name(&p, 3, "Speaker 4", None).unwrap(); // fallback label
+
+        // The identical voice in a new meeting must NOT inherit "Speaker 4".
+        let same = vec![0.90_f32, 0.10, 0.05, 0.02, 0.01, 0.00, 0.00, 0.00];
+        assert_eq!(
+            db.match_speaker_voiceprint(&c, &same, 0.80),
+            None,
+            "a fallback 'Speaker N' label must not propagate across meetings"
+        );
+
+        // But once the user gives them a REAL name, the same voice matches it.
+        db.set_speaker_name(&p, 3, "Jordan Lee", None).unwrap();
+        assert_eq!(
+            db.match_speaker_voiceprint(&c, &same, 0.80),
+            Some("Jordan Lee".to_string()),
+            "a real user-assigned name is matchable cross-meeting"
+        );
+    }
+
+    /// Production guard (MEASURED on real audio): a named speaker backed by too
+    /// little speech (< MIN_VOICEPRINT_SPEECH_MS) is NOT matchable — its centroid
+    /// is too noisy to trust. Real VoxConverse voiceprints from <3s of speech
+    /// self-matched at only 0.2–0.7, so enrolling them causes misses AND false
+    /// positives.
+    #[test]
+    fn thin_voiceprints_are_not_matchable() {
+        let db = Database::open(":memory:").unwrap();
+        let prior = uuid::Uuid::new_v4();
+        let cur = uuid::Uuid::new_v4();
+        db.ensure_meeting_session(prior, None).unwrap();
+        db.ensure_meeting_session(cur, None).unwrap();
+        let (p, c) = (prior.to_string(), cur.to_string());
+        let voice = vec![0.90_f32, 0.10, 0.05, 0.02, 0.01, 0.00, 0.00, 0.00];
+
+        // Named, but only 1.5s of speech → below the 3s reliability floor.
+        db.upsert_meeting_speaker(&p, 1, &voice, 3, 1500, 100)
+            .unwrap();
+        db.set_speaker_name(&p, 1, "Casey Morgan", None).unwrap();
+        assert_eq!(
+            db.match_speaker_voiceprint(&c, &voice, 0.80),
+            None,
+            "a voiceprint from too little speech must not be matchable"
+        );
+
+        // Same speaker later accrues enough speech → now matchable.
+        db.upsert_meeting_speaker(&p, 1, &voice, 20, 12000, 200)
+            .unwrap();
+        assert_eq!(
+            db.match_speaker_voiceprint(&c, &voice, 0.80),
+            Some("Casey Morgan".to_string()),
+            "once backed by enough speech, the voiceprint becomes matchable"
+        );
     }
 
     // `ensure_meeting_session` must never clobber a real agent session that

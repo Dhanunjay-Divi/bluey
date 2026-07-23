@@ -37,6 +37,19 @@ pub fn live_interval_secs() -> u64 {
         .unwrap_or(15)
 }
 
+/// Cosine-similarity floor for matching a live speaker centroid to a NAMED
+/// speaker from a prior meeting (cross-meeting voiceprint recognition). 0.80 is
+/// conservative — high enough to avoid forcing a stranger onto a known name,
+/// low enough to survive normal day-to-day/mic variation. Tunable without a
+/// recompile via `BLUEY_VOICEPRINT_THRESHOLD` (clamped to a sane 0.5..=0.99).
+pub fn voiceprint_match_threshold() -> f32 {
+    std::env::var("BLUEY_VOICEPRINT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .map(|t| t.clamp(0.5, 0.99))
+        .unwrap_or(0.80)
+}
+
 /// Whether the `BLUEY_DIARIZE` env override is set, and to what. `Some(true)` =
 /// forced on, `Some(false)` = forced off, `None` = unset (defer to the setting).
 /// The env wins in BOTH directions (dev/test), mirroring the ledger's
@@ -284,12 +297,23 @@ async fn label_segments_by_overlap(daemon: &Arc<Daemon>, segments: &[cue_diarize
         }
     }
 
+    // Open the DB once to prefer a USER-assigned speaker name over the computed
+    // "Speaker N" — otherwise the live tick keeps flashing the fallback label
+    // over a name the user typed (the rename flip-flop).
+    let name_db = {
+        let db_path = daemon.paths.data_dir.join("sessions.db");
+        crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")).ok()
+    };
     for (seg_id, text, source, speaker_id, secondary, ts_ms) in updates {
-        // Upgrade the OVERLAY's already-rendered line in place. A clean line is
-        // "Speaker N"; a talk-over line surfaces the co-speakers honestly rather
-        // than silently attributing everyone's words to the dominant voice.
-        let label = cue_core::meeting::speaker_display_label(speaker_id, &secondary);
-        crate::app::push_transcript_speaker(daemon, seg_id, label).await;
+        // Upgrade the OVERLAY's already-rendered line in place. Prefer the user's
+        // name for this speaker; else a clean "Speaker N" (a talk-over line
+        // surfaces the co-speakers honestly rather than silently attributing
+        // everyone's words to the dominant voice).
+        let label = name_db
+            .as_ref()
+            .and_then(|db| db.user_speaker_name(&session_id, speaker_id as i32))
+            .unwrap_or_else(|| cue_core::meeting::speaker_display_label(speaker_id, &secondary));
+        crate::app::push_transcript_speaker(daemon, seg_id, label, Some(speaker_id)).await;
         // Dev-view WebSocket (bluey listen) gets the same upgrade.
         crate::app::broadcast_speaker_update(
             daemon,
@@ -480,13 +504,41 @@ pub(crate) async fn post_process_meeting(
     // Rewrite far-side transcript speaker ids using the shared audio clock and the
     // same max-total-overlap rule as the live tier (`assign_speaker`). The post
     // pass is authoritative — it re-runs the diarizer over the full buffer.
+    //
+    // RENAME RECONCILIATION (the "Sam jumped to Speaker 2" fix). A user rename
+    // binds a NAME to a LIVE gid (the id a segment carried before this rewrite).
+    // The post-pass re-clusters into a DIFFERENT id space, so a blind rewrite
+    // would strand the user's name on the old integer. We bridge the two id
+    // spaces by TIME: each segment still carries its live gid here (set by the
+    // live tick); as we assign the post-pass id, we tally, per post-pass id, how
+    // much speech came from each user-named live gid. The user name that
+    // dominates a post-pass id is carried onto it — so the name follows the VOICE
+    // across the id-space change. Built during the rewrite, applied just after.
+    let user_names = load_user_named_gids(&daemon, &session_id);
+    // post_pass_id -> (live_gid_with_user_name -> accumulated ms of overlap)
+    let mut carry: std::collections::HashMap<i64, std::collections::HashMap<i64, i64>> =
+        std::collections::HashMap::new();
     let mut labeled = 0usize;
     for seg in meeting.transcript.iter_mut() {
         if seg.speaker.is_me() {
             continue;
         }
+        // The live gid this segment carried BEFORE the authoritative overwrite.
+        let live_gid = seg.speaker_id;
         match assign_speaker(seg, &out.segments) {
             Some(SpeakerAssignment { primary, secondary }) => {
+                // If the pre-rewrite live gid was user-named, credit this
+                // post-pass id with the segment's duration for that named voice.
+                if !user_names.is_empty() {
+                    if let Some(gid) = live_gid {
+                        if user_names.contains_key(&gid) {
+                            let dur_ms =
+                                (seg.audio_dur_secs.unwrap_or(0.0) * 1000.0).round() as i64;
+                            *carry.entry(primary).or_default().entry(gid).or_insert(0) +=
+                                dur_ms.max(1);
+                        }
+                    }
+                }
                 seg.speaker_id = Some(primary);
                 seg.secondary_speaker_ids = secondary;
                 labeled += 1;
@@ -496,6 +548,14 @@ pub(crate) async fn post_process_meeting(
             // context (B2). The primary label is left as the last best guess.
             None => seg.secondary_speaker_ids.clear(),
         }
+    }
+    // Apply the reconciliation: for each post-pass id, carry the user name of the
+    // live gid that contributed the most speech to it. Writes a user_set=1 row on
+    // the post-pass id so labeling (live + history) resolves the name by the NEW
+    // id, and so the named centroid (already upserted for this id in
+    // persist_diarization) becomes a matchable cross-meeting voiceprint.
+    if !carry.is_empty() {
+        reconcile_user_names(&daemon, &session_id, &carry, &user_names);
     }
     if let Err(e) = daemon.store.archive(&meeting) {
         warn!("diarize: re-archive after diarization failed: {e:#}");
@@ -540,17 +600,35 @@ async fn persist_diarization(
     let centroid_of: std::collections::HashMap<i64, &Vec<f32>> =
         out.centroids.iter().map(|(id, c)| (*id, c)).collect();
 
+    // Real per-speaker bookkeeping (utterance count + total speaking ms),
+    // computed from the segments rather than stored as placeholder zeros — these
+    // back voiceprint confidence (a centroid from 30s of speech is stronger than
+    // one from 0.5s) and let downstream logic weight matches by evidence.
+    let mut n_utts: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    let mut total_ms: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+    for seg in &out.segments {
+        let dur = (((seg.end - seg.start) * 1000.0).round() as i64).max(0);
+        *n_utts.entry(seg.speaker).or_insert(0) += 1;
+        *total_ms.entry(seg.speaker).or_insert(0) += dur;
+    }
+
     // Resolved speakers.
+    let threshold = voiceprint_match_threshold();
     for (id, centroid) in &out.centroids {
-        if let Err(e) = db.upsert_meeting_speaker(session_id, *id, centroid, 0, 0, now_ms) {
+        let n = n_utts.get(id).copied().unwrap_or(0);
+        let ms = total_ms.get(id).copied().unwrap_or(0);
+        if let Err(e) = db.upsert_meeting_speaker(session_id, *id, centroid, n, ms, now_ms) {
             warn!("diarize: upsert_meeting_speaker failed: {e:#}");
         }
-        // Cross-meeting voiceprint matching: if centroid matches a historical speaker, auto-name it.
-        if let Some(matched_name) = db.match_speaker_voiceprint(session_id, centroid, 0.80) {
+        // Cross-meeting voiceprint matching: if the centroid matches a named
+        // speaker from a PRIOR meeting (cosine ≥ threshold), inherit that name;
+        // otherwise assign a stable per-meeting fallback label. Runs once per
+        // speaker at meeting end (not per live tick), so the historical scan is
+        // bounded by the number of resolved speakers, not the tick rate.
+        if let Some(matched_name) = db.match_speaker_voiceprint(session_id, centroid, threshold) {
             info!(speaker_id = *id, matched_name = %matched_name, "diarize: auto-matched cross-meeting voiceprint");
             let _ = db.set_speaker_name(session_id, *id as i32, &matched_name, None);
         } else {
-            // Unmatched speaker: assign a unique iterating fallback label ("Speaker 1", "Speaker 2", etc.)
             let fallback_name = format!("Speaker {}", id + 1);
             let _ = db.set_speaker_name(session_id, *id as i32, &fallback_name, None);
         }
@@ -587,6 +665,71 @@ async fn persist_diarization(
         utterances = n,
         "diarize: persisted embeddings to sessions.db"
     );
+}
+
+/// Load `(live_gid -> user name)` for every speaker the user renamed in this
+/// session. Empty (and cheap) when nothing was renamed — the common case — so
+/// the reconciliation below no-ops with zero cost. Best-effort: a DB hiccup
+/// yields an empty map (labels fall back to auto, never a crash).
+fn load_user_named_gids(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+) -> std::collections::HashMap<i64, String> {
+    let db_path = daemon.paths.data_dir.join("sessions.db");
+    let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")) else {
+        return std::collections::HashMap::new();
+    };
+    match db.user_named_speakers(session_id) {
+        Ok(rows) => rows.into_iter().collect(),
+        Err(e) => {
+            warn!("diarize: load user-named speakers failed: {e:#}");
+            std::collections::HashMap::new()
+        }
+    }
+}
+
+/// Carry each user-typed name from the LIVE gid it was typed against onto the
+/// authoritative POST-PASS id for the same voice. `carry[post_id][live_gid]` is
+/// the accumulated speech-ms that post-pass `post_id` inherited from user-named
+/// live `live_gid`; the live gid contributing the most speech to a post-pass id
+/// wins that name. Writes a `user_set=1` `speakers` row on the post-pass id so
+/// both live labeling (`user_speaker_name`) and history (`speaker_display_label`
+/// via the persisted id) resolve the user's name, and so the named
+/// `meeting_speaker` centroid already upserted for that post-pass id becomes a
+/// matchable cross-meeting voiceprint. This is what makes the rename follow the
+/// VOICE across the live→post-pass id-space change.
+fn reconcile_user_names(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    carry: &std::collections::HashMap<i64, std::collections::HashMap<i64, i64>>,
+    user_names: &std::collections::HashMap<i64, String>,
+) {
+    let db_path = daemon.paths.data_dir.join("sessions.db");
+    let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")) else {
+        return;
+    };
+    for (post_id, by_gid) in carry {
+        // The user-named live gid that contributed the most speech to this
+        // post-pass id owns the name. Ties break on the lower gid (deterministic).
+        let Some((winning_gid, _ms)) = by_gid.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))
+        else {
+            continue;
+        };
+        let Some(name) = user_names.get(winning_gid) else {
+            continue;
+        };
+        if let Err(e) = db.set_speaker_name_by_user(session_id, *post_id as i32, name, None) {
+            warn!(
+                post_id, %name,
+                "diarize: reconcile rename onto post-pass id failed: {e:#}"
+            );
+        } else {
+            info!(
+                post_id, live_gid = winning_gid, %name,
+                "diarize: carried user rename onto authoritative speaker id (voice-anchored)"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
