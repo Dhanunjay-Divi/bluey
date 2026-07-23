@@ -37,12 +37,24 @@ pub fn live_interval_secs() -> u64 {
         .unwrap_or(15)
 }
 
-/// Whether diarization is enabled at runtime. Off unless `BLUEY_DIARIZE=1` — the
-/// feature being compiled in does not by itself turn it on (it's still heavy).
-pub fn enabled() -> bool {
-    std::env::var("BLUEY_DIARIZE")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+/// Whether the `BLUEY_DIARIZE` env override is set, and to what. `Some(true)` =
+/// forced on, `Some(false)` = forced off, `None` = unset (defer to the setting).
+/// The env wins in BOTH directions (dev/test), mirroring the ledger's
+/// `live_memory_enabled` override policy.
+fn env_override() -> Option<bool> {
+    std::env::var("BLUEY_DIARIZE").ok().map(|v| v == "1")
+}
+
+/// Whether diarization runs, honoring the env override then the persisted
+/// `diarize_enabled` setting (default ON). Env `BLUEY_DIARIZE` wins in both
+/// directions; with it unset, the setting decides (missing settings ⇒ ON).
+pub fn enabled_with_settings(paths: &cue_core::app_paths::AppPaths) -> bool {
+    if let Some(forced) = env_override() {
+        return forced;
+    }
+    cue_core::load_settings(paths)
+        .map(|s| s.diarize_enabled)
+        .unwrap_or(true)
 }
 
 /// Handle to the live diarizer running on its OWN OS thread.
@@ -66,8 +78,10 @@ pub(crate) struct LiveDiarizerHandle {
 /// Spawn the live diarizer worker thread if diarization is enabled. The heavy
 /// speakrs model loads ON the worker thread. Returns `None` when disabled or on
 /// load failure (best-effort; STT must never be blocked).
-pub(crate) fn spawn_live_diarizer() -> Option<LiveDiarizerHandle> {
-    if !enabled() {
+pub(crate) fn spawn_live_diarizer(
+    paths: &cue_core::app_paths::AppPaths,
+) -> Option<LiveDiarizerHandle> {
+    if !enabled_with_settings(paths) {
         return None;
     }
     let (window_tx, mut window_rx) = tokio::sync::mpsc::channel::<(Vec<f32>, f64)>(1);
@@ -420,7 +434,7 @@ pub(crate) async fn post_process_meeting(
     mut meeting: cue_core::meeting::MeetingRecord,
     session_id: String,
 ) {
-    if !enabled() {
+    if !enabled_with_settings(&daemon.paths) {
         return;
     }
     // Take + clear the full buffer (frees RAM after the meeting).
@@ -530,6 +544,15 @@ async fn persist_diarization(
     for (id, centroid) in &out.centroids {
         if let Err(e) = db.upsert_meeting_speaker(session_id, *id, centroid, 0, 0, now_ms) {
             warn!("diarize: upsert_meeting_speaker failed: {e:#}");
+        }
+        // Cross-meeting voiceprint matching: if centroid matches a historical speaker, auto-name it.
+        if let Some(matched_name) = db.match_speaker_voiceprint(session_id, centroid, 0.80) {
+            info!(speaker_id = *id, matched_name = %matched_name, "diarize: auto-matched cross-meeting voiceprint");
+            let _ = db.set_speaker_name(session_id, *id as i32, &matched_name, None);
+        } else {
+            // Unmatched speaker: assign a unique iterating fallback label ("Speaker 1", "Speaker 2", etc.)
+            let fallback_name = format!("Speaker {}", id + 1);
+            let _ = db.set_speaker_name(session_id, *id as i32, &fallback_name, None);
         }
     }
     // One utterance row per diarized segment (embedding = its speaker's centroid).

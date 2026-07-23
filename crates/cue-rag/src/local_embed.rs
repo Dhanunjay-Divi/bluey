@@ -161,4 +161,19 @@ impl EmbeddingProvider for LocalBgeEmbedder {
             .await
             .map_err(|e| EmbeddingError::Request(format!("join: {e}")))?
     }
+
+    /// Query embedding (bge/arctic prefix applied via the inherent method).
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        LocalBgeEmbedder::embed_query(self, text).await
+    }
+
+    /// bge/arctic score floor (measured ~0.45 on real meeting prose).
+    fn relevance_floor(&self) -> f32 {
+        0.45
+    }
+
+    /// Direct sync passage embed — no runtime hop (callers are already blocking).
+    fn embed_passage_blocking(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.embed_sync(text, false)
+    }
 }

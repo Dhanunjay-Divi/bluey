@@ -186,6 +186,12 @@ pub struct SetupStatus {
     pub model: SetupItem,
     /// The coding agent Bluey drives (Bluey never answers on its own).
     pub agent: SetupItem,
+    /// On-device memory embedder (bge-small) — prepared up front so cross-meeting
+    /// facts + attached-session history recall work from the first meeting.
+    /// Defaults to `ready` on builds without the `local-memory` feature (nothing
+    /// to prepare), so it never blocks onboarding there.
+    #[serde(default = "SetupItem::ready_memory")]
+    pub memory: SetupItem,
     /// True once every REQUIRED item is `Ready` — what onboarding gates on.
     pub all_ready: bool,
 }
@@ -202,4 +208,18 @@ pub struct SetupItem {
     /// The agent kind this item refers to, when it is agent-specific — so the
     /// UI can send `AgentInstallRequested` / `AgentLoginRequested` for it.
     pub kind: Option<String>,
+}
+
+impl SetupItem {
+    /// A `ready` memory item — the serde default for `SetupStatus::memory`, and
+    /// what non-`local-memory` builds report (there is no embedder to prepare, so
+    /// memory never gates onboarding on those builds).
+    pub fn ready_memory() -> Self {
+        SetupItem {
+            state: "ready".into(),
+            detail: "Memory ready — runs on this Mac".into(),
+            percent: None,
+            kind: None,
+        }
+    }
 }

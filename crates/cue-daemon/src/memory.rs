@@ -1,78 +1,182 @@
 //! Cross-meeting facts memory — daemon orchestration (feature `local-memory`).
 //!
 //! The long-term tier of the two-tier memory model (PLAN-CONTEXT-WARMUP
-//! Appendix A/E): quote-verified ledger facts are embedded with the LOCAL
-//! bge-small ONNX embedder (keyless, on-device — never OpenAI) and stored in
+//! Appendix A/E): quote-verified ledger facts are embedded with a LOCAL,
+//! keyless, on-device ONNX embedder (never OpenAI) and stored in
 //! `facts_memory.db`, then recalled semantically across ALL past meetings on
 //! the answer path. The store holds EXTRACTED FACTS, never raw transcript
 //! (the measured rule: facts ≈100% top-3 recall; raw transcript confidently
 //! mismatches).
 //!
-//! Model files (`model_int8.onnx` + `tokenizer.json`, ~35MB) download once on
-//! first run — same install-and-it-just-works pattern as the STT model — into
-//! `<data_dir>/models/bge-small-en/` (override: `BLUEY_EMBED_MODEL_DIR`;
-//! mirror: `BLUEY_EMBED_MODEL_URL_BASE`).
+//! The embedder is chosen by [`EmbedModel`] (`BLUEY_EMBED_MODEL`): the default
+//! `arctic-s` (light, ~100MB RAM) or the opt-in `gemma` (quality, ~350MB).
+//! Model files download once on first run — same install-and-it-just-works
+//! pattern as the STT model — into `<data_dir>/models/<model>/` (dir override:
+//! `BLUEY_EMBED_MODEL_DIR`; mirror for the default: `BLUEY_EMBED_MODEL_URL_BASE`).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use cue_core::app_paths::AppPaths;
-use cue_rag::{EmbeddingProvider, FactHit, FactRow, FactsStore, LocalBgeEmbedder};
+use cue_rag::{
+    EmbeddingProvider, FactHit, FactRow, FactsStore, LocalBgeEmbedder, LocalGemmaEmbedder,
+};
 use tracing::{debug, info};
 
-/// Xenova's ONNX export of BAAI/bge-small-en-v1.5 (verified public, int8 +
-/// tokenizer.json). int8 keeps the download small (~34MB) at negligible
-/// retrieval cost for extracted-fact inputs.
-const DEFAULT_MODEL_URL_BASE: &str = "https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main";
-
-const MODEL_FILE: &str = "model_int8.onnx";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 
-/// The assembled long-term memory: local embedder + facts store.
+/// Which on-device embedding model to load. Chosen via `BLUEY_EMBED_MODEL`
+/// (default [`ArcticS`](EmbedModel::ArcticS) — a free-footprint upgrade over the
+/// old bge-small: same 384-dim / ~100MB RAM, better retrieval on real meeting
+/// prose, verified in `cue-rag/tests/embedder_bakeoff.rs`). The `Gemma*` variants
+/// are the opt-in quality tier (higher hit@1, ~300–350MB RAM).
+///
+/// Switching models changes the store's vector DIMENSION and score
+/// distribution, so a switch REQUIRES a one-time re-embed (handled by
+/// `FactsStore::open` opening a dim-tagged store; a mismatched old store is
+/// rebuilt). See `resolve_model_dir` for the per-model on-disk location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedModel {
+    /// snowflake-arctic-embed-s — DEFAULT (light tier). BertModel/CLS/384-dim,
+    /// ~100MB RAM. Replaced the old bge-small (same footprint, better retrieval
+    /// on real meeting prose — see `cue-rag/tests/embedder_bakeoff.rs`).
+    ArcticS,
+    /// EmbeddingGemma-300M at full 768-dim — the opt-in QUALITY tier (~350MB
+    /// RAM). Highest hit@1 on real meeting prose; needs its own (lower) score
+    /// floor, see `LocalGemmaEmbedder::relevance_floor`.
+    Gemma768,
+}
+
+impl EmbedModel {
+    /// Resolve from `BLUEY_EMBED_MODEL` (default `ArcticS`). Accepts
+    /// `arctic-s` (default) or `gemma` / `gemma-768` (case-insensitive).
+    pub fn from_env() -> Self {
+        match std::env::var("BLUEY_EMBED_MODEL")
+            .ok()
+            .map(|s| s.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("gemma") | Some("gemma-768") | Some("gemma768") => EmbedModel::Gemma768,
+            // "arctic-s", unset, or unrecognized → the default.
+            _ => EmbedModel::ArcticS,
+        }
+    }
+
+    /// Sub-directory under `<data_dir>/models/` for this model's files.
+    fn dir_name(self) -> &'static str {
+        match self {
+            EmbedModel::ArcticS => "arctic-embed-s",
+            EmbedModel::Gemma768 => "embeddinggemma-300m",
+        }
+    }
+
+    /// The primary ONNX filename this model downloads/loads.
+    fn model_file(self) -> &'static str {
+        match self {
+            EmbedModel::ArcticS => "model_int8.onnx",
+            EmbedModel::Gemma768 => "model_quantized.onnx",
+        }
+    }
+
+    /// Output embedding dimension (the store is opened at this dim).
+    fn dim(self) -> usize {
+        match self {
+            EmbedModel::ArcticS => 384,
+            EmbedModel::Gemma768 => 768,
+        }
+    }
+
+    /// Download base URL + list of `(remote_rel_path, local_filename)` files.
+    /// Gemma splits weights into an `.onnx_data` sidecar that MUST sit next to
+    /// the `.onnx` file, so it is downloaded too.
+    fn downloads(self) -> (&'static str, Vec<(String, &'static str)>) {
+        match self {
+            EmbedModel::ArcticS => (
+                "https://huggingface.co/Snowflake/snowflake-arctic-embed-s/resolve/main",
+                vec![
+                    ("onnx/model_int8.onnx".into(), "model_int8.onnx"),
+                    ("tokenizer.json".into(), TOKENIZER_FILE),
+                ],
+            ),
+            EmbedModel::Gemma768 => (
+                "https://huggingface.co/onnx-community/embeddinggemma-300m-ONNX/resolve/main",
+                vec![
+                    ("onnx/model_quantized.onnx".into(), "model_quantized.onnx"),
+                    (
+                        "onnx/model_quantized.onnx_data".into(),
+                        "model_quantized.onnx_data",
+                    ),
+                    ("tokenizer.json".into(), TOKENIZER_FILE),
+                ],
+            ),
+        }
+    }
+}
+
+/// The assembled long-term memory: local embedder (behind the trait so bge/
+/// arctic/gemma all fit) + facts store.
 pub struct FactsMemory {
-    embedder: LocalBgeEmbedder,
+    embedder: std::sync::Arc<dyn EmbeddingProvider>,
     store: FactsStore,
 }
 
 impl FactsMemory {
-    /// Ensure model files (downloading on first run), load the embedder, open
-    /// the store. Any failure means "memory off" — never fatal to the daemon.
+    /// Ensure model files (downloading on first run), load the chosen embedder,
+    /// open the store at that model's dimension. Any failure means "memory off" —
+    /// never fatal to the daemon. The model is selected by `BLUEY_EMBED_MODEL`
+    /// (default `arctic-s`); `BLUEY_EMBED_MODEL_URL_BASE` still overrides the
+    /// download host for the default bge/arctic path.
     pub async fn ensure(paths: &AppPaths) -> Result<Self> {
-        let model_dir = resolve_model_dir(paths);
+        let model = EmbedModel::from_env();
+        let model_dir = resolve_model_dir(paths, model);
         tokio::fs::create_dir_all(&model_dir)
             .await
             .with_context(|| format!("create {}", model_dir.display()))?;
+
+        // Download any missing files for this model (URL-base override applies to
+        // the bge/arctic default; Gemma always uses its onnx-community mirror).
+        let (default_base, files) = model.downloads();
         let base = std::env::var("BLUEY_EMBED_MODEL_URL_BASE")
             .ok()
             .map(|s| s.trim_end_matches('/').to_string())
-            .unwrap_or_else(|| DEFAULT_MODEL_URL_BASE.to_string());
+            .filter(|_| matches!(model, EmbedModel::ArcticS))
+            .unwrap_or_else(|| default_base.to_string());
+        for (remote_rel, local_name) in &files {
+            let dest = model_dir.join(local_name);
+            if !dest.is_file() {
+                info!(
+                    model = ?model,
+                    file = local_name,
+                    "embedding model file missing; downloading on first run (one-time)"
+                );
+                download_file(&format!("{base}/{remote_rel}"), &dest).await?;
+            }
+        }
 
-        let model_path = model_dir.join(MODEL_FILE);
-        if !model_path.is_file() {
-            info!("embedding model not found; downloading on first run (~34MB, one-time)");
-            download_file(&format!("{base}/onnx/{MODEL_FILE}"), &model_path).await?;
-        }
+        let model_path = model_dir.join(model.model_file());
         let tokenizer_path = model_dir.join(TOKENIZER_FILE);
-        if !tokenizer_path.is_file() {
-            download_file(&format!("{base}/{TOKENIZER_FILE}"), &tokenizer_path).await?;
-        }
 
         // Session load is blocking CPU work — keep it off the async runtime.
-        let embedder = {
+        let embedder: std::sync::Arc<dyn EmbeddingProvider> = {
             let (m, t) = (model_path.clone(), tokenizer_path.clone());
-            tokio::task::spawn_blocking(move || LocalBgeEmbedder::load(&m, &t))
+            tokio::task::spawn_blocking(move || load_embedder(model, &m, &t))
                 .await
-                .context("embedder load task")?
-                .map_err(|e| anyhow::anyhow!("load local embedder: {e}"))?
+                .context("embedder load task")??
         };
-        let store = FactsStore::open(
-            &paths.data_dir.join("facts_memory.db"),
-            LocalBgeEmbedder::DIM,
-        )?;
+        // Store is opened at THIS model's dimension. A pre-existing store built
+        // at a different dim is incompatible — `FactsStore::open` rebuilds on a
+        // dim mismatch (the one-time re-embed a model switch requires).
+        let store = FactsStore::open(&paths.data_dir.join("facts_memory.db"), model.dim())?;
         info!(
             facts = store.current_len().unwrap_or(0),
-            "cross-meeting facts memory ready (local bge-small, keyless)"
+            model = ?model,
+            dim = model.dim(),
+            "cross-meeting facts memory ready (local embedder, keyless)"
         );
+        // Signal the onboarding "Preparing memory" row that the embedder is
+        // ready (whether we just downloaded it or found it on disk), so the row
+        // flips to ready and `all_ready` can unblock.
+        crate::setup_status::set_memory_progress(None);
         Ok(Self { embedder, store })
     }
 
@@ -334,7 +438,7 @@ impl FactsMemory {
     /// tokenizer are `Arc`-internal, so this clones the handle, NOT the ~35MB
     /// model). Lets other daemon retrieval paths (e.g. the agent-history index)
     /// reuse the SAME loaded model rather than loading a second copy.
-    pub fn embedder(&self) -> LocalBgeEmbedder {
+    pub fn embedder(&self) -> std::sync::Arc<dyn EmbeddingProvider> {
         self.embedder.clone()
     }
 
@@ -400,15 +504,13 @@ impl FactsMemory {
             &boosts,
             k,
             exclude_meeting,
-            RELEVANCE_FLOOR,
+            // Model-specific floor: the loaded embedder reports its own
+            // calibrated threshold (bge/arctic ~0.45, Gemma ~0.20). Using a
+            // bge-tuned constant here would discard a Gemma store's correct hits.
+            self.embedder.relevance_floor(),
         )
     }
 }
-
-/// Relevance floor for cross-meeting recall: gates the SEMANTIC score before
-/// fusion (mem0's threshold contract; 0.45 verified against real bge-small
-/// scores on extracted facts).
-pub const RELEVANCE_FLOOR: f32 = 0.45;
 
 /// Paper s: similar existing memories retrieved per candidate fact.
 const SIMILAR_PER_FACT: usize = 10;
@@ -564,14 +666,48 @@ fn normalized_eq(a: &str, b: &str) -> bool {
 
 /// Resolve the embedding-model dir: env override, else
 /// `<data_dir>/models/bge-small-en`.
-fn resolve_model_dir(paths: &AppPaths) -> PathBuf {
+/// On-disk dir for `model`'s files. `BLUEY_EMBED_MODEL_DIR` overrides the whole
+/// path (advanced/testing); otherwise it is `<data_dir>/models/<model-dir>`.
+fn resolve_model_dir(paths: &AppPaths, model: EmbedModel) -> PathBuf {
     if let Ok(dir) = std::env::var("BLUEY_EMBED_MODEL_DIR") {
         let dir = dir.trim();
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
-    paths.data_dir.join("models").join("bge-small-en")
+    paths.data_dir.join("models").join(model.dir_name())
+}
+
+/// Build the chosen embedder as a trait object. bge and arctic-s share the
+/// `LocalBgeEmbedder` load path (identical BertModel/CLS/384-dim); the Gemma
+/// variants use `LocalGemmaEmbedder` with the requested MRL output dim.
+fn load_embedder(
+    model: EmbedModel,
+    model_path: &Path,
+    tokenizer_path: &Path,
+) -> Result<std::sync::Arc<dyn EmbeddingProvider>> {
+    let embedder: std::sync::Arc<dyn EmbeddingProvider> = match model {
+        // arctic-s loads through the bge-family CLS/384-dim path (same BertModel).
+        EmbedModel::ArcticS => std::sync::Arc::new(
+            LocalBgeEmbedder::load(model_path, tokenizer_path)
+                .map_err(|e| anyhow::anyhow!("load arctic-s embedder: {e}"))?,
+        ),
+        EmbedModel::Gemma768 => std::sync::Arc::new(
+            LocalGemmaEmbedder::load(model_path, tokenizer_path, None)
+                .map_err(|e| anyhow::anyhow!("load gemma-768 embedder: {e}"))?,
+        ),
+    };
+    Ok(embedder)
+}
+
+/// Whether the on-device memory embedder (for the CURRENTLY-selected model) is
+/// ready on disk. Cheap disk check for onboarding's "Preparing memory" row —
+/// disk truth wins, so an embedder from a prior run / installer preload counts
+/// as ready without re-downloading.
+pub fn embedder_present(paths: &AppPaths) -> bool {
+    let model = EmbedModel::from_env();
+    let dir = resolve_model_dir(paths, model);
+    dir.join(model.model_file()).is_file() && dir.join(TOKENIZER_FILE).is_file()
 }
 
 /// Stream one file to `dest` (`.part` + rename so an interrupted download never
@@ -592,11 +728,15 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
     if !resp.status().is_success() {
         anyhow::bail!("download {url} returned HTTP {}", resp.status());
     }
+    // Total size for the onboarding "Preparing memory… X%" row. Absent
+    // Content-Length ⇒ no percent (the row still shows "working").
+    let total = resp.content_length();
     let tmp = dest.with_extension("part");
     let mut file = tokio::fs::File::create(&tmp)
         .await
         .with_context(|| format!("create {}", tmp.display()))?;
     let mut written: u64 = 0;
+    let mut last_pct: u8 = 255;
     while let Some(chunk) = resp
         .chunk()
         .await
@@ -606,6 +746,15 @@ async fn download_file(url: &str, dest: &Path) -> Result<()> {
             .await
             .with_context(|| format!("write error to {}", tmp.display()))?;
         written += chunk.len() as u64;
+        // Publish progress only on whole-percent changes so the atomic isn't
+        // hammered every chunk. Capped at 99 until rename finalizes.
+        if let Some(total) = total.filter(|t| *t > 0) {
+            let pct = ((written.min(total) * 100 / total) as u8).min(99);
+            if pct != last_pct {
+                last_pct = pct;
+                crate::setup_status::set_memory_progress(Some(pct));
+            }
+        }
     }
     file.flush().await.ok();
     drop(file);

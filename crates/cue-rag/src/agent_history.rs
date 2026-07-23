@@ -159,9 +159,91 @@ impl AgentHistoryIndex {
     /// fused score, newest `epoch_secs` as the tie-break. Fail-soft: an empty
     /// index, `k == 0`, or a dim-mismatched query all yield an empty vec.
     pub fn search(&self, query: &str, query_embedding: &[f32], k: usize) -> Vec<HistoryHit> {
+        self.search_filtered(query, query_embedding, k, None, RELEVANCE_FLOOR)
+    }
+
+    /// Like [`Self::search`], but tries the ONE session `prefer_session` first and
+    /// widens to the whole index only if that session yields nothing.
+    ///
+    /// This is the "attached session first, widen if empty" recall used by the
+    /// live-meeting bridge: a fresh meeting agent searches the session the user
+    /// attached (precise), falling back to the broader indexed history when that
+    /// session has no relevant prose. `prefer_session` is compared against each
+    /// chunk's `session_id` after trimming (the attached id is already trimmed;
+    /// the stored id may not be — see the id-space note in `cue-daemon`). A blank
+    /// `prefer_session` (or one matching no chunk) degrades cleanly to a plain
+    /// [`Self::search`] over the whole index.
+    pub fn search_prefer_session(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        k: usize,
+        prefer_session: &str,
+    ) -> Vec<HistoryHit> {
+        self.search_prefer_session_with_floor(
+            query,
+            query_embedding,
+            k,
+            prefer_session,
+            RELEVANCE_FLOOR,
+        )
+    }
+
+    /// Like [`Self::search_prefer_session`] but with an explicit semantic
+    /// `floor`. Different embedding models have different cosine-score
+    /// distributions (bge/arctic ~0.45, EmbeddingGemma ~0.20 — measured), so the
+    /// daemon passes `EmbeddingProvider::relevance_floor()` here; a wrong (bge-
+    /// tuned) floor discards a lower-scoring model's correct hits.
+    pub fn search_prefer_session_with_floor(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        k: usize,
+        prefer_session: &str,
+        floor: f32,
+    ) -> Vec<HistoryHit> {
+        let want = prefer_session.trim();
+        if !want.is_empty() {
+            let restrict: std::collections::HashSet<usize> = self
+                .chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.session_id.trim() == want)
+                .map(|(i, _)| i)
+                .collect();
+            if !restrict.is_empty() {
+                let hits = self.search_filtered(query, query_embedding, k, Some(&restrict), floor);
+                if !hits.is_empty() {
+                    return hits;
+                }
+            }
+        }
+        // Widen: the attached session was absent from the index or had no
+        // relevant prose. Fall back to the full-index search.
+        self.search_filtered(query, query_embedding, k, None, floor)
+    }
+
+    /// Core ranked search. `restrict`, when `Some`, limits scoring to the given
+    /// chunk indices (into `self.chunks`) — the mechanism behind
+    /// [`Self::search_prefer_session`]. `None` scores the whole index (the plain
+    /// [`Self::search`] path). `floor` gates the SEMANTIC score (model-specific).
+    fn search_filtered(
+        &self,
+        query: &str,
+        query_embedding: &[f32],
+        k: usize,
+        restrict: Option<&std::collections::HashSet<usize>>,
+        floor: f32,
+    ) -> Vec<HistoryHit> {
         if k == 0 || self.chunks.is_empty() {
             return Vec::new();
         }
+        // When restricting, an empty set means "no candidate chunks" — bail early
+        // rather than scoring nothing and returning an empty vec the long way.
+        if restrict.is_some_and(|r| r.is_empty()) {
+            return Vec::new();
+        }
+        let included = |i: usize| restrict.is_none_or(|r| r.contains(&i));
 
         // Semantic candidate pool, over-fetched (mem0: max(limit*4, 60)). The
         // internal id is the chunk's index into `self.chunks`.
@@ -169,6 +251,7 @@ impl AgentHistoryIndex {
             .chunks
             .iter()
             .enumerate()
+            .filter(|(i, _)| included(*i))
             .map(|(i, c)| hybrid::SemanticCandidate {
                 id: i as i64,
                 semantic: cosine(query_embedding, &c.embedding),
@@ -182,11 +265,15 @@ impl AgentHistoryIndex {
         semantic.truncate(hybrid::internal_limit(k));
 
         // BM25 over the same corpus, sigmoid-normalized with query-length params.
+        // Restricted to the same candidate set so IDF/scores match the semantic
+        // pool (a session-scoped search must not borrow BM25 stats from chunks it
+        // excludes).
         let query_stemmed = hybrid::stem_for_bm25(query);
         let stemmed_docs: Vec<(i64, String)> = self
             .chunks
             .iter()
             .enumerate()
+            .filter(|(i, _)| included(*i))
             .map(|(i, c)| (i as i64, hybrid::stem_for_bm25_joined(&c.text)))
             .collect();
         let raw = hybrid::bm25_raw_scores(
@@ -207,7 +294,7 @@ impl AgentHistoryIndex {
         // per-fact max). Exact-text matches (similarity 1.0) clear the floor.
         let boosts = self.entity_boosts(query);
 
-        let ranked = hybrid::score_and_rank(&semantic, &bm25, &boosts, RELEVANCE_FLOOR, k);
+        let ranked = hybrid::score_and_rank(&semantic, &bm25, &boosts, floor, k);
         ranked
             .into_iter()
             .filter_map(|hit| {
@@ -492,6 +579,101 @@ mod tests {
         let idx = AgentHistoryIndex::new();
         let hits = idx.search("anything at all", &vec![0.0f32; FAKE_DIM], 5);
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_prefer_session_scopes_to_that_session() {
+        let mut idx = AgentHistoryIndex::new();
+        let mut e = embedder();
+        // DISTINCT prose per session (identical text would be de-duped across
+        // sessions by `add_session`), but both mention the same topic so a topic
+        // query matches either. Preferring s2 must return ONLY s2's chunk, even
+        // though s1 also matches — proving the scope filter, not just recall.
+        let s1_prose = "The checkout latency SLA target is two hundred milliseconds.";
+        let s2_prose = "We tuned checkout latency down to meet the SLA last sprint.";
+        idx.add_session("claude", "s1", 100, &[s1_prose.to_string()], &mut e);
+        idx.add_session("claude", "s2", 200, &[s2_prose.to_string()], &mut e);
+
+        // Query is s2's prose verbatim → cosine 1.0 on s2's chunk; but s1 also
+        // shares "checkout latency SLA", so an UNSCOPED search could surface s1.
+        let q_emb = fake_embed(s2_prose).unwrap();
+        let hits = idx.search_prefer_session(s2_prose, &q_emb, 5, "s2");
+        assert!(
+            !hits.is_empty(),
+            "expected a hit from the preferred session"
+        );
+        assert!(
+            hits.iter().all(|h| h.session_id == "s2"),
+            "every hit must come from the preferred session s2, got {:?}",
+            hits.iter().map(|h| &h.session_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn search_prefer_session_widens_when_preferred_absent() {
+        let mut idx = AgentHistoryIndex::new();
+        let mut e = embedder();
+        let planted = "The checkout latency SLA is two hundred milliseconds after tuning.";
+        // Only s1 exists; preferring a session id that is not in the index must
+        // fall back to the whole-index search rather than return empty.
+        idx.add_session("claude", "s1", 100, &[planted.to_string()], &mut e);
+
+        let q_emb = fake_embed(planted).unwrap();
+        let hits = idx.search_prefer_session(planted, &q_emb, 5, "does-not-exist");
+        assert!(
+            !hits.is_empty(),
+            "must widen to the full index when preferred is absent"
+        );
+        assert_eq!(hits[0].session_id, "s1");
+    }
+
+    #[test]
+    fn search_prefer_session_widens_when_preferred_has_no_relevant_prose() {
+        let mut idx = AgentHistoryIndex::new();
+        let mut e = embedder();
+        let relevant = "The checkout latency SLA is two hundred milliseconds after tuning.";
+        // s1 holds the relevant prose; s2 exists but holds only unrelated prose.
+        idx.add_session("claude", "s1", 100, &[relevant.to_string()], &mut e);
+        idx.add_session(
+            "claude",
+            "s2",
+            200,
+            &["The lunch order was pizza on Friday.".to_string()],
+            &mut e,
+        );
+
+        // Prefer s2 (which has no match for this query) → widen and surface s1.
+        let q_emb = fake_embed(relevant).unwrap();
+        let hits = idx.search_prefer_session(relevant, &q_emb, 5, "s2");
+        assert!(
+            !hits.is_empty(),
+            "must widen when the preferred session is irrelevant"
+        );
+        assert!(
+            hits.iter().any(|h| h.session_id == "s1"),
+            "widened search should reach the relevant session s1"
+        );
+    }
+
+    #[test]
+    fn search_prefer_session_blank_equals_plain_search() {
+        let mut idx = AgentHistoryIndex::new();
+        let mut e = embedder();
+        let planted = "We enabled WAL mode on the sqlite store for concurrent reads.";
+        idx.add_session("claude", "s1", 100, &[planted.to_string()], &mut e);
+
+        let q_emb = fake_embed(planted).unwrap();
+        let plain = idx.search(planted, &q_emb, 5);
+        let blank = idx.search_prefer_session(planted, &q_emb, 5, "   ");
+        assert_eq!(
+            plain.len(),
+            blank.len(),
+            "a blank preference must behave exactly like plain search"
+        );
+        assert_eq!(
+            plain.first().map(|h| &h.text),
+            blank.first().map(|h| &h.text)
+        );
     }
 
     #[test]

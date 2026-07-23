@@ -28,6 +28,25 @@ use cue_core::conversation::{
 
 use crate::app::Daemon;
 
+/// Env flag gating the app-owned conversation Q&A memory. Default **OFF**.
+///
+/// This subsystem existed to hand-feed prior Q&A + a rolling summary into a
+/// *stateless* CLI each turn. Since Bluey now drives agents via true session
+/// **resume** (the agent keeps its own conversation state), that reconstruction
+/// is redundant. Off by default means: no `conversation_turns` table is created
+/// (see `Database::run_migrations`), and both the record and inject paths become
+/// no-ops — zero storage, zero work. Set `BLUEY_CONV_MEMORY=1` to re-enable for
+/// the case of driving a genuinely stateless agent.
+pub(crate) const ENV_CONV_MEMORY: &str = "BLUEY_CONV_MEMORY";
+
+/// Whether app-owned conversation Q&A memory is enabled. Default off.
+pub(crate) fn conv_memory_enabled() -> bool {
+    matches!(
+        std::env::var(ENV_CONV_MEMORY).ok().as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
 /// Open the sessions DB (best-effort). Mirrors `persist_diarization`'s pattern:
 /// SQLite calls are short and synchronous, the handle is never held across an
 /// await. Returns `None` (logged) on failure — conversation memory is a
@@ -52,6 +71,9 @@ fn open_db(daemon: &Arc<Daemon>) -> Option<crate::db::Database> {
 /// never the raw internal ASK_RECENT_QUESTION pointer. Callers skip the warm-up
 /// drive (it primes the session; it is not a conversation turn).
 pub(crate) fn record_turns(daemon: &Arc<Daemon>, meeting_id: Uuid, question: &str, answer: &str) {
+    if !conv_memory_enabled() {
+        return;
+    }
     let question = question.trim().to_string();
     let answer = answer.trim().to_string();
     if question.is_empty() && answer.is_empty() {
@@ -92,6 +114,9 @@ pub(crate) async fn conversation_context_block(
     meeting_id: Uuid,
     model: Option<&str>,
 ) -> Option<String> {
+    if !conv_memory_enabled() {
+        return None;
+    }
     let cfg = ConvConfig::from_env();
     let db = open_db(daemon)?;
     let turns = match db.conv_turns(meeting_id, cfg.max_stored_turns) {
@@ -200,6 +225,12 @@ pub(crate) async fn reset_for_meeting(daemon: &Arc<Daemon>, new_meeting_id: Opti
     daemon
         .conv_fold_inflight
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    // Only touch the DB when the feature is on — with it off the
+    // `conversation_turns` table is never created (see `run_migrations`), so a
+    // clear would be a guaranteed error on a non-existent table.
+    if !conv_memory_enabled() {
+        return;
+    }
     if let Some(id) = new_meeting_id {
         if let Some(db) = open_db(daemon) {
             if let Err(e) = db.conv_clear(id) {

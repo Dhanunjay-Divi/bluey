@@ -104,9 +104,15 @@ impl Database {
         self.conn
             .execute_batch(MIGRATION_010)
             .context("failed to run diarization migration")?;
-        self.conn
-            .execute_batch(MIGRATION_012)
-            .context("failed to run conversation_turns migration")?;
+        // App-owned conversation Q&A memory (see `crate::conversation`). Gated so
+        // the table is only created when the feature is explicitly enabled —
+        // with session-resume the reconstruction it powers is redundant, and an
+        // unused table is wasted storage. Default OFF.
+        if crate::conversation::conv_memory_enabled() {
+            self.conn
+                .execute_batch(MIGRATION_012)
+                .context("failed to run conversation_turns migration")?;
+        }
         self.ensure_cue_response_billing_columns()
             .context("failed to ensure cue_response billing columns")?;
         Ok(())

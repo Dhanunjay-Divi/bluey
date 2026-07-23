@@ -65,9 +65,14 @@ pub struct CueSettings {
     #[serde(default = "default_disguise_mode")]
     pub disguise_mode: String,
 
-    /// Agent bridge: global consent to read other agents' session history.
-    /// Off by default — reading a prior agent session requires opt-in.
-    #[serde(default)]
+    /// Agent bridge: consent to read the ATTACHED agent's session history to
+    /// power cross-session recall (`search_agent_history`). Default ON — it is
+    /// the user's OWN local session data on their OWN machine, and it backs the
+    /// core recall feature; the scope stays "attached" (only the connected
+    /// agent, never all installed agents, unless `BLUEY_AGENT_HISTORY_SCOPE=all`
+    /// is set). The user can turn it off here; env `BLUEY_AGENT_HISTORY`
+    /// overrides in both directions.
+    #[serde(default = "default_true")]
     pub allow_agent_session_history: bool,
     /// Agent bridge: the attached coding agent, as a snake_case [`AgentKind`]
     /// label (e.g. "claude_code"). `None` means no agent is attached and
@@ -139,9 +144,21 @@ pub struct CueSettings {
     /// Default OFF until validated live — env `BLUEY_EPHEMERAL_DRIVE` overrides.
     #[serde(default)]
     pub ephemeral_drive: bool,
+
+    /// Speaker diarization (who-said-what labels on the transcript). Default ON —
+    /// speaker labels work out of the box. It runs the Sortformer pass per
+    /// interval during a meeting (heavier CPU), so this setting (and env
+    /// `BLUEY_DIARIZE`, which overrides in both directions) let it be turned off.
+    #[serde(default = "default_true")]
+    pub diarize_enabled: bool,
 }
 
 fn default_live_memory_enabled() -> bool {
+    true
+}
+
+/// Shared serde default for boolean settings that ship ON.
+fn default_true() -> bool {
     true
 }
 
@@ -160,7 +177,7 @@ impl Default for CueSettings {
             auto_disguise_prompted: false,
             auto_disguise_enabled: false,
             disguise_mode: "activity".to_string(),
-            allow_agent_session_history: false,
+            allow_agent_session_history: true,
             attached_agent: None,
             attached_session: None,
             attached_model: None,
@@ -170,6 +187,7 @@ impl Default for CueSettings {
             auto_trigger_enabled: false,
             live_memory_enabled: true,
             ephemeral_drive: false,
+            diarize_enabled: true,
         }
     }
 }
@@ -253,7 +271,11 @@ mod tests {
             "updated_at": "0"
         }"#;
         let settings: CueSettings = serde_json::from_str(legacy).expect("legacy config loads");
-        assert!(!settings.allow_agent_session_history);
+        // A legacy config missing the field picks up the serde default, which is
+        // now ON (agent-history ships on by default; the user's own local data).
+        assert!(settings.allow_agent_session_history);
+        // Diarization likewise defaults ON for a legacy config.
+        assert!(settings.diarize_enabled);
         assert_eq!(settings.attached_agent, None);
         assert_eq!(settings.attached_session, None);
         assert_eq!(settings.attached_model, None);

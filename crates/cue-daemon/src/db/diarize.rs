@@ -131,6 +131,103 @@ impl Database {
         )?;
         Ok(())
     }
+
+    /// Load all historical speaker centroids that have user-assigned names.
+    pub fn load_historical_voiceprints(
+        &self,
+        current_session_id: &str,
+    ) -> Result<Vec<HistoricalVoiceprint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ms.session_id, ms.speaker_final, s.name, ms.centroid \
+             FROM meeting_speaker ms \
+             JOIN speakers s ON ms.session_id = s.session_id AND ms.speaker_final = s.speaker_id \
+             WHERE ms.session_id != ?1 AND s.name != ''",
+        )?;
+        let rows = stmt
+            .query_map(params![current_session_id], |r| {
+                let blob: Vec<u8> = r.get(3)?;
+                Ok(HistoricalVoiceprint {
+                    session_id: r.get(0)?,
+                    speaker_id: r.get(1)?,
+                    name: r.get(2)?,
+                    centroid: blob_to_embedding(&blob),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Match a voice centroid against historical voiceprints with a similarity threshold.
+    pub fn match_speaker_voiceprint(
+        &self,
+        current_session_id: &str,
+        centroid: &[f32],
+        threshold: f32,
+    ) -> Option<String> {
+        let voiceprints = self.load_historical_voiceprints(current_session_id).ok()?;
+        let mut best_match: Option<(String, f32)> = None;
+        for vp in &voiceprints {
+            let sim = cosine_similarity(centroid, &vp.centroid);
+            if sim >= threshold {
+                match &best_match {
+                    Some((_, best_sim)) if sim > *best_sim => {
+                        best_match = Some((vp.name.clone(), sim));
+                    }
+                    None => {
+                        best_match = Some((vp.name.clone(), sim));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        best_match.map(|(name, _)| name)
+    }
+
+    /// Merge two speaker centroids for a session.
+    pub fn merge_speaker_centroids(
+        &self,
+        session_id: &str,
+        source_speaker_id: i64,
+        target_speaker_id: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE utterance SET speaker_final = ?3 WHERE session_id = ?1 AND speaker_final = ?2",
+            params![session_id, source_speaker_id, target_speaker_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM meeting_speaker WHERE session_id = ?1 AND speaker_final = ?2",
+            params![session_id, source_speaker_id],
+        )?;
+        Ok(())
+    }
+}
+
+/// A historical speaker voiceprint record.
+#[derive(Debug, Clone)]
+pub struct HistoricalVoiceprint {
+    pub session_id: String,
+    pub speaker_id: i64,
+    pub name: String,
+    pub centroid: Vec<f32>,
+}
+
+/// Compute cosine similarity between two float vectors.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut norm_a = 0.0_f32;
+    let mut norm_b = 0.0_f32;
+    for i in 0..a.len() {
+        dot += a[i] * b[i];
+        norm_a += a[i] * a[i];
+        norm_b += b[i] * b[i];
+    }
+    if norm_a <= 0.0 || norm_b <= 0.0 {
+        return 0.0;
+    }
+    dot / (norm_a.sqrt() * norm_b.sqrt())
 }
 
 #[cfg(test)]
@@ -190,6 +287,38 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].speaker_final, Some(0));
         assert_eq!(rows[0].embedding, embedding);
+    }
+
+    #[test]
+    fn test_cosine_similarity_math() {
+        let v1 = vec![1.0_f32, 0.0, 0.0];
+        let v2 = vec![1.0_f32, 0.0, 0.0];
+        assert!((cosine_similarity(&v1, &v2) - 1.0).abs() < 1e-5);
+
+        let v3 = vec![0.0_f32, 1.0, 0.0];
+        assert!((cosine_similarity(&v1, &v3) - 0.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cross_meeting_voiceprint_matching() {
+        let db = Database::open(":memory:").unwrap();
+        let session1 = uuid::Uuid::new_v4();
+        let session2 = uuid::Uuid::new_v4();
+        let s1 = session1.to_string();
+        let s2 = session2.to_string();
+
+        db.ensure_meeting_session(session1, None).unwrap();
+        db.ensure_meeting_session(session2, None).unwrap();
+
+        let centroid_sarah = vec![0.8_f32, 0.2, 0.1];
+        db.upsert_meeting_speaker(&s1, 1, &centroid_sarah, 10, 5000, 100)
+            .unwrap();
+        db.set_speaker_name(&s1, 1, "Sarah Jenkins", None).unwrap();
+
+        // Query from session 2 with similar voice vector
+        let incoming = vec![0.81_f32, 0.19, 0.1];
+        let matched = db.match_speaker_voiceprint(&s2, &incoming, 0.80);
+        assert_eq!(matched, Some("Sarah Jenkins".to_string()));
     }
 
     // `ensure_meeting_session` must never clobber a real agent session that

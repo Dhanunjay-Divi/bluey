@@ -18,6 +18,8 @@ pub mod filter;
 pub mod hybrid;
 #[cfg(feature = "local-embed")]
 pub mod local_embed;
+#[cfg(feature = "local-embed")]
+pub mod local_gemma;
 pub mod store;
 
 #[cfg(feature = "local-embed")]
@@ -28,4 +30,6 @@ pub use facts::{AddOutcome, FactHit, FactRow, FactsStore, HistoryRow};
 pub use filter::is_self_prompt;
 #[cfg(feature = "local-embed")]
 pub use local_embed::LocalBgeEmbedder;
+#[cfg(feature = "local-embed")]
+pub use local_gemma::LocalGemmaEmbedder;
 pub use store::{RagHit, VectorStore};

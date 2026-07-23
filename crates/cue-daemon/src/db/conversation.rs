@@ -124,7 +124,17 @@ mod tests {
     use super::*;
 
     fn db() -> Database {
-        Database::open(":memory:").expect("open in-memory db")
+        let db = Database::open(":memory:").expect("open in-memory db");
+        // The `conversation_turns` migration is gated OFF by default in
+        // production (see `Database::run_migrations` / `conv_memory_enabled`),
+        // so it is not created by `open`. These tests validate the table's SQL
+        // logic directly, so we create it explicitly regardless of the flag.
+        db.conn
+            .execute_batch(include_str!(
+                "../../../../infra/migrations/012_conversation_turns.sql"
+            ))
+            .expect("create conversation_turns table for tests");
+        db
     }
 
     #[test]

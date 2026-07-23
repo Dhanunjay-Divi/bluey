@@ -37,7 +37,7 @@ use tracing::{debug, info, warn};
 
 use cue_agent_bridge::sessions::{list_with_health_check, reader_for};
 use cue_agent_bridge::{discover_agents, AgentKind, DiscoveredAgent, Role};
-use cue_rag::{AgentHistoryIndex, HistoryHit, LocalBgeEmbedder};
+use cue_rag::{AgentHistoryIndex, EmbeddingProvider, HistoryHit};
 
 use crate::app::Daemon;
 
@@ -195,10 +195,26 @@ impl AgentHistoryStore {
             }
         };
 
+        // Prefer the session the user ATTACHED (the live-meeting bridge: a fresh
+        // meeting agent searches that session first, widening to the broader
+        // index only if it holds nothing relevant — see `search_prefer_session`).
+        // `attached_session` and the index's `session_id` are the same id-space
+        // (both the raw `SessionRef.id`), so a direct match works; an unset
+        // attachment degrades to a plain full-index search.
+        let prefer = cue_core::load_settings(&daemon.paths)
+            .ok()
+            .and_then(|s| s.attached_session)
+            .unwrap_or_default();
+
+        // The active model's calibrated score floor (bge/arctic ~0.45, Gemma
+        // ~0.20). Passing the model's own floor keeps a lower-scoring model's
+        // correct hits instead of discarding them with a bge-tuned threshold.
+        let floor = embedder.relevance_floor();
+
         // SHORT read lock: search, then release. `search` is pure CPU over the
         // in-memory index; no await under the lock.
         let guard = self.index.read().await;
-        guard.search(query, &query_embedding, limit)
+        guard.search_prefer_session_with_floor(query, &query_embedding, limit, &prefer, floor)
     }
 
     /// Spawn a background rebuild iff the index is stale (older than the TTL) or
@@ -281,7 +297,7 @@ impl AgentHistoryStore {
         // Build a fresh index off-lock so searches keep serving the old one.
         let mut fresh = AgentHistoryIndex::new();
         let mut embed = |text: &str| -> Option<Vec<f32>> {
-            match embedder.embed_sync(text, false) {
+            match embedder.embed_passage_blocking(text) {
                 Ok(e) => Some(e),
                 Err(error) => {
                     debug!("agent-history: passage embed failed: {error}");
@@ -320,19 +336,23 @@ impl AgentHistoryStore {
 /// the single gate every entry point checks — reading the user's other agents'
 /// history requires the same consent the agent-session reads already use.
 fn feature_on(daemon: &Arc<Daemon>) -> bool {
-    if !enabled() {
-        return false;
+    // Env override wins in BOTH directions (dev/test), mirroring the ledger's
+    // `live_memory_enabled`: if `BLUEY_AGENT_HISTORY` is set, it decides; else
+    // the `allow_agent_session_history` setting decides (default ON — it is the
+    // user's own local session data and backs the core recall feature).
+    if std::env::var(ENV_ENABLE).is_ok() {
+        return enabled();
     }
     cue_core::load_settings(&daemon.paths)
         .map(|s| s.allow_agent_session_history)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
-/// Clone the shared, already-loaded `LocalBgeEmbedder` from the daemon's facts
-/// memory (its ONNX session/tokenizer are `Arc`-internal, so this is a cheap
-/// handle share, NOT a second model load). `None` until facts memory has
-/// finished its background init.
-async fn daemon_embedder(daemon: &Arc<Daemon>) -> Option<LocalBgeEmbedder> {
+/// Clone the shared, already-loaded embedder (bge/arctic/gemma, behind the
+/// trait) from the daemon's facts memory (its ONNX session is `Arc`-internal,
+/// so this is a cheap handle share, NOT a second model load). `None` until facts
+/// memory has finished its background init.
+async fn daemon_embedder(daemon: &Arc<Daemon>) -> Option<std::sync::Arc<dyn EmbeddingProvider>> {
     let memory = daemon.facts_memory.lock().await.clone()?;
     Some(memory.embedder())
 }

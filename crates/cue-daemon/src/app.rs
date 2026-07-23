@@ -103,9 +103,11 @@ impl OverlayAnswerStream {
         // feed shows one growing thought, not a row per token.
         match self.status_steps.last_mut() {
             Some(AnswerStatusStep::Reasoning { text: existing }) => existing.push_str(text),
-            _ => self.status_steps.push(AnswerStatusStep::Reasoning {
-                text: text.to_string(),
-            }),
+            _ => {
+                self.status_steps.push(AnswerStatusStep::Reasoning {
+                    text: text.to_string(),
+                });
+            }
         }
         self.flush_status(false).await
     }
@@ -113,7 +115,14 @@ impl OverlayAnswerStream {
     /// Record (or update) a tool-call step from the agent and push the feed.
     /// Repeated updates with the same `id` collapse onto the existing row; an
     /// empty `title` on an update keeps the title already shown for that id.
-    async fn push_tool(&mut self, id: &str, title: &str, status: ToolStatus) -> Result<()> {
+    async fn push_tool(
+        &mut self,
+        id: &str,
+        title: &str,
+        status: ToolStatus,
+        kind: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<()> {
         let state = match status {
             ToolStatus::Pending => AnswerStatusState::Pending,
             ToolStatus::InProgress => AnswerStatusState::Running,
@@ -134,6 +143,7 @@ impl OverlayAnswerStream {
             }
             *sstate = state;
         } else {
+            let _ = (kind, detail);
             self.status_steps.push(AnswerStatusStep::Tool {
                 id: id.to_string(),
                 title: title.to_string(),
@@ -1516,21 +1526,18 @@ pub async fn run() -> Result<()> {
     #[cfg(feature = "parakeet-stt")]
     spawn_model_progress_forwarder(daemon.clone());
 
-    // Cross-meeting facts memory: bring the local embedder + store up in the
-    // background (first run downloads ~35MB). Failure = memory stays off; the
-    // meeting loop is unaffected.
+    // Prepare the on-device memory embedder UP FRONT (the "Preparing memory"
+    // onboarding step): first run downloads ~35MB, publishing percent to the
+    // setup-status row so the user sees it alongside the speech model, and
+    // `all_ready` gates on it. Runs on its own task (so startup isn't blocked)
+    // but is EAGER — it begins immediately, not on first search. It re-pushes the
+    // setup status as it progresses so the onboarding row animates. Failure =
+    // memory stays off and the row reports it; the meeting loop is unaffected.
     #[cfg(feature = "local-memory")]
     {
         let daemon_mem = daemon.clone();
         tokio::spawn(async move {
-            match crate::memory::FactsMemory::ensure(&daemon_mem.paths).await {
-                Ok(memory) => {
-                    *daemon_mem.facts_memory.lock().await = Some(Arc::new(memory));
-                }
-                Err(error) => {
-                    warn!("cross-meeting facts memory unavailable: {error:#}");
-                }
-            }
+            prepare_memory(&daemon_mem).await;
         });
     }
 
@@ -1604,12 +1611,42 @@ pub async fn run() -> Result<()> {
                     info!(title = %event.title, "calendar trigger: warming meeting backend");
                     match warmup_open(&daemon_cal, Some(event.title.clone())).await {
                         Ok(WarmupOutcome::Ready(_)) => {
-                            // Consume the once-per-occurrence key ONLY on
-                            // success — a refused open (agent not attached
-                            // yet, server down) retries every tick until the
-                            // meeting starts and the event leaves the window.
                             fired.insert(crate::calendar::fired_key(&event));
                             info!(title = %event.title, "warm meeting backend ready");
+
+                            // Auto-spawn the overlay even in --no-overlay (background)
+                            // mode — the user still needs the UI when a meeting fires.
+                            // `ensure_overlay_ready` checks overlay_enabled; bypass it
+                            // here by spawning directly so the meeting trigger always
+                            // surfaces the UI.
+                            {
+                                let mut ov = daemon_cal.overlay.lock().await;
+                                if ov.is_none() {
+                                    if let Some(bin) = daemon_cal.overlay_bin.as_deref() {
+                                        match spawn_overlay(
+                                            Some(bin),
+                                            daemon_cal.overlay_events_tx.clone(),
+                                            daemon_cal.overlay_session_token.clone(),
+                                            daemon_cal.overlay_ui_state.clone(),
+                                        ) {
+                                            Ok(process) => {
+                                                *ov = Some(process);
+                                                daemon_cal.state.lock().await.overlay_visible =
+                                                    true;
+                                                info!(
+                                                    title = %event.title,
+                                                    "overlay auto-spawned by calendar trigger"
+                                                );
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "calendar trigger: overlay spawn failed: {e:#}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Ok(WarmupOutcome::Refused(reason)) => {
                             debug!(title = %event.title, "warmup not opened yet: {reason}");
@@ -1840,7 +1877,7 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                         ));
                 }
                 #[cfg(feature = "diarize")]
-                let mut live_diarizer = crate::diarize::spawn_live_diarizer();
+                let mut live_diarizer = crate::diarize::spawn_live_diarizer(&daemon_sys.paths);
 
                 // CHUNK COALESCING (fixes growing STT lag). The capture path frames
                 // 20ms/320-sample chunks, but parakeet-rs recomputes the mel
@@ -2060,6 +2097,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: TcpStream) -> Result<()> {
 
     let request: DaemonRequest = serde_json::from_str(line.trim_end())?;
     let shutdown = request.is_shutdown();
+    let is_close_overlay = matches!(request, DaemonRequest::CloseOverlay);
     let response = handle_request(&daemon, request).await;
     let line = serde_json::to_string(&response)?;
     writer.write_all(line.as_bytes()).await?;
@@ -2069,6 +2107,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: TcpStream) -> Result<()> {
     if shutdown {
         shutdown_daemon(&daemon).await;
         std::process::exit(0);
+    }
+
+    // CloseOverlay: kill the overlay child but keep the daemon alive.
+    if is_close_overlay {
+        close_overlay(&daemon).await;
     }
 
     Ok(())
@@ -2099,7 +2142,12 @@ async fn handle_request_inner(
         DaemonRequest::Status => Ok(DaemonResponse::Status {
             state: daemon.state.lock().await.clone(),
         }),
-        DaemonRequest::Shutdown => Ok(DaemonResponse::Ok),
+        DaemonRequest::Shutdown | DaemonRequest::QuitDaemon => Ok(DaemonResponse::Ok),
+        DaemonRequest::CloseOverlay => {
+            // Handled post-response in the connection handler so we can send
+            // Ok before tearing down the overlay (matching Shutdown pattern).
+            Ok(DaemonResponse::Ok)
+        }
         DaemonRequest::OverlayShow => {
             send_overlay(daemon, OverlayCommand::Show).await?;
             daemon.state.lock().await.overlay_visible = true;
@@ -10222,9 +10270,17 @@ async fn drive_answer_attempt(
             }
             // A real tool/connector call (MCP round-trip or built-in) — surfaced
             // live in the status feed so the user sees what the agent is doing.
-            AnswerChunk::ToolCall { id, title, status } => {
+            AnswerChunk::ToolCall {
+                id,
+                title,
+                status,
+                kind,
+                detail,
+            } => {
                 if let Some(stream) = stream.as_mut() {
-                    let _ = stream.push_tool(&id, &title, status).await;
+                    let _ = stream
+                        .push_tool(&id, &title, status, kind.as_deref(), detail.as_deref())
+                        .await;
                 }
             }
             AnswerChunk::Done { cost_usd: cost } => {
@@ -10812,7 +10868,11 @@ async fn maybe_offer_agent_install(
 /// the same card and run the same vetted recipe. No-op when the agent has no
 /// installer (VS Code, Windsurf, unknown).
 async fn push_agent_install_offer(daemon: &Arc<Daemon>, kind: &cue_agent_bridge::AgentKind) {
-    let Some(plan) = cue_agent_bridge::provision::plan_install(kind) else {
+    let resolved_kind = match kind {
+        cue_agent_bridge::AgentKind::VsCodeFork => cue_agent_bridge::AgentKind::Copilot,
+        other => other.clone(),
+    };
+    let Some(plan) = cue_agent_bridge::provision::plan_install(&resolved_kind) else {
         return; // no installer for this agent (VS Code, Windsurf, unknown)
     };
     let command = plan.human_command.clone();
@@ -10845,6 +10905,47 @@ async fn push_agent_install_offer(daemon: &Arc<Daemon>, kind: &cue_agent_bridge:
 /// counts as ready. The agent is the attached one when there is one, else the
 /// best discovered candidate — so a signed-out CLI reports `needs_login` here
 /// rather than failing later on the first ask.
+/// Eagerly prepare the on-device memory embedder (the "Preparing memory"
+/// onboarding step) and store it on the daemon. While the download runs, a
+/// lightweight poller re-pushes the setup status so the onboarding row animates
+/// with the percent published by the memory download loop. Best-effort: any
+/// failure leaves memory off (the row reports it) and never affects the meeting
+/// loop.
+#[cfg(feature = "local-memory")]
+async fn prepare_memory(daemon: &Arc<Daemon>) {
+    // Nothing to prepare if it is already on disk — go straight to load.
+    let already = crate::memory::embedder_present(&daemon.paths);
+    if !already {
+        // Animate the onboarding row while the download streams: re-push the
+        // status roughly twice a second until the embedder is ready. The
+        // download loop owns the percent; this only forwards it to the overlay.
+        let poll_daemon = daemon.clone();
+        let poller = tokio::spawn(async move {
+            loop {
+                push_setup_status(&poll_daemon).await;
+                if crate::memory::embedder_present(&poll_daemon.paths) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        });
+        // Ensure runs the actual download+load; abort the poller once it returns.
+        let result = crate::memory::FactsMemory::ensure(&daemon.paths).await;
+        poller.abort();
+        match result {
+            Ok(memory) => *daemon.facts_memory.lock().await = Some(Arc::new(memory)),
+            Err(error) => warn!("cross-meeting facts memory unavailable: {error:#}"),
+        }
+    } else {
+        match crate::memory::FactsMemory::ensure(&daemon.paths).await {
+            Ok(memory) => *daemon.facts_memory.lock().await = Some(Arc::new(memory)),
+            Err(error) => warn!("cross-meeting facts memory unavailable: {error:#}"),
+        }
+    }
+    // Final push so the row settles to ready (or its failure state).
+    push_setup_status(daemon).await;
+}
+
 pub(crate) async fn push_setup_status(daemon: &Arc<Daemon>) {
     #[cfg(feature = "parakeet-stt")]
     let models_present = {
@@ -10853,6 +10954,14 @@ pub(crate) async fn push_setup_status(daemon: &Arc<Daemon>) {
     };
     #[cfg(not(feature = "parakeet-stt"))]
     let models_present = true; // no on-device STT in this build; nothing to fetch
+
+    // Memory embedder presence: disk truth (a prepared embedder from a prior run
+    // or the eager `prepare_memory` step). On builds without `local-memory`
+    // there is nothing to prepare, so it is always "present".
+    #[cfg(feature = "local-memory")]
+    let memory_present = crate::memory::embedder_present(&daemon.paths);
+    #[cfg(not(feature = "local-memory"))]
+    let memory_present = true;
 
     let agents = discover_agent_summaries(daemon).await;
     let best = agents
@@ -10868,7 +10977,7 @@ pub(crate) async fn push_setup_status(daemon: &Arc<Daemon>) {
         )
     });
 
-    let status = crate::setup_status::build(models_present, agent);
+    let status = crate::setup_status::build(models_present, memory_present, agent);
     let _ = send_overlay(daemon, OverlayCommand::SetSetupStatus { status }).await;
 }
 
@@ -10964,10 +11073,14 @@ async fn handle_agent_install_response(daemon: &Arc<Daemon>, kind: &str, approve
     let Some(parsed) = parse_attached_agent(Some(kind)) else {
         return;
     };
-    let Some(plan) = plan_install(&parsed) else {
+    let target = match parsed {
+        cue_agent_bridge::AgentKind::VsCodeFork => cue_agent_bridge::AgentKind::Copilot,
+        other => other,
+    };
+    let Some(plan) = plan_install(&target) else {
         return;
     };
-    let display = agent_display_name(&parsed);
+    let display = agent_display_name(&target);
     let command = plan.human_command.clone();
 
     // Progress card: the install can take many seconds.
@@ -13595,6 +13708,21 @@ fn transcript_event_to_stt_segment(
         }
         TranscriptEvent::SpeakerLabel { .. } => None,
     }
+}
+
+/// Close the overlay UI only — the daemon process keeps running.
+/// Calendar polling, pre-context warmup, and all background tasks continue.
+/// This is the correct behaviour for `bluey off`; use `shutdown_daemon` only
+/// for full quit (e.g. `bluey quit` or system shutdown).
+async fn close_overlay(daemon: &Arc<Daemon>) {
+    if let Some(mut overlay) = daemon.overlay.lock().await.take() {
+        let _ = overlay.send(&OverlayCommand::Shutdown);
+        let _ = overlay.child.kill();
+        let _ = overlay.child.wait();
+        info!("overlay closed; daemon continues running in background");
+    }
+    daemon.state.lock().await.overlay_visible = false;
+    write_state(daemon).await.ok();
 }
 
 async fn shutdown_daemon(daemon: &Arc<Daemon>) {

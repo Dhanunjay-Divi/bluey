@@ -22,7 +22,36 @@ pub enum EmbeddingError {
 pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &'static str;
     fn dim(&self) -> usize;
+    /// Embed a PASSAGE / document (what gets indexed).
     async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbeddingError>;
+
+    /// Embed a retrieval QUERY. Local models apply a model-specific query prompt
+    /// (bge/arctic prefix, Gemma `task:… | query:`); providers with no query/doc
+    /// asymmetry (e.g. OpenAI) default to plain [`Self::embed`].
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        self.embed(text).await
+    }
+
+    /// The retrieval score floor calibrated for THIS model's cosine
+    /// distribution. Measured live per model — bge/arctic sit ~0.45, Gemma's
+    /// scores are compressed to ~0.20 (proven in `tests/embedder_bakeoff.rs`).
+    /// The default suits the bge family.
+    fn relevance_floor(&self) -> f32 {
+        0.45
+    }
+
+    /// Blocking PASSAGE embed for callers that build an index from a synchronous
+    /// closure (e.g. the agent-history index rebuild, already off the async
+    /// runtime). Local ONNX models override this to run inference directly
+    /// without a runtime hop; the default bridges to the async [`Self::embed`]
+    /// via a transient current-thread runtime, so remote providers still work.
+    fn embed_passage_blocking(&self, text: &str) -> Result<Vec<f32>, EmbeddingError> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| EmbeddingError::Request(format!("blocking rt: {e}")))?
+            .block_on(self.embed(text))
+    }
 }
 
 /// OpenAI text-embedding-3-small (1536 dimensions).
