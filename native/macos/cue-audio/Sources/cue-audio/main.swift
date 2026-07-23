@@ -737,21 +737,34 @@ private final class SourcePicker: NSObject, SCContentSharingPickerObserver, SCSt
 private func run() async -> Int32 {
     let args = parseArgs()
 
-    // Trigger the macOS Screen Recording permission flow up front. Without a
-    // grant, ScreenCaptureKit returns SILENT audio buffers (no error) and the
-    // binary never appears in System Settings → Screen Recording.
-    // CGRequestScreenCaptureAccess() registers the process with TCC (adding it to
-    // the list) and prompts on first use; CGPreflight reports current state so we
-    // fail LOUDLY instead of capturing silence.
-    if #available(macOS 11.0, *) {
-        if !CGPreflightScreenCaptureAccess() {
-            fputs("screen recording permission not granted — requesting…\n", stderr)
-            if !CGRequestScreenCaptureAccess() {
-                fputs(
-                    "ERROR: screen recording permission DENIED. Grant it in System Settings → Privacy & Security → Screen Recording, then relaunch.\n",
-                    stderr
-                )
-                return 3
+    // PERMISSION MODEL — this matters, and was subtly WRONG before.
+    //
+    // The system-audio path uses the Core Audio process-tap
+    // (`AudioHardwareCreateProcessTap`, macOS 14.4+). On 14.4+ that tap is gated
+    // by the NEWER **"System Audio Recording Only"** TCC permission
+    // (`NSAudioCaptureUsageDescription`) — NOT "Screen & System Audio Recording"
+    // (`CGRequestScreenCaptureAccess` / kTCCServiceScreenCapture). The tap
+    // requests the correct permission on its own first use.
+    //
+    // The OLD code gated EVERY mode on `CGRequestScreenCaptureAccess` — a
+    // leftover from the retired ScreenCaptureKit path. That checked the WRONG
+    // list: the user could grant Screen Recording and still be denied (the tap
+    // needs the Audio-Recording grant), and the dialog kept firing for a
+    // permission the tap never uses. So we DO NOT gate the tap on Screen
+    // Recording here. Only the interactive `--pick` mode uses ScreenCaptureKit
+    // (`SCContentSharingPicker`), which genuinely needs Screen Recording, so the
+    // gate is scoped to that mode below.
+    if args.mode == .pick {
+        if #available(macOS 11.0, *) {
+            if !CGPreflightScreenCaptureAccess() {
+                fputs("screen recording permission not granted — requesting…\n", stderr)
+                if !CGRequestScreenCaptureAccess() {
+                    fputs(
+                        "ERROR: screen recording permission DENIED (needed for the app picker). Grant it in System Settings → Privacy & Security → Screen Recording, then relaunch.\n",
+                        stderr
+                    )
+                    return 3
+                }
             }
         }
     }

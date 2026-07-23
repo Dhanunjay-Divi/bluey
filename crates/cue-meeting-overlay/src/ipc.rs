@@ -237,6 +237,13 @@ async fn run_connection(
         }
     }
     writer.abort();
+    // The daemon is gone (clean shutdown OR crash/kill). The overlay is a child
+    // launched via `open` and reparented to launchd, so it does NOT die with the
+    // daemon on its own — without this it lingers as a zombie window and stale
+    // overlays pile up across daemon restarts. Exit the process so exactly one
+    // overlay is alive per daemon: a fresh daemon spawns a fresh overlay.
+    eprintln!("[meeting-overlay] daemon connection lost — exiting overlay");
+    app.exit(0);
 }
 
 /// Write one event: take the UI's JSON object string, inject `"token"`, append `\n`.
