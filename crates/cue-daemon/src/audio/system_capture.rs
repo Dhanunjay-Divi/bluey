@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use cue_core::pcm::{AudioChunk, AudioSource, SampleRate};
 use tokio::io::AsyncReadExt;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinHandle;
 
@@ -29,6 +29,24 @@ const MAX_RESTART_ATTEMPTS: u32 = 5;
 pub struct SystemAudioCapture {
     stop: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
+}
+
+/// Which capture the native helper runs — selects the helper's `--source` arg
+/// and the `AudioChunk.source` tag. Microphone mode enables Apple's
+/// VoiceProcessingIO acoustic echo cancellation in the helper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureRole {
+    System,
+    Microphone,
+}
+
+impl CaptureRole {
+    fn audio_source(self) -> AudioSource {
+        match self {
+            CaptureRole::System => AudioSource::System,
+            CaptureRole::Microphone => AudioSource::Microphone,
+        }
+    }
 }
 
 impl SystemAudioCapture {
@@ -51,7 +69,34 @@ impl SystemAudioCapture {
         let stop_clone = stop.clone();
 
         let task = tokio::spawn(async move {
-            supervisor_loop(binary, sender, stop_clone, pick).await;
+            supervisor_loop(binary, sender, stop_clone, pick, CaptureRole::System).await;
+        });
+
+        Ok(Self {
+            stop,
+            task: Some(task),
+        })
+    }
+
+    /// Start MICROPHONE capture via the SAME native helper in `--source
+    /// microphone` mode. Critically this enables Apple's VoiceProcessingIO
+    /// acoustic echo cancellation (see the Swift helper), so the far side's voice
+    /// leaking from the speakers into the mic is removed BEFORE STT — the fix for
+    /// the mic double-transcribing system audio when the user is on speakers (no
+    /// headphones). PCM output is the identical 16 kHz mono i16 stream; only the
+    /// `AudioChunk.source` is `Microphone`.
+    ///
+    /// Independent of the system-audio tap permission-wise: VoiceProcessingIO is a
+    /// plain microphone unit and needs only the Microphone TCC grant, not Screen /
+    /// System-Audio Recording — so running it alongside the system tap does not
+    /// contend for the same grant.
+    pub fn start_microphone(sender: UnboundedSender<AudioChunk>) -> std::io::Result<Self> {
+        let binary = resolve_binary()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = stop.clone();
+
+        let task = tokio::spawn(async move {
+            supervisor_loop(binary, sender, stop_clone, false, CaptureRole::Microphone).await;
         });
 
         Ok(Self {
@@ -238,19 +283,72 @@ fn platform_binary_path() -> PathBuf {
     PathBuf::from("bluey-audio")
 }
 
-async fn spawn_child(binary: &PathBuf, pick: bool) -> std::io::Result<Child> {
-    let mut cmd = Command::new(binary);
-    if pick {
-        // Interactive picker mode: the helper presents the system content-sharing
-        // picker, then streams the chosen app's audio (same PCM format).
-        cmd.args(["--pick", "--continuous"]);
-    } else {
-        cmd.args(["--source", "system", "--continuous"]);
+/// Resolve the `BlueyAudio.app` BUNDLE directory (not the inner binary) so the
+/// MIC helper can be launched via `/usr/bin/open`, which reads the bundle
+/// Info.plist (NSMicrophoneUsageDescription) that mic access requires. Mirrors
+/// the search order of [`platform_binary_path`]. Returns `None` when only a bare
+/// binary exists (dev builds without the bundle).
+#[cfg(target_os = "macos")]
+fn macos_app_bundle_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("BLUEY_AUDIO_APP_BUNDLE") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
     }
-    cmd.stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .kill_on_drop(true)
-        .spawn()
+    let app = "BlueyAudio.app";
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dirs = Vec::new();
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+        if let Ok(canonical) = exe.canonicalize() {
+            if let Some(dir) = canonical.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        for dir in dirs {
+            let candidate = dir.join(app);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    let dev_app = PathBuf::from(format!("native/macos/cue-audio/.build/{app}"));
+    if dev_app.exists() {
+        return Some(dev_app);
+    }
+    None
+}
+
+/// Frame freshly-read bytes (already in `buf[..offset]`) into whole 20 ms
+/// `AudioChunk`s tagged with `role`'s source, and push them. Returns `false` if
+/// the receiver was dropped (caller should stop). `offset` is left holding the
+/// leftover partial-chunk bytes.
+fn drain_frames(
+    buf: &mut [u8],
+    offset: &mut usize,
+    sender: &UnboundedSender<AudioChunk>,
+    role: CaptureRole,
+) -> bool {
+    while *offset >= CHUNK_BYTES {
+        let samples: Vec<i16> = buf[..CHUNK_BYTES]
+            .chunks_exact(2)
+            .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        let chunk = AudioChunk {
+            source: role.audio_source(),
+            sample_rate: SampleRate::SR_16K,
+            samples,
+            captured_at_ms: epoch_ms(),
+        };
+        if sender.send(chunk).is_err() {
+            return false;
+        }
+        buf.copy_within(CHUNK_BYTES..*offset, 0);
+        *offset -= CHUNK_BYTES;
+    }
+    true
 }
 
 async fn supervisor_loop(
@@ -258,6 +356,7 @@ async fn supervisor_loop(
     sender: UnboundedSender<AudioChunk>,
     stop: Arc<AtomicBool>,
     pick: bool,
+    role: CaptureRole,
 ) {
     let mut consecutive_failures: u32 = 0;
 
@@ -266,28 +365,27 @@ async fn supervisor_loop(
             return;
         }
 
-        let child = match spawn_child(&binary, pick).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to spawn system audio helper");
-                consecutive_failures += 1;
-                if consecutive_failures > MAX_RESTART_ATTEMPTS {
-                    tracing::error!("system audio helper failed too many times; giving up");
-                    return;
-                }
-                tokio::time::sleep(restart_delay(consecutive_failures - 1)).await;
-                continue;
+        // The MIC helper MUST be launched as the .app bundle (macOS reads
+        // NSMicrophoneUsageDescription from the bundle Info.plist — a bare exec
+        // lacks it and macOS traps on mic access), so it uses the open+socket
+        // transport. SYSTEM audio works fine as a bare exec over stdout.
+        #[cfg(target_os = "macos")]
+        let clean = if role == CaptureRole::Microphone {
+            if let Some(bundle) = macos_app_bundle_path() {
+                run_mic_socket_session(&bundle, &sender, &stop).await
+            } else {
+                // No bundle (dev build with only a bare binary) — fall back to
+                // stdout. The mic will trap without the plist, but this keeps a
+                // plain checkout from failing to spawn; system audio still works.
+                run_stdout_session(&binary, pick, role, &sender, &stop).await
             }
+        } else {
+            run_stdout_session(&binary, pick, role, &sender, &stop).await
         };
+        #[cfg(not(target_os = "macos"))]
+        let clean = run_stdout_session(&binary, pick, role, &sender, &stop).await;
 
-        let exited_cleanly = read_child_stdout(child, &sender, &stop).await;
-
-        if stop.load(Ordering::Acquire) {
-            return;
-        }
-
-        if exited_cleanly {
-            // Clean exit means intentional stop
+        if stop.load(Ordering::Acquire) || clean {
             return;
         }
 
@@ -310,58 +408,140 @@ async fn supervisor_loop(
     }
 }
 
-async fn read_child_stdout(
-    mut child: Child,
+/// Bare-exec + stdout transport (system audio; non-macOS; macOS dev fallback).
+async fn run_stdout_session(
+    binary: &std::path::Path,
+    pick: bool,
+    role: CaptureRole,
     sender: &UnboundedSender<AudioChunk>,
     stop: &Arc<AtomicBool>,
 ) -> bool {
+    let mut cmd = Command::new(binary);
+    if pick {
+        cmd.args(["--pick", "--continuous"]);
+    } else {
+        let source = match role {
+            CaptureRole::System => "system",
+            CaptureRole::Microphone => "microphone",
+        };
+        cmd.args(["--source", source, "--continuous"]);
+    }
+    let mut child = match cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn native audio helper");
+            return false;
+        }
+    };
     let Some(mut stdout) = child.stdout.take() else {
         return false;
     };
-
-    let mut buf = vec![0u8; CHUNK_BYTES];
+    let mut buf = vec![0u8; CHUNK_BYTES.max(8192)];
     let mut offset = 0usize;
-
     loop {
         if stop.load(Ordering::Acquire) {
             let _ = child.kill().await;
             return true;
         }
-
-        let n = match stdout.read(&mut buf[offset..]).await {
+        match stdout.read(&mut buf[offset..]).await {
             Ok(0) => break, // EOF
-            Ok(n) => n,
-            Err(_) => break,
-        };
-
-        offset += n;
-
-        while offset >= CHUNK_BYTES {
-            let samples: Vec<i16> = buf[..CHUNK_BYTES]
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]))
-                .collect();
-
-            let chunk = AudioChunk {
-                source: AudioSource::System,
-                sample_rate: SampleRate::SR_16K,
-                samples,
-                captured_at_ms: epoch_ms(),
-            };
-
-            if sender.send(chunk).is_err() {
-                // Receiver dropped
-                let _ = child.kill().await;
-                return true;
+            Ok(n) => {
+                offset += n;
+                if !drain_frames(&mut buf, &mut offset, sender, role) {
+                    let _ = child.kill().await;
+                    return true;
+                }
             }
-
-            buf.copy_within(CHUNK_BYTES..offset, 0);
-            offset -= CHUNK_BYTES;
+            Err(_) => break,
         }
     }
-
     let status = child.wait().await;
     matches!(status, Ok(s) if s.success())
+}
+
+/// macOS bundle + UNIX-socket transport for the MIC helper. Binds a socket,
+/// launches `BlueyAudio.app` via `/usr/bin/open` (so macOS reads the bundle
+/// Info.plist and grants mic access), and reads PCM from the accepted
+/// connection. Mirrors the overlay's open+socket handshake.
+#[cfg(target_os = "macos")]
+async fn run_mic_socket_session(
+    bundle: &std::path::Path,
+    sender: &UnboundedSender<AudioChunk>,
+    stop: &Arc<AtomicBool>,
+) -> bool {
+    use tokio::net::UnixListener;
+
+    let socket_path = std::env::temp_dir().join(format!("bluey-mic-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket_path);
+    let listener = match UnixListener::bind(&socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!(error = %e, "mic: failed to bind capture socket");
+            return false;
+        }
+    };
+
+    // `open -n <BlueyAudio.app> --args --source microphone --socket <path>`.
+    // No `-W` (that would block until the app exits); open returns after launch.
+    let mut cmd = Command::new("/usr/bin/open");
+    cmd.arg("-n")
+        .arg(bundle)
+        .arg("--args")
+        .args(["--source", "microphone", "--continuous"])
+        .arg("--socket")
+        .arg(&socket_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit());
+    if !matches!(cmd.status().await, Ok(s) if s.success()) {
+        tracing::warn!("mic: `open` failed to launch BlueyAudio.app");
+        let _ = std::fs::remove_file(&socket_path);
+        return false;
+    }
+
+    let accept = tokio::time::timeout(Duration::from_secs(15), listener.accept()).await;
+    let (mut conn, _addr) = match accept {
+        Ok(Ok(pair)) => pair,
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "mic: socket accept failed");
+            let _ = std::fs::remove_file(&socket_path);
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!("mic: helper did not connect before timeout");
+            let _ = std::fs::remove_file(&socket_path);
+            return false;
+        }
+    };
+
+    let mut buf = vec![0u8; CHUNK_BYTES.max(8192)];
+    let mut offset = 0usize;
+    let clean = loop {
+        if stop.load(Ordering::Acquire) {
+            break true;
+        }
+        // Short read timeout so the stop flag is checked promptly even when the
+        // mic is silent.
+        let read =
+            tokio::time::timeout(Duration::from_millis(250), conn.read(&mut buf[offset..])).await;
+        match read {
+            Ok(Ok(0)) => break false, // EOF: helper exited
+            Ok(Ok(n)) => {
+                offset += n;
+                if !drain_frames(&mut buf, &mut offset, sender, CaptureRole::Microphone) {
+                    break true; // receiver dropped
+                }
+            }
+            Ok(Err(_)) => break false,
+            Err(_) => continue, // read timeout — re-check stop
+        }
+    };
+    let _ = std::fs::remove_file(&socket_path);
+    clean
 }
 
 fn epoch_ms() -> u64 {

@@ -26,6 +26,15 @@ private struct Args {
     /// When set (system capture), restrict capture to this app's audio only,
     /// instead of the whole display. Chosen via `--pick`.
     var appBundleId: String?
+    /// When set, stream PCM to this UNIX-domain socket instead of stdout. Used by
+    /// the MICROPHONE path: the daemon must launch that helper AS the
+    /// `BlueyAudio.app` bundle (via `open`) so macOS reads
+    /// `NSMicrophoneUsageDescription` from the bundle Info.plist — a bare exec
+    /// lacks the plist and macOS TRAPS the instant it touches the mic (exit 133).
+    /// But `open` detaches the process and gives no stdout pipe, so the helper
+    /// connects back over this socket to deliver PCM. (System audio does not need
+    /// this — the Core Audio tap works from a bare exec over stdout.)
+    var socketPath: String?
 }
 
 private func parseArgs() -> Args {
@@ -49,6 +58,10 @@ private func parseArgs() -> Args {
             if let value = iterator.next(), !value.isEmpty {
                 parsed.appBundleId = value
             }
+        case "--socket":
+            if let value = iterator.next(), !value.isEmpty {
+                parsed.socketPath = value
+            }
         default:
             break
         }
@@ -56,11 +69,52 @@ private func parseArgs() -> Args {
     return parsed
 }
 
-/// Writes 16 kHz mono i16 LE PCM to stdout from 48 kHz mono float input.
+/// Connect to the daemon's UNIX-domain socket and return a `FileHandle` for
+/// writing PCM. Returns nil on failure (bad path / daemon not listening); the
+/// caller then treats it as fatal (the daemon reads the socket, not stdout, so a
+/// stdout fallback would silently drop all audio). The daemon binds+listens
+/// BEFORE launching this helper, so a healthy launch connects immediately.
+private func connectSocket(_ path: String) -> FileHandle? {
+    let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    if fd < 0 { return nil }
+    var addr = sockaddr_un()
+    addr.sun_family = sa_family_t(AF_UNIX)
+    let pathBytes = Array(path.utf8)
+    let maxLen = MemoryLayout.size(ofValue: addr.sun_path) - 1
+    if pathBytes.count > maxLen {
+        close(fd)
+        return nil
+    }
+    withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+        ptr.withMemoryRebound(to: CChar.self, capacity: maxLen + 1) { dst in
+            for (i, b) in pathBytes.enumerated() { dst[i] = CChar(bitPattern: b) }
+            dst[pathBytes.count] = 0
+        }
+    }
+    let connected = withUnsafePointer(to: &addr) { aptr in
+        aptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saptr in
+            connect(fd, saptr, socklen_t(MemoryLayout<sockaddr_un>.size))
+        }
+    }
+    if connected != 0 {
+        close(fd)
+        return nil
+    }
+    return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+}
+
+/// Writes 16 kHz mono i16 LE PCM to a sink (stdout by default, or the daemon's
+/// UNIX socket when the helper was launched as a bundle) from float input.
 private final class PCM16Writer {
-    private let handle = FileHandle.standardOutput
+    private let handle: FileHandle
     private let lock = NSLock()
     private var carry: Double = 0.0
+
+    /// Default sink is stdout (system path). The socket sink is installed by
+    /// `main` when `--socket` is passed (mic path), so the same writer serves both.
+    init(handle: FileHandle = FileHandle.standardOutput) {
+        self.handle = handle
+    }
 
     func writeMonoFloat(_ samples: [Float], sourceSampleRate: Double) {
         guard !samples.isEmpty, sourceSampleRate > 0 else { return }
@@ -77,8 +131,32 @@ private final class PCM16Writer {
                 carry -= 1.0
             }
         }
-        handle.write(output)
+        writeAll(output)
         lock.unlock()
+    }
+
+    /// Write every byte to the sink fd, tolerating short writes. If the sink is
+    /// gone (daemon disconnected → EPIPE), exit cleanly. Uses `write(2)` directly
+    /// (not `FileHandle.write`, which raises on EPIPE); SIGPIPE is ignored
+    /// process-wide (see `main`), so a broken pipe is an `errno`, not a crash.
+    private func writeAll(_ data: Data) {
+        let fd = handle.fileDescriptor
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.baseAddress else { return }
+            var offset = 0
+            let total = raw.count
+            while offset < total {
+                let n = write(fd, base + offset, total - offset)
+                if n > 0 {
+                    offset += n
+                } else if n < 0 && errno == EINTR {
+                    continue
+                } else {
+                    fputs("bluey audio helper: sink closed (errno \(errno)); exiting\n", stderr)
+                    exit(0)
+                }
+            }
+        }
     }
 
     func write48kFloat(_ pointer: UnsafePointer<Float>, frameCount: Int) {
@@ -173,7 +251,7 @@ private final class SystemAudioCapture {
     private let duration: TimeInterval
     private let continuous: Bool
     private let appBundleId: String?
-    private let writer = PCM16Writer()
+    private let writer: PCM16Writer
 
     // Core Audio resources owned by this capture; torn down on cleanup.
     private var tapID = AudioObjectID(kAudioObjectUnknown)
@@ -182,10 +260,11 @@ private final class SystemAudioCapture {
     /// The tap's real stream sample rate (often 48 kHz), read from the tap.
     private var tapSampleRate: Double = 48_000
 
-    init(durationMs: Int, continuous: Bool, appBundleId: String?) {
+    init(durationMs: Int, continuous: Bool, appBundleId: String?, sink: FileHandle) {
         self.duration = TimeInterval(durationMs) / 1_000.0
         self.continuous = continuous
         self.appBundleId = appBundleId
+        self.writer = PCM16Writer(handle: sink)
     }
 
     func run() async throws {
@@ -522,12 +601,13 @@ private final class SystemAudioCapture {
 private final class MicrophoneCapture {
     private let duration: TimeInterval
     private let continuous: Bool
-    private let writer = PCM16Writer()
+    private let writer: PCM16Writer
     private let engine = AVAudioEngine()
 
-    init(durationMs: Int, continuous: Bool) {
+    init(durationMs: Int, continuous: Bool, sink: FileHandle) {
         self.duration = TimeInterval(durationMs) / 1_000.0
         self.continuous = continuous
+        self.writer = PCM16Writer(handle: sink)
     }
 
     /// Enables Apple's VoiceProcessingIO acoustic echo cancellation on the input
@@ -737,6 +817,11 @@ private final class SourcePicker: NSObject, SCContentSharingPickerObserver, SCSt
 private func run() async -> Int32 {
     let args = parseArgs()
 
+    // Ignore SIGPIPE so a write to a closed socket (daemon gone) returns EPIPE
+    // instead of killing the process — `PCM16Writer.writeAll` then exits cleanly.
+    // Harmless in stdout mode.
+    signal(SIGPIPE, SIG_IGN)
+
     // PERMISSION MODEL — this matters, and was subtly WRONG before.
     //
     // The system-audio path uses the Core Audio process-tap
@@ -784,6 +869,21 @@ private func run() async -> Int32 {
         return 0
     }
 
+    // Resolve the PCM sink: the daemon's UNIX socket when launched as a bundle
+    // (`--socket`, the mic path), else stdout (the system path). When `--socket`
+    // is given but the connection fails, exit — the daemon reads the socket, not
+    // our stdout, so a stdout fallback would silently drop all audio.
+    let sink: FileHandle
+    if let socketPath = args.socketPath {
+        guard let connected = connectSocket(socketPath) else {
+            fputs("bluey audio helper: could not connect to socket \(socketPath)\n", stderr)
+            return 4
+        }
+        sink = connected
+    } else {
+        sink = FileHandle.standardOutput
+    }
+
     do {
         switch args.source {
         case .system:
@@ -794,11 +894,16 @@ private func run() async -> Int32 {
             let capture = SystemAudioCapture(
                 durationMs: args.durationMs,
                 continuous: args.continuous,
-                appBundleId: args.appBundleId
+                appBundleId: args.appBundleId,
+                sink: sink
             )
             try await capture.run()
         case .microphone:
-            let capture = MicrophoneCapture(durationMs: args.durationMs, continuous: args.continuous)
+            let capture = MicrophoneCapture(
+                durationMs: args.durationMs,
+                continuous: args.continuous,
+                sink: sink
+            )
             try capture.run()
         }
         return 0

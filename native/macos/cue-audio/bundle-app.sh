@@ -42,6 +42,12 @@ cat > ".build/$APP/Contents/Info.plist" <<'PLIST'
        AudioHardwareCreateProcessTap is denied. This is the real capture path. -->
   <key>NSAudioCaptureUsageDescription</key>
   <string>Bluey transcribes your meeting's audio on-device so it can follow along and answer questions for you. Audio never leaves your machine.</string>
+  <!-- MICROPHONE (--source microphone, VoiceProcessingIO AEC) REQUIRES this.
+       macOS TRAPS (SIGTRAP / exit 133) the instant a process touches the mic
+       without NSMicrophoneUsageDescription — it is not optional. Its absence is
+       why the mic-AEC helper crashed on launch the first time the mic path ran. -->
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Bluey captures your microphone on-device so it can transcribe what you say in meetings. Audio never leaves your machine.</string>
   <!-- Kept for the --pick (SCContentSharingPicker) path, which still uses SCK. -->
   <key>NSScreenCaptureUsageDescription</key>
   <string>Bluey transcribes your meeting's audio on-device so it can follow along and answer questions for you. Audio never leaves your machine.</string>

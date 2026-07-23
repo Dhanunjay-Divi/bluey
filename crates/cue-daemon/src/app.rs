@@ -1137,17 +1137,21 @@ pub(crate) fn broadcast_speaker_update(
 }
 
 /// The active microphone capture backend. On macOS the preferred path is the
-/// Handle to the running microphone capture (raw cpal). Held on the daemon so
-/// stop can tear it down. (An AEC helper backend was tried and reverted — see the
-/// mic capture path in `start_microphone_capture_task`.)
+/// native helper in `--source microphone` mode, which applies Apple's
+/// VoiceProcessingIO acoustic echo cancellation (removes speaker→mic bleed before
+/// STT). The raw cpal path is the fallback (no AEC) for non-macOS or when the
+/// helper is unavailable / disabled via `BLUEY_MIC_AEC=0`. Held on the daemon so
+/// stop can tear down whichever one is running.
 pub(crate) enum MicCaptureHandle {
+    Helper(crate::audio::system_capture::SystemAudioCapture),
     Cpal(crate::audio::capture::MicrophoneCapture),
 }
 
 impl MicCaptureHandle {
-    /// Stop the capture.
+    /// Stop the capture, whichever backend it is.
     async fn stop(self) {
         match self {
+            MicCaptureHandle::Helper(cap) => cap.stop().await,
             MicCaptureHandle::Cpal(cap) => cap.stop(),
         }
     }
@@ -5594,40 +5598,68 @@ async fn start_microphone_capture_task(daemon: &Arc<Daemon>) -> Result<()> {
         }
     }
 
-    // MIC CAPTURE PATH — raw cpal (no native helper).
-    //
-    // An AEC path (a second `BlueyAudio` helper in `--source microphone` mode with
-    // VoiceProcessingIO echo cancellation) was tried, but running two BlueyAudio
-    // helpers at once broke the system-audio helper's capture-permission
-    // attribution and crash-looped it (regression 2026-07-23; system audio worked
-    // 2026-07-22 with cpal). That path is reverted until the helper can be spawned
-    // as a single process emitting both streams. cpal has no AEC, so on speakers
-    // (no headphones) the mic may pick up system audio — the cross-channel dedup
-    // mitigates that downstream.
+    // MIC CAPTURE PATH — prefer the native helper's `--source microphone` mode,
+    // which applies Apple's VoiceProcessingIO acoustic echo cancellation so the
+    // far side's voice bleeding from the speakers into the mic is removed BEFORE
+    // STT (the fix for the mic double-transcribing system audio when the user is
+    // on speakers). The helper streams the SAME 16 kHz mono i16 AudioChunk shape
+    // as system audio, so `device_hz = 16000` makes the downstream resample a
+    // no-op. It needs only the Microphone TCC grant (VoiceProcessingIO is a plain
+    // mic unit), independent of the system tap's Screen/System-Audio grant, so the
+    // two helpers don't contend. Raw cpal (no AEC) is the fallback for
+    // helper-unavailable / non-macOS; `BLUEY_MIC_AEC=0` forces it.
     let (mut mic_rx, device_hz, mic_handle): (
         tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
         u32,
         MicCaptureHandle,
     ) = {
-        let mic_device = {
-            let db_path = daemon.paths.data_dir.join("sessions.db");
-            crate::audio::capture::load_mic_device_setting(
-                db_path.to_str().unwrap_or("sessions.db"),
-            )
+        let aec_disabled = std::env::var("BLUEY_MIC_AEC")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "0" | "false" | "no" | "off"))
+            .unwrap_or(false);
+        let helper: Option<(
+            tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+            MicCaptureHandle,
+        )> = if cfg!(target_os = "macos") && !aec_disabled {
+            let (tx, rx) = mpsc::unbounded_channel::<AudioChunk>();
+            match crate::audio::system_capture::SystemAudioCapture::start_microphone(tx) {
+                Ok(cap) => {
+                    info!("microphone continuous capture started (native helper + AEC, 16kHz)");
+                    Some((rx, MicCaptureHandle::Helper(cap)))
+                }
+                Err(e) => {
+                    warn!("mic AEC helper unavailable ({e}); falling back to raw cpal (no AEC)");
+                    None
+                }
+            }
+        } else {
+            None
         };
-        let opts = crate::audio::capture::CaptureOptions {
-            source: AudioSource::Microphone,
-            chunk_ms: 20,
-            device_name: mic_device,
-        };
-        let (handle, rx) = crate::audio::capture::MicrophoneCapture::start(opts)
-            .context("start microphone capture")?;
-        let hz = handle.sample_rate().hz();
-        info!(
-            device_hz = hz,
-            "microphone continuous capture started (raw cpal, no AEC)"
-        );
-        (rx, hz, MicCaptureHandle::Cpal(handle))
+        match helper {
+            Some((rx, h)) => (rx, 16_000, h),
+            None => {
+                let mic_device = {
+                    let db_path = daemon.paths.data_dir.join("sessions.db");
+                    crate::audio::capture::load_mic_device_setting(
+                        db_path.to_str().unwrap_or("sessions.db"),
+                    )
+                };
+                let opts = crate::audio::capture::CaptureOptions {
+                    source: AudioSource::Microphone,
+                    chunk_ms: 20,
+                    device_name: mic_device,
+                };
+                let (handle, rx) = crate::audio::capture::MicrophoneCapture::start(opts)
+                    .context("start microphone capture")?;
+                let hz = handle.sample_rate().hz();
+                info!(
+                    device_hz = hz,
+                    "microphone continuous capture started (raw cpal, no AEC)"
+                );
+                (rx, hz, MicCaptureHandle::Cpal(handle))
+            }
+        }
     };
     // Keep the capture handle alive on the daemon so stop() can reach it.
     daemon.microphone_helper.lock().await.replace(mic_handle);
