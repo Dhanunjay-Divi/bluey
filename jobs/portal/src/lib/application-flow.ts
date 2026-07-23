@@ -1,11 +1,23 @@
-import type { Intervention, JobApplication, JobPosting, SubmissionMode } from "../types";
+import type {
+  Intervention,
+  JobApplication,
+  JobPosting,
+  RunnerAvailability,
+  SubmissionMode,
+} from "../types";
 
 export function runnerEligibleApplications(applications: JobApplication[]): JobApplication[] {
   return applications.filter((application) => application.state === "queued");
 }
 
-export function effectiveSubmissionMode(job: JobPosting, requested: SubmissionMode): SubmissionMode {
-  return requested === "auto_submit" && job.eligibility?.can_auto_submit === true
+export function effectiveSubmissionMode(
+  job: JobPosting,
+  requested: SubmissionMode,
+  runners: RunnerAvailability,
+): SubmissionMode {
+  return requested === "auto_submit"
+    && job.eligibility?.can_auto_submit === true
+    && runners.auto_submit_available
     ? "auto_submit"
     : "review_first";
 }

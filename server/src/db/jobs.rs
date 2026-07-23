@@ -1054,6 +1054,50 @@ pub struct JobsEntitlement {
     pub additional_inbox_cents: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerChannelAvailability {
+    pub status: String,
+    pub available: bool,
+    pub plan_included: bool,
+    pub distribution_enabled: bool,
+    pub reason: String,
+    pub next_action: String,
+}
+
+impl Default for RunnerChannelAvailability {
+    fn default() -> Self {
+        Self {
+            status: "invited_beta".to_string(),
+            available: false,
+            plan_included: false,
+            distribution_enabled: false,
+            reason: "This runner is not available for this account.".to_string(),
+            next_action: "Use Review first.".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunnerAvailability {
+    pub local: RunnerChannelAvailability,
+    pub cloud: RunnerChannelAvailability,
+    pub auto_submit_available: bool,
+    pub auto_submit_reason: String,
+}
+
+impl Default for RunnerAvailability {
+    fn default() -> Self {
+        Self {
+            local: RunnerChannelAvailability::default(),
+            cloud: RunnerChannelAvailability::default(),
+            auto_submit_available: false,
+            auto_submit_reason:
+                "Auto-submit is unavailable because no Bluey runner is available for this account."
+                    .to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunEvent {
     pub id: String,
@@ -1162,6 +1206,8 @@ pub struct JobsWorkspace {
     pub mailbox_connections: Vec<MailboxConnection>,
     pub discovery_sources: Vec<DiscoverySourceSummary>,
     pub entitlement: JobsEntitlement,
+    #[serde(default)]
+    pub runner_availability: RunnerAvailability,
 }
 
 /// User-exportable Jobs data. Ephemeral local-run tickets and their secrets are

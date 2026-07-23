@@ -45,6 +45,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
             .map(DiscoverySourceSummary::from)
             .collect(),
         entitlement: get_entitlement(pool, account_id)?,
+        runner_availability: RunnerAvailability::default(),
     })
 }
 

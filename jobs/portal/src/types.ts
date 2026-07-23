@@ -411,6 +411,24 @@ export interface JobsEntitlement {
   additional_inbox_cents: number;
 }
 
+export type RunnerAvailabilityStatus = "available" | "invited_beta" | "upgrade_required";
+
+export interface RunnerChannelAvailability {
+  status: RunnerAvailabilityStatus;
+  available: boolean;
+  plan_included: boolean;
+  distribution_enabled: boolean;
+  reason: string;
+  next_action: string;
+}
+
+export interface RunnerAvailability {
+  local: RunnerChannelAvailability;
+  cloud: RunnerChannelAvailability;
+  auto_submit_available: boolean;
+  auto_submit_reason: string;
+}
+
 export interface JobsWorkspace {
   profile: CareerProfile;
   preferences: JobPreferences;
@@ -428,6 +446,7 @@ export interface JobsWorkspace {
   mailbox_connections: MailboxConnection[];
   discovery_sources: DiscoverySource[];
   entitlement: JobsEntitlement;
+  runner_availability: RunnerAvailability;
 }
 
 export interface AccountSummary {

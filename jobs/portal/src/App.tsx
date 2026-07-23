@@ -30,6 +30,7 @@ import { AuthGate } from "./components/AuthGate";
 import { Onboarding } from "./components/Onboarding";
 import { LoadError, LoadingScreen } from "./components/PageState";
 import { previewPosting, previewResume } from "./lib/preview-application";
+import { runnerAvailabilityOrLocked } from "./lib/runner-access";
 
 const MatchesView = lazy(() => import("./views/MatchesView").then((module) => ({ default: module.MatchesView })));
 const ApplicationsView = lazy(() => import("./views/ApplicationsView").then((module) => ({ default: module.ApplicationsView })));
@@ -62,7 +63,10 @@ export default function App() {
     setError("");
     try {
       const [nextWorkspace, nextAccount] = await Promise.all([jobsApi.workspace(), jobsApi.account()]);
-      setWorkspace(nextWorkspace);
+      setWorkspace({
+        ...nextWorkspace,
+        runner_availability: runnerAvailabilityOrLocked(nextWorkspace.runner_availability),
+      });
       setAccount(nextAccount);
     } catch (requestError) {
       const message = requestError instanceof Error ? requestError.message : "Bluey Jobs could not load.";
@@ -696,6 +700,7 @@ export default function App() {
       workspace={workspace}
       onRefresh={refresh}
       preview={isPreview}
+      previewSearch={previewSearch}
     >
       {error && <div className="global-message error"><AlertCircle size={16} />{error}</div>}
       {toast && <div className="toast" role="status">{toast}</div>}

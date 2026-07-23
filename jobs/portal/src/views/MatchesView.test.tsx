@@ -1,7 +1,8 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { DiscoverySource, DiscoverySourceHealth, JobPosting } from "../types";
+import type { DiscoverySource, DiscoverySourceHealth, JobPosting, RunnerAvailability } from "../types";
 import {
+  canAutoSubmit,
   DiscoverySourceHealthList,
   JOB_IMPORT_ACTION_LABEL,
   JOB_IMPORT_DESCRIPTION,
@@ -29,6 +30,7 @@ function source(status: DiscoverySource["status"], health: DiscoverySourceHealth
 }
 
 function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibility"]>["capability"] = "beta_review"): JobPosting {
+  const canAutoSubmit = canPrepare && capability === "certified";
   return {
     id: "job-1",
     canonical_key: "job-1",
@@ -53,9 +55,9 @@ function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibil
     eligibility: {
       capability,
       can_prepare: canPrepare,
-      can_auto_submit: false,
-      can_queue_local: false,
-      can_queue_cloud: false,
+      can_auto_submit: canAutoSubmit,
+      can_queue_local: canAutoSubmit,
+      can_queue_cloud: canAutoSubmit,
       hard_failures: canPrepare ? [] : [{ code: "location", message: "Austin is outside your selected locations." }],
       review_reasons: canPrepare ? [{ code: "beta", message: "Review first is required." }] : [],
       passed_checks: [],
@@ -63,6 +65,29 @@ function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibil
     },
   };
 }
+
+const runners = (available: boolean): RunnerAvailability => ({
+  local: {
+    status: available ? "available" : "invited_beta",
+    available,
+    plan_included: true,
+    distribution_enabled: available,
+    reason: available ? "Available." : "Bluey Browser is still in invited beta.",
+    next_action: available ? "Run locally." : "Use Review first.",
+  },
+  cloud: {
+    status: "upgrade_required",
+    available: false,
+    plan_included: false,
+    distribution_enabled: false,
+    reason: "Cloud plan required.",
+    next_action: "View plans.",
+  },
+  auto_submit_available: available,
+  auto_submit_reason: available
+    ? "Auto-submit is available."
+    : "Auto-submit is not available in this release because your included runner is still in invited beta.",
+});
 
 describe("discovery source health", () => {
   it.each(["healthy", "degraded", "paused", "waiting"] as const)("preserves the %s server health state", (health) => {
@@ -196,5 +221,14 @@ describe("Career Track filtering and submission truth", () => {
     expect(autoSubmitUnavailableReason(match(true, "beta_review"))).toContain("beta");
     expect(autoSubmitUnavailableReason(match(true, "handoff"))).toContain("user-controlled handoff");
     expect(autoSubmitUnavailableReason(match(false))).toContain("Career Track rules");
+  });
+
+  it("explains runner rollout separately from ATS eligibility", () => {
+    const certified = match(true, "certified");
+
+    expect(canAutoSubmit(certified, runners(false))).toBe(false);
+    expect(autoSubmitUnavailableReason(certified, runners(false))).toContain("invited beta");
+    expect(canAutoSubmit(certified, runners(true))).toBe(true);
+    expect(autoSubmitUnavailableReason(certified, runners(true))).toBeUndefined();
   });
 });

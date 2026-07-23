@@ -1,6 +1,27 @@
 import { describe, expect, it } from "vitest";
-import type { Intervention, JobApplication, JobPosting } from "../types";
+import type { Intervention, JobApplication, JobPosting, RunnerAvailability } from "../types";
 import { effectiveSubmissionMode, isFinalSubmissionReview, runnerEligibleApplications } from "./application-flow";
+
+const runners = (available: boolean): RunnerAvailability => ({
+  local: {
+    status: available ? "available" : "invited_beta",
+    available,
+    plan_included: true,
+    distribution_enabled: available,
+    reason: available ? "Available." : "Invited beta.",
+    next_action: available ? "Run locally." : "Review first.",
+  },
+  cloud: {
+    status: "upgrade_required",
+    available: false,
+    plan_included: false,
+    distribution_enabled: false,
+    reason: "Upgrade required.",
+    next_action: "View plans.",
+  },
+  auto_submit_available: available,
+  auto_submit_reason: available ? "Auto-submit is available." : "Auto-submit is still in invited beta.",
+});
 
 const application = (state: JobApplication["state"]): JobApplication => ({
   id: state,
@@ -57,9 +78,10 @@ describe("application workflow boundaries", () => {
     ]).map((item) => item.state)).toEqual(["queued"]);
   });
 
-  it("downgrades Auto-submit to Review first unless the server authorizes it", () => {
-    expect(effectiveSubmissionMode(job(false), "auto_submit")).toBe("review_first");
-    expect(effectiveSubmissionMode(job(true), "auto_submit")).toBe("auto_submit");
+  it("downgrades Auto-submit unless both the job and a runner are authorized", () => {
+    expect(effectiveSubmissionMode(job(false), "auto_submit", runners(true))).toBe("review_first");
+    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(false))).toBe("review_first");
+    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true))).toBe("auto_submit");
   });
 
   it("recognizes only the structured, open final-review intervention", () => {

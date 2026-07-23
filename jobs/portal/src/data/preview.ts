@@ -623,6 +623,27 @@ export const previewWorkspace: JobsWorkspace = {
     connected_inbox_limit: 5,
     additional_inbox_cents: 400,
   },
+  runner_availability: {
+    local: {
+      status: "available",
+      available: true,
+      plan_included: true,
+      distribution_enabled: true,
+      reason: "Bluey Browser is available on this account.",
+      next_action: "Approve a packet, then run it on this computer.",
+    },
+    cloud: {
+      status: "available",
+      available: true,
+      plan_included: true,
+      distribution_enabled: true,
+      reason: "The background runner is available on this account.",
+      next_action: "Approve a packet, then queue it in the cloud.",
+    },
+    auto_submit_available: true,
+    auto_submit_reason:
+      "Auto-submit can use either Bluey Browser or the background runner.",
+  },
 };
 
 export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: string): JobsWorkspace {
@@ -683,6 +704,91 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
           last_success_at_ms: now - 90_000,
         },
       ],
+    };
+  }
+  if (scenario === "runner-beta") {
+    const certified = workspace.matches[0];
+    const handoff = workspace.matches[2];
+    const unknown = workspace.matches[3];
+    return {
+      ...workspace,
+      matches: [
+        {
+          ...certified,
+          eligibility: {
+            ...(certified.eligibility ?? betaEligibility()),
+            capability: "certified",
+            can_auto_submit: true,
+            can_queue_local: true,
+            can_queue_cloud: true,
+            review_reasons: [],
+          },
+        },
+        workspace.matches[1],
+        {
+          ...handoff,
+          source: "indeed",
+          canonical_url: "https://www.indeed.com/viewjob?jk=preview-handoff",
+          eligibility: {
+            ...(handoff.eligibility ?? betaEligibility()),
+            capability: "handoff",
+            can_auto_submit: false,
+            can_queue_local: false,
+            can_queue_cloud: false,
+            review_reasons: [
+              {
+                code: "portal_handoff_required",
+                message:
+                  "Indeed applications stay in Review first. Bluey prepares the packet, then opens the job site for you.",
+              },
+            ],
+          },
+        },
+        {
+          ...unknown,
+          source: "direct_employer",
+          canonical_url: "https://careers.example.com/jobs/preview-unknown",
+          eligibility: {
+            ...(unknown.eligibility ?? betaEligibility()),
+            capability: "unknown_review",
+            can_auto_submit: false,
+            can_queue_local: false,
+            can_queue_cloud: false,
+            review_reasons: [
+              {
+                code: "unknown_ats_review_required",
+                message:
+                  "Bluey has not certified this application system. Review the packet and complete this application on the job site.",
+              },
+            ],
+          },
+        },
+      ],
+      runner_availability: {
+        local: {
+          status: "invited_beta",
+          available: false,
+          plan_included: true,
+          distribution_enabled: false,
+          reason:
+            "Bluey Browser is included in your plan but has not been enabled for this release.",
+          next_action:
+            "Use Review first; Bluey will prepare the exact resume and answers for handoff.",
+        },
+        cloud: {
+          status: "upgrade_required",
+          available: false,
+          plan_included: false,
+          distribution_enabled: false,
+          reason:
+            "Background Auto-submit is not included in the PRO Jobs plan.",
+          next_action:
+            "Choose Cloud, or keep using Review first.",
+        },
+        auto_submit_available: false,
+        auto_submit_reason:
+          "Auto-submit is not available in this release because your included runner is still in invited beta. Review first and job-site handoff remain available.",
+      },
     };
   }
   if (scenario !== "final-review") return workspace;

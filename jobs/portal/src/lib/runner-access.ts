@@ -1,3 +1,33 @@
+import type { RunnerAvailability, RunnerChannelAvailability } from "../types";
+
+export const lockedRunnerAvailability: RunnerAvailability = {
+  local: {
+    status: "invited_beta",
+    available: false,
+    plan_included: false,
+    distribution_enabled: false,
+    reason: "Bluey Browser availability could not be confirmed.",
+    next_action: "Use Review first while Bluey refreshes your runner access.",
+  },
+  cloud: {
+    status: "invited_beta",
+    available: false,
+    plan_included: false,
+    distribution_enabled: false,
+    reason: "Background runner availability could not be confirmed.",
+    next_action: "Use Review first while Bluey refreshes your runner access.",
+  },
+  auto_submit_available: false,
+  auto_submit_reason:
+    "Auto-submit is unavailable until Bluey confirms runner access. Review first and job-site handoff remain available.",
+};
+
+export function runnerAvailabilityOrLocked(
+  availability: RunnerAvailability | undefined,
+): RunnerAvailability {
+  return availability ?? lockedRunnerAvailability;
+}
+
 export const runnerLandingCopy = {
   flowTitle: "Review before a runner starts",
   flowBody:
@@ -18,54 +48,78 @@ export interface RunnerAccessCopy {
   action: string;
 }
 
-export function localRunnerAccessCopy(enabled: boolean): RunnerAccessCopy {
-  return enabled
-    ? {
-        badge: "Enabled",
-        description:
-          "Applications run on your computer in a separate Jobs browser. Take over at any moment.",
-        points: [
-          "Keeps your job-site sign-ins ready",
-          "Uses the same reviewed application packet",
-          "Stops when your computer is off",
-        ],
-        action: "Run locally",
-      }
-    : {
-        badge: "Invited beta",
-        description:
-          "Local runner access is opening gradually to invited beta accounts.",
-        points: [
-          "Request access from Settings",
-          "Review tailored packets in the portal now",
-          "No browser run starts until access is enabled",
-        ],
-        action: "Request access",
-      };
+export function localRunnerAccessCopy(access: RunnerChannelAvailability): RunnerAccessCopy {
+  if (access.available) {
+    return {
+      badge: "Enabled",
+      description:
+        "Applications run on your computer in a separate Jobs browser. Take over at any moment.",
+      points: [
+        "Keeps your job-site sign-ins ready",
+        "Uses the same reviewed application packet",
+        "Stops when your computer is off",
+      ],
+      action: "Run locally",
+    };
+  }
+  if (access.status === "upgrade_required") {
+    return {
+      badge: "Plan upgrade",
+      description: access.reason,
+      points: [
+        access.next_action,
+        "Review tailored packets in the portal now",
+        "No browser run starts without runner access",
+      ],
+      action: "View plans",
+    };
+  }
+  return {
+    badge: "Invited beta",
+    description: access.reason,
+    points: [
+      access.next_action,
+      "Review tailored packets in the portal now",
+      "No browser run starts until this release enables it",
+    ],
+    action: "Review applications",
+  };
 }
 
-export function cloudRunnerAccessCopy(enabled: boolean): RunnerAccessCopy {
-  return enabled
-    ? {
-        badge: "Enabled",
-        description:
-          "Bluey continues from an encrypted, isolated browser profile while your computer is off.",
-        points: [
-          "Offers one-click email-code approval",
-          "Pauses for security checks and user handoff",
-          "Stores an evidence-backed submission receipt",
-        ],
-        action: "Queue a run",
-      }
-    : {
-        badge: "Invited beta",
-        description:
-          "Background runner access is opening gradually to invited beta accounts.",
-        points: [
-          "Request access from Settings",
-          "Review tailored packets in the portal now",
-          "No cloud run starts until access is enabled",
-        ],
-        action: "Request access",
-      };
+export function cloudRunnerAccessCopy(access: RunnerChannelAvailability): RunnerAccessCopy {
+  if (access.available) {
+    return {
+      badge: "Enabled",
+      description:
+        "Bluey continues from an encrypted, isolated browser profile while your computer is off.",
+      points: [
+        "Offers one-click email-code approval",
+        "Pauses for security checks and user handoff",
+        "Stores an evidence-backed submission receipt",
+      ],
+      action: "Queue a run",
+    };
+  }
+  if (access.status === "upgrade_required") {
+    return {
+      badge: "Plan upgrade",
+      description: access.reason,
+      points: [
+        access.next_action,
+        "Review tailored packets in the portal now",
+        "No cloud run starts without runner access",
+      ],
+      action: "View plans",
+    };
+  }
+  return {
+    badge: "Invited beta",
+    description: access.reason,
+    points: [
+      access.next_action,
+      "Review tailored packets in the portal now",
+      "No cloud run starts until this release enables it",
+    ],
+    action: "Review applications",
+  };
 }

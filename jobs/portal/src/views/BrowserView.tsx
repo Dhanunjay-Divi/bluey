@@ -39,8 +39,10 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   const finalSubmissionReview = isFinalSubmissionReview(intervention);
   const takeoverUrl = active?.takeover_url;
   const queuedApplications = runnerEligibleApplications(workspace.applications);
-  const localCopy = localRunnerAccessCopy(workspace.entitlement.local_browser);
-  const cloudCopy = cloudRunnerAccessCopy(workspace.entitlement.cloud_browser);
+  const localAccess = workspace.runner_availability.local;
+  const cloudAccess = workspace.runner_availability.cloud;
+  const localCopy = localRunnerAccessCopy(localAccess);
+  const cloudCopy = cloudRunnerAccessCopy(cloudAccess);
 
   const updateActiveSession = async () => {
     if (!active || sessionBusy) return;
@@ -121,15 +123,15 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       )}
 
       <section className="runner-grid">
-        <article className={`runner-option ${workspace.entitlement.local_browser ? "enabled" : "locked"}`}>
+        <article className={`runner-option ${localAccess.available ? "enabled" : "locked"}`}>
           <div className="runner-icon"><Laptop /></div>
           <div className="runner-copy"><p>LOCAL</p><h2>Bluey Browser</h2><span>{localCopy.description}</span><ul>{localCopy.points.map((point) => <li key={point}><Check size={14} />{point}</li>)}</ul></div>
-          <div className="runner-action"><b>{localCopy.badge}</b>{workspace.entitlement.local_browser ? <><button className="button primary" onClick={() => setLocalOpen(true)}>{localCopy.action}<ArrowRight size={16} /></button><button className="button secondary compact" onClick={() => setInstallOpen(true)}>Set up browser</button></> : <a className="button secondary" href="/jobs/settings#plans">{localCopy.action}<ArrowRight size={16} /></a>}</div>
+          <div className="runner-action"><b>{localCopy.badge}</b>{localAccess.available ? <><button className="button primary" onClick={() => setLocalOpen(true)}>{localCopy.action}<ArrowRight size={16} /></button><button className="button secondary compact" onClick={() => setInstallOpen(true)}>Set up browser</button></> : <a className="button secondary" href={localAccess.status === "upgrade_required" ? "/jobs/settings#plans" : "/jobs/applications"}>{localCopy.action}<ArrowRight size={16} /></a>}</div>
         </article>
-        <article className={`runner-option ${workspace.entitlement.cloud_browser ? "enabled" : "locked"}`}>
+        <article className={`runner-option ${cloudAccess.available ? "enabled" : "locked"}`}>
           <div className="runner-icon cloud"><Cloud /></div>
           <div className="runner-copy"><p>CLOUD</p><h2>Background runner</h2><span>{cloudCopy.description}</span><ul>{cloudCopy.points.map((point) => <li key={point}><Check size={14} />{point}</li>)}</ul></div>
-          <div className="runner-action"><b>{cloudCopy.badge}</b>{workspace.entitlement.cloud_browser ? <button className="button primary" onClick={() => setCloudOpen(true)}>{cloudCopy.action}<ArrowRight size={16} /></button> : <a className="button secondary" href="/jobs/settings#plans">{cloudCopy.action}<ArrowRight size={16} /></a>}</div>
+          <div className="runner-action"><b>{cloudCopy.badge}</b>{cloudAccess.available ? <button className="button primary" onClick={() => setCloudOpen(true)}>{cloudCopy.action}<ArrowRight size={16} /></button> : <a className="button secondary" href={cloudAccess.status === "upgrade_required" ? "/jobs/settings#plans" : "/jobs/applications"}>{cloudCopy.action}<ArrowRight size={16} /></a>}</div>
         </article>
       </section>
 

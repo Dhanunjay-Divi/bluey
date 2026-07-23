@@ -25,8 +25,9 @@ use crate::{
         self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
         AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
         CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication, JobPosting,
-        JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace, MailboxConnection,
-        PacketCommitResult, ResumeVersion, RunEvent,
+        JobEligibilityDecision, JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace,
+        MailboxConnection, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
+        RunnerChannelAvailability,
     },
     object_storage::{sha256_hex, ObjectStorage},
 };
@@ -329,6 +330,160 @@ fn apply_jobs_distribution_gates(
     entitlement.cloud_browser &= cloud_browser;
 }
 
+fn runner_channel_availability(
+    runner: &str,
+    plan: &str,
+    plan_included: bool,
+    distribution_enabled: bool,
+) -> RunnerChannelAvailability {
+    if !plan_included {
+        let (reason, next_action) = if runner == "local" {
+            (
+                format!(
+                    "Local Auto-submit is not included in the {} Jobs plan.",
+                    plan.to_ascii_uppercase()
+                ),
+                "Choose Pro or Cloud, or keep using Review first.".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "Background Auto-submit is not included in the {} Jobs plan.",
+                    plan.to_ascii_uppercase()
+                ),
+                "Choose Cloud, or keep using Review first.".to_string(),
+            )
+        };
+        return RunnerChannelAvailability {
+            status: "upgrade_required".to_string(),
+            available: false,
+            plan_included: false,
+            distribution_enabled,
+            reason,
+            next_action,
+        };
+    }
+    if !distribution_enabled {
+        let label = if runner == "local" {
+            "Bluey Browser"
+        } else {
+            "Background runner"
+        };
+        return RunnerChannelAvailability {
+            status: "invited_beta".to_string(),
+            available: false,
+            plan_included: true,
+            distribution_enabled: false,
+            reason: format!(
+                "{label} is included in your plan but has not been enabled for this release."
+            ),
+            next_action:
+                "Use Review first; Bluey will prepare the exact resume and answers for handoff."
+                    .to_string(),
+        };
+    }
+    let (reason, next_action) = if runner == "local" {
+        (
+            "Bluey Browser is available on this account.".to_string(),
+            "Approve a packet, then run it on this computer.".to_string(),
+        )
+    } else {
+        (
+            "The background runner is available on this account.".to_string(),
+            "Approve a packet, then queue it in the cloud.".to_string(),
+        )
+    };
+    RunnerChannelAvailability {
+        status: "available".to_string(),
+        available: true,
+        plan_included: true,
+        distribution_enabled: true,
+        reason,
+        next_action,
+    }
+}
+
+fn build_runner_availability(
+    entitlement: &JobsEntitlement,
+    local_distribution_enabled: bool,
+    cloud_distribution_enabled: bool,
+) -> RunnerAvailability {
+    let local = runner_channel_availability(
+        "local",
+        &entitlement.plan,
+        entitlement.local_browser,
+        local_distribution_enabled,
+    );
+    let cloud = runner_channel_availability(
+        "cloud",
+        &entitlement.plan,
+        entitlement.cloud_browser,
+        cloud_distribution_enabled,
+    );
+    let auto_submit_available = local.available || cloud.available;
+    let auto_submit_reason = if local.available && cloud.available {
+        "Auto-submit can use either Bluey Browser or the background runner.".to_string()
+    } else if local.available {
+        "Auto-submit can use Bluey Browser while this computer is running.".to_string()
+    } else if cloud.available {
+        "Auto-submit can use the background runner while your computer is off.".to_string()
+    } else if local.plan_included || cloud.plan_included {
+        "Auto-submit is not available in this release because your included runner is still in invited beta. Review first and job-site handoff remain available.".to_string()
+    } else {
+        "Auto-submit requires a Jobs plan with runner access. Review first remains available."
+            .to_string()
+    };
+    RunnerAvailability {
+        local,
+        cloud,
+        auto_submit_available,
+        auto_submit_reason,
+    }
+}
+
+fn auto_submit_request_error(
+    eligibility: &JobEligibilityDecision,
+    runners: &RunnerAvailability,
+) -> Option<ApiError> {
+    if let Some(reason) = eligibility.hard_failures.first() {
+        return Some((
+            StatusCode::CONFLICT,
+            format!("Auto-submit is blocked by your Career Track: {}", reason.message),
+        ));
+    }
+    if !eligibility.can_auto_submit {
+        let message = match eligibility.capability.as_str() {
+            "beta_review" => {
+                "Auto-submit is unavailable because this application system is in beta and requires packet review."
+            }
+            "handoff" => {
+                "Auto-submit is unavailable because this site requires a user-controlled handoff after Bluey prepares the application kit."
+            }
+            "unknown_review" => {
+                "Auto-submit is unavailable because this application system has not been certified."
+            }
+            "blocked" => "Auto-submit is unavailable because Bluey blocks runners on this site.",
+            _ => eligibility
+                .review_reasons
+                .first()
+                .map(|reason| reason.message.as_str())
+                .unwrap_or(
+                    "Auto-submit is unavailable until every application-system and Career Track check passes.",
+                ),
+        };
+        return Some((StatusCode::CONFLICT, message.to_string()));
+    }
+    if !runners.auto_submit_available {
+        let status = if runners.local.plan_included || runners.cloud.plan_included {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::PAYMENT_REQUIRED
+        };
+        return Some((status, runners.auto_submit_reason.clone()));
+    }
+    None
+}
+
 fn schedule_global_candidate_materialization(
     pool: crate::db::DbPool,
     account_id: String,
@@ -402,10 +557,17 @@ pub async fn workspace(
             ),
         }
     }
+    let local_distribution_enabled = jobs_local_browser_distribution_enabled();
+    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled();
+    workspace.runner_availability = build_runner_availability(
+        &workspace.entitlement,
+        local_distribution_enabled,
+        cloud_distribution_enabled,
+    );
     apply_jobs_distribution_gates(
         &mut workspace.entitlement,
-        jobs_local_browser_distribution_enabled(),
-        jobs_cloud_browser_distribution_enabled(),
+        local_distribution_enabled,
+        cloud_distribution_enabled,
     );
     Ok(Json(workspace))
 }
@@ -1126,6 +1288,27 @@ pub async fn prepare_application(
                 .to_string(),
         ));
     }
+    if req.submission_mode == "auto_submit" {
+        let eligibility = prepared
+            .application
+            .receipt
+            .get("eligibility")
+            .cloned()
+            .and_then(|value| serde_json::from_value::<JobEligibilityDecision>(value).ok())
+            .ok_or((
+                StatusCode::CONFLICT,
+                "Auto-submit is unavailable because Bluey could not verify the current application-system and Career Track decision.".to_string(),
+            ))?;
+        let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
+        let runners = build_runner_availability(
+            &entitlement,
+            jobs_local_browser_distribution_enabled(),
+            jobs_cloud_browser_distribution_enabled(),
+        );
+        if let Some(error) = auto_submit_request_error(&eligibility, &runners) {
+            return Err(error);
+        }
+    }
     let generated = jobs_resume_generation::generate(
         &state,
         &account.id,
@@ -1284,7 +1467,7 @@ pub async fn approve_application_packet(
         Some(&application.id),
     )
     .map_err(internal)?;
-    if !eligibility.can_queue_local {
+    if !eligibility.can_queue_local && !eligibility.can_queue_cloud {
         let message = eligibility
             .hard_failures
             .first()
@@ -1447,27 +1630,26 @@ pub async fn queue_application_run(
             "Only queued applications can start a browser runner.".to_string(),
         ));
     }
-    if req.runner == "local" && !jobs_local_browser_distribution_enabled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser is still an invited beta and is not distributed in this release."
-                .to_string(),
-        ));
-    }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    if (req.runner == "local" && !entitlement.local_browser)
-        || (req.runner == "cloud" && !entitlement.cloud_browser)
-    {
+    let runners = build_runner_availability(
+        &entitlement,
+        jobs_local_browser_distribution_enabled(),
+        jobs_cloud_browser_distribution_enabled(),
+    );
+    let channel = if req.runner == "local" {
+        &runners.local
+    } else {
+        &runners.cloud
+    };
+    if !channel.available {
+        let status = if channel.plan_included {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::PAYMENT_REQUIRED
+        };
         return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            "That browser runner is not included in your Jobs plan.".to_string(),
-        ));
-    }
-    if req.runner == "cloud" && !jobs_cloud_browser_distribution_enabled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The cloud runner is still an invited beta and is not available in this release."
-                .to_string(),
+            status,
+            format!("{} {}", channel.reason, channel.next_action),
         ));
     }
     let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
@@ -1963,13 +2145,6 @@ pub async fn save_browser_session(
     if !matches!(session.runner.as_str(), "local" | "cloud") {
         return bad_request("Choose the local or cloud browser.");
     }
-    if session.runner == "local" && !jobs_local_browser_distribution_enabled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser is still an invited beta and is not distributed in this release."
-                .to_string(),
-        ));
-    }
     if !matches!(
         session.status.as_str(),
         "queued" | "running" | "needs_input" | "paused" | "complete" | "failed"
@@ -1990,19 +2165,25 @@ pub async fn save_browser_session(
         }
     }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    if (session.runner == "local" && !entitlement.local_browser)
-        || (session.runner == "cloud" && !entitlement.cloud_browser)
-    {
+    let runners = build_runner_availability(
+        &entitlement,
+        jobs_local_browser_distribution_enabled(),
+        jobs_cloud_browser_distribution_enabled(),
+    );
+    let channel = if session.runner == "local" {
+        &runners.local
+    } else {
+        &runners.cloud
+    };
+    if !channel.available {
+        let status = if channel.plan_included {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::PAYMENT_REQUIRED
+        };
         return Err((
-            StatusCode::PAYMENT_REQUIRED,
-            "This browser runner is not included in your Jobs plan.".to_string(),
-        ));
-    }
-    if session.runner == "cloud" && !jobs_cloud_browser_distribution_enabled() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The cloud runner is still an invited beta and is not available in this release."
-                .to_string(),
+            status,
+            format!("{} {}", channel.reason, channel.next_action),
         ));
     }
     jobs::upsert_browser_session(&state.pool, &account.id, &session)
@@ -5110,6 +5291,86 @@ mod tests {
 
         assert!(entitlement.local_browser);
         assert!(entitlement.cloud_browser);
+    }
+
+    #[test]
+    fn free_plan_explains_that_auto_submit_needs_runner_access() {
+        let entitlement = test_entitlement(1);
+        let availability = build_runner_availability(&entitlement, false, false);
+
+        assert_eq!(availability.local.status, "upgrade_required");
+        assert_eq!(availability.cloud.status, "upgrade_required");
+        assert!(!availability.auto_submit_available);
+        assert!(availability.auto_submit_reason.contains("requires a Jobs plan"));
+    }
+
+    #[test]
+    fn included_but_undistributed_runner_is_truthfully_invited_beta() {
+        let mut entitlement = test_entitlement(3);
+        entitlement.plan = "pro".to_string();
+        entitlement.local_browser = true;
+        let availability = build_runner_availability(&entitlement, false, false);
+
+        assert_eq!(availability.local.status, "invited_beta");
+        assert!(availability.local.plan_included);
+        assert!(!availability.local.available);
+        assert!(!availability.auto_submit_available);
+        assert!(availability.auto_submit_reason.contains("invited beta"));
+    }
+
+    #[test]
+    fn distributed_runner_enables_auto_submit_availability() {
+        let mut entitlement = test_entitlement(5);
+        entitlement.plan = "cloud".to_string();
+        entitlement.local_browser = true;
+        entitlement.cloud_browser = true;
+        let availability = build_runner_availability(&entitlement, true, true);
+
+        assert!(availability.local.available);
+        assert!(availability.cloud.available);
+        assert!(availability.auto_submit_available);
+    }
+
+    fn test_eligibility(capability: &str, can_auto_submit: bool) -> JobEligibilityDecision {
+        JobEligibilityDecision {
+            capability: capability.to_string(),
+            can_auto_submit,
+            can_queue_local: can_auto_submit,
+            can_queue_cloud: can_auto_submit,
+            ..JobEligibilityDecision::default()
+        }
+    }
+
+    #[test]
+    fn auto_submit_error_names_ats_and_runner_boundaries() {
+        let mut entitlement = test_entitlement(3);
+        entitlement.plan = "pro".to_string();
+        entitlement.local_browser = true;
+        let unavailable = build_runner_availability(&entitlement, false, false);
+
+        let beta =
+            auto_submit_request_error(&test_eligibility("beta_review", false), &unavailable)
+                .expect("beta must stay in review");
+        assert_eq!(beta.0, StatusCode::CONFLICT);
+        assert!(beta.1.contains("in beta"));
+
+        let handoff =
+            auto_submit_request_error(&test_eligibility("handoff", false), &unavailable)
+                .expect("handoff must stay user controlled");
+        assert!(handoff.1.contains("user-controlled handoff"));
+
+        let unknown =
+            auto_submit_request_error(&test_eligibility("unknown_review", false), &unavailable)
+                .expect("unknown ATS must stay in review");
+        assert!(unknown.1.contains("has not been certified"));
+
+        let runner = auto_submit_request_error(
+            &test_eligibility("certified", true),
+            &unavailable,
+        )
+        .expect("undistributed runner must block auto submit");
+        assert_eq!(runner.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(runner.1.contains("invited beta"));
     }
 
     fn test_track(id: &str) -> CareerTrack {

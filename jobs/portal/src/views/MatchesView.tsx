@@ -30,6 +30,7 @@ import type {
   DiscoverySourceHealth,
   JobPosting,
   JobsWorkspace,
+  RunnerAvailability,
   UserJobInput,
 } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
@@ -193,7 +194,11 @@ export function MatchesView({
         setActionError("Bluey checked the original job, but it still needs attention before an application can be prepared.");
         return;
       }
-      await onPrepare(job, mode, effectiveSubmissionMode(job, submissionMode));
+      await onPrepare(
+        job,
+        mode,
+        effectiveSubmissionMode(job, submissionMode, workspace.runner_availability),
+      );
       setSelected(null);
     } catch (cause) {
       setActionError(cause instanceof Error ? cause.message : "Bluey could not verify this job right now.");
@@ -324,8 +329,8 @@ export function MatchesView({
                 <div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div>
                 <p className="selection-help">{mode === "enhance" ? "Enhance strengthens wording and emphasizes JD-relevant skills already supported by your profile. It never invents employers, dates, credentials, or experience." : "Factual keeps your verified wording and moves the strongest relevant evidence first."}</p>
                 <label>After preparation</label>
-                <div className="segmented"><button className={submissionMode === "review_first" || !jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!jobEligibility(selected).can_auto_submit} title={autoSubmitUnavailableReason(selected)} className={submissionMode === "auto_submit" && jobEligibility(selected).can_auto_submit ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div>
-                {!jobEligibility(selected).can_auto_submit && <p className="selection-help warning-copy">{autoSubmitUnavailableReason(selected)}</p>}
+                <div className="segmented"><button className={submissionMode === "review_first" || !canAutoSubmit(selected, workspace.runner_availability) ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!canAutoSubmit(selected, workspace.runner_availability)} title={autoSubmitUnavailableReason(selected, workspace.runner_availability)} className={submissionMode === "auto_submit" && canAutoSubmit(selected, workspace.runner_availability) ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div>
+                {!canAutoSubmit(selected, workspace.runner_availability) && <p className="selection-help warning-copy">{autoSubmitUnavailableReason(selected, workspace.runner_availability)}</p>}
               </section>
             </div>
             {actionError && <div className="inline-error" role="alert">{actionError}</div>}
@@ -501,14 +506,23 @@ function capabilityDescription(capability: ReturnType<typeof jobEligibility>["ca
   return "Bluey can prepare a kit, but this application system is not certified for runner submission.";
 }
 
-export function autoSubmitUnavailableReason(job: JobPosting): string | undefined {
+export function canAutoSubmit(job: JobPosting, runners: RunnerAvailability): boolean {
+  return jobEligibility(job).can_auto_submit && runners.auto_submit_available;
+}
+
+export function autoSubmitUnavailableReason(
+  job: JobPosting,
+  runners?: RunnerAvailability,
+): string | undefined {
   const eligibility = jobEligibility(job);
-  if (eligibility.can_auto_submit) return undefined;
   if (eligibility.hard_failures.length > 0) return "Resolve the Career Track rules above before Auto-submit can be considered.";
   if (eligibility.capability === "beta_review") return "Review first is required while this application system is in beta.";
   if (eligibility.capability === "handoff") return "This site uses a user-controlled handoff after Bluey prepares the application kit.";
   if (eligibility.capability === "unknown_review") return "Review first is required because this application system is not certified.";
   if (eligibility.capability === "blocked") return "This listing cannot use a Bluey runner.";
+  if (!eligibility.can_auto_submit) return "Auto-submit is available only after every server rule and application-system check passes.";
+  if (runners && !runners.auto_submit_available) return runners.auto_submit_reason;
+  if (eligibility.can_auto_submit) return undefined;
   return "Auto-submit is available only after every server rule and application-system check passes.";
 }
 

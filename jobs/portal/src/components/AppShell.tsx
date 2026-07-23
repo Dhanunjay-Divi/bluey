@@ -26,6 +26,7 @@ interface Props {
   workspace: JobsWorkspace;
   onRefresh: () => void;
   preview: boolean;
+  previewSearch: string;
 }
 
 const navItems = [
@@ -36,7 +37,7 @@ const navItems = [
   { to: "/settings", label: "Settings", icon: Settings },
 ];
 
-export function AppShell({ children, account, workspace, onRefresh, preview }: Props) {
+export function AppShell({ children, account, workspace, onRefresh, preview, previewSearch }: Props) {
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     const saved = localStorage.getItem("bluey_jobs_theme");
     if (saved === "light" || saved === "dark") return saved;
@@ -46,7 +47,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview }: P
   const profileRef = useRef<HTMLDivElement>(null);
   const profileButtonRef = useRef<HTMLButtonElement>(null);
   const openInterventions = workspace.interventions.filter((item) => item.status === "open").length;
-  const destination = (path: string) => `${path}${preview ? "?preview=1" : ""}`;
+  const destination = (path: string) => `${path}${previewSearch}`;
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
