@@ -66,13 +66,17 @@ source maps.
 
 ## Deployment Evidence
 
-Source commit:
+Implementation source commit used for the production Jobs API build:
 
 ```text
 02a8cce224eb40124d5151deedd1deaaaf4e0407
 ```
 
-Branch and `origin/main` both point to this commit.
+Final mainline/documentation commit:
+
+```text
+ae4c733981690e22b8da37b641234c9bcc178dd2
+```
 
 Production backups captured before rollout:
 
@@ -128,15 +132,17 @@ bluey-jobs-api.service ActiveState=active MainPID=2425193 NRestarts=0
 caddy.service ActiveState=active MainPID=2217438 NRestarts=0
 ```
 
-Final live checks:
+Final live checks after the documentation commit:
 
 ```text
-GET https://bluey.sh/jobs/                              200 0.333s
-GET https://bluey.sh/health                             200 0.143s
-GET https://bluey.sh/api/jobs/workspace                 401 0.260s
-GET https://bluey.sh/api/jobs/internal/discovery/lease  404 0.127s
-GET https://bluey.sh/jobs/assets/index-*.js.map         404 0.164s
-GET https://bluey.sh/jobs/ with GPTBot UA               403 0.083s
+GET https://bluey.sh/jobs/                              200 0.070s
+GET https://bluey.sh/jobs/assets/index-*.js             200 0.409s
+GET https://bluey.sh/jobs/assets/index-*.css            200 0.134s
+GET https://bluey.sh/health                             200
+GET https://bluey.sh/api/jobs/workspace                 401 0.078s
+GET https://bluey.sh/api/jobs/internal/discovery/lease  404
+GET https://bluey.sh/jobs/assets/index-*.js.map         404
+GET https://bluey.sh/jobs/ with GPTBot UA               403 0.157s
 GET http://127.0.0.1:8081/api/jobs/workspace            401 0.001s
 ```
 
