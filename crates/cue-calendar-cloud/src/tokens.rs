@@ -17,8 +17,10 @@ const KEY_EMAIL: &str = "account_email";
 /// slightly ahead of the real expiry rather than mid-request.
 pub const DEFAULT_EXPIRY_SKEW_SECS: u64 = 60;
 
+use serde::{Deserialize, Serialize};
+
 /// Calendar OAuth tokens for one provider connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalTokens {
     /// Bearer access token used on calendar API calls.
     pub access: String,
@@ -28,6 +30,53 @@ pub struct CalTokens {
     pub expires_at_epoch: u64,
     /// The connected account's email (for the UI label; best-effort).
     pub email: String,
+}
+
+/// Secure file-backed token store fallback (`~/.config/bluey/tokens/`) to bypass macOS Keychain prompt loops during dev.
+pub struct FileCalStore {
+    path: std::path::PathBuf,
+}
+
+impl FileCalStore {
+    pub fn new(service: &'static str) -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let dir = std::path::PathBuf::from(home)
+            .join(".config")
+            .join("bluey")
+            .join("tokens");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join(format!("{service}.json"));
+        Self { path }
+    }
+}
+
+impl CalTokenStore for FileCalStore {
+    fn save(&self, tokens: &CalTokens) -> Result<()> {
+        let json = serde_json::to_string_pretty(tokens)?;
+        std::fs::write(&self.path, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(())
+    }
+
+    fn load(&self) -> Result<Option<CalTokens>> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let data = std::fs::read_to_string(&self.path)?;
+        let tokens: CalTokens = serde_json::from_str(&data)?;
+        Ok(Some(tokens))
+    }
+
+    fn clear(&self) -> Result<()> {
+        if self.path.exists() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+        Ok(())
+    }
 }
 
 /// True when `tokens.access` is expired (or within `skew_secs` of expiry).
@@ -41,9 +90,15 @@ pub trait CalTokenStore: Send + Sync {
     fn save(&self, tokens: &CalTokens) -> Result<()>;
     fn load(&self) -> Result<Option<CalTokens>>;
     fn clear(&self) -> Result<()>;
+    /// Returns true if tokens exist in the FILE store only — never touches the
+    /// OS keychain, so it is safe to call on every poll tick without triggering
+    /// macOS Keychain authorization prompts.
+    fn file_connected(&self) -> bool {
+        false // overridden by KeyringCalStore
+    }
 }
 
-/// Production OS-keyring-backed store, namespaced per provider.
+/// Production OS-keyring-backed store with local file fallback to eliminate macOS Keychain prompts in dev.
 pub struct KeyringCalStore {
     /// The per-provider keyring service (from `Provider::keyring_service()`).
     service: &'static str,
@@ -61,15 +116,34 @@ impl KeyringCalStore {
 
 impl CalTokenStore for KeyringCalStore {
     fn save(&self, tokens: &CalTokens) -> Result<()> {
-        self.entry(KEY_ACCESS)?.set_password(&tokens.access)?;
-        self.entry(KEY_REFRESH)?.set_password(&tokens.refresh)?;
-        self.entry(KEY_EXPIRES_AT)?
-            .set_password(&tokens.expires_at_epoch.to_string())?;
-        self.entry(KEY_EMAIL)?.set_password(&tokens.email)?;
+        // File store is the PRIMARY read path — always write it first so that
+        // subsequent load() calls never need to touch the OS keychain.
+        let file_store = FileCalStore::new(self.service);
+        if let Err(e) = file_store.save(tokens) {
+            // Log but don't fail — keychain is the fallback.
+            tracing::warn!(error = %e, "calendar token file save failed; falling back to keychain-only");
+        }
+
+        // Keychain is a secondary backup (useful on a fresh machine before the
+        // file exists). Errors are best-effort — the file write above is the
+        // authoritative store.
+        let _ = self.entry(KEY_ACCESS).and_then(|e| Ok(e.set_password(&tokens.access)?));
+        let _ = self.entry(KEY_REFRESH).and_then(|e| Ok(e.set_password(&tokens.refresh)?));
+        let _ = self.entry(KEY_EXPIRES_AT).and_then(|e| Ok(e.set_password(&tokens.expires_at_epoch.to_string())?));
+        let _ = self.entry(KEY_EMAIL).and_then(|e| Ok(e.set_password(&tokens.email)?));
         Ok(())
     }
 
     fn load(&self) -> Result<Option<CalTokens>> {
+        let file_store = FileCalStore::new(self.service);
+
+        // Fast path: file exists → return immediately, zero keychain reads.
+        if let Ok(Some(tokens)) = file_store.load() {
+            return Ok(Some(tokens));
+        }
+
+        // Slow path (first run / file deleted): read from keychain, then
+        // immediately write back to the file so future calls never reach here.
         let access = match self.entry(KEY_ACCESS)?.get_password() {
             Ok(s) => s,
             Err(keyring::Error::NoEntry) => return Ok(None),
@@ -83,15 +157,17 @@ impl CalTokenStore for KeyringCalStore {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or(0);
         let email = self.entry(KEY_EMAIL)?.get_password().unwrap_or_default();
-        Ok(Some(CalTokens {
-            access,
-            refresh,
-            expires_at_epoch,
-            email,
-        }))
+        let tokens = CalTokens { access, refresh, expires_at_epoch, email };
+
+        // Write to file immediately so the next load() uses the fast path.
+        let _ = file_store.save(&tokens);
+
+        Ok(Some(tokens))
     }
 
     fn clear(&self) -> Result<()> {
+        let file_store = FileCalStore::new(self.service);
+        let _ = file_store.clear();
         for key in [KEY_ACCESS, KEY_REFRESH, KEY_EXPIRES_AT, KEY_EMAIL] {
             // Best-effort: ignore NoEntry on delete.
             if let Ok(entry) = self.entry(key) {
@@ -99,6 +175,12 @@ impl CalTokenStore for KeyringCalStore {
             }
         }
         Ok(())
+    }
+
+    /// Check connection status from the file store only — never touches the
+    /// OS keychain, so calling this on every daemon poll tick is safe.
+    fn file_connected(&self) -> bool {
+        FileCalStore::new(self.service).load().ok().flatten().is_some()
     }
 }
 

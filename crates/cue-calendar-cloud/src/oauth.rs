@@ -68,24 +68,34 @@ pub async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<TokenResponse> {
-    let form = [
+    let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("client_id", cfg.client_id.as_str()),
         ("code_verifier", verifier),
     ];
+    if let Some(ref secret) = cfg.client_secret {
+        if !secret.is_empty() {
+            form.push(("client_secret", secret.as_str()));
+        }
+    }
     post_token_form(&cfg.token_url, &form).await
 }
 
 /// Refresh an access token (`grant_type=refresh_token`). Google may omit a new
 /// refresh_token in the response — callers keep the prior one in that case.
 pub async fn refresh(cfg: &ProviderConfig, refresh_token: &str) -> Result<TokenResponse> {
-    let form = [
+    let mut form = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", cfg.client_id.as_str()),
     ];
+    if let Some(ref secret) = cfg.client_secret {
+        if !secret.is_empty() {
+            form.push(("client_secret", secret.as_str()));
+        }
+    }
     post_token_form(&cfg.token_url, &form).await
 }
 
