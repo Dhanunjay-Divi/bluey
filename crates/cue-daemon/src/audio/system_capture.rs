@@ -497,11 +497,17 @@ async fn run_mic_socket_session(
         .arg(&socket_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
+    tracing::info!(
+        bundle = %bundle.display(),
+        socket = %socket_path.display(),
+        "mic: launching BlueyAudio.app (open -n --source microphone)"
+    );
     if !matches!(cmd.status().await, Ok(s) if s.success()) {
         tracing::warn!("mic: `open` failed to launch BlueyAudio.app");
         let _ = std::fs::remove_file(&socket_path);
         return false;
     }
+    tracing::info!("mic: `open` returned OK; waiting for helper to connect to the socket…");
 
     let accept = tokio::time::timeout(Duration::from_secs(15), listener.accept()).await;
     let (mut conn, _addr) = match accept {
@@ -512,14 +518,27 @@ async fn run_mic_socket_session(
             return false;
         }
         Err(_) => {
-            tracing::warn!("mic: helper did not connect before timeout");
+            tracing::warn!(
+                "mic: helper did not connect before timeout — BlueyAudio.app likely \
+                 crashed on launch (missing NSMicrophoneUsageDescription?) or was denied"
+            );
             let _ = std::fs::remove_file(&socket_path);
             return false;
         }
     };
+    tracing::info!("mic: helper connected — reading audio frames");
 
     let mut buf = vec![0u8; CHUNK_BYTES.max(8192)];
     let mut offset = 0usize;
+    // Debug telemetry: total bytes read + a rough peak amplitude so the log shows
+    // whether audio is FLOWING and whether it's REAL vs SILENCE. macOS delivers a
+    // connected-but-silent stream when the Microphone grant is missing (the
+    // helper runs, frames arrive, but every sample is ~0) — this distinguishes
+    // "no permission" (bytes flow, peak ≈ 0) from "helper dead" (no bytes).
+    let mut total_bytes: u64 = 0;
+    let mut peak_abs: i32 = 0;
+    let mut last_report = std::time::Instant::now();
+    let mut reported_first_audio = false;
     let clean = loop {
         if stop.load(Ordering::Acquire) {
             break true;
@@ -529,8 +548,45 @@ async fn run_mic_socket_session(
         let read =
             tokio::time::timeout(Duration::from_millis(250), conn.read(&mut buf[offset..])).await;
         match read {
-            Ok(Ok(0)) => break false, // EOF: helper exited
+            Ok(Ok(0)) => {
+                tracing::warn!(
+                    total_bytes,
+                    "mic: helper closed the stream (EOF) — it exited"
+                );
+                break false;
+            } // EOF: helper exited
             Ok(Ok(n)) => {
+                total_bytes += n as u64;
+                // Sample peak amplitude over the freshly-read bytes (i16 LE PCM).
+                let fresh = &buf[offset..offset + n];
+                for pair in fresh.chunks_exact(2) {
+                    let s = i16::from_le_bytes([pair[0], pair[1]]) as i32;
+                    let a = s.abs();
+                    if a > peak_abs {
+                        peak_abs = a;
+                    }
+                }
+                if !reported_first_audio {
+                    tracing::info!(bytes = n, "mic: first audio bytes received");
+                    reported_first_audio = true;
+                }
+                // Report ~every 3s: bytes/s and peak. peak ≈ 0 over seconds ⇒
+                // connected but SILENT ⇒ Microphone permission almost certainly
+                // not granted to sh.bluey.audio.
+                if last_report.elapsed() >= Duration::from_secs(3) {
+                    if peak_abs < 8 {
+                        tracing::warn!(
+                            total_bytes,
+                            peak_abs,
+                            "mic: audio is flowing but SILENT (peak ~0) — grant \
+                             Microphone to BlueyAudio in System Settings → Privacy"
+                        );
+                    } else {
+                        tracing::info!(total_bytes, peak_abs, "mic: audio flowing (real signal)");
+                    }
+                    peak_abs = 0;
+                    last_report = std::time::Instant::now();
+                }
                 offset += n;
                 if !drain_frames(&mut buf, &mut offset, sender, CaptureRole::Microphone) {
                     break true; // receiver dropped

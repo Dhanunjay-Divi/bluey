@@ -663,6 +663,38 @@ private final class MicrophoneCapture {
     }
 
     func run() throws {
+        // Microphone TCC gate. Without an EXPLICIT authorization request the
+        // engine "starts" but the input tap never receives buffers (macOS returns
+        // a silent/empty input when mic access is denied), so the helper streams
+        // ZERO bytes and exits — the daemon then sees EOF and crash-loops. We
+        // request access synchronously and refuse to proceed if it isn't granted,
+        // logging the exact status so the failure is visible, not silent.
+        let status = AVCaptureDevice.authorizationStatus(for: .audio)
+        fputs("microphone: TCC authorization status = \(status.rawValue) "
+            + "(0=notDetermined 1=restricted 2=denied 3=authorized)\n", stderr)
+        if status == .notDetermined {
+            let sema = DispatchSemaphore(value: 0)
+            var granted = false
+            AVCaptureDevice.requestAccess(for: .audio) { ok in
+                granted = ok
+                sema.signal()
+            }
+            sema.wait()
+            fputs("microphone: permission prompt result granted=\(granted)\n", stderr)
+            if !granted {
+                throw NSError(
+                    domain: "BlueyAudio", code: 10,
+                    userInfo: [NSLocalizedDescriptionKey:
+                        "microphone access denied by the user"])
+            }
+        } else if status != .authorized {
+            throw NSError(
+                domain: "BlueyAudio", code: 11,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "microphone access not authorized (status \(status.rawValue)); "
+                    + "grant Microphone to BlueyAudio in System Settings → Privacy"])
+        }
+
         let input = engine.inputNode
         // Enable AEC BEFORE reading the input format: the VoiceProcessingIO unit
         // imposes its own sample rate and channel count, so a format captured
@@ -677,9 +709,16 @@ private final class MicrophoneCapture {
             throw NSError(domain: "BlueyAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "failed to create target format"])
         }
         let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+        fputs("microphone: input format \(inputFormat.sampleRate)Hz "
+            + "\(inputFormat.channelCount)ch; tap installed\n", stderr)
 
+        var tapFireCount = 0
         input.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) { [weak self] buffer, _ in
             guard let self else { return }
+            tapFireCount += 1
+            if tapFireCount == 1 {
+                fputs("microphone: FIRST tap buffer received (frames=\(buffer.frameLength)) — audio is flowing\n", stderr)
+            }
             let ratio = targetFormat.sampleRate / buffer.format.sampleRate
             let capacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 8))
             guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
@@ -693,11 +732,23 @@ private final class MicrophoneCapture {
             guard converted.frameLength > 0, let channel = converted.floatChannelData?[0] else { return }
             self.writer.write48kFloat(channel, frameCount: Int(converted.frameLength))
         }
-        try engine.start()
+        engine.prepare()
+        do {
+            try engine.start()
+            fputs("microphone: engine.start() OK isRunning=\(engine.isRunning) — waiting for tap buffers\n", stderr)
+        } catch {
+            fputs("microphone: engine.start() FAILED: \(error.localizedDescription)\n", stderr)
+            throw error
+        }
 
         if continuous {
-            // Run until killed
-            dispatchMain()
+            // Park on the CURRENT thread's run loop to keep the process alive.
+            // This method is invoked on the MAIN thread (see main.swift) so this
+            // services the main run loop AVAudioEngine needs. (Previously this was
+            // reached from inside a background `Task`, where the engine started on
+            // a thread with no live run loop and the tap never fired — the
+            // "engine started, 0 buffers" bug.)
+            RunLoop.current.run()
         } else {
             Thread.sleep(forTimeInterval: duration)
             engine.stop()
@@ -913,7 +964,45 @@ private func run() async -> Int32 {
     }
 }
 
-Task {
-    exit(await run())
+// The MICROPHONE path must run its AVAudioEngine on the MAIN thread: the engine
+// attaches to the calling thread's run loop, and starting it on a background
+// `Task` thread (which has no live run loop) leaves the input tap silent — the
+// engine "starts" but 0 buffers ever arrive. So we parse args up front and, for
+// mic mode, run synchronously on the main thread here (its own RunLoop.run()
+// keeps the process alive). Every other source keeps the async Task path.
+// Wrapped in a function so no top-level constant exposes the private `Args`
+// type (Swift rejects a file-scope `let` whose type is private).
+private func runMicrophoneOnMainThread() {
+    let parsed = parseArgs()
+    let sink: FileHandle
+    if let socketPath = parsed.socketPath {
+        guard let connected = connectSocket(socketPath) else {
+            fputs("bluey audio helper: could not connect to socket \(socketPath)\n", stderr)
+            exit(4)
+        }
+        sink = connected
+    } else {
+        sink = FileHandle.standardOutput
+    }
+    do {
+        let capture = MicrophoneCapture(
+            durationMs: parsed.durationMs,
+            continuous: parsed.continuous,
+            sink: sink
+        )
+        try capture.run() // continuous mode parks on the main run loop inside
+        exit(0)
+    } catch {
+        fputs("bluey audio helper failed: \(error.localizedDescription)\n", stderr)
+        exit(1)
+    }
 }
-dispatchMain()
+
+if CommandLine.arguments.contains("microphone") {
+    runMicrophoneOnMainThread()
+} else {
+    Task {
+        exit(await run())
+    }
+    dispatchMain()
+}
