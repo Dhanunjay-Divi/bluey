@@ -4226,6 +4226,46 @@ fn apply_attach_to_settings(
 /// resumed meeting is linked too; the in-meeting dedup guard avoids redundant
 /// saves. Best-effort — a failure only costs the resume affordance, never the
 /// answer; it holds the meeting lock only to mutate + save, then drops it.
+/// Clear `attached_session` so the next drive starts a FRESH agent conversation
+/// thread — used when a brand-new meeting is minted. Keeps `attached_agent`
+/// (same agent, new thread) and `attached_model`. The prior thread is not lost:
+/// it stays stamped on the previous meeting's `agent_session_id`, resumable by
+/// reopening that meeting. This is the default-fresh-per-meeting behaviour;
+/// cross-meeting recall is still available to the agent via the
+/// `search_agent_history` / `search_past_meetings` MCP tools (which scope by
+/// agent family, not by this thread id, so clearing it does not narrow recall).
+/// Pure settings mutation for [`clear_attached_session_for_new_meeting`]
+/// (extracted so the fresh-session rule is unit-testable without a `Daemon`).
+/// Moves any `attached_session` into `search_prefer_session` and clears the
+/// resume target. Returns `true` when it changed anything (so the caller only
+/// persists on a real change). `attached_agent`/`attached_model` are untouched —
+/// same agent, fresh thread.
+fn apply_fresh_session_to_settings(settings: &mut CueSettings) -> bool {
+    if settings.attached_session.is_none() {
+        return false; // already fresh
+    }
+    // Move (not lose) the cleared session into the search hint: the drive starts
+    // a fresh thread, but `search_agent_history` still prefers this most-recent
+    // session first before widening to the agent's OTHER sessions.
+    settings.search_prefer_session = settings.attached_session.take();
+    true
+}
+
+pub(crate) async fn clear_attached_session_for_new_meeting(daemon: &Arc<Daemon>) {
+    let Ok(mut settings) = load_settings(&daemon.paths) else {
+        return;
+    };
+    if !apply_fresh_session_to_settings(&mut settings) {
+        return; // already fresh — nothing to persist
+    }
+    settings.touch();
+    if let Err(error) = save_settings(&daemon.paths, &settings) {
+        warn!(error = %error, "failed to clear attached session for new meeting");
+    } else {
+        debug!("new meeting: cleared attached agent session (fresh thread); kept as search hint");
+    }
+}
+
 async fn stamp_meeting_agent_link(
     daemon: &Arc<Daemon>,
     kind: &AgentKind,
@@ -8298,11 +8338,16 @@ enum WarmupOutcome {
 async fn warmup_open(daemon: &Arc<Daemon>, title: Option<String>) -> Result<WarmupOutcome> {
     // Hard gate: no attached agent → no backend (there is no fallback LLM).
     let settings = load_settings(&daemon.paths).unwrap_or_default();
-    let Some(agent) = parse_attached_agent(settings.attached_agent.as_deref()) else {
+    let Some(attached) = parse_attached_agent(settings.attached_agent.as_deref()) else {
         return Ok(WarmupOutcome::Refused(
             "No coding agent attached — attach one to enable the meeting backend.".to_string(),
         ));
     };
+    // Cross-surface bridge: an agent with no CLI of its own (e.g. Antigravity IDE)
+    // drives through its sibling CLI (agy / Antigravity) — same product/account,
+    // replaying its transcript as context. Registration + drive both target the
+    // sibling, so `get_recent_transcript` lands in the CLI that actually answers.
+    let agent = cue_agent_bridge::continuation::continuation_bridge_kind(&attached, true);
 
     // Fresh per-meeting token; rotate on the running server and register.
     let reg = {
@@ -8354,6 +8399,9 @@ async fn warmup_open(daemon: &Arc<Daemon>, title: Option<String>) -> Result<Warm
                 daemon
                     .last_summary_words
                     .store(0, std::sync::atomic::Ordering::Relaxed);
+                // `reset_for_meeting` also clears the attached agent session so
+                // this meeting starts a FRESH agent thread (see its doc + the
+                // fresh-session helper) — no cross-meeting transcript bleed.
                 crate::conversation::reset_for_meeting(daemon, Some(meeting.id)).await;
                 update_state_from_meeting(daemon, Some(&meeting)).await?;
                 t
@@ -16532,12 +16580,26 @@ mod tests {
             "we should   cache the answer.",
             true,
         ));
-        assert!(!is_near_duplicate_transcript(
+        // CROSS-CHANNEL ECHO GUARD: the SAME long text arriving on a DIFFERENT
+        // channel (System line, now a User line) IS a duplicate — this is the
+        // mic-picks-up-the-speakers echo, which must be dropped. (A short shared
+        // phrase like "okay" would NOT match — see the next assertion.)
+        assert!(is_near_duplicate_transcript(
             &meeting,
             Speaker::User,
             "we should cache the answer.",
             true,
         ));
+        // A SHORT cross-speaker phrase (< CROSS_SPEAKER_MIN_LEN) is NOT a dup:
+        // two people can legitimately both say "okay" / "yes".
+        meeting.transcript.push(TranscriptSegment::new(Speaker::System, "okay", true));
+        assert!(!is_near_duplicate_transcript(
+            &meeting,
+            Speaker::User,
+            "okay",
+            true,
+        ));
+        // Different text on the same channel is never a dup.
         assert!(!is_near_duplicate_transcript(
             &meeting,
             Speaker::System,
@@ -16835,6 +16897,53 @@ mod tests {
         assert_eq!(settings.attached_agent, None);
         assert_eq!(settings.attached_session, None);
         assert_eq!(settings.attached_model, None);
+    }
+
+    #[test]
+    fn fresh_session_per_meeting_clears_resume_but_keeps_search_hint() {
+        // A meeting is active on session "s1" with the agent attached.
+        let mut settings = CueSettings {
+            attached_agent: Some("cursor".to_string()),
+            attached_session: Some("s1".to_string()),
+            attached_model: Some("opus".to_string()),
+            ..CueSettings::default()
+        };
+
+        // New meeting minted → fresh agent thread.
+        let changed = apply_fresh_session_to_settings(&mut settings);
+        assert!(changed, "a new meeting with a live session must reset it");
+        // The RESUME target is cleared (next drive starts a fresh thread)...
+        assert_eq!(
+            settings.attached_session, None,
+            "attached_session must be cleared so the drive starts fresh"
+        );
+        // ...but the session is NOT lost: it becomes the search-prefer hint, so
+        // search_agent_history still prefers the most-recent session first.
+        assert_eq!(
+            settings.search_prefer_session.as_deref(),
+            Some("s1"),
+            "the cleared session must survive as the search-prefer hint"
+        );
+        // Same agent, same model — only the thread is fresh.
+        assert_eq!(settings.attached_agent.as_deref(), Some("cursor"));
+        assert_eq!(settings.attached_model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn fresh_session_is_a_noop_when_already_fresh() {
+        // No live session → nothing to reset (avoids a needless settings write).
+        let mut settings = CueSettings {
+            attached_agent: Some("cursor".to_string()),
+            attached_session: None,
+            search_prefer_session: Some("s0".to_string()),
+            ..CueSettings::default()
+        };
+        assert!(
+            !apply_fresh_session_to_settings(&mut settings),
+            "already-fresh must report no change"
+        );
+        // An existing search hint is left untouched (not clobbered to None).
+        assert_eq!(settings.search_prefer_session.as_deref(), Some("s0"));
     }
 
     #[test]

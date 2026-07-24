@@ -589,11 +589,12 @@ mod tests {
         let solo = TranscriptSegment::new(Speaker::System, "hi", true).with_speaker_id(Some(1));
         assert_eq!(solo.context_label(), "Speaker 2");
 
-        // Talk-over: co-speakers appended so the AI sees the line was mixed.
+        // Talk-over: co-speakers appended (comma-separated) so the AI sees the
+        // line was mixed. 1-based ids: primary 1→"2", secondaries 2,4→"3","5".
         let mut mixed =
             TranscriptSegment::new(Speaker::System, "hi", true).with_speaker_id(Some(1));
         mixed.secondary_speaker_ids = vec![2, 4];
-        assert_eq!(mixed.context_label(), "Speaker 2 + 3 + 5");
+        assert_eq!(mixed.context_label(), "Speaker 2, 3, 5");
 
         // No diarization yet → coarse channel label, not "Speaker N".
         let unlabeled = TranscriptSegment::new(Speaker::System, "hi", true);

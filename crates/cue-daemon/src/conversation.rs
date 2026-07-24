@@ -225,6 +225,20 @@ pub(crate) async fn reset_for_meeting(daemon: &Arc<Daemon>, new_meeting_id: Opti
     daemon
         .conv_fold_inflight
         .store(false, std::sync::atomic::Ordering::SeqCst);
+    // FRESH AGENT SESSION PER MEETING (independent of the conv-memory feature).
+    // A brand-new meeting must NOT inherit the PREVIOUS meeting's agent
+    // conversation thread — that thread still holds the last meeting's transcript,
+    // so resuming it makes the agent answer from the WRONG meeting (the observed
+    // "referenced a different meeting's transcript" bug). Clear the attached
+    // session so the next drive starts a fresh thread; the old thread stays
+    // stamped on the prior meeting (`agent_session_id`), resumable on demand.
+    // Runs on EVERY mint path (warmup / MeetingStart / overlay Listen) because
+    // they all funnel through here. Done BEFORE the conv-memory early-return so it
+    // is NOT gated by that flag — this reset used to live implicitly in the
+    // conversation-memory subsystem and was lost when that was disabled.
+    if new_meeting_id.is_some() {
+        crate::app::clear_attached_session_for_new_meeting(daemon).await;
+    }
     // Only touch the DB when the feature is on — with it off the
     // `conversation_turns` table is never created (see `run_migrations`), so a
     // clear would be a guaranteed error on a non-existent table.

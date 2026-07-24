@@ -20,6 +20,15 @@ use parakeet_rs::Nemotron;
 
 const SAMPLE_RATE: f64 = 16_000.0;
 
+/// How many CONSECUTIVE empty (silence) chunks must arrive before the held tip
+/// is flushed as an utterance end. A single empty ~100ms chunk is NOT enough — a
+/// natural mid-word micro-gap (a breath, a plosive) produces one empty chunk,
+/// and flushing on it splits the word ("competencies" → "compet encies"). A real
+/// end-of-utterance pause spans several chunks, so we wait for a run of them.
+/// ~4 chunks ≈ 400ms — long enough to clear a mid-word gap, short enough that the
+/// final word still lands promptly at a true sentence end.
+const SILENCE_FLUSH_CHUNKS: u32 = 4;
+
 /// One streaming ASR engine, bound to a single audio source. Stateful — do not
 /// share across sources.
 pub struct SttEngine {
@@ -33,6 +42,10 @@ pub struct SttEngine {
     /// is committed. Flushed by `finalize_tip`. This is the local mitigation for
     /// the fully-causal encoder (no future right-context; see the crate notes).
     tip: String,
+    /// Run of consecutive empty (silence) chunks seen. The tip is flushed as an
+    /// utterance end only once this reaches [`SILENCE_FLUSH_CHUNKS`], so a brief
+    /// mid-word gap doesn't split the word. Reset to 0 on any non-empty chunk.
+    consecutive_silence: u32,
 }
 
 impl SttEngine {
@@ -55,6 +68,7 @@ impl SttEngine {
             asr,
             samples_seen: 0,
             tip: String::new(),
+            consecutive_silence: 0,
         })
     }
 
@@ -69,6 +83,7 @@ impl SttEngine {
             asr: Nemotron::from_shared(&handle.inner),
             samples_seen: 0,
             tip: String::new(),
+            consecutive_silence: 0,
         }
     }
 }
@@ -153,15 +168,23 @@ impl SttEngine {
             .transcribe_chunk(pcm)
             .map_err(|e| anyhow!("Nemotron transcribe_chunk failed: {e:?}"))?;
         if text.is_empty() {
-            // Silence chunk = a VAD pause: speech just stopped. The tip is held
-            // ONLY to reunite a word split across the NEXT chunk — but on a pause
-            // no next chunk is coming, so a held word would otherwise sit and get
-            // prepended to the NEXT sentence (the "last word bleeds into the next
-            // segment" bug). Flush it NOW so the sentence ends where the speaker
-            // stopped. This is standard endpointing: emit the final word on
-            // silence rather than waiting for more audio.
-            return Ok(self.finalize_tip());
+            // Silence chunk. A held tip is flushed as an utterance end ONLY after
+            // a RUN of silence (`SILENCE_FLUSH_CHUNKS`), not on the first empty
+            // chunk: a natural mid-word micro-gap (breath, plosive) yields a
+            // single empty ~100ms chunk, and flushing on it would split the word
+            // ("competencies" → "compet encies"). A real end-of-utterance pause
+            // spans several chunks — once we've seen enough, flush so the final
+            // word lands where the speaker stopped (endpointing) instead of
+            // bleeding into the next sentence. Below threshold: keep holding.
+            self.consecutive_silence = self.consecutive_silence.saturating_add(1);
+            if self.consecutive_silence >= SILENCE_FLUSH_CHUNKS {
+                return Ok(self.finalize_tip());
+            }
+            return Ok(None);
         }
+        // Speech resumed — reset the silence run so a later mid-word gap starts
+        // counting fresh.
+        self.consecutive_silence = 0;
 
         // Hold-the-tip: reunite the previously-held fragment with this chunk's
         // text (keeping the model's own spacing), then split off the NEW trailing

@@ -19,6 +19,27 @@ import { ChevronIcon, MicIcon, SystemAudioIcon } from "./icons";
  *  short enough that the answer feed above it stays the focus. */
 const EXPANDED_MAX_H = 168;
 
+/** How many trailing characters of the live line the collapsed caption shows.
+ *  The grouped line grows as one speaker keeps talking; a plain left-anchored
+ *  ellipsis would then freeze on the START of the line and hide the words being
+ *  spoken NOW. Keeping the TAIL means the caption always shows current speech. */
+const LIVE_CAPTION_TAIL = 90;
+
+/** The collapsed one-line caption: the newest words being spoken (the tail of
+ *  the current line), or a listening/idle placeholder. Trimming to the tail on a
+ *  word boundary keeps the live words visible instead of a stale line-start. */
+function liveCaption(text: string | undefined, listening: boolean): string {
+  const t = text?.trim();
+  if (!t) return listening ? "Listening…" : "Not listening — start audio to transcribe";
+  if (t.length <= LIVE_CAPTION_TAIL) return t;
+  const tail = t.slice(t.length - LIVE_CAPTION_TAIL);
+  // Start at the next word boundary so we don't slice mid-word; prefix an
+  // ellipsis to signal there's earlier text (the full line is in the tooltip
+  // and the expanded scroller).
+  const sp = tail.indexOf(" ");
+  return "…" + (sp >= 0 ? tail.slice(sp + 1) : tail);
+}
+
 export function LiveTranscriptBar() {
   // Reads the shared session state directly (MeetingProvider sits above <App/>),
   // so the bar stays a drop-in bottom row with no prop-drilling through the shell.
@@ -126,10 +147,7 @@ export function LiveTranscriptBar() {
           }}
           title={current?.text ?? undefined}
         >
-          {current?.text?.trim() ||
-            (listening
-              ? "Listening…"
-              : "Not listening — start audio to transcribe")}
+          {liveCaption(current?.text, listening)}
         </span>
         {/* ALWAYS-visible chevron affordance (decorative — the whole row is the
             toggle via its pointer handlers, so this is just a pointer-events:none

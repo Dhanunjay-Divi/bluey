@@ -49,9 +49,6 @@ const ENV_ENABLE: &str = "BLUEY_AGENT_HISTORY";
 const ENV_TTL_SECS: &str = "BLUEY_AGENT_HISTORY_TTL_SECS";
 /// Env override for the total-chunk cap (min-clamped).
 const ENV_MAX_CHUNKS: &str = "BLUEY_AGENT_HISTORY_MAX_CHUNKS";
-/// Env override for which agents' history is indexed — `attached` (default) or
-/// `all`. See [`HistoryScope`].
-const ENV_SCOPE: &str = "BLUEY_AGENT_HISTORY_SCOPE";
 
 /// Default rebuild TTL: 15 minutes.
 const DEFAULT_TTL_SECS: u64 = 900;
@@ -72,37 +69,21 @@ const MAX_TURNS_PER_SESSION: usize = 400;
 
 /// Which agents' session history the index covers.
 ///
-/// DEFAULT is [`Attached`](HistoryScope::Attached) — the least-surprising and
-/// most privacy-preserving choice: you attached one agent, so only that agent's
-/// past reasoning is searched. Reading the OTHER agents you happen to have
-/// installed (Cursor, Copilot, Gemini…) is a bigger step than attaching one, so
-/// it is explicit opt-in via `BLUEY_AGENT_HISTORY_SCOPE=all`.
-///
-/// `All` is genuinely useful — reasoning is scattered across tools, and a
-/// meeting answer arguably shouldn't care which one you happened to use — but
-/// that is a choice the user makes, not a default they inherit.
+/// ALWAYS [`Attached`](HistoryScope::Attached): only the currently attached
+/// agent's own sessions are searched — NEVER other agents you happen to have
+/// installed. `search_agent_history` prefers the most-recent session first, then
+/// widens to the SAME agent's other sessions, and stops there. Cross-agent search
+/// was removed deliberately: a meeting answer must not silently pull another
+/// agent's private reasoning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryScope {
-    /// Only the currently attached agent's sessions (default).
+    /// Only the currently attached agent's sessions.
     Attached,
-    /// Every discovered agent's sessions.
-    All,
 }
 
-/// Resolve the scope from `BLUEY_AGENT_HISTORY_SCOPE`. Unset or unrecognized →
-/// [`HistoryScope::Attached`] (fail-closed toward the private default).
+/// The history scope is fixed to the attached agent — see [`HistoryScope`].
 pub(crate) fn scope() -> HistoryScope {
-    resolve_scope(std::env::var(ENV_SCOPE).ok().as_deref())
-}
-
-/// Pure scope resolution, split out so it is unit-testable without touching
-/// process env (racy + `unsafe` in recent editions).
-fn resolve_scope(raw: Option<&str>) -> HistoryScope {
-    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
-        Some("all") => HistoryScope::All,
-        // "attached", anything unrecognized, or unset → the private default.
-        _ => HistoryScope::Attached,
-    }
+    HistoryScope::Attached
 }
 
 /// Whether the env flag requests the feature (independent of consent). The
@@ -195,15 +176,15 @@ impl AgentHistoryStore {
             }
         };
 
-        // Prefer the session the user ATTACHED (the live-meeting bridge: a fresh
-        // meeting agent searches that session first, widening to the broader
-        // index only if it holds nothing relevant — see `search_prefer_session`).
-        // `attached_session` and the index's `session_id` are the same id-space
-        // (both the raw `SessionRef.id`), so a direct match works; an unset
-        // attachment degrades to a plain full-index search.
+        // Prefer the most-recent agent session FIRST, widening to the agent's
+        // OTHER sessions only if it holds nothing relevant. Prefer the live
+        // resume target (`attached_session`) when one is set; else the retained
+        // `search_prefer_session` hint (the last session, kept after a fresh-per-
+        // meeting drive cleared `attached_session`). Both share the index's
+        // `session_id` id-space, so a direct match works; unset → plain search.
         let prefer = cue_core::load_settings(&daemon.paths)
             .ok()
-            .and_then(|s| s.attached_session)
+            .and_then(|s| s.attached_session.or(s.search_prefer_session))
             .unwrap_or_default();
 
         // The active model's calibrated score floor (bge/arctic ~0.45, Gemma
@@ -261,12 +242,10 @@ impl AgentHistoryStore {
         };
         let cap = max_chunks();
 
-        // Scope (default: the attached agent only — see `HistoryScope`). Resolved
-        // HERE, per rebuild, so re-attaching a different agent re-scopes the
-        // index on the next TTL rebuild.
-        let scope = scope();
-        let only_kind = match scope {
-            HistoryScope::All => None,
+        // Scope: the attached agent ONLY (see `HistoryScope`) — never other
+        // agents. Resolved HERE, per rebuild, so re-attaching a different agent
+        // re-scopes the index on the next TTL rebuild.
+        let only_kind = match scope() {
             HistoryScope::Attached => {
                 let settings = cue_core::load_settings(&daemon.paths).ok();
                 let kind = settings
@@ -391,12 +370,12 @@ fn same_agent_family(want: &AgentKind, candidate: &AgentKind) -> bool {
 /// session. The caller applies the global chunk cap while indexing (so the
 /// most-recent sessions win).
 ///
-/// `only_kind` scopes the sweep: `Some(kind)` indexes ONLY that agent's sessions
-/// (the default [`HistoryScope::Attached`]), `None` indexes every discovered
-/// agent ([`HistoryScope::All`], explicit opt-in). All three Claude surfaces
-/// (CLI / App / Agent) share one `claude` engine and transcript store, so
-/// attaching any of them matches the others — scoping to a single variant would
-/// hide the same underlying history.
+/// `only_kind` scopes the sweep to ONLY that agent's sessions — always
+/// `Some(kind)` now ([`HistoryScope::Attached`]); cross-agent indexing was
+/// removed. (`None` still means "no kind filter", but callers no longer pass it.)
+/// All three Claude surfaces (CLI / App / Agent) share one `claude` engine and
+/// transcript store, so attaching any of them matches the others — scoping to a
+/// single variant would hide the same underlying history.
 fn collect_recent_sessions(only_kind: Option<AgentKind>) -> Vec<SessionProse> {
     let mut out: Vec<SessionProse> = Vec::new();
     for agent in discover_agents() {
@@ -537,18 +516,10 @@ mod tests {
     }
 
     #[test]
-    fn scope_defaults_to_attached_and_only_all_widens_it() {
-        // Unset → the private default. Unrecognized values also fail CLOSED to
-        // Attached rather than silently widening to every installed agent.
-        assert_eq!(resolve_scope(None), HistoryScope::Attached);
-        assert_eq!(resolve_scope(Some("attached")), HistoryScope::Attached);
-        assert_eq!(resolve_scope(Some("")), HistoryScope::Attached);
-        assert_eq!(resolve_scope(Some("everything")), HistoryScope::Attached);
-        assert_eq!(resolve_scope(Some("1")), HistoryScope::Attached);
-        // Only an explicit "all" opts in to cross-agent history.
-        assert_eq!(resolve_scope(Some("all")), HistoryScope::All);
-        assert_eq!(resolve_scope(Some("ALL")), HistoryScope::All);
-        assert_eq!(resolve_scope(Some("  all  ")), HistoryScope::All);
+    fn scope_is_always_attached_never_cross_agent() {
+        // The scope is fixed to the attached agent — cross-agent history search
+        // was removed, so there is exactly one scope and no env override widens it.
+        assert_eq!(scope(), HistoryScope::Attached);
     }
 
     #[test]

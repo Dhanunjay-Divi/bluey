@@ -810,7 +810,12 @@ pub const REGISTRY: &[AgentEntry] = &[
         // Replay/fork: the IDE conversation ids are not resumable cross-store via
         // a CLI (mirrors Cursor / Gemini / the 2.0 Antigravity row).
         continuation: ContinuationTier::Replay,
-        continuation_via: None,
+        // The IDE has NO CLI of its own, but it is the same product/account as the
+        // `Antigravity` CLI (`agy`) — so bridge drives through that sibling,
+        // replaying the IDE's transcript as context. Same cross-surface pattern
+        // as VS Code → Copilot. Without this, selecting Antigravity IDE reports
+        // "no CLI installed" even though `agy` is available.
+        continuation_via: Some(KindTag::Antigravity),
         // GUI-installed out of band; no CLI installer.
         install: None,
         // No headless CLI to drive an apply — read/propose only.

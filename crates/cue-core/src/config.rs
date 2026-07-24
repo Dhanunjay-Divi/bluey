@@ -81,9 +81,20 @@ pub struct CueSettings {
     pub attached_agent: Option<String>,
     /// Agent bridge: the session id to resume on the attached agent, if the
     /// user attached with a session to continue. `None` means start a fresh
-    /// session. Cleared on detach.
+    /// session. Cleared on detach. Also cleared when a NEW meeting is minted so
+    /// each meeting drives a FRESH agent thread (no cross-meeting transcript
+    /// bleed); the prior thread stays resumable via the meeting's stamped
+    /// `agent_session_id`.
     #[serde(default)]
     pub attached_session: Option<String>,
+    /// Agent bridge: the MOST RECENT agent session id, kept for
+    /// `search_agent_history`'s "prefer this session first" ranking even after
+    /// `attached_session` is cleared for a fresh-per-meeting drive. Distinct from
+    /// `attached_session` (which is the RESUME target): this is only a search
+    /// hint, so the agent's own most-recent reasoning is preferred before
+    /// widening to its OTHER sessions. Never crosses to other agents.
+    #[serde(default)]
+    pub search_prefer_session: Option<String>,
     /// Agent bridge: per-run model override for the attached agent (a vendor
     /// model id, e.g. "composer-2.5" / "gpt-5.1-codex"). Applied via the
     /// registry row's `model_flag`; a no-op for agents with no model flag.
@@ -180,6 +191,7 @@ impl Default for CueSettings {
             allow_agent_session_history: true,
             attached_agent: None,
             attached_session: None,
+            search_prefer_session: None,
             attached_model: None,
             accepted_byot_vendors: Vec::new(),
             pinned_overlay_sessions: Vec::new(),

@@ -117,6 +117,30 @@ pub async fn register_bluey_memory(
             )?;
             Ok(RegisterOutcome::Registered)
         }
+        AgentKind::Antigravity | AgentKind::AntigravityIde => {
+            // `agy` is the Gemini desktop family and reads its MCP servers from
+            // the USER-scope `~/.gemini/config/mcp_config.json` (`mcpServers`
+            // section), NOT a project-scope file — and `agy mcp add` opens a TTY
+            // TUI (not scriptable), so we merge the config file directly. Same
+            // streamable-HTTP shape Gemini uses (`httpUrl` + bearer header).
+            // Without this, Antigravity never receives Bluey's memory server, so
+            // `get_recent_transcript` is unavailable and the agent answers "no
+            // meeting transcript was provided" mid-meeting.
+            let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                return Ok(RegisterOutcome::Unsupported(
+                    "cannot locate $HOME for Antigravity MCP config".to_string(),
+                ));
+            };
+            merge_json_config(
+                &home.join(".gemini").join("config").join("mcp_config.json"),
+                "mcpServers",
+                json!({
+                    "httpUrl": reg.url,
+                    "headers": { "Authorization": format!("Bearer {}", reg.token) }
+                }),
+            )?;
+            Ok(RegisterOutcome::Registered)
+        }
         AgentKind::Cursor => {
             merge_json_config(
                 &cwd.join(".cursor").join("mcp.json"),
@@ -154,6 +178,17 @@ pub async fn deregister_bluey_memory(kind: &AgentKind, cwd: &Path) -> Result<()>
         AgentKind::Gemini => {
             remove_json_config_key(&cwd.join(".gemini").join("settings.json"), "mcpServers")
         }
+        AgentKind::Antigravity | AgentKind::AntigravityIde => {
+            // Surgically remove only the bluey-memory key from the user-scope
+            // `~/.gemini/config/mcp_config.json` (the user's other servers stay).
+            match std::env::var_os("HOME").map(std::path::PathBuf::from) {
+                Some(home) => remove_json_config_key(
+                    &home.join(".gemini").join("config").join("mcp_config.json"),
+                    "mcpServers",
+                ),
+                None => Ok(()),
+            }
+        }
         AgentKind::Cursor => {
             let _ = run(cwd, "cursor-agent", &["mcp", "disable", BLUEY_SERVER_NAME]).await;
             remove_json_config_key(&cwd.join(".cursor").join("mcp.json"), "mcpServers")
@@ -166,8 +201,11 @@ pub async fn deregister_bluey_memory(kind: &AgentKind, cwd: &Path) -> Result<()>
 /// Bluey's server (live-verified per agent in the Batch-0 spike).
 pub fn drive_env_for(kind: &AgentKind, reg: &BlueyServerReg) -> Vec<(String, String)> {
     match kind {
-        // Gemini refuses headless MCP in an untrusted workspace.
-        AgentKind::Gemini => vec![("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into())],
+        // Gemini (and the Antigravity desktop family it shares an engine with)
+        // refuse headless MCP in an untrusted workspace.
+        AgentKind::Gemini | AgentKind::Antigravity | AgentKind::AntigravityIde => {
+            vec![("GEMINI_CLI_TRUST_WORKSPACE".into(), "true".into())]
+        }
         // Codex reads the bearer token from this env var.
         AgentKind::Codex => vec![(BLUEY_TOKEN_ENV.into(), reg.token.clone())],
         _ => Vec::new(),
