@@ -8051,6 +8051,30 @@ async fn auto_end_active_meeting(daemon: &Arc<Daemon>) -> Result<Option<MeetingR
     };
 
     meeting.ended_at = Some(clock::now_epoch_ms_string());
+
+    // Never persist an EMPTY meeting. A meeting with no transcript, no Q&A, no
+    // context, and no summary is an auto-created shell (every daemon restart or
+    // stray trigger mints one). Archiving it here is exactly what littered
+    // History with "No transcript was captured · 0 lines · 0 Q&A" rows. Discard
+    // the active file and return without archiving — nothing of value is lost.
+    if !meeting.has_content() {
+        if let Err(error) = daemon.store.discard_active() {
+            warn!(meeting_id = %meeting.id, "failed to discard empty meeting on end: {error:#}");
+        } else {
+            debug!(meeting_id = %meeting.id, "empty meeting discarded on end (not archived)");
+        }
+        *daemon.ledger.lock().await = cue_core::LedgerState::default();
+        daemon
+            .last_ledger_words
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        daemon
+            .last_summary_words
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        crate::conversation::reset_for_meeting(daemon, None).await;
+        update_state_from_meeting(daemon, None).await?;
+        return Ok(None);
+    }
+
     let recap = generate_recap(&meeting);
     meeting.summary = Some(recap.summary.clone());
     // Title upgrade: this is the ONLY place a meeting gets a content-derived

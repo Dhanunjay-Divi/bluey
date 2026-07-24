@@ -3,6 +3,12 @@ use uuid::Uuid;
 
 use crate::clock;
 
+/// The boilerplate summary/title a meeting gets when it ends with no captured
+/// content. It is NOT real content, so [`MeetingRecord::meeting_is_substantive`]
+/// must not count it — otherwise every empty meeting clutters the History list
+/// as a "0 lines · 0 Q&A" row. Referenced by the recap generator too.
+pub const EMPTY_MEETING_SUMMARY: &str = "No transcript was captured for this meeting.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Speaker {
@@ -453,7 +459,14 @@ impl MeetingRecord {
             || self
                 .summary
                 .as_ref()
-                .is_some_and(|summary| !summary.trim().is_empty())
+                // The "no transcript was captured" placeholder is NOT real
+                // content — a meeting that ended empty gets that boilerplate
+                // summary + title, and counting it as substantive is exactly what
+                // clutters the list with "0 lines · 0 Q&A" rows. Ignore it.
+                .is_some_and(|summary| {
+                    let s = summary.trim();
+                    !s.is_empty() && s != EMPTY_MEETING_SUMMARY
+                })
     }
 
     pub fn last_transcript_text(&self, count: usize) -> String {
@@ -663,6 +676,16 @@ mod tests {
         let mut blank_summary = MeetingRecord::new(Some("Meeting 10:00".to_string()));
         blank_summary.summary = Some("   ".to_string());
         assert!(!blank_summary.meeting_is_substantive());
+
+        // The "no transcript was captured" placeholder summary is NOT real
+        // content — an empty meeting that ended with it must stay hidden (the
+        // "0 lines · 0 Q&A" clutter bug).
+        let mut placeholder = MeetingRecord::new(Some(EMPTY_MEETING_SUMMARY.to_string()));
+        placeholder.summary = Some(EMPTY_MEETING_SUMMARY.to_string());
+        assert!(
+            !placeholder.meeting_is_substantive(),
+            "the empty-meeting placeholder summary must not make a meeting substantive"
+        );
 
         // Attached context alone → substantive.
         let mut with_context = MeetingRecord::new(Some("Meeting 10:00".to_string()));

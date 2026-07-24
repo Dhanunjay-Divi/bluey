@@ -148,7 +148,7 @@ pub fn generate_recap(meeting: &MeetingRecord) -> MeetingRecap {
             && meeting.context.is_empty()
             && meeting.conversation.is_empty()
         {
-            "No transcript was captured for this meeting.".to_string()
+            crate::meeting::EMPTY_MEETING_SUMMARY.to_string()
         } else {
             let mut summary = format!(
                 "Captured {} transcript segment(s).\n\nRecent context:\n{}",
