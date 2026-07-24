@@ -174,6 +174,7 @@ pub fn run() {
             commands::meeting_ask,
             commands::meeting_ask_cancel,
             commands::pick_context_files,
+            commands::capture_screenshot,
             ipc::overlay_send,
         ])
         .setup(|app| {

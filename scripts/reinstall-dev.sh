@@ -61,6 +61,15 @@ printf 'reinstall-dev: building daemon + CLI + overlay (%s, %s)…\n' "$TARGET" 
 cargo build --target "$TARGET" --features "$DAEMON_FEATURES" \
   -p cue-daemon -p cue-cli -p cue-meeting-overlay
 
+# --- 2b. build the BlueyShot.app screenshot helper (macOS) ---
+# The overlay launches this bundle for "Take a screenshot": a bare binary can't
+# hold the Screen Recording TCC grant, only an .app bundle can (proven by
+# BlueyAudio.app). Built + staged beside the overlay so it resolves at runtime.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  printf 'reinstall-dev: building BlueyShot.app screenshot helper…\n'
+  bash native/macos/cue-shot/build.sh >/dev/null
+fi
+
 out="$REPO/target/$TARGET/debug"
 
 # --- 3. stop the running daemon BEFORE overwriting its binary ---
@@ -81,6 +90,17 @@ for b in bluey bluey-daemon cue-meeting-overlay; do
   fi
 done
 
+# --- 4a. stage BlueyShot.app beside the overlay in BOTH the target dir (where
+# the daemon launches the overlay from) and the install dir, so the overlay's
+# bundle resolver finds it at runtime. ---
+if [[ "$(uname -s)" == "Darwin" && -d native/macos/cue-shot/.build/BlueyShot.app ]]; then
+  for dest in "$out" "$install_bin"; do
+    rm -rf "$dest/BlueyShot.app"
+    cp -R native/macos/cue-shot/.build/BlueyShot.app "$dest/" \
+      && printf 'reinstall-dev: staged BlueyShot.app in %s\n' "$dest"
+  done
+fi
+
 # --- 4b. STABLE codesign identity for the daemon (TCC persistence) ---------
 # macOS TCC keys a permission grant (Screen Recording, Microphone) to the code
 # signature's IDENTIFIER. An ad-hoc `codesign --sign -` derives that identifier
@@ -94,6 +114,19 @@ if command -v codesign >/dev/null 2>&1; then
     >/dev/null 2>&1 \
     && printf 'reinstall-dev: signed bluey-daemon with stable identifier sh.bluey.daemon\n' \
     || printf 'reinstall-dev: WARN stable codesign of bluey-daemon failed\n' >&2
+  # The OVERLAY captures the screenshot now (Screen Recording is keyed to the
+  # capturing process), so it needs the same stable-identifier treatment or its
+  # grant resets on every rebuild too. IMPORTANT: the daemon launches the overlay
+  # from the TARGET dir (target/<triple>/debug/cue-meeting-overlay), not the
+  # install dir — so sign BOTH copies, or the running process keeps a hash id.
+  for overlay_bin in "$install_bin/cue-meeting-overlay" "$out/cue-meeting-overlay"; do
+    if [[ -x "$overlay_bin" ]]; then
+      codesign --force --sign - --identifier "sh.bluey.overlay" "$overlay_bin" \
+        >/dev/null 2>&1 \
+        && printf 'reinstall-dev: signed %s with stable identifier sh.bluey.overlay\n' "$overlay_bin" \
+        || printf 'reinstall-dev: WARN stable codesign of %s failed\n' "$overlay_bin" >&2
+    fi
+  done
 fi
 
 # --- 5. (re)start ---

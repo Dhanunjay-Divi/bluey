@@ -314,3 +314,107 @@ pub async fn pick_context_files(app: AppHandle) -> Result<Vec<String>, String> {
         .collect();
     Ok(paths)
 }
+
+/// Capture the screen to a PNG and return its path. The capture runs inside the
+/// `BlueyShot.app` BUNDLE (launched via `/usr/bin/open`), NOT a bare binary:
+/// macOS TCC (Screen Recording) can only be granted to an app with a bundle
+/// identity — a bare binary is always silently denied (empty file). This mirrors
+/// the proven `BlueyAudio.app` pattern. The caller (JS) then hands the path to
+/// the daemon as `attach_files_requested`, which classifies the PNG as an image
+/// and sends it to the agent as pixels over ACP.
+///
+/// Returns an error string if the bundle is missing, the tool fails, or the file
+/// is empty (e.g. Screen Recording was not granted to BlueyShot yet).
+#[tauri::command]
+pub async fn capture_screenshot() -> Result<String, String> {
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("screenshot capture is implemented on macOS only".to_string())
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let bundle = bluey_shot_app_bundle()
+            .ok_or_else(|| "BlueyShot.app not found (screenshot helper not staged)".to_string())?;
+
+        let dir = std::env::temp_dir().join("bluey-overlay-captures");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("create capture dir: {e}"))?;
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let path = dir.join(format!("screenshot-{stamp}.png"));
+
+        let path_for_task = path.clone();
+        // `open -W -n <BlueyShot.app> --args --out <png>`: -W waits for it to
+        // finish, -n launches a fresh instance, and macOS reads the bundle
+        // identity so the capture is attributed to sh.bluey.shot (which holds the
+        // Screen Recording grant).
+        let status = tauri::async_runtime::spawn_blocking(move || {
+            Command::new("/usr/bin/open")
+                .arg("-W")
+                .arg("-n")
+                .arg(&bundle)
+                .arg("--args")
+                .arg("--out")
+                .arg(&path_for_task)
+                .status()
+        })
+        .await
+        .map_err(|e| format!("screenshot task failed: {e}"))?
+        .map_err(|e| format!("failed to launch BlueyShot.app: {e}"))?;
+
+        if !status.success() {
+            return Err("screenshot helper exited with an error".to_string());
+        }
+        match std::fs::metadata(&path) {
+            Ok(m) if m.len() > 0 => Ok(path.to_string_lossy().to_string()),
+            Ok(_) | Err(_) => Err(
+                "screen capture was denied — grant Screen Recording to BlueyShot in \
+                 System Settings → Privacy & Security → Screen Recording, then try again"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Resolve the `BlueyShot.app` bundle dir (not the inner binary) so it can be
+/// launched via `/usr/bin/open` — the only way macOS reads the bundle identity
+/// the Screen Recording grant attaches to. Mirrors the audio helper's resolver:
+/// beside the overlay binary first (staged install), then the dev `.build` dir.
+#[cfg(target_os = "macos")]
+fn bluey_shot_app_bundle() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("BLUEY_SHOT_APP_BUNDLE") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    let app = "BlueyShot.app";
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dirs = Vec::new();
+        if let Some(dir) = exe.parent() {
+            dirs.push(dir.to_path_buf());
+        }
+        if let Ok(canonical) = exe.canonicalize() {
+            if let Some(dir) = canonical.parent() {
+                dirs.push(dir.to_path_buf());
+            }
+        }
+        for dir in dirs {
+            let candidate = dir.join(app);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    let dev_app = PathBuf::from(format!("native/macos/cue-shot/.build/{app}"));
+    if dev_app.exists() {
+        return Some(dev_app);
+    }
+    None
+}

@@ -725,11 +725,19 @@ export function createTauriClient(): MeetingClient {
     },
 
     captureScreenshot() {
-      // "+" → Take a screenshot: the daemon captures the screen, attaches the PNG
-      // as an image artifact, and routes it to the attached agent, which reads the
-      // pixels itself over ACP (no separate vision provider). A thumbnail chip
-      // appears via the set_context_items push.
-      sendEvent({ type: "analyze_screen_requested" });
+      // "+" → Take a screenshot: capture the screen from the OVERLAY's own process
+      // (Screen Recording permission is keyed to the capturing process; the
+      // headless daemon's grant is fragile, so the overlay — a stable GUI app — is
+      // the robust capturer). Hand the PNG to the daemon as `attach_files_requested`;
+      // it classifies the .png as an image and sends it to the agent as pixels over
+      // ACP. A thumbnail chip appears via the set_context_items push.
+      void invoke<string>("capture_screenshot")
+        .then((path) => {
+          if (path) sendEvent({ type: "attach_files_requested", paths: [path] });
+        })
+        .catch((error) => {
+          console.error("capture_screenshot failed", error);
+        });
     },
 
     onContextItems(cb) {
