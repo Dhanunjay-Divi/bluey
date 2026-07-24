@@ -484,7 +484,11 @@
 
 /* --- Inline attachments (screenshots/files) in the document -------- */
 .fp-attach {
-  margin-top: 26px;
+  /* Balanced spacing: the preceding .fp-line already contributes 22px below it,
+     so keep the attachment's own top margin small and add an equal bottom margin
+     so it sits evenly between the two transcript blocks (was 26px top / 0 bottom
+     → lopsided). */
+  margin: 6px 0 20px;
   animation: fp-fade-in 0.35s ease both;
 }
 .fp-attach-kicker {
@@ -643,6 +647,245 @@
 .fp-speaker-cand:hover {
   background: var(--paper-sink);
   color: var(--ink);
+}
+
+/* --- Premium speaker editor popover (SpeakerEditor) ---------------- */
+.fp-speaker-current {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--paper-sink);
+  border-radius: 5px;
+  padding: 0 4px;
+  box-shadow: 0 0 0 2px var(--paper-sink);
+}
+.fp-speditor {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: 232px;
+  padding: 8px;
+  border-radius: 14px;
+  background: var(--glass-solid, var(--paper-2));
+  border: 1px solid var(--line);
+  box-shadow: 0 14px 40px rgba(28, 26, 25, 0.22);
+  animation: fp-pop-in 0.18s cubic-bezier(0.22, 1, 0.36, 1);
+  cursor: default;
+  text-align: left;
+}
+.fp-speditor-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 2px 4px 8px;
+}
+.fp-speditor-head span {
+  flex: 1 1 auto;
+}
+.fp-speditor-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+}
+.fp-speditor-x:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+.fp-speditor-namerow {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.fp-speditor-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--font);
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 7px 10px;
+  outline: none;
+}
+.fp-speditor-input:focus {
+  border-color: var(--ink-3);
+}
+.fp-speditor-apply {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  border: none;
+  border-radius: 9px;
+  background: var(--ink);
+  color: var(--paper);
+  cursor: pointer;
+  transition: opacity 0.14s ease;
+}
+.fp-speditor-apply:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+.fp-speditor-group {
+  margin-top: 6px;
+}
+.fp-speditor-kicker {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-4, var(--ink-3));
+  padding: 4px 4px 3px;
+}
+.fp-speditor-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 6px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+.fp-speditor-row:hover {
+  background: var(--paper-sink);
+}
+.fp-speditor-avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 11px;
+  font-weight: 600;
+}
+.fp-speditor-avatar.is-alt {
+  background: var(--paper-sink);
+  color: var(--ink-2);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.fp-speditor-rowname {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fp-speditor-new {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 8px;
+  border: 1px dashed var(--line);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.fp-speditor-new:hover {
+  background: var(--paper-sink);
+  border-color: var(--ink-3);
+  color: var(--ink);
+}
+
+/* --- Selection toolbar (assign a highlighted transcript span) ------ */
+.fp-seltool {
+  z-index: 60;
+  animation: fp-pop-in 0.14s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fp-seltool-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 12px;
+  border: none;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 12.5px;
+  font-weight: 560;
+  cursor: pointer;
+  box-shadow: 0 8px 24px rgba(28, 26, 25, 0.28);
+}
+.fp-seltool-menu {
+  min-width: 190px;
+  padding: 6px;
+  border-radius: 12px;
+  background: var(--glass-solid, var(--paper-2));
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 34px rgba(28, 26, 25, 0.24);
+}
+.fp-seltool-kicker {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 3px 6px 5px;
+}
+.fp-seltool-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+.fp-seltool-row:hover {
+  background: var(--paper-sink);
+}
+.fp-seltool-avatar {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 11px;
+  font-weight: 600;
+}
+.fp-seltool-avatar.is-new {
+  background: var(--paper-sink);
+  color: var(--ink-2);
+  box-shadow: inset 0 0 0 1px var(--line);
 }
 
 /* =====================================================================
@@ -935,6 +1178,21 @@
 }
 .fp-fab:active {
   transform: scale(0.94);
+}
+/* Per-click tap-pop — a quick springy bounce on every press. */
+.fp-fab.is-tapped {
+  animation: fp-fab-tap 0.32s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes fp-fab-tap {
+  0% {
+    transform: scale(0.9);
+  }
+  45% {
+    transform: scale(1.12);
+  }
+  100% {
+    transform: scale(1);
+  }
 }
 .fp-fab:disabled {
   opacity: 0.5;
@@ -1480,15 +1738,53 @@
   }
 }
 /* The Ask input's "droplet/bubble-open" spring to the right. */
+/* The Ask input's bubble/droplet OPEN: springs out from the anchor with a soft
+ * overshoot so it reads as a bubble popping open, not a linear slide. */
 @keyframes fp-droplet {
-  from {
+  0% {
     opacity: 0;
-    transform: scaleX(0.6) translateY(4px);
+    transform: scale(0.5) translateX(-6px);
   }
-  to {
+  60% {
     opacity: 1;
-    transform: scaleX(1) translateY(0);
+    transform: scale(1.04) translateX(0);
   }
+  100% {
+    opacity: 1;
+    transform: scale(1) translateX(0);
+  }
+}
+
+/* Mic toggle pop — the glyph springs when on/off flips (the little dopamine
+ * hit). Keyed by a changing `key` in React so it re-runs on every toggle. */
+.fp-mic-glyph {
+  display: inline-flex;
+  animation: fp-mic-pop 0.32s cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+@keyframes fp-mic-pop {
+  0% {
+    transform: scale(0.55) rotate(-12deg);
+    opacity: 0.4;
+  }
+  55% {
+    transform: scale(1.18) rotate(3deg);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1) rotate(0);
+  }
+}
+
+/* Top drawer/menu button: a gentle press + the layers glyph slides on hover so
+ * it feels like it "opens". */
+.fp-iconbtn svg {
+  transition: transform 0.22s cubic-bezier(0.2, 0.9, 0.2, 1);
+}
+.fp-iconbtn:hover svg {
+  transform: translateY(-1px) scale(1.06);
+}
+.fp-iconbtn:active svg {
+  transform: scale(0.92);
 }
 
 /* =====================================================================

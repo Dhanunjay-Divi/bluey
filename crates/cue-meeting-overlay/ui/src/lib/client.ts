@@ -119,6 +119,20 @@ export interface MeetingClient {
    *  voice is auto-recognized in future meetings. Fire-and-forget. Empty `name`
    *  clears back to a fallback label. */
   renameSpeaker(speakerId: number, name: string): void;
+  /** Reassign a SPAN of transcript segments to a speaker (the "select a span →
+   *  assign to speaker" correction). `speakerId` may be an existing speaker or a
+   *  fresh index for a NEW speaker; optional `name` sets the label in one step.
+   *  The daemon rewrites the segments, re-broadcasts, and (during a live meeting)
+   *  re-enrolls the speaker's voiceprint from the span's audio. Fire-and-forget. */
+  reassignSpan(segmentIds: string[], speakerId: number, name?: string): void;
+  /** Split ONE transcript segment at a character offset into two, assigning each
+   *  half to a (possibly different) speaker (the "break here" correction). */
+  splitSegment(
+    segmentId: string,
+    charOffset: number,
+    firstSpeakerId: number,
+    secondSpeakerId: number,
+  ): void;
   /** Subscribe to the active meeting's calendar attendees (pushed at warmup) —
    *  the tap-to-pick candidates for speaker rename. Returns an unsubscribe fn. */
   onMeetingCandidates(cb: (candidates: SpeakerCandidate[]) => void): () => void;

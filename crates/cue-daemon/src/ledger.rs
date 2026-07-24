@@ -61,7 +61,10 @@ pub fn interval_turns() -> usize {
 /// and merges nothing — a cheap no-op pass. We fire often to stay fresh, and the
 /// model decides there's nothing worth saving. Override with
 /// `BLUEY_LEDGER_INTERVAL_WORDS`.
-pub const DEFAULT_INTERVAL_WORDS: usize = 350;
+// TESTING (temporary): lowered 350 → 120 so the ledger fires within a short
+// test meeting instead of needing ~2.7 min of continuous speech. Revert to 350
+// for production. Override at runtime with BLUEY_LEDGER_INTERVAL_WORDS.
+pub const DEFAULT_INTERVAL_WORDS: usize = 120;
 
 /// Words between ledger passes (env `BLUEY_LEDGER_INTERVAL_WORDS`, min 100).
 pub fn interval_words() -> usize {

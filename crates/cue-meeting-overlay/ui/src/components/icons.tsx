@@ -46,6 +46,21 @@ export function MicIcon({ size }: { size?: number }) {
   );
 }
 
+/** Microphone MUTED — the mic with a diagonal slash. The universal "off/muted"
+ *  read, so mic-on vs mic-off is unmistakable at a glance. */
+export function MicOffIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <rect x="9" y="3" width="6" height="11" rx="3" />
+      <path d="M5.5 11a6.5 6.5 0 0 0 13 0" />
+      <path d="M12 17.5V21" />
+      <path d="M9 21h6" />
+      {/* the slash — a slightly heavier stroke so it reads as "off" */}
+      <path d="M4 3l16 18" strokeWidth={1.9} />
+    </Icon>
+  );
+}
+
 /** System audio — a speaker emitting waves; the "the call / others" source. */
 export function SystemAudioIcon({ size }: { size?: number }) {
   return (

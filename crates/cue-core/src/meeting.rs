@@ -286,6 +286,15 @@ pub struct ContextArtifact {
     #[serde(default)]
     pub processing_error: Option<String>,
     pub created_at: String,
+    /// The id of the LAST finalized transcript segment present when this artifact
+    /// was attached — its ANCHOR into the timeline. The overlay renders each
+    /// attachment inline right after the transcript line CONTAINING this segment,
+    /// so a screenshot/file stays pinned where it was added (like a Q&A turn) and
+    /// the conversation flows below it. A segment id (not a raw index) because the
+    /// UI GROUPS segments into fewer lines — an index would overshoot to the tail.
+    /// `None` on pre-existing artifacts (they fall to the end).
+    #[serde(default)]
+    pub anchor_segment_id: Option<String>,
 }
 
 impl ContextArtifact {
@@ -307,7 +316,15 @@ impl ContextArtifact {
             processing_status: ContextProcessingStatus::Pending,
             processing_error: None,
             created_at: clock::now_epoch_ms_string(),
+            anchor_segment_id: None,
         }
+    }
+
+    /// Pin this artifact to the transcript segment it was attached after (the
+    /// last finalized segment at attach time). See [`ContextArtifact::anchor_segment_id`].
+    pub fn with_anchor_segment_id(mut self, id: impl Into<String>) -> Self {
+        self.anchor_segment_id = Some(id.into());
+        self
     }
 
     pub fn with_text_preview(mut self, preview: impl Into<String>) -> Self {
@@ -437,6 +454,18 @@ impl MeetingRecord {
                 .summary
                 .as_ref()
                 .is_some_and(|summary| !summary.trim().is_empty())
+    }
+
+    /// The most recent activity time (epoch ms) — the newest transcript segment's
+    /// `created_at`, falling back to `started_at`. Used by boot recovery to tell a
+    /// genuine mid-session restart (resume) from stale leftover junk (archive).
+    pub fn last_activity_ms(&self) -> i64 {
+        self.transcript
+            .iter()
+            .filter_map(|s| s.created_at.parse::<i64>().ok())
+            .max()
+            .or_else(|| self.started_at.parse::<i64>().ok())
+            .unwrap_or(0)
     }
 
     /// A STRICTER bar than [`has_content`] for what belongs in the History list.

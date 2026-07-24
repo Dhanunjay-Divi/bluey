@@ -42,7 +42,9 @@ import {
 } from "./transcriptGrouping";
 import type {
   AnswerStatusStep,
+  ContextItem,
   FixProposal,
+  ListeningState,
   MeetingDecision,
   MeetingState,
   TranscriptLine,
@@ -106,6 +108,19 @@ interface MeetingStateValue {
   turnSeq: React.MutableRefObject<number>;
   /** false until the Fix-B snapshot seed has applied once. */
   rehydrated: boolean;
+  /** Attached context (screenshots/files). Seeded from the meeting snapshot on
+   *  mount/reseed (so reopening reloads them) AND kept live by onContextItems.
+   *  Each item's `anchorIndex` pins it inline in the timeline. */
+  context: ContextItem[];
+  /** The live capture state (idle | connecting | listening | paused | failed |
+   *  permission_denied). Lives HERE (not in a screen) so it survives a
+   *  collapse→expand: the screen unmounts on collapse and would otherwise reset
+   *  to "idle" while the daemon keeps capturing — the toggle then lies. */
+  listenState: ListeningState;
+  /** Whether OUR mic is being captured (in addition to system audio). Also kept
+   *  here so it survives the collapse→expand remount. */
+  micInputOn: boolean;
+  setMicInputOn: (on: boolean) => void;
 }
 
 const MeetingStateContext = createContext<MeetingStateValue | null>(null);
@@ -120,6 +135,15 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   const [detectedQ, setDetectedQ] = useState<DetectedQuestion | null>(null);
   const [fixProposal, setFixProposal] = useState<FixProposal | null>(null);
   const [rehydrated, setRehydrated] = useState(false);
+  // Capture state lives at the provider (never-unmounted) so it survives a
+  // collapse→expand. The daemon pushes listening_state_changed on every
+  // transition; we hold the latest so a remounted screen reads the TRUTH.
+  const [listenState, setListenState] = useState<ListeningState>("idle");
+  const [micInputOn, setMicInputOn] = useState(false);
+  // Attached context, seeded from the snapshot (reopen/reseed) and kept live by
+  // onContextItems. Lives here so it survives a collapse→expand and reloads on
+  // reopen — the live push alone never re-delivers already-attached artifacts.
+  const [context, setContext] = useState<ContextItem[]>([]);
 
   // The authoritative grouped history, keyed by member segment ids. This grouper
   // is the single writer of the `history` state; both the seed and the live sub
@@ -210,6 +234,9 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     setTurns(seededTurns);
     turnSeq.current = snap.conversation.length;
     setDecisions(snap.decisions ?? []);
+    // Reload persisted attachments inline (the live push never re-delivers
+    // already-attached artifacts to a fresh mount).
+    setContext(snap.context ?? []);
     setDetectedQ(null);
     setFixProposal(null);
   };
@@ -258,6 +285,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
         setTurns(seededTurns);
         turnSeq.current = snap.conversation.length;
         setDecisions(snap.decisions ?? []);
+        setContext(snap.context ?? []);
 
         // Treat the seed as "just heard" so the FIRST live fragment continuing
         // the same speaker within PAUSE_MS joins the seeded tail into one flowing
@@ -298,6 +326,15 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
       }),
     [client],
   );
+
+  // Capture state — subscribed ONCE at the provider so the latest daemon-pushed
+  // state persists across a collapse→expand (the screen that used to own this
+  // reset it to "idle" on every remount, desyncing the toggle from reality).
+  useEffect(() => client.onListeningState(setListenState), [client]);
+
+  // Live context push (attach/screenshot/remove). Seeded separately from the
+  // snapshot (below) so a reopen reloads persisted context; this keeps it fresh.
+  useEffect(() => client.onContextItems(setContext), [client]);
 
   // ---- diarized speaker-label upgrades (single owner) ----
   // Labels lag lines: the daemon's live diarize tick resolves "who said it" a
@@ -355,6 +392,10 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     patchTurn,
     turnSeq,
     rehydrated,
+    context,
+    listenState,
+    micInputOn,
+    setMicInputOn,
   };
 
   return (

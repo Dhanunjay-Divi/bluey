@@ -62,9 +62,13 @@ export function tailCap(text: string): string {
   return sp > 0 ? tail.slice(sp + 1) : tail;
 }
 
-// Project the internal grouped lines to the public render shape (drop `ids`).
+// Project the internal grouped lines to the public render shape. `ids` (the
+// internal reconciliation key) is surfaced as `memberIds` so callers can resolve
+// an ATTACHMENT ANCHOR (a segment id) to the grouped line that contains it — the
+// UI groups many segments into one line, so an attachment anchored to segment N
+// must find WHICH line holds N. The renderer otherwise ignores it.
 export function toHistory(lines: GroupedLine[]): TranscriptLine[] {
-  return lines.map(({ ids: _ids, ...line }) => line);
+  return lines.map(({ ids, ...line }) => ({ ...line, memberIds: ids }));
 }
 
 /** The result of folding one segment: the fresh full history and the ambient

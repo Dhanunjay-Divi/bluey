@@ -57,7 +57,10 @@ pub fn interval_segments() -> usize {
 /// not cadence: `build_prompt` lets the model return the summary UNCHANGED when a
 /// window added nothing meaningful (see `build_prompt`), so a chitchat stretch is
 /// a cheap near-no-op. Override with `BLUEY_SUMMARY_INTERVAL_WORDS`.
-pub const DEFAULT_INTERVAL_WORDS: usize = 800;
+// TESTING (temporary): lowered 800 → 200 so a rolling summary appears within a
+// short test meeting. Revert to 800 for production. Override with
+// BLUEY_SUMMARY_INTERVAL_WORDS.
+pub const DEFAULT_INTERVAL_WORDS: usize = 200;
 
 /// Words between summary passes (env `BLUEY_SUMMARY_INTERVAL_WORDS`, min 150).
 pub fn interval_words() -> usize {

@@ -15,6 +15,7 @@ import {
   AttachIcon,
   GlobeIcon,
   MicIcon,
+  MicOffIcon,
   SendIcon,
   SparkleIcon,
   SpinnerIcon,
@@ -33,6 +34,7 @@ export function FloatingStack({
   onAttach,
   onCapturePage,
   onAsk,
+  onAskRecent,
 }: {
   listenState: ListeningState;
   micInputOn: boolean;
@@ -44,14 +46,27 @@ export function FloatingStack({
   onAttach: () => void;
   onCapturePage: () => void;
   onAsk: (question: string) => void;
+  /** Single-click on Ask → answer the most recent meeting question immediately
+   *  (no input). Double-click opens the typing bar. */
+  onAskRecent: () => void;
 }) {
   const [asking, setAsking] = useState(false);
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  // Disambiguate single vs double click on the Ask anchor: a single click fires
+  // after a short delay UNLESS a second click arrives first (→ double).
+  const clickTimer = useRef<number | null>(null);
 
   useEffect(() => {
     if (asking) inputRef.current?.focus();
   }, [asking]);
+
+  useEffect(
+    () => () => {
+      if (clickTimer.current) window.clearTimeout(clickTimer.current);
+    },
+    [],
+  );
 
   const submit = () => {
     const q = text.trim();
@@ -62,6 +77,29 @@ export function FloatingStack({
     onAsk(q);
     setText("");
     setAsking(false);
+  };
+
+  // Ask anchor click routing. If the typing bar is already open, a click just
+  // closes it. Otherwise: wait ~230ms; if no second click lands, treat as a
+  // SINGLE click → answer the recent question. A second click cancels the timer
+  // and opens the typing bar (DOUBLE click).
+  const onAskClick = () => {
+    if (askStreaming) return;
+    if (asking) {
+      setAsking(false);
+      return;
+    }
+    if (clickTimer.current) {
+      // second click → double: cancel the pending single, open the input.
+      window.clearTimeout(clickTimer.current);
+      clickTimer.current = null;
+      setAsking(true);
+      return;
+    }
+    clickTimer.current = window.setTimeout(() => {
+      clickTimer.current = null;
+      onAskRecent();
+    }, 230);
   };
 
   const sys = systemAudioMeta(listenState);
@@ -85,7 +123,11 @@ export function FloatingStack({
             tone={micInputOn ? "accent" : undefined}
             onClick={onToggleMic}
           >
-            <MicIcon size={17} />
+            {/* Distinct on/off glyph — a slashed mic when muted — plus a
+                pop animation keyed to the state so the toggle feels alive. */}
+            <span key={micInputOn ? "on" : "off"} className="fp-mic-glyph">
+              {micInputOn ? <MicIcon size={17} /> : <MicOffIcon size={17} />}
+            </span>
           </StackButton>
 
           <StackButton label="Take a screenshot" onClick={onScreenshot}>
@@ -101,11 +143,15 @@ export function FloatingStack({
           </StackButton>
 
           <StackButton
-            label={agentName ? `Ask ${agentName}` : "Ask"}
+            label={
+              agentName
+                ? `Ask ${agentName} — click to answer the last question, double-click to type`
+                : "Click to answer the last question, double-click to type"
+            }
             anchor
             active={asking}
             disabled={askStreaming}
-            onClick={() => setAsking((v) => !v)}
+            onClick={onAskClick}
           >
             <SparkleIcon size={17} />
           </StackButton>
@@ -165,11 +211,22 @@ function StackButton({
   disabled?: boolean;
   onClick: () => void;
 }) {
+  // A transient tap-pop on every click (the subtle "dopamine" feedback). The
+  // class is toggled off after the animation so the NEXT click re-triggers it.
+  const [tapped, setTapped] = useState(false);
+  const tapTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (tapTimer.current) window.clearTimeout(tapTimer.current);
+    },
+    [],
+  );
   const cls = [
     "fp-fab",
     anchor ? "fp-fab-anchor" : "",
     active && tone === "live" ? "fp-fab-live" : "",
     active && tone !== "live" ? "fp-fab-on" : "",
+    tapped ? "is-tapped" : "",
   ]
     .filter(Boolean)
     .join(" ");
@@ -180,7 +237,14 @@ function StackButton({
       aria-label={label}
       aria-pressed={active}
       disabled={disabled}
-      onClick={onClick}
+      onClick={() => {
+        setTapped(false);
+        // next frame → re-add so the animation restarts on every click
+        requestAnimationFrame(() => setTapped(true));
+        if (tapTimer.current) window.clearTimeout(tapTimer.current);
+        tapTimer.current = window.setTimeout(() => setTapped(false), 320);
+        onClick();
+      }}
     >
       {children}
     </button>

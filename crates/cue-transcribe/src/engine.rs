@@ -25,9 +25,16 @@ const SAMPLE_RATE: f64 = 16_000.0;
 /// natural mid-word micro-gap (a breath, a plosive) produces one empty chunk,
 /// and flushing on it splits the word ("competencies" → "compet encies"). A real
 /// end-of-utterance pause spans several chunks, so we wait for a run of them.
-/// ~4 chunks ≈ 400ms — long enough to clear a mid-word gap, short enough that the
-/// final word still lands promptly at a true sentence end.
-const SILENCE_FLUSH_CHUNKS: u32 = 4;
+///
+/// TUNING (2026-07): raised 4 → 8 (~400ms → ~800ms). At 400ms a slow/careful
+/// speaker's mid-word pause (drawing out a word, an inter-syllable beat, the gap
+/// in "slash"/"orders"/"request"/"language"/"database") crossed the threshold,
+/// the held partial word was flushed WITH a trailing space (via `flush_boundary`,
+/// which adds one so a flushed tip doesn't glue to the next word), and the
+/// remainder arrived as a new chunk → "sl ash", "requ est", "langu age". A true
+/// end-of-utterance pause is reliably ≥700ms, so 8 chunks clears intra-word
+/// pauses while still endpointing promptly at real sentence ends.
+const SILENCE_FLUSH_CHUNKS: u32 = 8;
 
 /// One streaming ASR engine, bound to a single audio source. Stateful — do not
 /// share across sources.

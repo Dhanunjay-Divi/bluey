@@ -95,6 +95,11 @@ export interface TranscriptLine {
   text: string;
   /** true once the line is finalized (not a partial). */
   final: boolean;
+  /** All daemon segment ids folded into this grouped line (the grouper merges
+   *  many streamed fragments into one line). Present on grouped history lines so
+   *  an attachment anchored to a segment id can find the line that contains it;
+   *  absent on live/partial lines. */
+  memberIds?: string[];
 }
 
 /** A persisted transcript line from the active meeting's rehydration snapshot
@@ -134,6 +139,9 @@ export interface MeetingState {
   conversation: MeetingConversationTurn[];
   /** The Key Decisions ledger for this session (may be empty). */
   decisions: MeetingDecision[];
+  /** Attached context (screenshots/files) carried in the snapshot so reopening
+   *  or continuing a meeting reloads them inline at their anchor (may be empty). */
+  context: ContextItem[];
 }
 
 /** One past meeting summarized for the MEETINGS lens (the "my past meetings"
@@ -153,6 +161,10 @@ export interface ContextItem {
   /** a small inline `data:image/...` thumbnail for image/diagram kinds, so the
    *  chip shows a ChatGPT-style preview. Absent for non-image kinds. */
   thumbnail?: string;
+  /** The id of the last transcript segment present when this was attached — its
+   *  anchor into the timeline. Resolved against each grouped line's `memberIds`
+   *  so it renders inline in the line that contains it. Absent → tail. */
+  anchorSegmentId?: string;
 }
 
 export interface MeetingSummary {

@@ -752,6 +752,94 @@ fn reconcile_user_names(
     }
 }
 
+/// Re-enroll a speaker's voiceprint from a set of audio spans (correction
+/// feedback for the "reassign a span → this speaker" flow). Slices the retained
+/// live audio for each `(start_secs, dur_secs)` span, runs the diarizer to get a
+/// centroid over the concatenated audio, and upserts it as `speaker_id`'s
+/// meeting-speaker centroid — so the post-pass + future meetings recognize this
+/// voice as this speaker. LIVE-ONLY: needs the retained audio buffer (cleared at
+/// meeting end); a too-short span (< the min voiceprint length) is skipped as it
+/// yields a noisy centroid. Best-effort; never fatal.
+pub(crate) async fn reenroll_speaker_from_spans(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+    speaker_id: i64,
+    spans: &[(f64, f64)],
+) {
+    if !enabled_with_settings(&daemon.paths) || spans.is_empty() {
+        return;
+    }
+    // Slice + concatenate the span audio from the retained full buffer.
+    let audio: Vec<f32> = {
+        let guard = daemon.audio_retention.lock().await;
+        let Some(r) = guard.as_ref() else {
+            return;
+        };
+        let full = r.full();
+        let mut acc = Vec::new();
+        for (start, dur) in spans {
+            let a = (*start * 16_000.0).max(0.0) as usize;
+            let b = ((*start + *dur) * 16_000.0).max(0.0) as usize;
+            if a < b && b <= full.len() {
+                acc.extend_from_slice(&full[a..b]);
+            }
+        }
+        acc
+    };
+    // Need enough speech for a stable centroid (~3s, mirrors MIN_VOICEPRINT).
+    if audio.len() < 3 * 16_000 {
+        debug!(
+            samples = audio.len(),
+            speaker_id, "reassign-span: span too short to re-enroll voiceprint; skipped"
+        );
+        return;
+    }
+    let dur_ms = ((audio.len() as f64 / 16_000.0) * 1000.0) as i64;
+    let out = match tokio::task::spawn_blocking(move || {
+        let mut d = cue_diarize::Diarizer::load(cue_diarize::Backend::preferred())?;
+        d.diarize_with_centroids(&audio)
+    })
+    .await
+    {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            warn!("reassign-span: diarize span failed: {e:#}");
+            return;
+        }
+        Err(e) => {
+            warn!("reassign-span: diarize task join failed: {e:#}");
+            return;
+        }
+    };
+    // Take the dominant centroid (the span should be one speaker) and enroll it
+    // as the target speaker's voiceprint.
+    let Some((_, centroid)) = out
+        .centroids
+        .into_iter()
+        .max_by_key(|(id, _)| out.segments.iter().filter(|s| s.speaker == *id).count())
+    else {
+        debug!(speaker_id, "reassign-span: no centroid produced; skipped");
+        return;
+    };
+    let db_path = daemon.paths.data_dir.join("sessions.db");
+    let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")) else {
+        return;
+    };
+    let now_ms = cue_core::clock::now_epoch_ms_string()
+        .parse::<i64>()
+        .unwrap_or(0);
+    if let Err(e) =
+        db.upsert_meeting_speaker(session_id, speaker_id, &centroid, spans.len() as i64, dur_ms, now_ms)
+    {
+        warn!("reassign-span: upsert_meeting_speaker failed: {e:#}");
+    } else {
+        info!(
+            speaker_id,
+            dur_ms, "reassign-span: re-enrolled speaker voiceprint from corrected span"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

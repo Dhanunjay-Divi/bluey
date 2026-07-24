@@ -77,6 +77,7 @@ interface WireContextItem {
   kind: string;
   path?: string | null;
   thumbnail?: string | null;
+  anchor_segment_id?: string | null;
 }
 
 // One first-run setup prerequisite (daemon `SetupItem`).
@@ -101,6 +102,7 @@ interface WireMeetingTranscriptLine {
   id: string;
   source: string;
   speaker?: string | null;
+  speaker_id?: number | null;
   text: string;
   final: boolean;
 }
@@ -164,6 +166,8 @@ type OverlayCommand =
       conversation: WireMeetingConversationTurn[];
       // The Key Decisions ledger; absent (omitted on the wire) when empty.
       decisions?: { id: string; text: string }[];
+      // Attached context (screenshots/files) in the snapshot; absent when empty.
+      context?: WireContextItem[];
       // Present only for a PAST-meeting VIEW reply (Decision 2). Absent on the
       // active-rehydrate reply — the discriminator that keeps the two request()
       // pickers on the shared bus from stealing each other's replies.
@@ -260,6 +264,7 @@ function toContextItem(w: WireContextItem): ContextItem {
     kind: w.kind,
     path: w.path ?? undefined,
     thumbnail: w.thumbnail ?? undefined,
+    anchorSegmentId: w.anchor_segment_id ?? undefined,
   };
 }
 
@@ -285,6 +290,7 @@ function toMeetingTranscriptLine(
     id: w.id,
     source: w.source,
     speaker: w.speaker ?? undefined,
+    speakerId: w.speaker_id ?? undefined,
     text: w.text,
     final: w.final,
   };
@@ -536,6 +542,7 @@ export function createTauriClient(): MeetingClient {
           transcript: c.transcript.map(toMeetingTranscriptLine),
           conversation: c.conversation.map(toMeetingConversationTurn),
           decisions: c.decisions ?? [],
+          context: (c.context ?? []).map(toContextItem),
         };
       }),
 
@@ -562,6 +569,7 @@ export function createTauriClient(): MeetingClient {
             transcript: c.transcript.map(toMeetingTranscriptLine),
             conversation: c.conversation.map(toMeetingConversationTurn),
             decisions: c.decisions ?? [],
+            context: (c.context ?? []).map(toContextItem),
             meetingId: c.meeting_id,
             readOnly: c.read_only ?? false,
           };
@@ -616,6 +624,7 @@ export function createTauriClient(): MeetingClient {
           transcript: c.transcript.map(toMeetingTranscriptLine),
           conversation: c.conversation.map(toMeetingConversationTurn),
           decisions: c.decisions ?? [],
+          context: (c.context ?? []).map(toContextItem),
         });
       };
       handlers.add(handler);
@@ -636,6 +645,28 @@ export function createTauriClient(): MeetingClient {
         type: "rename_speaker_requested",
         speaker_id: speakerId,
         name,
+      });
+    },
+
+    reassignSpan: (segmentIds, speakerId, name) => {
+      // Reassign a span of transcript segments to a speaker (+ optional name).
+      // The daemon rewrites speaker_id, re-broadcasts, and (live) re-enrolls the
+      // voiceprint from the span's audio.
+      sendEvent({
+        type: "reassign_span_requested",
+        segment_ids: segmentIds,
+        speaker_id: speakerId,
+        ...(name ? { name } : {}),
+      });
+    },
+
+    splitSegment: (segmentId, charOffset, firstSpeakerId, secondSpeakerId) => {
+      sendEvent({
+        type: "split_segment_requested",
+        segment_id: segmentId,
+        char_offset: charOffset,
+        first_speaker_id: firstSpeakerId,
+        second_speaker_id: secondSpeakerId,
       });
     },
 

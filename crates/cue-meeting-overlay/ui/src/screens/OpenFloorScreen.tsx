@@ -22,7 +22,6 @@ import type {
   AnswerSource,
   AnswerStatusStep,
   ContextItem,
-  ListeningState,
   MeetingDecision,
   SpeakerCandidate,
   TranscriptLine,
@@ -42,7 +41,11 @@ import {
 } from "../components/icons";
 import { FloatingStack } from "../components/floorplan/FloatingStack";
 import { DetectedDock } from "../components/floorplan/DetectedDock";
-import { EditableSpeaker } from "../components/floorplan/EditableSpeaker";
+import {
+  SpeakerEditor,
+  type KnownSpeaker,
+} from "../components/floorplan/SpeakerEditor";
+import { SelectionToolbar } from "../components/floorplan/SelectionToolbar";
 import { Waveform } from "../components/primitives";
 
 /** The instruction actually SENT to the agent when the user taps "Ask the
@@ -84,13 +87,14 @@ export function OpenFloorScreen({
     appendTurn,
     patchTurn,
     turnSeq,
+    context: contextItems,
+    listenState,
+    micInputOn,
+    setMicInputOn,
   } = useMeetingState();
 
   // ---- local (view-owned) state -------------------------------------------
   const [phase, setPhase] = useState<Phase>("idle");
-  const [listenState, setListenState] = useState<ListeningState>("idle");
-  const [micInputOn, setMicInputOn] = useState(false);
-  const [contextItems, setContextItems] = useState<ContextItem[]>([]);
   const [candidates, setCandidates] = useState<SpeakerCandidate[]>([]);
   // Exactly ONE transcript line renders its speaker editor at a time (the
   // "4× rename" guard) — the timeline row whose id is `editingId`.
@@ -104,8 +108,8 @@ export function OpenFloorScreen({
   useDragHeader(topbarRef);
 
   // ---- subscriptions (this view is the single owner of these) -------------
-  useEffect(() => client.onListeningState(setListenState), [client]);
-  useEffect(() => client.onContextItems(setContextItems), [client]);
+  // (listenState + context are owned by MeetingProvider now, so they survive a
+  // collapse→expand and reload from the snapshot on reopen.)
   useEffect(() => client.onMeetingCandidates(setCandidates), [client]);
 
   // Follow the tail as content streams in, but only when already near the
@@ -205,9 +209,24 @@ export function OpenFloorScreen({
   // Each turn's `anchor` is the history length at ask time → it renders right
   // after history line #anchor. Turns with no anchor (seeded) fall to the end.
   const timeline = useMemo(
-    () => buildTimeline(history, turns),
-    [history, turns],
+    () => buildTimeline(history, turns, contextItems),
+    [history, turns, contextItems],
   );
+
+  // Distinct diarized speakers seen so far — the "reassign this line to…" targets
+  // in the speaker editor. Labelled by the first line that named each speaker id.
+  const knownSpeakers = useMemo<KnownSpeaker[]>(() => {
+    const seen = new Map<number, string>();
+    for (const l of history) {
+      if (l.speakerId != null && !seen.has(l.speakerId)) {
+        seen.set(
+          l.speakerId,
+          l.speaker?.trim() || `Speaker ${l.speakerId + 1}`,
+        );
+      }
+    }
+    return [...seen.entries()].map(([id, label]) => ({ id, label }));
+  }, [history]);
 
   return (
     <div className="fp-root" data-floorplan="">
@@ -297,25 +316,38 @@ export function OpenFloorScreen({
               <div className="fp-timeline">
                 <div className="fp-kicker">Timeline</div>
 
-                {timeline.map((item) =>
-                  item.kind === "line" ? (
-                    <TranscriptRow
-                      key={item.line.id ?? `h${item.index}`}
-                      line={item.line}
-                      // Mark the newest line live while capturing, so it carries
-                      // a LIVE badge instead of rendering a SEPARATE duplicate
-                      // caption row (the old redundant-live-line bug).
-                      live={capturing && item.index === history.length - 1}
-                      candidates={candidates}
-                      editing={
-                        editingId === (item.line.id ?? `h${item.index}`)
-                      }
-                      onStartEdit={() =>
-                        setEditingId(item.line.id ?? `h${item.index}`)
-                      }
-                      onDone={() => setEditingId(null)}
-                    />
-                  ) : (
+                {timeline.map((item, i) => {
+                  if (item.kind === "line") {
+                    return (
+                      <TranscriptRow
+                        key={item.line.id ?? `h${item.index}`}
+                        line={item.line}
+                        // Mark the newest line live while capturing, so it
+                        // carries a LIVE badge instead of a SEPARATE duplicate
+                        // caption row (the old redundant-live-line bug).
+                        live={capturing && item.index === history.length - 1}
+                        candidates={candidates}
+                        knownSpeakers={knownSpeakers}
+                        editing={
+                          editingId === (item.line.id ?? `h${item.index}`)
+                        }
+                        onStartEdit={() =>
+                          setEditingId(item.line.id ?? `h${item.index}`)
+                        }
+                        onDone={() => setEditingId(null)}
+                      />
+                    );
+                  }
+                  if (item.kind === "attach") {
+                    return (
+                      <Attachments
+                        key={`a${i}`}
+                        items={item.items}
+                        onRemove={(id) => client.removeContextItem(id)}
+                      />
+                    );
+                  }
+                  return (
                     <QaBlock
                       key={`q${item.turn.id}`}
                       turn={item.turn}
@@ -327,31 +359,27 @@ export function OpenFloorScreen({
                         )
                       }
                     />
-                  ),
-                )}
+                  );
+                })}
 
                 {/* When nothing has been transcribed yet but capture is on, show
-                    a single live placeholder so the user sees it's listening. */}
+                    a single live placeholder so the user sees it's listening.
+                    (Attachments now interleave in the timeline above, anchored
+                    where each was added — no separate tail block.) */}
                 {history.length === 0 && capturing && (
                   <div className="fp-live-hint">
                     <Waveform />
                     <span>Listening…</span>
                   </div>
                 )}
-
-                {/* Attached screenshots/files flow INLINE at the document tail —
-                    where the next question lands — not floating on the stack. */}
-                {contextItems.length > 0 && (
-                  <Attachments
-                    items={contextItems}
-                    onRemove={(id) => client.removeContextItem(id)}
-                  />
-                )}
               </div>
             </>
           )}
         </div>
       </div>
+
+      {/* ---- selection toolbar (assign a highlighted span to a speaker) ---- */}
+      <SelectionToolbar knownSpeakers={knownSpeakers} />
 
       {/* ---- floating control stack ---- */}
       <FloatingStack
@@ -365,6 +393,7 @@ export function OpenFloorScreen({
         onAttach={() => client.openAttachPicker()}
         onCapturePage={() => client.capturePage()}
         onAsk={(q) => runAsk(q)}
+        onAskRecent={askDetected}
       />
 
       {/* ---- detected-question dock ---- */}
@@ -424,6 +453,7 @@ function TranscriptRow({
   line,
   live,
   candidates,
+  knownSpeakers,
   editing,
   onStartEdit,
   onDone,
@@ -431,6 +461,7 @@ function TranscriptRow({
   line: TranscriptLine;
   live?: boolean;
   candidates: SpeakerCandidate[];
+  knownSpeakers: KnownSpeaker[];
   editing: boolean;
   onStartEdit: () => void;
   onDone: () => void;
@@ -438,9 +469,10 @@ function TranscriptRow({
   return (
     <div className={`fp-line${live ? " is-live" : ""}`}>
       <div className="fp-line-head">
-        <EditableSpeaker
+        <SpeakerEditor
           line={line}
           candidates={candidates}
+          knownSpeakers={knownSpeakers}
           editing={editing}
           onStartEdit={onStartEdit}
           onDone={onDone}
@@ -452,7 +484,15 @@ function TranscriptRow({
           </span>
         )}
       </div>
-      <div className="fp-line-text">{line.text}</div>
+      {/* data-line-id lets the selection toolbar map a text selection back to the
+          segment(s) to split/reassign. */}
+      <div
+        className="fp-line-text"
+        data-line-id={line.id ?? ""}
+        data-member-ids={(line.memberIds ?? []).join(",")}
+      >
+        {line.text}
+      </div>
     </div>
   );
 }
@@ -723,44 +763,72 @@ function AttachKindGlyph({ kind }: { kind: string }) {
 // helpers
 // ==========================================================================
 
-/** A rendered timeline item: a transcript line (with its history index) or a
- *  Q&A turn, in reading order. */
+/** A rendered timeline item: a transcript line (with its history index), a Q&A
+ *  turn, or an attachment — all interleaved in reading order. */
 type TimelineItem =
   | { kind: "line"; line: TranscriptLine; index: number }
-  | { kind: "qa"; turn: Turn };
+  | { kind: "qa"; turn: Turn }
+  | { kind: "attach"; items: ContextItem[] };
 
-/** Interleave Q&A turns into the transcript by their `anchor` (the history
- *  length at ask time): a turn renders right AFTER history line #(anchor-1), so
- *  the exchange stays pinned where it was asked and later transcript flows below
- *  it. Turns are grouped by anchor and, within an anchor, ordered by id. A turn
- *  with anchor 0 renders before all transcript; a missing/over-large anchor
- *  falls to the end (seeded turns). */
+/** Interleave Q&A turns AND attachments into the transcript by their anchor (the
+ *  history length when they were created): each renders right AFTER history line
+ *  #(anchor-1), so an exchange or a screenshot stays pinned where it happened
+ *  and later transcript flows below it. Within one anchor, turns are ordered by
+ *  id and attachments are grouped into a single block. A missing/over-large
+ *  anchor falls to the end. */
 function buildTimeline(
   history: TranscriptLine[],
   turns: Turn[],
+  attachments: ContextItem[],
 ): TimelineItem[] {
-  // Bucket turns by the history index they should appear AFTER. `anchor` counts
-  // lines present at ask time, so the turn slots in after index (anchor - 1);
-  // clamp into [−1, history.length−1], with −1 meaning "before all lines".
-  const byAfter = new Map<number, Turn[]>();
-  const clamp = (a: number | undefined): number => {
+  // Turns anchor by a COUNT of lines at ask time (they're created in this same
+  // grouped space), so clamp the count to an "after index".
+  const clampCount = (a: number | undefined): number => {
     const n = a ?? history.length; // no anchor → end
     return Math.min(Math.max(n - 1, -1), history.length - 1);
   };
+  // Attachments anchor by a SEGMENT ID (the daemon works in raw segments; the UI
+  // groups them). Resolve it to the index of the grouped line whose memberIds
+  // contain that segment. Not found → tail.
+  const segToLineIndex = new Map<string, number>();
+  history.forEach((line, i) => {
+    if (line.id) segToLineIndex.set(line.id, i);
+    for (const sid of line.memberIds ?? []) segToLineIndex.set(sid, i);
+  });
+  const anchorIndexOf = (segId: string | undefined): number => {
+    if (!segId) return history.length - 1; // no anchor → tail
+    const i = segToLineIndex.get(segId);
+    return i == null ? history.length - 1 : i;
+  };
+
+  // Bucket turns by the history index they appear AFTER (−1 = before all lines).
+  const turnsByAfter = new Map<number, Turn[]>();
   for (const t of turns) {
-    const after = clamp(t.anchor);
-    const arr = byAfter.get(after);
-    if (arr) arr.push(t);
-    else byAfter.set(after, [t]);
+    const after = clampCount(t.anchor);
+    (turnsByAfter.get(after) ?? turnsByAfter.set(after, []).get(after)!).push(t);
   }
-  for (const arr of byAfter.values()) arr.sort((a, b) => a.id - b.id);
+  for (const arr of turnsByAfter.values()) arr.sort((a, b) => a.id - b.id);
+
+  // Bucket attachments by the line that contains their anchor segment.
+  const attachByAfter = new Map<number, ContextItem[]>();
+  for (const item of attachments) {
+    const after = anchorIndexOf(item.anchorSegmentId);
+    (
+      attachByAfter.get(after) ?? attachByAfter.set(after, []).get(after)!
+    ).push(item);
+  }
+
+  const emitAfter = (idx: number, out: TimelineItem[]) => {
+    for (const t of turnsByAfter.get(idx) ?? []) out.push({ kind: "qa", turn: t });
+    const att = attachByAfter.get(idx);
+    if (att && att.length) out.push({ kind: "attach", items: att });
+  };
 
   const out: TimelineItem[] = [];
-  // Turns anchored before any transcript (anchor 0 → after −1).
-  for (const t of byAfter.get(-1) ?? []) out.push({ kind: "qa", turn: t });
+  emitAfter(-1, out); // anchored before any transcript
   history.forEach((line, index) => {
     out.push({ kind: "line", line, index });
-    for (const t of byAfter.get(index) ?? []) out.push({ kind: "qa", turn: t });
+    emitAfter(index, out);
   });
   return out;
 }

@@ -72,6 +72,12 @@ pub struct OverlayContextItem {
     /// and then omitted from the wire so text/doc chips carry no null noise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thumbnail: Option<String>,
+    /// The id of the last finalized transcript segment present when this artifact
+    /// was attached — the overlay renders it inline after the LINE containing
+    /// that segment, so it stays where it was added. A segment id (not an index)
+    /// because the UI groups segments into fewer lines. `None` → render at tail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_segment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,6 +124,14 @@ pub struct MeetingTranscriptLine {
     /// `None`. `v1` leaves this `None`; the caption uses `source`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speaker: Option<String>,
+    /// The numeric diarized speaker id behind `speaker`, when known. Carried in
+    /// the SNAPSHOT (not just the live TranscriptSpeaker push) so a rehydrated /
+    /// continued / reopened meeting's lines are still editable AND so a rename
+    /// echo (which relabels every line of a speaker_id) actually finds them.
+    /// Without this, snapshot lines had no id → the editor was disabled and
+    /// renames didn't reflect. `None` when diarization hasn't resolved one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker_id: Option<i64>,
     /// The raw (untrimmed) spoken text of this segment.
     pub text: String,
     /// Always `true` — only finalized segments are persisted and emitted. Named
@@ -392,6 +406,14 @@ pub enum OverlayCommand {
         /// snapshots and the glass UI (which ignores the field).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         decisions: Vec<MeetingDecision>,
+        /// The meeting's attached context (screenshots/files), carried in the
+        /// SNAPSHOT so reopening/continuing a meeting reloads them inline at
+        /// their anchor — not just via the live `SetContextItems` push (which a
+        /// fresh mount never receives for an already-attached artifact). Empty
+        /// (and omitted) when there are none, so this stays byte-compatible with
+        /// pre-context snapshots and the glass UI.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context: Vec<OverlayContextItem>,
         /// When this snapshot is a PAST-meeting VIEW (answering
         /// [`OverlayEvent::MeetingOpenRequested`]), the opened meeting's id, so
         /// the UI can match this reply to its open request and disambiguate it
@@ -527,6 +549,29 @@ pub enum OverlayEvent {
     RenameSpeakerRequested {
         speaker_id: i64,
         name: String,
+    },
+    /// UI reassigned a RANGE of transcript segments to a speaker — the
+    /// "select a span → assign to speaker" correction. `segment_ids` are the
+    /// transcript segment ids to relabel; `speaker_id` is the target diarized
+    /// speaker (an existing one, or a fresh index for a NEW speaker); `name` is
+    /// an optional display name to set for that speaker in one step. During a
+    /// live meeting the daemon also re-enrolls the speaker's voiceprint from the
+    /// reassigned span's retained audio so future auto-detection improves.
+    ReassignSpanRequested {
+        segment_ids: Vec<String>,
+        speaker_id: i64,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// UI split ONE transcript segment at a character offset into two, assigning
+    /// each part to a (possibly different) speaker — the "break here" correction.
+    /// `segment_id` is the segment to split; `char_offset` is where in its text;
+    /// `first_speaker_id`/`second_speaker_id` are the speakers for the two halves.
+    SplitSegmentRequested {
+        segment_id: String,
+        char_offset: usize,
+        first_speaker_id: i64,
+        second_speaker_id: i64,
     },
     /// UI asked for the current discovered-agent list (agent-bridge Slice 5a).
     AgentListRequested,
@@ -798,6 +843,7 @@ mod tests {
                 kind: "document".to_string(),
                 path: Some("/tmp/GenAI Engineer JD.pdf".to_string()),
                 thumbnail: None,
+                anchor_segment_id: None,
             }],
             turns: 3,
         })
@@ -1189,6 +1235,7 @@ mod tests {
                     id: "00000000-0000-0000-0000-000000000001".to_string(),
                     source: "system".to_string(),
                     speaker: None,
+                    speaker_id: None,
                     text: "hello there".to_string(),
                     is_final: true,
                 },
@@ -1196,6 +1243,7 @@ mod tests {
                     id: "00000000-0000-0000-0000-000000000002".to_string(),
                     source: "mic".to_string(),
                     speaker: None,
+                    speaker_id: None,
                     text: "hi back".to_string(),
                     is_final: true,
                 },
@@ -1209,6 +1257,14 @@ mod tests {
             decisions: vec![MeetingDecision {
                 id: "00000000-0000-0000-0000-000000000004".to_string(),
                 text: "Ship the beta on Friday.".to_string(),
+            }],
+            context: vec![OverlayContextItem {
+                id: uuid::Uuid::nil(),
+                title: "screenshot.png".to_string(),
+                kind: "image".to_string(),
+                path: None,
+                thumbnail: None,
+                anchor_segment_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
             }],
             meeting_id: None,
             read_only: false,
@@ -1283,11 +1339,13 @@ mod tests {
                 id: "00000000-0000-0000-0000-000000000001".to_string(),
                 source: "system".to_string(),
                 speaker: None,
+                speaker_id: None,
                 text: "hello".to_string(),
                 is_final: true,
             }],
             conversation: vec![],
             decisions: vec![],
+            context: vec![],
             meeting_id: None,
             read_only: false,
         };
@@ -1312,6 +1370,7 @@ mod tests {
             transcript: vec![],
             conversation: vec![],
             decisions: vec![],
+            context: vec![],
             meeting_id: Some("00000000-0000-0000-0000-0000000000aa".to_string()),
             read_only: true,
         };

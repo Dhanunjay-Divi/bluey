@@ -1284,6 +1284,16 @@ pub(crate) struct Daemon {
     /// Normalized text of the last for-me question surfaced/answered (see
     /// [`Self::for_me_last_trigger_ms`]). Skips re-detecting the same question.
     for_me_last_question: Mutex<String>,
+    /// UTTERANCE-COALESCING debounce generation. A spoken question fragments
+    /// across several STT segments arriving ~1-2s apart, and the per-segment
+    /// detector would surface a popup for EACH fragment. Instead, each
+    /// question-shaped segment bumps this counter and schedules a deferred check;
+    /// a later fragment bumps it again (cancelling the earlier pending check), so
+    /// only the LAST fragment of a settled utterance actually evaluates — and it
+    /// evaluates the JOINED recent transcript tail, seeing the whole question
+    /// once. This is the root-cause fix (one detection per utterance), not a
+    /// text/time-overlap heuristic.
+    for_me_debounce_gen: std::sync::atomic::AtomicU64,
     /// Bluey's own MCP memory server handle (the no-push pivot: the attached
     /// agent PULLS meeting memory through its tools). `None` when the
     /// loopback bind failed — the daemon runs on without it.
@@ -1345,7 +1355,6 @@ const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
 /// fragments and the post-Ask re-fire, while a genuinely NEW question (different
 /// text) still surfaces immediately once outside it. See
 /// `maybe_trigger_for_me_question` + `note_for_me_trigger`.
-const FOR_ME_COOLDOWN_MS: u64 = 20_000;
 
 /// The question text the for-me auto-trigger (and its suggestion card) sends to
 /// the agent — instead of the raw detected segment.
@@ -1501,26 +1510,44 @@ pub async fn run() -> Result<()> {
     }
 
     let store = MeetingStore::new(&paths)?;
-    // Do NOT silently resume a leftover "active" meeting on boot. A stray screen
-    // capture or transcript segment auto-creates an ad-hoc meeting and persists it
-    // as active; resuming it makes the daemon reattach to old junk on every launch
-    // ("Continuing Ad hoc meeting..."). Instead: archive it if it has real content
-    // (so nothing is lost), discard it if it's an empty shell, and start clean.
+    // Boot recovery for a leftover "active" meeting. The old rule ALWAYS archived
+    // (never resumed) so a stray screen capture / ad-hoc meeting wouldn't make the
+    // daemon reattach to old junk on every launch. But that also lost a GENUINE
+    // mid-session meeting whenever the daemon restarted (a crash, or a dev
+    // reinstall) — the next ask then had an empty active meeting and the agent
+    // answered "I don't see a transcript".
     //
-    // Fail-soft: a corrupt/unparseable active file must NOT crash boot — discard it.
+    // Middle ground, gated tightly on RECENCY: resume a leftover active meeting
+    // only if it was active within RESUME_WINDOW_MS (a true restart mid-session);
+    // otherwise archive it (stale junk from a prior day/session) and start clean.
+    // Empty shells are discarded; unreadable files are discarded fail-soft.
+    const RESUME_WINDOW_MS: i64 = 15 * 60 * 1000; // 15 min
+    let mut active_meeting: Option<MeetingRecord> = None;
     match store.load_active() {
         Ok(Some(leftover)) => {
-            if leftover.has_content() {
-                if let Err(error) = store.archive(&leftover) {
-                    warn!("failed to archive leftover active meeting on boot: {error:#}");
+            if !leftover.has_content() {
+                if let Err(error) = store.discard_active() {
+                    warn!("failed to discard empty leftover active meeting on boot: {error:#}");
+                }
+            } else {
+                let now = clock::now_epoch_ms_string().parse::<i64>().unwrap_or(0);
+                let recent = now.saturating_sub(leftover.last_activity_ms()) <= RESUME_WINDOW_MS;
+                if recent {
+                    // Genuine mid-session restart → RESUME so the transcript stays
+                    // active and the next ask still has its context.
+                    info!(
+                        meeting_id = %leftover.id,
+                        "resumed recently-active meeting on boot (mid-session restart)"
+                    );
+                    active_meeting = Some(leftover);
+                } else if let Err(error) = store.archive(&leftover) {
+                    warn!("failed to archive stale leftover active meeting on boot: {error:#}");
                 } else {
                     info!(
                         meeting_id = %leftover.id,
-                        "archived leftover active meeting on boot (not resuming)"
+                        "archived stale leftover active meeting on boot (not resuming)"
                     );
                 }
-            } else if let Err(error) = store.discard_active() {
-                warn!("failed to discard empty leftover active meeting on boot: {error:#}");
             }
         }
         Ok(None) => {}
@@ -1531,7 +1558,6 @@ pub async fn run() -> Result<()> {
             }
         }
     }
-    let active_meeting: Option<MeetingRecord> = None;
     let initial_state = state_from_active_meeting(active_meeting.as_ref());
     let cloud_status = cloud_status_from_env(&paths);
     let (overlay_events_tx, overlay_events_rx) = mpsc::unbounded_channel();
@@ -1591,6 +1617,7 @@ pub async fn run() -> Result<()> {
         qdetect: Mutex::new(None),
         for_me_last_trigger_ms: std::sync::atomic::AtomicU64::new(0),
         for_me_last_question: Mutex::new(String::new()),
+        for_me_debounce_gen: std::sync::atomic::AtomicU64::new(0),
         mcp_server: Mutex::new(None),
         agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
@@ -3366,6 +3393,34 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::RenameSpeakerRequested { speaker_id, name } => {
             handle_rename_speaker_requested(daemon, speaker_id, &name).await;
         }
+        OverlayEvent::ReassignSpanRequested {
+            segment_ids,
+            speaker_id,
+            name,
+        } => {
+            handle_reassign_span_requested(
+                daemon,
+                &segment_ids,
+                speaker_id,
+                name.as_deref(),
+            )
+            .await;
+        }
+        OverlayEvent::SplitSegmentRequested {
+            segment_id,
+            char_offset,
+            first_speaker_id,
+            second_speaker_id,
+        } => {
+            handle_split_segment_requested(
+                daemon,
+                &segment_id,
+                char_offset,
+                first_speaker_id,
+                second_speaker_id,
+            )
+            .await;
+        }
         OverlayEvent::AgentListRequested => {
             refresh_overlay_agents_swr(daemon).await;
         }
@@ -4425,20 +4480,24 @@ async fn handle_agent_sessions_requested(
 /// path). The meeting `Mutex` is dropped before the send: never held across an
 /// `await`.
 async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
-    let (transcript, conversation, decisions) = {
+    let (transcript, conversation, decisions, context) = {
         let guard = daemon.meeting.lock().await;
         match guard.as_ref() {
-            Some(meeting) => (
-                meeting
-                    .transcript
-                    .iter()
-                    .filter(|segment| segment.is_final)
-                    .map(to_wire_line)
-                    .collect(),
-                meeting.conversation.iter().map(to_wire_turn).collect(),
-                meeting.decisions.iter().map(to_wire_decision).collect(),
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new()),
+            Some(meeting) => {
+                let names = load_user_speaker_names(daemon, &meeting.id.to_string());
+                (
+                    meeting
+                        .transcript
+                        .iter()
+                        .filter(|segment| segment.is_final)
+                        .map(|s| to_wire_line_named(s, &names))
+                        .collect(),
+                    meeting.conversation.iter().map(to_wire_turn).collect(),
+                    meeting.decisions.iter().map(to_wire_decision).collect(),
+                    meeting.context.iter().map(to_wire_context_item).collect(),
+                )
+            }
+            None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         }
     };
     let count = transcript.len();
@@ -4454,6 +4513,7 @@ async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
             transcript,
             conversation,
             decisions,
+            context,
             // Active rehydrate: no meeting_id + not read-only, so the wire form
             // stays byte-identical and the UI's live-rehydrate picker matches.
             meeting_id: None,
@@ -4461,6 +4521,31 @@ async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
         },
     )
     .await;
+
+    // Re-sync the capture state on this (re)mount. listening_state_changed only
+    // fires on TRANSITIONS, so a freshly-mounted overlay (first launch, or the
+    // provider re-seeding after a collapse→expand) would otherwise sit at "idle"
+    // while audio is physically capturing — the toggle then lies. The overlay
+    // requests meeting state on mount, so this is the natural sync point: tell it
+    // the TRUTH (listening if audio is live, else idle).
+    let state = if audio_is_live(daemon).await {
+        ListeningState::Listening
+    } else {
+        ListeningState::Idle
+    };
+    set_overlay_listening_state(daemon, state).await;
+
+    // Re-push the context items with REBUILT thumbnails. The snapshot above
+    // carries context WITHOUT thumbnails (they're big inline data URIs built
+    // off-thread), so an image attachment would render as a broken icon on
+    // reopen. refresh_overlay_context_items regenerates the data-URI previews and
+    // pushes SetContextItems, upgrading the chips to real images.
+    let active = { daemon.meeting.lock().await.clone() };
+    if let Some(meeting) = active {
+        if !meeting.context.is_empty() {
+            refresh_overlay_context_items(daemon, &meeting).await;
+        }
+    }
 }
 
 /// Answer the MEETINGS lens ("my past meetings"): map every non-empty persisted
@@ -4576,25 +4661,34 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
 
     match daemon.store.load_by_id(id) {
         Ok(Some(record)) => {
+            let names = load_user_speaker_names(daemon, &record.id.to_string());
             let transcript = record
                 .transcript
                 .iter()
                 .filter(|segment| segment.is_final)
-                .map(to_wire_line)
+                .map(|s| to_wire_line_named(s, &names))
                 .collect();
             let conversation = record.conversation.iter().map(to_wire_turn).collect();
             let decisions = record.decisions.iter().map(to_wire_decision).collect();
+            let context = record.context.iter().map(to_wire_context_item).collect();
             let _ = send_overlay(
                 daemon,
                 OverlayCommand::SetMeetingState {
                     transcript,
                     conversation,
                     decisions,
+                    context,
                     meeting_id: Some(record.id.to_string()),
                     read_only,
                 },
             )
             .await;
+            // Rebuild + push image thumbnails so a reopened meeting's screenshots
+            // render as real previews, not broken icons (the snapshot carries no
+            // thumbnail data URI).
+            if !record.context.is_empty() {
+                refresh_overlay_context_items(daemon, &record).await;
+            }
         }
         Ok(None) => {
             // Meeting vanished (deleted between list and open): reply empty +
@@ -4606,6 +4700,7 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
                     transcript: Vec::new(),
                     conversation: Vec::new(),
                     decisions: Vec::new(),
+                    context: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
                 },
@@ -4620,6 +4715,7 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
                     transcript: Vec::new(),
                     conversation: Vec::new(),
                     decisions: Vec::new(),
+                    context: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
                 },
@@ -4698,6 +4794,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                     transcript: Vec::new(),
                     conversation: Vec::new(),
                     decisions: Vec::new(),
+                    context: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
                 },
@@ -4707,20 +4804,24 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
         ContinueDecision::ReseedActive => {
             // target == active: no switch. Re-emit the ACTIVE snapshot exactly
             // like `handle_meeting_state_requested`. No archive.
-            let (transcript, conversation, decisions) = {
+            let (transcript, conversation, decisions, context) = {
                 let guard = daemon.meeting.lock().await;
                 match guard.as_ref() {
-                    Some(meeting) => (
-                        meeting
-                            .transcript
-                            .iter()
-                            .filter(|segment| segment.is_final)
-                            .map(to_wire_line)
-                            .collect(),
-                        meeting.conversation.iter().map(to_wire_turn).collect(),
-                        meeting.decisions.iter().map(to_wire_decision).collect(),
-                    ),
-                    None => (Vec::new(), Vec::new(), Vec::new()),
+                    Some(meeting) => {
+                        let names = load_user_speaker_names(daemon, &meeting.id.to_string());
+                        (
+                            meeting
+                                .transcript
+                                .iter()
+                                .filter(|segment| segment.is_final)
+                                .map(|s| to_wire_line_named(s, &names))
+                                .collect(),
+                            meeting.conversation.iter().map(to_wire_turn).collect(),
+                            meeting.decisions.iter().map(to_wire_decision).collect(),
+                            meeting.context.iter().map(to_wire_context_item).collect(),
+                        )
+                    }
+                    None => (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
                 }
             };
             let _ = send_overlay(
@@ -4729,6 +4830,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                     transcript,
                     conversation,
                     decisions,
+                    context,
                     meeting_id: None,
                     read_only: false,
                 },
@@ -4781,6 +4883,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                             transcript: Vec::new(),
                             conversation: Vec::new(),
                             decisions: Vec::new(),
+                            context: Vec::new(),
                             meeting_id: Some(id.to_string()),
                             read_only: true,
                         },
@@ -4797,6 +4900,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                             transcript: Vec::new(),
                             conversation: Vec::new(),
                             decisions: Vec::new(),
+                            context: Vec::new(),
                             meeting_id: Some(id.to_string()),
                             read_only: true,
                         },
@@ -4826,25 +4930,33 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
 
             // (e) The ACTIVE reseed — byte-identical to the active-rehydrate
             // SetMeetingState so MeetingProvider reseeds the Ask screen.
+            let names = load_user_speaker_names(daemon, &record.id.to_string());
             let transcript = record
                 .transcript
                 .iter()
                 .filter(|segment| segment.is_final)
-                .map(to_wire_line)
+                .map(|s| to_wire_line_named(s, &names))
                 .collect();
             let conversation = record.conversation.iter().map(to_wire_turn).collect();
             let decisions = record.decisions.iter().map(to_wire_decision).collect();
+            let context = record.context.iter().map(to_wire_context_item).collect();
             let _ = send_overlay(
                 daemon,
                 OverlayCommand::SetMeetingState {
                     transcript,
                     conversation,
                     decisions,
+                    context,
                     meeting_id: None,
                     read_only: false,
                 },
             )
             .await;
+            // Rebuild + push image thumbnails for the continued meeting's
+            // screenshots (the snapshot carries no thumbnail data URI).
+            if !record.context.is_empty() {
+                refresh_overlay_context_items(daemon, &record).await;
+            }
         }
     }
 }
@@ -4868,18 +4980,48 @@ fn speaker_channel(speaker: Speaker) -> &'static str {
 /// NOT the live display label. `speaker` stays `None` in v1 (the caption uses
 /// `source`); `is_final` is always `true` — only finalized segments reach here.
 fn to_wire_line(segment: &TranscriptSegment) -> MeetingTranscriptLine {
+    to_wire_line_named(segment, &std::collections::HashMap::new())
+}
+
+/// Like [`to_wire_line`] but overlays the user's PERSISTED speaker names (from
+/// the diarization store) onto the label. On reopen/continue the segment only
+/// carries a numeric `speaker_id`; the computed "Speaker N" label would hide a
+/// rename the user made ("Robo 1"). `names` maps speaker_id → user name; when a
+/// segment's id is in it, that name wins over the computed label.
+fn to_wire_line_named(
+    segment: &TranscriptSegment,
+    names: &std::collections::HashMap<i64, String>,
+) -> MeetingTranscriptLine {
     MeetingTranscriptLine {
         id: segment.id.to_string(),
         source: speaker_channel(segment.speaker).to_string(),
-        // Diarized display label when the live/post pass has resolved one (the
-        // rehydrate/past-meeting paths carry labels this way; live lines get
-        // theirs via OverlayCommand::TranscriptSpeaker upgrades instead). Uses
-        // the shared cue-core helper so overlay/wire/AI-context labels never drift.
-        speaker: segment
-            .speaker_id
-            .map(|id| cue_core::meeting::speaker_display_label(id, &segment.secondary_speaker_ids)),
+        speaker: segment.speaker_id.map(|id| {
+            names.get(&id).cloned().unwrap_or_else(|| {
+                cue_core::meeting::speaker_display_label(id, &segment.secondary_speaker_ids)
+            })
+        }),
+        // Carry the numeric id so snapshot lines stay editable + rename echoes
+        // (which match by speaker_id) reflect on rehydrated/continued meetings.
+        speaker_id: segment.speaker_id,
         text: segment.text.clone(),
         is_final: true,
+    }
+}
+
+/// Load the user-assigned speaker names for a session as a `speaker_id → name`
+/// map (empty on any DB miss). Used to overlay renames onto the snapshot labels.
+fn load_user_speaker_names(
+    daemon: &Arc<Daemon>,
+    session_id: &str,
+) -> std::collections::HashMap<i64, String> {
+    let db_path = daemon.paths.data_dir.join("sessions.db");
+    match crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")) {
+        Ok(db) => db
+            .user_named_speakers(session_id)
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
+        Err(_) => std::collections::HashMap::new(),
     }
 }
 
@@ -7502,8 +7644,25 @@ fn overlay_context_items(
             kind: item.kind.to_string(),
             path: Some(item.path.clone()),
             thumbnail: thumbnails.get(&item.id).cloned(),
+            anchor_segment_id: item.anchor_segment_id.clone(),
         })
         .collect()
+}
+
+/// Map a [`ContextArtifact`] to its LEAN snapshot wire form — id/title/kind/path
+/// + the timeline anchor, but NO thumbnail (thumbnails are built off-thread for
+/// the live `SetContextItems` push, which fires shortly after a reopen and fills
+/// them in). Mirrors [`to_wire_decision`]: the snapshot carries the artifacts so
+/// they reload inline at their anchor; the live push then upgrades the previews.
+fn to_wire_context_item(item: &cue_core::meeting::ContextArtifact) -> OverlayContextItem {
+    OverlayContextItem {
+        id: item.id,
+        title: item.title.clone(),
+        kind: item.kind.to_string(),
+        path: Some(item.path.clone()),
+        thumbnail: None,
+        anchor_segment_id: item.anchor_segment_id.clone(),
+    }
 }
 
 async fn fetch_current_balance_snapshot(
@@ -8666,8 +8825,16 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     if !crate::ledger::should_fire_words(total_words, last_words) {
         return;
     }
+    // TESTING visibility: log every ledger fire so you can SEE the pipeline run.
+    info!(
+        total_words,
+        last_words,
+        interval = crate::ledger::interval_words(),
+        "LEDGER-DEBUG: word threshold crossed → firing a ledger pass"
+    );
     // Settings read only on interval boundaries — never per-segment.
     if !live_memory_enabled(daemon) {
+        info!("LEDGER-DEBUG: live_memory disabled → skipping (would have fired)");
         return;
     }
     // Mark this word boundary as fired now (before the async spawn) so rapid
@@ -8716,6 +8883,15 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 // Parse+verify once so the verified items can ALSO feed the
                 // cross-meeting facts memory (long-term tier) after the merge.
                 let verified = cue_core::parse_and_verify(&raw, &window);
+                // TESTING visibility: show the RAW agent extraction + how many
+                // survived verification. Pinpoints whether the agent returned no
+                // decisions vs. verification (verbatim-quote check) dropped them.
+                info!(
+                    raw_len = raw.len(),
+                    verified_count = verified.len(),
+                    raw_preview = %raw.chars().take(300).collect::<String>(),
+                    "LEDGER-DEBUG: extraction returned → verified items"
+                );
                 #[cfg(feature = "local-memory")]
                 let verified_texts: Vec<String> = verified
                     .iter()
@@ -8870,6 +9046,12 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     if !crate::summary::should_fire_words(total_words, last_words) {
         return;
     }
+    info!(
+        total_words,
+        last_words,
+        interval = crate::summary::interval_words(),
+        "SUMMARY-DEBUG: word threshold crossed → firing a summary pass"
+    );
     if !live_memory_enabled(daemon) {
         return;
     }
@@ -9128,25 +9310,17 @@ async fn add_audio_transcript_segment_inner(
 ///
 /// Best-effort and non-fatal: a missing settings file, no attached agent, or a
 /// detection miss simply means no trigger. Never blocks the transcript path.
-/// Pure re-trigger decision (extracted so it is unit-testable without a
-/// `Daemon`). Suppress when we are BOTH inside the cooldown window AND the new
-/// normalized question overlaps the last one (equal, or one contains the other —
-/// an STT fragment of the same question). A genuinely NEW question (different
-/// text) is never suppressed; nor is one outside the cooldown. `last_ms == 0`
-/// (never triggered) never suppresses.
-fn for_me_should_suppress(norm: &str, now_ms: u64, last_ms: u64, last_q: &str) -> bool {
-    let within_cooldown = last_ms != 0 && now_ms.saturating_sub(last_ms) < FOR_ME_COOLDOWN_MS;
-    let overlaps =
-        !last_q.is_empty() && (norm == last_q || norm.contains(last_q) || last_q.contains(norm));
-    within_cooldown && overlaps
-}
-
 /// Arm the for-me re-trigger guard as if a question had just been surfaced —
 /// called when the user MANUALLY asks (the "Answer the last question" button), so
 /// the auto-detector does not immediately re-surface a popup for the same
 /// question the user just handled (consume-on-Ask). `question` is the human text
 /// the ask was about; empty is fine (arms the cooldown, no text to dedup on).
 fn note_for_me_trigger(daemon: &Arc<Daemon>, question: &str) {
+    // Cancel any pending debounced fire: the user handled the current question,
+    // so a still-scheduled surface for the same utterance must not pop after.
+    daemon
+        .for_me_debounce_gen
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
     daemon
         .for_me_last_trigger_ms
@@ -9208,36 +9382,70 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
         return;
     }
 
-    // RE-TRIGGER SUPPRESSION. One spoken question is split by STT across several
-    // finalized segments, so without this each qualifying segment re-surfaces the
-    // SAME popup — and it keeps re-firing even after the user clicked Ask (the
-    // reported "the question popup comes back" bug). Suppress a re-trigger when
-    // EITHER (a) we triggered within the cooldown window, OR (b) the normalized
-    // text is the same as, or contained in / contains, the last one (an
-    // overlapping fragment of the same question). `note_for_me_trigger` on the
-    // manual-ask path arms the same guard, so asking consumes the detection.
-    {
-        let norm = normalize_transcript_text(&detected.question);
-        let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
-        let last_ms = daemon
-            .for_me_last_trigger_ms
-            .load(std::sync::atomic::Ordering::Acquire);
-        let last_q = daemon.for_me_last_question.lock().await.clone();
-        if for_me_should_suppress(&norm, now_ms, last_ms, &last_q) {
-            debug!(q = %detected.question, "for-me question suppressed (recent duplicate)");
+    // UTTERANCE COALESCING (the root-cause fix for the double-popup). Do NOT fire
+    // now: this segment is likely one FRAGMENT of a still-in-progress spoken
+    // question. Bump the debounce generation and schedule a deferred fire; a
+    // later fragment bumps the generation again, cancelling this pending fire, so
+    // only the LAST fragment of a SETTLED utterance actually surfaces — once.
+    let gen = daemon
+        .for_me_debounce_gen
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        + 1;
+    debug!(q = %detected.question, gen, "for-me: question fragment seen, (re)scheduling debounced fire");
+    let daemon = Arc::clone(daemon);
+    let matched_name = detected.matched_name.clone();
+    tokio::spawn(async move {
+        // Wait out the inter-fragment gap. Fragments of one question arrive
+        // ~1-2s apart (confirmed in the logs: "what does that" then "are attached
+        // to that" 1.3s later), so a settle window just past that coalesces them.
+        tokio::time::sleep(std::time::Duration::from_millis(FOR_ME_SETTLE_MS)).await;
+        // If a newer fragment arrived during the wait, THIS scheduled fire is
+        // stale — the newer one owns the utterance. Bail.
+        if daemon
+            .for_me_debounce_gen
+            .load(std::sync::atomic::Ordering::Acquire)
+            != gen
+        {
             return;
         }
-        // Arm the guard for the next segment(s) of this question.
-        daemon
-            .for_me_last_trigger_ms
-            .store(now_ms, std::sync::atomic::Ordering::Release);
-        *daemon.for_me_last_question.lock().await = norm;
-    }
+        fire_for_me_question(&daemon, matched_name).await;
+    });
+}
 
+/// Milliseconds to wait after a question-shaped fragment before firing, so the
+/// remaining fragments of the same spoken utterance coalesce into ONE detection.
+/// Just past the observed ~1-2s inter-fragment gap.
+const FOR_ME_SETTLE_MS: u64 = 2200;
+
+/// Fire a settled for-me question: surface the card (or auto-drive). Called by
+/// the debounce task once an utterance has settled, so it runs ONCE per spoken
+/// question regardless of how many STT fragments it spanned. It reads the recent
+/// transcript tail for the human-readable question text; the ask envelope
+/// carries the full transcript so the agent sees the complete question.
+async fn fire_for_me_question(daemon: &Arc<Daemon>, matched_name: Option<String>) {
+    let settings = match load_settings(&daemon.paths) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    // The readable question shown on the card = the recent transcript tail (the
+    // coalesced utterance), bounded. The agent always answers from the full
+    // envelope, so this is display-only.
+    let question_text = {
+        let guard = daemon.meeting.lock().await;
+        match guard.as_ref() {
+            Some(m) => m.last_transcript_text_bounded(3, 220),
+            None => return,
+        }
+    };
+    let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
+    daemon
+        .for_me_last_trigger_ms
+        .store(now_ms, std::sync::atomic::Ordering::Release);
+    *daemon.for_me_last_question.lock().await = normalize_transcript_text(&question_text);
     info!(
-        matched_name = detected.matched_name.as_deref().unwrap_or("(any)"),
+        matched_name = matched_name.as_deref().unwrap_or("(any)"),
         auto = settings.auto_trigger_enabled,
-        "for-me question detected; {}",
+        "for-me question SETTLED (coalesced utterance); {}",
         if settings.auto_trigger_enabled {
             "auto-driving agent"
         } else {
@@ -9246,15 +9454,6 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
     );
 
     if settings.auto_trigger_enabled {
-        // Auto mode: drive the attached agent now, reusing the overlay ask path
-        // so context assembly, model selection, and session chaining all apply.
-        //
-        // Send ASK_RECENT_QUESTION, not `detected.question`: the detected
-        // segment is only a FRAGMENT of the spoken question (STT splits it
-        // across finals). The answer envelope already attaches the recent
-        // transcript, so pointing the agent at the transcript tail lets it read
-        // the COMPLETE question itself — no truncated "your message looks cut
-        // off". `detected.question` is still what we logged/surfaced.
         let request = answer_request_from_overlay(
             ASK_RECENT_QUESTION,
             None,
@@ -9267,13 +9466,11 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
             warn!("auto-trigger answer failed: {error:#}");
         }
     } else {
-        // Suggest mode (default): surface the detected question as a card the
-        // user can tap to ask. No agent call until they opt in.
-        let title = match detected.matched_name.as_deref() {
+        let title = match matched_name.as_deref() {
             Some(name) => format!("{name}, this looks like a question for you"),
             None => "Question detected — ask your agent?".to_string(),
         };
-        let card = CueCard::new(CardKind::Question, title, detected.question)
+        let card = CueCard::new(CardKind::Question, title, question_text)
             .with_source("question trigger");
         let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
     }
@@ -9517,6 +9714,168 @@ async fn handle_rename_speaker_requested(daemon: &Arc<Daemon>, speaker_id: i64, 
         },
     )
     .await;
+}
+
+/// Reassign a SPAN of transcript segments to a speaker (the "select a span →
+/// assign to speaker" correction). Rewrites `speaker_id` on the named segments
+/// in the active meeting, optionally sets a display name for that speaker, and —
+/// during a LIVE meeting — re-enrolls the speaker's voiceprint from the span's
+/// retained audio so future auto-detection improves (per the correction-feedback
+/// design). Best-effort; a missing meeting or DB hiccup is logged, never fatal.
+async fn handle_reassign_span_requested(
+    daemon: &Arc<Daemon>,
+    segment_ids: &[String],
+    speaker_id: i64,
+    name: Option<&str>,
+) {
+    // (a) Rewrite the segments' speaker_id under the meeting lock, and collect
+    // the reassigned segments' audio spans (for the live re-enroll below).
+    let (meeting_id, spans, snapshot) = {
+        let mut guard = daemon.meeting.lock().await;
+        let Some(meeting) = guard.as_mut() else {
+            debug!("reassign-span: no active meeting; ignoring");
+            return;
+        };
+        let want: std::collections::HashSet<&str> =
+            segment_ids.iter().map(|s| s.as_str()).collect();
+        let mut spans: Vec<(f64, f64)> = Vec::new();
+        for seg in meeting.transcript.iter_mut() {
+            if want.contains(seg.id.to_string().as_str()) {
+                seg.speaker_id = Some(speaker_id);
+                seg.secondary_speaker_ids.clear();
+                if let (Some(start), Some(dur)) =
+                    (seg.audio_start_secs, seg.audio_dur_secs)
+                {
+                    spans.push((start, dur));
+                }
+            }
+        }
+        if let Err(e) = daemon.store.save_active(meeting) {
+            warn!("reassign-span: save failed: {e:#}");
+        }
+        (meeting.id.to_string(), spans, meeting.clone())
+    };
+
+    // (b) Persist the display name (if given) so it shows and survives.
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        let db_path = daemon.paths.data_dir.join("sessions.db");
+        if let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db"))
+        {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&meeting_id) {
+                let _ = db.ensure_meeting_session(uuid, None);
+            }
+            if let Err(e) =
+                db.set_speaker_name_by_user(&meeting_id, speaker_id as i32, name, None)
+            {
+                warn!("reassign-span: set_speaker_name failed: {e:#}");
+            }
+        }
+    }
+
+    // (c) LIVE re-enroll: fine-tune the speaker's voiceprint from the reassigned
+    // span's audio, so future auto-detection recognizes this voice as this
+    // speaker. Only possible during the meeting (the audio buffer is cleared at
+    // end); gated behind the diarize feature.
+    #[cfg(feature = "diarize")]
+    crate::diarize::reenroll_speaker_from_spans(daemon, &meeting_id, speaker_id, &spans).await;
+    #[cfg(not(feature = "diarize"))]
+    let _ = &spans;
+
+    // (d) Re-broadcast so the transcript relabels live. Re-emit the whole active
+    // snapshot (simplest correct path — the UI re-renders labels from it).
+    update_state_from_meeting(daemon, Some(&snapshot))
+        .await
+        .ok();
+    handle_meeting_state_requested(daemon).await;
+    info!(
+        segments = segment_ids.len(),
+        speaker_id, "reassign-span: applied"
+    );
+}
+
+/// Split ONE transcript segment at a character offset into two, assigning each
+/// half to a (possibly different) speaker. Divides the text at the offset and
+/// proportionally divides the audio timing, replacing the one segment with two.
+async fn handle_split_segment_requested(
+    daemon: &Arc<Daemon>,
+    segment_id: &str,
+    char_offset: usize,
+    first_speaker_id: i64,
+    second_speaker_id: i64,
+) {
+    let snapshot = {
+        let mut guard = daemon.meeting.lock().await;
+        let Some(meeting) = guard.as_mut() else {
+            debug!("split-segment: no active meeting; ignoring");
+            return;
+        };
+        let Some(pos) = meeting
+            .transcript
+            .iter()
+            .position(|s| s.id.to_string() == segment_id)
+        else {
+            debug!("split-segment: segment not found; ignoring");
+            return;
+        };
+        let original = meeting.transcript[pos].clone();
+        // Clamp the offset onto a char boundary within the text.
+        let text_len = original.text.chars().count();
+        let off = char_offset.min(text_len);
+        let first_text: String = original.text.chars().take(off).collect();
+        let second_text: String = original.text.chars().skip(off).collect();
+        // Proportionally divide the audio timing by the char fraction.
+        let frac = if text_len == 0 {
+            0.5
+        } else {
+            off as f64 / text_len as f64
+        };
+        let (first_start, first_dur, second_start, second_dur) =
+            match (original.audio_start_secs, original.audio_dur_secs) {
+                (Some(start), Some(dur)) => {
+                    let split_dur = dur * frac;
+                    (
+                        Some(start),
+                        Some(split_dur),
+                        Some(start + split_dur),
+                        Some(dur - split_dur),
+                    )
+                }
+                _ => (None, None, None, None),
+            };
+
+        // A speaker id of -1 means "keep the original segment's speaker" (the UI
+        // sentinel for the half that isn't being reassigned).
+        let keep = original.speaker_id;
+        let resolve = |sid: i64| if sid < 0 { keep } else { Some(sid) };
+
+        let mut first = cue_core::meeting::TranscriptSegment::new(
+            original.speaker.clone(),
+            first_text,
+            original.is_final,
+        );
+        first.speaker_id = resolve(first_speaker_id);
+        first.audio_start_secs = first_start;
+        first.audio_dur_secs = first_dur;
+
+        let mut second = cue_core::meeting::TranscriptSegment::new(
+            original.speaker.clone(),
+            second_text,
+            original.is_final,
+        );
+        second.speaker_id = resolve(second_speaker_id);
+        second.audio_start_secs = second_start;
+        second.audio_dur_secs = second_dur;
+
+        meeting.transcript.splice(pos..=pos, [first, second]);
+        if let Err(e) = daemon.store.save_active(meeting) {
+            warn!("split-segment: save failed: {e:#}");
+        }
+        meeting.clone()
+    };
+
+    update_state_from_meeting(daemon, Some(&snapshot)).await.ok();
+    handle_meeting_state_requested(daemon).await;
+    info!(segment_id, char_offset, "split-segment: applied");
 }
 
 async fn handle_remove_context_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) -> Result<()> {
@@ -13426,9 +13785,8 @@ fn capture_active_page_platform() -> Result<ActivePageCapture> {
 
 async fn attach_context_artifacts(
     daemon: &Arc<Daemon>,
-    artifacts: Vec<ContextArtifact>,
+    mut artifacts: Vec<ContextArtifact>,
 ) -> Result<MeetingRecord> {
-    let indexed_artifacts = artifacts.clone();
     let meeting_snapshot = {
         let mut meeting_guard = daemon.meeting.lock().await;
         if meeting_guard.is_none() {
@@ -13436,10 +13794,29 @@ async fn attach_context_artifacts(
         }
 
         let meeting = meeting_guard.as_mut().expect("meeting exists");
+        // ANCHOR each new artifact to the LAST finalized transcript segment so the
+        // overlay renders it inline after the line containing that segment (not at
+        // the tail). A segment id — not a count — because the UI GROUPS segments
+        // into fewer lines, so a raw index would overshoot. Only stamp artifacts
+        // that don't already carry one.
+        let anchor = meeting
+            .transcript
+            .iter()
+            .rev()
+            .find(|s| s.is_final)
+            .map(|s| s.id.to_string());
+        for a in artifacts.iter_mut() {
+            if a.anchor_segment_id.is_none() {
+                a.anchor_segment_id = anchor.clone();
+            }
+        }
+        let indexed = artifacts.clone();
         meeting.context.extend(artifacts);
         daemon.store.save_active(meeting)?;
-        meeting.clone()
+        let snapshot = meeting.clone();
+        (snapshot, indexed)
     };
+    let (meeting_snapshot, indexed_artifacts) = meeting_snapshot;
 
     index_context_artifacts_for_rag(daemon, meeting_snapshot.id.to_string(), indexed_artifacts);
     Ok(meeting_snapshot)
@@ -17401,39 +17778,6 @@ mod tests {
         // Same agent, same model — only the thread is fresh.
         assert_eq!(settings.attached_agent.as_deref(), Some("cursor"));
         assert_eq!(settings.attached_model.as_deref(), Some("opus"));
-    }
-
-    #[test]
-    fn for_me_suppresses_same_question_within_cooldown() {
-        let last = normalize_transcript_text("is there anything falling behind schedule");
-        // A follow-on STT fragment of the SAME question, 2s later → suppressed.
-        let frag = normalize_transcript_text("anything falling behind schedule");
-        assert!(
-            for_me_should_suppress(&frag, 2_000, 0_000 + 1, &last),
-            "an overlapping fragment within the cooldown must be suppressed"
-        );
-        // The exact same text again → suppressed.
-        assert!(for_me_should_suppress(&last, 2_000, 1, &last));
-    }
-
-    #[test]
-    fn for_me_allows_new_question_and_after_cooldown() {
-        let last = normalize_transcript_text("is there anything falling behind schedule");
-        // A genuinely DIFFERENT question within the window → NOT suppressed.
-        let other = normalize_transcript_text("what is the deadline for the handbook");
-        assert!(
-            !for_me_should_suppress(&other, 2_000, 1, &last),
-            "a distinct question must surface even within the cooldown"
-        );
-        // The SAME question but AFTER the cooldown window → NOT suppressed.
-        assert!(
-            !for_me_should_suppress(&last, FOR_ME_COOLDOWN_MS + 5, 1, &last),
-            "the same question after the cooldown may re-surface"
-        );
-        // Never triggered before (last_ms == 0) → never suppressed.
-        assert!(!for_me_should_suppress(&last, 5_000, 0, &last));
-        // No prior question text → nothing to dedup against.
-        assert!(!for_me_should_suppress(&last, 2_000, 1, ""));
     }
 
     #[test]
