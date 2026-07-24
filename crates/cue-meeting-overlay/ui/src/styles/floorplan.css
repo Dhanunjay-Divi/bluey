@@ -78,6 +78,11 @@
   border-bottom: 1px solid var(--line);
   background: var(--paper);
   -webkit-app-region: drag; /* the bar itself drags the window */
+  /* Sit ABOVE the floating control stack (z-index:40) with a solid background,
+     so when the stack is tall / the window is short, the icons never bleed up
+     over the header — the header always covers them. */
+  position: relative;
+  z-index: 50;
 }
 
 .fp-topbar-left,
@@ -407,9 +412,20 @@
  * Key Decisions ledger — a left-ruled inline block
  * =================================================================== */
 .fp-ledger {
+  /* STICKY: the Key Decisions block pins to the top of the scrolling canvas so
+     it stays visible while the transcript scrolls underneath. A paper background
+     + soft bottom edge keep the transcript from showing through as it passes. */
+  position: sticky;
+  top: 0;
+  z-index: 6;
   border-left: 2px solid var(--line-2);
-  padding-left: 16px;
-  margin-bottom: 34px;
+  padding: 8px 12px 12px 16px;
+  margin: 0 -12px 28px;
+  background: linear-gradient(
+    var(--paper) 0%,
+    var(--paper) 82%,
+    color-mix(in srgb, var(--paper) 0%, transparent) 100%
+  );
   animation: fp-slide-down 0.4s cubic-bezier(0.2, 0.9, 0.2, 1) both;
 }
 .fp-ledger-item {

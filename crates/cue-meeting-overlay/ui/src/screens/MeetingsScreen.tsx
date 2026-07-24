@@ -233,6 +233,22 @@ function MeetingViewer({
 
         {view !== null && !failed && (
           <>
+            {/* Key Decisions ledger — the SAME block the live view shows, so a
+                past meeting's verified decisions are visible on reopen (they were
+                previously dropped: the viewer received view.decisions but never
+                rendered them). Only shown when the meeting has decisions. */}
+            {view.decisions.length > 0 && (
+              <div style={decisionsPanel}>
+                <div style={decisionsKicker}>Key decisions</div>
+                {view.decisions.map((d) => (
+                  <div key={d.id} style={decisionRow}>
+                    <span style={decisionMark}>✓</span>
+                    <span>{d.text}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Q&A feed — every asked question + its answer, oldest first. */}
             {turns.map((turn) => (
               <div key={turn.id}>
@@ -426,6 +442,38 @@ const answerText = {
 const transcriptPanel = {
   borderTop: "1px solid var(--line)",
   marginTop: 6,
+} as const;
+
+// Key Decisions block for the read-only viewer — a left-ruled inline panel,
+// echoing the live view's DecisionLedger but in this screen's inline-style world.
+const decisionsPanel = {
+  borderLeft: "2px solid var(--ok, #4e8d5b)",
+  paddingLeft: 12,
+  margin: "4px 16px 14px",
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+} as const;
+const decisionsKicker = {
+  fontSize: 10,
+  fontWeight: 600,
+  letterSpacing: "0.04em",
+  textTransform: "uppercase",
+  color: "var(--ink-3)",
+  marginBottom: 2,
+} as const;
+const decisionRow = {
+  display: "flex",
+  alignItems: "flex-start",
+  gap: 8,
+  fontSize: 13.5,
+  lineHeight: 1.45,
+  color: "var(--ink)",
+} as const;
+const decisionMark = {
+  flex: "none",
+  color: "var(--ok, #4e8d5b)",
+  fontWeight: 700,
 } as const;
 
 const loadingWrap = {

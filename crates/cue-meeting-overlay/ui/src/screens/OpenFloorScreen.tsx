@@ -214,6 +214,7 @@ export function OpenFloorScreen({
     [history, turns, contextItems],
   );
 
+
   // Distinct diarized speakers seen so far — the "reassign this line to…" targets
   // in the speaker editor. Labelled by the first line that named each speaker id.
   const knownSpeakers = useMemo<KnownSpeaker[]>(() => {

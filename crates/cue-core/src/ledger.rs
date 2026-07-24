@@ -205,11 +205,32 @@ struct RawOwner {
 /// bad pass simply contributes nothing.
 pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
     let Some(json) = extract_json_object(raw) else {
+        tracing::info!(
+            target: "ledger_verify",
+            raw_len = raw.len(),
+            "LEDGER-VERIFY: no JSON object found in model output → 0 items"
+        );
         return Vec::new();
     };
-    let Ok(parsed) = serde_json::from_str::<RawExtraction>(&json) else {
-        return Vec::new();
+    let parsed = match serde_json::from_str::<RawExtraction>(&json) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::info!(
+                target: "ledger_verify",
+                error = %e,
+                json_len = json.len(),
+                "LEDGER-VERIFY: JSON parse failed → 0 items"
+            );
+            return Vec::new();
+        }
     };
+    tracing::info!(
+        target: "ledger_verify",
+        decisions = parsed.decisions.len(),
+        constraints = parsed.constraints.len(),
+        owners = parsed.owners.len(),
+        "LEDGER-VERIFY: model returned N raw items (pre-verify)"
+    );
 
     let window_norm = normalize(window);
     // Live STT emits short finals, so one spoken sentence often spans several
@@ -219,20 +240,71 @@ pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
     // verbatim TRANSCRIPT content, we just stop segmentation artifacts from
     // rejecting real items (found live, VoxConverse E2E 2026-07).
     let window_content_norm = normalize(&strip_speaker_labels(window));
+    // Punctuation-insensitive variants: the live STT transcript is nearly
+    // punctuation-free, but a capable extractor re-punctuates its quote ("we
+    // have." / "James, please"). Exact substring then fails on a lone comma or
+    // period. Strip punctuation from BOTH sides so a re-punctuated quote of real
+    // spoken content still matches. (Content-only, never invents words.)
+    let window_np = strip_punct(&window_norm);
+    let window_content_np = strip_punct(&window_content_norm);
     let verified = |quote: &str| {
         let q = normalize(quote);
-        window_norm.contains(&q) || window_content_norm.contains(&q)
+        // Tier 1: exact substring (fast path, original guarantee).
+        if window_norm.contains(&q) || window_content_norm.contains(&q) {
+            return true;
+        }
+        // Tier 2: punctuation-insensitive substring — recovers quotes rejected
+        // ONLY by a stray comma/period (the dominant real-world false negative).
+        let q_np = strip_punct(&q);
+        if !q_np.is_empty() && (window_np.contains(&q_np) || window_content_np.contains(&q_np)) {
+            tracing::info!(
+                target: "ledger_verify",
+                quote = %truncate_for_log(&q, 160),
+                "LEDGER-VERIFY: quote accepted via punctuation-insensitive match"
+            );
+            return true;
+        }
+        // Tier 3: CONTIGUOUS-span fallback (partial-ratio style). The quote's words
+        // must appear as an unbroken RUN in the transcript, and that run must cover
+        // ≥ CONTIGUOUS_FLOOR of the quote. This is the anti-hallucination guard:
+        // a fabricated "decision" assembled from common words scattered across the
+        // window (e.g. "we have to look at the plan for the release") has NO long
+        // contiguous run, so it fails — whereas a real quote off by a dropped
+        // filler word keeps a long run. This is deliberately stricter than a
+        // bag-of-words overlap, which a scattered-common-word hallucination could
+        // pass (confirmed adversarially). Order + adjacency are what make a quote
+        // real, not mere word presence.
+        let run = longest_contiguous_run(&q_np, &window_content_np);
+        if run >= CONTIGUOUS_FLOOR {
+            tracing::info!(
+                target: "ledger_verify",
+                quote = %truncate_for_log(&q, 160),
+                run = format!("{run:.2}"),
+                "LEDGER-VERIFY: quote accepted via contiguous-span match"
+            );
+            return true;
+        }
+        tracing::info!(
+            target: "ledger_verify",
+            quote = %truncate_for_log(&q, 160),
+            run = format!("{run:.2}"),
+            "LEDGER-VERIFY: quote REJECTED (no exact / punct / contiguous match)"
+        );
+        false
     };
     let mut out = Vec::new();
+    let mut rejected = 0usize;
 
     let mut push_statement = |kind: LedgerKind, s: RawStatement| {
         let quote = s.quote.trim();
         let text = s.text.trim();
         if quote.is_empty() || text.is_empty() {
+            rejected += 1;
             return;
         }
         // The guarantee: quote must literally appear in the transcript.
         if !verified(quote) {
+            rejected += 1;
             return;
         }
         let speaker = verify_speaker(s.speaker, window);
@@ -255,9 +327,11 @@ pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
         let owner = o.owner.trim();
         let task = o.task.trim();
         if quote.is_empty() || owner.is_empty() {
+            rejected += 1;
             continue;
         }
         if !verified(quote) {
+            rejected += 1;
             continue;
         }
         let text = if task.is_empty() {
@@ -273,7 +347,50 @@ pub fn parse_and_verify(raw: &str, window: &str) -> Vec<LedgerItem> {
         });
     }
 
+    tracing::info!(
+        target: "ledger_verify",
+        verified = out.len(),
+        rejected,
+        "LEDGER-VERIFY: verify complete (survived / rejected)"
+    );
     out
+}
+
+/// Longest UNBROKEN run of `quote`'s words that appears contiguously in `window`,
+/// as a fraction of the quote's word count. Both args must already be normalized
+/// + punctuation-stripped. This is a word-level `partial_ratio`: it rewards
+/// adjacency, so a real quote (words in order, maybe one dropped) scores high
+/// while a hallucination stitched from scattered common words scores low. O(n·m)
+/// over word counts — quotes are short, so this is cheap.
+fn longest_contiguous_run(quote: &str, window: &str) -> f64 {
+    let q: Vec<&str> = quote.split_whitespace().collect();
+    let w: Vec<&str> = window.split_whitespace().collect();
+    if q.is_empty() {
+        return 0.0;
+    }
+    // Classic longest-common-substring over token slices (DP row-compressed).
+    let mut prev = vec![0usize; w.len() + 1];
+    let mut best = 0usize;
+    for &qt in &q {
+        let mut curr = vec![0usize; w.len() + 1];
+        for (j, &wt) in w.iter().enumerate() {
+            if qt == wt {
+                curr[j + 1] = prev[j] + 1;
+                if curr[j + 1] > best {
+                    best = curr[j + 1];
+                }
+            }
+        }
+        prev = curr;
+    }
+    best as f64 / q.len() as f64
+}
+
+fn truncate_for_log(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    s.chars().take(max).collect::<String>() + "…"
 }
 
 /// Keep a speaker label only if it actually occurs in the window.
@@ -336,6 +453,26 @@ fn normalize(s: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .to_ascii_lowercase()
+}
+
+/// Contiguous-run floor for the Tier-3 fuzzy verify fallback. The quote is
+/// accepted only if an UNBROKEN run of its words appears in the transcript
+/// covering ≥ this fraction of the quote. 0.75 tuned against the real-transcript
+/// diagnostic: a punctuation-only near-miss keeps a full run (1.0); a real quote
+/// with one STT glitch keeps ~0.7–0.8; a scattered-common-word hallucination
+/// breaks into short runs (≤0.5) and is rejected. Stricter than bag-of-words
+/// overlap on purpose — adjacency, not mere presence, is what proves a quote.
+const CONTIGUOUS_FLOOR: f64 = 0.75;
+
+/// Strip ASCII punctuation from a normalized string, so a re-punctuated quote
+/// ("we have." / "james,") matches punctuation-free STT transcript content. Keeps
+/// letters, digits, and single spaces; collapses the result.
+fn strip_punct(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
+        .collect();
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Drop the leading `Label: ` from each window line (the window renders one
@@ -466,6 +603,93 @@ mod tests {
     }
 
     use super::*;
+
+    // DIAGNOSTIC: reproduces the real-world "decisions:0" failure using an actual
+    // punctuation-free, glitchy STT window (like the user's meetings). Proves WHICH
+    // quote variations the verbatim gate rejects. Run with:
+    //   cargo test -p cue-core parse_and_verify_diagnostic -- --nocapture
+    #[test]
+    fn parse_and_verify_diagnostic_real_transcript() {
+        // A real slice of a low-quality live transcript: no punctuation, run-on,
+        // one STT word-glitch ("MVC" for the spoken "MVP").
+        let window = "\
+System: the source code group is going to try and do that around file by file diff navigation to solve performance and usability problems in twelve dot three
+System: I'll share any findings we have and if anyone's interested in discussing that with me more put a meeting my calendar or drop me a message
+System: whatever you learn from yours James please feed that back";
+
+        // What a capable LLM NATURALLY returns: cleaned + re-punctuated quotes.
+        // Each SHOULD be a true positive, but the exact-substring gate may reject.
+        let raw = r#"{
+          "decisions": [],
+          "constraints": [],
+          "owners": [
+            {"quote": "I'll share any findings we have.", "owner": "James", "task": "share findings from the product discovery sprint"},
+            {"quote": "whatever you learn from yours James, please feed that back", "owner": "James", "task": "feed learnings back to the team"},
+            {"quote": "the source code group is going to try to get to an MVC quickly", "owner": "source code group", "task": "run a discovery sprint on diff navigation"}
+          ]
+        }"#;
+
+        let items = parse_and_verify(raw, window);
+        // Report what survived so --nocapture shows the exact split.
+        eprintln!("DIAGNOSTIC survived {} item(s):", items.len());
+        for it in &items {
+            eprintln!("  KEPT: {:?} — {}", it.kind, it.text);
+        }
+        // After the tiered-match fix:
+        //   Item 1 ("...we have.") — recovered via punctuation-insensitive match.
+        //   Item 2 ("...James, please feed that back") — recovered (comma stripped).
+        //   Item 3 (paraphrase "MVC quickly", overlap 0.43) — STILL rejected.
+        // So the two REAL action items survive; the hallucination stays blocked.
+        assert_eq!(
+            items.len(),
+            2,
+            "tiered match must recover the 2 punctuation-only near-misses and \
+             still reject the paraphrase (anti-hallucination guarantee)"
+        );
+        let texts: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        assert!(texts.iter().any(|t| t.contains("share findings")));
+        assert!(texts.iter().any(|t| t.contains("feed learnings back")));
+        assert!(
+            !texts.iter().any(|t| t.contains("diff navigation")),
+            "the paraphrased/hallucinated item must NOT survive"
+        );
+    }
+
+    #[test]
+    fn scattered_common_word_hallucination_is_rejected() {
+        // Adversarial: a "decision" assembled ENTIRELY from common words that DO
+        // each appear in the window, but were never said together. A bag-of-words
+        // overlap would accept this (every word present); the contiguous-run gate
+        // must reject it — adjacency, not presence, proves a quote.
+        let window = "\
+System: so i think we have to look at the plan and the team and the customers
+System: and the release and the webinar and the feedback and the issues and the
+System: performance and the problems that we have around all of this";
+        let halluc = r#"{
+          "decisions": [{
+            "quote": "we have to look at the plan for the release",
+            "text": "Decide the release plan"
+          }],
+          "constraints": [],
+          "owners": []
+        }"#;
+        assert!(
+            parse_and_verify(halluc, window).is_empty(),
+            "scattered-common-word hallucination must be rejected by the \
+             contiguous-run gate"
+        );
+
+        // But a REAL contiguous quote off only by punctuation is still accepted.
+        let real = r#"{
+          "decisions": [{
+            "quote": "we have to look at the plan.",
+            "text": "Look at the plan"
+          }],
+          "constraints": [],
+          "owners": []
+        }"#;
+        assert_eq!(parse_and_verify(real, window).len(), 1);
+    }
 
     #[test]
     fn quote_spanning_choppy_stt_segments_still_verifies() {

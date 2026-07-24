@@ -159,7 +159,7 @@ export function App() {
           glass panel entirely rather than living inside the tab body. History &
           Agents are reached via its drawer button (onOpenDrawer). */}
       {floorplan && !collapsed && !onboarding && (
-        <div style={{ position: "fixed", inset: 8, display: "flex" }}>
+        <div style={{ position: "fixed", inset: 0, display: "flex" }}>
           <Glass
             radius="var(--r-xl)"
             style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
@@ -221,7 +221,7 @@ export function App() {
       <div
         style={{
           position: "fixed",
-          inset: 8,
+          inset: 0,
           display: collapsed || onboarding || floorplan ? "none" : "flex",
         }}
       >
