@@ -422,7 +422,7 @@ function CalendarStep({
 
 function Glyph({ children }: { children: React.ReactNode }) {
   return (
-    <span style={{ width: 40, height: 40, borderRadius: 12, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 19, background: "linear-gradient(150deg,#eef0ff,#e7f6f1)", color: "var(--tint-ink)", boxShadow: "inset 0 0 0 1px rgba(255,255,255,.6)" }}>
+    <span style={{ width: 40, height: 40, borderRadius: 12, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 19, background: "var(--paper-sink, var(--glass-2))", color: "var(--ink)", boxShadow: "inset 0 0 0 1px var(--line)" }}>
       {children}
     </span>
   );
@@ -432,14 +432,14 @@ const h2 = { fontSize: 19, fontWeight: 600, letterSpacing: "-.02em", color: "var
 const p = { fontSize: 13.5, lineHeight: 1.6, color: "var(--ink-2)" } as const;
 const primary = {
   fontSize: 13.5,
-  fontWeight: 540,
-  color: "#fff",
-  background: "linear-gradient(140deg,var(--tint),#8f7af5)",
+  fontWeight: 560,
+  color: "var(--paper, #fff)",
+  background: "var(--ink)",
   border: "none",
   borderRadius: 11,
   padding: "10px 18px",
   cursor: "pointer",
-  boxShadow: "0 5px 14px -3px rgba(111,106,240,.5)",
+  boxShadow: "0 5px 14px -4px rgba(28,26,25,.35)",
 } as const;
 const ghost = {
   fontSize: 13.5,

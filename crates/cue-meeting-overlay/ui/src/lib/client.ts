@@ -97,6 +97,12 @@ export interface MeetingClient {
    *  and a guidance card is shown. Resolves { ok:true } once activation is
    *  confirmed. */
   continueMeeting(id: string): Promise<ContinueResult>;
+  /** Start a BRAND-NEW meeting: the daemon archives the active meeting (if it
+   *  has content; else discards it) and starts a fresh empty one — the same
+   *  end→start `bluey on` uses. Fire-and-forget: the daemon pushes a fresh
+   *  (empty) active reseed via {@link onMeetingReseed}, so the transcript, Q&A,
+   *  decisions, and context all clear. Safe with no active meeting. */
+  newMeeting(): void;
   /** Subscribe to daemon-pushed ACTIVE meeting-state reseeds (meeting_id
    *  absent) — emitted when a past meeting is continued into the active slot.
    *  Returns an unsubscribe fn. Read-only VIEW replies (meeting_id present)
@@ -125,6 +131,19 @@ export interface MeetingClient {
    *  The daemon rewrites the segments, re-broadcasts, and (during a live meeting)
    *  re-enrolls the speaker's voiceprint from the span's audio. Fire-and-forget. */
   reassignSpan(segmentIds: string[], speakerId: number, name?: string): void;
+  /** Reassign a precise CHARACTER RANGE of a transcript line to a speaker. The
+   *  line is composed of `memberIds` (ordered raw segments); the daemon maps
+   *  `[charStart, charEnd)` onto their concatenated text, reassigns fully-covered
+   *  segments whole, and splits partially-covered boundary segments at the exact
+   *  char — so ANY selection (mid-segment, spanning segments) is honored. `name`
+   *  optionally sets/creates the speaker's display name in one step. */
+  reassignRange(
+    memberIds: string[],
+    charStart: number,
+    charEnd: number,
+    speakerId: number,
+    name?: string,
+  ): void;
   /** Split ONE transcript segment at a character offset into two, assigning each
    *  half to a (possibly different) speaker (the "break here" correction). */
   splitSegment(

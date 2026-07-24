@@ -573,6 +573,21 @@ pub enum OverlayEvent {
         first_speaker_id: i64,
         second_speaker_id: i64,
     },
+    /// UI reassigned a precise CHARACTER RANGE of a transcript LINE to a speaker —
+    /// the robust "select any text → assign" correction. `member_ids` are the
+    /// line's raw segments in order; the daemon concatenates their text, maps
+    /// `[char_start, char_end)` onto it, reassigns fully-covered segments whole,
+    /// and splits the two boundary segments at the exact char so only the selected
+    /// portion moves. `name` optionally sets the speaker's display name in one
+    /// step. Replaces the fragile grouped-line-offset SplitSegmentRequested path.
+    ReassignRangeRequested {
+        member_ids: Vec<String>,
+        char_start: usize,
+        char_end: usize,
+        speaker_id: i64,
+        #[serde(default)]
+        name: Option<String>,
+    },
     /// UI asked for the current discovered-agent list (agent-bridge Slice 5a).
     AgentListRequested,
     /// UI attached an agent; `session_id` is an optional session to resume and
@@ -641,6 +656,12 @@ pub enum OverlayEvent {
     MeetingContinueRequested {
         id: uuid::Uuid,
     },
+    /// UI clicked **New meeting** — archive the active meeting (if any) and start
+    /// a fresh empty one, exactly like `bluey meeting end` + `bluey meeting
+    /// start` (the same path `bluey on` uses). The daemon replies with a fresh
+    /// [`OverlayCommand::SetMeetingState`] so the transcript/Q&A/decisions all
+    /// clear. Safe to call with no active meeting (just starts a new one).
+    MeetingNewRequested,
     /// UI asked to re-authenticate one hosted-OAuth connector. For now this
     /// only logs and re-emits guidance; the real OAuth flow is future work.
     ConnectorReauthRequested {

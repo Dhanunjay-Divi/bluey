@@ -75,6 +75,13 @@
   --tint-wash: rgba(44, 42, 41, 0.06);
   --mint: #4e8d5b; /* connector "ready" dot */
   --ok: #4e8d5b;
+  /* The glass theme's accent hues (violet/blue) are NOT part of the warm-paper
+     look. Remap them to monochrome ink so any leftover var(--violet)/var(--blue)
+     reference (spinners, agent avatars, gradients) stays on-palette instead of
+     rendering the default indigo/blue. Hardcoded hex (#8f7af5 …) still needs a
+     direct edit — only token refs are caught here. */
+  --violet: #3c3a38;
+  --blue: #6b655c;
   --shadow: 0 40px 100px -20px rgba(45, 35, 22, 0.15),
     0 0 1px rgba(45, 35, 22, 0.1);
   /* floorplan-only */

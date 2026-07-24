@@ -19,10 +19,16 @@ import type { KnownSpeaker } from "./SpeakerEditor";
 import { UserIcon, PlusIcon } from "../icons";
 
 interface SelInfo {
-  lineId: string;
-  start: number; // char offset of selection start within the line text
-  end: number; // char offset of selection end
-  lineLen: number;
+  /** The grouped line's member segment ids, in order (the segments the daemon
+   *  will walk to locate + split the selection precisely). */
+  memberIds: string[];
+  /** The char range of the selection within the grouped line's joined text. The
+   *  daemon maps this range onto the concatenated member-segment texts, so ANY
+   *  selection — mid-segment, spanning segments, anywhere — resolves precisely:
+   *  fully-covered segments are reassigned whole; partially-covered boundary
+   *  segments are split at the exact char, and only the covered part reassigned. */
+  start: number;
+  end: number;
   x: number; // viewport coords for the toolbar
   y: number;
 }
@@ -47,6 +53,8 @@ export function SelectionToolbar({
 }) {
   const [sel, setSel] = useState<SelInfo | null>(null);
   const [picking, setPicking] = useState(false);
+  const [naming, setNaming] = useState(false);
+  const [newName, setNewName] = useState("");
   const barRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -74,7 +82,13 @@ export function SelectionToolbar({
         setSel(null);
         return;
       }
-      const text = startEl.textContent ?? "";
+      // The raw segment ids this line is composed of (the grouper merges many).
+      // We reassign these WHOLE segments — the UI has no per-segment text to
+      // safely split at a sub-segment offset, and a grouped-line offset does NOT
+      // map to any single segment (the bug that split " Scale " at offset 35).
+      const memberIds = (startEl.dataset.memberIds ?? "")
+        .split(",")
+        .filter(Boolean);
       const start = offsetWithin(
         startEl,
         range.startContainer,
@@ -87,14 +101,15 @@ export function SelectionToolbar({
       }
       const rect = range.getBoundingClientRect();
       setSel({
-        lineId,
+        memberIds,
         start: Math.min(start, end),
         end: Math.max(start, end),
-        lineLen: text.length,
         x: rect.left + rect.width / 2,
         y: rect.top,
       });
       setPicking(false);
+      setNaming(false);
+      setNewName("");
     };
     document.addEventListener("selectionchange", onSelect);
     return () => document.removeEventListener("selectionchange", onSelect);
@@ -106,31 +121,15 @@ export function SelectionToolbar({
   const newSpeakerId =
     knownSpeakers.reduce((m, s) => Math.max(m, s.id), -1) + 1;
 
-  const assign = (speakerId: number) => {
-    const client = getClient();
-    const { lineId, start, end, lineLen } = sel;
-    // A near-whole-line selection → reassign the whole line (the common case:
-    // "this line is actually X"). A genuine PARTIAL selection → split the line at
-    // the selection boundaries so the highlighted words become their own segment
-    // assigned to the chosen speaker, and the rest keeps its speaker. This is
-    // what lets two speakers share one section: highlight each person's words and
-    // assign them separately.
-    const nearWhole = start <= 1 && end >= lineLen - 1;
-    if (nearWhole) {
-      client.reassignSpan([lineId], speakerId);
-    } else if (end >= lineLen - 1) {
-      // Selection runs to the end → one split: [head keeps speaker | tail=target].
-      client.splitSegment(lineId, start, -1, speakerId);
-    } else if (start <= 1) {
-      // Selection from the start → one split: [head=target | tail keeps speaker].
-      client.splitSegment(lineId, end, speakerId, -1);
-    } else {
-      // Middle selection → split off the tail after the selection first (both
-      // halves keep the original), then split the remaining head at `start` so
-      // the selected middle (now the tail of the first split) becomes the target.
-      client.splitSegment(lineId, end, -1, -1);
-      client.splitSegment(lineId, start, -1, speakerId);
-    }
+  const assign = (speakerId: number, name?: string) => {
+    const { memberIds, start, end } = sel;
+    // ONE precise command: the daemon maps [start,end) onto the concatenated
+    // member-segment texts, reassigns fully-covered segments whole, and splits
+    // partially-covered boundary segments at the exact char — so ANY selection
+    // (mid-segment, spanning segments, anywhere) is honored precisely. Replaces
+    // the old grouped-line-offset splitSegment that mis-mapped (" Scale " split
+    // at offset 35) and dropped the name.
+    getClient().reassignRange(memberIds, start, end, speakerId, name);
     window.getSelection()?.removeAllRanges();
     setSel(null);
   };
@@ -154,6 +153,33 @@ export function SelectionToolbar({
           <UserIcon size={13} />
           Assign speaker
         </button>
+      ) : naming ? (
+        <form
+          className="fp-seltool-name"
+          onSubmit={(e) => {
+            e.preventDefault();
+            const n = newName.trim();
+            assign(newSpeakerId, n || undefined);
+          }}
+        >
+          <input
+            autoFocus
+            className="fp-seltool-input"
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="Name this speaker…"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setNaming(false);
+            }}
+          />
+          <button
+            type="submit"
+            className="fp-seltool-apply"
+            disabled={!newName.trim()}
+          >
+            Assign to “{newName.trim() || "…"}”
+          </button>
+        </form>
       ) : (
         <div className="fp-seltool-menu">
           <div className="fp-seltool-kicker">Assign selection to</div>
@@ -171,12 +197,12 @@ export function SelectionToolbar({
           ))}
           <button
             className="fp-seltool-row is-new"
-            onClick={() => assign(newSpeakerId)}
+            onClick={() => setNaming(true)}
           >
             <span className="fp-seltool-avatar is-new" aria-hidden>
               <PlusIcon size={12} />
             </span>
-            New speaker
+            New speaker…
           </button>
         </div>
       )}

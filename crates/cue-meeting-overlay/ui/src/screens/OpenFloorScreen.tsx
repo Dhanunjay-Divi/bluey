@@ -37,6 +37,7 @@ import {
   CloseIcon,
   CopyIcon,
   LayersIcon,
+  PlusIcon,
   SparkleIcon,
 } from "../components/icons";
 import { FloatingStack } from "../components/floorplan/FloatingStack";
@@ -143,7 +144,7 @@ export function OpenFloorScreen({
       id,
       // Pin this exchange after whatever transcript is on screen right now, so
       // it stays anchored where it was asked and later lines flow below it.
-      anchor: history.length,
+      anchorSegmentId: history.length > 0 ? history[history.length - 1].id : undefined,
       question: displayQuestion ?? question,
       sendQuestion: displayQuestion ? question : undefined,
       answer: { ...draft },
@@ -261,6 +262,21 @@ export function OpenFloorScreen({
           <span className="fp-speaker-count">
             {speakerCount} {speakerCount === 1 ? "speaker" : "speakers"}
           </span>
+          <button
+            className="fp-iconbtn"
+            title="New meeting session"
+            aria-label="New meeting session"
+            onClick={() => {
+              // Archives the current meeting + starts fresh. Guard when there's
+              // real content so a stray click can't wipe a live transcript.
+              if (history.length > 0 && !confirm("Start a new meeting? The current transcript will be saved to History.")) {
+                return;
+              }
+              client.newMeeting();
+            }}
+          >
+            <PlusIcon size={16} />
+          </button>
           <button
             className="fp-iconbtn"
             title="Meetings & Agents"
@@ -781,15 +797,9 @@ function buildTimeline(
   turns: Turn[],
   attachments: ContextItem[],
 ): TimelineItem[] {
-  // Turns anchor by a COUNT of lines at ask time (they're created in this same
-  // grouped space), so clamp the count to an "after index".
-  const clampCount = (a: number | undefined): number => {
-    const n = a ?? history.length; // no anchor → end
-    return Math.min(Math.max(n - 1, -1), history.length - 1);
-  };
-  // Attachments anchor by a SEGMENT ID (the daemon works in raw segments; the UI
-  // groups them). Resolve it to the index of the grouped line whose memberIds
-  // contain that segment. Not found → tail.
+  // Both turns and attachments anchor by a SEGMENT ID (the UI groups many raw
+  // segments into one line). Resolve it to the index of the grouped line whose
+  // memberIds contain that segment. Not found → tail.
   const segToLineIndex = new Map<string, number>();
   history.forEach((line, i) => {
     if (line.id) segToLineIndex.set(line.id, i);
@@ -801,10 +811,12 @@ function buildTimeline(
     return i == null ? history.length - 1 : i;
   };
 
-  // Bucket turns by the history index they appear AFTER (−1 = before all lines).
+  // Bucket turns by the line that contains their anchor segment (same stable
+  // segment-id resolution as attachments — a raw count would drift as the
+  // grouper merges live fragments).
   const turnsByAfter = new Map<number, Turn[]>();
   for (const t of turns) {
-    const after = clampCount(t.anchor);
+    const after = anchorIndexOf(t.anchorSegmentId);
     (turnsByAfter.get(after) ?? turnsByAfter.set(after, []).get(after)!).push(t);
   }
   for (const arr of turnsByAfter.values()) arr.sort((a, b) => a.id - b.id);

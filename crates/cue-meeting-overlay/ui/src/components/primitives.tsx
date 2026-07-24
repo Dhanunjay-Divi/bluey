@@ -141,8 +141,8 @@ export function Toggle({ on, onClick }: { on: boolean; onClick?: () => void }) {
         cursor: "pointer",
         position: "relative",
         flex: "none",
-        background: on ? "linear-gradient(140deg,var(--tint),#8f7af5)" : "rgba(20,22,28,.12)",
-        boxShadow: on ? "0 2px 6px -1px rgba(111,106,240,.4)" : "none",
+        background: on ? "var(--ink)" : "rgba(20,22,28,.12)",
+        boxShadow: on ? "0 2px 6px -2px rgba(28,26,25,.35)" : "none",
         transition: ".18s",
       }}
     >

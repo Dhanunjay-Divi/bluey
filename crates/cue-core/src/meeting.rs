@@ -499,10 +499,31 @@ impl MeetingRecord {
     }
 
     pub fn last_transcript_text(&self, count: usize) -> String {
-        let start = self.transcript.len().saturating_sub(count);
-        self.transcript[start..]
+        // `count` = speaker TURNS. Coalesce consecutive same-speaker fragments into
+        // one labeled line first (the streaming STT emits many tiny fragments per
+        // utterance; labeling each produced "They: … They: … They: …" mid-turn),
+        // then take the last `count` turns.
+        let mut turns: Vec<(String, String)> = Vec::new();
+        for segment in self.transcript.iter() {
+            let label = segment.context_label().to_string();
+            let text = segment.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            match turns.last_mut() {
+                Some((prev_label, prev_text)) if *prev_label == label => {
+                    if !prev_text.ends_with(' ') && !text.starts_with(' ') {
+                        prev_text.push(' ');
+                    }
+                    prev_text.push_str(text);
+                }
+                _ => turns.push((label, text.to_string())),
+            }
+        }
+        let start = turns.len().saturating_sub(count);
+        turns[start..]
             .iter()
-            .map(|segment| format!("{}: {}", segment.context_label(), segment.text))
+            .map(|(label, text)| format!("{label}: {text}"))
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -512,16 +533,39 @@ impl MeetingRecord {
             return String::new();
         }
 
-        let start = self.transcript.len().saturating_sub(count);
+        // `count` is a count of speaker TURNS, not raw segments. The streaming STT
+        // emits many tiny fragments PER utterance (each ~10 chars is its own
+        // segment), so labeling per-segment produced "They: could actually give
+        // They: feedback They: but" — the label repeated mid-sentence. Coalesce
+        // consecutive same-speaker segments into ONE turn line first, THEN take the
+        // last `count` turns and bound by chars. The label now appears once per
+        // turn, as a reader expects.
+        let mut turns: Vec<(String, String)> = Vec::new(); // (label, joined text)
+        for segment in self.transcript.iter() {
+            let label = segment.context_label().to_string();
+            let text = segment.text.trim();
+            if text.is_empty() {
+                continue;
+            }
+            match turns.last_mut() {
+                Some((prev_label, prev_text)) if *prev_label == label => {
+                    // Same speaker → extend the turn. RAW concat with a single
+                    // space keeps fragment word boundaries without doubling.
+                    if !prev_text.ends_with(' ') && !text.starts_with(' ') {
+                        prev_text.push(' ');
+                    }
+                    prev_text.push_str(text);
+                }
+                _ => turns.push((label, text.to_string())),
+            }
+        }
+
+        let start = turns.len().saturating_sub(count);
         let mut selected = Vec::new();
         let mut used_chars = 0usize;
 
-        for segment in self.transcript[start..].iter().rev() {
-            let line = format!("{}: {}", segment.context_label(), segment.text.trim());
-            if line.trim().is_empty() {
-                continue;
-            }
-
+        for (label, text) in turns[start..].iter().rev() {
+            let line = format!("{label}: {text}");
             let separator_chars = usize::from(!selected.is_empty());
             let line_chars = line.chars().count();
             if used_chars + separator_chars + line_chars <= max_chars {
@@ -530,12 +574,13 @@ impl MeetingRecord {
                 continue;
             }
 
+            // Turn too long for the remaining budget: keep its TAIL (the most
+            // recent words) so the newest content survives the char cap.
             let remaining = max_chars.saturating_sub(used_chars + separator_chars);
             if selected.is_empty() || remaining >= 96 {
-                let truncated =
-                    truncate_transcript_line_tail(segment.speaker, &segment.text, remaining);
-                if !truncated.trim().is_empty() {
-                    selected.push(truncated);
+                let tail = tail_chars(text, remaining.saturating_sub(label.len() + 2));
+                if !tail.trim().is_empty() {
+                    selected.push(format!("{label}: {tail}"));
                 }
             }
             break;
@@ -573,20 +618,6 @@ impl MeetingRecord {
     }
 }
 
-fn truncate_transcript_line_tail(speaker: Speaker, text: &str, max_chars: usize) -> String {
-    let label = speaker.display_label();
-    let prefix = format!("{label}: ...");
-    let prefix_chars = prefix.chars().count();
-    if max_chars <= prefix_chars {
-        return tail_chars(&format!("{label}: {}", text.trim()), max_chars);
-    }
-
-    let tail_budget = max_chars - prefix_chars;
-    format!(
-        "{prefix}{}",
-        tail_chars(text.trim(), tail_budget).trim_start()
-    )
-}
 
 fn tail_chars(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
@@ -778,9 +809,31 @@ mod tests {
 
         let text = meeting.last_transcript_text_bounded(4, 80);
         assert!(text.chars().count() <= 80);
-        // System audio renders with the conversational "They" label.
-        assert!(text.starts_with("They: ..."));
+        // System audio renders with the conversational "They" label — once, at the
+        // start of the (single) turn, not repeated per fragment.
+        assert!(text.starts_with("They: "));
+        assert_eq!(text.matches("They:").count(), 1);
+        // The TAIL (newest words) survives the char cap.
         assert!(text.contains("important ending"));
+    }
+
+    #[test]
+    fn bounded_transcript_coalesces_same_speaker_fragments() {
+        // The bug: streaming STT emits many tiny fragments per utterance, each its
+        // own segment. Labeling per-segment produced "They: could actually give
+        // They: feedback They: but". Coalescing must render ONE label per turn.
+        let mut meeting = MeetingRecord::new(Some("Frag".to_string()));
+        for frag in ["could actually give ", "feedback ", "but"] {
+            meeting.transcript.push(TranscriptSegment::new(
+                Speaker::System,
+                frag.to_string(),
+                true,
+            ));
+        }
+        let text = meeting.last_transcript_text_bounded(3, 220);
+        // One label, one line — the whole utterance under a single "They:".
+        assert_eq!(text.matches("They:").count(), 1);
+        assert_eq!(text, "They: could actually give feedback but");
     }
 
     #[test]

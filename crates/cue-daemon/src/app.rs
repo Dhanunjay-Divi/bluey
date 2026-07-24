@@ -3421,6 +3421,23 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             )
             .await;
         }
+        OverlayEvent::ReassignRangeRequested {
+            member_ids,
+            char_start,
+            char_end,
+            speaker_id,
+            name,
+        } => {
+            handle_reassign_range_requested(
+                daemon,
+                &member_ids,
+                char_start,
+                char_end,
+                speaker_id,
+                name.as_deref(),
+            )
+            .await;
+        }
         OverlayEvent::AgentListRequested => {
             refresh_overlay_agents_swr(daemon).await;
         }
@@ -3459,6 +3476,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         }
         OverlayEvent::MeetingContinueRequested { id } => {
             handle_meeting_continue_requested(daemon, id).await;
+        }
+        OverlayEvent::MeetingNewRequested => {
+            handle_meeting_new_requested(daemon).await;
         }
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
@@ -4975,19 +4995,14 @@ fn speaker_channel(speaker: Speaker) -> &'static str {
     }
 }
 
-/// Map a persisted [`TranscriptSegment`] to the minimal rehydrate wire line. The
-/// capture channel is derived from the reliable [`Speaker`] tag (mic vs system),
-/// NOT the live display label. `speaker` stays `None` in v1 (the caption uses
-/// `source`); `is_final` is always `true` — only finalized segments reach here.
-fn to_wire_line(segment: &TranscriptSegment) -> MeetingTranscriptLine {
-    to_wire_line_named(segment, &std::collections::HashMap::new())
-}
-
-/// Like [`to_wire_line`] but overlays the user's PERSISTED speaker names (from
-/// the diarization store) onto the label. On reopen/continue the segment only
-/// carries a numeric `speaker_id`; the computed "Speaker N" label would hide a
-/// rename the user made ("Robo 1"). `names` maps speaker_id → user name; when a
-/// segment's id is in it, that name wins over the computed label.
+/// Map a persisted [`TranscriptSegment`] to the minimal rehydrate wire line,
+/// overlaying the user's PERSISTED speaker names (from the diarization store)
+/// onto the label. The capture channel is derived from the reliable [`Speaker`]
+/// tag (mic vs system), NOT the live display label. On reopen/continue the
+/// segment only carries a numeric `speaker_id`; the computed "Speaker N" label
+/// would hide a rename the user made ("Robo 1"). `names` maps speaker_id → user
+/// name; when a segment's id is in it, that name wins over the computed label.
+/// `is_final` is always `true` — only finalized segments reach here.
 fn to_wire_line_named(
     segment: &TranscriptSegment,
     names: &std::collections::HashMap<i64, String>,
@@ -5346,6 +5361,60 @@ fn scrape_models_cli(binary: &str, args: &[&'static str]) -> Option<String> {
             }
         }
     }
+}
+
+/// **New meeting** from the overlay: archive the active meeting (if any) and
+/// start a fresh empty one — the same end→start the CLI's `bluey on` uses. The
+/// fresh meeting resets the ledger/summary/conversation and clears the
+/// transcript, Q&A, decisions, and context in the UI. Safe with no active
+/// meeting (`auto_end_active_meeting` returns None → we just start a new one).
+async fn handle_meeting_new_requested(daemon: &Arc<Daemon>) {
+    info!("overlay: MeetingNewRequested — ending active meeting + starting fresh");
+    // (a) End the current meeting through the SHARED end path (archives if it has
+    // content, discards if empty, resets ledger/summary/conversation, broadcasts
+    // the cleared state). Best-effort: a failure here must not block the new one.
+    if let Err(e) = auto_end_active_meeting(daemon).await {
+        warn!("new-meeting: ending active meeting failed: {e:#}");
+    }
+
+    // (b) Start a fresh empty meeting (generic title, upgraded at end from recap).
+    let meeting = {
+        let mut guard = daemon.meeting.lock().await;
+        // A racing auto-create may have re-minted one; only start if truly empty.
+        if guard.is_some() {
+            debug!("new-meeting: a meeting is already active after end; reusing it");
+            guard.clone()
+        } else {
+            let meeting = MeetingRecord::new(Some(generic_meeting_title()));
+            if let Err(e) = daemon.store.save_active(&meeting) {
+                warn!("new-meeting: save_active failed: {e:#}");
+            }
+            *guard = Some(meeting.clone());
+            Some(meeting)
+        }
+    };
+
+    // (c) Fresh meeting → fresh ledger/summary counters + conversation, so no
+    // cross-meeting bleed (mirrors DaemonRequest::MeetingStart).
+    *daemon.ledger.lock().await = cue_core::LedgerState::default();
+    daemon
+        .last_ledger_words
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    daemon
+        .last_summary_words
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    if let Some(m) = meeting.as_ref() {
+        crate::conversation::reset_for_meeting(daemon, Some(m.id)).await;
+    }
+
+    // (d) Broadcast the fresh (empty) state so the overlay clears everything.
+    let _ = update_state_from_meeting(daemon, meeting.as_ref()).await;
+    handle_meeting_state_requested(daemon).await;
+    let _ = write_state(daemon).await;
+    info!(
+        meeting_id = meeting.as_ref().map(|m| m.id.to_string()).unwrap_or_default(),
+        "new-meeting: fresh meeting started + broadcast"
+    );
 }
 
 /// Re-auth one hosted-OAuth connector. Real OAuth is future work; for now this
@@ -9728,6 +9797,14 @@ async fn handle_reassign_span_requested(
     speaker_id: i64,
     name: Option<&str>,
 ) {
+    // STEP 2 (daemon): what the UI asked us to reassign.
+    info!(
+        target_speaker_id = speaker_id,
+        want_ids = ?segment_ids,
+        want_count = segment_ids.len(),
+        name = name.unwrap_or(""),
+        "SPAN-DEBUG: reassign-span request received"
+    );
     // (a) Rewrite the segments' speaker_id under the meeting lock, and collect
     // the reassigned segments' audio spans (for the live re-enroll below).
     let (meeting_id, spans, snapshot) = {
@@ -9738,11 +9815,24 @@ async fn handle_reassign_span_requested(
         };
         let want: std::collections::HashSet<&str> =
             segment_ids.iter().map(|s| s.as_str()).collect();
+        let total_segments = meeting.transcript.len();
         let mut spans: Vec<(f64, f64)> = Vec::new();
-        for seg in meeting.transcript.iter_mut() {
+        let mut changed = 0usize;
+        for (idx, seg) in meeting.transcript.iter_mut().enumerate() {
             if want.contains(seg.id.to_string().as_str()) {
+                let old = seg.speaker_id;
                 seg.speaker_id = Some(speaker_id);
                 seg.secondary_speaker_ids.clear();
+                changed += 1;
+                // STEP 3 (daemon): every segment we actually mutated.
+                info!(
+                    idx,
+                    seg_id = %seg.id,
+                    old_speaker_id = ?old,
+                    new_speaker_id = speaker_id,
+                    text = %seg.text.chars().take(50).collect::<String>(),
+                    "SPAN-DEBUG: reassigned a segment"
+                );
                 if let (Some(start), Some(dur)) =
                     (seg.audio_start_secs, seg.audio_dur_secs)
                 {
@@ -9750,6 +9840,12 @@ async fn handle_reassign_span_requested(
                 }
             }
         }
+        info!(
+            changed,
+            total_segments,
+            requested = segment_ids.len(),
+            "SPAN-DEBUG: reassign applied (changed / total transcript segments)"
+        );
         if let Err(e) = daemon.store.save_active(meeting) {
             warn!("reassign-span: save failed: {e:#}");
         }
@@ -9786,11 +9882,191 @@ async fn handle_reassign_span_requested(
     update_state_from_meeting(daemon, Some(&snapshot))
         .await
         .ok();
+    // STEP 4 (daemon): the re-broadcast reads the CURRENT active meeting, which
+    // may have grown with NEW live segments since the reassign — log the segment
+    // count now vs. the snapshot we mutated, to catch the live-race where the
+    // re-emit re-groups the reassigned block together with fresh live segments.
+    let live_now = { daemon.meeting.lock().await.as_ref().map(|m| m.transcript.len()) };
+    info!(
+        snapshot_segments = snapshot.transcript.len(),
+        live_segments_now = ?live_now,
+        "SPAN-DEBUG: re-broadcasting SetMeetingState after reassign (snapshot vs live NOW)"
+    );
     handle_meeting_state_requested(daemon).await;
     info!(
         segments = segment_ids.len(),
-        speaker_id, "reassign-span: applied"
+        speaker_id, "SPAN-DEBUG: reassign-span applied + re-broadcast done"
     );
+}
+
+/// Reassign a precise CHARACTER RANGE of a transcript line to a speaker — the
+/// robust "select any text → assign" path. `member_ids` are the line's raw
+/// segments in order. We concatenate their text (in the SAME order the grouper
+/// joined them for display), map `[char_start, char_end)` onto that, and for
+/// each member segment:
+///   * fully inside the range  → reassign it whole
+///   * partially covered (a boundary segment) → split it at the exact within-
+///     segment char so ONLY the covered part gets the new speaker; the rest
+///     keeps its speaker
+/// This is precise for ANY selection (mid-segment, spanning segments) and never
+/// mis-maps a grouped-line offset onto the wrong segment (the old bug that split
+/// " Scale " at offset 35). Optional `name` sets the speaker's display name.
+async fn handle_reassign_range_requested(
+    daemon: &Arc<Daemon>,
+    member_ids: &[String],
+    char_start: usize,
+    char_end: usize,
+    speaker_id: i64,
+    name: Option<&str>,
+) {
+    info!(
+        member_ids = ?member_ids,
+        char_start,
+        char_end,
+        speaker_id,
+        name = name.unwrap_or(""),
+        "SPAN-DEBUG: reassign-range request received"
+    );
+    if char_end <= char_start || member_ids.is_empty() {
+        return;
+    }
+    let want: std::collections::HashSet<&str> =
+        member_ids.iter().map(|s| s.as_str()).collect();
+
+    let (meeting_id, spans, snapshot) = {
+        let mut guard = daemon.meeting.lock().await;
+        let Some(meeting) = guard.as_mut() else {
+            debug!("reassign-range: no active meeting; ignoring");
+            return;
+        };
+
+        // Walk the transcript ONCE, tracking the running char offset across the
+        // line's member segments IN TRANSCRIPT ORDER (the grouper joins them in
+        // that order, so the concatenated text matches the display). Build a new
+        // transcript, splitting boundary segments as needed.
+        let mut new_transcript: Vec<cue_core::meeting::TranscriptSegment> =
+            Vec::with_capacity(meeting.transcript.len() + 2);
+        let mut cursor = 0usize; // chars consumed across member segments so far
+        let mut spans: Vec<(f64, f64)> = Vec::new();
+        let mut changed = 0usize;
+
+        for seg in meeting.transcript.iter() {
+            if !want.contains(seg.id.to_string().as_str()) {
+                new_transcript.push(seg.clone());
+                continue;
+            }
+            // This is a member of the selected line. Its text occupies
+            // [cursor, cursor+len) in the joined line text.
+            let seg_len = seg.text.chars().count();
+            let seg_lo = cursor;
+            let seg_hi = cursor + seg_len;
+            cursor = seg_hi;
+
+            // Intersection of [char_start,char_end) with this segment's span.
+            let lo = char_start.max(seg_lo);
+            let hi = char_end.min(seg_hi);
+            if lo >= hi {
+                // Selection doesn't touch this segment → keep as-is.
+                new_transcript.push(seg.clone());
+                continue;
+            }
+            // Local (within-segment) cover range.
+            let a = lo - seg_lo; // covered start within segment
+            let b = hi - seg_lo; // covered end within segment
+            let covered_dur_frac = if seg_len == 0 {
+                1.0
+            } else {
+                (b - a) as f64 / seg_len as f64
+            };
+
+            if a == 0 && b == seg_len {
+                // Fully covered → reassign whole.
+                let mut s = seg.clone();
+                s.speaker_id = Some(speaker_id);
+                s.secondary_speaker_ids.clear();
+                if let (Some(st), Some(du)) = (s.audio_start_secs, s.audio_dur_secs) {
+                    spans.push((st, du));
+                }
+                changed += 1;
+                new_transcript.push(s);
+            } else {
+                // Partially covered → emit up to 3 pieces: [head keeps][covered
+                // →target][tail keeps], skipping empty pieces. Timing is divided
+                // proportionally by char fraction.
+                let chars: Vec<char> = seg.text.chars().collect();
+                let head: String = chars[..a].iter().collect();
+                let mid: String = chars[a..b].iter().collect();
+                let tail: String = chars[b..].iter().collect();
+                let (base_start, base_dur) =
+                    (seg.audio_start_secs, seg.audio_dur_secs);
+                let mk = |text: String,
+                          sid: Option<i64>,
+                          off_frac: f64,
+                          len_frac: f64|
+                 -> cue_core::meeting::TranscriptSegment {
+                    let mut s = cue_core::meeting::TranscriptSegment::new(
+                        seg.speaker.clone(),
+                        text,
+                        seg.is_final,
+                    );
+                    s.speaker_id = sid;
+                    if let (Some(st), Some(du)) = (base_start, base_dur) {
+                        s.audio_start_secs = Some(st + du * off_frac);
+                        s.audio_dur_secs = Some(du * len_frac);
+                    }
+                    s
+                };
+                let head_frac = a as f64 / seg_len.max(1) as f64;
+                if !head.is_empty() {
+                    new_transcript.push(mk(head, seg.speaker_id, 0.0, head_frac));
+                }
+                // covered middle → target speaker
+                let mid_seg = mk(mid, Some(speaker_id), head_frac, covered_dur_frac);
+                if let (Some(st), Some(du)) = (mid_seg.audio_start_secs, mid_seg.audio_dur_secs) {
+                    spans.push((st, du));
+                }
+                changed += 1;
+                new_transcript.push(mid_seg);
+                if !tail.is_empty() {
+                    let tail_frac = (seg_len - b) as f64 / seg_len.max(1) as f64;
+                    new_transcript.push(mk(
+                        tail,
+                        seg.speaker_id,
+                        head_frac + covered_dur_frac,
+                        tail_frac,
+                    ));
+                }
+            }
+        }
+
+        meeting.transcript = new_transcript;
+        if let Err(e) = daemon.store.save_active(meeting) {
+            warn!("reassign-range: save failed: {e:#}");
+        }
+        info!(changed, "SPAN-DEBUG: reassign-range applied (segments changed)");
+        (meeting.id.to_string(), spans, meeting.clone())
+    };
+
+    // Persist the display name (if given).
+    if let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) {
+        let db_path = daemon.paths.data_dir.join("sessions.db");
+        if let Ok(db) = crate::db::Database::open(db_path.to_str().unwrap_or("sessions.db")) {
+            if let Ok(uuid) = uuid::Uuid::parse_str(&meeting_id) {
+                let _ = db.ensure_meeting_session(uuid, None);
+            }
+            if let Err(e) = db.set_speaker_name_by_user(&meeting_id, speaker_id as i32, name, None) {
+                warn!("reassign-range: set_speaker_name failed: {e:#}");
+            }
+        }
+    }
+
+    #[cfg(feature = "diarize")]
+    crate::diarize::reenroll_speaker_from_spans(daemon, &meeting_id, speaker_id, &spans).await;
+    #[cfg(not(feature = "diarize"))]
+    let _ = &spans;
+
+    update_state_from_meeting(daemon, Some(&snapshot)).await.ok();
+    handle_meeting_state_requested(daemon).await;
 }
 
 /// Split ONE transcript segment at a character offset into two, assigning each
@@ -9803,6 +10079,13 @@ async fn handle_split_segment_requested(
     first_speaker_id: i64,
     second_speaker_id: i64,
 ) {
+    info!(
+        segment_id,
+        char_offset,
+        first_speaker_id,
+        second_speaker_id,
+        "SPAN-DEBUG: split-segment request received"
+    );
     let snapshot = {
         let mut guard = daemon.meeting.lock().await;
         let Some(meeting) = guard.as_mut() else {
@@ -9820,6 +10103,18 @@ async fn handle_split_segment_requested(
         let original = meeting.transcript[pos].clone();
         // Clamp the offset onto a char boundary within the text.
         let text_len = original.text.chars().count();
+        // STEP 3b (daemon): the segment we're about to split — its FULL text +
+        // length vs. the char_offset the UI computed. If char_offset > this
+        // segment's length, the UI's offset was in GROUPED-LINE space (spanning
+        // many segments), which is the mismatch we're hunting.
+        info!(
+            pos,
+            seg_text_len = text_len,
+            char_offset,
+            offset_out_of_range = char_offset > text_len,
+            full_text = %original.text,
+            "SPAN-DEBUG: split target segment (text vs offset)"
+        );
         let off = char_offset.min(text_len);
         let first_text: String = original.text.chars().take(off).collect();
         let second_text: String = original.text.chars().skip(off).collect();

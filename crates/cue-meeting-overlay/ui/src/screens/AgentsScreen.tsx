@@ -59,7 +59,7 @@ export function AgentsScreen({
             height: 18,
             borderRadius: "50%",
             background:
-              "conic-gradient(var(--violet),var(--blue),var(--mint),var(--violet))",
+              "conic-gradient(var(--ink),var(--ink-3),var(--line),var(--ink))",
             animation: "aurora-spin 1.4s linear infinite",
           }}
         />
@@ -104,8 +104,8 @@ export function AgentsScreen({
                 width: 30,
                 height: 30,
                 borderRadius: 9,
-                background: "linear-gradient(150deg,#eef0ff,#e7f6f1)",
-                color: "var(--tint-ink)",
+                background: "var(--paper-sink, var(--glass-2))",
+                color: "var(--ink)",
                 display: "inline-flex",
                 alignItems: "center",
                 justifyContent: "center",
@@ -194,15 +194,15 @@ const sectionLabel = {
 
 const attachBtn = {
   fontSize: 12,
-  fontWeight: 540,
-  color: "#fff",
-  background: "linear-gradient(140deg,var(--tint),#8f7af5)",
+  fontWeight: 560,
+  color: "var(--paper)",
+  background: "var(--ink)",
   border: "none",
   borderRadius: 9,
   padding: "6px 13px",
   cursor: "pointer",
   flex: "none",
-  boxShadow: "0 4px 12px -3px rgba(111,106,240,.5)",
+  boxShadow: "0 4px 12px -4px rgba(28,26,25,.35)",
 } as const;
 const detachBtn = {
   fontSize: 12,

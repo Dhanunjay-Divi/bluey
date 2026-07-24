@@ -888,6 +888,71 @@
   box-shadow: inset 0 0 0 1px var(--line);
 }
 
+/* Custom-label form — shares the menu card so "New speaker…" reads as the same
+ * surface, not a bare unstyled input. A titled card, a real text field, and a
+ * solid Assign button matching the primary .fp-seltool-btn. */
+.fp-seltool-name {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 210px;
+  padding: 10px;
+  border-radius: 12px;
+  background: var(--glass-solid, var(--paper-2));
+  border: 1px solid var(--line);
+  box-shadow: 0 12px 34px rgba(28, 26, 25, 0.24);
+}
+.fp-seltool-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--paper);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+  outline: none;
+  transition:
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
+}
+.fp-seltool-input::placeholder {
+  color: var(--ink-3);
+}
+.fp-seltool-input:focus {
+  border-color: var(--ink-2);
+  box-shadow: 0 0 0 3px var(--paper-sink);
+}
+.fp-seltool-apply {
+  align-self: stretch;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 12px;
+  border: none;
+  border-radius: 10px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 12.5px;
+  font-weight: 560;
+  cursor: pointer;
+  transition:
+    opacity 0.12s ease,
+    transform 0.06s ease;
+}
+.fp-seltool-apply:hover {
+  opacity: 0.9;
+}
+.fp-seltool-apply:active {
+  transform: translateY(0.5px);
+}
+.fp-seltool-apply:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 /* =====================================================================
  * Q&A dialog block — reasoning renders INSIDE the dialog
  * =================================================================== */

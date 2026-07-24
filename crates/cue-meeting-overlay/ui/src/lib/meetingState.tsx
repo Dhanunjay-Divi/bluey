@@ -56,13 +56,13 @@ import type {
  *  last. */
 export interface Turn {
   id: number;
-  /** How many transcript history lines existed when this question was asked —
-   *  the turn's ANCHOR into the timeline. The Open Floor document interleaves
-   *  each Q&A directly after the transcript line that was live when it was
-   *  asked, so the exchange stays pinned where it happened and later transcript
-   *  + Q&A flow BELOW it (instead of all Q&A piling at the bottom). Absent on
-   *  seeded turns (they render after the transcript they followed). */
-  anchor?: number;
+  /** The id of the last transcript SEGMENT present when this question was asked —
+   *  the turn's ANCHOR into the timeline. The Open Floor document interleaves each
+   *  Q&A directly after the transcript LINE that contains this segment, so the
+   *  exchange stays pinned where it happened even as the grouper merges later
+   *  fragments (a raw count would DRIFT as grouping changes; a segment id is
+   *  stable — the same anchoring attachments use). Absent → renders at the tail. */
+  anchorSegmentId?: string;
   /** What is SHOWN in the feed for this turn. */
   question: string;
   /** What is SENT to the agent on (re)ask — differs from `question` only for the
@@ -204,6 +204,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
           id: l.id,
           source: l.source,
           speaker: l.speaker,
+          speakerId: l.speakerId,
           text: l.text,
           final: true,
         },
@@ -214,6 +215,19 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
         lastCaption = caption;
       }
     }
+    // STEP 5 (UI): how the re-broadcast re-grouped. If the reassigned block MERGED
+    // with adjacent live segments (fewer grouped lines than distinct speakers), we
+    // see it here — the re-fold groups consecutive same-speaker segments together.
+    console.log("[SPAN-DEBUG] UI reseed re-grouped", {
+      snapshotSegments: snap.transcript.length,
+      groupedLines: folded.length,
+      lines: folded.map((l) => ({
+        id: l.id,
+        speaker: l.speaker,
+        speakerId: l.speakerId,
+        text: l.text.slice(0, 40),
+      })),
+    });
     setHistory(folded);
     setTranscript(lastCaption);
 

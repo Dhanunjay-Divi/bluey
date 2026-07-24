@@ -241,15 +241,32 @@ fn recent_transcript_highlights(meeting: &MeetingRecord, count: usize) -> String
         return "No transcript text captured yet.".to_string();
     }
 
-    meeting
-        .transcript
+    // `count` = speaker TURNS, not raw segments. Coalesce consecutive same-speaker
+    // fragments into one labeled line first (streaming STT emits many ~10-char
+    // fragments per utterance; labeling each produced "They: … They: … They: …"
+    // repeated mid-sentence), then take the last `count` turns.
+    let mut turns: Vec<(String, String)> = Vec::new();
+    for segment in meeting.transcript.iter() {
+        let label = segment.speaker.display_label().to_string();
+        let text = segment.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match turns.last_mut() {
+            Some((prev_label, prev_text)) if *prev_label == label => {
+                if !prev_text.ends_with(' ') && !text.starts_with(' ') {
+                    prev_text.push(' ');
+                }
+                prev_text.push_str(text);
+            }
+            _ => turns.push((label, text.to_string())),
+        }
+    }
+
+    let start = turns.len().saturating_sub(count);
+    turns[start..]
         .iter()
-        .rev()
-        .take(count)
-        .map(|segment| format!("{}: {}", segment.speaker.display_label(), segment.text))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
+        .map(|(label, text)| format!("{label}: {text}"))
         .collect::<Vec<_>>()
         .join("\n")
 }

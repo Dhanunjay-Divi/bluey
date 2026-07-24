@@ -670,6 +670,27 @@ export function createTauriClient(): MeetingClient {
       });
     },
 
+    reassignRange: (memberIds, charStart, charEnd, speakerId, name) => {
+      // Precise char-range reassign: the daemon maps [charStart,charEnd) onto the
+      // ordered member segments' concatenated text, reassigns fully-covered
+      // segments and splits boundary segments at the exact char.
+      sendEvent({
+        type: "reassign_range_requested",
+        member_ids: memberIds,
+        char_start: charStart,
+        char_end: charEnd,
+        speaker_id: speakerId,
+        ...(name ? { name } : {}),
+      });
+    },
+
+    newMeeting: () => {
+      // Archive the active meeting + start a fresh one. Fire-and-forget: the
+      // daemon replies with a meeting_id-absent set_meeting_state, delivered via
+      // onMeetingReseed, which clears the transcript/Q&A/decisions/context.
+      sendEvent({ type: "meeting_new_requested" });
+    },
+
     onListeningState(cb) {
       // The daemon pushes listening_state_changed with the full pipeline state
       // (idle | connecting | listening | paused | failed). Pass it through so

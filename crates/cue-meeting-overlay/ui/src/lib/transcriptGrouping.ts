@@ -30,18 +30,25 @@ export const MAX_LINES = 400;
 // the daemon persists consecutive same-speaker fragments that ARE one line.)
 export const PAUSE_MS = 2500;
 // Sentence-boundary break: once a grouped line reaches this length AND ends on
-// sentence-final punctuation, the NEXT fragment starts a fresh line. Without
-// this a continuous speaker (no >PAUSE_MS gap) accumulates into one endless
-// run-on paragraph — the pause split alone almost never fires mid-monologue,
-// because Parakeet streams ~560ms fragments so the idle gap rarely exceeds
-// PAUSE_MS. The length floor stops abbreviations / "U.S." / "3.5" from
-// shattering the line into fragments; the punctuation check keeps breaks at
-// natural clause ends. Applies to the LIVE path only (seeds fold whole).
+// sentence-final punctuation, the NEXT fragment starts a fresh line so the
+// transcript reads as paragraphs, not one ever-growing block. The model DOES
+// emit punctuation (verified end-to-end: it produces ". ? ," from prosody), so
+// this fires at the model's real sentence ends. The length floor stops
+// abbreviations / "U.S." / "3.5" from shattering the line into fragments.
 export const SENTENCE_MIN_CHARS = 160;
 // True when `text` ends on sentence-final punctuation (optionally followed by a
 // closing quote/bracket and trailing space) — the break point for a new line.
 function endsSentence(text: string): boolean {
   return /[.!?]["')\]]?\s*$/.test(text);
+}
+// Punctuation glue: the streaming model emits punctuation as its OWN space-
+// prefixed token and each token lands as a SEPARATE segment ("well " then ". "),
+// so concatenating segments for display yields detached "well . These". Pull a
+// space that sits directly before a punctuation mark back onto the preceding
+// word. Safe: a space before "." "," … is never a real word boundary, so this
+// never merges two words — it only removes the model's stray pre-punctuation gap.
+function gluePunctuation(text: string): string {
+  return text.replace(/\s+([.,?!;:%)\]}])/g, "$1");
 }
 
 // One grouped transcript line, plus the set of segment ids folded into it. The
@@ -133,7 +140,16 @@ export function createTranscriptGrouper(): TranscriptGrouper {
       last.source === seg.source &&
       !paused &&
       !sentenceBreak &&
-      !(last.speaker && seg.speaker && last.speaker !== seg.speaker);
+      !(last.speaker && seg.speaker && last.speaker !== seg.speaker) &&
+      // Break on a diarized speaker_id change too — otherwise a segment the user
+      // just REASSIGNED to a different speaker would merge back into the adjacent
+      // line (the "my reassigned block globbed into the live transcript" bug).
+      // Two known-but-different ids never share a line.
+      !(
+        last.speakerId != null &&
+        seg.speakerId != null &&
+        last.speakerId !== seg.speakerId
+      );
 
     let next: GroupedLine[];
     if (continues && last) {
@@ -141,10 +157,14 @@ export function createTranscriptGrouper(): TranscriptGrouper {
       // word boundaries (re-spacing would split words).
       const merged: GroupedLine = {
         ...last,
-        text: last.text + seg.text,
-        // Adopt the segment's label when the line has none yet (a seed whose
+        // RAW concat preserves the model's leading-space word boundaries, then
+        // gluePunctuation pulls back the stray space before a punctuation segment
+        // ("well " + ". These" -> "well. These") — the detached-punctuation fix.
+        text: gluePunctuation(last.text + seg.text),
+        // Adopt the segment's label/id when the line has none yet (a seed whose
         // first fragment predates the diarize tick that labeled the rest).
         speaker: last.speaker ?? seg.speaker,
+        speakerId: last.speakerId ?? seg.speakerId,
         ids: seg.id ? [...last.ids, seg.id] : last.ids,
       };
       next = [...lines.slice(0, -1), merged];

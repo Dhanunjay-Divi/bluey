@@ -224,6 +224,18 @@ impl SttEngine {
                 }
             }
         };
+        // Intra-delta punctuation glue: this Nemotron export emits punctuation as
+        // its OWN space-prefixed token (" ." / " ," / " ?"), so a naive pass-through
+        // yields "well ." / "so ,". Remove a space sitting directly before a
+        // punctuation mark inside this delta ("well ." -> "well."). Safe: a space
+        // before "." "," … is never a real word boundary (punctuation is never
+        // mid-word), so this never splits a word. The CROSS-delta case (the model
+        // sends "well " then a standalone ". " next delta) is handled at the
+        // concatenation point downstream (`glue_punctuation` over the joined text),
+        // NOT here — a per-delta fix can't reach the previous delta's trailing
+        // space without reshaping delta boundaries and risking the word-integrity
+        // guarantees the hold-the-tip logic provides.
+        let emit = glue_punctuation(&emit);
         if emit.trim().is_empty() {
             return Ok(None);
         }
@@ -274,6 +286,33 @@ fn flush_boundary(tip: &str) -> Option<String> {
     Some(format!("{trimmed} "))
 }
 
+/// The punctuation marks the model emits as their own space-prefixed token. A
+/// leading space before one of these is the model's stray spacing, never a word
+/// boundary — so removing it can't split a word.
+const GLUE_PUNCT: &[char] = &['.', ',', '?', '!', ';', ':', '%', ')', ']', '}'];
+
+/// Remove any space that sits directly before a punctuation mark, so this
+/// Nemotron export's space-prefixed punctuation tokens (" ." / " ,") attach to
+/// the preceding word instead of floating ("well ." -> "well."). Handles the
+/// LEADING edge too: an emitted delta that starts with " ." keeps a single
+/// leading space stripped so it glues onto whatever the previous delta ended
+/// with (downstream concatenates deltas verbatim). This never merges two words —
+/// it only ever deletes a space whose NEXT non-space char is punctuation.
+fn glue_punctuation(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if GLUE_PUNCT.contains(&c) {
+            // Pull the punctuation back onto the previous word: drop the whole run
+            // of trailing spaces we already pushed (handles "done  ." → "done.").
+            while out.ends_with(' ') {
+                out.pop();
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Whether `text` ends a sentence — its last non-space, non-closing character is
 /// sentence-final punctuation (`.`, `?`, `!`), allowing trailing closers like a
 /// quote or paren (`."`, `?)`). Such a token cannot be a mid-word split, so the
@@ -296,7 +335,25 @@ pub struct TranscriptChunk {
 
 #[cfg(test)]
 mod tests {
-    use super::{ends_sentence, flush_boundary};
+    use super::{ends_sentence, flush_boundary, glue_punctuation};
+
+    #[test]
+    fn glue_punctuation_attaches_stray_punct() {
+        // The model emits punctuation as a space-prefixed token → "well ." "so ,".
+        assert_eq!(glue_punctuation("well ."), "well.");
+        assert_eq!(glue_punctuation("so , yeah"), "so, yeah");
+        assert_eq!(glue_punctuation("are we agreed ?"), "are we agreed?");
+        assert_eq!(glue_punctuation("ship it !"), "ship it!");
+        // Multiple spaces before punctuation collapse too.
+        assert_eq!(glue_punctuation("done  ."), "done.");
+        // A closing bracket/paren glues.
+        assert_eq!(glue_punctuation("see note )"), "see note)");
+        // No stray space → unchanged; never merges two real words.
+        assert_eq!(glue_punctuation("hello world"), "hello world");
+        assert_eq!(glue_punctuation("already ok."), "already ok.");
+        // A leading space (word boundary, no punctuation) is preserved.
+        assert_eq!(glue_punctuation(" west "), " west ");
+    }
 
     #[test]
     fn flush_boundary_preserves_word_boundary() {

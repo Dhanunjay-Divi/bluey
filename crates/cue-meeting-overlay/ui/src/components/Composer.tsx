@@ -255,9 +255,9 @@ export function Composer({
             borderRadius: 9,
             border: "none",
             cursor: "pointer",
-            background: "linear-gradient(140deg,var(--tint),#8f7af5)",
-            color: "#fff",
-            boxShadow: "0 4px 12px -2px rgba(111,106,240,.5)",
+            background: "var(--ink)",
+            color: "var(--paper, #fff)",
+            boxShadow: "0 4px 12px -3px rgba(28,26,25,.35)",
             fontSize: 15,
           }}
         >

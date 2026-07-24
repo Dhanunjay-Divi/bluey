@@ -80,9 +80,9 @@ const note = {
 } as const;
 const primary = {
   fontSize: 12.5,
-  fontWeight: 540,
-  color: "#fff",
-  background: "linear-gradient(140deg,var(--tint),#8f7af5)",
+  fontWeight: 560,
+  color: "var(--paper, #fff)",
+  background: "var(--ink)",
   border: "none",
   borderRadius: 9,
   padding: "8px 16px",
