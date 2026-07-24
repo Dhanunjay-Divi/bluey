@@ -162,6 +162,8 @@ type OverlayCommand =
       type: "set_meeting_state";
       transcript: WireMeetingTranscriptLine[];
       conversation: WireMeetingConversationTurn[];
+      // The Key Decisions ledger; absent (omitted on the wire) when empty.
+      decisions?: { id: string; text: string }[];
       // Present only for a PAST-meeting VIEW reply (Decision 2). Absent on the
       // active-rehydrate reply — the discriminator that keeps the two request()
       // pickers on the shared bus from stealing each other's replies.
@@ -533,6 +535,7 @@ export function createTauriClient(): MeetingClient {
         return {
           transcript: c.transcript.map(toMeetingTranscriptLine),
           conversation: c.conversation.map(toMeetingConversationTurn),
+          decisions: c.decisions ?? [],
         };
       }),
 
@@ -558,6 +561,7 @@ export function createTauriClient(): MeetingClient {
           return {
             transcript: c.transcript.map(toMeetingTranscriptLine),
             conversation: c.conversation.map(toMeetingConversationTurn),
+            decisions: c.decisions ?? [],
             meetingId: c.meeting_id,
             readOnly: c.read_only ?? false,
           };
@@ -611,6 +615,7 @@ export function createTauriClient(): MeetingClient {
         cb({
           transcript: c.transcript.map(toMeetingTranscriptLine),
           conversation: c.conversation.map(toMeetingConversationTurn),
+          decisions: c.decisions ?? [],
         });
       };
       handlers.add(handler);

@@ -44,6 +44,119 @@
   --mono: "SF Mono", ui-monospace, monospace;
 }
 
+/* ───────────────────────────────────────────────────────────────
+   OPEN FLOOR PLAN — the nude "paper document" theme.
+
+   The SAME token names remapped to the exact NUDE palette from the reference
+   (Granola-style warm paper), scoped under [data-floorplan] on the shell root.
+   Because every component reads the tokens (never hardcoded hex), flipping this
+   attribute re-skins the entire UI to the document look with zero component
+   edits — the glass theme is the default and stays untouched when the attribute
+   is absent. There is deliberately NO color accent (the reference is monochrome
+   warm ink); the only non-neutral is the LIVE red. Floorplan-only tokens (serif,
+   paper surfaces, warm shadow) are additive. Light + warm-dark variants both
+   defined so the overlay honors the OS theme.
+   ─────────────────────────────────────────────────────────────── */
+:root[data-floorplan] {
+  --ink: #1c1a19; /* the reference's darkest ink (titles, strong text) */
+  --ink-2: #3c3a38;
+  --ink-3: #8c867d; /* muted taupe — subtitles */
+  --ink-4: #b8b1a4; /* faint — timestamps */
+  --line: #ebe7df;
+  --line-2: #ded9cf;
+  /* Panel surface = warm paper (near-opaque; the window is transparent). */
+  --glass: rgba(247, 245, 240, 0.98);
+  --glass-2: rgba(253, 252, 251, 0.92);
+  --glass-solid: #fdfcfb;
+  /* NO accent hue — the "tint" resolves to warm ink so any accent usage stays
+     monochrome and on-palette instead of an off-tone violet. */
+  --tint: #2c2a29;
+  --tint-ink: #1c1a19;
+  --tint-wash: rgba(44, 42, 41, 0.06);
+  --mint: #4e8d5b; /* connector "ready" dot */
+  --ok: #4e8d5b;
+  --shadow: 0 40px 100px -20px rgba(45, 35, 22, 0.15),
+    0 0 1px rgba(45, 35, 22, 0.1);
+  /* floorplan-only */
+  --paper: #f7f5f0;
+  --paper-2: #fdfcfb;
+  --paper-sink: #ebe7df;
+  --fp-live: #e0443e; /* the recording / LIVE red — the only chromatic color */
+  --fp-avatar: #ebe7df;
+  --fp-shadow-float: 0 8px 24px rgba(45, 35, 22, 0.06);
+  --fp-shadow-anchor: 0 12px 32px rgba(28, 26, 25, 0.25);
+  --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia,
+    "Times New Roman", serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-floorplan] {
+    --ink: #efe9de;
+    --ink-2: #cfc6b7;
+    --ink-3: #928a7c;
+    --ink-4: #61594d;
+    --line: #322c24;
+    --line-2: #40382d;
+    --glass: rgba(26, 23, 20, 0.98);
+    --glass-2: rgba(37, 33, 26, 0.92);
+    --glass-solid: #252119;
+    --tint: #efe9de;
+    --tint-ink: #f4efe6;
+    --tint-wash: rgba(239, 233, 222, 0.08);
+    --mint: #6bbf7e;
+    --ok: #6bbf7e;
+    --shadow: 0 40px 100px -20px rgba(0, 0, 0, 0.6),
+      0 0 1px rgba(0, 0, 0, 0.5);
+    --paper: #1a1714;
+    --paper-2: #252119;
+    --paper-sink: #14110e;
+    --fp-live: #e5675e;
+    --fp-avatar: #322c24;
+    --fp-shadow-float: 0 8px 24px rgba(0, 0, 0, 0.5);
+    --fp-shadow-anchor: 0 12px 32px rgba(0, 0, 0, 0.55);
+  }
+}
+/* The viewer's explicit theme toggle stamps data-theme — it must win over the
+   media query in BOTH directions. */
+:root[data-floorplan][data-theme="light"] {
+  --ink: #1c1a19;
+  --ink-2: #3c3a38;
+  --ink-3: #8c867d;
+  --ink-4: #b8b1a4;
+  --line: #ebe7df;
+  --line-2: #ded9cf;
+  --glass: rgba(247, 245, 240, 0.98);
+  --glass-2: rgba(253, 252, 251, 0.92);
+  --glass-solid: #fdfcfb;
+  --tint: #2c2a29;
+  --tint-ink: #1c1a19;
+  --tint-wash: rgba(44, 42, 41, 0.06);
+  --paper: #f7f5f0;
+  --paper-2: #fdfcfb;
+  --paper-sink: #ebe7df;
+  --fp-live: #e0443e;
+  --fp-avatar: #ebe7df;
+}
+:root[data-floorplan][data-theme="dark"] {
+  --ink: #efe9de;
+  --ink-2: #cfc6b7;
+  --ink-3: #928a7c;
+  --ink-4: #61594d;
+  --line: #322c24;
+  --line-2: #40382d;
+  --glass: rgba(26, 23, 20, 0.98);
+  --glass-2: rgba(37, 33, 26, 0.92);
+  --glass-solid: #252119;
+  --tint: #efe9de;
+  --tint-ink: #f4efe6;
+  --tint-wash: rgba(239, 233, 222, 0.08);
+  --paper: #1a1714;
+  --paper-2: #252119;
+  --paper-sink: #14110e;
+  --fp-live: #e5675e;
+  --fp-avatar: #322c24;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;
@@ -108,8 +221,10 @@ body.dev-backdrop {
     var(--glass);
   backdrop-filter: var(--blur);
   -webkit-backdrop-filter: var(--blur);
-  border: 1px solid var(--line-2);
-  box-shadow: var(--shadow);
+  border: none !important;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6),
+    0 16px 40px -10px rgba(0, 0, 0, 0.08),
+    0 4px 16px -4px rgba(0, 0, 0, 0.04) !important;
   overflow: hidden;
 }
 .glass > * {

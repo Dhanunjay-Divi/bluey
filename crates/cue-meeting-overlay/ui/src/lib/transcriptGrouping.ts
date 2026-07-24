@@ -29,6 +29,20 @@ export const MAX_LINES = 400;
 // one. (A seed has no per-segment timing, so it groups on speaker change only —
 // the daemon persists consecutive same-speaker fragments that ARE one line.)
 export const PAUSE_MS = 2500;
+// Sentence-boundary break: once a grouped line reaches this length AND ends on
+// sentence-final punctuation, the NEXT fragment starts a fresh line. Without
+// this a continuous speaker (no >PAUSE_MS gap) accumulates into one endless
+// run-on paragraph — the pause split alone almost never fires mid-monologue,
+// because Parakeet streams ~560ms fragments so the idle gap rarely exceeds
+// PAUSE_MS. The length floor stops abbreviations / "U.S." / "3.5" from
+// shattering the line into fragments; the punctuation check keeps breaks at
+// natural clause ends. Applies to the LIVE path only (seeds fold whole).
+export const SENTENCE_MIN_CHARS = 160;
+// True when `text` ends on sentence-final punctuation (optionally followed by a
+// closing quote/bracket and trailing space) — the break point for a new line.
+function endsSentence(text: string): boolean {
+  return /[.!?]["')\]]?\s*$/.test(text);
+}
 
 // One grouped transcript line, plus the set of segment ids folded into it. The
 // ids are the reconciliation key: a live/seed segment already listed here is a
@@ -95,13 +109,26 @@ export function createTranscriptGrouper(): TranscriptGrouper {
     if (seg.id) seen.add(seg.id);
 
     const last = lines.length > 0 ? lines[lines.length - 1] : null;
-    // Same channel, no live gap, and no CONFLICTING diarized speaker labels.
-    // (Seeded past-meeting lines carry labels on the segments themselves; two
-    // different voices on the same channel must not fold into one line.)
+    // Break a long line at a sentence end so the transcript reads as paragraphs,
+    // not one ever-growing block. The length floor (SENTENCE_MIN_CHARS) keeps
+    // abbreviations / decimals ("U.S.", "3.5") from shattering a line; the break
+    // only ever ENDS the current line before appending the next fragment, so it
+    // is safe on the seed path too (a persisted line is never re-split — the
+    // boundary just decides where the FOLLOWING fragment starts). Live and seed
+    // fold identically, preserving the byte-for-byte-identical render guarantee.
+    const sentenceBreak =
+      last != null &&
+      last.text.length >= SENTENCE_MIN_CHARS &&
+      endsSentence(last.text);
+    // Same channel, no live gap, no CONFLICTING diarized speaker labels, and not
+    // just past a sentence boundary. (Seeded past-meeting lines carry labels on
+    // the segments themselves; two different voices on the same channel must not
+    // fold into one line.)
     const continues =
       last != null &&
       last.source === seg.source &&
       !paused &&
+      !sentenceBreak &&
       !(last.speaker && seg.speaker && last.speaker !== seg.speaker);
 
     let next: GroupedLine[];

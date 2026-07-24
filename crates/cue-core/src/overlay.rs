@@ -143,6 +143,19 @@ pub struct MeetingConversationTurn {
     pub source: Option<String>,
 }
 
+/// One decision from the active meeting's ledger, pushed to the overlay so the
+/// Open Floor Plan can render the "Key Decisions" block at the top of the
+/// document. A MINIMAL wire surface over [`crate::meeting::Decision`] — just the
+/// human text and a stable id; the source-segment / timestamp internals stay
+/// daemon-side.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeetingDecision {
+    /// The decision's id (a `Uuid` rendered as a string) — stable for keying.
+    pub id: String,
+    /// The verified decision text (verbatim from the AI ledger).
+    pub text: String,
+}
+
 /// One row in the MEETINGS lens ("my past meetings"): a cheap summary of a
 /// persisted [`crate::meeting::MeetingRecord`], sent in answer to an
 /// [`OverlayEvent::MeetingsRequested`] via [`OverlayCommand::SetMeetings`]. The
@@ -373,6 +386,12 @@ pub enum OverlayCommand {
     SetMeetingState {
         transcript: Vec<MeetingTranscriptLine>,
         conversation: Vec<MeetingConversationTurn>,
+        /// The active meeting's verified Key Decisions ledger, for the Open Floor
+        /// Plan's top-of-document block. Empty (and omitted from the wire) when
+        /// there are none, so this stays byte-compatible with pre-decisions
+        /// snapshots and the glass UI (which ignores the field).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decisions: Vec<MeetingDecision>,
         /// When this snapshot is a PAST-meeting VIEW (answering
         /// [`OverlayEvent::MeetingOpenRequested`]), the opened meeting's id, so
         /// the UI can match this reply to its open request and disambiguate it
@@ -1187,6 +1206,10 @@ mod tests {
                 answer: "ship it".to_string(),
                 source: Some("overlay ask".to_string()),
             }],
+            decisions: vec![MeetingDecision {
+                id: "00000000-0000-0000-0000-000000000004".to_string(),
+                text: "Ship the beta on Friday.".to_string(),
+            }],
             meeting_id: None,
             read_only: false,
         };
@@ -1264,6 +1287,7 @@ mod tests {
                 is_final: true,
             }],
             conversation: vec![],
+            decisions: vec![],
             meeting_id: None,
             read_only: false,
         };
@@ -1287,6 +1311,7 @@ mod tests {
         let command = OverlayCommand::SetMeetingState {
             transcript: vec![],
             conversation: vec![],
+            decisions: vec![],
             meeting_id: Some("00000000-0000-0000-0000-0000000000aa".to_string()),
             read_only: true,
         };

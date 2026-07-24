@@ -1,0 +1,1504 @@
+/* ───────────────────────────────────────────────────────────────
+   Open Floor Plan — the warm-paper "meeting document" surface.
+
+   A Granola-style living document: a centered reading column of
+   transcript + interwoven Q&A, a monochrome warm-ink palette (the ONLY
+   chromatic color is --fp-live, the recording red), generous air, and a
+   serif voice for headings. Every value reads from the [data-floorplan]
+   tokens in aurora.css (paper surfaces, warm shadows, serif) — nothing is
+   hardcoded, so the light/dark variants defined there flip this whole
+   surface for free.
+
+   Layout invariant (no overlap at any window size):
+     • .fp-root is position:relative and fills the panel.
+     • .fp-canvas scrolls the document; its 150px bottom padding keeps the
+       tail clear of the absolutely-positioned stack + dock.
+     • .fp-stack (bottom-left) and .fp-dock (bottom, left:78px) are
+       position:absolute in .fp-root and never sit under each other.
+     • Everything uses relative units / flex-wrap so nothing collides on
+       resize.
+   ─────────────────────────────────────────────────────────────── */
+
+/* =====================================================================
+ * Shell
+ * =================================================================== */
+.fp-root {
+  position: relative;
+  height: 100%;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  color: var(--ink);
+  overflow: hidden;
+  font-family: var(--font);
+}
+
+/* The scrolling document viewport. The LEFT padding clears the floating stack
+ * column (buttons at left:20px, 44px wide → ~64px), so transcript text never
+ * sits under the controls. The 150px bottom padding keeps the tail clear of the
+ * stack/dock vertically. Both are the "reserve space, don't overlap" contract. */
+.fp-canvas {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 44px 24px 150px 84px;
+  scroll-behavior: smooth;
+}
+
+/* The centered reading column — this single max-width is what makes the surface
+ * feel like a document rather than a chat panel. `margin: 0 auto` centers it in
+ * the padded box; the canvas's asymmetric left padding already reserves the
+ * stack's rail, so the column never collides with the controls. */
+.fp-doc {
+  max-width: 640px;
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* Narrow windows: the centered gutters vanish, so the doc would grow to meet the
+ * stack. Bump the left inset and let the column go full width in the remaining
+ * space — text stays right of the stack at every size. */
+@media (max-width: 560px) {
+  .fp-canvas {
+    padding: 40px 16px 150px 78px;
+  }
+}
+
+/* =====================================================================
+ * Top bar — mac dots + serif title + listening chip + drawer button
+ * =================================================================== */
+.fp-topbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 13px 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+  -webkit-app-region: drag; /* the bar itself drags the window */
+}
+
+.fp-topbar-left,
+.fp-topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  -webkit-app-region: no-drag; /* controls stay clickable */
+}
+
+.fp-topbar-right {
+  margin-left: auto;
+}
+
+/* The two functional traffic-light dots (turn off / hide). */
+.fp-dots {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fp-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  position: relative;
+  transition: filter 0.15s ease, transform 0.12s ease;
+}
+.fp-dot:hover {
+  filter: brightness(0.92);
+}
+.fp-dot:active {
+  transform: scale(0.9);
+}
+.fp-dot-red {
+  background: #ff5f57;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.12);
+}
+.fp-dot-amber {
+  background: #febc2e;
+  box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.12);
+}
+
+.fp-title {
+  font-family: var(--serif);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 46vw;
+}
+
+/* Inline "listening" indicator — the live waveform + quiet label. */
+.fp-listening {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--fp-live);
+  font-weight: 560;
+  letter-spacing: 0.01em;
+}
+/* Recolor the shared Waveform bars to the floorplan's single accent (the live
+ * red) instead of the glass violet/blue gradient — monochrome-warm + one red. */
+.fp-wave span span {
+  background: var(--fp-live) !important;
+}
+.fp-live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fp-live);
+  flex: none;
+  animation: fp-pulse 1.6s ease-in-out infinite;
+}
+
+.fp-speaker-count {
+  font-size: 12px;
+  color: var(--ink-3);
+  white-space: nowrap;
+}
+
+/* Quiet icon button (the "Meetings & Agents" drawer trigger). */
+.fp-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+}
+.fp-iconbtn:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+.fp-iconbtn:active {
+  transform: scale(0.94);
+}
+
+/* =====================================================================
+ * Agent bar — a FLOATING rounded pill under the top bar (not a full-bleed
+ * banner): inset from the edges, rounded, its own border + soft lift, so it
+ * reads like the floating stack rather than a page-spanning strip.
+ * =================================================================== */
+.fp-agentbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 16px 2px;
+  padding: 9px 12px 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  background: var(--paper-2);
+  box-shadow: var(--fp-shadow-float, 0 6px 18px rgba(28, 26, 25, 0.08));
+  flex-wrap: wrap;
+  position: relative;
+  z-index: 5;
+}
+
+.fp-agentbar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* The square brand logo tile. */
+.fp-agent-logo {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--paper-sink);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+
+.fp-agent-meta {
+  min-width: 0;
+}
+.fp-agent-name {
+  font-size: 13px;
+  font-weight: 560;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fp-agent-name .fp-agent-sub {
+  color: var(--ink-3);
+  font-weight: 430;
+}
+.fp-agent-detail {
+  font-size: 11px;
+  color: var(--ink-3);
+  margin-top: 1px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Connector chips — compact (name + ready dot), with a "+N" button that opens a
+ * popover over the FULL list. Kept tight so the bar doesn't feel crowded. */
+.fp-connectors {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: nowrap;
+  justify-content: flex-end;
+  position: relative;
+}
+.fp-connector {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--ink-2);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+  border-radius: var(--r-pill);
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fp-connector.is-off {
+  color: var(--ink-3);
+}
+.fp-connector-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--ok);
+  flex: none;
+}
+.fp-connector-dot.is-off {
+  background: var(--ink-4, var(--ink-3));
+}
+.fp-connector-more {
+  font-size: 11px;
+  font-weight: 560;
+  color: var(--ink-2);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  padding: 2px 9px;
+  border-radius: var(--r-pill);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+.fp-connector-more:hover {
+  background: var(--paper-sink);
+  border-color: var(--ink-4, var(--ink-3));
+}
+
+/* The "+N" popover — the full connector list, one row each with a ready dot. */
+.fp-connector-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 30;
+  min-width: 180px;
+  max-width: 240px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--glass-solid, var(--paper-2));
+  box-shadow: 0 10px 30px rgba(28, 26, 25, 0.18);
+  animation: fp-pop-in 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fp-connector-pop-kicker {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 2px 6px 6px;
+}
+.fp-connector-pop-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: var(--ink);
+}
+.fp-connector-pop-row:hover {
+  background: var(--paper);
+}
+.fp-connector-pop-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fp-connector-pop-note {
+  flex: none;
+  font-size: 10px;
+  color: var(--ink-3);
+}
+
+/* =====================================================================
+ * Empty state — a calm mark ~40% down the column
+ * =================================================================== */
+.fp-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  text-align: center;
+  padding-top: 26vh;
+  animation: fp-fade-in 0.5s ease both;
+}
+.fp-empty-mark {
+  width: 30px;
+  height: 30px;
+  color: var(--ink-4);
+}
+.fp-empty-text {
+  font-family: var(--serif);
+  font-size: 17px;
+  font-style: italic;
+  color: var(--ink-3);
+  letter-spacing: 0.005em;
+}
+
+/* =====================================================================
+ * Section kickers + rules
+ * =================================================================== */
+.fp-kicker {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.11em;
+  color: var(--ink-4);
+  margin-bottom: 12px;
+}
+
+/* A hairline divider between sections. */
+.fp-rule {
+  height: 1px;
+  background: var(--line);
+  border: none;
+  margin: 34px 0;
+}
+
+/* =====================================================================
+ * Key Decisions ledger — a left-ruled inline block
+ * =================================================================== */
+.fp-ledger {
+  border-left: 2px solid var(--line-2);
+  padding-left: 16px;
+  margin-bottom: 34px;
+  animation: fp-slide-down 0.4s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+.fp-ledger-item {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink-2);
+  margin: 8px 0;
+}
+.fp-ledger-item::before {
+  content: "—";
+  color: var(--ink-4);
+  margin-right: 8px;
+}
+
+/* =====================================================================
+ * Timeline — interwoven transcript lines + Q&A blocks
+ * =================================================================== */
+.fp-timeline {
+  display: flex;
+  flex-direction: column;
+}
+
+/* A transcript line: speaker + optional time, then the spoken text. */
+.fp-line {
+  margin-bottom: 22px;
+  animation: fp-fade-in 0.35s ease both;
+}
+.fp-line-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.fp-line-time {
+  font-size: 11px;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+.fp-line-text {
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+/* The newest line while capturing carries a LIVE badge inline (no separate
+ * duplicate caption row — that was the redundant-live-line bug). */
+.fp-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  color: var(--fp-live);
+  padding: 1px 6px;
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, var(--fp-live) 32%, transparent);
+  background: color-mix(in srgb, var(--fp-live) 8%, transparent);
+}
+
+/* A quiet "listening…" placeholder before the first words land. */
+.fp-live-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 13px;
+  color: var(--ink-3);
+  font-style: italic;
+  margin-top: 4px;
+  animation: fp-fade-in 0.4s ease both;
+}
+
+/* --- Inline attachments (screenshots/files) in the document -------- */
+.fp-attach {
+  margin-top: 26px;
+  animation: fp-fade-in 0.35s ease both;
+}
+.fp-attach-kicker {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  margin-bottom: 10px;
+}
+.fp-attach-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.fp-attach-item {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  max-width: 100%;
+  padding: 8px 10px 8px 8px;
+  border-radius: 12px;
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  box-shadow: var(--fp-shadow-float);
+}
+/* Image attachments show a larger preview tile. */
+.fp-attach-item.is-image {
+  padding: 6px;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 140px;
+}
+.fp-attach-thumb {
+  width: 128px;
+  height: 84px;
+  border-radius: 8px;
+  object-fit: cover;
+  display: block;
+}
+.fp-attach-glyph {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--paper-sink);
+  color: var(--ink-2);
+}
+.fp-attach-title {
+  font-size: 12.5px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+.fp-attach-item.is-image .fp-attach-title {
+  max-width: 128px;
+  margin-top: 2px;
+  padding: 0 2px;
+}
+.fp-attach-x {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: none;
+  background: var(--paper);
+  box-shadow: 0 1px 4px rgba(28, 26, 25, 0.14);
+  color: var(--ink-3);
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+/* On image tiles the remove button floats over the top-right corner. */
+.fp-attach-item.is-image .fp-attach-x {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+}
+.fp-attach-x:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+
+/* --- Speaker label (shared by EditableSpeaker) --------------------- */
+.fp-speaker {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-2);
+  letter-spacing: -0.005em;
+}
+.fp-speaker-renameable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.fp-speaker-renameable:hover {
+  color: var(--ink);
+  background: var(--paper-sink);
+  box-shadow: 0 0 0 3px var(--paper-sink);
+}
+.fp-speaker-edit {
+  position: relative;
+  display: inline-flex;
+}
+.fp-speaker-input {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  background: var(--paper-2);
+  border: 1px solid var(--line-2);
+  border-radius: 7px;
+  padding: 2px 8px;
+  min-width: 120px;
+  outline: none;
+}
+.fp-speaker-input:focus {
+  border-color: var(--ink-3);
+}
+.fp-speaker-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 160px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--paper-2);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--fp-shadow-float);
+}
+.fp-speaker-cand {
+  text-align: left;
+  font-size: 13px;
+  color: var(--ink-2);
+  background: transparent;
+  border: none;
+  border-radius: 7px;
+  padding: 6px 9px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.fp-speaker-cand:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+
+/* =====================================================================
+ * Q&A dialog block — reasoning renders INSIDE the dialog
+ * =================================================================== */
+.fp-qa {
+  background: var(--paper-2);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 22px 24px;
+  margin: 8px 0 22px;
+  box-shadow: var(--fp-shadow-float);
+  animation: fp-rise-in 0.4s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+
+/* The question row: "You" avatar + the question text. */
+.fp-qa-q {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.fp-qa-avatar {
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--paper-sink);
+  color: var(--ink-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 620;
+  letter-spacing: 0.01em;
+}
+.fp-qa-question {
+  font-size: 15px;
+  font-weight: 550;
+  line-height: 1.5;
+  color: var(--ink);
+  padding-top: 4px;
+}
+
+/* Everything below the question aligns under the text, not the avatar. */
+.fp-qa-indent {
+  padding-left: 40px;
+}
+.fp-qa-status {
+  margin-top: 12px;
+}
+
+/* The streamed answer body. */
+.fp-qa-a {
+  margin-top: 12px;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--ink);
+}
+
+/* Blinking cursor while the answer streams. */
+.fp-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 15px;
+  background: var(--ink-3);
+  vertical-align: -3px;
+  margin-left: 3px;
+  border-radius: 1px;
+  animation: fp-blink 1.1s step-end infinite;
+}
+
+/* Grounding source rows under an answer. */
+.fp-sources {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+.fp-source {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--ink-2);
+}
+.fp-source-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-4);
+  flex: none;
+}
+.fp-source-note {
+  color: var(--ink-4);
+  margin-left: auto;
+  font-size: 11px;
+}
+
+/* Quiet actions once the answer is done. */
+.fp-qa-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 16px;
+}
+.fp-qa-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--ink-2);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 6px 11px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+}
+.fp-qa-action:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+.fp-qa-action:active {
+  transform: scale(0.96);
+}
+.fp-qa-cost {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--ink-4);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Error block — the ONLY place --fp-live tints an answer. */
+.fp-qa-error {
+  margin-top: 12px;
+  padding: 13px 15px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--fp-live) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--fp-live) 26%, transparent);
+}
+.fp-qa-error-kicker {
+  font-size: 10px;
+  font-weight: 680;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--fp-live);
+  margin-bottom: 5px;
+}
+.fp-qa-error-text {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--ink-2);
+}
+.fp-qa-error-retry {
+  margin-top: 10px;
+  padding: 5px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, var(--fp-live) 34%, transparent);
+  background: transparent;
+  color: var(--fp-live);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.fp-qa-error-retry:hover {
+  background: color-mix(in srgb, var(--fp-live) 10%, transparent);
+}
+
+/* --- Q&A markdown treatment (the answer body) --------------------- */
+.fp-qa-a :is(h1, h2, h3) {
+  font-family: var(--serif);
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.3;
+  margin: 16px 0 6px;
+}
+.fp-qa-a :is(h1, h2, h3):first-child {
+  margin-top: 0;
+}
+.fp-qa-a h1 {
+  font-size: 18px;
+}
+.fp-qa-a h2 {
+  font-size: 16px;
+}
+.fp-qa-a h3 {
+  font-size: 14.5px;
+  color: var(--ink-2);
+}
+.fp-qa-a p {
+  margin: 0 0 10px;
+}
+.fp-qa-a p:last-child {
+  margin-bottom: 0;
+}
+.fp-qa-a :is(ul, ol) {
+  margin: 6px 0 10px;
+  padding-left: 20px;
+}
+.fp-qa-a li {
+  margin: 3px 0;
+}
+.fp-qa-a code {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  background: var(--paper-sink);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 1px 5px;
+  color: var(--ink);
+}
+.fp-qa-a pre {
+  margin: 10px 0;
+  padding: 12px 14px;
+  background: var(--paper-sink);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow-x: auto;
+}
+.fp-qa-a pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  white-space: pre;
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+.fp-qa-a a {
+  color: var(--ink);
+  text-decoration: none;
+  border-bottom: 1px solid var(--line-2);
+}
+.fp-qa-a a:hover {
+  border-bottom-color: var(--ink-3);
+}
+
+/* =====================================================================
+ * Floating control stack — bottom-left vertical column
+ * =================================================================== */
+.fp-stack {
+  position: absolute;
+  left: 20px;
+  bottom: 20px;
+  z-index: 40;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  pointer-events: none; /* only the children take pointer events */
+}
+.fp-stack > * {
+  pointer-events: auto;
+}
+
+/* The buttons row + the ask-form that springs open beside it. */
+.fp-stack-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+.fp-stack-col {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* A circular vector-icon button. */
+.fp-fab {
+  width: 44px;
+  height: 44px;
+  flex: none;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: var(--fp-shadow-float);
+  transition: transform 0.14s cubic-bezier(0.2, 0.9, 0.2, 1),
+    background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  animation: fp-pop-in 0.32s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+.fp-fab:hover {
+  transform: translateY(-1px) scale(1.04);
+  color: var(--ink);
+  background: var(--paper-2);
+}
+.fp-fab:active {
+  transform: scale(0.94);
+}
+.fp-fab:disabled {
+  opacity: 0.5;
+  cursor: default;
+  transform: none;
+}
+
+/* The dark "Ask" anchor button. */
+.fp-fab-anchor {
+  background: var(--ink);
+  color: var(--paper-2);
+  border-color: var(--ink);
+  box-shadow: var(--fp-shadow-anchor);
+}
+.fp-fab-anchor:hover {
+  background: var(--ink);
+  color: var(--paper-2);
+}
+
+/* A "live"-toned control (system audio while listening) — the recording red. */
+.fp-fab-live {
+  background: var(--fp-live);
+  color: #fff;
+  border-color: var(--fp-live);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--fp-live) 16%, transparent),
+    var(--fp-shadow-float);
+}
+.fp-fab-live:hover {
+  background: var(--fp-live);
+  color: #fff;
+}
+
+/* A subtly-active control (mic captured) — warm-ink tint, no chroma. */
+.fp-fab-on {
+  background: var(--paper-sink);
+  color: var(--ink);
+  border-color: var(--line-2);
+}
+
+/* Spinner wrapper (connecting state). */
+.fp-spin {
+  display: inline-flex;
+  animation: fp-spin 1.1s linear infinite;
+}
+
+/* The Ask input that springs open to the RIGHT of the stack. */
+.fp-ask-form {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 6px 6px 14px;
+  border-radius: var(--r-pill);
+  background: var(--paper-2);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--fp-shadow-float);
+  transform-origin: left bottom;
+  animation: fp-droplet 0.34s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+.fp-ask-input {
+  font-family: var(--font);
+  font-size: 14px;
+  color: var(--ink);
+  background: transparent;
+  border: none;
+  outline: none;
+  width: min(46vw, 300px);
+  min-width: 160px;
+}
+.fp-ask-input::placeholder {
+  color: var(--ink-4);
+}
+.fp-ask-send {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  border: none;
+  background: var(--ink);
+  color: var(--paper-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.15s ease;
+}
+.fp-ask-send:hover {
+  transform: scale(1.06);
+}
+.fp-ask-send:active {
+  transform: scale(0.92);
+}
+.fp-ask-send:disabled {
+  opacity: 0.4;
+  cursor: default;
+  transform: none;
+}
+
+/* =====================================================================
+ * Detected-question dock — rises from the bottom, beside the stack
+ * =================================================================== */
+.fp-dock {
+  position: absolute;
+  left: 78px; /* clears the stack column (44px + 20px gutter + air) */
+  right: 20px;
+  bottom: 20px;
+  z-index: 30;
+  max-width: 420px;
+  padding: 16px 18px;
+  border-radius: 18px;
+  background: var(--paper-2);
+  border: 1px solid var(--line-2);
+  box-shadow: var(--fp-shadow-anchor);
+  animation: fp-dock-rise 0.42s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+.fp-dock-eyebrow {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--ink-3);
+  letter-spacing: 0.01em;
+  margin-bottom: 8px;
+}
+.fp-dock-pulse {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--fp-live);
+  flex: none;
+  animation: fp-pulse 1.6s ease-in-out infinite;
+}
+.fp-dock-q {
+  font-size: 15px;
+  line-height: 1.5;
+  color: var(--ink);
+  margin-bottom: 14px;
+}
+.fp-dock-btns {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Shared dock/button primitives. */
+.fp-btn {
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 560;
+  border-radius: 10px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: transform 0.12s ease, background 0.15s ease, color 0.15s ease;
+}
+.fp-btn:active {
+  transform: scale(0.97);
+}
+.fp-btn-primary {
+  background: var(--ink);
+  color: var(--paper-2);
+  border: 1px solid var(--ink);
+}
+.fp-btn-primary:hover {
+  background: var(--ink-2);
+}
+.fp-btn-ghost {
+  background: transparent;
+  color: var(--ink-3);
+  border: 1px solid var(--line);
+}
+.fp-btn-ghost:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+
+/* =====================================================================
+ * Drawer — the slide-over sheet (History & Agents)
+ *
+ * Reaches the surfaces the floorplan replaced (past meetings, agent sessions,
+ * attach/select). A scrim dims the document; the sheet slides in from the right
+ * and hosts the existing HistoryTab / AgentsScreen leaf screens.
+ * =================================================================== */
+.fp-drawer-root {
+  position: absolute;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  justify-content: flex-end;
+}
+.fp-drawer-scrim {
+  position: absolute;
+  inset: 0;
+  background: color-mix(in srgb, var(--ink) 26%, transparent);
+  animation: fp-fade-in 0.2s ease both;
+}
+.fp-drawer {
+  position: relative;
+  width: min(88%, 400px);
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--paper);
+  border-left: 1px solid var(--line);
+  box-shadow: -18px 0 44px rgba(28, 26, 25, 0.22);
+  animation: fp-drawer-in 0.26s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.fp-drawer-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 12px 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.fp-drawer-switch {
+  display: inline-flex;
+  gap: 2px;
+  padding: 3px;
+  border-radius: 12px;
+  background: var(--paper-sink);
+}
+.fp-drawer-tab {
+  font-size: 12.5px;
+  font-weight: 560;
+  color: var(--ink-3);
+  background: transparent;
+  border: none;
+  padding: 5px 14px;
+  border-radius: 9px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.fp-drawer-tab.is-on {
+  color: var(--ink);
+  background: var(--paper-2);
+  box-shadow: 0 1px 3px rgba(28, 26, 25, 0.08);
+}
+.fp-drawer-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  border: 1px solid var(--line);
+  background: var(--paper-2);
+  color: var(--ink-2);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.fp-drawer-close:hover {
+  background: var(--paper-sink);
+}
+.fp-drawer-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+@keyframes fp-drawer-in {
+  from {
+    transform: translateX(18px);
+    opacity: 0.4;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+/* =====================================================================
+ * Dynamic-Island pill — the collapsed surface
+ *
+ * Fills the fixed pill window (the OS window itself morphs size per phase via
+ * useCollapse.setPillSize; this fills whatever size it lands on). The pill's
+ * SHAPE, accent and content swap by data-phase; the window + pill spring
+ * between sizes so the morph reads as one continuous island, not a reflow.
+ * =================================================================== */
+.fp-pill-root {
+  position: fixed;
+  inset: 4px;
+  display: flex;
+}
+
+.fp-pill {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  padding: 0 7px 0 12px;
+  border-radius: 999px;
+  background: var(--glass, var(--paper-2));
+  color: var(--ink);
+  border: 1px solid var(--line);
+  box-shadow:
+    0 6px 20px rgba(28, 26, 25, 0.14),
+    0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  -webkit-app-region: drag;
+  transition:
+    box-shadow 0.22s ease,
+    border-radius 0.28s cubic-bezier(0.22, 1, 0.36, 1),
+    background 0.2s ease;
+}
+/* The richer phases square the corners slightly (island "expanded" feel). */
+.fp-pill[data-phase="detected"],
+.fp-pill[data-phase="peek"],
+.fp-pill[data-phase="answering"] {
+  border-radius: 22px;
+  align-items: center;
+}
+.fp-pill.is-flash {
+  box-shadow:
+    0 6px 20px rgba(28, 26, 25, 0.14),
+    0 0 0 1.5px color-mix(in srgb, var(--ink) 26%, transparent) inset;
+}
+.fp-pill[data-phase="detected"],
+.fp-pill[data-phase="peek"] {
+  box-shadow:
+    0 6px 20px rgba(28, 26, 25, 0.16),
+    0 0 0 1.5px color-mix(in srgb, var(--fp-live) 34%, transparent) inset;
+}
+
+/* Leading glyph / status dot. */
+.fp-pill-lead {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  color: var(--ink-2);
+}
+.fp-pill[data-phase="detected"] .fp-pill-lead,
+.fp-pill[data-phase="peek"] .fp-pill-lead {
+  color: var(--fp-live);
+}
+.fp-pill-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--ink-4, var(--ink-3));
+}
+.fp-pill-dot.is-live {
+  background: var(--fp-live);
+  box-shadow: 0 0 7px var(--fp-live);
+  animation: fp-pulse 1.6s ease-in-out infinite;
+}
+.fp-pill-spin {
+  display: inline-flex;
+  animation: fp-spin 0.9s linear infinite;
+  color: var(--ink-2);
+}
+
+/* Body — the tap/drag target. Content crossfades in per phase. */
+.fp-pill-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  cursor: grab;
+  -webkit-app-region: no-drag;
+  animation: fp-pill-morph 0.26s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fp-pill-label {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.fp-pill[data-phase="detected"] .fp-pill-label,
+.fp-pill[data-phase="peek"] .fp-pill-label {
+  color: var(--fp-live);
+}
+.fp-pill-sub {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.fp-pill-caption {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12.5px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.fp-pill-caption.is-muted {
+  color: var(--ink-3);
+}
+.fp-pill-clamp {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Trailing affordances. */
+.fp-pill-toggle {
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 999px;
+  border: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: transparent;
+  color: var(--ink-3);
+  -webkit-app-region: no-drag;
+  transition: background 0.16s ease, color 0.16s ease;
+}
+.fp-pill-toggle:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+.fp-pill-toggle.is-on {
+  background: color-mix(in srgb, var(--fp-live) 12%, transparent);
+  color: var(--fp-live);
+}
+.fp-pill-cta {
+  flex: none;
+  height: 28px;
+  padding: 0 14px;
+  border-radius: 999px;
+  border: none;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  background: var(--ink);
+  color: var(--paper);
+  -webkit-app-region: no-drag;
+  transition: transform 0.14s ease, opacity 0.14s ease;
+  animation: fp-pop-in 0.22s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fp-pill-cta:hover {
+  transform: translateY(-1px);
+}
+.fp-pill-cta:active {
+  transform: translateY(0);
+  opacity: 0.85;
+}
+
+@keyframes fp-pill-morph {
+  from {
+    opacity: 0.3;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Reduced motion for the pill (it lives outside .fp-root). */
+@media (prefers-reduced-motion: reduce) {
+  .fp-pill-root *,
+  .fp-pill {
+    animation: none !important;
+    transition: none !important;
+  }
+}
+
+/* =====================================================================
+ * Keyframes
+ * =================================================================== */
+@keyframes fp-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.82);
+  }
+}
+@keyframes fp-blink {
+  50% {
+    opacity: 0;
+  }
+}
+@keyframes fp-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes fp-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes fp-rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes fp-slide-down {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes fp-pop-in {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+@keyframes fp-dock-rise {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+/* The Ask input's "droplet/bubble-open" spring to the right. */
+@keyframes fp-droplet {
+  from {
+    opacity: 0;
+    transform: scaleX(0.6) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scaleX(1) translateY(0);
+  }
+}
+
+/* =====================================================================
+ * Reduced motion — kill every animation/transition on this surface
+ * =================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .fp-root *,
+  .fp-canvas {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

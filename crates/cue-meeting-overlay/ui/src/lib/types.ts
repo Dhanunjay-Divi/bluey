@@ -116,12 +116,24 @@ export interface MeetingConversationTurn {
   source?: string;
 }
 
+/** One verified decision from the active meeting's ledger — the Open Floor
+ *  Plan's "Key Decisions" block renders these. Mirrors the daemon's
+ *  `MeetingDecision`. */
+export interface MeetingDecision {
+  /** Decision.id (Uuid) as string — the render key. */
+  id: string;
+  /** The verified decision text. */
+  text: string;
+}
+
 /** The active meeting's read-only snapshot, fetched once on mount to rehydrate
- *  the overlay after a collapse-remount or a full process restart (Fix B). Both
+ *  the overlay after a collapse-remount or a full process restart (Fix B). All
  *  arrays are empty when no meeting is active. */
 export interface MeetingState {
   transcript: MeetingTranscriptLine[];
   conversation: MeetingConversationTurn[];
+  /** The Key Decisions ledger for this session (may be empty). */
+  decisions: MeetingDecision[];
 }
 
 /** One past meeting summarized for the MEETINGS lens (the "my past meetings"

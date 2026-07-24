@@ -30,6 +30,14 @@ TARGET="$(rustc -vV | awk '/host:/{print $2}')"
 # that falls through to the cloud "sign in" gate and transcribes nothing.
 # local-memory adds the keyless cross-meeting facts memory (bge-small via ort).
 DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory"
+# Speaker diarization (cue-daemon/diarize) is OPT-IN via BLUEY_DIARIZE_BUILD=1 —
+# it links Homebrew arm64 OpenBLAS + a CoreML backend, so it's off by default
+# (a plain reinstall stays lean). With it on, real per-speaker labels replace the
+# "You"/"Them" channel fallback. Diarization models (~60MB) download on first use.
+if [[ "${BLUEY_DIARIZE_BUILD:-0}" == "1" ]]; then
+  DAEMON_FEATURES="$DAEMON_FEATURES cue-daemon/diarize"
+  echo "reinstall-dev: diarization ENABLED (linking Homebrew arm64 OpenBLAS)"
+fi
 # openblas pkg-config for the diarize/daemon link.
 export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/opt/homebrew/opt/openblas/lib/pkgconfig}"
 
@@ -70,6 +78,18 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
   bash native/macos/cue-shot/build.sh >/dev/null
 fi
 
+# --- 2c. build the BlueyAudio.app mic/system-audio helper (macOS) ---
+# The daemon launches this bundle (via `/usr/bin/open`) to capture mic + system
+# audio: a bare binary can't hold the Microphone TCC grant and its Info.plist
+# NSMicrophoneUsageDescription, only an .app bundle can. Without it staged beside
+# the daemon, capture returns SILENT buffers ("mic: audio is flowing but SILENT")
+# and the system-audio helper "failed too many times" — transcription gets
+# garbage. Built + staged like BlueyShot.app so the resolver finds it at runtime.
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  printf 'reinstall-dev: building BlueyAudio.app audio helper…\n'
+  bash native/macos/cue-audio/build.sh >/dev/null
+fi
+
 out="$REPO/target/$TARGET/debug"
 
 # --- 3. stop the running daemon BEFORE overwriting its binary ---
@@ -98,6 +118,26 @@ if [[ "$(uname -s)" == "Darwin" && -d native/macos/cue-shot/.build/BlueyShot.app
     rm -rf "$dest/BlueyShot.app"
     cp -R native/macos/cue-shot/.build/BlueyShot.app "$dest/" \
       && printf 'reinstall-dev: staged BlueyShot.app in %s\n' "$dest"
+  done
+fi
+
+# --- 4a-audio. stage BlueyAudio.app beside the DAEMON (its bundle resolver,
+# macos_app_bundle_path, searches current_exe().parent()). Without this the mic +
+# system-audio helper can't launch → SILENT capture + "system audio helper failed
+# too many times" → garbage STT. Give it the SAME stable-identifier codesign as
+# the daemon/overlay so its Microphone TCC grant persists across rebuilds (a
+# per-build hash identifier makes macOS re-prompt every time). ---
+if [[ "$(uname -s)" == "Darwin" && -d native/macos/cue-audio/.build/BlueyAudio.app ]]; then
+  for dest in "$out" "$install_bin"; do
+    rm -rf "$dest/BlueyAudio.app"
+    cp -R native/macos/cue-audio/.build/BlueyAudio.app "$dest/" \
+      && printf 'reinstall-dev: staged BlueyAudio.app in %s\n' "$dest"
+    if command -v codesign >/dev/null 2>&1; then
+      codesign --force --deep --sign - --identifier "sh.bluey.audio" \
+        "$dest/BlueyAudio.app" >/dev/null 2>&1 \
+        && printf 'reinstall-dev: signed BlueyAudio.app (sh.bluey.audio) in %s\n' "$dest" \
+        || printf 'reinstall-dev: WARN codesign of BlueyAudio.app in %s failed\n' "$dest" >&2
+    fi
   done
 fi
 

@@ -7,6 +7,20 @@ import { useCallback, useEffect, useState } from "react";
 
 const DEFAULT_EXPANDED = { width: 540, height: 760 };
 const PILL = { width: 232, height: 60 };
+// Dynamic-Island pill morph sizes. The collapsed pill is not one fixed shape:
+// like the iOS Dynamic Island it GROWS to fit richer state (a detected question,
+// a thinking spinner, an answer peek) and settles back to the compact caption
+// bar when idle/listening. The pill component drives these via setPillSize; the
+// window resize stays owned here so it never fights collapse()/expand().
+export const PILL_SIZES = {
+  // idle / listening — the ambient caption bar
+  compact: { width: 232, height: 60 },
+  // a detected for-me question OR a live "thinking" turn — one line taller/wider
+  alert: { width: 320, height: 76 },
+  // an answer just landed — a peek of the answer tail needs the most room
+  peek: { width: 340, height: 96 },
+} as const;
+export type PillSize = keyof typeof PILL_SIZES;
 // Onboarding is a small centered card, NOT the full Ask panel — sizing the window
 // to the full panel made the card float in a large empty box. This is just big
 // enough for the tallest step (attach: up to 4 agent rows).
@@ -36,8 +50,15 @@ async function currentExpandedSize(): Promise<Size> {
     const factor = await win.scaleFactor();
     const w = Math.round(inner.width / factor);
     const h = Math.round(inner.height / factor);
-    // Guard against reading a stale pill size as the "expanded" size.
-    if (w > PILL.width + 40 && h > PILL.height + 40) {
+    // Guard against reading a stale pill size (any morph variant) as the
+    // "expanded" size. The pill can grow to PILL_SIZES.peek, so gate on the
+    // tallest pill height, not the compact one.
+    const maxPillH = Math.max(
+      PILL_SIZES.compact.height,
+      PILL_SIZES.alert.height,
+      PILL_SIZES.peek.height,
+    );
+    if (h > maxPillH + 40) {
       return { width: w, height: h };
     }
   } catch {
@@ -64,7 +85,17 @@ export function useCollapse() {
     await setWindowSize(expandedSize);
   }, [expandedSize]);
 
-  return { collapsed, collapse, expand };
+  // Resize the collapsed pill window to one of its morph variants. No-op unless
+  // collapsed (the pill only owns the window while collapsed). The pill component
+  // calls this as its derived state changes (idle → detected → thinking → peek).
+  const setPillSize = useCallback(
+    async (size: PillSize) => {
+      await setWindowSize(PILL_SIZES[size]);
+    },
+    [],
+  );
+
+  return { collapsed, collapse, expand, setPillSize };
 }
 
 /**

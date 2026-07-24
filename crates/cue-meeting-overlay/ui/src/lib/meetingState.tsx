@@ -43,6 +43,7 @@ import {
 import type {
   AnswerStatusStep,
   FixProposal,
+  MeetingDecision,
   MeetingState,
   TranscriptLine,
 } from "./types";
@@ -53,6 +54,13 @@ import type {
  *  last. */
 export interface Turn {
   id: number;
+  /** How many transcript history lines existed when this question was asked —
+   *  the turn's ANCHOR into the timeline. The Open Floor document interleaves
+   *  each Q&A directly after the transcript line that was live when it was
+   *  asked, so the exchange stays pinned where it happened and later transcript
+   *  + Q&A flow BELOW it (instead of all Q&A piling at the bottom). Absent on
+   *  seeded turns (they render after the transcript they followed). */
+  anchor?: number;
   /** What is SHOWN in the feed for this turn. */
   question: string;
   /** What is SENT to the agent on (re)ask — differs from `question` only for the
@@ -77,6 +85,8 @@ interface MeetingStateValue {
   history: TranscriptLine[];
   /** The conversation feed — every asked question + its answer, in order. */
   turns: Turn[];
+  /** The active meeting's Key Decisions ledger (empty until decisions land). */
+  decisions: MeetingDecision[];
   /** The current detected for-me question, or null when none/dismissed. */
   detectedQ: DetectedQuestion | null;
   setDetectedQ: (q: DetectedQuestion | null) => void;
@@ -106,6 +116,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   const [transcript, setTranscript] = useState<TranscriptLine | null>(null);
   const [history, setHistory] = useState<TranscriptLine[]>([]);
   const [turns, setTurns] = useState<Turn[]>([]);
+  const [decisions, setDecisions] = useState<MeetingDecision[]>([]);
   const [detectedQ, setDetectedQ] = useState<DetectedQuestion | null>(null);
   const [fixProposal, setFixProposal] = useState<FixProposal | null>(null);
   const [rehydrated, setRehydrated] = useState(false);
@@ -198,6 +209,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     }));
     setTurns(seededTurns);
     turnSeq.current = snap.conversation.length;
+    setDecisions(snap.decisions ?? []);
     setDetectedQ(null);
     setFixProposal(null);
   };
@@ -245,6 +257,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
         }));
         setTurns(seededTurns);
         turnSeq.current = snap.conversation.length;
+        setDecisions(snap.decisions ?? []);
 
         // Treat the seed as "just heard" so the FIRST live fragment continuing
         // the same speaker within PAUSE_MS joins the seeded tail into one flowing
@@ -333,6 +346,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     transcript,
     history,
     turns,
+    decisions,
     detectedQ,
     setDetectedQ,
     fixProposal,

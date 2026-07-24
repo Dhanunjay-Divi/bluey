@@ -172,10 +172,30 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
                 _ => None,
             }
         };
-        if let Some((window, start)) = submit {
+        if let Some((window, _retention_start)) = submit {
+            // CLOCK ALIGNMENT (critical): the window's absolute start MUST be on
+            // the SAME clock as the transcript segments' `audio_start_secs`, or
+            // the overlap matcher never lands and live speaker labels are never
+            // emitted (post-process still works — it re-times over the full
+            // buffer). Segments are stamped from `audio_samples` (an unconditional
+            // fetch_add, app.rs). Retention's own `total` — the basis of
+            // `rolling_window()`'s start — LAGS `audio_samples`, because the
+            // retention push is behind a `try_lock` that skips chunks under
+            // contention. That lag shifts the window's turns earlier than the
+            // segments by more than the matcher's tolerance → zero live labels.
+            // Recompute the start from `audio_samples` so both share one clock:
+            // the window holds the most-recent `window.len()` samples, so on the
+            // audio clock it starts `window.len()` samples before "now".
+            let now_secs = d
+                .audio_samples
+                .load(std::sync::atomic::Ordering::Relaxed)
+                as f64
+                / 16_000.0;
+            let start = (now_secs - window.len() as f64 / 16_000.0).max(0.0);
             debug!(
                 samples = window.len(),
                 start_secs = start,
+                retention_start = _retention_start,
                 "diarize: live_tick submitting rolling window"
             );
             let _ = tx.try_send((window, start));

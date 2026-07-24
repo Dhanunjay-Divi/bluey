@@ -4,6 +4,7 @@ import { App } from "./App";
 import { MeetingProvider } from "./lib/meetingState";
 import { DataProvider } from "./lib/dataStore";
 import "./styles/aurora.css";
+import "./styles/floorplan.css";
 
 const inTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;

@@ -174,3 +174,72 @@ export function CheckIcon({ size }: { size?: number }) {
     </Icon>
   );
 }
+
+/** Sparkle — the "Ask" / assistant action glyph (a four-point star). */
+export function SparkleIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M12 3c.4 3.6 1.4 4.6 5 5-3.6.4-4.6 1.4-5 5-.4-3.6-1.4-4.6-5-5 3.6-.4 4.6-1.4 5-5z" />
+    </Icon>
+  );
+}
+
+/** Send — an upward arrow; submit the typed question. */
+export function SendIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M12 20V5" />
+      <path d="M6 11l6-6 6 6" />
+    </Icon>
+  );
+}
+
+/** Plus — add / open the more-actions affordance. */
+export function PlusIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M12 5v14" />
+      <path d="M5 12h14" />
+    </Icon>
+  );
+}
+
+/** Close — the ✕ / turn-off glyph. */
+export function CloseIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M6 6l12 12" />
+      <path d="M18 6L6 18" />
+    </Icon>
+  );
+}
+
+/** Layers / drawer — the "meetings & agents" panel glyph. */
+export function LayersIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <path d="M12 3 3 8l9 5 9-5-9-5z" />
+      <path d="M3 13l9 5 9-5" />
+    </Icon>
+  );
+}
+
+/** Clock / history — past meetings & sessions. */
+export function HistoryIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3.5 2" />
+    </Icon>
+  );
+}
+
+/** Copy — duplicate the answer to the clipboard. */
+export function CopyIcon({ size }: { size?: number }) {
+  return (
+    <Icon size={size}>
+      <rect x="9" y="9" width="11" height="11" rx="2" />
+      <path d="M5 15V5a2 2 0 0 1 2-2h8" />
+    </Icon>
+  );
+}

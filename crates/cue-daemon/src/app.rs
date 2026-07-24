@@ -4425,7 +4425,7 @@ async fn handle_agent_sessions_requested(
 /// path). The meeting `Mutex` is dropped before the send: never held across an
 /// `await`.
 async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
-    let (transcript, conversation) = {
+    let (transcript, conversation, decisions) = {
         let guard = daemon.meeting.lock().await;
         match guard.as_ref() {
             Some(meeting) => (
@@ -4436,8 +4436,9 @@ async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
                     .map(to_wire_line)
                     .collect(),
                 meeting.conversation.iter().map(to_wire_turn).collect(),
+                meeting.decisions.iter().map(to_wire_decision).collect(),
             ),
-            None => (Vec::new(), Vec::new()),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         }
     };
     let count = transcript.len();
@@ -4452,6 +4453,7 @@ async fn handle_meeting_state_requested(daemon: &Arc<Daemon>) {
         OverlayCommand::SetMeetingState {
             transcript,
             conversation,
+            decisions,
             // Active rehydrate: no meeting_id + not read-only, so the wire form
             // stays byte-identical and the UI's live-rehydrate picker matches.
             meeting_id: None,
@@ -4581,11 +4583,13 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
                 .map(to_wire_line)
                 .collect();
             let conversation = record.conversation.iter().map(to_wire_turn).collect();
+            let decisions = record.decisions.iter().map(to_wire_decision).collect();
             let _ = send_overlay(
                 daemon,
                 OverlayCommand::SetMeetingState {
                     transcript,
                     conversation,
+                    decisions,
                     meeting_id: Some(record.id.to_string()),
                     read_only,
                 },
@@ -4601,6 +4605,7 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
                 OverlayCommand::SetMeetingState {
                     transcript: Vec::new(),
                     conversation: Vec::new(),
+                    decisions: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
                 },
@@ -4614,6 +4619,7 @@ async fn handle_meeting_open_requested(daemon: &Arc<Daemon>, id: uuid::Uuid) {
                 OverlayCommand::SetMeetingState {
                     transcript: Vec::new(),
                     conversation: Vec::new(),
+                    decisions: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
                 },
@@ -4691,6 +4697,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                 OverlayCommand::SetMeetingState {
                     transcript: Vec::new(),
                     conversation: Vec::new(),
+                    decisions: Vec::new(),
                     meeting_id: Some(id.to_string()),
                     read_only: true,
                 },
@@ -4700,7 +4707,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
         ContinueDecision::ReseedActive => {
             // target == active: no switch. Re-emit the ACTIVE snapshot exactly
             // like `handle_meeting_state_requested`. No archive.
-            let (transcript, conversation) = {
+            let (transcript, conversation, decisions) = {
                 let guard = daemon.meeting.lock().await;
                 match guard.as_ref() {
                     Some(meeting) => (
@@ -4711,8 +4718,9 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                             .map(to_wire_line)
                             .collect(),
                         meeting.conversation.iter().map(to_wire_turn).collect(),
+                        meeting.decisions.iter().map(to_wire_decision).collect(),
                     ),
-                    None => (Vec::new(), Vec::new()),
+                    None => (Vec::new(), Vec::new(), Vec::new()),
                 }
             };
             let _ = send_overlay(
@@ -4720,6 +4728,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                 OverlayCommand::SetMeetingState {
                     transcript,
                     conversation,
+                    decisions,
                     meeting_id: None,
                     read_only: false,
                 },
@@ -4771,6 +4780,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                         OverlayCommand::SetMeetingState {
                             transcript: Vec::new(),
                             conversation: Vec::new(),
+                            decisions: Vec::new(),
                             meeting_id: Some(id.to_string()),
                             read_only: true,
                         },
@@ -4786,6 +4796,7 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                         OverlayCommand::SetMeetingState {
                             transcript: Vec::new(),
                             conversation: Vec::new(),
+                            decisions: Vec::new(),
                             meeting_id: Some(id.to_string()),
                             read_only: true,
                         },
@@ -4822,11 +4833,13 @@ async fn handle_meeting_continue_requested(daemon: &Arc<Daemon>, id: uuid::Uuid)
                 .map(to_wire_line)
                 .collect();
             let conversation = record.conversation.iter().map(to_wire_turn).collect();
+            let decisions = record.decisions.iter().map(to_wire_decision).collect();
             let _ = send_overlay(
                 daemon,
                 OverlayCommand::SetMeetingState {
                     transcript,
                     conversation,
+                    decisions,
                     meeting_id: None,
                     read_only: false,
                 },
@@ -4877,6 +4890,15 @@ fn to_wire_turn(turn: &ConversationTurn) -> MeetingConversationTurn {
         question: turn.question.clone(),
         answer: turn.answer.clone(),
         source: turn.source.clone(),
+    }
+}
+
+/// Map a meeting [`Decision`] to its MINIMAL overlay wire form — the id + text
+/// the Open Floor Plan's "Key Decisions" block renders.
+fn to_wire_decision(decision: &cue_core::Decision) -> cue_core::overlay::MeetingDecision {
+    cue_core::overlay::MeetingDecision {
+        id: decision.id.to_string(),
+        text: decision.text.clone(),
     }
 }
 
@@ -8804,7 +8826,20 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 }
             }
             Ok(None) => {
-                debug!("ledger: no attached agent and no usable cheap provider; pass skipped");
+                // Visible (info, not debug) because this is the difference between
+                // "the ledger is working" and "decisions:0 forever": the pass fired
+                // but produced nothing — almost always because the attached agent
+                // was unreachable (the drive returned None) and no cloud provider
+                // is configured to fall back to. Silently swallowing this at debug
+                // is exactly why an unreachable Antigravity looked like a broken
+                // ledger. If you see this repeatedly, the attached agent's backend
+                // is down — decisions/action-items can't be extracted until it's
+                // reachable (or a cloud provider key is set).
+                info!(
+                    "ledger: extraction pass produced nothing (attached agent \
+                     unreachable / not attached, and no cheap provider); \
+                     decisions not updated this pass"
+                );
             }
             Err(error) => {
                 warn!("ledger extraction pass failed: {error:#}");
@@ -8903,7 +8938,13 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
                 }
             }
             None => {
-                debug!("rolling summary pass skipped (no attached agent / drive failed)");
+                // Visible for the same reason as the ledger skip above: a summary
+                // that never updates because the agent is unreachable should not be
+                // invisible at debug level.
+                info!(
+                    "summary: pass produced nothing (attached agent unreachable / \
+                     not attached); summary not refreshed this pass"
+                );
             }
         }
     });
