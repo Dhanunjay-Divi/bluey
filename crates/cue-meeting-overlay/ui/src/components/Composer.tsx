@@ -2,7 +2,7 @@
 // ⌘↵ hint, send. Submits on Enter (⌘↵ or plain Enter) when there's text.
 
 import { useState, type ReactNode } from "react";
-import type { AskMode, ListeningState } from "../lib/types";
+import type { AskMode, ContextItem, ListeningState } from "../lib/types";
 import { PlusMenu } from "./PlusMenu";
 import { ModelPicker } from "./ModelPicker";
 import {
@@ -29,6 +29,8 @@ const MODES: ReadonlyArray<{ id: AskMode; label: string; hint: string }> = [
 export function Composer({
   placeholder,
   contextLabel,
+  contextItems,
+  onRemoveContext,
   onSubmit,
   onMic,
   onToggleMicInput,
@@ -44,6 +46,11 @@ export function Composer({
 }: {
   placeholder: string;
   contextLabel?: string;
+  /** Attached context artifacts (the "+" menu). Rendered as ChatGPT-style chips
+   *  above the input: image kinds show a thumbnail, others a glyph + title. */
+  contextItems?: ContextItem[];
+  /** Remove one attached artifact by id (the chip's ✕). */
+  onRemoveContext?: (id: string) => void;
   onSubmit: (text: string) => void;
   onMic?: () => void;
   /** Toggle MICROPHONE capture (your own voice) — independent of the system-audio
@@ -101,6 +108,26 @@ export function Composer({
         >
           ✓ {contextLabel}
         </span>
+      )}
+      {contextItems && contextItems.length > 0 && (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 7,
+            marginBottom: 10,
+          }}
+        >
+          {contextItems.map((item) => (
+            <ContextChip
+              key={item.id}
+              item={item}
+              onRemove={
+                onRemoveContext ? () => onRemoveContext(item.id) : undefined
+              }
+            />
+          ))}
+        </div>
       )}
       {(onModeChange || (onModelChange && (models?.length ?? 0) > 1)) && (
         <div
@@ -316,6 +343,102 @@ const iconBtn = {
   justifyContent: "center",
   fontSize: 16,
 } as const;
+
+/** One attached-context chip. Image/diagram kinds render the daemon-supplied
+ *  `data:` thumbnail (ChatGPT-style); other kinds show a glyph + title. The ✕
+ *  removes the artifact. */
+function ContextChip({
+  item,
+  onRemove,
+}: {
+  item: ContextItem;
+  onRemove?: () => void;
+}) {
+  const isImage =
+    (item.kind === "image" || item.kind === "diagram") && !!item.thumbnail;
+  return (
+    <span
+      title={item.title}
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 7,
+        maxWidth: 190,
+        fontSize: 11,
+        color: "var(--ink-2)",
+        background: "var(--glass-solid)",
+        border: "1px solid var(--line)",
+        borderRadius: 10,
+        padding: isImage ? "4px 7px 4px 4px" : "5px 7px 5px 9px",
+      }}
+    >
+      {isImage ? (
+        <img
+          src={item.thumbnail}
+          alt={item.title}
+          style={{
+            width: 26,
+            height: 26,
+            objectFit: "cover",
+            borderRadius: 6,
+            display: "block",
+            flexShrink: 0,
+          }}
+        />
+      ) : (
+        <span style={{ fontSize: 13, flexShrink: 0 }}>
+          {contextKindGlyph(item.kind)}
+        </span>
+      )}
+      <span
+        style={{
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {item.title}
+      </span>
+      {onRemove && (
+        <button
+          onClick={onRemove}
+          aria-label={`Remove ${item.title}`}
+          title="Remove"
+          style={{
+            border: "none",
+            background: "transparent",
+            color: "var(--ink-3)",
+            cursor: "pointer",
+            fontSize: 13,
+            lineHeight: 1,
+            padding: 0,
+            marginLeft: 1,
+            flexShrink: 0,
+          }}
+        >
+          ✕
+        </button>
+      )}
+    </span>
+  );
+}
+
+/** Emoji glyph per context kind — the non-image chip's leading icon. */
+function contextKindGlyph(kind: string): string {
+  switch (kind) {
+    case "image":
+    case "diagram":
+      return "🖼️";
+    case "code":
+      return "📄";
+    case "document":
+      return "📕";
+    case "text":
+      return "📝";
+    default:
+      return "📎";
+  }
+}
 
 // Per-state visual for the mic button, so a connecting/failed start is visible
 // (the bug before: any non-"listening" state silently snapped back to off).

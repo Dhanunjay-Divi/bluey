@@ -34,6 +34,7 @@ import type {
   AnswerChunk,
   AnswerStatusStep,
   CalendarConnection,
+  ContextItem,
   ContinueResult,
   FixProposal,
   ListeningState,
@@ -66,6 +67,16 @@ interface WireAgentSessionSummary {
   title: string | null;
   updated_at: string;
   project: string | null;
+}
+
+// The daemon's OverlayContextItem — one attached context artifact. `thumbnail`
+// is a small inline `data:` URI, present only for image/diagram kinds.
+interface WireContextItem {
+  id: string;
+  title: string;
+  kind: string;
+  path?: string | null;
+  thumbnail?: string | null;
 }
 
 // One first-run setup prerequisite (daemon `SetupItem`).
@@ -158,6 +169,11 @@ type OverlayCommand =
       read_only?: boolean;
     }
   | { type: "set_meetings"; meetings: WireMeetingSummary[] }
+  | {
+      type: "set_context_items";
+      items: WireContextItem[];
+      turns?: number;
+    }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
   // Diarization resolved a speaker for an already-pushed transcript line
@@ -235,6 +251,16 @@ function toAgentSummary(w: WireAgentSummary): AgentSummary {
   };
 }
 
+function toContextItem(w: WireContextItem): ContextItem {
+  return {
+    id: w.id,
+    title: w.title,
+    kind: w.kind,
+    path: w.path ?? undefined,
+    thumbnail: w.thumbnail ?? undefined,
+  };
+}
+
 function toAgentSessionSummary(
   w: WireAgentSessionSummary,
 ): AgentSessionSummary {
@@ -306,6 +332,9 @@ function toFixProposal(
 // ---------------------------------------------------------------------------
 
 function sendEvent(event: Record<string, unknown>): void {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    return;
+  }
   void invoke<void>("overlay_send", { event: JSON.stringify(event) }).catch(
     (e) => {
       // Surface, never silently swallow — but don't crash the UI loop.
@@ -323,20 +352,24 @@ export function createTauriClient(): MeetingClient {
   // The bus must be LISTENING before we send any event — otherwise a fast daemon
   // response (the agent list comes back in ~20ms) arrives before listen() is
   // registered and is lost, hanging the UI on "Discovering agents…" forever.
-  // `busReady` resolves once the listener is active; every send awaits it.
-  const busReady: Promise<void> = listen<string>("overlay://command", (e) => {
-    let cmd: OverlayCommand;
-    try {
-      // The payload is the daemon's NDJSON line, forwarded verbatim as a string.
-      cmd = JSON.parse(e.payload) as OverlayCommand;
-    } catch (err) {
-      console.error("[tauriClient] bad overlay://command payload", err);
-      return;
-    }
-    for (const h of [...handlers]) h(cmd);
-  }).then((fn) => {
-    unlistenBus = fn;
-  });
+  const inTauri =
+    typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+  const busReady: Promise<void> = inTauri
+    ? listen<string>("overlay://command", (e) => {
+        let cmd: OverlayCommand;
+        try {
+          // The payload is the daemon's NDJSON line, forwarded verbatim as a string.
+          cmd = JSON.parse(e.payload) as OverlayCommand;
+        } catch (err) {
+          console.error("[tauriClient] bad overlay://command payload", err);
+          return;
+        }
+        for (const h of [...handlers]) h(cmd);
+      }).then((fn) => {
+        unlistenBus = fn;
+      })
+    : Promise.resolve();
   // Best-effort teardown if the window unloads (the shell also cleans up).
   if (typeof window !== "undefined") {
     window.addEventListener("beforeunload", () => unlistenBus?.());
@@ -674,18 +707,51 @@ export function createTauriClient(): MeetingClient {
     },
 
     openAttachPicker() {
-      // "+" → Attach files: ask the DAEMON to open its own native file picker
-      // (osascript / picker helper) and attach the chosen files as context. The
-      // overlay can't open NSOpenPanel itself (accessory app → NULL panel →
-      // crash), so the picker must run daemon-side.
-      sendEvent({ type: "attach_requested" });
+      // "+" → Attach files: open the NATIVE macOS file picker from the overlay's
+      // OWN GUI process (via the `pick_context_files` command → tauri-plugin-dialog),
+      // then hand the chosen paths to the daemon as `attach_files_requested`. The
+      // daemon is headless and a daemon-spawned helper has no window-server access,
+      // so the dialog must originate here. (`attach_requested` — the old
+      // daemon-driven picker — is retired.)
+      void invoke<string[]>("pick_context_files")
+        .then((paths) => {
+          if (Array.isArray(paths) && paths.length > 0) {
+            sendEvent({ type: "attach_files_requested", paths });
+          }
+        })
+        .catch((error) => {
+          console.error("pick_context_files failed", error);
+        });
     },
 
     captureScreenshot() {
-      // "+" → Take a screenshot: the daemon captures the screen and routes it to
-      // vision/context (AnalyzeScreenRequested). Shows an honest "needs vision"
-      // card if no vision provider is configured.
+      // "+" → Take a screenshot: the daemon captures the screen, attaches the PNG
+      // as an image artifact, and routes it to the attached agent, which reads the
+      // pixels itself over ACP (no separate vision provider). A thumbnail chip
+      // appears via the set_context_items push.
       sendEvent({ type: "analyze_screen_requested" });
+    },
+
+    onContextItems(cb) {
+      // Persistent subscriber to the daemon's attached-context list. Every
+      // set_context_items line (an attach, a screenshot, a remove) carries the
+      // FULL current list, so the composer chip strip is a pure mirror of it.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "set_context_items") return;
+        const c = cmd as Extract<
+          OverlayCommand,
+          { type: "set_context_items" }
+        >;
+        cb(c.items.map(toContextItem));
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    removeContextItem(id) {
+      // The chip's ✕ — ask the daemon to drop this artifact from the meeting; it
+      // replies with a fresh set_context_items the onContextItems mirror applies.
+      sendEvent({ type: "remove_context_requested", id });
     },
 
     onAgents(cb) {

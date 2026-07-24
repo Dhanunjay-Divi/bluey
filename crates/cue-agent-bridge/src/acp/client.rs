@@ -191,7 +191,20 @@ impl AcpClient {
     ///
     /// [`resume`]: AcpClient::resume
     pub fn prompt(&self, prompt: impl Into<String>) -> AnswerStream {
-        self.run(prompt.into(), None)
+        self.run(prompt.into(), None, Vec::new())
+    }
+
+    /// Like [`prompt`], but attaches `images` (local file paths) as real ACP
+    /// `ContentBlock::Image` blocks alongside the text — the multimodal "+"-menu
+    /// path. Vision-capable agents receive the images natively.
+    ///
+    /// [`prompt`]: AcpClient::prompt
+    pub fn prompt_with_images(
+        &self,
+        prompt: impl Into<String>,
+        images: Vec<std::path::PathBuf>,
+    ) -> AnswerStream {
+        self.run(prompt.into(), None, images)
     }
 
     /// Like [`prompt`], but continue an existing session via ACP `session/load`
@@ -204,7 +217,19 @@ impl AcpClient {
     ///
     /// [`prompt`]: AcpClient::prompt
     pub fn resume(&self, session_id: impl Into<String>, prompt: impl Into<String>) -> AnswerStream {
-        self.run(prompt.into(), Some(session_id.into()))
+        self.run(prompt.into(), Some(session_id.into()), Vec::new())
+    }
+
+    /// Like [`resume`], but attaches `images` as ACP image blocks.
+    ///
+    /// [`resume`]: AcpClient::resume
+    pub fn resume_with_images(
+        &self,
+        session_id: impl Into<String>,
+        prompt: impl Into<String>,
+        images: Vec<std::path::PathBuf>,
+    ) -> AnswerStream {
+        self.run(prompt.into(), Some(session_id.into()), images)
     }
 
     /// Shared drive path for both [`prompt`] and [`resume`].
@@ -212,7 +237,12 @@ impl AcpClient {
     /// `resume_id == None` → open a new session; `Some(id)` → `session/load`
     /// that id. Builds the channel-backed [`AnswerStream`], spawns the
     /// connection task, and returns the consumer end immediately.
-    fn run(&self, prompt: String, resume_id: Option<String>) -> AnswerStream {
+    fn run(
+        &self,
+        prompt: String,
+        resume_id: Option<String>,
+        images: Vec<std::path::PathBuf>,
+    ) -> AnswerStream {
         let (tx, rx) = mpsc::unbounded::<AnswerChunk>();
 
         let spec = self.spec.clone();
@@ -224,8 +254,16 @@ impl AcpClient {
         // the inner closure finishes, so the task naturally lives exactly as
         // long as the turn.
         tokio::spawn(async move {
-            let result =
-                drive_connection(spec, cwd, client_name, prompt, resume_id, tx.clone()).await;
+            let result = drive_connection(
+                spec,
+                cwd,
+                client_name,
+                prompt,
+                resume_id,
+                images,
+                tx.clone(),
+            )
+            .await;
 
             // The closure inside `drive_connection` already emits a terminal
             // Done/Error in the happy and most error paths. This is the
@@ -271,12 +309,30 @@ async fn drive_connection(
     client_name: String,
     prompt: String,
     resume_id: Option<String>,
+    images: Vec<PathBuf>,
     tx: mpsc::UnboundedSender<AnswerChunk>,
 ) -> anyhow::Result<()> {
     use agent_client_protocol::util::MatchDispatch;
     use agent_client_protocol::SessionMessage;
 
     let agent = spec.to_acp_agent()?;
+
+    // Build the attached-image content blocks ONCE (before the connection
+    // closure). Each becomes a `ContentBlock::Image` carrying BOTH the base64
+    // `data` and the `uri` (file path), so an agent can use whichever it prefers
+    // (bytes for inline-vision agents, path for file-reading ones). A file we
+    // can't read or whose type isn't a known image is skipped with a warning —
+    // never fail the whole turn over one bad attachment.
+    let image_blocks: Vec<ContentBlock> = images
+        .iter()
+        .filter_map(|path| match image_block_from_path(path) {
+            Some(block) => Some(block),
+            None => {
+                tracing::warn!(path = %path.display(), "acp: skipping unreadable/unsupported image attachment");
+                None
+            }
+        })
+        .collect();
 
     // The SDK's `Error` is not `std::error::Error`; render it to a string so it
     // flows through `anyhow` and our `AnswerChunk::Error`.
@@ -397,10 +453,51 @@ async fn drive_connection(
                         session_id: Some(session.session_id().to_string()),
                     });
 
-                    // 3. Send the prompt. `send_prompt` fires the request and
-                    // arranges for the turn's StopReason to arrive on the
-                    // session's update channel.
-                    session.send_prompt(prompt)?;
+                    // 3. Send the prompt.
+                    //
+                    // TEXT-ONLY (the common path): `send_prompt` fires the request
+                    // and arranges for the turn's StopReason to arrive on the
+                    // session's update channel (`read_update`), which the pump
+                    // below breaks on.
+                    //
+                    // WITH IMAGES (the "+"-menu multimodal path): the SDK's
+                    // `send_prompt` hardcodes a single TEXT block, so we build the
+                    // multi-block request ourselves — a text block plus one
+                    // `ContentBlock::Image` per attached file (uri = the file
+                    // path, NOT base64-in-text, which overflows the prompt) — and
+                    // send it via the session's connection. The connection routes
+                    // the agent's answer notifications to `read_update` exactly as
+                    // before; only the terminal StopReason arrives on the awaited
+                    // result instead, so we forward it to the pump via a oneshot
+                    // the loop also selects on.
+                    let mut img_done_rx: Option<futures::channel::oneshot::Receiver<StopReason>> =
+                        None;
+                    if image_blocks.is_empty() {
+                        session.send_prompt(prompt)?;
+                    } else {
+                        use agent_client_protocol::schema::PromptRequest;
+                        let mut blocks = vec![ContentBlock::from(prompt.clone())];
+                        blocks.extend(image_blocks.clone());
+                        let (done_tx, done_rx) = futures::channel::oneshot::channel::<StopReason>();
+                        img_done_rx = Some(done_rx);
+                        let done_tx = std::sync::Mutex::new(Some(done_tx));
+                        session
+                            .connection()
+                            .send_request_to(
+                                agent_client_protocol::Agent,
+                                PromptRequest::new(session.session_id().clone(), blocks),
+                            )
+                            .on_receiving_result(move |result| {
+                                let done_tx = done_tx.lock().ok().and_then(|mut g| g.take());
+                                async move {
+                                    let resp = result?;
+                                    if let Some(tx) = done_tx {
+                                        let _ = tx.send(resp.stop_reason);
+                                    }
+                                    Ok(())
+                                }
+                            })?;
+                    }
 
                     // 4. Pump the session's update channel until the turn ends.
                     //    Each `SessionMessage` is either a `session/update`
@@ -422,7 +519,25 @@ async fn drive_connection(
                     // tail and the echo.
                     let answer_acc = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
                     loop {
-                        match session.read_update().await? {
+                        // For the image path the terminal StopReason arrives on the
+                        // oneshot (the request result) rather than as a
+                        // `read_update` message, so race the two: whichever fires
+                        // first ends the turn. For the text path `img_done_rx` is
+                        // None and this collapses to a plain `read_update`.
+                        let msg = if let Some(rx) = img_done_rx.as_mut() {
+                            use futures::future::{select, Either};
+                            match select(std::pin::pin!(session.read_update()), rx).await {
+                                Either::Left((update, _)) => update?,
+                                Either::Right((stop, _)) => {
+                                    let reason = stop.unwrap_or(StopReason::EndTurn);
+                                    let _ = tx.unbounded_send(stop_reason_to_chunk(reason));
+                                    break;
+                                }
+                            }
+                        } else {
+                            session.read_update().await?
+                        };
+                        match msg {
                             SessionMessage::SessionMessage(dispatch) => {
                                 let tx = tx.clone();
                                 let acc = std::sync::Arc::clone(&answer_acc);
@@ -648,10 +763,98 @@ fn text_prompt(prompt: impl Into<String>) -> Vec<ContentBlock> {
     vec![ContentBlock::from(prompt.into())]
 }
 
+/// The image MIME type for a file path by extension, or `None` if it is not a
+/// supported image. Bounds attachments to real image types.
+fn image_mime_for_path(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("heic") => Some("image/heic"),
+        Some("bmp") => Some("image/bmp"),
+        _ => None,
+    }
+}
+
+/// Build an ACP `ContentBlock::Image` from a local image file: base64 the bytes
+/// into `data` AND set `uri` to the file path (agents pick whichever they
+/// support). `None` if the file can't be read or isn't a supported image type.
+fn image_block_from_path(path: &std::path::Path) -> Option<ContentBlock> {
+    use base64::Engine;
+    let mime = image_mime_for_path(path)?;
+    let bytes = std::fs::read(path).ok()?;
+    let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let mut img = agent_client_protocol::schema::ImageContent::new(data, mime);
+    img.uri = Some(format!("file://{}", path.display()));
+    Some(ContentBlock::Image(img))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agent_client_protocol::schema::{ContentChunk, TextContent};
+
+    #[test]
+    fn image_mime_maps_known_extensions_only() {
+        assert_eq!(
+            image_mime_for_path(std::path::Path::new("a.png")),
+            Some("image/png")
+        );
+        assert_eq!(
+            image_mime_for_path(std::path::Path::new("a.JPG")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_mime_for_path(std::path::Path::new("a.jpeg")),
+            Some("image/jpeg")
+        );
+        assert_eq!(
+            image_mime_for_path(std::path::Path::new("a.webp")),
+            Some("image/webp")
+        );
+        // Non-image / no extension → None (never attached as an image).
+        assert_eq!(image_mime_for_path(std::path::Path::new("a.txt")), None);
+        assert_eq!(image_mime_for_path(std::path::Path::new("noext")), None);
+    }
+
+    #[test]
+    fn image_block_carries_base64_data_uri_and_mime() {
+        // Write a tiny PNG-ish file and confirm the block base64s it, sets the
+        // mime from the extension, and records a file:// uri.
+        let dir = std::env::temp_dir().join(format!("bluey-imgblk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shot.png");
+        std::fs::write(&path, b"\x89PNG\r\n\x1a\nhello-bytes").unwrap();
+
+        let block = image_block_from_path(&path).expect("image block");
+        match block {
+            ContentBlock::Image(img) => {
+                assert_eq!(img.mime_type, "image/png");
+                assert_eq!(
+                    img.uri.as_deref(),
+                    Some(format!("file://{}", path.display()).as_str())
+                );
+                // data is base64 of the bytes (non-empty, decodes back).
+                use base64::Engine;
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(img.data.as_bytes())
+                    .expect("valid base64");
+                assert_eq!(decoded, b"\x89PNG\r\n\x1a\nhello-bytes");
+            }
+            other => panic!("expected Image block, got {other:?}"),
+        }
+        // Unsupported type → None (skipped, never a bad block).
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        assert!(image_block_from_path(&txt).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn spec_builds_argv_with_program_first() {

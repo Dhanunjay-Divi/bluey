@@ -103,6 +103,12 @@ pub struct Question {
     /// project path. `None` → the child inherits the daemon's cwd (today's
     /// behavior), which is fine for fresh, non-resumed drives.
     pub cwd: Option<String>,
+    /// Image files to attach to this turn (the "+"-menu attach / screenshot /
+    /// page-capture flow). Over ACP these become real `ContentBlock::Image`
+    /// blocks (uri = the file path — NOT base64-in-text, which overflows the
+    /// prompt); a CLI-only agent gets the paths referenced in the prompt text so
+    /// it can read them from disk. Absolute paths on the local machine.
+    pub images: Vec<std::path::PathBuf>,
 }
 
 impl Question {
@@ -113,6 +119,7 @@ impl Question {
             context: None,
             resume: None,
             cwd: None,
+            images: Vec::new(),
         }
     }
 
@@ -140,8 +147,8 @@ impl Question {
     /// [`render_prompt`]: Question::render_prompt
     pub(crate) fn render_prompt_within(&self, char_budget: usize) -> String {
         let turns = match &self.context {
-            None => return self.prompt.clone(),
-            Some(t) if t.turns.is_empty() => return self.prompt.clone(),
+            None => return self.with_image_refs(self.prompt.clone()),
+            Some(t) if t.turns.is_empty() => return self.with_image_refs(self.prompt.clone()),
             Some(t) => &t.turns,
         };
 
@@ -220,6 +227,24 @@ impl Question {
         out.push_str(UNTRUSTED_CONTENT_FRAMING);
         out.push_str("\n\nQuestion:\n");
         out.push_str(&self.prompt);
+        self.with_image_refs(out)
+    }
+
+    /// Append attached-image references to a rendered CLI prompt. ACP agents get
+    /// real `ContentBlock::Image` blocks (see the ACP client), so this is the
+    /// CLI-only fallback: a plain-language note listing each image's absolute
+    /// path, which a file-reading agent (e.g. `agy`) can open from disk. No-op
+    /// when there are no images.
+    fn with_image_refs(&self, prompt: String) -> String {
+        if self.images.is_empty() {
+            return prompt;
+        }
+        let mut out = prompt;
+        out.push_str("\n\nAttached image files (read them from disk to answer):");
+        for path in &self.images {
+            out.push_str("\n- ");
+            out.push_str(&path.display().to_string());
+        }
         out
     }
 }
@@ -388,6 +413,7 @@ mod tests {
             context: Some(Transcript { turns }),
             resume: None,
             cwd: None,
+            images: Vec::new(),
         }
     }
 

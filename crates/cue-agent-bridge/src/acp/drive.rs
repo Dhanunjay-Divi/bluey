@@ -86,24 +86,29 @@ pub async fn drive_acp(
         question.resume.clone()
     };
 
+    // Attached images (the "+"-menu multimodal path) ride along on every ACP
+    // drive as real `ContentBlock::Image` blocks.
+    let images = question.images.clone();
+
     let Some(session_id) = resume else {
         // Fresh ask (ephemeral, or a plain fork with no resume id): fold any
         // context into the prompt — `render_prompt()` returns just the prompt when
         // there's none. Under ephemeral this is what re-supplies conversation
         // continuity in place of a persisted/loaded session.
-        return Ok(make_client().prompt(question.render_prompt()));
+        return Ok(make_client().prompt_with_images(question.render_prompt(), images));
     };
 
     // Resume path. Send the BARE question (resume restores the history itself);
     // keep a fork prompt ready in case the load fails.
     let bare = question.prompt.clone();
     let fork_prompt = question.render_prompt();
-    let resume_stream = make_client().resume(&session_id, bare);
+    let resume_images = images.clone();
+    let resume_stream = make_client().resume_with_images(&session_id, bare, resume_images);
 
     // The fork branch is built lazily so we only spawn a second subprocess when
     // the resume actually fails (the common case — resume succeeding — spawns one
     // subprocess, not two).
-    let make_fork = move || make_client().prompt(fork_prompt);
+    let make_fork = move || make_client().prompt_with_images(fork_prompt, images);
 
     Ok(Box::pin(resume_with_fork_fallback(
         resume_stream,

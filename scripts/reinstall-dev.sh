@@ -81,6 +81,21 @@ for b in bluey bluey-daemon cue-meeting-overlay; do
   fi
 done
 
+# --- 4b. STABLE codesign identity for the daemon (TCC persistence) ---------
+# macOS TCC keys a permission grant (Screen Recording, Microphone) to the code
+# signature's IDENTIFIER. An ad-hoc `codesign --sign -` derives that identifier
+# from a per-build content hash (bluey_daemon-<hash>), so EVERY rebuild looks
+# like a brand-new app and the user's grant does not carry over — the "screen
+# capture failed or was denied" + duplicate "bluey-daemon" rows in Settings. We
+# pin a STABLE identifier so the grant sticks across rebuilds. macOS still
+# prompts once the first time this identifier appears; never again after.
+if command -v codesign >/dev/null 2>&1; then
+  codesign --force --sign - --identifier "sh.bluey.daemon" "$install_bin/bluey-daemon" \
+    >/dev/null 2>&1 \
+    && printf 'reinstall-dev: signed bluey-daemon with stable identifier sh.bluey.daemon\n' \
+    || printf 'reinstall-dev: WARN stable codesign of bluey-daemon failed\n' >&2
+fi
+
 # --- 5. (re)start ---
 if [[ "$start_after" -eq 1 ]]; then
   printf 'reinstall-dev: starting daemon…\n'

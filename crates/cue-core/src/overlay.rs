@@ -65,6 +65,13 @@ pub struct OverlayContextItem {
     pub kind: String,
     #[serde(default)]
     pub path: Option<String>,
+    /// A small inline `data:` thumbnail for image/diagram artifacts, so the
+    /// overlay can render a ChatGPT-style preview chip WITHOUT the Tauri asset
+    /// protocol (the overlay has no filesystem/asset permission; the command bus
+    /// carrying a data URI is the whole transport). `None` for non-image kinds,
+    /// and then omitted from the wire so text/doc chips carry no null noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thumbnail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -771,6 +778,7 @@ mod tests {
                 title: "GenAI Engineer JD.pdf".to_string(),
                 kind: "document".to_string(),
                 path: Some("/tmp/GenAI Engineer JD.pdf".to_string()),
+                thumbnail: None,
             }],
             turns: 3,
         })

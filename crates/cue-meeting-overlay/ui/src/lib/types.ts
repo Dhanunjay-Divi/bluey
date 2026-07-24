@@ -127,6 +127,22 @@ export interface MeetingState {
 /** One past meeting summarized for the MEETINGS lens (the "my past meetings"
  *  list). Distinct from the AGENT-SESSION lens ({@link AgentSessionSummary}):
  *  this is a meeting Bluey recorded, not a coding-agent thread. */
+/** One attached context artifact shown as a composer chip (the "+" menu:
+ *  files, screenshots, pages). Mirrors the daemon's `OverlayContextItem`. */
+export interface ContextItem {
+  /** ContextArtifact.id (Uuid) as string — the id to remove by. */
+  id: string;
+  title: string;
+  /** stringified ContextKind: "image" | "diagram" | "code" | "document" |
+   *  "text" | "other". Drives the chip glyph and thumbnail treatment. */
+  kind: string;
+  /** absolute file path, when known. */
+  path?: string;
+  /** a small inline `data:image/...` thumbnail for image/diagram kinds, so the
+   *  chip shows a ChatGPT-style preview. Absent for non-image kinds. */
+  thumbnail?: string;
+}
+
 export interface MeetingSummary {
   /** MeetingRecord.id (Uuid) as string. */
   id: string;

@@ -41,8 +41,8 @@ use cue_core::{
     ContextArtifact, ContextKind, ContextProcessingStatus, ConversationTurn, CueCard,
     CueCardArtifact, CueSettings, DaemonState, MeetingConversationTurn, MeetingRecord,
     MeetingState, MeetingSummary, MeetingTranscriptLine, MemoryHit, OverlayCommand,
-    OverlayContextItem, OverlayEvent, OverlaySessionItem, PrivacyFlags, ProviderRoute,
-    ProviderSelector, ProviderStatus, RouteBudget, Speaker, TranscriptSegment,
+    OverlayContextItem, OverlayEvent, OverlaySessionItem, ProviderRoute, ProviderSelector,
+    ProviderStatus, Speaker, TranscriptSegment,
 };
 use futures_util::{future::join_all, SinkExt, StreamExt};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -3502,22 +3502,30 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             handle_overlay_session_pin(daemon, id, false).await;
         }
         OverlayEvent::ActivePageCaptureRequested => {
-            if let Err(error) = capture_active_page_context(daemon, "overlay page").await {
-                push_system_card(
-                    daemon,
-                    CardKind::Warning,
-                    "Page context failed",
-                    format!("{error:#}"),
-                )
-                .await;
+            // "+ → Capture page": grab the active browser page as text context. If
+            // the page text can't be read, fall back to a screenshot image (the
+            // agent reads the pixels over ACP) rather than failing outright.
+            if let Err(page_error) = capture_active_page_context(daemon, "overlay page").await {
+                if let Err(shot_error) = capture_page_screenshot_fallback(daemon, page_error).await
+                {
+                    push_system_card(
+                        daemon,
+                        CardKind::Warning,
+                        "Page context failed",
+                        format!("{shot_error:#}"),
+                    )
+                    .await;
+                }
             }
         }
         OverlayEvent::AnalyzeScreenRequested => {
-            if let Err(error) = analyze_active_page_context(daemon).await {
+            // "+ → Take a screenshot": capture the screen and attach it as a real
+            // image the agent reads over ACP (no vision provider needed).
+            if let Err(error) = capture_screenshot_and_analyze(daemon).await {
                 push_system_card(
                     daemon,
                     CardKind::Warning,
-                    "Analyse failed",
+                    "Screenshot failed",
                     format!("{error:#}"),
                 )
                 .await;
@@ -5288,6 +5296,7 @@ async fn handle_fix_requested(daemon: &Arc<Daemon>, _card_id: Option<uuid::Uuid>
         context: None,
         resume,
         cwd: None,
+        images: Vec::new(),
     };
     debug!(
         agent = %agent_model_label(&agent),
@@ -5413,6 +5422,7 @@ from the proposal.",
         context: None,
         resume,
         cwd: None,
+        images: Vec::new(),
     };
     debug!(
         agent = %agent_model_label(&pending.agent),
@@ -7160,14 +7170,95 @@ async fn refresh_overlay_balance(daemon: &Arc<Daemon>, trace_id: Option<&str>) -
 }
 
 async fn refresh_overlay_context_items(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+    // Build inline thumbnails off the async thread — `sips` is a blocking spawn.
+    // Best-effort: a failed/oversized thumbnail just yields a glyph chip.
+    let image_sources: Vec<(uuid::Uuid, String)> = meeting
+        .context
+        .iter()
+        .filter(|item| matches!(item.kind, ContextKind::Image | ContextKind::Diagram))
+        .map(|item| (item.id, item.path.clone()))
+        .collect();
+    let thumbnails = if image_sources.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        tokio::task::spawn_blocking(move || {
+            let mut map = std::collections::HashMap::new();
+            for (id, path) in image_sources {
+                if let Some(uri) = context_thumbnail_data_uri(Path::new(&path)) {
+                    map.insert(id, uri);
+                }
+            }
+            map
+        })
+        .await
+        .unwrap_or_default()
+    };
+
     let _ = send_overlay(
         daemon,
         OverlayCommand::SetContextItems {
-            items: overlay_context_items(meeting),
+            items: overlay_context_items(meeting, &thumbnails),
             turns: meeting.conversation.len(),
         },
     )
     .await;
+}
+
+/// Produce a small inline `data:` thumbnail for an image artifact using macOS
+/// `sips` (built-in — no image-crate dependency, keeps the daemon lean). Returns
+/// `None` when the tool is missing, the file is unreadable, or the encoded
+/// thumbnail would be too large for the command bus. Best-effort: the overlay
+/// falls back to a glyph chip when this is `None`.
+#[cfg(target_os = "macos")]
+fn context_thumbnail_data_uri(src: &Path) -> Option<String> {
+    use base64::Engine;
+
+    if !src.is_file() {
+        return None;
+    }
+    let out = env::temp_dir().join(format!(
+        "bluey-thumb-{}-{}.jpg",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    // `-Z 96` fits the longest side into 96px (preserves aspect); re-encode to
+    // JPEG so a huge PNG collapses to a few KB.
+    let status = Command::new("sips")
+        .arg("-Z")
+        .arg("96")
+        .arg("--setProperty")
+        .arg("format")
+        .arg("jpeg")
+        .arg(src)
+        .arg("--out")
+        .arg(&out)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    let uri = if status.success() {
+        std::fs::read(&out).ok().and_then(|bytes| {
+            // Guard the bus: skip anything that didn't shrink to a sane size.
+            if bytes.is_empty() || bytes.len() > 256 * 1024 {
+                None
+            } else {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                Some(format!("data:image/jpeg;base64,{b64}"))
+            }
+        })
+    } else {
+        None
+    };
+    let _ = std::fs::remove_file(&out);
+    uri
+}
+
+#[cfg(not(target_os = "macos"))]
+fn context_thumbnail_data_uri(_src: &Path) -> Option<String> {
+    None
 }
 
 async fn refresh_overlay_sessions(daemon: &Arc<Daemon>) {
@@ -7376,7 +7467,10 @@ fn plural_s(count: usize) -> &'static str {
     }
 }
 
-fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
+fn overlay_context_items(
+    meeting: &MeetingRecord,
+    thumbnails: &std::collections::HashMap<uuid::Uuid, String>,
+) -> Vec<OverlayContextItem> {
     meeting
         .context
         .iter()
@@ -7385,6 +7479,7 @@ fn overlay_context_items(meeting: &MeetingRecord) -> Vec<OverlayContextItem> {
             title: item.title.clone(),
             kind: item.kind.to_string(),
             path: Some(item.path.clone()),
+            thumbnail: thumbnails.get(&item.id).cloned(),
         })
         .collect()
 }
@@ -8152,6 +8247,7 @@ pub(crate) async fn memory_oneshot_via_agent(
         context: None,
         resume: None,
         cwd: None,
+        images: Vec::new(),
     };
     // Background one-shots honor the ephemeral setting too. `resume: None` only
     // means "don't CONTINUE a session" — the agent still WRITES one unless the
@@ -9216,7 +9312,25 @@ async fn rebuild_meeting_rag_index(
 }
 
 async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
-    let paths = choose_context_files().await?;
+    info!("attach: opening file picker…");
+    let paths = match choose_context_files().await {
+        Ok(paths) => paths,
+        Err(error) => {
+            warn!("attach: file picker failed: {error:#}");
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "File picker failed",
+                format!("{error:#}"),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+    info!("attach: picker returned {} path(s): {:?}", paths.len(), paths);
+    if paths.is_empty() {
+        info!("attach: no files selected (picker cancelled or nothing chosen)");
+    }
     handle_attach_paths(daemon, paths).await
 }
 
@@ -10296,6 +10410,14 @@ fn agent_question_from_payload(
     resume: Option<&str>,
 ) -> AgentQuestion {
     let mut turns = Vec::new();
+    // Real image files attached this turn (screenshots, page captures, picked
+    // images). These ride the agent prompt as actual image blocks over ACP
+    // (`Question.images` → `ContentBlock::Image`), so the agent reads the pixels
+    // itself — no separate vision model in the loop. We collect the on-disk path
+    // from every Screenshot-kind context whose `source` points at a readable
+    // image file, and DROP that context from the text turns (the placeholder
+    // "shot.png (image)" text would just be redundant noise beside the pixels).
+    let mut images: Vec<std::path::PathBuf> = Vec::new();
     if let Some(instructions) = payload
         .instructions
         .as_ref()
@@ -10307,6 +10429,21 @@ fn agent_question_from_payload(
         });
     }
     for context in &payload.context {
+        // Screenshot/image contexts with a real image path are sent as pixels,
+        // not text — pull the path and skip the text turn for this entry.
+        if matches!(context.kind, AnswerContextKind::Screenshot) {
+            if let Some(path) = context
+                .source
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .filter(|p| is_attachable_image_path(p))
+            {
+                if !images.iter().any(|existing| existing == &path) {
+                    images.push(path);
+                }
+                continue;
+            }
+        }
         if context.content.trim().is_empty() {
             continue;
         }
@@ -10337,7 +10474,25 @@ fn agent_question_from_payload(
         // cwd is resolved by the tier-aware continuation step (see
         // `apply_continuation_tier`), not here — this stays pure string assembly.
         cwd: None,
+        images,
     }
+}
+
+/// True when `path` points at a readable image file we can attach as pixels over
+/// ACP (by extension + existence). The extension gate mirrors the ACP image-mime
+/// table in `cue-agent-bridge`; existence keeps a stale artifact path from
+/// producing a dead attachment. Pure predicate — one `metadata` stat, no reads.
+fn is_attachable_image_path(path: &std::path::Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_image = matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "bmp"
+    );
+    is_image && path.is_file()
 }
 
 /// Upgrade a [`Question`] to **continue a specific prior session** with the
@@ -10370,6 +10525,7 @@ async fn apply_continuation_tier(
                     context: None,
                     resume: None,
                     cwd: None,
+                    images: Vec::new(),
                 };
                 drive_and_collect(agent, summary_q, DriveMode::Answer)
                     .await
@@ -12184,54 +12340,6 @@ fn default_answer_request(question: &str) -> AnswerRequest {
     AnswerRequest::new(question, ai_status_from_env().route).streaming()
 }
 
-fn vision_answer_request(question: &str, provider: ProviderSelector) -> AnswerRequest {
-    let route = ProviderRoute::direct(provider)
-        .require(cue_core::AiCapability::Vision)
-        .with_budgets(RouteBudget::realtime())
-        .with_privacy(PrivacyFlags::managed_commercial().with_image_upload());
-    AnswerRequest::new(question, route).streaming()
-}
-
-fn select_vision_provider_from_env() -> Option<ProviderSelector> {
-    let configured_model = env::var("BLUEY_VISION_MODEL")
-        .or_else(|_| env::var("CUE_VISION_MODEL"))
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-
-    if let Some(provider) = env::var("BLUEY_VISION_PROVIDER")
-        .or_else(|_| env::var("CUE_VISION_PROVIDER"))
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-    {
-        return Some(provider_selector(&provider, configured_model.as_deref()));
-    }
-
-    if env_configured("OPENAI_API_KEY") {
-        return Some(provider_selector("openai", configured_model.as_deref()));
-    }
-
-    if cloud_token_configured()
-        && env::var("BLUEY_CLOUD_ANSWER_COMPAT")
-            .or_else(|_| env::var("CUE_CLOUD_ANSWER_COMPAT"))
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    {
-        return Some(provider_selector(
-            "bluey_managed",
-            configured_model.as_deref(),
-        ));
-    }
-
-    // Groq vision model names vary by availability. Require an explicit model so
-    // the screenshot fallback does not accidentally send images to a text-only
-    // low-latency default.
-    if env_configured("GROQ_API_KEY") && configured_model.is_some() {
-        return Some(provider_selector("groq", configured_model.as_deref()));
-    }
-
-    None
-}
-
 fn answer_request_from_overlay(
     question: &str,
     provider: Option<String>,
@@ -12736,6 +12844,79 @@ async fn capture_once_and_attach(daemon: &Arc<Daemon>) -> Result<()> {
     Ok(())
 }
 
+/// Take one screenshot, attach the PNG as an **image** artifact, and drive the
+/// attached agent to look at it. The image rides the prompt as real pixels over
+/// ACP (`Question.images` → `ContentBlock::Image`) — no vision provider in the
+/// loop, the agent's own vision reads it. This is what the "+ → Take a
+/// screenshot" menu item invokes.
+async fn capture_screenshot_and_analyze(daemon: &Arc<Daemon>) -> Result<()> {
+    info!("screenshot: capturing screen to file…");
+    let capture_path = match capture_screen_to_file(&daemon.paths).await {
+        Ok(path) => {
+            info!("screenshot: captured {}", path.display());
+            path
+        }
+        Err(error) => {
+            warn!("screenshot: capture_screen_to_file failed: {error:#}");
+            return Err(error);
+        }
+    };
+    let artifact = match build_context_artifact(
+        capture_path.display().to_string(),
+        Some("Screenshot".to_string()),
+        Some("Screenshot attached — sent to the agent as-is.".to_string()),
+    ) {
+        Ok(a) => {
+            info!(
+                "screenshot: built artifact kind={} status={}",
+                a.kind, a.processing_status
+            );
+            a
+        }
+        Err(error) => {
+            warn!("screenshot: build_context_artifact failed: {error:#}");
+            return Err(error);
+        }
+    };
+
+    let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact.clone()]).await?;
+    info!(
+        "screenshot: attached; meeting now has {} context item(s)",
+        meeting_snapshot.context.len()
+    );
+    update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
+
+    let card = CueCard::new(
+        CardKind::Context,
+        "Screenshot attached",
+        format!(
+            "{} ({}:{})",
+            artifact.title, artifact.kind, artifact.processing_status
+        ),
+    )
+    .with_source(artifact.path.clone());
+    let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+    write_state(daemon).await?;
+
+    // Route it to the attached agent. The answer path pulls the Ready image
+    // artifact's path into `Question.images`, so the agent receives the pixels.
+    // BEST-EFFORT: the attach already succeeded above; a failed answer (no agent
+    // attached, agent error) must NOT make the whole screenshot look failed. Log
+    // it and return Ok so the chip stays.
+    let question =
+        "Look at the screenshot I just attached. Answer any visible question, task, code, \
+         diagram, or UI, then give concise next steps."
+            .to_string();
+    match answer_question(daemon, question, "overlay screenshot").await {
+        Ok(_) => info!("screenshot: answer routed to attached agent"),
+        Err(error) => warn!(
+            "screenshot: attached OK but answering failed (attach still stands): {error:#}"
+        ),
+    }
+    Ok(())
+}
+
 async fn capture_active_page_context(
     daemon: &Arc<Daemon>,
     source: impl Into<String>,
@@ -12773,47 +12954,22 @@ async fn capture_active_page_context(
     Ok(artifact)
 }
 
-async fn analyze_active_page_context(daemon: &Arc<Daemon>) -> Result<()> {
-    match capture_active_page_context(daemon, "overlay analyse").await {
-        Ok(artifact) => {
-            let question = format!(
-                "Analyse the active browser page that was just attached as context: {}. Answer the visible question or prompt if there is one, then give concise next steps.",
-                artifact.title
-            );
-            let _ = answer_question(daemon, question, "overlay analyse").await?;
-        }
-        Err(page_error) => {
-            analyze_screen_with_screenshot_fallback(daemon, page_error).await?;
-        }
-    }
-    Ok(())
-}
-
-async fn analyze_screen_with_screenshot_fallback(
+/// Page-capture fallback: when the active browser page text can't be read,
+/// attach a full screenshot as a real **image** and route it to the attached
+/// agent, which reads the pixels itself over ACP. No vision provider — the
+/// agent's own vision does the reading. Keeps "+ → Capture page" useful on pages
+/// (canvas, PDF, protected) that expose no readable text.
+async fn capture_page_screenshot_fallback(
     daemon: &Arc<Daemon>,
     page_error: anyhow::Error,
 ) -> Result<()> {
     let page_error_text = format!("{page_error:#}");
-    let Some(provider) = select_vision_provider_from_env() else {
-        push_system_card(
-            daemon,
-            CardKind::Warning,
-            "Analyse needs vision",
-            format!(
-                "Bluey could not read browser page text, and no vision provider is configured for screenshot fallback.\n\nBrowser text error: {}\n\nSet OPENAI_API_KEY, or set BLUEY_VISION_PROVIDER with BLUEY_VISION_MODEL for an OpenAI-compatible vision route.",
-                compact_snippet(&page_error_text, 520)
-            ),
-        )
-        .await;
-        return Ok(());
-    };
-
     push_system_card(
         daemon,
         CardKind::Warning,
         "Page text unavailable",
         format!(
-            "Browser text was not available, so Bluey is capturing one screenshot and routing it to vision. Reason: {}",
+            "Browser text was not available, so Bluey attached a screenshot instead. Reason: {}",
             compact_snippet(&page_error_text, 360)
         ),
     )
@@ -12822,9 +12978,9 @@ async fn analyze_screen_with_screenshot_fallback(
     let capture_path = capture_screen_to_file(&daemon.paths).await?;
     let artifact = build_context_artifact(
         capture_path.display().to_string(),
-        Some("Screen capture fallback".to_string()),
+        Some("Screenshot".to_string()),
         Some(format!(
-            "Captured after active browser page text failed: {}",
+            "Screenshot attached after page text failed — sent to the agent as-is: {}",
             compact_snippet(&page_error_text, 220)
         )),
     )?;
@@ -12834,37 +12990,21 @@ async fn analyze_screen_with_screenshot_fallback(
 
     let card = CueCard::new(
         CardKind::Context,
-        "Screenshot fallback attached",
+        "Screenshot attached",
         format!(
-            "{}\n{} bytes. Vision route: {}.",
-            artifact.title,
-            artifact.size_bytes.unwrap_or_default(),
-            provider.display_label()
+            "{} ({}:{})",
+            artifact.title, artifact.kind, artifact.processing_status
         ),
     )
     .with_source(artifact.path.clone());
     let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
     write_state(daemon).await?;
 
-    let question = format!(
-        "Browser page text was unavailable, so analyze the attached screenshot instead. If the screenshot contains a question, task, code, diagram, or UI, answer it directly and give concise next steps. Browser text error for context: {}",
-        compact_snippet(&page_error_text, 260)
-    );
-    let mut request = vision_answer_request(&question, provider);
-    request.context = answer_context_for_question(daemon, &meeting_snapshot, &question).await;
-    request.context.push(
-        AnswerContext::new(
-            AnswerContextKind::Screenshot,
-            format!(
-                "{} ({})\nCaptured as screenshot fallback after browser text extraction failed.",
-                artifact.title, artifact.kind
-            ),
-        )
-        .with_title(artifact.title)
-        .with_source(artifact.path),
-    );
-
-    let _ = answer_with_provider_runtime(daemon, request, "overlay screenshot analyse").await?;
+    let question =
+        "The browser page text was unavailable, so look at the screenshot I just attached. \
+         Answer any visible question, task, code, diagram, or UI, then give concise next steps."
+            .to_string();
+    let _ = answer_question(daemon, question, "overlay page screenshot").await?;
     Ok(())
 }
 
@@ -14591,16 +14731,19 @@ pub fn validate_and_decode_overlay_line(
         .unwrap_or("Unknown")
         .to_string();
     let current_state = *ui_state.lock();
-    use cue_core::overlay_ipc::OverlayUiState as S;
     let allowed = match &event {
         // AttachRequested / InstructionsRequested are user-initiated *entry*
         // events: clicking "open attach" or "open instructions" from any state.
         // They drive the transition Idle -> AttachOpen / InstructionsOpen.
         // They MUST be accepted from Idle (otherwise the panels can never open).
         OverlayEvent::AttachRequested | OverlayEvent::InstructionsRequested => true,
-        // AttachFilesRequested is the inner submit from the attach picker;
-        // it makes sense only while the attach panel is open.
-        OverlayEvent::AttachFilesRequested { .. } => current_state == S::AttachOpen,
+        // AttachFilesRequested carries the paths the user picked. It used to be
+        // gated on AttachOpen (the inner submit of the daemon-driven modal), but
+        // the picker now runs in the OVERLAY's own GUI process (the native macOS
+        // dialog — the daemon is headless and can't show one). The overlay emits
+        // this directly with the chosen paths, from any state, so the gate is
+        // obsolete; accept it like the other user-initiated events.
+        OverlayEvent::AttachFilesRequested { .. } => true,
         // InstructionsUpdated may come from the inline native overlay textbox.
         // Token validation and length caps still apply; no separate modal state
         // is required for this product flow.
@@ -14835,20 +14978,27 @@ async fn choose_context_files() -> Result<Vec<PathBuf>> {
 
 #[cfg(target_os = "macos")]
 fn choose_context_files_platform() -> Result<Vec<PathBuf>> {
-    if let Some(picker_app) = discover_macos_context_picker_app() {
-        match run_context_picker_app(&picker_app) {
-            Ok(paths) => return Ok(paths),
-            Err(error) => warn!(
-                picker = %picker_app.display(),
-                "native macOS context picker app failed, falling back to AppleScript: {error:#}"
-            ),
+    match discover_macos_context_picker_app() {
+        Some(picker_app) => {
+            info!("attach: using native picker app at {}", picker_app.display());
+            match run_context_picker_app(&picker_app) {
+                Ok(paths) => {
+                    info!("attach: native picker app returned {} path(s)", paths.len());
+                    return Ok(paths);
+                }
+                Err(error) => warn!(
+                    picker = %picker_app.display(),
+                    "native macOS context picker app failed, falling back to AppleScript: {error:#}"
+                ),
+            }
         }
+        None => info!("attach: no native picker app found, using AppleScript file dialog"),
     }
 
     let script = r#"
 try
-  set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "public.rtf", "net.daringfireball.markdown", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf"}
-  set pickedFiles to choose file with prompt "Choose readable text, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, shell/SQL, or RTF files for this Bluey session. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
+  set allowedTypes to {"public.text", "public.source-code", "public.shell-script", "public.json", "public.yaml", "public.xml", "public.html", "public.css", "com.adobe.pdf", "com.microsoft.word.doc", "org.openxmlformats.wordprocessingml.document", "public.rtf", "net.daringfireball.markdown", "public.image", "public.png", "public.jpeg", "com.compuserve.gif", "org.webmproject.webp", "public.heic", "com.microsoft.bmp", "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html", "css", "scss", "pdf", "doc", "docx", "rtf", "png", "jpg", "jpeg", "gif", "webp", "heic", "bmp"}
+  set pickedFiles to choose file with prompt "Choose text, code, PDF, DOC/DOCX, CSV/TSV, JSON/YAML/TOML, HTML/CSS, or images (PNG/JPG/GIF/WebP/HEIC) for this Bluey session. Images are sent to your agent as-is. Video, audio, apps, and certificates are skipped." of type allowedTypes with multiple selections allowed
   set output to ""
   repeat with pickedFile in pickedFiles
     set output to output & POSIX path of pickedFile & linefeed
@@ -14914,6 +15064,11 @@ fn run_context_picker_app(picker_app: &Path) -> Result<Vec<PathBuf>> {
             .unwrap_or_default()
             .as_millis()
     ));
+    info!(
+        "attach: launching picker via `open -W -n {} --args --output {}`",
+        picker_app.display(),
+        output_path.display()
+    );
     let output = Command::new("open")
         .arg("-W")
         .arg("-n")
@@ -14923,14 +15078,24 @@ fn run_context_picker_app(picker_app: &Path) -> Result<Vec<PathBuf>> {
         .arg(&output_path)
         .output()
         .with_context(|| format!("failed to launch {}", picker_app.display()))?;
+    info!(
+        "attach: picker `open` exited status={} stderr={:?}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
     if !output.status.success() {
         return Err(anyhow!(
-            "{} exited with status {}",
+            "{} exited with status {} (stderr: {})",
             picker_app.display(),
-            output.status
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
     let selected = std::fs::read_to_string(&output_path).unwrap_or_default();
+    info!(
+        "attach: picker output file had {} byte(s)",
+        selected.len()
+    );
     let _ = std::fs::remove_file(&output_path);
     Ok(selected
         .lines()
@@ -15081,7 +15246,11 @@ fn classify_context_path(path: &Path) -> ContextKind {
 fn is_supported_picker_context_file(path: &Path) -> bool {
     matches!(
         classify_context_path(path),
-        ContextKind::Code | ContextKind::Document | ContextKind::Text
+        ContextKind::Code
+            | ContextKind::Document
+            | ContextKind::Text
+            | ContextKind::Image
+            | ContextKind::Diagram
     )
 }
 
@@ -15114,12 +15283,26 @@ fn enrich_context_artifact(
             }
         }
         ContextKind::Image | ContextKind::Diagram => {
-            if vision_context_available_from_env() {
-                artifact.with_processing_status(ContextProcessingStatus::Pending)
-            } else {
-                artifact.with_unsupported_error(
-                    "image context needs a configured OCR/vision provider before answers can use it",
+            // Images ride the agent prompt as real pixels over ACP
+            // (`Question.images` → `ContentBlock::Image`), so the attached agent's
+            // own vision reads them — Bluey needs NO separate OCR/vision provider.
+            // A guard on size keeps a giant file from bloating the base64 payload;
+            // otherwise the artifact is immediately Ready and its on-disk path is
+            // what the answer path attaches.
+            if size_bytes > 20_000_000 {
+                artifact.with_processing_error(
+                    "image is over 20 MB; attach a smaller screenshot or crop before sending",
                 )
+            } else {
+                let mut ready = artifact.with_processing_status(ContextProcessingStatus::Ready);
+                if ready
+                    .note
+                    .as_ref()
+                    .is_none_or(|note| note.trim().is_empty())
+                {
+                    ready.note = Some("Image attached — sent to the agent as-is.".to_string());
+                }
+                ready
             }
         }
         ContextKind::Document => match extract_document_text_preview(path, size_bytes) {
@@ -15131,10 +15314,6 @@ fn enrich_context_artifact(
             "unsupported context file type; attach readable text, Markdown, code, PDF, DOC, or DOCX",
         ),
     }
-}
-
-fn vision_context_available_from_env() -> bool {
-    ai_status_from_env().vision_enabled || select_vision_provider_from_env().is_some()
 }
 
 fn extract_document_text_preview(path: &Path, size_bytes: u64) -> Result<String> {
@@ -15608,6 +15787,10 @@ fn build_recap_llm_from_env() -> Option<Box<dyn cue_llm::LlmProvider>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Used only by the cloud provider-message image tests below; the non-test
+    // build no longer routes images through a vision provider (screenshots are
+    // sent to the agent as pixels over ACP), so these are test-scoped imports.
+    use cue_core::{PrivacyFlags, RouteBudget};
 
     #[test]
     fn name_from_email_prettifies_common_shapes() {
@@ -15835,6 +16018,75 @@ mod tests {
             bin.as_os_str(),
             "meeting overlay must run directly, not via /usr/bin/open <app>"
         );
+    }
+
+    #[test]
+    fn full_chain_attached_image_artifact_lands_in_question_images() {
+        // The COMPLETE daemon chain a screenshot/attach takes to the agent:
+        //   meeting.context (Ready image artifact)
+        //     → answer_context_from_meeting_within  (emits a Screenshot context
+        //        whose `source` is the image path)
+        //     → AnswerRequest → ProviderRequestPayload
+        //     → agent_question_from_payload         (routes it to Question.images)
+        // A real image file on disk is required (the routing gates on existence).
+        let dir = std::env::temp_dir().join(format!("bluey-fullchain-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n").unwrap();
+
+        // Build a meeting and attach a Ready image artifact exactly as the
+        // screenshot handler does (enrich → Ready, path = the PNG).
+        let mut meeting = MeetingRecord::new(Some("Vision chain".to_string()));
+        let artifact = enrich_context_artifact(
+            ContextArtifact::new(
+                ContextKind::Image,
+                png.display().to_string(),
+                "Screenshot",
+                None,
+                Some(8),
+            ),
+            &png,
+            ContextKind::Image,
+            8,
+        );
+        assert_eq!(
+            artifact.processing_status,
+            ContextProcessingStatus::Ready,
+            "image artifact must be Ready to flow into the answer context"
+        );
+        meeting.context.push(artifact);
+
+        // Run the real context builder → the Screenshot context must carry the path.
+        let context = answer_context_from_meeting_within(&meeting);
+        let screenshot = context
+            .iter()
+            .find(|c| matches!(c.kind, AnswerContextKind::Screenshot))
+            .expect("a Screenshot context is emitted for the image artifact");
+        assert_eq!(
+            screenshot.source.as_deref(),
+            Some(png.display().to_string().as_str())
+        );
+
+        // Feed the whole context through the real payload → question assembly.
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let mut request = cue_core::ai::AnswerRequest::new("What is on screen?", route);
+        request.context = context;
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+        let question = agent_question_from_payload(&payload, None);
+
+        // The end of the chain: the image path is attached as pixels.
+        assert_eq!(
+            question.images,
+            vec![png.clone()],
+            "the attached image must reach Question.images for the ACP image block"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -16611,8 +16863,80 @@ mod tests {
             "architecture.pdf"
         )));
         assert!(is_supported_picker_context_file(Path::new("main.rs")));
+        // Images are now accepted — they ride to the agent as pixels over ACP.
+        assert!(is_supported_picker_context_file(Path::new("shot.png")));
+        assert!(is_supported_picker_context_file(Path::new("photo.jpeg")));
+        assert!(is_supported_picker_context_file(Path::new(
+            "system-diagram.png"
+        )));
         assert!(!is_supported_picker_context_file(Path::new("clip.mp4")));
         assert!(!is_supported_picker_context_file(Path::new("backup.p12")));
+    }
+
+    #[test]
+    fn enrich_marks_image_ready_without_a_vision_provider() {
+        // An image artifact is immediately Ready (the agent reads the pixels over
+        // ACP) — no OCR/vision provider needed. A note is filled in when absent.
+        let dir = std::env::temp_dir().join(format!("bluey-enrich-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG\r\n").unwrap();
+
+        let artifact = ContextArtifact::new(
+            ContextKind::Image,
+            png.display().to_string(),
+            "shot.png",
+            None,
+            Some(6),
+        );
+        let enriched = enrich_context_artifact(artifact, &png, ContextKind::Image, 6);
+        assert_eq!(enriched.processing_status, ContextProcessingStatus::Ready);
+        assert!(enriched.processing_error.is_none());
+        assert!(enriched
+            .note
+            .as_deref()
+            .unwrap_or_default()
+            .contains("agent"));
+
+        // An oversized image is rejected up front (would bloat the base64 payload).
+        let big = ContextArtifact::new(
+            ContextKind::Image,
+            png.display().to_string(),
+            "big.png",
+            None,
+            Some(21_000_000),
+        );
+        let big = enrich_context_artifact(big, &png, ContextKind::Image, 21_000_000);
+        assert_eq!(big.processing_status, ContextProcessingStatus::Failed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_context_artifact_makes_a_real_png_a_ready_image() {
+        // The exact transform the screenshot/attach handlers apply to a captured
+        // or picked PNG: build_context_artifact → classify (Image) → enrich
+        // (Ready) → validate (passes). A real file is required (it canonicalizes
+        // + stats the path). This is the handler entry, not a hand-built artifact.
+        let dir = std::env::temp_dir().join(format!("bluey-buildctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("eye-capture-123.png");
+        std::fs::write(&png, b"\x89PNG\r\n\x1a\n0123456789").unwrap();
+
+        let artifact = build_context_artifact(
+            png.display().to_string(),
+            Some("Screenshot".to_string()),
+            None,
+        )
+        .expect("a real PNG must build into a context artifact");
+        assert!(matches!(artifact.kind, ContextKind::Image));
+        assert_eq!(
+            artifact.processing_status,
+            ContextProcessingStatus::Ready,
+            "a captured/picked screenshot must be Ready (agent reads the pixels), not gated on vision"
+        );
+        // validate_context_artifact accepts Ready — so the handler would attach it.
+        assert!(validate_context_artifact(&artifact).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -16675,7 +16999,9 @@ mod tests {
         ));
         // A SHORT cross-speaker phrase (< CROSS_SPEAKER_MIN_LEN) is NOT a dup:
         // two people can legitimately both say "okay" / "yes".
-        meeting.transcript.push(TranscriptSegment::new(Speaker::System, "okay", true));
+        meeting
+            .transcript
+            .push(TranscriptSegment::new(Speaker::System, "okay", true));
         assert!(!is_near_duplicate_transcript(
             &meeting,
             Speaker::User,
@@ -17155,6 +17481,86 @@ mod tests {
         // A blank id never becomes a resume target.
         let blank = agent_question_from_payload(&payload, Some("   "));
         assert!(blank.resume.is_none());
+    }
+
+    #[test]
+    fn is_attachable_image_path_gates_on_extension_and_existence() {
+        // A real image file on disk → attachable.
+        let dir = std::env::temp_dir().join(format!("bluey-imgpath-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"\x89PNG").unwrap();
+        assert!(is_attachable_image_path(&png));
+        // Right extension but no file → not attachable (stale artifact path).
+        assert!(!is_attachable_image_path(&dir.join("missing.jpg")));
+        // Real file, non-image extension → not attachable.
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        assert!(!is_attachable_image_path(&txt));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_question_from_payload_routes_screenshot_context_to_images() {
+        // A Screenshot-kind context whose source is a real image file becomes a
+        // `Question.images` entry (sent as pixels over ACP) and is DROPPED from the
+        // text turns — the placeholder text would be redundant noise beside the
+        // pixels. A non-image context alongside it still rides as a text turn.
+        let dir = std::env::temp_dir().join(format!("bluey-qpayload-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("screen.png");
+        std::fs::write(&png, b"\x89PNG\r\n").unwrap();
+
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("What is on screen?", route)
+            .with_context(AnswerContext::transcript("Bob: look at this"))
+            .with_context(
+                AnswerContext::new(AnswerContextKind::Screenshot, "screen.png (image)")
+                    .with_title("Screenshot")
+                    .with_source(png.display().to_string()),
+            );
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+
+        let question = agent_question_from_payload(&payload, None);
+        // The image path rode into `images`.
+        assert_eq!(question.images.len(), 1);
+        assert_eq!(question.images[0], png);
+        // The transcript turn survives; the screenshot placeholder did NOT.
+        let turns = question.context.expect("context present").turns;
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].text, "Bob: look at this");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_question_from_payload_skips_screenshot_with_missing_or_nonimage_source() {
+        // A Screenshot context pointing at a nonexistent file is NOT attached and
+        // NOT dropped — it falls through to a normal text turn so the agent still
+        // sees that something was referenced.
+        let route = ProviderRoute::direct(ProviderSelector::agent("claude_code"));
+        let request = cue_core::ai::AnswerRequest::new("Explain", route).with_context(
+            AnswerContext::new(AnswerContextKind::Screenshot, "gone.png (image)")
+                .with_title("Screenshot")
+                .with_source("/tmp/does-not-exist-bluey.png"),
+        );
+        let payload = ProviderRequestPayload::from_request(
+            &request,
+            ProviderSelector::agent("claude_code"),
+            None,
+            "claude_code",
+            RouteBudget::realtime(),
+        );
+        let question = agent_question_from_payload(&payload, None);
+        assert!(question.images.is_empty());
+        let turns = question.context.expect("context present").turns;
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].text.contains("gone.png"));
     }
 
     #[test]

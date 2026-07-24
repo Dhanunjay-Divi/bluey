@@ -38,8 +38,13 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
   <string>1</string>
   <key>LSBackgroundOnly</key>
   <false/>
+  <!-- NOT a UI element / accessory: the picker must show a real, frontmost
+       NSOpenPanel. With LSUIElement=true the dialog opens behind other windows
+       and the user never sees it (the daemon's `open -W` then just blocks until
+       timeout). The process is short-lived (opens the panel, writes the paths,
+       quits), so a brief Dock presence is fine. -->
   <key>LSUIElement</key>
-  <true/>
+  <false/>
   <key>NSHighResolutionCapable</key>
   <true/>
 </dict>

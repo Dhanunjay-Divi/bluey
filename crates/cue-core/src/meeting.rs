@@ -157,7 +157,9 @@ pub fn speaker_display_label(primary: i64, secondary: &[i64]) -> String {
     }
     // Talk-over: list all speaker numbers comma-separated ("Speaker 2, 1"),
     // not "Speaker 2 + 1" (which reads like arithmetic).
-    let mut nums: Vec<i64> = std::iter::once(primary).chain(secondary.iter().copied()).collect();
+    let mut nums: Vec<i64> = std::iter::once(primary)
+        .chain(secondary.iter().copied())
+        .collect();
     nums.dedup();
     let joined = nums
         .iter()

@@ -11,6 +11,7 @@ import type {
   AnswerSource,
   AnswerStatusStep,
   AskMode,
+  ContextItem,
   ListeningState,
 } from "../lib/types";
 import { AgentBar } from "../components/AgentBar";
@@ -70,6 +71,11 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   // toggled separately and the current pair is re-sent on every change (the
   // daemon's start takes both flags at once).
   const [micInputOn, setMicInputOn] = useState(false);
+  // Attached context artifacts (the "+" menu: files, screenshots, pages), pushed
+  // by the daemon as set_context_items. Rendered as ChatGPT-style chips above the
+  // composer input; the strip is a pure mirror of the daemon's list.
+  const [contextItems, setContextItems] = useState<ContextItem[]>([]);
+  useEffect(() => client.onContextItems(setContextItems), [client]);
   // Daemon offer to install a missing agent CLI (push_agent_install). Shown as a
   // card with Install / Not now; the daemon reports the install result as a card.
   const [installOffer, setInstallOffer] = useState<AgentInstallOffer | null>(
@@ -405,6 +411,8 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
       <Composer
         placeholder="Ask a follow-up while Bluey listens…"
         contextLabel={transcript ? "live transcript · in context" : undefined}
+        contextItems={contextItems}
+        onRemoveContext={(id) => client.removeContextItem(id)}
         onSubmit={(q) => runAsk(q)}
         onAskRecent={() => runAsk(ASK_RECENT_QUESTION, ASK_RECENT_LABEL)}
         askRecentDisabled={askStreaming}

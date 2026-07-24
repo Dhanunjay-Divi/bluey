@@ -250,3 +250,67 @@ pub async fn meeting_ask_cancel(link: State<'_, DaemonLink>, id: String) -> Resu
     }
     Ok(())
 }
+
+/// Open the NATIVE macOS file picker from the overlay's OWN GUI process and
+/// return the chosen absolute paths (empty on cancel). The daemon is headless
+/// and a daemon-spawned helper has no window-server access, so the dialog must
+/// originate here, in a process that already owns a real window.
+///
+/// The overlay normally runs as an ACCESSORY app (no Dock icon, invisible to
+/// screen capture). An accessory app's file dialog won't come to the front, so
+/// we momentarily flip to REGULAR around the picker, then restore accessory —
+/// the capture-invisibility promise still holds (the flip lasts only while the
+/// modal is open, and the overlay window itself stays content-protected).
+#[tauri::command]
+pub async fn pick_context_files(app: AppHandle) -> Result<Vec<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    // Flip to a foreground policy so the native dialog is visible + focused.
+    // In capture-visible test mode the overlay is already Regular; restoring to
+    // Accessory afterward is still correct for the real (invisible) product.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
+    // The dialog plugin's blocking picker must run off the main thread (it spins
+    // its own modal loop). `blocking_pick_files` returns None on cancel.
+    let dialog = app.dialog().clone();
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        dialog
+            .file()
+            .set_title("Attach files to Bluey")
+            .add_filter(
+                "Attachable files",
+                &[
+                    // Text / code / docs
+                    "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift",
+                    "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt",
+                    "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json",
+                    "html", "css", "scss", "pdf", "doc", "docx", "rtf",
+                    // Images — sent to the agent as pixels over ACP
+                    "png", "jpg", "jpeg", "gif", "webp", "heic", "bmp",
+                ],
+            )
+            .blocking_pick_files()
+    })
+    .await
+    .map_err(|e| format!("file dialog task failed: {e}"))?;
+
+    // Restore the invisible accessory policy.
+    #[cfg(target_os = "macos")]
+    {
+        let capture_visible = std::env::var("BLUEY_MEETING_CAPTURE_VISIBLE")
+            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+        if !capture_visible {
+            let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+        }
+    }
+
+    let paths = picked
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|p| p.into_path().ok())
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+    Ok(paths)
+}

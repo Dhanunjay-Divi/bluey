@@ -15,6 +15,7 @@ import type {
   AgentSummary,
   AnswerChunk,
   AskOptions,
+  ContextItem,
   ContinueResult,
   FixProposal,
   ListeningState,
@@ -22,6 +23,7 @@ import type {
   MeetingSummary,
   MeetingViewState,
   SetupStatus,
+  SpeakerCandidate,
   TranscriptLine,
 } from "./types";
 
@@ -108,7 +110,18 @@ export interface MeetingClient {
    *  transcript lines. Labels lag lines: the daemon's live diarize tick
    *  resolves "who said it" a few seconds after the text streamed in, then
    *  pushes (segmentId, label) so the UI patches the line in place. */
-  onSpeakerUpdate(cb: (segmentId: string, speaker: string) => void): () => void;
+  onSpeakerUpdate(
+    cb: (segmentId: string, speaker: string, speakerId?: number | null) => void,
+  ): () => void;
+  /** Rename a diarized speaker in the active meeting (the "Reassign Speaker"
+   *  flow — from a calendar-attendee pick OR a custom typed name). Persists to
+   *  the diarization store and enrolls the speaker's voiceprint so the same
+   *  voice is auto-recognized in future meetings. Fire-and-forget. Empty `name`
+   *  clears back to a fallback label. */
+  renameSpeaker(speakerId: number, name: string): void;
+  /** Subscribe to the active meeting's calendar attendees (pushed at warmup) —
+   *  the tap-to-pick candidates for speaker rename. Returns an unsubscribe fn. */
+  onMeetingCandidates(cb: (candidates: SpeakerCandidate[]) => void): () => void;
   /** Subscribe to daemon-detected "for-me" questions (master doc §6) — the
    *  distinct signal that drives the Ask view's "They asked…" hero card.
    *  Returns an unsubscribe fn. */
@@ -200,6 +213,13 @@ export interface MeetingClient {
   /** Open the DAEMON-owned native file picker to attach files as context.
    *  (The overlay is an accessory app and cannot open NSOpenPanel itself.) */
   openAttachPicker(): void;
-  /** Capture a screenshot of the screen and route it to context/vision. */
+  /** Capture a screenshot and attach it as an image the attached agent reads
+   *  over ACP (no separate vision provider — the agent's own vision reads it). */
   captureScreenshot(): void;
+  /** Subscribe to the daemon-PUSHED attached-context list (set_context_items).
+   *  Fires on every attach/remove with the full current list, so the composer
+   *  chip strip stays in sync. Returns an unsubscribe fn. Pure subscribe. */
+  onContextItems(cb: (items: ContextItem[]) => void): () => void;
+  /** Remove one attached context artifact by id (the chip's ✕). */
+  removeContextItem(id: string): void;
 }
