@@ -24,15 +24,15 @@ use crate::{
     db::jobs::{
         self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
         AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
-        CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication, JobPosting,
-        JobEligibilityDecision, JobPreferences, JobsEntitlement, JobsIntegration, JobsWorkspace,
-        MailboxConnection, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
+        CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
+        JobEligibilityDecision, JobPosting, JobPreferences, JobsEntitlement, JobsIntegration,
+        JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
         RunnerChannelAvailability,
     },
     object_storage::{sha256_hex, ObjectStorage},
 };
 
-type ApiError = (StatusCode, String);
+pub(super) type ApiError = (StatusCode, String);
 
 // Receipts include the exact resume and confirmation screenshot as base64 so
 // the server can verify and persist evidence before accepting "submitted".
@@ -160,11 +160,31 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/jobs/mailbox-connections",
-            get(mailbox_connections).post(request_mailbox_connection),
+            get(super::jobs_mailbox::mailbox_connections),
+        )
+        .route(
+            "/api/jobs/mailbox-oauth/config",
+            get(super::jobs_mailbox_oauth::provider_availability),
+        )
+        .route(
+            "/api/jobs/mailbox-oauth/:provider/start",
+            post(super::jobs_mailbox_oauth::start_oauth),
         )
         .route(
             "/api/jobs/mailbox-connections/:connection_id",
-            delete(remove_mailbox_connection),
+            delete(super::jobs_mailbox::remove_mailbox_connection),
+        )
+        .route(
+            "/api/jobs/mailbox-connections/:connection_id/sync-state",
+            get(super::jobs_mailbox::mailbox_sync_state),
+        )
+        .route(
+            "/api/jobs/mailbox-connections/:connection_id/sync",
+            post(super::jobs_mailbox::sync_mailbox_now),
+        )
+        .route(
+            "/api/jobs/mailbox-messages",
+            get(super::jobs_mailbox::mailbox_messages),
         )
         .route("/api/jobs/entitlements", get(entitlements))
         .route("/api/jobs/runs/:run_id/events", get(run_events))
@@ -448,7 +468,10 @@ fn auto_submit_request_error(
     if let Some(reason) = eligibility.hard_failures.first() {
         return Some((
             StatusCode::CONFLICT,
-            format!("Auto-submit is blocked by your Career Track: {}", reason.message),
+            format!(
+                "Auto-submit is blocked by your Career Track: {}",
+                reason.message
+            ),
         ));
     }
     if !eligibility.can_auto_submit {
@@ -2862,51 +2885,6 @@ pub async fn remove_application_identity(
     Ok(StatusCode::NO_CONTENT)
 }
 
-pub async fn mailbox_connections(
-    State(state): State<AppState>,
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-) -> Result<Json<Vec<MailboxConnection>>, ApiError> {
-    jobs::list_mailbox_connections(&state.pool, &account.id)
-        .map(Json)
-        .map_err(internal)
-}
-
-pub async fn request_mailbox_connection(
-    State(state): State<AppState>,
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Json(mut connection): Json<MailboxConnection>,
-) -> Result<Json<MailboxConnection>, ApiError> {
-    // This records a beta-access request only. It must not look like an OAuth
-    // grant or advertise sync capabilities before provider authorization,
-    // revocation, ingestion workers, and deletion are deployed.
-    connection.id.clear();
-    connection.status = "pending".to_string();
-    connection.aliases.clear();
-    connection.capabilities.clear();
-    connection.created_at_ms = 0;
-    connection.updated_at_ms = 0;
-    let provider_subject = connection.account_label.clone();
-    jobs::save_mailbox_connection(&state.pool, &account.id, &connection, &provider_subject)
-        .map(Json)
-        .map_err(domain_error)
-}
-
-pub async fn remove_mailbox_connection(
-    State(state): State<AppState>,
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Path(connection_id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    if !jobs::delete_mailbox_connection(&state.pool, &account.id, &connection_id)
-        .map_err(internal)?
-    {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "Connected inbox not found.".to_string(),
-        ));
-    }
-    Ok(StatusCode::NO_CONTENT)
-}
-
 pub async fn entitlements(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -5126,7 +5104,7 @@ fn default_review_first() -> String {
     "review_first".to_string()
 }
 
-fn bad_request<T>(message: &str) -> Result<T, ApiError> {
+pub(super) fn bad_request<T>(message: &str) -> Result<T, ApiError> {
     Err((StatusCode::BAD_REQUEST, message.to_string()))
 }
 
@@ -5138,7 +5116,7 @@ fn validation_or_internal(error: anyhow::Error, validation_message: &str) -> Api
     }
 }
 
-fn domain_error(error: anyhow::Error) -> ApiError {
+pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
     let message = error.to_string();
     let status = if message.contains("another Bluey Jobs account")
         || message.contains("dedicated confirmation flow")
@@ -5238,7 +5216,7 @@ fn execution_lease_error(error: jobs::ExecutionLeaseError) -> ApiError {
     }
 }
 
-fn internal(error: anyhow::Error) -> ApiError {
+pub(super) fn internal(error: anyhow::Error) -> ApiError {
     tracing::error!(error = %error, "Bluey Jobs request failed");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -5301,7 +5279,9 @@ mod tests {
         assert_eq!(availability.local.status, "upgrade_required");
         assert_eq!(availability.cloud.status, "upgrade_required");
         assert!(!availability.auto_submit_available);
-        assert!(availability.auto_submit_reason.contains("requires a Jobs plan"));
+        assert!(availability
+            .auto_submit_reason
+            .contains("requires a Jobs plan"));
     }
 
     #[test]
@@ -5348,15 +5328,13 @@ mod tests {
         entitlement.local_browser = true;
         let unavailable = build_runner_availability(&entitlement, false, false);
 
-        let beta =
-            auto_submit_request_error(&test_eligibility("beta_review", false), &unavailable)
-                .expect("beta must stay in review");
+        let beta = auto_submit_request_error(&test_eligibility("beta_review", false), &unavailable)
+            .expect("beta must stay in review");
         assert_eq!(beta.0, StatusCode::CONFLICT);
         assert!(beta.1.contains("in beta"));
 
-        let handoff =
-            auto_submit_request_error(&test_eligibility("handoff", false), &unavailable)
-                .expect("handoff must stay user controlled");
+        let handoff = auto_submit_request_error(&test_eligibility("handoff", false), &unavailable)
+            .expect("handoff must stay user controlled");
         assert!(handoff.1.contains("user-controlled handoff"));
 
         let unknown =
@@ -5364,11 +5342,8 @@ mod tests {
                 .expect("unknown ATS must stay in review");
         assert!(unknown.1.contains("has not been certified"));
 
-        let runner = auto_submit_request_error(
-            &test_eligibility("certified", true),
-            &unavailable,
-        )
-        .expect("undistributed runner must block auto submit");
+        let runner = auto_submit_request_error(&test_eligibility("certified", true), &unavailable)
+            .expect("undistributed runner must block auto submit");
         assert_eq!(runner.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(runner.1.contains("invited beta"));
     }

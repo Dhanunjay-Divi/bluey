@@ -48,6 +48,13 @@ describe("curated job feeds", () => {
       categoryEvidence: "feed_default",
       submissionCapability: "beta_review",
       atsSource: { kind: "lever", site: "acme", company: "Acme" },
+      sourceTrust: {
+        score: 100,
+        level: "high",
+        flags: [],
+        hostname: "jobs.lever.co",
+        requiresOriginalRevalidation: true,
+      },
       requiresOriginalRevalidation: true,
     });
     expect(result.leads[1]).toMatchObject({
@@ -91,6 +98,13 @@ describe("curated job feeds", () => {
       originalUrl: "https://careers.acme.example/jobs/42",
       submissionCapability: "unknown_review",
       atsSource: null,
+      sourceTrust: {
+        score: 100,
+        level: "high",
+        flags: [],
+        hostname: "careers.acme.example",
+        requiresOriginalRevalidation: true,
+      },
     });
   });
 

@@ -31,6 +31,11 @@ Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
 account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
 must opt into another IP with `BLUEY_JOBS_API_HOST` and enforce private ingress.
+Keep `BLUEY_JOBS_MAILBOX_SYNC_ENABLED=0` until Gmail/Outlook OAuth credentials,
+reviewed redirect URIs, encrypted provider-token storage, and mailbox-worker
+monitoring are configured and verified. The server defaults the read-only
+mailbox worker off when the variable is absent. Connecting an inbox does not
+authorize Bluey to send mail or infer employer outcomes.
 
 The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
 API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
@@ -46,6 +51,9 @@ BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
 # Keep managed model generation disabled until provider credentials, the
 # global spend guard, and usage-ledger monitoring are verified in production.
 BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
+BLUEY_JOBS_MAILBOX_SYNC_ENABLED=0
+# Set to 1 only after the Gmail/Outlook release gates below are complete.
+# BLUEY_JOBS_MAILBOX_SYNC_POLL_SECONDS=30
 BLUEY_UPSTREAM_SPEND_LIMIT_CENTS=1000
 BLUEY_UPSTREAM_SPEND_WINDOW_HOURS=24
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal

@@ -3,13 +3,11 @@ import {
   ArrowRight,
   Bot,
   BrainCircuit,
-  CalendarDays,
   Check,
   ChevronRight,
   CirclePlus,
   ClipboardCheck,
   CreditCard,
-  Mail,
   MailCheck,
   MapPin,
   MessageCircleQuestion,
@@ -27,11 +25,14 @@ import type {
   CareerProfile,
   CareerTrack,
   JobPreferences,
-  JobsIntegration,
   JobsWorkspace,
   MailboxConnection,
+  MailboxMessage,
+  MailboxProviderAvailability,
+  MailboxSyncState,
 } from "../types";
 import { Dialog, ConfirmDialog } from "../components/Dialog";
+import { ApplicationInboxSettings } from "../components/ApplicationInboxSettings";
 import { CareerField, CareerTagField } from "../components/CareerFields";
 import {
   canonicalTargetRoles,
@@ -61,13 +62,16 @@ interface Props {
   onSavePreferences(preferences: JobPreferences): Promise<void>;
   onSaveTrack(track: CareerTrack): Promise<void>;
   onDeleteTrack(track: CareerTrack): Promise<void>;
-  onSaveIntegration(integration: JobsIntegration): Promise<void>;
   onCreateIdentity(identity: ApplicationIdentity): Promise<ApplicationIdentity>;
   onUpdateIdentity(identity: ApplicationIdentity): Promise<ApplicationIdentity>;
   onVerifyIdentity(identity: ApplicationIdentity, code: string): Promise<ApplicationIdentity>;
   onResendIdentity(identity: ApplicationIdentity): Promise<void>;
   onDeleteIdentity(identity: ApplicationIdentity): Promise<void>;
-  onRequestMailbox(connection: MailboxConnection): Promise<MailboxConnection>;
+  onMailboxProviders(): Promise<MailboxProviderAvailability[]>;
+  onConnectMailbox(provider: MailboxConnection["provider"]): Promise<void>;
+  onMailboxSyncState(connection: MailboxConnection): Promise<MailboxSyncState>;
+  onMailboxMessages(connectionId?: string): Promise<MailboxMessage[]>;
+  onSyncMailbox(connection: MailboxConnection): Promise<MailboxSyncState>;
   onDeleteMailbox(connection: MailboxConnection): Promise<void>;
   onSaveAnswerMemory(answer: AnswerMemory): Promise<AnswerMemory>;
   onDeleteAnswerMemory(answer: AnswerMemory): Promise<void>;
@@ -79,13 +83,16 @@ export function SettingsView({
   onSavePreferences,
   onSaveTrack,
   onDeleteTrack,
-  onSaveIntegration,
   onCreateIdentity,
   onUpdateIdentity,
   onVerifyIdentity,
   onResendIdentity,
   onDeleteIdentity,
-  onRequestMailbox,
+  onMailboxProviders,
+  onConnectMailbox,
+  onMailboxSyncState,
+  onMailboxMessages,
+  onSyncMailbox,
   onDeleteMailbox,
   onSaveAnswerMemory,
   onDeleteAnswerMemory,
@@ -98,14 +105,10 @@ export function SettingsView({
   const [profile, setProfile] = useState(workspace.profile);
   const [trackOpen, setTrackOpen] = useState(false);
   const [editingTrack, setEditingTrack] = useState<CareerTrack | null>(null);
-  const [disconnecting, setDisconnecting] = useState<JobsIntegration | null>(null);
-  const [connecting, setConnecting] = useState<JobsIntegration | null>(null);
   const [deletingTrack, setDeletingTrack] = useState<CareerTrack | null>(null);
   const [identityOpen, setIdentityOpen] = useState(false);
   const [verifyingIdentity, setVerifyingIdentity] = useState<ApplicationIdentity | null>(null);
   const [deletingIdentity, setDeletingIdentity] = useState<ApplicationIdentity | null>(null);
-  const [mailboxOpen, setMailboxOpen] = useState(false);
-  const [disconnectingMailbox, setDisconnectingMailbox] = useState<MailboxConnection | null>(null);
   const [answerOpen, setAnswerOpen] = useState(false);
   const [editingAnswer, setEditingAnswer] = useState<AnswerMemory | null>(null);
   const [deletingAnswer, setDeletingAnswer] = useState<AnswerMemory | null>(null);
@@ -260,7 +263,7 @@ export function SettingsView({
               onChange={(values) => updatePreferences({ ...preferences, engagement_types: values })}
             />
             <label><span>Sponsorship filter</span><select value={preferences.sponsorship} onChange={(event) => updatePreferences({ ...preferences, sponsorship: event.target.value })}><option value="ask">Ask when unclear</option><option value="required">Only roles offering sponsorship</option><option value="not_required">Sponsorship not required</option><option value="any">Do not filter</option></select></label>
-            <SearchPolicySummary profile={profile} compact />
+            <SearchPolicySummary profile={profile} role={preferences.desired_roles[0]} compact />
             <label><span>Minimum salary</span><input type="number" value={preferences.minimum_compensation || ""} onChange={(event) => updatePreferences({ ...preferences, minimum_compensation: Number(event.target.value) || undefined })} /></label>
             <CareerTagField label="Excluded companies" values={preferences.excluded_companies} onChange={(values) => updatePreferences({ ...preferences, excluded_companies: values })} placeholder="Add a company" suggestions={companySuggestions} />
             <CareerTagField label="Excluded titles" values={preferences.excluded_titles} onChange={(values) => updatePreferences({ ...preferences, excluded_titles: values })} placeholder="Add a title" suggestions={roleSuggestions} />
@@ -310,19 +313,16 @@ export function SettingsView({
         </div>
       </section>
 
-      <section className="settings-section">
-        <div className="settings-section-title"><span><Mail /></span><div><p>INBOX & CALENDAR BETA</p><h2>Request outcome-sync access</h2><small>Provider authorization and timeline ingestion are not active yet. A request does not connect, read, or bill an inbox.</small></div><button className="button secondary compact" onClick={() => setMailboxOpen(true)} disabled={workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length >= workspace.entitlement.connected_inbox_limit}><Plus size={15} />Request inbox beta</button></div>
-        <div className="connection-usage"><span><b>{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length}</b> beta request{workspace.mailbox_connections.filter((item) => item.status !== "disconnected").length === 1 ? "" : "s"}</span><span>No mailbox access or slot charge while pending</span></div>
-        <div className="integration-list">
-          {workspace.mailbox_connections.map((connection) => <div key={connection.id}>
-            <span className="integration-icon"><Mail /></span>
-            <div><b>{connection.account_label}</b><p>{connectionName(connection.provider)}{connection.aliases.length ? ` · ${connection.aliases.length} alias${connection.aliases.length === 1 ? "" : "es"}` : ""}</p></div>
-            <span className={`integration-state ${connection.status}`}>{titleCase(connection.status)}</span>
-            <button className="button secondary compact" onClick={() => setDisconnectingMailbox(connection)}>{connection.status === "pending" ? "Remove" : "Disconnect"}</button>
-          </div>)}
-          {workspace.integrations.map((integration) => <div key={integration.provider}><span className="integration-icon"><CalendarDays /></span><div><b>{integrationName(integration.provider)}</b><p>{integration.status === "connected" ? integration.account_label : integration.capabilities.map(titleCase).join(" · ")}</p></div><span className={`integration-state ${integration.status}`}>{titleCase(integration.status)}</span>{integration.status === "connected" ? <button className="button secondary compact" onClick={() => setDisconnecting(integration)}>Disconnect</button> : <button className="button secondary compact" onClick={() => setConnecting(integration)}>Connect</button>}</div>)}
-        </div>
-      </section>
+      <ApplicationInboxSettings
+        workspace={workspace}
+        onMailboxProviders={onMailboxProviders}
+        onConnectMailbox={onConnectMailbox}
+        onMailboxSyncState={onMailboxSyncState}
+        onMailboxMessages={onMailboxMessages}
+        onSyncMailbox={onSyncMailbox}
+        onDeleteMailbox={onDeleteMailbox}
+        onError={setLocalError}
+      />
 
       <section className="settings-section" id="plans">
         <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included applications used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
@@ -331,7 +331,7 @@ export function SettingsView({
           <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · local runner beta waitlist" active={workspace.entitlement.plan === "pro"} />
           <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · invited cloud runner beta" active={workspace.entitlement.plan === "cloud"} />
         </div>
-        <p className="plan-footnote">Application emails are included. Inbox/calendar sync stays an unbilled request-only beta until provider authorization and ingestion are enabled. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
+        <p className="plan-footnote">Application emails are included. Connected inboxes use read-only access to match employer updates and never send mail. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
       </section>
 
       <ApplicationEmailDialog
@@ -354,15 +354,6 @@ export function SettingsView({
         }}
         onResend={onResendIdentity}
       />
-      <MailboxDialog
-        open={mailboxOpen}
-        onClose={() => setMailboxOpen(false)}
-        onSave={async (connection) => {
-          setLocalError("");
-          await onRequestMailbox(connection);
-          setMailboxOpen(false);
-        }}
-      />
       <AnswerMemoryDialog
         open={answerOpen}
         answer={editingAnswer}
@@ -384,16 +375,7 @@ export function SettingsView({
         onSave={async (track) => { await onSaveTrack(track); setTrackOpen(false); }}
         onDelete={(track) => { setTrackOpen(false); setDeletingTrack(track); }}
       />
-      <Dialog open={Boolean(connecting)} title={`Connect ${connecting ? integrationName(connecting.provider) : "account"}`} description="Email and calendar connections are being enabled for invited Jobs beta accounts." onClose={() => setConnecting(null)}>
-        <div className="integration-connect-copy">
-          <span className="integration-icon large">{connecting?.provider.includes("calendar") ? <CalendarDays /> : <Mail />}</span>
-          <div><h3>Integration beta access</h3><p>Email and calendar sync is not active for this account yet. Request access to help test provider authorization; Bluey will never ask for your email password.</p></div>
-        </div>
-        <div className="dialog-actions"><button className="button secondary" onClick={() => setConnecting(null)}>Not now</button><a className="button primary" href={`mailto:hello@bluey.sh?subject=${encodeURIComponent(`Bluey Jobs ${connecting ? integrationName(connecting.provider) : "integration"} beta`)}`}>Request beta access<ArrowRight size={15} /></a></div>
-      </Dialog>
-      <ConfirmDialog open={Boolean(disconnecting)} title={`Disconnect ${disconnecting ? integrationName(disconnecting.provider) : "integration"}?`} description="Bluey will stop syncing new status updates from this account. Existing application history stays in Jobs." confirmLabel="Disconnect" tone="danger" onClose={() => setDisconnecting(null)} onConfirm={() => { const integration = disconnecting; setDisconnecting(null); if (integration) void onSaveIntegration({ ...integration, status: "disconnected", account_label: "" }).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingIdentity)} title={`Remove ${deletingIdentity?.email || "application email"}?`} description="Bluey will keep existing application receipts, but this address will no longer be available for new Career Tracks." confirmLabel="Remove email" tone="danger" onClose={() => setDeletingIdentity(null)} onConfirm={() => { const identity = deletingIdentity; setDeletingIdentity(null); if (identity) void onDeleteIdentity(identity).catch(showError(setLocalError)); }} />
-      <ConfirmDialog open={Boolean(disconnectingMailbox)} title={`${disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} ${disconnectingMailbox?.account_label || "inbox"}?`} description={disconnectingMailbox?.status === "pending" ? "This removes only the beta request. Bluey has not connected to or read this inbox." : "Bluey will stop reading new application updates from this inbox. Existing application history stays in Jobs."} confirmLabel={disconnectingMailbox?.status === "pending" ? "Remove" : "Disconnect"} tone="danger" onClose={() => setDisconnectingMailbox(null)} onConfirm={() => { const connection = disconnectingMailbox; setDisconnectingMailbox(null); if (connection) void onDeleteMailbox(connection).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingTrack)} title={`Delete ${deletingTrack?.name || "Career Track"}?`} description="This stops discovery for the track. Existing matches and applications stay in your history." confirmLabel="Delete track" tone="danger" onClose={() => setDeletingTrack(null)} onConfirm={() => { const track = deletingTrack; setDeletingTrack(null); if (track) void onDeleteTrack(track).catch(showError(setLocalError)); }} />
       <ConfirmDialog open={Boolean(deletingAnswer)} title="Remove this saved answer?" description="Bluey will ask again the next time this question appears. Existing application receipts stay unchanged." confirmLabel="Remove answer" tone="danger" onClose={() => setDeletingAnswer(null)} onConfirm={() => { const answer = deletingAnswer; setDeletingAnswer(null); if (answer) void onDeleteAnswerMemory(answer).catch(showError(setLocalError)); }} />
     </div>
@@ -532,36 +514,6 @@ function VerifyIdentityDialog({ identity, onClose, onVerify, onResend }: { ident
   </Dialog>;
 }
 
-function MailboxDialog({ open, onClose, onSave }: { open: boolean; onClose(): void; onSave(connection: MailboxConnection): Promise<void> }) {
-  const [provider, setProvider] = useState<MailboxConnection["provider"]>("gmail");
-  const [email, setEmail] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-  useEffect(() => {
-    if (open) { setProvider("gmail"); setEmail(""); setError(""); }
-  }, [open]);
-  const submit = async () => {
-    setSaving(true);
-    setError("");
-    try {
-      await onSave({ id: "", provider, status: "pending", account_label: email, aliases: [], capabilities: ["status_sync", "follow_ups"], created_at_ms: 0, updated_at_ms: 0 });
-    } catch (requestError) {
-      setError(errorMessage(requestError));
-    } finally {
-      setSaving(false);
-    }
-  };
-  return <Dialog open={open} title="Request inbox beta" description="Tell Bluey which provider you want to test. This records a request only; it does not start OAuth or mailbox access." onClose={onClose}>
-    <div className="dialog-form">
-      <label><span>Provider</span><div className="segmented"><button className={provider === "gmail" ? "active" : ""} onClick={() => setProvider("gmail")}>Gmail</button><button className={provider === "outlook" ? "active" : ""} onClick={() => setProvider("outlook")}>Outlook</button></div></label>
-      <label><span>Inbox for beta eligibility</span><input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" /></label>
-      <p className="field-note">No authorization, inbox reading, timeline sync, or charge begins from this request. Bluey will never ask for your mailbox password.</p>
-      {error && <div className="inline-error">{error}</div>}
-    </div>
-    <div className="dialog-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={saving || !email.includes("@")} onClick={() => void submit()}>{saving ? "Requesting..." : `Request ${provider === "gmail" ? "Gmail" : "Outlook"} beta`}</button></div>
-  </Dialog>;
-}
-
 function TrackDialog({ open, track, identities, roleSuggestions, locationSuggestions, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; identities: ApplicationIdentity[]; roleSuggestions: string[]; locationSuggestions: string[]; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
   const defaultIdentityId = identities.find((identity) => identity.is_default && identity.verification_status === "verified")?.id;
   const [draft, setDraft] = useState<CareerTrack>(normalizeTrack(track, defaultIdentityId));
@@ -613,14 +565,6 @@ function Toggle({ checked, onChange }: { checked: boolean; onChange(checked: boo
 
 function Plan({ name, price, details, active }: { name: string; price: string; details: string; active: boolean }) {
   return <div className={active ? "active" : ""}><span>{active ? "CURRENT" : ""}</span><h3>{name}</h3><b>{price}<small>{price !== "$0" ? "/mo" : ""}</small></b><p>{details}</p>{active ? <button className="button secondary compact" disabled><Check size={14} />Current plan</button> : <a className="button secondary compact" href={`mailto:hello@bluey.sh?subject=${encodeURIComponent(`Bluey Jobs ${name} beta`)}`}>Request {name}</a>}</div>;
-}
-
-function integrationName(provider: string): string {
-  return ({ google_calendar: "Google Calendar", outlook_calendar: "Outlook Calendar" } as Record<string, string>)[provider] || titleCase(provider);
-}
-
-function connectionName(provider: MailboxConnection["provider"]): string {
-  return provider === "gmail" ? "Gmail inbox" : "Outlook inbox";
 }
 
 function errorMessage(error: unknown): string {

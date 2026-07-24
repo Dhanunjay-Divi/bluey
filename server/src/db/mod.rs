@@ -1512,6 +1512,74 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
     // 0036 - source resume bytes and exact-template capability metadata.
     SQLITE_JOBS_RESUME_SOURCE_ASSETS,
+    // 0037 - server-only OAuth state and encrypted provider credentials.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_oauth_states (
+        state_hash       TEXT PRIMARY KEY,
+        account_id       TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        provider         TEXT NOT NULL,
+        state_json       TEXT NOT NULL,
+        expires_at_ms    INTEGER NOT NULL,
+        created_at_ms    INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_oauth_states_expiry
+        ON jobs_oauth_states(expires_at_ms);
+
+    CREATE TABLE IF NOT EXISTS jobs_provider_credentials (
+        connection_id         TEXT PRIMARY KEY REFERENCES jobs_mailbox_connections(id) ON DELETE CASCADE,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        provider              TEXT NOT NULL,
+        provider_subject_hash TEXT NOT NULL,
+        credential_json       TEXT NOT NULL,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, provider, provider_subject_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_credentials_account
+        ON jobs_provider_credentials(account_id, provider, updated_at_ms DESC);
+    "#,
+    // 0038 - durable provider cursors, restart-safe leases, and encrypted
+    // mailbox messages for application outcome and intervention processing.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_provider_sync_state (
+        connection_id       TEXT PRIMARY KEY REFERENCES jobs_mailbox_connections(id) ON DELETE CASCADE,
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        provider            TEXT NOT NULL,
+        sync_json           TEXT NOT NULL,
+        next_sync_at_ms     INTEGER NOT NULL,
+        last_synced_at_ms   INTEGER,
+        lease_owner         TEXT,
+        lease_expires_at_ms INTEGER,
+        created_at_ms       INTEGER NOT NULL,
+        updated_at_ms       INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_sync_due
+        ON jobs_provider_sync_state(next_sync_at_ms, lease_expires_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_sync_account
+        ON jobs_provider_sync_state(account_id, provider, updated_at_ms DESC);
+
+    CREATE TABLE IF NOT EXISTS jobs_provider_messages (
+        id                    TEXT PRIMARY KEY,
+        account_id            TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        connection_id         TEXT NOT NULL REFERENCES jobs_mailbox_connections(id) ON DELETE CASCADE,
+        provider              TEXT NOT NULL,
+        provider_message_hash TEXT NOT NULL,
+        application_id        TEXT REFERENCES jobs_applications(id) ON DELETE SET NULL,
+        processing_status     TEXT NOT NULL,
+        message_json          TEXT NOT NULL,
+        received_at_ms        INTEGER NOT NULL,
+        processed_at_ms       INTEGER,
+        created_at_ms         INTEGER NOT NULL,
+        updated_at_ms         INTEGER NOT NULL,
+        UNIQUE(account_id, provider, provider_message_hash)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_messages_account
+        ON jobs_provider_messages(account_id, received_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_messages_application
+        ON jobs_provider_messages(account_id, application_id, received_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_provider_messages_status
+        ON jobs_provider_messages(account_id, processing_status, updated_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1866,6 +1934,10 @@ const POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
     include_str!("../../../infra/postgres/server-runtime/012_jobs_global_candidate_index.sql");
 const POSTGRES_JOBS_RESUME_SOURCE_ASSETS: &str =
     include_str!("../../../infra/postgres/server-runtime/013_jobs_resume_source_assets.sql");
+const POSTGRES_JOBS_PROVIDER_CONNECTIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/014_jobs_provider_connections.sql");
+const POSTGRES_JOBS_MAILBOX_SYNC: &str =
+    include_str!("../../../infra/postgres/server-runtime/015_jobs_mailbox_sync.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1910,6 +1982,11 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         "013_jobs_resume_source_assets.sql",
         POSTGRES_JOBS_RESUME_SOURCE_ASSETS,
     ),
+    (
+        "014_jobs_provider_connections.sql",
+        POSTGRES_JOBS_PROVIDER_CONNECTIONS,
+    ),
+    ("015_jobs_mailbox_sync.sql", POSTGRES_JOBS_MAILBOX_SYNC),
 ];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {

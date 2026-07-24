@@ -3,14 +3,24 @@ import type { CareerProfile } from "../types";
 import {
   BLUEY_DAILY_APPLICATION_LIMIT,
   BLUEY_MAX_POSTING_AGE_DAYS,
-  experienceRange,
+  roleExperienceRange,
 } from "../lib/search-policy";
 
-export function SearchPolicySummary({ profile, compact = false }: { profile: CareerProfile; compact?: boolean }) {
-  const experience = experienceRange(profile.employment);
-  const experienceCopy = experience.years > 0
-    ? `${experience.minimum}-${experience.maximum} years requested`
-    : "Entry-level through early-career roles";
+export function SearchPolicySummary({
+  profile,
+  role = "",
+  compact = false,
+}: {
+  profile: CareerProfile;
+  role?: string;
+  compact?: boolean;
+}) {
+  const experience = roleExperienceRange(profile.employment, role);
+  const experienceCopy = !role
+    ? "Relevant experience only · usually 1 year below to 2 years above"
+    : experience.years > 0
+      ? `${experience.minimum}-${experience.maximum} years for ${role}`
+      : `Entry-level ${role} openings until relevant experience is added`;
   return <section className={`search-policy-summary ${compact ? "compact" : ""}`} aria-label="Bluey search policy">
     <div><CalendarClock /><span><b>Recent openings</b><small>Posted within {BLUEY_MAX_POSTING_AGE_DAYS} days and still open</small></span></div>
     <div><TrendingUp /><span><b>Experience fit</b><small>{experienceCopy}</small></span></div>

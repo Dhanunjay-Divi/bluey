@@ -361,12 +361,47 @@ export interface ApplicationIdentity {
 export interface MailboxConnection {
   id: string;
   provider: "gmail" | "outlook";
-  status: "pending" | "connected" | "disconnected";
+  status: "connected" | "disconnected" | "reauthorization_required";
   account_label: string;
   aliases: string[];
   capabilities: string[];
   created_at_ms: number;
   updated_at_ms: number;
+}
+
+export interface MailboxProviderAvailability {
+  provider: MailboxConnection["provider"];
+  configured: boolean;
+  capabilities: string[];
+}
+
+export interface MailboxOAuthStart {
+  authorization_url: string;
+}
+
+export interface MailboxSyncState {
+  connection_id: string;
+  provider: MailboxConnection["provider"];
+  cursor: Record<string, unknown>;
+  next_sync_at_ms: number;
+  last_synced_at_ms?: number;
+  last_error: string;
+  lease_owner?: string;
+  lease_expires_at_ms?: number;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface MailboxMessage {
+  id: string;
+  connection_id: string;
+  provider: MailboxConnection["provider"];
+  sender: string;
+  subject: string;
+  received_at_ms: number;
+  application_id?: string;
+  processing_status: "received" | "processed" | "needs_input" | "ignored" | "failed" | string;
+  classification: string;
 }
 
 export type DiscoverySourceHealth = "healthy" | "degraded" | "paused" | "waiting";

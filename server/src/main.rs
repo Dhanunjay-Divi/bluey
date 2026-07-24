@@ -7,7 +7,7 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, object_storage,
+    db, jobs_mailbox_sync, object_storage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
         "startup upstream spend truth cleanup completed"
     );
     let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
+    let mailbox_sync_worker = jobs_mailbox_sync::spawn_mailbox_sync_worker(pool.clone());
 
     let cleanup_worker = object_storage::spawn_cleanup_worker(
         pool.clone(),
@@ -98,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("axum serve");
     if let Some(worker) = cleanup_worker {
+        worker.abort();
+    }
+    if let Some(worker) = mailbox_sync_worker {
         worker.abort();
     }
     spend_truth_janitor.abort();

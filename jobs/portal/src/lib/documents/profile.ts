@@ -88,12 +88,27 @@ export function resumeReviewWarnings(profile: CareerProfile): string[] {
   } else {
     const incomplete = profile.employment.filter((entry) => !entry.company || !entry.title).length;
     if (incomplete) warnings.push(`${incomplete} experience ${incomplete === 1 ? "entry needs" : "entries need"} a company or title.`);
+    const sentenceLike = profile.employment.filter((entry) =>
+      looksLikeResumeNarrative(entry.company) || looksLikeResumeNarrative(entry.title)
+    ).length;
+    if (sentenceLike) {
+      warnings.push(`${sentenceLike} experience ${sentenceLike === 1 ? "entry has" : "entries have"} sentence-like company or title text.`);
+    }
   }
   const incompleteEducation = profile.education.filter((entry) => !entry.school || !entry.degree).length;
   if (incompleteEducation) {
     warnings.push(`${incompleteEducation} education ${incompleteEducation === 1 ? "entry needs" : "entries need"} a school or degree.`);
   }
   return warnings;
+}
+
+function looksLikeResumeNarrative(value: string): boolean {
+  const clean = value.trim();
+  if (!clean) return false;
+  if (/^(?:achieved|administered|analyzed|assisted|built|collaborated|coordinated|created|delivered|designed|developed|directed|drove|established|executed|implemented|improved|increased|launched|led|managed|optimized|owned|reduced|supported|trained|verified|worked)\b/i.test(clean)) {
+    return true;
+  }
+  return clean.split(/\s+/).length >= 12 && /[.!?]$/.test(clean);
 }
 
 export function applyResumeImport(preview: ResumeImportPreview, mode: ResumeImportMode): CareerProfile {

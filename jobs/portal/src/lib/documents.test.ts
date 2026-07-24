@@ -276,6 +276,32 @@ Specialty`,
     ]);
   });
 
+  it("does not promote employment responsibilities into employer fields", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "clinical-operations.docx",
+      text: `Jordan Example
+Harbor City, India | jordan@example.com
+EXPERIENCE
+Harbor Dental Hospital
+Director of Clinical Operations, Harbor City, India, January 2019 – December 2019
+Coordinated patient care activities and clinical operations across several departments.
+Worked closely with clinicians to improve documentation quality and daily workflows.`,
+    });
+
+    expect(result.employment).toHaveLength(1);
+    expect(result.employment[0]).toMatchObject({
+      company: "Harbor Dental Hospital",
+      title: "Director of Clinical Operations",
+      location: "Harbor City, India",
+      start_date: "2019-01",
+      end_date: "2019-12",
+    });
+    expect(result.employment[0].highlights).toEqual([
+      "Coordinated patient care activities and clinical operations across several departments.",
+      "Worked closely with clinicians to improve documentation quality and daily workflows.",
+    ]);
+  });
+
   it("cleans template noise and separates a school from its trailing location", () => {
     const result = inferProfileFromResume(emptyProfile(), {
       name: "education-template.pdf",
@@ -760,6 +786,27 @@ Cloud: AWS (EKS, EC2, Lambda), Kubernetes`,
       "Current location was not found.",
       "1 experience entry needs a company or title.",
       "1 education entry needs a school or degree.",
+    ]);
+  });
+
+  it("flags sentence-like employer fields for correction before import", () => {
+    expect(resumeReviewWarnings({
+      ...emptyProfile(),
+      full_name: "Jordan Example",
+      current_location: "Harbor City, India",
+      headline: "Clinical Operations Director",
+      employment: [{
+        id: "job-1",
+        company: "Supported clinical teams across several patient care programs.",
+        title: "Clinical Operations Director",
+        location: "Harbor City, India",
+        start_date: "2019-01",
+        end_date: "2019-12",
+        current: false,
+        highlights: [],
+      }],
+    })).toEqual([
+      "1 experience entry has sentence-like company or title text.",
     ]);
   });
 

@@ -1037,6 +1037,85 @@ pub struct MailboxConnection {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsOAuthState {
+    pub provider: String,
+    pub code_verifier: String,
+    #[serde(default)]
+    pub return_path: String,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsProviderCredential {
+    pub connection_id: String,
+    pub provider: String,
+    pub provider_subject: String,
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsProviderSyncState {
+    pub connection_id: String,
+    pub provider: String,
+    #[serde(default)]
+    pub cursor: Value,
+    #[serde(default)]
+    pub next_sync_at_ms: i64,
+    #[serde(default)]
+    pub last_synced_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_error: String,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsProviderMessage {
+    #[serde(default)]
+    pub id: String,
+    pub connection_id: String,
+    pub provider: String,
+    pub external_id: String,
+    #[serde(default)]
+    pub sender: String,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default)]
+    pub subject: String,
+    #[serde(default)]
+    pub body_text: String,
+    pub received_at_ms: i64,
+    #[serde(default)]
+    pub application_id: Option<String>,
+    #[serde(default)]
+    pub processing_status: String,
+    #[serde(default)]
+    pub classification: String,
+    #[serde(default)]
+    pub confidence: f64,
+    #[serde(default)]
+    pub metadata: Value,
+    #[serde(default)]
+    pub processed_at_ms: Option<i64>,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsEntitlement {
     pub plan: String,
@@ -1509,6 +1588,7 @@ include!("jobs/resume_assets.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");
+include!("jobs/mailbox_sync.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");

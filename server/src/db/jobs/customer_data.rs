@@ -1729,7 +1729,7 @@ pub fn list_mailbox_connections(pool: &DbPool, account_id: &str) -> Result<Vec<M
     )
 }
 
-fn mailbox_connection_by_subject(
+pub fn mailbox_connection_by_subject(
     pool: &DbPool,
     account_id: &str,
     provider: &str,
@@ -1758,6 +1758,265 @@ fn mailbox_connection_by_subject(
             )?
             .map(|row| parse_json(row.get(0), "mailbox connection"))
             .transpose(),
+    })
+}
+
+pub fn mailbox_connection_for_provider_subject(
+    pool: &DbPool,
+    account_id: &str,
+    provider: &str,
+    provider_subject: &str,
+) -> Result<Option<MailboxConnection>> {
+    if !matches!(provider, "gmail" | "outlook") {
+        anyhow::bail!("unsupported Jobs credential provider")
+    }
+    let subject = provider_subject.trim();
+    if subject.is_empty() {
+        anyhow::bail!("provider subject is required")
+    }
+    let subject_hash = private_lookup_hash(&format!("mailbox:{provider}"), subject)?;
+    mailbox_connection_by_subject(pool, account_id, provider, &subject_hash)
+}
+
+pub fn save_mailbox_connection_with_credential(
+    pool: &DbPool,
+    account_id: &str,
+    connection: &MailboxConnection,
+    credential: &JobsProviderCredential,
+) -> Result<(MailboxConnection, JobsProviderCredential)> {
+    let mut mailbox = connection.clone();
+    if !matches!(mailbox.provider.as_str(), "gmail" | "outlook")
+        || mailbox.provider != credential.provider
+    {
+        anyhow::bail!("mailbox and credential provider must match")
+    }
+    if mailbox.status != "connected" {
+        anyhow::bail!("OAuth mailbox must be connected")
+    }
+    if credential.provider_subject.trim().is_empty()
+        || credential.access_token.trim().is_empty()
+        || credential.refresh_token.trim().is_empty()
+    {
+        anyhow::bail!("provider credential is incomplete")
+    }
+
+    mailbox.account_label = normalize_application_email(&mailbox.account_label)?;
+    mailbox.aliases = mailbox
+        .aliases
+        .iter()
+        .filter_map(|alias| normalize_application_email(alias).ok())
+        .collect();
+    mailbox.aliases.sort();
+    mailbox.aliases.dedup();
+    if mailbox.capabilities.is_empty() {
+        mailbox.capabilities = vec![
+            "status_sync".to_string(),
+            "application_correlation".to_string(),
+            "review_interventions".to_string(),
+        ];
+    }
+
+    let provider_subject = credential.provider_subject.trim();
+    let subject_hash = private_lookup_hash(
+        &format!("mailbox:{}", mailbox.provider),
+        provider_subject,
+    )?;
+    let existing =
+        mailbox_connection_by_subject(pool, account_id, &mailbox.provider, &subject_hash)?;
+    let is_new = existing.is_none();
+    if let Some(existing) = existing {
+        mailbox.id = existing.id;
+        mailbox.created_at_ms = existing.created_at_ms;
+    } else if mailbox.id.is_empty() {
+        mailbox.id = uuid::Uuid::new_v4().to_string();
+    }
+
+    let now = now_ms();
+    if mailbox.created_at_ms == 0 {
+        mailbox.created_at_ms = now;
+    }
+    mailbox.updated_at_ms = now;
+
+    let mut stored_credential = credential.clone();
+    stored_credential.connection_id = mailbox.id.clone();
+    if stored_credential.created_at_ms == 0 {
+        stored_credential.created_at_ms = now;
+    }
+    stored_credential.updated_at_ms = now;
+
+    let mailbox_payload = to_json(&mailbox, "mailbox connection")?;
+    let credential_payload = to_json(&stored_credential, "Jobs provider credential")?;
+    let sync_state = JobsProviderSyncState {
+        connection_id: mailbox.id.clone(),
+        provider: mailbox.provider.clone(),
+        cursor: json!({}),
+        next_sync_at_ms: now,
+        last_synced_at_ms: None,
+        last_error: String::new(),
+        lease_owner: None,
+        lease_expires_at_ms: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let sync_payload = to_json(&sync_state, "Jobs provider sync state")?;
+    let entitlement = get_entitlement(pool, account_id)?;
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if is_new {
+                let active_count: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND status != 'disconnected'",
+                    params![account_id],
+                    |row| row.get(0),
+                )?;
+                if active_count >= entitlement.connected_inbox_limit {
+                    anyhow::bail!("connected inbox limit reached for this Jobs plan")
+                }
+            }
+            tx.execute(
+                "INSERT INTO jobs_mailbox_connections (
+                    id, account_id, provider, provider_subject_hash, status,
+                    connection_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(id) DO UPDATE SET status = excluded.status,
+                    connection_json = excluded.connection_json,
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_mailbox_connections.account_id = excluded.account_id",
+                params![
+                    mailbox.id,
+                    account_id,
+                    mailbox.provider,
+                    subject_hash,
+                    mailbox.status,
+                    mailbox_payload,
+                    mailbox.created_at_ms,
+                    mailbox.updated_at_ms,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_provider_credentials (
+                    connection_id, account_id, provider, provider_subject_hash,
+                    credential_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(connection_id) DO UPDATE SET
+                    provider = excluded.provider,
+                    provider_subject_hash = excluded.provider_subject_hash,
+                    credential_json = excluded.credential_json,
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_provider_credentials.account_id = excluded.account_id",
+                params![
+                    stored_credential.connection_id,
+                    account_id,
+                    stored_credential.provider,
+                    subject_hash,
+                    credential_payload,
+                    stored_credential.created_at_ms,
+                    stored_credential.updated_at_ms,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_provider_sync_state (
+                    connection_id, account_id, provider, sync_json, next_sync_at_ms,
+                    last_synced_at_ms, lease_owner, lease_expires_at_ms,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?7)
+                 ON CONFLICT(connection_id) DO NOTHING",
+                params![
+                    mailbox.id,
+                    account_id,
+                    mailbox.provider,
+                    sync_payload,
+                    sync_state.next_sync_at_ms,
+                    sync_state.created_at_ms,
+                    sync_state.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((mailbox, stored_credential))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            tx.query_one(
+                "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+                &[&account_id],
+            )?;
+            if is_new {
+                let active_count: i64 = tx
+                    .query_one(
+                        "SELECT COUNT(*) FROM jobs_mailbox_connections
+                          WHERE account_id = $1 AND status != 'disconnected'",
+                        &[&account_id],
+                    )?
+                    .get(0);
+                if active_count >= entitlement.connected_inbox_limit {
+                    anyhow::bail!("connected inbox limit reached for this Jobs plan")
+                }
+            }
+            tx.execute(
+                "INSERT INTO jobs_mailbox_connections (
+                    id, account_id, provider, provider_subject_hash, status,
+                    connection_json, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT(id) DO UPDATE SET status = EXCLUDED.status,
+                    connection_json = EXCLUDED.connection_json,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_mailbox_connections.account_id = EXCLUDED.account_id",
+                &[
+                    &mailbox.id,
+                    &account_id,
+                    &mailbox.provider,
+                    &subject_hash,
+                    &mailbox.status,
+                    &mailbox_payload,
+                    &mailbox.created_at_ms,
+                    &mailbox.updated_at_ms,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_provider_credentials (
+                    connection_id, account_id, provider, provider_subject_hash,
+                    credential_json, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT(connection_id) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    provider_subject_hash = EXCLUDED.provider_subject_hash,
+                    credential_json = EXCLUDED.credential_json,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_provider_credentials.account_id = EXCLUDED.account_id",
+                &[
+                    &stored_credential.connection_id,
+                    &account_id,
+                    &stored_credential.provider,
+                    &subject_hash,
+                    &credential_payload,
+                    &stored_credential.created_at_ms,
+                    &stored_credential.updated_at_ms,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_provider_sync_state (
+                    connection_id, account_id, provider, sync_json, next_sync_at_ms,
+                    last_synced_at_ms, lease_owner, lease_expires_at_ms,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, NULL, NULL, NULL, $6, $7)
+                 ON CONFLICT(connection_id) DO NOTHING",
+                &[
+                    &mailbox.id,
+                    &account_id,
+                    &mailbox.provider,
+                    &sync_payload,
+                    &sync_state.next_sync_at_ms,
+                    &sync_state.created_at_ms,
+                    &sync_state.updated_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok((mailbox, stored_credential))
+        }
     })
 }
 
@@ -1816,7 +2075,11 @@ pub fn save_mailbox_connection(
     }
     value.updated_at_ms = now;
     if value.capabilities.is_empty() {
-        value.capabilities = vec!["status_sync".to_string(), "follow_ups".to_string()];
+        value.capabilities = vec![
+            "status_sync".to_string(),
+            "application_correlation".to_string(),
+            "review_interventions".to_string(),
+        ];
     }
     let payload = to_json(&value, "mailbox connection")?;
     crate::db::run_blocking_db(|| match pool {
@@ -1883,6 +2146,276 @@ pub fn delete_mailbox_connection(
             "DELETE FROM jobs_mailbox_connections WHERE account_id = $1 AND id = $2",
             &[&account_id, &connection_id],
         )? > 0),
+    })
+}
+
+pub fn mark_mailbox_reauthorization_required(
+    pool: &DbPool,
+    account_id: &str,
+    connection_id: &str,
+) -> Result<bool> {
+    let Some(mut mailbox) = mailbox_connection(pool, account_id, connection_id)? else {
+        return Ok(false);
+    };
+    if mailbox.status == "reauthorization_required" {
+        return Ok(true);
+    }
+    mailbox.status = "reauthorization_required".to_string();
+    mailbox.updated_at_ms = now_ms();
+    let payload = to_json(&mailbox, "mailbox connection")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
+            "UPDATE jobs_mailbox_connections
+                SET status = 'reauthorization_required',
+                    connection_json = ?3,
+                    updated_at_ms = ?4
+              WHERE account_id = ?1 AND id = ?2",
+            params![
+                account_id,
+                connection_id,
+                payload,
+                mailbox.updated_at_ms
+            ],
+        )? > 0),
+        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
+            "UPDATE jobs_mailbox_connections
+                SET status = 'reauthorization_required',
+                    connection_json = $3,
+                    updated_at_ms = $4
+              WHERE account_id = $1 AND id = $2",
+            &[
+                &account_id,
+                &connection_id,
+                &payload,
+                &mailbox.updated_at_ms,
+            ],
+        )? > 0),
+    })
+}
+
+pub fn save_jobs_oauth_state(
+    pool: &DbPool,
+    account_id: &str,
+    state_token: &str,
+    state: &JobsOAuthState,
+) -> Result<()> {
+    if state_token.trim().len() < 32 {
+        anyhow::bail!("OAuth state token is too short")
+    }
+    if !matches!(state.provider.as_str(), "gmail" | "outlook") {
+        anyhow::bail!("unsupported Jobs OAuth provider")
+    }
+    let state_hash = private_lookup_hash("jobs-oauth-state", state_token.trim())?;
+    let payload = to_json(state, "Jobs OAuth state")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.execute(
+                "DELETE FROM jobs_oauth_states WHERE expires_at_ms <= ?1",
+                params![now_ms()],
+            )?;
+            conn.execute(
+                "INSERT INTO jobs_oauth_states (
+                    state_hash, account_id, provider, state_json, expires_at_ms, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(state_hash) DO NOTHING",
+                params![
+                    state_hash,
+                    account_id,
+                    state.provider,
+                    payload,
+                    state.expires_at_ms,
+                    state.created_at_ms,
+                ],
+            )?;
+            Ok(())
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM jobs_oauth_states WHERE expires_at_ms <= $1",
+                &[&now_ms()],
+            )?;
+            tx.execute(
+                "INSERT INTO jobs_oauth_states (
+                    state_hash, account_id, provider, state_json, expires_at_ms, created_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6)
+                 ON CONFLICT(state_hash) DO NOTHING",
+                &[
+                    &state_hash,
+                    &account_id,
+                    &state.provider,
+                    &payload,
+                    &state.expires_at_ms,
+                    &state.created_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        }
+    })
+}
+
+pub fn consume_jobs_oauth_state(
+    pool: &DbPool,
+    state_token: &str,
+) -> Result<Option<(String, JobsOAuthState)>> {
+    let state_hash = private_lookup_hash("jobs-oauth-state", state_token.trim())?;
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction()?;
+            let row: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT account_id, state_json, expires_at_ms
+                       FROM jobs_oauth_states
+                      WHERE state_hash = ?1",
+                    params![state_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            tx.execute(
+                "DELETE FROM jobs_oauth_states WHERE state_hash = ?1",
+                params![state_hash],
+            )?;
+            tx.commit()?;
+            let Some((account_id, payload, expires_at_ms)) = row else {
+                return Ok(None);
+            };
+            if expires_at_ms <= now {
+                return Ok(None);
+            }
+            Ok(Some((
+                account_id,
+                parse_json(payload, "Jobs OAuth state")?,
+            )))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let row = tx.query_opt(
+                "DELETE FROM jobs_oauth_states
+                       WHERE state_hash = $1
+                   RETURNING account_id, state_json, expires_at_ms",
+                &[&state_hash],
+            )?;
+            tx.commit()?;
+            let Some(row) = row else {
+                return Ok(None);
+            };
+            let expires_at_ms: i64 = row.get(2);
+            if expires_at_ms <= now {
+                return Ok(None);
+            }
+            Ok(Some((
+                row.get(0),
+                parse_json(row.get(1), "Jobs OAuth state")?,
+            )))
+        }
+    })
+}
+
+pub fn save_jobs_provider_credential(
+    pool: &DbPool,
+    account_id: &str,
+    credential: &JobsProviderCredential,
+) -> Result<JobsProviderCredential> {
+    if !matches!(credential.provider.as_str(), "gmail" | "outlook") {
+        anyhow::bail!("unsupported Jobs credential provider")
+    }
+    if credential.connection_id.trim().is_empty()
+        || credential.provider_subject.trim().is_empty()
+        || credential.access_token.trim().is_empty()
+    {
+        anyhow::bail!("provider credential is incomplete")
+    }
+    let provider_subject_hash = private_lookup_hash(
+        &format!("mailbox:{}", credential.provider),
+        credential.provider_subject.trim(),
+    )?;
+    let payload = to_json(credential, "Jobs provider credential")?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            pool.get()?.execute(
+                "INSERT INTO jobs_provider_credentials (
+                    connection_id, account_id, provider, provider_subject_hash,
+                    credential_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(connection_id) DO UPDATE SET
+                    provider = excluded.provider,
+                    provider_subject_hash = excluded.provider_subject_hash,
+                    credential_json = excluded.credential_json,
+                    updated_at_ms = excluded.updated_at_ms
+                 WHERE jobs_provider_credentials.account_id = excluded.account_id",
+                params![
+                    credential.connection_id,
+                    account_id,
+                    credential.provider,
+                    provider_subject_hash,
+                    payload,
+                    credential.created_at_ms,
+                    credential.updated_at_ms,
+                ],
+            )?;
+            Ok(credential.clone())
+        }
+        DbPool::Postgres(_) => {
+            pool.get_pg()?.execute(
+                "INSERT INTO jobs_provider_credentials (
+                    connection_id, account_id, provider, provider_subject_hash,
+                    credential_json, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 ON CONFLICT(connection_id) DO UPDATE SET
+                    provider = EXCLUDED.provider,
+                    provider_subject_hash = EXCLUDED.provider_subject_hash,
+                    credential_json = EXCLUDED.credential_json,
+                    updated_at_ms = EXCLUDED.updated_at_ms
+                 WHERE jobs_provider_credentials.account_id = EXCLUDED.account_id",
+                &[
+                    &credential.connection_id,
+                    &account_id,
+                    &credential.provider,
+                    &provider_subject_hash,
+                    &payload,
+                    &credential.created_at_ms,
+                    &credential.updated_at_ms,
+                ],
+            )?;
+            Ok(credential.clone())
+        }
+    })
+}
+
+pub fn jobs_provider_credential(
+    pool: &DbPool,
+    account_id: &str,
+    connection_id: &str,
+) -> Result<Option<JobsProviderCredential>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let raw: Option<String> = pool
+                .get()?
+                .query_row(
+                    "SELECT credential_json FROM jobs_provider_credentials
+                      WHERE account_id = ?1 AND connection_id = ?2",
+                    params![account_id, connection_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            raw.map(|value| parse_json(value, "Jobs provider credential"))
+                .transpose()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT credential_json FROM jobs_provider_credentials
+                  WHERE account_id = $1 AND connection_id = $2",
+                &[&account_id, &connection_id],
+            )?
+            .map(|row| parse_json(row.get(0), "Jobs provider credential"))
+            .transpose(),
     })
 }
 

@@ -21,6 +21,10 @@ import type {
   JobsIntegration,
   JobsWorkspace,
   MailboxConnection,
+  MailboxMessage,
+  MailboxOAuthStart,
+  MailboxProviderAvailability,
+  MailboxSyncState,
   PacketCommitResult,
   QueueApplicationRunResponse,
   PrepareApplicationResponse,
@@ -393,11 +397,24 @@ export const jobsApi = {
     }),
   deleteApplicationIdentity: (id: string) =>
     request<void>(`/api/jobs/application-identities/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  requestMailboxConnection: (connection: MailboxConnection) =>
-    request<MailboxConnection>("/api/jobs/mailbox-connections", {
+  mailboxOAuthProviders: () =>
+    request<MailboxProviderAvailability[]>("/api/jobs/mailbox-oauth/config"),
+  startMailboxOAuth: (provider: MailboxConnection["provider"]) =>
+    request<MailboxOAuthStart>(`/api/jobs/mailbox-oauth/${encodeURIComponent(provider)}/start`, {
       method: "POST",
-      body: JSON.stringify(connection),
     }),
+  mailboxSyncState: (id: string) =>
+    request<MailboxSyncState>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync-state`),
+  syncMailbox: (id: string) =>
+    request<MailboxSyncState>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync`, {
+      method: "POST",
+    }),
+  mailboxMessages: (connectionId?: string, status?: string, limit = 50) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (connectionId) params.set("connection_id", connectionId);
+    if (status) params.set("status", status);
+    return request<MailboxMessage[]>(`/api/jobs/mailbox-messages?${params.toString()}`);
+  },
   deleteMailboxConnection: (id: string) =>
     request<void>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
 };

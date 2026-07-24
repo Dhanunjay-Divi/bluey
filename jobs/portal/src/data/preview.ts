@@ -569,7 +569,7 @@ export const previewWorkspace: JobsWorkspace = {
       status: "connected",
       account_label: "taylor@example.com",
       aliases: ["jobs@taylor.build"],
-      capabilities: ["status_sync", "follow_ups"],
+      capabilities: ["status_sync", "application_correlation", "review_interventions"],
       created_at_ms: now - 4_320_000,
       updated_at_ms: now - 86_000,
     },

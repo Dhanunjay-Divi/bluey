@@ -1,6 +1,10 @@
 import { parseFragment, type DefaultTreeAdapterMap } from "parse5";
 
 import type { PublicAtsSource } from "./contracts.js";
+import {
+  assessJobSourceTrust,
+  type SourceTrustAssessment,
+} from "./job-source-intelligence.js";
 import { submissionPolicy, type SubmissionCapability } from "./policy.js";
 
 const MAX_FEED_BYTES = 2 * 1024 * 1024;
@@ -47,6 +51,7 @@ export interface CuratedFeedLead {
   categoryEvidence: "explicit" | "feed_default";
   submissionCapability: SubmissionCapability;
   atsSource: PublicAtsSource | null;
+  sourceTrust: SourceTrustAssessment;
   requiresOriginalRevalidation: true;
 }
 
@@ -225,6 +230,7 @@ export function parseCuratedFeed(feedId: CuratedFeedId, content: string): Curate
         categoryEvidence: categories.explicit ? "explicit" : "feed_default",
         submissionCapability: submissionPolicy(originalUrl).capability,
         atsSource: publicAtsSourceFromUrl(originalUrl, company),
+        sourceTrust: assessJobSourceTrust({ applicationUrl: originalUrl, company }),
         requiresOriginalRevalidation: true,
       });
     }

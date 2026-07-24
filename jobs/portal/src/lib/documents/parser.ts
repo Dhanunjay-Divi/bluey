@@ -571,14 +571,23 @@ function isBullet(line: string): boolean {
   return /^\s*[-*•]/.test(line);
 }
 
+const EMPLOYMENT_NARRATIVE_START_PATTERN = /^(?:achieved|administered|analyzed|assisted|built|collaborated|coordinated|created|delivered|designed|developed|directed|drove|established|executed|implemented|improved|increased|launched|led|managed|optimized|owned|reduced|supported|trained|verified|worked)\b/i;
+
 function isUsefulHighlight(line: string): boolean {
   const value = stripBullet(line);
   return (
     isBullet(line) ||
     value.length > 90 ||
     /[.!?]$/.test(value) ||
-    /^(?:achieved|administered|analyzed|built|collaborated|coordinated|created|delivered|designed|developed|directed|drove|established|executed|implemented|improved|increased|launched|led|managed|optimized|owned|reduced|supported|trained|verified)\b/i.test(value)
+    EMPLOYMENT_NARRATIVE_START_PATTERN.test(value)
   );
+}
+
+function looksLikeEmploymentNarrative(line: string): boolean {
+  const value = stripBullet(line).trim();
+  if (!value) return false;
+  if (isBullet(line) || EMPLOYMENT_NARRATIVE_START_PATTERN.test(value)) return true;
+  return value.split(/\s+/).length >= 12 && /[.!?]$/.test(value);
 }
 
 function looksLikeContact(line: string): boolean {
@@ -725,6 +734,7 @@ function augmentEmploymentBlock(block: DatedBlock): { candidates: string[]; body
     if (!clean || isNestedAssignmentLine(clean) || /^(?:responsibilities|duties)\s*:?$/i.test(clean)) {
       continue;
     }
+    if (looksLikeEmploymentNarrative(line)) break;
     const parsed = splitEmploymentCandidate(clean);
     const headerLike = (
       !isBullet(line) &&

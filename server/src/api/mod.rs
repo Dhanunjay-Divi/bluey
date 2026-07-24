@@ -21,6 +21,8 @@ pub mod jobs;
 mod jobs_import;
 pub mod jobs_interview_prep;
 pub mod jobs_local_capability;
+mod jobs_mailbox;
+pub mod jobs_mailbox_oauth;
 pub(crate) mod jobs_resume_assets;
 pub(crate) mod jobs_resume_generation;
 mod jobs_source_directory;
@@ -186,7 +188,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
                 state.clone(),
                 crate::rate_limit::limit_jobs_local_runner,
             )),
-        );
+        )
+        .merge(jobs_mailbox_oauth::public_router().route_layer(
+            axum::middleware::from_fn_with_state(state.clone(), crate::rate_limit::limit_auth_otp),
+        ));
 
     // ---- Admin-only (require_auth + require_admin) -------------------------
     let admin_only = Router::new()
@@ -402,6 +407,9 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
 
     Router::new()
         .route("/health", get(admin::health))
+        .merge(jobs_mailbox_oauth::public_router().route_layer(
+            axum::middleware::from_fn_with_state(state.clone(), crate::rate_limit::limit_auth_otp),
+        ))
         .merge(
             jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
                 state.clone(),

@@ -6,6 +6,7 @@ import type {
   NormalizedJob,
   PublicAtsSource,
 } from "./contracts.js";
+import { findPotentialCrossListings } from "./job-source-intelligence.js";
 import { submissionPolicy } from "./policy.js";
 
 const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
@@ -105,6 +106,12 @@ export class PublicAtsDiscoveryProvider implements DiscoveryProvider {
     const jobs = recentJobs
       .filter((job) => job.title.length > 0 && job.canonicalUrl.length > 0)
       .filter((job) => matchesQuery(job, query));
+    const crossListings = findPotentialCrossListings(jobs);
+    if (crossListings.length > 0) {
+      warnings.push(
+        `${crossListings.length} possible cross-listed posting pair${crossListings.length === 1 ? "" : "s"} kept separate for original-source comparison.`,
+      );
+    }
     return {
       jobs: jobs.slice(0, clamp(query.pageSize ?? 100, 1, 250)),
       warnings: warnings.length ? warnings : undefined,

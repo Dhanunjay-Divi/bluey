@@ -19,8 +19,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        let identity = ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com")
-            .unwrap();
+        let identity =
+            ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com").unwrap();
         upsert_track(
             &pool,
             "acct-jobs",
@@ -188,11 +188,15 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         };
-        let evidence = role_experience_evidence(&profile, Some(&track), &test_posting(
-            "https://boards.greenhouse.io/example/jobs/evidence",
-            now_ms(),
-            now_ms(),
-        ));
+        let evidence = role_experience_evidence(
+            &profile,
+            Some(&track),
+            &test_posting(
+                "https://boards.greenhouse.io/example/jobs/evidence",
+                now_ms(),
+                now_ms(),
+            ),
+        );
         assert_eq!(evidence.total_months, 24);
         assert_eq!(evidence.target_min_months, 12);
         assert_eq!(evidence.target_max_months, 48);
@@ -208,9 +212,19 @@ mod tests {
         );
         aligned.track_id = track.id.clone();
         aligned.description = "Requires 4+ years of software engineering experience.".to_string();
-        assert_eq!(experience_requirement(&aligned).required_min_months, Some(48));
-        let aligned_decision =
-            build_job_eligibility(&aligned, &profile, &preferences, &[], false, None, Some(&track));
+        assert_eq!(
+            experience_requirement(&aligned).required_min_months,
+            Some(48)
+        );
+        let aligned_decision = build_job_eligibility(
+            &aligned,
+            &profile,
+            &preferences,
+            &[],
+            false,
+            None,
+            Some(&track),
+        );
         assert!(aligned_decision
             .passed_checks
             .iter()
@@ -241,16 +255,15 @@ mod tests {
         title_only_senior.track_id = track.id.clone();
         title_only_senior.title = "Senior Software Engineer".to_string();
         title_only_senior.description = "Build reliable products with Rust.".to_string();
-        let blocked =
-            build_job_eligibility(
-                &title_only_senior,
-                &profile,
-                &preferences,
-                &[],
-                false,
-                None,
-                Some(&track),
-            );
+        let blocked = build_job_eligibility(
+            &title_only_senior,
+            &profile,
+            &preferences,
+            &[],
+            false,
+            None,
+            Some(&track),
+        );
         assert!(blocked
             .hard_failures
             .iter()
@@ -503,26 +516,26 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-                "INSERT INTO jobs_global_candidates (
+            "INSERT INTO jobs_global_candidates (
                     id, canonical_key, candidate_json, company, title, location, workplace,
                     canonical_url, role_family, posted_at_ms, availability_status,
                     first_seen_at_ms, last_seen_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'software_engineering',
                            ?9, 'active', ?10, ?10, ?10)",
-                params![
-                    id,
-                    posting.canonical_key,
-                    to_json(&input, "global candidate input").unwrap(),
-                    input.company,
-                    input.title,
-                    input.location,
-                    input.workplace,
-                    input.canonical_url,
-                    input.posted_at_ms,
-                    updated_at_ms,
-                ],
-            )
-            .unwrap();
+            params![
+                id,
+                posting.canonical_key,
+                to_json(&input, "global candidate input").unwrap(),
+                input.company,
+                input.title,
+                input.location,
+                input.workplace,
+                input.canonical_url,
+                input.posted_at_ms,
+                updated_at_ms,
+            ],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO jobs_global_candidate_memberships (
                 source_id, external_id, candidate_id, content_hash, first_seen_at_ms,
@@ -941,12 +954,9 @@ mod tests {
             now_ms(),
         );
 
-        let first = materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        let first =
+            materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap();
         assert_eq!(first.materialized_count, 1);
         assert_eq!(first.refreshed_count, 0);
 
@@ -956,24 +966,15 @@ mod tests {
         assert_eq!(postings[0].source, "curated_feed:jobhive:lever");
         assert_eq!(postings[0].availability_status, "unknown");
         assert!(postings[0].last_verified_at_ms.is_none());
-        let decision = evaluate_job_eligibility(
-            &pool,
-            "acct-jobs",
-            &postings[0],
-            true,
-            None,
-        )
-        .unwrap();
+        let decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &postings[0], true, None).unwrap();
         assert!(!decision.can_prepare);
         assert!(!decision.can_queue_local);
         assert!(!decision.can_queue_cloud);
 
-        let second = materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        let second =
+            materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap();
         assert_eq!(second, empty_global_materialization_result());
         assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
     }
@@ -981,12 +982,7 @@ mod tests {
     #[test]
     fn global_candidates_wait_for_their_ingestion_run_to_complete() {
         let pool = test_pool();
-        save_profile(
-            &pool,
-            "acct-jobs",
-            &default_profile("jobs@example.com"),
-        )
-        .unwrap();
+        save_profile(&pool, "acct-jobs", &default_profile("jobs@example.com")).unwrap();
         insert_global_candidate_with_run_status(
             &pool,
             "candidate-global-running",
@@ -996,12 +992,9 @@ mod tests {
             "running",
         );
 
-        let hidden = materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        let hidden =
+            materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap();
         assert_eq!(hidden, empty_global_materialization_result());
         assert!(list_postings(&pool, "acct-jobs").unwrap().is_empty());
 
@@ -1016,12 +1009,9 @@ mod tests {
             )
             .unwrap();
 
-        let visible = materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        let visible =
+            materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap();
         assert_eq!(visible.materialized_count, 1);
         assert_eq!(list_postings(&pool, "acct-jobs").unwrap().len(), 1);
     }
@@ -1124,11 +1114,9 @@ mod tests {
 
         let conn = pool.get().unwrap();
         let candidates: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM jobs_global_candidates",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM jobs_global_candidates", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         let memberships: i64 = conn
             .query_row(
@@ -1164,12 +1152,9 @@ mod tests {
             now_ms(),
         );
 
-        let result = materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        let result =
+            materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap();
         assert_eq!(result.materialized_count, 0);
         assert_eq!(result.skipped_count, 1);
         let postings = list_postings(&pool, "acct-jobs").unwrap();
@@ -1182,12 +1167,7 @@ mod tests {
     #[test]
     fn expired_global_candidates_leave_the_account_review_queue() {
         let pool = test_pool();
-        save_profile(
-            &pool,
-            "acct-jobs",
-            &default_profile("jobs@example.com"),
-        )
-        .unwrap();
+        save_profile(&pool, "acct-jobs", &default_profile("jobs@example.com")).unwrap();
         insert_global_candidate(
             &pool,
             "candidate-global-expired",
@@ -1195,12 +1175,7 @@ mod tests {
             "https://jobs.lever.co/acme/software-engineer",
             now_ms(),
         );
-        materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com").unwrap();
 
         pool.get()
             .unwrap()
@@ -1211,12 +1186,7 @@ mod tests {
                 params!["candidate-global-expired", now_ms() + 1_000],
             )
             .unwrap();
-        materialize_global_candidates_for_account(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-        )
-        .unwrap();
+        materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com").unwrap();
 
         let postings = list_postings(&pool, "acct-jobs").unwrap();
         assert_eq!(postings.len(), 1);
@@ -1364,14 +1334,7 @@ mod tests {
         let direct_url = "https://jobs.lever.co/acme/software-engineer";
         let mut direct = test_posting(direct_url, now_ms() - DAY_MS, now_ms());
         direct.source = "lever".to_string();
-        let direct = upsert_posting(
-            &pool,
-            "acct-jobs",
-            &direct,
-            &profile,
-            &preferences,
-        )
-        .unwrap();
+        let direct = upsert_posting(&pool, "acct-jobs", &direct, &profile, &preferences).unwrap();
         assert_eq!(direct.availability_status, "active");
         assert!(direct.last_verified_at_ms.is_some());
 
@@ -4652,8 +4615,7 @@ mod tests {
             now_ms(),
         );
         posting.employment_type = "contract c2c".to_string();
-        let posting =
-            upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
 
         let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
         assert!(!decision.can_prepare);
@@ -4685,8 +4647,7 @@ mod tests {
             now_ms(),
         );
         posting.employment_type = "contract".to_string();
-        let posting =
-            upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
 
         let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
         assert!(decision.can_prepare, "unexpected decision: {decision:#?}");
@@ -5106,6 +5067,553 @@ mod tests {
         let mailboxes = list_mailbox_connections(&pool, "acct-jobs").unwrap();
         assert_eq!(mailboxes.len(), 2);
         assert!(mailboxes.iter().all(|item| item.provider == "gmail"));
+    }
+
+    #[test]
+    fn mailbox_connections_only_advertise_implemented_capabilities() {
+        let pool = test_pool();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-capabilities",
+        )
+        .unwrap();
+
+        assert_eq!(
+            mailbox.capabilities,
+            vec![
+                "status_sync",
+                "application_correlation",
+                "review_interventions"
+            ]
+        );
+    }
+
+    #[test]
+    fn oauth_state_is_encrypted_single_use_and_expires() {
+        let pool = test_pool();
+        let now = now_ms();
+        let token = "state-token-with-more-than-thirty-two-random-characters";
+        let state = JobsOAuthState {
+            provider: "gmail".to_string(),
+            code_verifier: "pkce-secret-that-must-not-be-visible-at-rest".to_string(),
+            return_path: "/jobs/settings".to_string(),
+            expires_at_ms: now + 60_000,
+            created_at_ms: now,
+        };
+        save_jobs_oauth_state(&pool, "acct-jobs", token, &state).unwrap();
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row("SELECT state_json FROM jobs_oauth_states", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(!raw.contains("pkce-secret"));
+        let (account_id, consumed) = consume_jobs_oauth_state(&pool, token)
+            .unwrap()
+            .expect("state exists");
+        assert_eq!(account_id, "acct-jobs");
+        assert_eq!(consumed, state);
+        assert!(consume_jobs_oauth_state(&pool, token).unwrap().is_none());
+
+        let expired_token = "another-state-token-with-more-than-thirty-two-characters";
+        save_jobs_oauth_state(
+            &pool,
+            "acct-jobs",
+            expired_token,
+            &JobsOAuthState {
+                expires_at_ms: now - 1,
+                ..consumed
+            },
+        )
+        .unwrap();
+        assert!(consume_jobs_oauth_state(&pool, expired_token)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn provider_credentials_are_encrypted_and_tenant_scoped() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-credential-test",
+        )
+        .unwrap();
+        let now = now_ms();
+        let credential = JobsProviderCredential {
+            connection_id: mailbox.id.clone(),
+            provider: "gmail".to_string(),
+            provider_subject: "google-subject-credential-test".to_string(),
+            access_token: "provider-access-token-secret".to_string(),
+            refresh_token: "provider-refresh-token-secret".to_string(),
+            scopes: vec!["gmail.readonly".to_string()],
+            expires_at_ms: now + 3_600_000,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        save_jobs_provider_credential(&pool, "acct-jobs", &credential).unwrap();
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT credential_json FROM jobs_provider_credentials WHERE connection_id = ?1",
+                params![mailbox.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("provider-access-token"));
+        assert_eq!(
+            jobs_provider_credential(&pool, "acct-jobs", &credential.connection_id)
+                .unwrap()
+                .unwrap(),
+            credential
+        );
+        assert!(
+            jobs_provider_credential(&pool, "acct-other", &credential.connection_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(delete_mailbox_connection(&pool, "acct-jobs", &mailbox.id).unwrap());
+        assert!(
+            jobs_provider_credential(&pool, "acct-jobs", &credential.connection_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn oauth_mailbox_setup_atomically_initializes_sync_state() {
+        let pool = test_pool();
+        let now = now_ms();
+        let (mailbox, credential) = save_mailbox_connection_with_credential(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: vec!["jobs+applications@example.com".to_string()],
+                capabilities: Vec::new(),
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            &JobsProviderCredential {
+                connection_id: String::new(),
+                provider: "gmail".to_string(),
+                provider_subject: "google-subject-atomic-setup".to_string(),
+                access_token: "atomic-access-token".to_string(),
+                refresh_token: "atomic-refresh-token".to_string(),
+                scopes: vec!["gmail.readonly".to_string()],
+                expires_at_ms: now + 3_600_000,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(mailbox.id, credential.connection_id);
+        assert_eq!(
+            jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+                .unwrap()
+                .unwrap()
+                .refresh_token,
+            "atomic-refresh-token"
+        );
+        let sync = mailbox_sync_state(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .expect("OAuth setup creates the durable sync state");
+        assert_eq!(sync.provider, "gmail");
+        assert!(sync
+            .cursor
+            .as_object()
+            .is_some_and(|cursor| cursor.is_empty()));
+        assert!(sync.lease_owner.is_none());
+    }
+
+    #[test]
+    fn mailbox_sync_lease_is_exclusive_and_recovers_after_expiry() {
+        let pool = test_pool();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "outlook".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "microsoft-subject-lease-test",
+        )
+        .unwrap();
+        initialize_mailbox_sync_state(&pool, "acct-jobs", &mailbox.id, "outlook").unwrap();
+
+        let first = claim_mailbox_sync(&pool, "acct-jobs", &mailbox.id, "worker-a", 60_000)
+            .unwrap()
+            .expect("first worker claims the mailbox");
+        assert_eq!(first.lease_owner.as_deref(), Some("worker-a"));
+        assert!(
+            claim_mailbox_sync(&pool, "acct-jobs", &mailbox.id, "worker-b", 60_000)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!finish_mailbox_sync(
+            &pool,
+            "acct-jobs",
+            &mailbox.id,
+            "worker-b",
+            json!({"delta_link": "wrong-owner"}),
+            "",
+            None,
+        )
+        .unwrap());
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_sync_state
+                    SET lease_expires_at_ms = ?2
+                  WHERE connection_id = ?1",
+                params![mailbox.id, now_ms() - 1],
+            )
+            .unwrap();
+        let recovered = claim_mailbox_sync(&pool, "acct-jobs", &mailbox.id, "worker-b", 60_000)
+            .unwrap()
+            .expect("expired lease can be recovered");
+        assert_eq!(recovered.lease_owner.as_deref(), Some("worker-b"));
+        assert!(finish_mailbox_sync(
+            &pool,
+            "acct-jobs",
+            &mailbox.id,
+            "worker-b",
+            json!({"delta_link": "next"}),
+            "",
+            Some(now_ms() + 120_000),
+        )
+        .unwrap());
+        let finished = mailbox_sync_state(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(finished.cursor["delta_link"], "next");
+        assert!(finished.last_synced_at_ms.is_some());
+        assert!(finished.lease_owner.is_none());
+    }
+
+    #[test]
+    fn reconnect_required_mailboxes_are_not_claimed_until_reconnected() {
+        let pool = test_pool();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-reconnect-required",
+        )
+        .unwrap();
+        initialize_mailbox_sync_state(&pool, "acct-jobs", &mailbox.id, "gmail").unwrap();
+
+        assert!(mark_mailbox_reauthorization_required(&pool, "acct-jobs", &mailbox.id).unwrap());
+        assert_eq!(
+            mailbox_connection(&pool, "acct-jobs", &mailbox.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "reauthorization_required"
+        );
+        assert!(claim_mailbox_sync(
+            &pool,
+            "acct-jobs",
+            &mailbox.id,
+            "single-worker",
+            60_000
+        )
+        .unwrap()
+        .is_none());
+        assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 10)
+            .unwrap()
+            .is_empty());
+
+        let reconnected = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                status: "connected".to_string(),
+                ..mailbox.clone()
+            },
+            "google-subject-reconnect-required",
+        )
+        .unwrap();
+        assert_eq!(reconnected.id, mailbox.id);
+        assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 10)
+            .unwrap()
+            .iter()
+            .any(|(account_id, state)| {
+                account_id == "acct-jobs" && state.connection_id == mailbox.id
+            }));
+        assert!(mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id)
+            .unwrap()
+            == false);
+    }
+
+    #[test]
+    fn provider_messages_are_idempotent_encrypted_and_tenant_scoped() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-message-test",
+        )
+        .unwrap();
+        let message = JobsProviderMessage {
+            id: String::new(),
+            connection_id: mailbox.id.clone(),
+            provider: "gmail".to_string(),
+            external_id: "gmail-message-123".to_string(),
+            sender: "recruiter@example.org".to_string(),
+            recipients: vec!["jobs@example.com".to_string()],
+            subject: "Interview availability".to_string(),
+            body_text: "Please share a few interview times.".to_string(),
+            received_at_ms: now_ms(),
+            application_id: None,
+            processing_status: "needs_input".to_string(),
+            classification: "interview".to_string(),
+            confidence: 0.98,
+            metadata: json!({"thread_id": "gmail-thread-456"}),
+            processed_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let (stored, inserted) = save_provider_message(&pool, "acct-jobs", &message).unwrap();
+        assert!(inserted);
+        let (redelivered, inserted_again) =
+            save_provider_message(&pool, "acct-jobs", &message).unwrap();
+        assert!(!inserted_again);
+        assert_eq!(stored.id, redelivered.id);
+        assert_eq!(
+            list_provider_messages(&pool, "acct-jobs", Some(&mailbox.id), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(list_provider_messages(&pool, "acct-other", None, 20)
+            .unwrap()
+            .is_empty());
+
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT message_json FROM jobs_provider_messages WHERE id = ?1",
+                params![stored.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("Please share a few interview times"));
+        assert!(!raw.contains("recruiter@example.org"));
+    }
+
+    #[test]
+    fn mailbox_sync_can_be_scheduled_immediately_without_stealing_a_lease() {
+        let pool = test_pool();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-sync-now",
+        )
+        .unwrap();
+        initialize_mailbox_sync_state(&pool, "acct-jobs", &mailbox.id, "gmail").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_sync_state
+                    SET next_sync_at_ms = ?2
+                  WHERE connection_id = ?1",
+                params![mailbox.id, now_ms() + 3_600_000],
+            )
+            .unwrap();
+        let claimed = claim_mailbox_sync(
+            &pool,
+            "acct-jobs",
+            &mailbox.id,
+            "active-sync-worker",
+            60_000,
+        )
+        .unwrap()
+        .unwrap();
+
+        let scheduled = schedule_mailbox_sync_now(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        assert!(scheduled.next_sync_at_ms <= now_ms());
+        assert_eq!(scheduled.lease_owner.as_deref(), Some("active-sync-worker"));
+        assert_eq!(scheduled.lease_expires_at_ms, claimed.lease_expires_at_ms);
+    }
+
+    #[test]
+    fn pending_provider_messages_survive_restart_and_transition_once() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "outlook".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "microsoft-subject-recovery",
+        )
+        .unwrap();
+        let (stored, inserted) = save_provider_message(
+            &pool,
+            "acct-jobs",
+            &JobsProviderMessage {
+                id: String::new(),
+                connection_id: mailbox.id.clone(),
+                provider: "outlook".to_string(),
+                external_id: "outlook-message-recovery".to_string(),
+                sender: "recruiter@example.org".to_string(),
+                recipients: vec!["jobs@example.com".to_string()],
+                subject: "Application update".to_string(),
+                body_text: "We received your application.".to_string(),
+                received_at_ms: now_ms(),
+                application_id: None,
+                processing_status: "received".to_string(),
+                classification: String::new(),
+                confidence: 0.0,
+                metadata: json!({"conversation_id": "conversation-1"}),
+                processed_at_ms: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        assert!(inserted);
+        assert_eq!(
+            list_pending_provider_messages(&pool, "acct-jobs", &mailbox.id, 10)
+                .unwrap()
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![stored.id.as_str()]
+        );
+
+        assert!(update_provider_message_processing(
+            &pool,
+            "acct-other",
+            &stored.id,
+            None,
+            "processed",
+            "acknowledgment",
+            0.99,
+            json!({"correlation": "none"}),
+        )
+        .unwrap()
+        .is_none());
+        let updated = update_provider_message_processing(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            None,
+            "processed",
+            "acknowledgment",
+            0.99,
+            json!({"correlation": "unmatched"}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(updated.processing_status, "processed");
+        assert_eq!(updated.classification, "acknowledgment");
+        assert_eq!(updated.metadata["correlation"], "unmatched");
+        assert!(updated.processed_at_ms.is_some());
+        assert!(
+            list_pending_provider_messages(&pool, "acct-jobs", &mailbox.id, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

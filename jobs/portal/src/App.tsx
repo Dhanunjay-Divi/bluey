@@ -19,9 +19,11 @@ import type {
   JobApplication,
   JobPosting,
   JobPreferences,
-  JobsIntegration,
   JobsWorkspace,
   MailboxConnection,
+  MailboxMessage,
+  MailboxProviderAvailability,
+  MailboxSyncState,
   ResumeVersion,
   UserJobInput,
 } from "./types";
@@ -420,20 +422,6 @@ export default function App() {
     [account?.email, resumeVersions, workspace],
   );
 
-  const saveIntegration = useCallback(async (integration: JobsIntegration) => {
-    const saved = isPreview
-      ? { ...integration, updated_at_ms: Date.now() }
-      : await jobsApi.saveIntegration(integration);
-    setWorkspace((current) =>
-      current
-        ? {
-            ...current,
-            integrations: [saved, ...current.integrations.filter((item) => item.provider !== saved.provider)],
-          }
-        : current,
-    );
-  }, []);
-
   const createApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
     const saved = isPreview
       ? { ...identity, id: `identity-${Date.now()}`, verification_status: "pending" as const, is_default: false, created_at_ms: Date.now(), updated_at_ms: Date.now() }
@@ -484,17 +472,69 @@ export default function App() {
     setToast(`${identity.email} removed.`);
   }, []);
 
-  const requestMailboxConnection = useCallback(async (connection: MailboxConnection) => {
-    const saved = isPreview
-      ? { ...connection, id: `mailbox-${Date.now()}`, status: "pending" as const, created_at_ms: Date.now(), updated_at_ms: Date.now() }
-      : await jobsApi.requestMailboxConnection(connection);
-    setWorkspace((current) => current ? {
-      ...current,
-      mailbox_connections: [saved, ...current.mailbox_connections.filter((item) => item.id !== saved.id)],
-    } : current);
-    setToast(`${saved.account_label} is ready for authorization.`);
-    return saved;
+  const mailboxOAuthProviders = useCallback(async (): Promise<MailboxProviderAvailability[]> => {
+    if (isPreview) {
+      return [
+        { provider: "gmail", configured: true, capabilities: ["status_sync"] },
+        { provider: "outlook", configured: true, capabilities: ["status_sync"] },
+      ];
+    }
+    return jobsApi.mailboxOAuthProviders();
   }, []);
+
+  const connectMailbox = useCallback(async (provider: MailboxConnection["provider"]) => {
+    if (isPreview) {
+      const now = Date.now();
+      const saved: MailboxConnection = {
+        id: `mailbox-${now}`,
+        provider,
+        status: "connected",
+        account_label: provider === "gmail" ? "taylor@gmail.com" : "taylor@outlook.com",
+        aliases: [],
+        capabilities: ["status_sync"],
+        created_at_ms: now,
+        updated_at_ms: now,
+      };
+      setWorkspace((current) => current ? {
+        ...current,
+        mailbox_connections: [saved, ...current.mailbox_connections.filter((item) => item.id !== saved.id)],
+      } : current);
+      setToast(`${saved.account_label} connected.`);
+      return;
+    }
+
+    const result = await jobsApi.startMailboxOAuth(provider);
+    window.location.assign(result.authorization_url);
+  }, []);
+
+  const mailboxSyncState = useCallback(async (connection: MailboxConnection): Promise<MailboxSyncState> => {
+    if (isPreview) {
+      return {
+        connection_id: connection.id,
+        provider: connection.provider,
+        cursor: {},
+        next_sync_at_ms: Date.now() + 60_000,
+        last_synced_at_ms: Date.now() - 4 * 60_000,
+        last_error: "",
+        created_at_ms: connection.created_at_ms,
+        updated_at_ms: Date.now(),
+      };
+    }
+    return jobsApi.mailboxSyncState(connection.id);
+  }, []);
+
+  const mailboxMessages = useCallback(async (connectionId?: string): Promise<MailboxMessage[]> => {
+    if (isPreview) return [];
+    return jobsApi.mailboxMessages(connectionId, undefined, 30);
+  }, []);
+
+  const syncMailbox = useCallback(async (connection: MailboxConnection): Promise<MailboxSyncState> => {
+    const state = isPreview
+      ? await mailboxSyncState(connection)
+      : await jobsApi.syncMailbox(connection.id);
+    setToast(`Checking ${connection.account_label} for application updates.`);
+    return state;
+  }, [mailboxSyncState]);
 
   const deleteMailboxConnection = useCallback(async (connection: MailboxConnection) => {
     if (!isPreview) await jobsApi.deleteMailboxConnection(connection.id);
@@ -768,13 +808,16 @@ export default function App() {
               onSavePreferences={savePreferences}
               onSaveTrack={saveTrack}
               onDeleteTrack={deleteTrack}
-              onSaveIntegration={saveIntegration}
               onCreateIdentity={createApplicationIdentity}
               onUpdateIdentity={updateApplicationIdentity}
               onVerifyIdentity={verifyApplicationIdentity}
               onResendIdentity={resendApplicationIdentity}
               onDeleteIdentity={deleteApplicationIdentity}
-              onRequestMailbox={requestMailboxConnection}
+              onMailboxProviders={mailboxOAuthProviders}
+              onConnectMailbox={connectMailbox}
+              onMailboxSyncState={mailboxSyncState}
+              onMailboxMessages={mailboxMessages}
+              onSyncMailbox={syncMailbox}
               onDeleteMailbox={deleteMailboxConnection}
               onSaveAnswerMemory={saveAnswerMemory}
               onDeleteAnswerMemory={deleteAnswerMemory}

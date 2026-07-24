@@ -117,7 +117,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       remote_preference: preferences.remote_preference,
       policy: {
         role_family: "",
-        relevant_employment_ids: profile.employment.map((entry) => entry.id).filter(Boolean),
+        relevant_employment_ids: [],
         employment_types: preferences.employment_types,
         engagement_types: preferences.engagement_types,
         work_authorizations: profile.work_authorization ? [profile.work_authorization] : [],
@@ -463,7 +463,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
                 <div><b>Review new claims</b><span>Pause when Bluey proposes a factual claim not already in your profile.</span></div>
                 <Toggle checked={profile.review_new_claims} onChange={(checked) => update("review_new_claims", checked)} />
               </div>
-              <SearchPolicySummary profile={profile} />
+              <SearchPolicySummary profile={profile} role={track.role} />
             </>
           )}
 
