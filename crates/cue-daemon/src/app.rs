@@ -1272,6 +1272,18 @@ pub(crate) struct Daemon {
     /// the bundled model is absent — detection stays regex-only.
     #[cfg(feature = "local-memory")]
     qdetect: Mutex<Option<Arc<crate::qdetect::QuestionClassifier>>>,
+    /// For-me question-detection suppression. One spoken question is split by STT
+    /// across several finalized segments, and each qualifying segment would
+    /// otherwise re-surface the SAME detected-question popup — plus it would keep
+    /// re-firing after the user already clicked Ask. This guards both: a wall-clock
+    /// cooldown (epoch-ms of the last trigger; 0 = never) suppresses re-triggers
+    /// for a short window, and the last-triggered normalized text skips an
+    /// identical/overlapping re-detection. Set on every trigger AND when the user
+    /// manually asks (consume-on-Ask), so the popup does not come back.
+    for_me_last_trigger_ms: std::sync::atomic::AtomicU64,
+    /// Normalized text of the last for-me question surfaced/answered (see
+    /// [`Self::for_me_last_trigger_ms`]). Skips re-detecting the same question.
+    for_me_last_question: Mutex<String>,
     /// Bluey's own MCP memory server handle (the no-push pivot: the attached
     /// agent PULLS meeting memory through its tools). `None` when the
     /// loopback bind failed — the daemon runs on without it.
@@ -1326,6 +1338,14 @@ enum AudioRuntimeConfigResolution {
 const DEFAULT_AUDIO_IDLE_STOP_SECS: u64 = 5 * 60;
 const ANSWER_TRANSCRIPT_TURN_LIMIT: usize = 32;
 const ANSWER_TRANSCRIPT_CHAR_BUDGET: usize = 8_000;
+
+/// Cooldown after a for-me question is surfaced/answered before the SAME (or an
+/// overlapping) question may re-trigger the popup. One spoken question spans
+/// several STT segments over a few seconds; this window swallows those follow-on
+/// fragments and the post-Ask re-fire, while a genuinely NEW question (different
+/// text) still surfaces immediately once outside it. See
+/// `maybe_trigger_for_me_question` + `note_for_me_trigger`.
+const FOR_ME_COOLDOWN_MS: u64 = 20_000;
 
 /// The question text the for-me auto-trigger (and its suggestion card) sends to
 /// the agent — instead of the raw detected segment.
@@ -1569,6 +1589,8 @@ pub async fn run() -> Result<()> {
         agent_history: Arc::new(crate::agent_history::AgentHistoryStore::new()),
         #[cfg(feature = "local-memory")]
         qdetect: Mutex::new(None),
+        for_me_last_trigger_ms: std::sync::atomic::AtomicU64::new(0),
+        for_me_last_question: Mutex::new(String::new()),
         mcp_server: Mutex::new(None),
         agent_cache_epoch: std::sync::atomic::AtomicU64::new(0),
         #[cfg(feature = "diarize")]
@@ -3317,6 +3339,10 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             model,
             mode,
         } => {
+            // CONSUME-ON-ASK: the user manually handled the current question, so
+            // arm the for-me guard — the auto-detector must not immediately
+            // re-surface a popup for the same question they just asked about.
+            note_for_me_trigger(daemon, &question);
             let request = answer_request_from_overlay(&question, provider, model, mode);
             let _ = answer_with_provider_runtime(daemon, request, "overlay ask").await?;
         }
@@ -8941,6 +8967,37 @@ async fn add_audio_transcript_segment_inner(
 ///
 /// Best-effort and non-fatal: a missing settings file, no attached agent, or a
 /// detection miss simply means no trigger. Never blocks the transcript path.
+/// Pure re-trigger decision (extracted so it is unit-testable without a
+/// `Daemon`). Suppress when we are BOTH inside the cooldown window AND the new
+/// normalized question overlaps the last one (equal, or one contains the other —
+/// an STT fragment of the same question). A genuinely NEW question (different
+/// text) is never suppressed; nor is one outside the cooldown. `last_ms == 0`
+/// (never triggered) never suppresses.
+fn for_me_should_suppress(norm: &str, now_ms: u64, last_ms: u64, last_q: &str) -> bool {
+    let within_cooldown = last_ms != 0 && now_ms.saturating_sub(last_ms) < FOR_ME_COOLDOWN_MS;
+    let overlaps =
+        !last_q.is_empty() && (norm == last_q || norm.contains(last_q) || last_q.contains(norm));
+    within_cooldown && overlaps
+}
+
+/// Arm the for-me re-trigger guard as if a question had just been surfaced —
+/// called when the user MANUALLY asks (the "Answer the last question" button), so
+/// the auto-detector does not immediately re-surface a popup for the same
+/// question the user just handled (consume-on-Ask). `question` is the human text
+/// the ask was about; empty is fine (arms the cooldown, no text to dedup on).
+fn note_for_me_trigger(daemon: &Arc<Daemon>, question: &str) {
+    let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
+    daemon
+        .for_me_last_trigger_ms
+        .store(now_ms, std::sync::atomic::Ordering::Release);
+    let norm = normalize_transcript_text(question);
+    if !norm.is_empty() {
+        if let Ok(mut last) = daemon.for_me_last_question.try_lock() {
+            *last = norm;
+        }
+    }
+}
+
 async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &TranscriptSegment) {
     let settings = match load_settings(&daemon.paths) {
         Ok(settings) => settings,
@@ -8988,6 +9045,32 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
             "for-me question too thin to act on; ignoring"
         );
         return;
+    }
+
+    // RE-TRIGGER SUPPRESSION. One spoken question is split by STT across several
+    // finalized segments, so without this each qualifying segment re-surfaces the
+    // SAME popup — and it keeps re-firing even after the user clicked Ask (the
+    // reported "the question popup comes back" bug). Suppress a re-trigger when
+    // EITHER (a) we triggered within the cooldown window, OR (b) the normalized
+    // text is the same as, or contained in / contains, the last one (an
+    // overlapping fragment of the same question). `note_for_me_trigger` on the
+    // manual-ask path arms the same guard, so asking consumes the detection.
+    {
+        let norm = normalize_transcript_text(&detected.question);
+        let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
+        let last_ms = daemon
+            .for_me_last_trigger_ms
+            .load(std::sync::atomic::Ordering::Acquire);
+        let last_q = daemon.for_me_last_question.lock().await.clone();
+        if for_me_should_suppress(&norm, now_ms, last_ms, &last_q) {
+            debug!(q = %detected.question, "for-me question suppressed (recent duplicate)");
+            return;
+        }
+        // Arm the guard for the next segment(s) of this question.
+        daemon
+            .for_me_last_trigger_ms
+            .store(now_ms, std::sync::atomic::Ordering::Release);
+        *daemon.for_me_last_question.lock().await = norm;
     }
 
     info!(
@@ -16927,6 +17010,39 @@ mod tests {
         // Same agent, same model — only the thread is fresh.
         assert_eq!(settings.attached_agent.as_deref(), Some("cursor"));
         assert_eq!(settings.attached_model.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn for_me_suppresses_same_question_within_cooldown() {
+        let last = normalize_transcript_text("is there anything falling behind schedule");
+        // A follow-on STT fragment of the SAME question, 2s later → suppressed.
+        let frag = normalize_transcript_text("anything falling behind schedule");
+        assert!(
+            for_me_should_suppress(&frag, 2_000, 0_000 + 1, &last),
+            "an overlapping fragment within the cooldown must be suppressed"
+        );
+        // The exact same text again → suppressed.
+        assert!(for_me_should_suppress(&last, 2_000, 1, &last));
+    }
+
+    #[test]
+    fn for_me_allows_new_question_and_after_cooldown() {
+        let last = normalize_transcript_text("is there anything falling behind schedule");
+        // A genuinely DIFFERENT question within the window → NOT suppressed.
+        let other = normalize_transcript_text("what is the deadline for the handbook");
+        assert!(
+            !for_me_should_suppress(&other, 2_000, 1, &last),
+            "a distinct question must surface even within the cooldown"
+        );
+        // The SAME question but AFTER the cooldown window → NOT suppressed.
+        assert!(
+            !for_me_should_suppress(&last, FOR_ME_COOLDOWN_MS + 5, 1, &last),
+            "the same question after the cooldown may re-surface"
+        );
+        // Never triggered before (last_ms == 0) → never suppressed.
+        assert!(!for_me_should_suppress(&last, 5_000, 0, &last));
+        // No prior question text → nothing to dedup against.
+        assert!(!for_me_should_suppress(&last, 2_000, 1, ""));
     }
 
     #[test]
