@@ -10,7 +10,6 @@ import type {
   AgentSummary,
   AnswerSource,
   AnswerStatusStep,
-  AskMode,
   ContextItem,
   ListeningState,
 } from "../lib/types";
@@ -85,9 +84,6 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     () => client.onAgentInstall((offer) => setInstallOffer(offer)),
     [client],
   );
-  // The answer-speed preset, forwarded to the daemon as `mode`. Defaults to
-  // "balanced" so an untouched composer behaves exactly as before.
-  const [mode, setMode] = useState<AskMode>("balanced");
   // The attached agent's selectable models ("auto" is always element [0]) and
   // the current pick. Fetched when the agent changes; the Composer shows the
   // picker beside the speed pills only when there is more than one choice.
@@ -222,7 +218,6 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         }
         patch();
       },
-      { mode },
     );
   };
 
@@ -416,8 +411,6 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         onSubmit={(q) => runAsk(q)}
         onAskRecent={() => runAsk(ASK_RECENT_QUESTION, ASK_RECENT_LABEL)}
         askRecentDisabled={askStreaming}
-        mode={mode}
-        onModeChange={setMode}
         models={models}
         selectedModel={selectedModel}
         onModelChange={(m) => {
