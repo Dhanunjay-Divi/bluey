@@ -9,6 +9,7 @@ pub mod account;
 pub mod admin;
 pub mod auth_routes;
 pub mod billing;
+pub mod calendar;
 pub mod metrics;
 pub mod middleware;
 pub mod pricing;
@@ -43,6 +44,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         // for backward compat. Both return identical JSON.
         .route("/health", get(admin::health))
         .route("/admin/health", get(admin::health))
+        .route("/webhook/calendar/google", axum::routing::post(calendar::google_webhook))
+        .route(
+            "/webhook/calendar/microsoft",
+            axum::routing::get(calendar::microsoft_webhook_get)
+                .post(calendar::microsoft_webhook_post),
+        )
         .route(
             "/auth/signup",
             axum::routing::post(auth_routes::signup).route_layer(
