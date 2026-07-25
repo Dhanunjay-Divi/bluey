@@ -6,6 +6,12 @@ This file is the short onboarding path. For the complete current project state,
 read `AGENT-HANDOFF.md` and then
 `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`.
 
+## Codex Operating Memory
+
+When working in Codex on the owner workstation, load the `bluey-ops` skill
+before using this guide. The skill provides project navigation and operating
+memory; the checked-in code and current repository docs remain authoritative.
+
 ## Repo And Branch
 
 - Repo: `/Users/uno/Downloads/cue`

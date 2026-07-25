@@ -4,6 +4,12 @@ Last updated: 2026-06-02
 
 Start here when joining the Bluey repo.
 
+## Codex Operating Memory
+
+When working in Codex on the owner workstation, load the `bluey-ops` skill
+before using this handoff. The skill provides project navigation and operating
+memory; the checked-in code and current repository docs remain authoritative.
+
 ## Read First
 
 1. `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`

@@ -125,6 +125,7 @@ impl TestContext {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(identity.id),
+                source_resume_asset_id: String::new(),
                 policy: jobs::CareerTrackPolicy {
                     role_family: "software_engineering".to_string(),
                     ..jobs::CareerTrackPolicy::default()

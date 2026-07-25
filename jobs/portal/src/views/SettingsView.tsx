@@ -8,6 +8,7 @@ import {
   CirclePlus,
   ClipboardCheck,
   CreditCard,
+  FileText,
   MailCheck,
   MapPin,
   MessageCircleQuestion,
@@ -55,6 +56,12 @@ import {
   BLUEY_MAX_POSTING_AGE_DAYS,
 } from "../lib/search-policy";
 import { money, titleCase } from "../lib/format";
+import {
+  bindCareerTrackForSave,
+  careerTrackAuthorityState,
+  createCareerTrackDraft,
+  type CareerTrackAuthority,
+} from "../lib/career-track";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -133,6 +140,16 @@ export function SettingsView({
     () => mergeCareerSuggestions(profile.employment.map((entry) => entry.company)),
     [profile.employment],
   );
+  const trackAuthority = useMemo<CareerTrackAuthority>(
+    () => ({
+      currentSourceAssetId: workspace.profile.source_resume_asset_id,
+      sourceName: workspace.profile.source_resume_name,
+    }),
+    [
+      workspace.profile.source_resume_asset_id,
+      workspace.profile.source_resume_name,
+    ],
+  );
 
   useEffect(() => {
     if (searchDirty) return;
@@ -194,7 +211,24 @@ export function SettingsView({
       <section className="settings-section" id="tracks">
         <div className="settings-section-title"><span><Bot /></span><div><p>CAREER TRACK AGENTS</p><h2>Separate searches for separate goals</h2><small>Each agent has its own role, location, and match stream.</small></div><button className="button secondary compact" onClick={() => { setEditingTrack(null); setTrackOpen(true); }} disabled={workspace.tracks.length >= workspace.entitlement.track_limit}><Plus size={15} />New track</button></div>
         <div className="track-settings-list">
-          {workspace.tracks.map((track) => <button key={track.id} onClick={() => { setEditingTrack(track); setTrackOpen(true); }}><span className="agent-orbit"><Bot size={18} /></span><div><b>{track.name}</b><p>{track.role}</p><small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small></div><span className={track.active ? "agent-state active" : "agent-state"}>{track.active ? "Active" : "Paused"}</span><ChevronRight size={17} /></button>)}
+          {workspace.tracks.map((track) => {
+            const authority = careerTrackAuthorityState(track, trackAuthority);
+            const identity = workspace.application_identities.find(
+              (item) => item.id === track.application_identity_id,
+            );
+            return <button key={track.id} onClick={() => { setEditingTrack(track); setTrackOpen(true); }}>
+              <span className="agent-orbit"><Bot size={18} /></span>
+              <div>
+                <b>{track.name}</b>
+                <p>{track.role}</p>
+                <small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small>
+                <small><MailCheck size={12} />{identity?.email || "Application email required"}</small>
+                <small className={authority.sourceStale ? "track-source-stale" : ""}><FileText size={12} />{authority.sourceStale ? "Resume changed · review this Track" : authority.sourceLabel}</small>
+              </div>
+              <span className={authority.sourceStale ? "agent-state warning" : track.active ? "agent-state active" : "agent-state"}>{authority.sourceStale ? "Review resume" : track.active ? "Active" : "Paused"}</span>
+              <ChevronRight size={17} />
+            </button>;
+          })}
           <div className="track-limit"><span>{workspace.tracks.length} of {workspace.entitlement.track_limit} agents</span><div><i style={{ width: `${Math.min(100, workspace.tracks.length / workspace.entitlement.track_limit * 100)}%` }} /></div></div>
         </div>
       </section>
@@ -369,6 +403,7 @@ export function SettingsView({
         open={trackOpen}
         track={editingTrack}
         identities={workspace.application_identities}
+        authority={trackAuthority}
         roleSuggestions={targetRoleSuggestionValues}
         locationSuggestions={locationSuggestions}
         onClose={() => setTrackOpen(false)}
@@ -514,28 +549,30 @@ function VerifyIdentityDialog({ identity, onClose, onVerify, onResend }: { ident
   </Dialog>;
 }
 
-function TrackDialog({ open, track, identities, roleSuggestions, locationSuggestions, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; identities: ApplicationIdentity[]; roleSuggestions: string[]; locationSuggestions: string[]; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
+function TrackDialog({ open, track, identities, authority, roleSuggestions, locationSuggestions, onClose, onSave, onDelete }: { open: boolean; track: CareerTrack | null; identities: ApplicationIdentity[]; authority: CareerTrackAuthority; roleSuggestions: string[]; locationSuggestions: string[]; onClose(): void; onSave(track: CareerTrack): Promise<void>; onDelete(track: CareerTrack): void }) {
   const defaultIdentityId = identities.find((identity) => identity.is_default && identity.verification_status === "verified")?.id;
-  const [draft, setDraft] = useState<CareerTrack>(normalizeTrack(track, defaultIdentityId));
+  const [draft, setDraft] = useState<CareerTrack>(
+    createCareerTrackDraft(track, defaultIdentityId, authority),
+  );
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   useEffect(() => {
     if (open) {
-      setDraft(normalizeTrack(track, defaultIdentityId));
+      setDraft(createCareerTrackDraft(track, defaultIdentityId, authority));
       setError("");
     }
-  }, [open, track, defaultIdentityId]);
+  }, [open, track, defaultIdentityId, authority]);
   const current = draft;
+  const authorityState = careerTrackAuthorityState(current, authority);
   const update = (next: CareerTrack) => setDraft(next);
   const save = async () => {
     setSaving(true);
     setError("");
     try {
-      await onSave({
+      await onSave(bindCareerTrackForSave({
         ...current,
         role: canonicalizeTargetRole(current.role),
-        application_identity_id: current.application_identity_id || defaultIdentityId,
-      });
+      }, defaultIdentityId, authority));
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -552,6 +589,14 @@ function TrackDialog({ open, track, identities, roleSuggestions, locationSuggest
       <JobCategoryChoices label="Employment types" description="Only match these job arrangements for this Career Track." values={current.policy.employment_types} options={EMPLOYMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, employment_types: values } })} />
       <JobCategoryChoices label="Contract engagement" description="Optional. Restrict contract work to the selected engagement types." values={current.policy.engagement_types} options={ENGAGEMENT_TYPE_OPTIONS} onChange={(values) => update({ ...current, policy: { ...current.policy, engagement_types: values } })} />
       <label><span>Application email</span><select value={current.application_identity_id || defaultIdentityId || ""} onChange={(event) => update({ ...current, application_identity_id: event.target.value || undefined })}>{identities.filter((identity) => identity.verification_status === "verified").map((identity) => <option key={identity.id} value={identity.id}>{identity.email}{identity.is_default ? " (default)" : ""}</option>)}</select></label>
+      <div className={`track-authority-summary ${authorityState.sourceStale ? "stale" : ""}`}>
+        <FileText size={17} />
+        <div>
+          <b>{authorityState.sourceStale ? "Resume update ready" : "Resume source"}</b>
+          <span>{authorityState.sourceLabel}</span>
+          <small>{authorityState.sourceStale ? "Saving this Track binds it to the current Career Profile resume. Existing application receipts keep their original resume." : "Bluey tailors a new job-specific version from this source for every application."}</small>
+        </div>
+      </div>
       <label className="setting-line simple"><div><b>Agent active</b><span>Paused agents keep history but stop discovery.</span></div><Toggle checked={current.active} onChange={(checked) => update({ ...current, active: checked })} /></label>
       {error && <div className="inline-error" role="alert">{error}</div>}
     </div>
@@ -573,41 +618,4 @@ function errorMessage(error: unknown): string {
 
 function showError(setError: (message: string) => void): (error: unknown) => void {
   return (error) => setError(errorMessage(error));
-}
-
-function emptyTrack(applicationIdentityId?: string): CareerTrack {
-  return {
-    id: "",
-    name: "",
-    role: "",
-    locations: [],
-    remote_preference: "remote_or_hybrid",
-    application_identity_id: applicationIdentityId,
-    policy: {
-      role_family: "",
-      relevant_employment_ids: [],
-      employment_types: [],
-      engagement_types: [],
-      work_authorizations: [],
-    },
-    active: true,
-    match_count: 0,
-    created_at_ms: 0,
-    updated_at_ms: 0,
-  };
-}
-
-function normalizeTrack(track: CareerTrack | null, applicationIdentityId?: string): CareerTrack {
-  if (!track) return emptyTrack(applicationIdentityId);
-  return {
-    ...track,
-    application_identity_id: track.application_identity_id || applicationIdentityId,
-    policy: {
-      role_family: track.policy?.role_family || "",
-      relevant_employment_ids: track.policy?.relevant_employment_ids || [],
-      employment_types: track.policy?.employment_types || [],
-      engagement_types: track.policy?.engagement_types || [],
-      work_authorizations: track.policy?.work_authorizations || [],
-    },
-  };
 }

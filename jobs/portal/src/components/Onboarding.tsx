@@ -106,6 +106,10 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
   const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
   const fileRef = useRef<HTMLInputElement>(null);
   const trackId = useRef(workspace.tracks[0]?.id || "onboarding-primary-track");
+  const defaultIdentityId = workspace.application_identities.find(
+    (identity) =>
+      identity.is_default && identity.verification_status === "verified",
+  )?.id;
 
   const progress = ((step + 1) / steps.length) * 100;
   const track = useMemo<CareerTrack>(
@@ -115,6 +119,9 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       role: preferences.desired_roles[0] || profile.headline,
       locations: preferences.desired_locations,
       remote_preference: preferences.remote_preference,
+      application_identity_id:
+        workspace.tracks[0]?.application_identity_id || defaultIdentityId,
+      source_resume_asset_id: profile.source_resume_asset_id,
       policy: {
         role_family: "",
         relevant_employment_ids: [],
@@ -127,7 +134,15 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
       created_at_ms: workspace.tracks[0]?.created_at_ms || 0,
       updated_at_ms: 0,
     }),
-    [preferences, profile.employment, profile.headline, profile.work_authorization, workspace.tracks],
+    [
+      defaultIdentityId,
+      preferences,
+      profile.employment,
+      profile.headline,
+      profile.source_resume_asset_id,
+      profile.work_authorization,
+      workspace.tracks,
+    ],
   );
   const roleSuggestions = useMemo(
     () => mergeCareerSuggestions(

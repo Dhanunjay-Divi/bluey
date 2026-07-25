@@ -5,6 +5,40 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Added
+
+- Added server-owned Career Track authority that binds every track to one
+  verified application identity and the current source resume revision.
+- Added canonical role, location, employment, engagement, authorization,
+  experience, evidence, and execution checks for Jobs preparation and
+  submission eligibility.
+- Added immutable candidate-evidence enforcement for PostgreSQL and focused
+  regression coverage for exact resume, claim, identity, and receipt authority.
+
+### Changed
+
+- Standardized active Bluey agent onboarding, handoff, operations, release,
+  deployment, Jobs, and work-document templates on the validated `bluey-ops`
+  preflight while keeping current repository docs authoritative.
+
+- Improved PDF and DOCX Career Profile extraction for common Word bullets,
+  headings, employment layouts, cities, and certifications, alongside complete
+  location suggestions and compact skills and certifications editing.
+- Canonicalized role and technology aliases on the server with token-boundary
+  matching for safer Career Track and skill-fit decisions.
+- Replaced user-facing application pace and Auto-submit threshold tuning with
+  server-owned policy summaries.
+- Split the Jobs portal runtime from React dependencies and kept the large
+  document parser lazy-loaded during resume import.
+
+### Fixed
+
+- Prevented stale Career Tracks from silently following a replaced resume.
+- Prevented unrelated or overlapping employment from inflating role-specific
+  experience.
+- Updated discovery test fixtures to create the verified identity and resume
+  authority now required by production Career Tracks.
+
 ## [0.1.104] - 2026-07-19
 
 ### Added

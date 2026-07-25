@@ -4,6 +4,12 @@
 > **Audience:** Operator with sudo access to the deployment host.
 > **Estimated time:** 30-45 minutes from a fresh Ubuntu 24.04 droplet.
 
+## Codex Operating Memory
+
+When working in Codex on the owner workstation, load the `bluey-ops` skill
+before using this runbook. The skill provides project navigation and operating
+memory; this runbook and the current repository state remain authoritative.
+
 ## 0. Prerequisites checklist
 
 Before starting, you must already have:

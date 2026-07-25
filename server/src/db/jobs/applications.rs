@@ -768,13 +768,19 @@ fn commit_prepared_application(
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            let eligibility_context = EligibilityContext {
+                profile: &current_profile,
+                preferences: &preferences,
+                reservations: &reservations,
+                require_live_verification: false,
+                existing_application_id: Some(application.id.as_str()),
+                track: current_track.as_ref(),
+                identity: current_identity,
+            };
             enforce_application_finalization_eligibility(
                 application,
                 &current_posting,
-                &current_profile,
-                &preferences,
-                current_track.as_ref(),
-                &reservations,
+                &eligibility_context,
                 &authorities,
             )?;
             let current_track = current_track
@@ -1090,13 +1096,19 @@ fn commit_prepared_application(
                     last_seen_run_id: row.get(6),
                 })
                 .collect::<Vec<_>>();
+            let eligibility_context = EligibilityContext {
+                profile: &current_profile,
+                preferences: &preferences,
+                reservations: &reservations,
+                require_live_verification: false,
+                existing_application_id: Some(application.id.as_str()),
+                track: current_track.as_ref(),
+                identity: current_identity,
+            };
             enforce_application_finalization_eligibility(
                 application,
                 &current_posting,
-                &current_profile,
-                &preferences,
-                current_track.as_ref(),
-                &reservations,
+                &eligibility_context,
                 &authorities,
             )?;
             let current_track = current_track

@@ -76,7 +76,7 @@ export async function importResume(file: File): Promise<ImportedResume> {
 export function mergeDocxTextSources(htmlText: string, rawText: string): string {
   const htmlLines = normalizedTextLines(htmlText);
   const rawLines = normalizedTextLines(rawText);
-  const sectionIndex = rawLines.findIndex((line) => /^(?:(?:professional|work|project|relevant)\s+)?(?:summary|profile|objective|experience|employment|education|skills|projects?)\b/i.test(line));
+  const sectionIndex = rawLines.findIndex((line) => /^(?:(?:professional|executive|career|work|project|relevant|core|key|personal|academic)\s+)?(?:summary|profile|objective|experience|employment|background|education|skills|expertise|proficiencies|certifications?|licenses?|projects?)\b/i.test(line));
   const preamble = rawLines.slice(0, sectionIndex >= 0 ? sectionIndex : Math.min(rawLines.length, 12));
   const known = new Set(htmlLines.slice(0, 16).map((line) => line.toLowerCase()));
   const missing = preamble.filter((line) => !known.has(line.toLowerCase()));
@@ -190,6 +190,7 @@ function decodeHtmlEntities(value: string): string {
 
 function normalizedTextLines(value: string): string[] {
   return value
+    .replace(/[\u2028\u2029]/g, "\n")
     .split(/\r?\n/)
     .map((line) => line.replace(/[ \t]+/g, " ").trim())
     .filter(Boolean);

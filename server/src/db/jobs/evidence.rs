@@ -1,5 +1,10 @@
 const JOBS_EVIDENCE_SCHEMA_VERSION: i64 = 1;
 
+fn evidence_snapshot_content_hash(snapshot: &Value) -> Result<String> {
+    let encoded = serde_json::to_vec(snapshot).context("encode Jobs evidence snapshot")?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
 fn build_profile_evidence_revision(
     account_id: &str,
     profile: &CareerProfile,
@@ -34,8 +39,7 @@ fn build_profile_evidence_revision(
         },
         "role_experience": experience,
     });
-    let encoded = serde_json::to_vec(&snapshot).context("encode Jobs evidence snapshot")?;
-    let content_hash = hex::encode(Sha256::digest(encoded));
+    let content_hash = evidence_snapshot_content_hash(&snapshot)?;
     let scoped = Sha256::digest(format!("{account_id}:{content_hash}").as_bytes());
     Ok(ProfileEvidenceRevision {
         id: format!("evidence-{}", &hex::encode(scoped)[..32]),
@@ -381,12 +385,16 @@ fn persist_evidence_revision_sqlite(
         )
         .optional()?
     {
+        let snapshot = parse_json(snapshot_json, "Jobs evidence revision")?;
+        if evidence_snapshot_content_hash(&snapshot)? != evidence.content_hash {
+            anyhow::bail!("stored Jobs evidence snapshot hash does not match its content")
+        }
         return Ok(ProfileEvidenceRevision {
             id,
             career_track_id: evidence.career_track_id.clone(),
             revision_no,
             content_hash: evidence.content_hash.clone(),
-            snapshot: parse_json(snapshot_json, "Jobs evidence revision")?,
+            snapshot,
             created_at_ms,
         });
     }
@@ -432,12 +440,16 @@ fn persist_evidence_revision_postgres(
           WHERE account_id = $1 AND career_track_id = $2 AND content_hash = $3",
         &[&account_id, &evidence.career_track_id, &evidence.content_hash],
     )? {
+        let snapshot = parse_json(row.get(2), "Jobs evidence revision")?;
+        if evidence_snapshot_content_hash(&snapshot)? != evidence.content_hash {
+            anyhow::bail!("stored Jobs evidence snapshot hash does not match its content")
+        }
         return Ok(ProfileEvidenceRevision {
             id: row.get(0),
             career_track_id: evidence.career_track_id.clone(),
             revision_no: row.get(1),
             content_hash: evidence.content_hash.clone(),
-            snapshot: parse_json(row.get(2), "Jobs evidence revision")?,
+            snapshot,
             created_at_ms: row.get(3),
         });
     }
@@ -693,6 +705,7 @@ mod evidence_tests {
             locations: Vec::new(),
             remote_preference: String::new(),
             application_identity_id: Some("identity-1".into()),
+            source_resume_asset_id: String::new(),
             policy: CareerTrackPolicy {
                 relevant_employment_ids: vec!["work-1".into()],
                 ..Default::default()

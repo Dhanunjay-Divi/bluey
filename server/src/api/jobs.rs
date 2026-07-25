@@ -609,6 +609,8 @@ pub async fn save_profile(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(profile): Json<CareerProfile>,
 ) -> Result<Json<CareerProfile>, ApiError> {
+    let profile = jobs::with_authoritative_resume_source(&state.pool, &account.id, &profile)
+        .map_err(internal)?;
     validate_profile(&profile)?;
     jobs::save_profile(&state.pool, &account.id, &profile)
         .map(Json)
@@ -630,9 +632,16 @@ pub async fn complete_onboarding(
 ) -> Result<Json<JobsWorkspace>, ApiError> {
     input.profile.onboarding_step = 6;
     input.profile.onboarding_complete = true;
+    input.profile =
+        jobs::with_authoritative_resume_source(&state.pool, &account.id, &input.profile)
+            .map_err(internal)?;
+    input.track =
+        jobs::bind_career_track_authority(&state.pool, &account.id, &account.email, &input.track)
+            .map_err(domain_error)?;
     validate_profile(&input.profile)?;
     validate_preferences(&input.preferences)?;
     validate_track(&input.track)?;
+    validate_track_employment_refs(&input.track, &input.profile)?;
 
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
@@ -742,9 +751,13 @@ pub async fn tracks(
 pub async fn save_track(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Json(track): Json<CareerTrack>,
+    Json(mut track): Json<CareerTrack>,
 ) -> Result<Json<CareerTrack>, ApiError> {
+    track = jobs::bind_career_track_authority(&state.pool, &account.id, &account.email, &track)
+        .map_err(domain_error)?;
     validate_track(&track)?;
+    let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
+    validate_track_employment_refs(&track, &profile)?;
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     enforce_track_limit(&track, &current, &entitlement)?;
@@ -760,7 +773,11 @@ pub async fn update_track(
     Json(mut track): Json<CareerTrack>,
 ) -> Result<Json<CareerTrack>, ApiError> {
     track.id = track_id;
+    track = jobs::bind_career_track_authority(&state.pool, &account.id, &account.email, &track)
+        .map_err(domain_error)?;
     validate_track(&track)?;
+    let profile = jobs::get_profile(&state.pool, &account.id, &account.email).map_err(internal)?;
+    validate_track_employment_refs(&track, &profile)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     if !current.iter().any(|item| item.id == track.id) {
         return Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string()));
@@ -1988,7 +2005,7 @@ fn freeze_approved_execution(
 
     let profile = jobs::get_profile(&state.pool, account_id, account_email).map_err(internal)?;
     let answers = execution_answers(&profile, application, &identity_email);
-    let verified_claim_ids = confirmed_resume_claim_ids(state, account_id, resume)?;
+    let verified_claim_ids = verified_resume_claim_ids(resume)?;
     let packet = json!({
         "applicationId": application.id,
         "jobId": posting.id,
@@ -4003,7 +4020,7 @@ async fn persist_submission_receipt(
     let posting = jobs::get_posting(&state.pool, account_id, &application.job_id)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
-    let verified_claim_ids = confirmed_resume_claim_ids(state, account_id, &resume)?;
+    let verified_claim_ids = verified_resume_claim_ids(&resume)?;
     validate_receipt_verified_claim_ids(&receipt, &verified_claim_ids)?;
     if expected_runner == "cloud" {
         match jobs::execution_lease_phase_for_application(
@@ -4128,25 +4145,22 @@ fn submission_request_fingerprint(
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
-fn confirmed_resume_claim_ids(
-    state: &AppState,
-    account_id: &str,
-    resume: &ResumeVersion,
-) -> Result<Vec<String>, ApiError> {
-    let confirmed = jobs::list_facts(&state.pool, account_id)
-        .map_err(internal)?
-        .into_iter()
-        .filter(|fact| fact.verification_status == "confirmed")
-        .map(|fact| fact.id)
-        .collect::<BTreeSet<_>>();
+fn verified_resume_claim_ids(resume: &ResumeVersion) -> Result<Vec<String>, ApiError> {
     let mut claim_ids = resume
         .claim_ids
         .iter()
-        .filter(|claim_id| confirmed.contains(*claim_id))
-        .cloned()
+        .map(|claim_id| claim_id.trim())
+        .filter(|claim_id| !claim_id.is_empty())
+        .map(str::to_string)
         .collect::<Vec<_>>();
     claim_ids.sort();
     claim_ids.dedup();
+    if claim_ids.is_empty() {
+        return Err((
+            StatusCode::CONFLICT,
+            "The prepared resume is missing verified evidence claims.".to_string(),
+        ));
+    }
     Ok(claim_ids)
 }
 
@@ -4905,6 +4919,30 @@ fn validate_track(track: &CareerTrack) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn validate_track_employment_refs(
+    track: &CareerTrack,
+    profile: &CareerProfile,
+) -> Result<(), ApiError> {
+    let known_ids: BTreeSet<&str> = profile
+        .employment
+        .iter()
+        .map(|entry| entry.id.trim())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if track
+        .policy
+        .relevant_employment_ids
+        .iter()
+        .map(|id| id.trim())
+        .any(|id| id.is_empty() || !known_ids.contains(id))
+    {
+        return bad_request(
+            "Choose relevant experience from employment records in this Career Profile.",
+        );
+    }
+    Ok(())
+}
+
 fn enforce_track_limit(
     track: &CareerTrack,
     current: &[CareerTrack],
@@ -5158,6 +5196,8 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("application issue")
         || message.contains("application outcome")
         || message.contains("does not belong to this job")
+        || message.contains("application email")
+        || message.contains("Career Track resume source")
     {
         StatusCode::BAD_REQUEST
     } else {
@@ -5356,12 +5396,35 @@ mod tests {
             locations: vec!["Austin, TX".to_string()],
             remote_preference: "hybrid_ok".to_string(),
             application_identity_id: None,
+            source_resume_asset_id: String::new(),
             policy: CareerTrackPolicy::default(),
             active: true,
             match_count: 0,
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn track_experience_must_reference_the_current_career_profile() {
+        let profile = CareerProfile {
+            employment: vec![crate::db::jobs::EmploymentEntry {
+                id: "known-role".to_string(),
+                company: "Example".to_string(),
+                title: "Software Engineer".to_string(),
+                ..crate::db::jobs::EmploymentEntry::default()
+            }],
+            ..CareerProfile::default()
+        };
+        let mut track = test_track("track-1");
+        track.policy.relevant_employment_ids = vec!["unknown-role".to_string()];
+
+        let error = validate_track_employment_refs(&track, &profile).unwrap_err();
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("Career Profile"));
+
+        track.policy.relevant_employment_ids = vec!["known-role".to_string()];
+        validate_track_employment_refs(&track, &profile).unwrap();
     }
 
     fn discovery_enrollment_test_pool() -> crate::db::DbPool {
@@ -5382,6 +5445,22 @@ mod tests {
         .unwrap();
         drop(conn);
         pool
+    }
+
+    fn store_discovery_test_track(
+        pool: &crate::db::DbPool,
+        account_id: &str,
+        account_email: &str,
+        track_id: &str,
+    ) {
+        let track = jobs::bind_career_track_authority(
+            pool,
+            account_id,
+            account_email,
+            &test_track(track_id),
+        )
+        .unwrap();
+        jobs::upsert_track(pool, account_id, &track).unwrap();
     }
 
     fn imported_discovery_posting(source: &str, canonical_url: &str, track_id: &str) -> JobPosting {
@@ -5450,8 +5529,8 @@ mod tests {
     #[test]
     fn verified_import_enrollment_is_idempotent_bound_and_retries_after_failure() {
         let pool = discovery_enrollment_test_pool();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-two")).unwrap();
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-one");
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-two");
 
         let first = imported_discovery_posting(
             "ashby_import",
@@ -5490,7 +5569,12 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        jobs::upsert_track(&pool, "acct-two", &test_track("track-two-account-two")).unwrap();
+        store_discovery_test_track(
+            &pool,
+            "acct-two",
+            "two@example.com",
+            "track-two-account-two",
+        );
         let second_account = imported_discovery_posting(
             "ashby_import",
             "https://jobs.ashbyhq.com/acme/job-123",
@@ -5528,7 +5612,7 @@ mod tests {
     #[test]
     fn workspace_backfills_a_legacy_verified_import_once() {
         let pool = discovery_enrollment_test_pool();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-one");
         store_discovery_posting(
             &pool,
             "acct-one",
@@ -5570,7 +5654,7 @@ mod tests {
     #[test]
     fn workspace_backfill_repairs_a_legacy_source_without_membership() {
         let pool = discovery_enrollment_test_pool();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-one");
         let stored = store_discovery_posting(
             &pool,
             "acct-one",
@@ -5623,7 +5707,7 @@ mod tests {
     #[test]
     fn workspace_backfill_filters_before_its_bounded_scan() {
         let pool = discovery_enrollment_test_pool();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-one");
         let mut postings = (0..MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS)
             .map(|index| {
                 imported_discovery_posting(
@@ -5653,7 +5737,7 @@ mod tests {
     #[test]
     fn workspace_backfill_skips_manual_restricted_unverified_and_invalid_imports() {
         let pool = discovery_enrollment_test_pool();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-one");
         let postings = [
             imported_discovery_posting(
                 "pasted_link",
@@ -5709,7 +5793,7 @@ mod tests {
     #[test]
     fn workspace_backfill_is_quota_aware_and_track_validation_precedes_writes() {
         let pool = discovery_enrollment_test_pool();
-        jobs::upsert_track(&pool, "acct-one", &test_track("track-one")).unwrap();
+        store_discovery_test_track(&pool, "acct-one", "one@example.com", "track-one");
         for index in 0..jobs::DISCOVERY_MAX_SOURCES_PER_TRACK {
             jobs::upsert_discovery_source(
                 &pool,
@@ -5975,15 +6059,40 @@ mod tests {
     }
 
     #[test]
-    fn receipt_verified_claims_must_exactly_match_confirmed_resume_claims() {
+    fn receipt_verified_claims_must_exactly_match_resume_evidence_claims() {
         let (_, _, _, mut receipt, _) = strict_receipt_fixture();
-        receipt["packet"]["verifiedClaimIds"] = json!(["fact-confirmed"]);
-        validate_receipt_verified_claim_ids(&receipt, &["fact-confirmed".to_string()]).unwrap();
+        receipt["packet"]["verifiedClaimIds"] = json!(["claim-confirmed"]);
+        validate_receipt_verified_claim_ids(&receipt, &["claim-confirmed".to_string()]).unwrap();
 
-        receipt["packet"]["verifiedClaimIds"] = json!(["fact-confirmed", "fact-unconfirmed"]);
-        let forged = validate_receipt_verified_claim_ids(&receipt, &["fact-confirmed".to_string()])
-            .unwrap_err();
+        receipt["packet"]["verifiedClaimIds"] = json!(["claim-confirmed", "claim-forged"]);
+        let forged =
+            validate_receipt_verified_claim_ids(&receipt, &["claim-confirmed".to_string()])
+                .unwrap_err();
         assert!(forged.1.contains("do not match"));
+    }
+
+    #[test]
+    fn prepared_resume_requires_at_least_one_verified_evidence_claim() {
+        let mut resume = ResumeVersion {
+            id: "resume-one".to_string(),
+            job_id: "job-one".to_string(),
+            version_no: 1,
+            mode: "factual".to_string(),
+            content: json!({}),
+            diff: json!({}),
+            claim_ids: vec![" claim-b ".to_string(), "claim-a".to_string()],
+            checksum: "checksum-one".to_string(),
+            created_at_ms: 1,
+        };
+        assert_eq!(
+            verified_resume_claim_ids(&resume).unwrap(),
+            vec!["claim-a".to_string(), "claim-b".to_string()]
+        );
+
+        resume.claim_ids = vec!["  ".to_string()];
+        let error = verified_resume_claim_ids(&resume).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("evidence claims"));
     }
 
     #[test]

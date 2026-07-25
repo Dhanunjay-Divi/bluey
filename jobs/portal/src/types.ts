@@ -143,6 +143,7 @@ export interface CareerTrack {
   locations: string[];
   remote_preference: string;
   application_identity_id?: string;
+  source_resume_asset_id: string;
   policy: CareerTrackPolicy;
   active: boolean;
   match_count: number;

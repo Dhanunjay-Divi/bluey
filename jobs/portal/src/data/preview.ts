@@ -139,6 +139,7 @@ export const previewWorkspace: JobsWorkspace = {
       locations: ["New York, NY", "Remote - US"],
       remote_preference: "remote_or_hybrid",
       application_identity_id: "identity-primary",
+      source_resume_asset_id: "preview-source-resume",
       policy: {
         role_family: "product_management",
         relevant_employment_ids: ["exp-1", "exp-2"],
@@ -158,6 +159,7 @@ export const previewWorkspace: JobsWorkspace = {
       locations: ["New York, NY"],
       remote_preference: "hybrid_ok",
       application_identity_id: "identity-career",
+      source_resume_asset_id: "preview-source-resume",
       policy: {
         role_family: "software_engineering",
         relevant_employment_ids: ["exp-1", "exp-2"],

@@ -9,6 +9,12 @@ For the high-level lifecycle (environments, branches, promotion gates),
 read `docs/DELIVERY-LIFECYCLE.md` first. This doc is the concrete
 checklist.
 
+## Codex Operating Memory
+
+When working in Codex on the owner workstation, load the `bluey-ops` skill
+before using this runbook. The skill provides project navigation and operating
+memory; this runbook and the current repository state remain authoritative.
+
 ## Deployment Execution Policy
 
 Use this as the default rule when deciding how to build, test, and deploy:

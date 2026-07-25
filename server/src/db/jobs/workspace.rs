@@ -3,7 +3,15 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
     let _ = ensure_primary_application_identity(pool, account_id, email)?;
     let profile = get_profile(pool, account_id, email)?;
     let preferences = get_preferences(pool, account_id)?;
-    let tracks = list_tracks(pool, account_id)?;
+    let tracks = list_tracks(pool, account_id)?
+        .into_iter()
+        .map(|track| {
+            backfill_legacy_career_track_authority(
+                pool, account_id, email, &profile, &track,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let application_identities = list_application_identities(pool, account_id)?;
     let applications = list_applications(pool, account_id)?;
     let reservations = list_attempt_reservations(pool, account_id)?;
     let mut matches = list_postings(pool, account_id)?;
@@ -13,15 +21,20 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
             .find(|application| application.job_id == posting.id)
             .map(|application| application.id.as_str());
         let track = tracks.iter().find(|track| track.id == posting.track_id);
-        let mut eligibility = build_job_eligibility(
-            posting,
-            &profile,
-            &preferences,
-            &reservations,
-            true,
+        let identity = selected_application_identity(
+            track.and_then(|track| track.application_identity_id.as_deref()),
+            &application_identities,
+        );
+        let context = EligibilityContext {
+            profile: &profile,
+            preferences: &preferences,
+            reservations: &reservations,
+            require_live_verification: true,
             existing_application_id,
             track,
-        );
+            identity,
+        };
+        let mut eligibility = build_job_eligibility(posting, &context);
         apply_discovery_authority(pool, account_id, posting, &mut eligibility)?;
         posting.eligibility = Some(eligibility);
     }
@@ -38,7 +51,7 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         answer_memory: list_answer_memory(pool, account_id)?,
         candidate_events: list_candidate_events(pool, account_id)?,
         integrations: list_integrations(pool, account_id)?,
-        application_identities: list_application_identities(pool, account_id)?,
+        application_identities,
         mailbox_connections: list_mailbox_connections(pool, account_id)?,
         discovery_sources: list_discovery_sources(pool, account_id)?
             .iter()

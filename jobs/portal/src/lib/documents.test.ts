@@ -276,6 +276,108 @@ Specialty`,
     ]);
   });
 
+  it("normalizes spaced headings, Word bullets, hyphen headers, and credential links", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "word-export.docx",
+      text: `Jordan Example
+San Francisco, CA | jordan@example.com
+P R O F E S S I O N A L  E X P E R I E N C E
+Software Engineer - Capital One | San Francisco, CA | January 2021 - Present
+\uF0B7 Architected reliable payment services.
+C E R T I F I C A T I O N S
+\uF0B7 Microsoft Certified: Azure Fundamentals | Link
+\uF0B7 AWS Certified Solutions Architect
+Professional`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Capital One",
+      title: "Software Engineer",
+      location: "San Francisco, CA",
+      current: true,
+    });
+    expect(result.employment[0].highlights).toContain("Architected reliable payment services.");
+    expect(result.certifications).toEqual([
+      "Microsoft Certified: Azure Fundamentals",
+      "AWS Certified Solutions Architect, Professional",
+    ]);
+  });
+
+  it("keeps a pure multiword city out of the company field", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "location-on-own-line.pdf",
+      text: `Jordan Example
+PROFESSIONAL EXPERIENCE
+Software Engineer
+Capital One
+San Francisco, CA
+January 2021 - Present
+• Built reliable services.`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Capital One",
+      title: "Software Engineer",
+      location: "San Francisco, CA",
+    });
+  });
+
+  it("recognizes broader section headings and current-role date phrases", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "real-world-headings.docx",
+      text: `Taylor Example
+Austin, TX | taylor@example.com
+CAREER SUMMARY
+Platform engineer focused on reliable distributed systems.
+PROFESSIONAL BACKGROUND
+Acme Systems
+Software Engineer
+January 2022 - Till Date
+• Built reliable services.
+CORE TECHNICAL SKILLS
+TypeScript, Rust, PostgreSQL
+PROFESSIONAL CERTIFICATIONS
+AWS Certified Developer
+PERSONAL PROJECTS
+Release Guard
+• Built a deployment safety toolkit.
+PROFESSIONAL DEVELOPMENT
+Cloud architecture workshop`,
+    });
+
+    expect(result.summary).toBe("Platform engineer focused on reliable distributed systems.");
+    expect(result.employment[0]).toMatchObject({
+      company: "Acme Systems",
+      title: "Software Engineer",
+      start_date: "2022-01",
+      end_date: "",
+      current: true,
+    });
+    expect(result.skills).toEqual(["TypeScript", "Rust", "PostgreSQL"]);
+    expect(result.certifications).toEqual(["AWS Certified Developer"]);
+    expect(result.projects[0]?.name).toBe("Release Guard");
+  });
+
+  it("treats ongoing employment as current", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "ongoing-role.pdf",
+      text: `Taylor Example
+EXPERIENCE
+Northstar Labs
+Data Engineer
+June 2023 - Ongoing
+• Built batch and streaming pipelines.`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Northstar Labs",
+      title: "Data Engineer",
+      start_date: "2023-06",
+      end_date: "",
+      current: true,
+    });
+  });
+
   it("does not promote employment responsibilities into employer fields", () => {
     const result = inferProfileFromResume(emptyProfile(), {
       name: "clinical-operations.docx",
@@ -431,6 +533,55 @@ IDE Tools: Eclipse My Eclipse, IntelliJ`,
       "Example University, December 2023",
       "• Verified source documentation.",
     ].join("\n"));
+  });
+
+  it("treats Word line separators as resume line breaks", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "health-informatics.docx",
+      text: [
+        "Morgan Reed",
+        "EDUCATION",
+        "Master of Science – Health Informatics\u2028Example University, December 2023",
+        "Relevant Coursework:\u2029Clinical Informatics",
+        "CERTIFICATIONS",
+        "Epic Ambulatory Certified",
+      ].join("\n"),
+    });
+
+    expect(result.education[0]).toMatchObject({
+      school: "Example University",
+      degree: "Master of Science – Health Informatics",
+      field: "Health Informatics",
+      end_date: "2023",
+    });
+    expect(result.certifications).toEqual(["Epic Ambulatory Certified"]);
+  });
+
+  it("repairs high-confidence PDF kerning without joining normal language", () => {
+    const result = inferProfileFromResume(emptyProfile(), {
+      name: "ai-engineer.pdf",
+      text: `Ravan Example
+1 (555) 555-0142 | ravan@example.com
+EXPERIENCE
+AI Engineer, V erizon August 2025 – Present
+• Built systems in C programming and PyT orch.
+EDUCATION
+Indian Institute of T echnology (BHU), V aranasiJune 2019 – May 2023
+Bachelor of Technology
+SKILLS
+T ech: PyT orch, T ensorFlow`,
+    });
+
+    expect(result.employment[0]).toMatchObject({
+      company: "Verizon",
+      title: "AI Engineer",
+    });
+    expect(result.employment[0].highlights).toEqual([
+      "Built systems in C programming and PyTorch.",
+    ]);
+    expect(result.education[0].school).toBe("Indian Institute of Technology (BHU)");
+    expect(result.education[0].location).toBe("Varanasi");
+    expect(result.skills).toEqual(["PyTorch", "TensorFlow"]);
   });
 
   it("drops DOCX table category headers without dropping skill values", () => {

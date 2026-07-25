@@ -93,10 +93,53 @@ function splitResumeSections(text: string): ResumeSections {
 function normalizeResumeLines(text: string): string[] {
   return text
     .replace(/\u00a0/g, " ")
-    .replace(/[●▪◦‣]/g, "•")
+    .replace(/[\u2028\u2029]/g, "\n")
+    .replace(/[●▪◦‣\uF0B7]/g, "•")
     .split(/\r?\n/)
-    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .map((line) => normalizeSpacedSectionHeading(
+      repairExtractionKerning(line.replace(/[ \t]+/g, " ").trim()),
+    ))
     .filter(Boolean);
+}
+
+const SPACED_SECTION_HEADINGS = new Map<string, string>([
+  ["SUMMARY", "SUMMARY"],
+  ["PROFESSIONALSUMMARY", "PROFESSIONAL SUMMARY"],
+  ["CAREERSUMMARY", "CAREER SUMMARY"],
+  ["EXPERIENCE", "EXPERIENCE"],
+  ["WORKEXPERIENCE", "WORK EXPERIENCE"],
+  ["PROFESSIONALEXPERIENCE", "PROFESSIONAL EXPERIENCE"],
+  ["EMPLOYMENTHISTORY", "EMPLOYMENT HISTORY"],
+  ["EDUCATION", "EDUCATION"],
+  ["SKILLS", "SKILLS"],
+  ["TECHNICALSKILLS", "TECHNICAL SKILLS"],
+  ["CORETECHNICALSKILLS", "CORE TECHNICAL SKILLS"],
+  ["CORECOMPETENCIES", "CORE COMPETENCIES"],
+  ["CERTIFICATIONS", "CERTIFICATIONS"],
+  ["LICENSESANDCERTIFICATIONS", "LICENSES AND CERTIFICATIONS"],
+  ["PROJECTS", "PROJECTS"],
+  ["PERSONALPROJECTS", "PERSONAL PROJECTS"],
+]);
+
+function normalizeSpacedSectionHeading(value: string): string {
+  const compact = value.replace(/[^A-Za-z]/g, "").toUpperCase();
+  return SPACED_SECTION_HEADINGS.get(compact) || value;
+}
+
+const EXTRACTION_KERNING_REPAIRS: Array<[RegExp, string]> = [
+  [/\bPyT orch\b/g, "PyTorch"],
+  [/\bT echnology\b/g, "Technology"],
+  [/\bT ensorFlow\b/g, "TensorFlow"],
+  [/\bT ech\b/g, "Tech"],
+  [/\bV aranasi(?=[A-Z]|\b)/g, "Varanasi"],
+  [/\bV erizon\b/g, "Verizon"],
+];
+
+function repairExtractionKerning(value: string): string {
+  return EXTRACTION_KERNING_REPAIRS.reduce(
+    (repaired, [pattern, replacement]) => repaired.replace(pattern, replacement),
+    value,
+  );
 }
 
 function detectSection(
@@ -113,14 +156,15 @@ function detectSection(
     return null;
   }
   const aliases: Array<[ResumeSection, RegExp]> = [
-    ["summary", /^(?:professional\s+)?(?:summary|profile|objective|about)(?:\s*[:|-]\s*(.*))?$/i],
-    ["employment", /^(?:(?:professional|work|project|relevant)\s+)?(?:experience|employment)(?:\s*[:|-]\s*(.*))?$/i],
+    ["summary", /^(?:(?:professional|executive|career)\s+)?(?:summary|profile|objective|about)(?:\s*[:|-]\s*(.*))?$/i],
+    ["employment", /^(?:(?:professional|work|project|relevant|career)\s+)?(?:experience|employment|background)(?:\s*[:|-]\s*(.*))?$/i],
     ["employment", /^(?:work history|career history)(?:\s*[:|-]\s*(.*))?$/i],
     ["education", /^(?:education|academic background|academics)(?:\s*[:|-]\s*(.*))?$/i],
-    ["skills", /^(?:technical\s+)?(?:skills|core competencies|technologies|expertise)(?:\s*(?:&|and)\s*(?:interests?|tools?|technologies))?(?:\s*[:|-]\s*(.*))?$/i],
-    ["certifications", /^(?:certifications?|licenses?|credentials)(?:\s*[:|-]\s*(.*))?$/i],
-    ["projects", /^(?:selected\s+)?projects?(?:\s*(?:&|and)\s*(?:leadership|research|publications?))?(?:\s*[:|-]\s*(.*))?$/i],
-    ["other", /^(?:(?:professional|selected)\s+)?(?:affiliations?|memberships?|awards?|honors?|recognition|achievements?|accomplishments?|publications?|languages?|volunteer(?:ing)?|interests?|references?)(?:\s*[:|-]\s*(.*))?$/i],
+    ["skills", /^(?:(?:core|key)\s+)?(?:technical\s+)?(?:skills|core competencies|technologies|expertise|proficiencies)(?:\s*(?:&|and)\s*(?:interests?|tools?|technologies))?(?:\s*[:|-]\s*(.*))?$/i],
+    ["skills", /^(?:areas?\s+of\s+expertise|technical\s+toolkit)(?:\s*[:|-]\s*(.*))?$/i],
+    ["certifications", /^(?:(?:professional|technical)\s+)?(?:certifications?|licenses?|credentials)(?:\s*(?:&|and)\s*(?:training|certifications?))?(?:\s*[:|-]\s*(.*))?$/i],
+    ["projects", /^(?:(?:selected|personal|academic|key)\s+)?projects?(?:\s*(?:&|and)\s*(?:leadership|research|publications?))?(?:\s*[:|-]\s*(.*))?$/i],
+    ["other", /^(?:(?:professional|selected)\s+)?(?:affiliations?|memberships?|awards?|honors?|recognition|achievements?|accomplishments?|publications?|languages?|volunteer(?:ing)?|interests?|references?|development|training)(?:\s*[:|-]\s*(.*))?$/i],
   ];
   for (const [section, pattern] of aliases) {
     const match = line.match(pattern);
@@ -170,8 +214,28 @@ function inferHeadline(lines: string[], name: string): string {
 function parseEmployment(lines: string[]): EmploymentEntry[] {
   const entries = datedBlocks(lines, false).map((block, index) => {
     const augmented = augmentEmploymentBlock(block);
-    const parsedCandidates = splitHeaderCandidates(augmented.candidates)
+    const rawCandidates = splitHeaderCandidates(augmented.candidates)
       .map(splitEmploymentCandidate);
+    const hasStandaloneCompanyCandidate = rawCandidates.some((candidate) => (
+      candidate.value &&
+      !candidate.location &&
+      titleScore(candidate.value) === 0
+    ));
+    const parsedCandidates = rawCandidates.map((candidate) => {
+      if (
+        hasStandaloneCompanyCandidate &&
+        candidate.value &&
+        candidate.location &&
+        titleScore(candidate.value) === 0 &&
+        companyScore(candidate.value) === 0
+      ) {
+        return {
+          value: "",
+          location: `${candidate.value} ${candidate.location}`,
+        };
+      }
+      return candidate;
+    });
     const location = parsedCandidates.map((candidate) => candidate.location).find(Boolean) || "";
     const roleCandidates = uniqueStrings(parsedCandidates.map((candidate) => candidate.value).filter(Boolean));
     const combined = roleCandidates.map(splitCombinedTitleCompany).find(Boolean);
@@ -209,13 +273,23 @@ function parseEducation(lines: string[]): EducationEntry[] {
   const source = blocks.length ? blocks : undatedEducationBlocks(lines);
   return source
     .map((block, index) => {
-      const candidates = splitHeaderCandidates([...block.header, block.dateRemainder, ...block.body.slice(0, 2)])
+      const headerCandidates = splitHeaderCandidates([
+        ...block.header,
+        block.dateRemainder,
+        ...block.body.slice(0, 2),
+      ]);
+      const explicitCityLocation = headerCandidates
+        .map(extractSchoolCityOnlyLocation)
+        .find(Boolean) || "";
+      const candidates = headerCandidates
         .flatMap(splitCombinedEducationCandidate)
         .flatMap(splitSchoolLocationCandidate)
         .map(cleanEducationValue)
         .filter(Boolean);
       const school = pickByScore(candidates, schoolScore);
-      const nonSchoolCandidates = candidates.filter((candidate) => candidate !== school);
+      const nonSchoolCandidates = candidates.filter((candidate) => (
+        candidate !== school && candidate !== explicitCityLocation
+      ));
       const degreeLine =
         pickByPositiveScore(nonSchoolCandidates, degreeScore) ||
         nonSchoolCandidates.find((candidate) => !looksLikeLocation(candidate)) ||
@@ -227,7 +301,7 @@ function parseEducation(lines: string[]): EducationEntry[] {
         degreeLine.match(/^(?:masters?|bachelors?|doctorate|ph\.?d\.?)\s*:\s*(.+)$/i)?.[1]?.trim() ||
         degreeLine.match(/^(?:associate|bachelor|master|doctor)(?:'s|s)?(?:\s+(?:degree|of\s+[^,]+))?,\s*(.+)$/i)?.[1]?.trim() ||
         "";
-      const location = candidates.find((candidate) => (
+      const location = explicitCityLocation || candidates.find((candidate) => (
         candidate !== school && (looksLikeLocation(candidate) || isCountryName(candidate))
       )) || "";
       return {
@@ -301,7 +375,12 @@ function parseCertificationSection(lines: string[]): string[] {
   return uniqueStrings(
     lines
       .flatMap((line) => {
-        const value = stripBullet(line).replace(/^[A-Za-z &/+.-]{2,30}:\s*/, "");
+        const value = stripBullet(line)
+          .replace(
+            /^(?:certifications?|credentials?|licenses?|cloud|security|data|technical)\s*:\s*/i,
+            "",
+          )
+          .replace(/\s*(?:[|•]|[-–—])\s*(?:link|credential link|view credential)\s*$/i, "");
         return parseDelimitedList(value);
       })
       .reduce<string[]>((certifications, value) => {
@@ -366,7 +445,7 @@ function datedBlocks(lines: string[], allowSingleYear: boolean): DatedBlock[] {
     body: lines.slice(index + 1, headerStarts[dateIndex + 1] ?? lines.length),
     start: range.start,
     end: range.end,
-    current: /present|current|now/i.test(range.end),
+    current: /present|current|now|ongoing|till\s+date|to\s+date/i.test(range.end),
   }));
 }
 
@@ -393,7 +472,8 @@ function extractDateRange(
 ): { raw: string; start: string; end: string } | null {
   const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
   const point = `(?:${month}\\s+)?(?:19|20)\\d{2}`;
-  const match = line.match(new RegExp(`(${point})\\s*(?:-|–|—|to)\\s*(${point}|Present|Current|Now)`, "i"));
+  const current = "(?:Present|Current|Now|Ongoing|Till\\s+Date|To\\s+Date)";
+  const match = line.match(new RegExp(`(${point})\\s*(?:-|–|—|to)\\s*(${point}|${current})`, "i"));
   if (match) return { raw: match[0], start: match[1], end: match[2] };
   const years = line.match(/\b(?:19|20)\d{2}\b/g);
   if (allowSingleYear && years?.length === 1 && stripBullet(line).length <= 80) {
@@ -404,7 +484,7 @@ function extractDateRange(
 
 function normalizeDate(value: string): string {
   const trimmed = value.trim();
-  if (!trimmed || /present|current|now/i.test(trimmed)) return "";
+  if (!trimmed || /present|current|now|ongoing|till\s+date|to\s+date/i.test(trimmed)) return "";
   const year = trimmed.match(/\b(?:19|20)\d{2}\b/)?.[0] || "";
   const monthName = trimmed.match(/[A-Za-z]+/)?.[0]?.slice(0, 3).toLowerCase();
   const monthIndex = monthName
@@ -421,7 +501,7 @@ function splitHeaderCandidates(lines: string[]): string[] {
         ? /\s*[|•]\s*/i
         : schoolScore(clean) > 0
           ? /\s*[|•]\s*|\s+[—–]\s+/i
-          : /\s+(?:at|@)\s+|\s*[|•]\s*|\s+[—–]\s+/i;
+          : /\s+(?:at|@)\s+|\s*[|•]\s*|\s+[-—–]\s+/i;
       return clean
         .split(separator)
         .map((part) => part.trim())
@@ -571,7 +651,7 @@ function isBullet(line: string): boolean {
   return /^\s*[-*•]/.test(line);
 }
 
-const EMPLOYMENT_NARRATIVE_START_PATTERN = /^(?:achieved|administered|analyzed|assisted|built|collaborated|coordinated|created|delivered|designed|developed|directed|drove|established|executed|implemented|improved|increased|launched|led|managed|optimized|owned|reduced|supported|trained|verified|worked)\b/i;
+const EMPLOYMENT_NARRATIVE_START_PATTERN = /^(?:achieved|administered|analyzed|architected|assisted|built|collaborated|coordinated|created|delivered|designed|developed|directed|drove|established|executed|implemented|improved|increased|launched|led|managed|optimized|owned|reduced|supported|trained|verified|worked)\b/i;
 
 function isUsefulHighlight(line: string): boolean {
   const value = stripBullet(line);
@@ -862,6 +942,17 @@ function splitCombinedEducationCandidate(value: string): string[] {
 }
 
 function splitSchoolLocationCandidate(value: string): string[] {
+  const cityOnly = value.trim().match(/^(.+?),\s*([A-Za-z][A-Za-z .'-]{1,49})$/);
+  if (
+    cityOnly &&
+    schoolScore(cityOnly[1]) > 0 &&
+    schoolScore(cityOnly[2]) === 0 &&
+    degreeScore(cityOnly[2]) === 0 &&
+    !isUsStateCode(cityOnly[2]) &&
+    !isCountryName(cityOnly[2])
+  ) {
+    return [cleanEducationValue(cityOnly[1]), normalizeLocationValue(cityOnly[2])];
+  }
   const gpaLocationPattern = new RegExp(
     `^(.+?)\\s*\\(?GPA\\s*:[^)]+\\)?\\s+([A-Za-z .'-]+,\\s*(?:${US_STATE_CODE_PATTERN}|${US_STATE_NAME_PATTERN}|${COUNTRY_PATTERN}))$`,
     "i",
@@ -884,6 +975,21 @@ function splitSchoolLocationCandidate(value: string): string[] {
     return [countryMatch[1].trim(), countryMatch[2].trim()];
   }
   return [clean];
+}
+
+function extractSchoolCityOnlyLocation(value: string): string {
+  const match = value.trim().match(/^(.+?),\s*([A-Za-z][A-Za-z .'-]{1,49})$/);
+  if (
+    !match ||
+    schoolScore(match[1]) === 0 ||
+    schoolScore(match[2]) > 0 ||
+    degreeScore(match[2]) > 0 ||
+    isUsStateCode(match[2]) ||
+    isCountryName(match[2])
+  ) {
+    return "";
+  }
+  return normalizeLocationValue(match[2]);
 }
 
 function cleanEducationValue(value: string): string {

@@ -2,6 +2,16 @@
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const LIVE_VERIFICATION_MAX_AGE_MS: i64 = DAY_MS;
 
+struct EligibilityContext<'a> {
+    profile: &'a CareerProfile,
+    preferences: &'a JobPreferences,
+    reservations: &'a [AttemptReservation],
+    require_live_verification: bool,
+    existing_application_id: Option<&'a str>,
+    track: Option<&'a CareerTrack>,
+    identity: Option<&'a ApplicationIdentity>,
+}
+
 pub fn get_job_discovery_authority(
     pool: &DbPool,
     account_id: &str,
@@ -115,21 +125,10 @@ fn apply_discovery_authorities(
 fn enforce_application_finalization_eligibility(
     application: &JobApplication,
     posting: &JobPosting,
-    profile: &CareerProfile,
-    preferences: &JobPreferences,
-    track: Option<&CareerTrack>,
-    reservations: &[AttemptReservation],
+    context: &EligibilityContext<'_>,
     authorities: &[JobDiscoveryAuthority],
 ) -> Result<()> {
-    let mut decision = build_job_eligibility(
-        posting,
-        profile,
-        preferences,
-        reservations,
-        false,
-        Some(application.id.as_str()),
-        track,
-    );
+    let mut decision = build_job_eligibility(posting, context);
     apply_discovery_authorities(authorities, &mut decision);
     if !decision.can_prepare {
         anyhow::bail!("job eligibility changed while the application packet was generated")
@@ -156,29 +155,37 @@ pub fn evaluate_job_eligibility(
     let preferences = get_preferences(pool, account_id)?;
     let tracks = list_tracks(pool, account_id)?;
     let track = tracks.iter().find(|track| track.id == posting.track_id);
+    let identities = list_application_identities(pool, account_id)?;
+    let identity = selected_application_identity(
+        track.and_then(|track| track.application_identity_id.as_deref()),
+        &identities,
+    );
     let reservations = list_attempt_reservations(pool, account_id)?;
-    let mut decision = build_job_eligibility(
-        posting,
-        &profile,
-        &preferences,
-        &reservations,
+    let context = EligibilityContext {
+        profile: &profile,
+        preferences: &preferences,
+        reservations: &reservations,
         require_live_verification,
         existing_application_id,
         track,
-    );
+        identity,
+    };
+    let mut decision = build_job_eligibility(posting, &context);
     apply_discovery_authority(pool, account_id, posting, &mut decision)?;
     Ok(decision)
 }
 
 fn build_job_eligibility(
     posting: &JobPosting,
-    profile: &CareerProfile,
-    preferences: &JobPreferences,
-    reservations: &[AttemptReservation],
-    require_live_verification: bool,
-    existing_application_id: Option<&str>,
-    track: Option<&CareerTrack>,
+    context: &EligibilityContext<'_>,
 ) -> JobEligibilityDecision {
+    let profile = context.profile;
+    let preferences = context.preferences;
+    let reservations = context.reservations;
+    let require_live_verification = context.require_live_verification;
+    let existing_application_id = context.existing_application_id;
+    let track = context.track;
+    let identity = context.identity;
     let now = now_ms();
     let capability = submission_capability(posting);
     let mut hard_failures = Vec::new();
@@ -198,14 +205,31 @@ fn build_job_eligibility(
             "career_track_inactive",
             "This Career Track is paused.",
         ),
-        Some(track) if track.application_identity_id.is_none() => push_reason(
-            &mut hard_failures,
-            "application_identity_required",
-            "Choose a verified application identity for this Career Track.",
-        ),
+        Some(track)
+            if track.application_identity_id.is_none()
+                || identity.is_none_or(|identity| {
+                    identity.verification_status != "verified"
+                        || track.application_identity_id.as_deref()
+                            != Some(identity.id.as_str())
+                }) =>
+        {
+            push_reason(
+                &mut hard_failures,
+                "application_identity_required",
+                "Choose a verified application email for this Career Track.",
+            )
+        }
+        Some(track) if track.source_resume_asset_id != profile.source_resume_asset_id => {
+            push_reason(
+                &mut hard_failures,
+                "career_track_resume_changed",
+                "Your Career Profile resume changed. Review and save this Career Track again.",
+            )
+        }
         Some(track) => {
             passed_checks.push("career_track_active".to_string());
-            passed_checks.push("application_identity_bound".to_string());
+            passed_checks.push("application_identity_verified".to_string());
+            passed_checks.push("career_track_resume_bound".to_string());
             let posting_family = posting_role_family(posting);
             if posting_family != ROLE_FAMILY_GENERIC
                 && experience_evidence.role_family != ROLE_FAMILY_GENERIC
@@ -322,6 +346,15 @@ fn build_job_eligibility(
     } else {
         passed_checks.push("location_allowed".to_string());
     }
+    if let Some(reason) = track_location_failure(posting, track) {
+        push_reason(
+            &mut hard_failures,
+            "track_location_mismatch",
+            &reason,
+        );
+    } else if track.is_some() {
+        passed_checks.push("track_location_allowed".to_string());
+    }
 
     if !preferences.employment_types.is_empty() {
         match candidate_employment_type(posting) {
@@ -427,6 +460,19 @@ fn build_job_eligibility(
             "preferred_experience_above_target",
             "The preferred experience is above this Career Track's target range.",
         );
+    }
+    if experience_evidence.target_title_level
+        > experience_evidence
+            .max_verified_title_level
+            .saturating_add(1)
+    {
+        push_reason(
+            &mut hard_failures,
+            "seniority_outside_verified_history",
+            "This role's title level is more than one step above the verified Career Track history.",
+        );
+    } else {
+        passed_checks.push("seniority_title_aligned".to_string());
     }
 
     if preferences.sponsorship == "required" {
@@ -657,6 +703,54 @@ fn location_failure(
     })
 }
 
+fn track_location_failure(
+    posting: &JobPosting,
+    track: Option<&CareerTrack>,
+) -> Option<String> {
+    let track = track?;
+    let workplace = candidate_normalize(&format!(
+        "{} {}",
+        posting.workplace, posting.location
+    ));
+    let is_remote = workplace.contains("remote");
+    let is_hybrid = workplace.contains("hybrid");
+    let is_onsite = workplace.contains("on site") || workplace.contains("onsite");
+
+    match track.remote_preference.as_str() {
+        "remote_only" if !is_remote => {
+            return Some("This Career Track is limited to remote roles.".to_string());
+        }
+        "remote_or_hybrid" if is_onsite && !is_hybrid => {
+            return Some(
+                "This Career Track allows remote or hybrid roles, not on-site-only roles."
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+
+    if track.locations.is_empty() || is_remote {
+        return None;
+    }
+    let posting_location = normalized_location(&posting.location);
+    let matches_location = track.locations.iter().any(|candidate| {
+        let candidate = normalized_location(candidate);
+        !candidate.is_empty()
+            && !posting_location.is_empty()
+            && (posting_location.contains(&candidate) || candidate.contains(&posting_location))
+    });
+    (!matches_location).then(|| {
+        format!(
+            "{} is outside this Career Track's locations.",
+            if posting.location.trim().is_empty() {
+                "This job"
+            } else {
+                posting.location.trim()
+            }
+        )
+    })
+}
+
 fn normalized_location(value: &str) -> String {
     value
         .to_ascii_lowercase()
@@ -831,15 +925,20 @@ fn score_posting(
     let mut reasons = Vec::new();
     let mut missing = Vec::new();
     let title = posting.title.to_lowercase();
-    let description = posting.description.to_lowercase();
+    let description = candidate_normalize(&posting.description);
     let location = posting.location.to_lowercase();
+    let canonical_posting_role = canonical_target_role(&posting.title).to_lowercase();
 
     let target_roles = track
         .map(|value| vec![value.role.as_str()])
         .unwrap_or_else(|| preferences.desired_roles.iter().map(String::as_str).collect());
     let role_text_matches = target_roles.iter().any(|role| {
         let role = role.to_lowercase();
-        !role.trim().is_empty() && (title.contains(&role) || role.contains(&title))
+        let canonical_role = canonical_target_role(&role).to_lowercase();
+        !role.trim().is_empty()
+            && (title.contains(&role)
+                || role.contains(&title)
+                || canonical_role == canonical_posting_role)
     });
     let target_family = canonical_role_family(track, posting);
     let posting_family = posting_role_family(posting);
@@ -857,7 +956,7 @@ fn score_posting(
     let matching_skills: Vec<String> = profile
         .skills
         .iter()
-        .filter(|skill| description.contains(&skill.to_lowercase()))
+        .filter(|skill| normalized_text_contains_skill(&description, skill))
         .take(5)
         .cloned()
         .collect();
@@ -868,10 +967,18 @@ fn score_posting(
         missing.push("No direct skill overlap found yet".to_string());
     }
 
-    if preferences.desired_locations.iter().any(|candidate| {
+    let target_locations = track
+        .map(|value| value.locations.as_slice())
+        .filter(|locations| !locations.is_empty())
+        .unwrap_or(preferences.desired_locations.as_slice());
+    let remote_preference = track
+        .map(|value| value.remote_preference.as_str())
+        .filter(|preference| !preference.trim().is_empty())
+        .unwrap_or(preferences.remote_preference.as_str());
+    if target_locations.iter().any(|candidate| {
         let candidate = candidate.to_lowercase();
         location.contains(&candidate) || candidate.contains(&location)
-    }) || (preferences.remote_preference.contains("remote")
+    }) || (remote_preference.contains("remote")
         && (posting.workplace.eq_ignore_ascii_case("remote") || location.contains("remote")))
     {
         score += 15;
@@ -921,6 +1028,77 @@ fn score_posting(
     (score.clamp(0, 99), reasons, missing)
 }
 
+fn normalized_text_contains_skill(normalized_text: &str, skill: &str) -> bool {
+    let haystack = format!(" {normalized_text} ");
+    skill_match_terms(skill)
+        .iter()
+        .any(|term| haystack.contains(&format!(" {term} ")))
+}
+
+fn skill_match_terms(skill: &str) -> BTreeSet<String> {
+    let mut terms = BTreeSet::new();
+    let normalized = candidate_normalize(skill);
+    if normalized.is_empty() {
+        return terms;
+    }
+    terms.insert(normalized.clone());
+
+    if let Some(primary) = skill.split('(').next() {
+        let primary = candidate_normalize(primary);
+        if !primary.is_empty() {
+            terms.insert(primary);
+        }
+    }
+
+    let parts = normalized.split_whitespace().collect::<Vec<_>>();
+    if parts.len() > 1 && parts.last().is_some_and(|part| part.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        terms.insert(parts[..parts.len() - 1].join(" "));
+    }
+
+    let aliases: &[&str] = match normalized.as_str() {
+        "node js" | "nodejs" => &["node js", "nodejs"],
+        "postgres" | "postgresql" => &["postgres", "postgresql"],
+        "react js" | "reactjs" => &["react", "react js", "reactjs"],
+        "amazon web services" | "aws" => &["amazon web services", "aws"],
+        "google cloud platform" | "gcp" => &["google cloud platform", "gcp"],
+        "microsoft azure" | "azure" => &["microsoft azure", "azure"],
+        "k8s" | "kubernetes" => &["k8s", "kubernetes"],
+        "rest api" | "rest apis" => &["rest api", "rest apis"],
+        _ => &[],
+    };
+    terms.extend(aliases.iter().map(|value| (*value).to_string()));
+    terms
+}
+
+#[cfg(test)]
+mod eligibility_skill_tests {
+    use super::*;
+
+    #[test]
+    fn skill_matching_normalizes_punctuation_versions_and_common_aliases() {
+        let description = candidate_normalize(
+            "Build NodeJS services with React, Postgres, Kubernetes, and AWS.",
+        );
+
+        assert!(normalized_text_contains_skill(&description, "Node.js"));
+        assert!(normalized_text_contains_skill(&description, "React 18"));
+        assert!(normalized_text_contains_skill(&description, "PostgreSQL"));
+        assert!(normalized_text_contains_skill(&description, "K8s"));
+        assert!(normalized_text_contains_skill(
+            &description,
+            "Amazon Web Services",
+        ));
+    }
+
+    #[test]
+    fn skill_matching_uses_word_boundaries() {
+        let description = candidate_normalize("Maintain a Golang service.");
+
+        assert!(!normalized_text_contains_skill(&description, "Go"));
+    }
+}
+
 fn candidate_truth_fingerprint(profile: &CareerProfile) -> String {
     // Fingerprint the exact candidate snapshot used to build the packet. The
     // login/application email is intentionally excluded because the verified
@@ -951,10 +1129,16 @@ fn selected_application_identity<'a>(
     track_identity_id: Option<&str>,
     identities: &'a [ApplicationIdentity],
 ) -> Option<&'a ApplicationIdentity> {
-    track_identity_id
-        .and_then(|identity_id| identities.iter().find(|item| item.id == identity_id))
-        .or_else(|| identities.iter().find(|item| item.is_default))
-        .filter(|item| item.verification_status == "verified")
+    match track_identity_id {
+        Some(identity_id) => identities
+            .iter()
+            .find(|item| item.id == identity_id)
+            .filter(|item| item.verification_status == "verified"),
+        None => identities
+            .iter()
+            .find(|item| item.is_default)
+            .filter(|item| item.verification_status == "verified"),
+    }
 }
 
 fn posting_snapshot_fingerprint(posting: &JobPosting) -> Result<String> {

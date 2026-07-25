@@ -803,6 +803,11 @@ pub fn save_verified_import_posting_with_source(
     let reservations = list_attempt_reservations(pool, account_id)?;
     let tracks = list_tracks(pool, account_id)?;
     let track = tracks.iter().find(|track| track.id == track_id);
+    let identities = list_application_identities(pool, account_id)?;
+    let identity = selected_application_identity(
+        track.and_then(|value| value.application_identity_id.as_deref()),
+        &identities,
+    );
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -855,6 +860,7 @@ pub fn save_verified_import_posting_with_source(
                     applications: &applications,
                     reservations: &reservations,
                     track,
+                    identity,
                     observed_at_ms: now,
                 },
             )?;
@@ -985,6 +991,7 @@ pub fn save_verified_import_posting_with_source(
                     applications: &applications,
                     reservations: &reservations,
                     track,
+                    identity,
                     observed_at_ms: now,
                 },
             )?;
@@ -1417,6 +1424,7 @@ fn prepare_discovery_snapshot_candidate(
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
     tracks: &[CareerTrack],
+    identities: &[ApplicationIdentity],
     observed_at_ms: i64,
 ) -> Result<JobPosting> {
     // A candidate feed is a lead, not application truth. It may attach source
@@ -1443,6 +1451,10 @@ fn prepare_discovery_snapshot_candidate(
     if !candidate.track_id.is_empty() && track.is_none() {
         anyhow::bail!("discovery job Career Track was not found")
     }
+    let identity = selected_application_identity(
+        track.and_then(|value| value.application_identity_id.as_deref()),
+        identities,
+    );
     prepare_snapshot_posting(
         &candidate,
         existing,
@@ -1452,6 +1464,7 @@ fn prepare_discovery_snapshot_candidate(
             applications,
             reservations,
             track,
+            identity,
             observed_at_ms,
         },
     )
@@ -1476,6 +1489,7 @@ fn publish_discovery_snapshot(
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
     tracks: &[CareerTrack],
+    identities: &[ApplicationIdentity],
     observed_at_ms: i64,
 ) -> Result<DiscoveryRunResult> {
     let token_hash = discovery_lease_token_hash(lease_token);
@@ -1621,6 +1635,7 @@ fn publish_discovery_snapshot(
                     applications,
                     reservations,
                     tracks,
+                    identities,
                     observed_at_ms,
                 )?;
                 let payload = to_json(&saved, "job posting")?;
@@ -1689,6 +1704,7 @@ fn publish_discovery_snapshot(
                 applications,
                 reservations,
                 tracks,
+                identities,
             )?;
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
@@ -1862,6 +1878,7 @@ fn publish_discovery_snapshot(
                     applications,
                     reservations,
                     tracks,
+                    identities,
                     observed_at_ms,
                 )?;
                 let payload = to_json(&saved, "job posting")?;
@@ -1940,6 +1957,7 @@ fn publish_discovery_snapshot(
                 applications,
                 reservations,
                 tracks,
+                identities,
             )?;
             let source_changed = tx.execute(
                 "UPDATE jobs_discovery_sources
@@ -2005,6 +2023,7 @@ fn close_missing_snapshot_memberships_sqlite(
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
     tracks: &[CareerTrack],
+    identities: &[ApplicationIdentity],
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let mut stmt = tx.prepare(
@@ -2087,19 +2106,25 @@ fn close_missing_snapshot_memberships_sqlite(
             };
             posting.updated_at_ms = observed_at_ms;
             let track = tracks.iter().find(|track| track.id == posting.track_id);
+            let identity = selected_application_identity(
+                track.and_then(|value| value.application_identity_id.as_deref()),
+                identities,
+            );
             let existing_application_id = applications
                 .iter()
                 .find(|application| application.job_id == posting.id)
                 .map(|application| application.id.as_str());
-            posting.eligibility = Some(build_job_eligibility(
-                &posting,
+            let eligibility_context = EligibilityContext {
                 profile,
                 preferences,
                 reservations,
-                true,
+                require_live_verification: true,
                 existing_application_id,
                 track,
-            ));
+                identity,
+            };
+            posting.eligibility =
+                Some(build_job_eligibility(&posting, &eligibility_context));
             let payload = to_json(&posting, "job posting")?;
             tx.execute(
                 "UPDATE jobs_postings SET posting_json = ?3, updated_at_ms = ?4
@@ -2126,6 +2151,7 @@ fn close_missing_snapshot_memberships_postgres(
     applications: &[JobApplication],
     reservations: &[AttemptReservation],
     tracks: &[CareerTrack],
+    identities: &[ApplicationIdentity],
 ) -> Result<i64> {
     const MISSING_GRACE_MS: i64 = 30 * 60 * 1_000;
     let active = tx
@@ -2208,19 +2234,25 @@ fn close_missing_snapshot_memberships_postgres(
             };
             posting.updated_at_ms = observed_at_ms;
             let track = tracks.iter().find(|track| track.id == posting.track_id);
+            let identity = selected_application_identity(
+                track.and_then(|value| value.application_identity_id.as_deref()),
+                identities,
+            );
             let existing_application_id = applications
                 .iter()
                 .find(|application| application.job_id == posting.id)
                 .map(|application| application.id.as_str());
-            posting.eligibility = Some(build_job_eligibility(
-                &posting,
+            let eligibility_context = EligibilityContext {
                 profile,
                 preferences,
                 reservations,
-                true,
+                require_live_verification: true,
                 existing_application_id,
                 track,
-            ));
+                identity,
+            };
+            posting.eligibility =
+                Some(build_job_eligibility(&posting, &eligibility_context));
             let payload = to_json(&posting, "job posting")?;
             tx.execute(
                 "UPDATE jobs_postings SET posting_json = $3, updated_at_ms = $4
@@ -2265,6 +2297,7 @@ pub fn complete_discovery_run(
     let applications = list_applications(pool, &source.account_id)?;
     let reservations = list_attempt_reservations(pool, &source.account_id)?;
     let tracks = list_tracks(pool, &source.account_id)?;
+    let identities = list_application_identities(pool, &source.account_id)?;
     let source_track = tracks.iter().find(|track| track.id == source.track_id);
     if source.provider == CURATED_DISCOVERY_PROVIDER && tracks.is_empty() {
         anyhow::bail!("curated discovery requires at least one Career Track")
@@ -2376,6 +2409,7 @@ pub fn complete_discovery_run(
         &applications,
         &reservations,
         &tracks,
+        &identities,
         fetched_at_ms,
     )
 }

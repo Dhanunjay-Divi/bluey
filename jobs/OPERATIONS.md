@@ -1,5 +1,11 @@
 # Bluey Jobs Operations
 
+## Codex Operating Memory
+
+When working in Codex on the owner workstation, load the `bluey-ops` skill
+before using this runbook. The skill provides project navigation and operating
+memory; this runbook and the current repository state remain authoritative.
+
 ## Processes
 
 Run these as separate deployable services:

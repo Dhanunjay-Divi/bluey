@@ -28,6 +28,16 @@ pub fn get_resume_source_asset(
     })
 }
 
+pub fn with_authoritative_resume_source(
+    pool: &DbPool,
+    account_id: &str,
+    profile: &CareerProfile,
+) -> Result<CareerProfile> {
+    let mut value = profile.clone();
+    apply_resume_source_asset(&mut value, get_resume_source_asset(pool, account_id)?.as_ref());
+    Ok(value)
+}
+
 pub fn save_resume_source_asset(
     pool: &DbPool,
     account_id: &str,
@@ -35,6 +45,7 @@ pub fn save_resume_source_asset(
     profile: &CareerProfile,
 ) -> Result<(Option<ResumeSourceAsset>, CareerProfile)> {
     let mut profile = profile.clone();
+    apply_resume_source_asset(&mut profile, Some(asset));
     profile.onboarding_step = profile.onboarding_step.clamp(0, 6);
     profile.auto_submit_threshold = default_auto_submit_threshold();
     profile.daily_limit = default_daily_limit();
@@ -163,6 +174,25 @@ pub fn save_resume_source_asset(
             Ok((previous, profile))
         }
     })
+}
+
+fn apply_resume_source_asset(profile: &mut CareerProfile, asset: Option<&ResumeSourceAsset>) {
+    match asset {
+        Some(asset) => {
+            profile.source_resume_name = asset.file_name.clone();
+            profile.source_resume_asset_id = asset.id.clone();
+            profile.source_resume_sha256 = asset.sha256.clone();
+            profile.source_resume_media_type = asset.media_type.clone();
+            profile.source_resume_template_status = asset.template_status.clone();
+        }
+        None => {
+            profile.source_resume_name.clear();
+            profile.source_resume_asset_id.clear();
+            profile.source_resume_sha256.clear();
+            profile.source_resume_media_type.clear();
+            profile.source_resume_template_status.clear();
+        }
+    }
 }
 
 fn resume_source_asset_from_sqlite_row(

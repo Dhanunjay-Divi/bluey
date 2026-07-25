@@ -85,7 +85,7 @@ pub fn save_profile(
     account_id: &str,
     profile: &CareerProfile,
 ) -> Result<CareerProfile> {
-    let mut value = profile.clone();
+    let mut value = with_authoritative_resume_source(pool, account_id, profile)?;
     value.onboarding_step = value.onboarding_step.clamp(0, 6);
     value.auto_submit_threshold = default_auto_submit_threshold();
     value.daily_limit = default_daily_limit();
@@ -572,13 +572,37 @@ pub fn list_tracks(pool: &DbPool, account_id: &str) -> Result<Vec<CareerTrack>> 
 }
 
 pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Result<CareerTrack> {
-    let mut value = track.clone();
+    let mut value = normalize_career_track(track);
+    if value
+        .policy
+        .employment_types
+        .iter()
+        .any(|item| normalize_candidate_employment_type(item).is_none())
+    {
+        anyhow::bail!("unsupported Career Track employment type")
+    }
+    if value
+        .policy
+        .engagement_types
+        .iter()
+        .any(|item| normalize_candidate_engagement_type(item).is_none())
+    {
+        anyhow::bail!("unsupported Career Track engagement type")
+    }
     if let Some(identity_id) = value.application_identity_id.as_deref() {
         let identity = get_application_identity(pool, account_id, identity_id)?
             .ok_or_else(|| anyhow::anyhow!("application email not found"))?;
         if identity.verification_status != "verified" {
             anyhow::bail!("verify the application email before using it on a Career Track")
         }
+    } else {
+        anyhow::bail!("choose a verified application email for this Career Track")
+    }
+    let source_resume_asset_id = get_resume_source_asset(pool, account_id)?
+        .map(|asset| asset.id)
+        .unwrap_or_default();
+    if value.source_resume_asset_id != source_resume_asset_id {
+        anyhow::bail!("Career Track resume source changed; review and save the Track again")
     }
     if value.id.trim().is_empty() {
         value.id = uuid::Uuid::new_v4().to_string();
@@ -632,6 +656,60 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
             Ok(value)
         }
     })
+}
+
+pub fn bind_career_track_authority(
+    pool: &DbPool,
+    account_id: &str,
+    account_email: &str,
+    track: &CareerTrack,
+) -> Result<CareerTrack> {
+    let mut value = normalize_career_track(track);
+    let primary = ensure_primary_application_identity(pool, account_id, account_email)?;
+    let identities = list_application_identities(pool, account_id)?;
+    let selected = match value
+        .application_identity_id
+        .as_deref()
+        .filter(|identity_id| !identity_id.trim().is_empty())
+    {
+        Some(identity_id) => identities
+            .iter()
+            .find(|identity| identity.id == identity_id)
+            .ok_or_else(|| anyhow::anyhow!("application email not found"))?,
+        None => identities
+            .iter()
+            .find(|identity| identity.is_default && identity.verification_status == "verified")
+            .unwrap_or(&primary),
+    };
+    if selected.verification_status != "verified" {
+        anyhow::bail!("verify the application email before using it on a Career Track")
+    }
+    value.application_identity_id = Some(selected.id.clone());
+    value.source_resume_asset_id = get_resume_source_asset(pool, account_id)?
+        .map(|asset| asset.id)
+        .unwrap_or_default();
+    Ok(value)
+}
+
+pub fn backfill_legacy_career_track_authority(
+    pool: &DbPool,
+    account_id: &str,
+    account_email: &str,
+    profile: &CareerProfile,
+    track: &CareerTrack,
+) -> Result<CareerTrack> {
+    let current_source_id = profile.source_resume_asset_id.trim();
+    let stored_source_id = track.source_resume_asset_id.trim();
+    if !stored_source_id.is_empty() && stored_source_id != current_source_id {
+        return Ok(track.clone());
+    }
+    let needs_identity = track.application_identity_id.is_none();
+    let needs_source = stored_source_id.is_empty() && !current_source_id.is_empty();
+    if !needs_identity && !needs_source {
+        return Ok(track.clone());
+    }
+    let value = bind_career_track_authority(pool, account_id, account_email, track)?;
+    upsert_track(pool, account_id, &value)
 }
 
 pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<bool> {
@@ -854,19 +932,25 @@ pub fn upsert_posting(
     value.updated_at_ms = now;
     let applications = list_applications(pool, account_id)?;
     let reservations = list_attempt_reservations(pool, account_id)?;
+    let identities = list_application_identities(pool, account_id)?;
+    let identity = selected_application_identity(
+        track.and_then(|value| value.application_identity_id.as_deref()),
+        &identities,
+    );
     let existing_application_id = applications
         .iter()
         .find(|application| application.job_id == value.id)
         .map(|application| application.id.as_str());
-    value.eligibility = Some(build_job_eligibility(
-        &value,
+    let eligibility_context = EligibilityContext {
         profile,
         preferences,
-        &reservations,
-        true,
+        reservations: &reservations,
+        require_live_verification: true,
         existing_application_id,
         track,
-    ));
+        identity,
+    };
+    value.eligibility = Some(build_job_eligibility(&value, &eligibility_context));
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
@@ -880,6 +964,7 @@ pub fn upsert_posting(
                     applications: &applications,
                     reservations: &reservations,
                     track,
+                    identity,
                     observed_at_ms: now,
                 },
             )?;
@@ -921,6 +1006,7 @@ pub fn upsert_posting(
                     applications: &applications,
                     reservations: &reservations,
                     track,
+                    identity,
                     observed_at_ms: now,
                 },
             )?;
@@ -959,6 +1045,7 @@ pub fn upsert_posting(
                     applications: &applications,
                     reservations: &reservations,
                     track,
+                    identity,
                     observed_at_ms: now,
                 },
             )?;
@@ -1003,6 +1090,7 @@ pub fn upsert_posting(
                     applications: &applications,
                     reservations: &reservations,
                     track,
+                    identity,
                     observed_at_ms: now,
                 },
             )?;
@@ -1041,6 +1129,7 @@ struct PostingSnapshotContext<'a> {
     applications: &'a [JobApplication],
     reservations: &'a [AttemptReservation],
     track: Option<&'a CareerTrack>,
+    identity: Option<&'a ApplicationIdentity>,
     observed_at_ms: i64,
 }
 
@@ -1106,14 +1195,15 @@ fn prepare_snapshot_posting(
         .iter()
         .find(|application| application.job_id == value.id)
         .map(|application| application.id.as_str());
-    value.eligibility = Some(build_job_eligibility(
-        &value,
-        context.profile,
-        context.preferences,
-        context.reservations,
-        true,
+    let eligibility_context = EligibilityContext {
+        profile: context.profile,
+        preferences: context.preferences,
+        reservations: context.reservations,
+        require_live_verification: true,
         existing_application_id,
-        context.track,
-    ));
+        track: context.track,
+        identity: context.identity,
+    };
+    value.eligibility = Some(build_job_eligibility(&value, &eligibility_context));
     Ok(value)
 }

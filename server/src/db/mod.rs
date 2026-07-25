@@ -1580,6 +1580,22 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_provider_messages_status
         ON jobs_provider_messages(account_id, processing_status, updated_at_ms DESC);
     "#,
+    // 0039 - frozen candidate evidence is append-only. Account/Track deletion
+    // may still cascade for privacy, but an existing revision or claim row can
+    // never be rewritten after it has authorized an employer-facing packet.
+    r#"
+    CREATE TRIGGER IF NOT EXISTS jobs_profile_evidence_revisions_immutable
+    BEFORE UPDATE ON jobs_profile_evidence_revisions
+    BEGIN
+        SELECT RAISE(ABORT, 'Jobs profile evidence revisions are immutable');
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS jobs_resume_claim_evidence_immutable
+    BEFORE UPDATE ON jobs_resume_claim_evidence
+    BEGIN
+        SELECT RAISE(ABORT, 'Jobs resume claim evidence is immutable');
+    END;
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1938,6 +1954,8 @@ const POSTGRES_JOBS_PROVIDER_CONNECTIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/014_jobs_provider_connections.sql");
 const POSTGRES_JOBS_MAILBOX_SYNC: &str =
     include_str!("../../../infra/postgres/server-runtime/015_jobs_mailbox_sync.sql");
+const POSTGRES_JOBS_EVIDENCE_IMMUTABILITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/016_jobs_evidence_immutability.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1987,6 +2005,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         POSTGRES_JOBS_PROVIDER_CONNECTIONS,
     ),
     ("015_jobs_mailbox_sync.sql", POSTGRES_JOBS_MAILBOX_SYNC),
+    (
+        "016_jobs_evidence_immutability.sql",
+        POSTGRES_JOBS_EVIDENCE_IMMUTABILITY,
+    ),
 ];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
@@ -2479,6 +2501,14 @@ mod postgres_migration_tests {
         assert!(sql.contains("CREATE TABLE IF NOT EXISTS jobs_resume_claim_evidence"));
         assert!(sql.contains("UNIQUE(account_id, resume_version_id, claim_id)"));
         assert!(sql.contains("evidence_revision_id TEXT NOT NULL REFERENCES jobs_profile_evidence_revisions(id) ON DELETE RESTRICT"));
+
+        let (_, immutable_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "016_jobs_evidence_immutability.sql")
+            .expect("candidate evidence must be immutable before Jobs routes are served");
+        assert!(immutable_sql.contains("jobs_profile_evidence_revisions_immutable"));
+        assert!(immutable_sql.contains("jobs_resume_claim_evidence_immutable"));
+        assert!(immutable_sql.contains("BEFORE UPDATE"));
     }
 
     #[test]

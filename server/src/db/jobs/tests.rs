@@ -31,6 +31,7 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(identity.id),
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy {
                     role_family: "software_engineering".to_string(),
                     ..CareerTrackPolicy::default()
@@ -43,6 +44,45 @@ mod tests {
         )
         .unwrap();
         pool
+    }
+
+    fn verified_test_identity() -> ApplicationIdentity {
+        ApplicationIdentity {
+            id: "identity-primary".to_string(),
+            email: "jobs@example.com".to_string(),
+            label: "Primary".to_string(),
+            verification_status: "verified".to_string(),
+            is_default: true,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    fn test_resume_source_asset(id: &str, file_name: &str) -> ResumeSourceAsset {
+        ResumeSourceAsset {
+            id: id.to_string(),
+            file_name: file_name.to_string(),
+            media_type: "application/pdf".to_string(),
+            file_type: "pdf".to_string(),
+            storage_key: format!("jobs/resumes/{id}.pdf"),
+            sha256: format!("sha256-{id}"),
+            size_bytes: 1_024,
+            page_count: Some(2),
+            template_status: "text_only".to_string(),
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+        }
+    }
+
+    fn upsert_authoritative_test_track(pool: &DbPool, track: &CareerTrack) -> CareerTrack {
+        let bound = bind_career_track_authority(
+            pool,
+            "acct-jobs",
+            "jobs@example.com",
+            track,
+        )
+        .unwrap();
+        upsert_track(pool, "acct-jobs", &bound).unwrap()
     }
 
     fn test_posting(url: &str, posted_at_ms: i64, last_verified_at_ms: i64) -> JobPosting {
@@ -161,6 +201,234 @@ mod tests {
     }
 
     #[test]
+    fn career_profile_resume_metadata_is_always_server_owned() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.source_resume_name = "spoofed.pdf".to_string();
+        profile.source_resume_asset_id = "spoofed-asset".to_string();
+        profile.source_resume_sha256 = "spoofed-sha".to_string();
+        profile.source_resume_media_type = "text/plain".to_string();
+        profile.source_resume_template_status = "spoofed".to_string();
+
+        let saved_without_asset = save_profile(&pool, "acct-jobs", &profile).unwrap();
+        assert!(saved_without_asset.source_resume_name.is_empty());
+        assert!(saved_without_asset.source_resume_asset_id.is_empty());
+        assert!(saved_without_asset.source_resume_sha256.is_empty());
+        assert!(saved_without_asset.source_resume_media_type.is_empty());
+        assert!(saved_without_asset
+            .source_resume_template_status
+            .is_empty());
+
+        let asset = test_resume_source_asset("resume-source-a", "candidate.pdf");
+        let (_, uploaded_profile) =
+            save_resume_source_asset(&pool, "acct-jobs", &asset, &profile).unwrap();
+        assert_eq!(uploaded_profile.source_resume_name, asset.file_name);
+        assert_eq!(uploaded_profile.source_resume_asset_id, asset.id);
+        assert_eq!(uploaded_profile.source_resume_sha256, asset.sha256);
+        assert_eq!(uploaded_profile.source_resume_media_type, asset.media_type);
+        assert_eq!(
+            uploaded_profile.source_resume_template_status,
+            asset.template_status
+        );
+
+        let mut tampered = uploaded_profile;
+        tampered.source_resume_name = "another-spoof.pdf".to_string();
+        tampered.source_resume_asset_id = "another-spoof".to_string();
+        tampered.source_resume_sha256 = "another-spoof".to_string();
+        let resaved = save_profile(&pool, "acct-jobs", &tampered).unwrap();
+        assert_eq!(resaved.source_resume_name, asset.file_name);
+        assert_eq!(resaved.source_resume_asset_id, asset.id);
+        assert_eq!(resaved.source_resume_sha256, asset.sha256);
+    }
+
+    #[test]
+    fn career_track_binding_uses_verified_identity_and_current_resume_source() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let asset = test_resume_source_asset("resume-source-a", "candidate.pdf");
+        save_resume_source_asset(&pool, "acct-jobs", &asset, &profile).unwrap();
+        let primary =
+            ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        let track = CareerTrack {
+            id: "track-authority".to_string(),
+            name: "Engineering".to_string(),
+            role: "SWE".to_string(),
+            locations: vec!["Arlington, VA".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: None,
+            source_resume_asset_id: "caller-supplied-source".to_string(),
+            policy: CareerTrackPolicy::default(),
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let bound =
+            bind_career_track_authority(&pool, "acct-jobs", "jobs@example.com", &track).unwrap();
+        assert_eq!(
+            bound.application_identity_id.as_deref(),
+            Some(primary.id.as_str())
+        );
+        assert_eq!(bound.source_resume_asset_id, asset.id);
+        assert_eq!(bound.role, "Software Engineer");
+        upsert_track(&pool, "acct-jobs", &bound).unwrap();
+    }
+
+    #[test]
+    fn unverified_application_identity_cannot_bind_or_save_a_career_track() {
+        let pool = test_pool();
+        let pending = save_application_identity(
+            &pool,
+            "acct-jobs",
+            &ApplicationIdentity {
+                id: String::new(),
+                email: "pending@example.com".to_string(),
+                label: "Pending".to_string(),
+                verification_status: "pending".to_string(),
+                is_default: false,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let track = CareerTrack {
+            id: "track-pending-identity".to_string(),
+            name: "Engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: Vec::new(),
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some(pending.id),
+            source_resume_asset_id: String::new(),
+            policy: CareerTrackPolicy::default(),
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+
+        let bind_error =
+            bind_career_track_authority(&pool, "acct-jobs", "jobs@example.com", &track)
+                .unwrap_err();
+        assert!(bind_error
+            .to_string()
+            .contains("verify the application email"));
+        let save_error = upsert_track(&pool, "acct-jobs", &track).unwrap_err();
+        assert!(save_error
+            .to_string()
+            .contains("verify the application email"));
+    }
+
+    #[test]
+    fn changed_resume_source_blocks_a_saved_track_until_explicit_rebind() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let first_asset = test_resume_source_asset("resume-source-a", "candidate-a.pdf");
+        let (_, first_profile) =
+            save_resume_source_asset(&pool, "acct-jobs", &first_asset, &profile).unwrap();
+        let track = upsert_authoritative_test_track(
+            &pool,
+            &CareerTrack {
+                id: "track-resume-binding".to_string(),
+                name: "Engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: None,
+                source_resume_asset_id: String::new(),
+                policy: CareerTrackPolicy::default(),
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        );
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/resume-binding",
+            now_ms(),
+            now_ms(),
+        );
+        posting.track_id = track.id.clone();
+        upsert_posting(
+            &pool,
+            "acct-jobs",
+            &posting,
+            &first_profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+
+        let second_asset = test_resume_source_asset("resume-source-b", "candidate-b.pdf");
+        save_resume_source_asset(&pool, "acct-jobs", &second_asset, &first_profile).unwrap();
+        let loaded = workspace(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        let loaded_track = loaded
+            .tracks
+            .iter()
+            .find(|value| value.id == track.id)
+            .unwrap();
+        assert_eq!(loaded_track.source_resume_asset_id, first_asset.id);
+        let decision = loaded
+            .matches
+            .iter()
+            .find(|value| value.track_id == track.id)
+            .and_then(|value| value.eligibility.as_ref())
+            .unwrap();
+        assert!(decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "career_track_resume_changed"));
+        assert!(!decision.can_prepare);
+
+        let rebound = bind_career_track_authority(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+            loaded_track,
+        )
+        .unwrap();
+        assert_eq!(rebound.source_resume_asset_id, second_asset.id);
+        upsert_track(&pool, "acct-jobs", &rebound).unwrap();
+    }
+
+    #[test]
+    fn persisted_career_tracks_use_server_owned_role_normalization() {
+        let pool = test_pool();
+        let saved = upsert_authoritative_test_track(
+            &pool,
+            &CareerTrack {
+                id: "track-imported".to_string(),
+                name: "  Imported SDE track ".to_string(),
+                role: "Capital One, Senior Software Engineer II".to_string(),
+                locations: vec![
+                    " Arlington, VA ".to_string(),
+                    "arlington, va".to_string(),
+                ],
+                remote_preference: "Remote Only".to_string(),
+                application_identity_id: None,
+                source_resume_asset_id: String::new(),
+                policy: CareerTrackPolicy {
+                    role_family: "clinical_research".to_string(),
+                    employment_types: vec!["Full Time".to_string()],
+                    engagement_types: vec!["W-2".to_string()],
+                    ..CareerTrackPolicy::default()
+                },
+                active: true,
+                match_count: 8,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        );
+
+        assert_eq!(saved.name, "Imported SDE track");
+        assert_eq!(saved.role, "Software Engineer");
+        assert_eq!(saved.policy.role_family, "software_engineering");
+        assert_eq!(saved.locations, vec!["Arlington, VA".to_string()]);
+        assert_eq!(saved.remote_preference, "remote_only");
+        assert_eq!(saved.policy.employment_types, vec!["full_time"]);
+        assert_eq!(saved.policy.engagement_types, vec!["w2"]);
+    }
+
+    #[test]
     fn experience_fit_is_derived_from_profile_dates_and_posting_requirements() {
         let mut profile = default_profile("jobs@example.com");
         profile.employment = vec![EmploymentEntry {
@@ -178,6 +446,7 @@ mod tests {
             locations: vec!["New York, NY".to_string()],
             remote_preference: "hybrid_ok".to_string(),
             application_identity_id: Some("identity-primary".to_string()),
+            source_resume_asset_id: String::new(),
             policy: CareerTrackPolicy {
                 role_family: "software_engineering".to_string(),
                 relevant_employment_ids: vec!["employment-software".to_string()],
@@ -205,6 +474,7 @@ mod tests {
             sponsorship: "not_required".to_string(),
             ..JobPreferences::default()
         };
+        let identity = verified_test_identity();
         let mut aligned = test_posting(
             "https://boards.greenhouse.io/example/jobs/aligned",
             now_ms(),
@@ -216,15 +486,16 @@ mod tests {
             experience_requirement(&aligned).required_min_months,
             Some(48)
         );
-        let aligned_decision = build_job_eligibility(
-            &aligned,
-            &profile,
-            &preferences,
-            &[],
-            false,
-            None,
-            Some(&track),
-        );
+        let context = EligibilityContext {
+            profile: &profile,
+            preferences: &preferences,
+            reservations: &[],
+            require_live_verification: false,
+            existing_application_id: None,
+            track: Some(&track),
+            identity: Some(&identity),
+        };
+        let aligned_decision = build_job_eligibility(&aligned, &context);
         assert!(aligned_decision
             .passed_checks
             .iter()
@@ -233,15 +504,7 @@ mod tests {
         let mut too_senior = aligned;
         too_senior.description =
             "Requires at least 5 years of software engineering experience.".to_string();
-        let blocked = build_job_eligibility(
-            &too_senior,
-            &profile,
-            &preferences,
-            &[],
-            false,
-            None,
-            Some(&track),
-        );
+        let blocked = build_job_eligibility(&too_senior, &context);
         assert!(blocked
             .hard_failures
             .iter()
@@ -255,19 +518,129 @@ mod tests {
         title_only_senior.track_id = track.id.clone();
         title_only_senior.title = "Senior Software Engineer".to_string();
         title_only_senior.description = "Build reliable products with Rust.".to_string();
-        let blocked = build_job_eligibility(
-            &title_only_senior,
-            &profile,
-            &preferences,
-            &[],
-            false,
-            None,
-            Some(&track),
-        );
+        let blocked = build_job_eligibility(&title_only_senior, &context);
         assert!(blocked
             .hard_failures
             .iter()
             .any(|reason| reason.code == "experience_outside_target_range"));
+    }
+
+    #[test]
+    fn career_track_location_is_a_hard_filter_in_shared_eligibility() {
+        let profile = default_profile("jobs@example.com");
+        let track = CareerTrack {
+            id: "track-software".to_string(),
+            name: "New York software".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "onsite_ok".to_string(),
+            application_identity_id: Some("identity-primary".to_string()),
+            source_resume_asset_id: String::new(),
+            policy: CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                ..CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let identity = verified_test_identity();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/example/jobs/sf-track",
+            now_ms(),
+            now_ms(),
+        );
+        posting.track_id = track.id.clone();
+        posting.location = "San Francisco, CA".to_string();
+        posting.workplace = "on-site".to_string();
+
+        let context = EligibilityContext {
+            profile: &profile,
+            preferences: &preferences,
+            reservations: &[],
+            require_live_verification: false,
+            existing_application_id: None,
+            track: Some(&track),
+            identity: Some(&identity),
+        };
+        let decision = build_job_eligibility(&posting, &context);
+
+        assert!(decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "track_location_mismatch"));
+        assert!(!decision.can_prepare);
+    }
+
+    #[test]
+    fn title_seniority_guard_is_independent_from_elapsed_experience() {
+        let mut profile = default_profile("jobs@example.com");
+        profile.employment = vec![EmploymentEntry {
+            id: "employment-software".to_string(),
+            company: "Example Company".to_string(),
+            title: "Software Engineer".to_string(),
+            start_date: "2010-01".to_string(),
+            end_date: "2024-12".to_string(),
+            ..EmploymentEntry::default()
+        }];
+        let track = CareerTrack {
+            id: "track-software".to_string(),
+            name: "Software engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some("identity-primary".to_string()),
+            source_resume_asset_id: String::new(),
+            policy: CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                relevant_employment_ids: vec!["employment-software".to_string()],
+                ..CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let identity = verified_test_identity();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/example/jobs/principal",
+            now_ms(),
+            now_ms(),
+        );
+        posting.track_id = track.id.clone();
+        posting.title = "Principal Software Engineer".to_string();
+        posting.description =
+            "Requires 10 years of software engineering experience.".to_string();
+
+        let context = EligibilityContext {
+            profile: &profile,
+            preferences: &preferences,
+            reservations: &[],
+            require_live_verification: false,
+            existing_application_id: None,
+            track: Some(&track),
+            identity: Some(&identity),
+        };
+        let decision = build_job_eligibility(&posting, &context);
+
+        assert!(decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "experience_aligned"));
+        assert!(decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "seniority_outside_verified_history"));
+        assert!(!decision.can_prepare);
     }
 
     fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
@@ -2332,9 +2705,8 @@ mod tests {
     #[test]
     fn discovery_source_limits_and_track_cleanup_are_enforced() {
         let pool = test_pool();
-        let track = upsert_track(
+        let track = upsert_authoritative_test_track(
             &pool,
-            "acct-jobs",
             &CareerTrack {
                 id: "track-discovery".to_string(),
                 name: "Engineering".to_string(),
@@ -2342,14 +2714,14 @@ mod tests {
                 locations: vec![],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: None,
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
                 updated_at_ms: 0,
             },
-        )
-        .unwrap();
+        );
         for index in 0..DISCOVERY_MAX_SOURCES_PER_TRACK {
             upsert_discovery_source(
                 &pool,
@@ -2458,9 +2830,8 @@ mod tests {
         let profile = default_profile("jobs@example.com");
         let preferences = JobPreferences::default();
         for index in 0..3 {
-            upsert_track(
+            upsert_authoritative_test_track(
                 &pool,
-                "acct-jobs",
                 &CareerTrack {
                     id: format!("filler-final-{index}"),
                     name: format!("Filler {index}"),
@@ -2468,14 +2839,14 @@ mod tests {
                     locations: Vec::new(),
                     remote_preference: "hybrid_ok".to_string(),
                     application_identity_id: None,
+                    source_resume_asset_id: String::new(),
                     policy: CareerTrackPolicy::default(),
                     active: true,
                     match_count: 0,
                     created_at_ms: 0,
                     updated_at_ms: 0,
                 },
-            )
-            .unwrap();
+            );
         }
         for index in 0..(DISCOVERY_MAX_SOURCES_PER_ACCOUNT - 1) {
             upsert_discovery_source(
@@ -2494,9 +2865,8 @@ mod tests {
         let tracks = ["track-final-a", "track-final-b"]
             .into_iter()
             .map(|id| {
-                upsert_track(
+                upsert_authoritative_test_track(
                     &pool,
-                    "acct-jobs",
                     &CareerTrack {
                         id: id.to_string(),
                         name: id.to_string(),
@@ -2504,6 +2874,7 @@ mod tests {
                         locations: Vec::new(),
                         remote_preference: "hybrid_ok".to_string(),
                         application_identity_id: None,
+                        source_resume_asset_id: String::new(),
                         policy: CareerTrackPolicy::default(),
                         active: true,
                         match_count: 0,
@@ -2511,7 +2882,6 @@ mod tests {
                         updated_at_ms: 0,
                     },
                 )
-                .unwrap()
             })
             .collect::<Vec<_>>();
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
@@ -2793,9 +3163,8 @@ mod tests {
     #[test]
     fn track_deletion_rejects_a_posting_without_a_discovery_source() {
         let pool = test_pool();
-        let track = upsert_track(
+        let track = upsert_authoritative_test_track(
             &pool,
-            "acct-jobs",
             &CareerTrack {
                 id: "track-with-posting".to_string(),
                 name: "Engineering".to_string(),
@@ -2803,14 +3172,14 @@ mod tests {
                 locations: Vec::new(),
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: None,
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
                 created_at_ms: 0,
                 updated_at_ms: 0,
             },
-        )
-        .unwrap();
+        );
         let mut posting = test_posting(
             "https://boards.greenhouse.io/acme/jobs/track-bound-posting",
             now_ms(),
@@ -3362,7 +3731,7 @@ mod tests {
                 canonical_url: "https://example.com/jobs/42".to_string(),
                 description: "Rust and TypeScript".to_string(),
                 compensation: String::new(),
-                employment_type: String::new(),
+                employment_type: "full_time".to_string(),
                 track_id: "track-default".to_string(),
                 match_score: 86,
                 matched_reasons: vec!["Skills fit".to_string()],
@@ -3559,6 +3928,7 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(primary.id),
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
@@ -3577,6 +3947,7 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(data_email.id),
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy {
                     role_family: "data_engineering".to_string(),
                     ..CareerTrackPolicy::default()
@@ -3734,7 +4105,7 @@ mod tests {
                 canonical_url: "https://example.com/jobs/1".to_string(),
                 description: String::new(),
                 compensation: String::new(),
-                employment_type: String::new(),
+                employment_type: "full_time".to_string(),
                 track_id: "track-default".to_string(),
                 match_score: 80,
                 matched_reasons: Vec::new(),
@@ -3782,7 +4153,7 @@ mod tests {
                 canonical_url: "https://linkedin.com/jobs/view/123".to_string(),
                 description: "Distributed systems".to_string(),
                 compensation: String::new(),
-                employment_type: String::new(),
+                employment_type: "full_time".to_string(),
                 track_id: "track-default".to_string(),
                 match_score: 96,
                 matched_reasons: Vec::new(),
@@ -4111,6 +4482,7 @@ mod tests {
                 locations: Vec::new(),
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(primary.id),
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
@@ -4650,8 +5022,12 @@ mod tests {
         let posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
 
         let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
-        assert!(decision.can_prepare, "unexpected decision: {decision:#?}");
+        assert!(!decision.can_prepare, "unexpected decision: {decision:#?}");
         assert!(!decision.can_auto_submit);
+        assert!(decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "track_engagement_type_mismatch"));
         assert!(decision
             .review_reasons
             .iter()
@@ -4834,7 +5210,7 @@ mod tests {
                 now_ms(),
             );
             posting.company = format!("Company {index}");
-            posting.title = format!("Platform Engineer {index}");
+            posting.title = "Software Engineer".to_string();
             let posting =
                 upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
             let (application, _) =
@@ -4918,7 +5294,7 @@ mod tests {
                 canonical_url: "https://boards.greenhouse.io/acme/jobs/state-machine".to_string(),
                 description: String::new(),
                 compensation: String::new(),
-                employment_type: String::new(),
+                employment_type: "full_time".to_string(),
                 track_id: "track-default".to_string(),
                 match_score: 84,
                 matched_reasons: Vec::new(),
@@ -5175,8 +5551,8 @@ mod tests {
             connection_id: mailbox.id.clone(),
             provider: "gmail".to_string(),
             provider_subject: "google-subject-credential-test".to_string(),
-            access_token: "provider-access-token-secret".to_string(),
-            refresh_token: "provider-refresh-token-secret".to_string(),
+            access_token: "dummy-provider-access-token".to_string(),
+            refresh_token: "dummy-provider-refresh-token".to_string(),
             scopes: vec!["gmail.readonly".to_string()],
             expires_at_ms: now + 3_600_000,
             created_at_ms: now,
@@ -5233,8 +5609,8 @@ mod tests {
                 connection_id: String::new(),
                 provider: "gmail".to_string(),
                 provider_subject: "google-subject-atomic-setup".to_string(),
-                access_token: "atomic-access-token".to_string(),
-                refresh_token: "atomic-refresh-token".to_string(),
+                access_token: "dummy-atomic-access-token".to_string(),
+                refresh_token: "dummy-atomic-refresh-token".to_string(),
                 scopes: vec!["gmail.readonly".to_string()],
                 expires_at_ms: now + 3_600_000,
                 created_at_ms: now,
@@ -5249,7 +5625,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .refresh_token,
-            "atomic-refresh-token"
+            "dummy-atomic-refresh-token"
         );
         let sync = mailbox_sync_state(&pool, "acct-jobs", &mailbox.id)
             .unwrap()
@@ -5393,9 +5769,9 @@ mod tests {
             .any(|(account_id, state)| {
                 account_id == "acct-jobs" && state.connection_id == mailbox.id
             }));
-        assert!(mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id)
-            .unwrap()
-            == false);
+        assert!(
+            !mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id).unwrap()
+        );
     }
 
     #[test]
@@ -5650,6 +6026,7 @@ mod tests {
                 locations: vec!["New York, NY".to_string()],
                 remote_preference: "hybrid_ok".to_string(),
                 application_identity_id: Some(alternate.id.clone()),
+                source_resume_asset_id: String::new(),
                 policy: CareerTrackPolicy::default(),
                 active: true,
                 match_count: 0,
@@ -5673,7 +6050,7 @@ mod tests {
                 canonical_url: "https://example.com/jobs/email-test".to_string(),
                 description: "Product engineering".to_string(),
                 compensation: String::new(),
-                employment_type: String::new(),
+                employment_type: "full_time".to_string(),
                 track_id: track.id,
                 match_score: 88,
                 matched_reasons: Vec::new(),
@@ -5762,6 +6139,61 @@ mod tests {
         assert!(!raw.contains("dependable products"));
         assert!(delete_answer_memory(&pool, "acct-jobs", &second.id).unwrap());
         assert!(list_answer_memory(&pool, "acct-jobs").unwrap().is_empty());
+    }
+
+    #[test]
+    fn prepared_candidate_evidence_is_database_immutable() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.full_name = "Taylor Rivera".to_string();
+        profile.headline = "Software Engineer".to_string();
+        profile.summary = "Builds reliable software systems.".to_string();
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/immutable-evidence",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, resume) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let evidence_id = application
+            .receipt
+            .pointer("/evidence_revision_id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let conn = pool.get().unwrap();
+
+        let revision_error = conn
+            .execute(
+                "UPDATE jobs_profile_evidence_revisions
+                    SET content_hash = 'tampered'
+                  WHERE account_id = ?1 AND id = ?2",
+                params!["acct-jobs", evidence_id],
+            )
+            .unwrap_err();
+        assert!(revision_error
+            .to_string()
+            .contains("Jobs profile evidence revisions are immutable"));
+
+        let claim_error = conn
+            .execute(
+                "UPDATE jobs_resume_claim_evidence
+                    SET claim_json = '{}'
+                  WHERE account_id = ?1 AND resume_version_id = ?2",
+                params!["acct-jobs", resume.id],
+            )
+            .unwrap_err();
+        assert!(claim_error
+            .to_string()
+            .contains("Jobs resume claim evidence is immutable"));
     }
 
     #[test]

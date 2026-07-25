@@ -380,6 +380,8 @@ pub struct CareerTrack {
     #[serde(default)]
     pub application_identity_id: Option<String>,
     #[serde(default)]
+    pub source_resume_asset_id: String,
+    #[serde(default)]
     pub policy: CareerTrackPolicy,
     #[serde(default = "default_true")]
     pub active: bool,
@@ -697,6 +699,10 @@ pub struct RoleExperienceEvidence {
     pub target_min_months: i64,
     #[serde(default)]
     pub target_max_months: i64,
+    #[serde(default)]
+    pub max_verified_title_level: i64,
+    #[serde(default)]
+    pub target_title_level: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

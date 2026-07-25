@@ -1,5 +1,8 @@
 # FIX-XXX: [Issue Title]
 
+> Codex preflight: load the `bluey-ops` skill, then verify its memory against
+> the current repository state and task-specific docs.
+
 ## Issue
 
 <!-- One-line description + link to issue/task if applicable -->

@@ -1,5 +1,8 @@
 # IMPL: [Task ID] — [Title]
 
+> Codex preflight: load the `bluey-ops` skill, then verify its memory against
+> the current repository state and task-specific docs.
+
 ## Scope
 
 **Does:**

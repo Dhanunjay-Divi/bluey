@@ -2,6 +2,12 @@
 
 Date: 2026-07-02
 
+## Codex Operating Memory
+
+When working in Codex on the owner workstation, load the `bluey-ops` skill
+before using this runbook. The skill provides project navigation and operating
+memory; this runbook and the current repository state remain authoritative.
+
 ## Purpose
 
 When a payment dispute, refund request, chargeback, unexplained credit loss, or

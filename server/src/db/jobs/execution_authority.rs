@@ -296,15 +296,16 @@ fn current_execution_authority_matches(
         return Ok(false);
     }
 
-    let mut decision = build_job_eligibility(
-        posting,
+    let context = EligibilityContext {
         profile,
         preferences,
         reservations,
-        true,
-        Some(application.id.as_str()),
-        Some(track),
-    );
+        require_live_verification: true,
+        existing_application_id: Some(application.id.as_str()),
+        track: Some(track),
+        identity: Some(identity),
+    };
+    let mut decision = build_job_eligibility(posting, &context);
     apply_discovery_authorities(authorities, &mut decision);
     let runner_authorized = match runner {
         ExecutionAuthorityRunner::Local => decision.can_queue_local,
@@ -347,34 +348,44 @@ fn stored_execution_evidence_matches_sqlite(
     else {
         return Ok(false);
     };
-    let stored_evidence: Option<(String, String)> = tx
+    let stored_evidence: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT career_track_id, content_hash FROM jobs_profile_evidence_revisions
+            "SELECT career_track_id, content_hash, snapshot_json
+               FROM jobs_profile_evidence_revisions
               WHERE account_id = ?1 AND id = ?2",
             params![account_id, evidence_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
-    let resume_exists: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM jobs_resume_versions
-          WHERE account_id = ?1 AND id = ?2 AND job_id = ?3)",
-        params![account_id, resume_id, application.job_id],
-        |row| row.get(0),
-    )?;
-    let (claim_count, wrong_revision): (i64, i64) = tx.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN evidence_revision_id <> ?3 THEN 1 ELSE 0 END), 0)
+    let resume_claim_ids = tx
+        .query_row(
+            "SELECT claim_ids_json
+               FROM jobs_resume_versions
+              WHERE account_id = ?1 AND id = ?2 AND job_id = ?3",
+            params![account_id, resume_id, application.job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| parse_json::<Vec<String>>(raw, "Jobs resume claim ids"))
+        .transpose()?;
+    let mut claim_stmt = tx.prepare(
+        "SELECT claim_id, evidence_revision_id
            FROM jobs_resume_claim_evidence
           WHERE account_id = ?1 AND resume_version_id = ?2",
-        params![account_id, resume_id, evidence_id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    Ok(stored_evidence.is_some_and(|(track_id, content_hash)| {
+    let claim_rows = claim_stmt
+        .query_map(params![account_id, resume_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(stored_evidence.is_some_and(|(track_id, content_hash, snapshot_raw)| {
         frozen_receipt_string(application, "/career_track_id").as_deref()
             == Some(track_id.as_str())
             && content_hash == evidence_hash
-    }) && resume_exists
-        && claim_count > 0
-        && wrong_revision == 0)
+            && parse_json::<Value>(snapshot_raw, "Jobs evidence revision")
+                .and_then(|snapshot| evidence_snapshot_content_hash(&snapshot))
+                .is_ok_and(|recomputed| recomputed == content_hash)
+    }) && claim_sets_match_evidence(resume_claim_ids, &claim_rows, &evidence_id))
 }
 
 fn stored_execution_evidence_matches_postgres(
@@ -396,34 +407,75 @@ fn stored_execution_evidence_matches_postgres(
         return Ok(false);
     };
     let stored_evidence = tx.query_opt(
-        "SELECT career_track_id, content_hash FROM jobs_profile_evidence_revisions
+        "SELECT career_track_id, content_hash, snapshot_json
+           FROM jobs_profile_evidence_revisions
           WHERE account_id = $1 AND id = $2",
         &[&account_id, &evidence_id],
     )?;
-    let resume_exists: bool = tx
-        .query_one(
-            "SELECT EXISTS(SELECT 1 FROM jobs_resume_versions
-              WHERE account_id = $1 AND id = $2 AND job_id = $3)",
+    let resume_claim_ids = tx
+        .query_opt(
+            "SELECT claim_ids_json
+               FROM jobs_resume_versions
+              WHERE account_id = $1 AND id = $2 AND job_id = $3",
             &[&account_id, &resume_id, &application.job_id],
         )?
-        .get(0);
-    let claim_row = tx.query_one(
-        "SELECT COUNT(*), COALESCE(SUM(CASE WHEN evidence_revision_id <> $3 THEN 1 ELSE 0 END), 0)
+        .map(|row| parse_json::<Vec<String>>(row.get(0), "Jobs resume claim ids"))
+        .transpose()?;
+    let claim_rows = tx
+        .query(
+            "SELECT claim_id, evidence_revision_id
            FROM jobs_resume_claim_evidence
           WHERE account_id = $1 AND resume_version_id = $2",
-        &[&account_id, &resume_id, &evidence_id],
-    )?;
-    let claim_count: i64 = claim_row.get(0);
-    let wrong_revision: i64 = claim_row.get(1);
+            &[&account_id, &resume_id],
+        )?
+        .into_iter()
+        .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+        .collect::<Vec<_>>();
     Ok(stored_evidence.is_some_and(|row| {
         let track_id: String = row.get(0);
         let content_hash: String = row.get(1);
+        let snapshot_raw: String = row.get(2);
         frozen_receipt_string(application, "/career_track_id").as_deref()
             == Some(track_id.as_str())
             && content_hash == evidence_hash
-    }) && resume_exists
-        && claim_count > 0
-        && wrong_revision == 0)
+            && parse_json::<Value>(snapshot_raw, "Jobs evidence revision")
+                .and_then(|snapshot| evidence_snapshot_content_hash(&snapshot))
+                .is_ok_and(|recomputed| recomputed == content_hash)
+    }) && claim_sets_match_evidence(resume_claim_ids, &claim_rows, &evidence_id))
+}
+
+fn claim_sets_match_evidence(
+    resume_claim_ids: Option<Vec<String>>,
+    claim_rows: &[(String, String)],
+    evidence_id: &str,
+) -> bool {
+    let Some(resume_claim_ids) = resume_claim_ids.and_then(normalized_nonempty_claim_ids) else {
+        return false;
+    };
+    if claim_rows
+        .iter()
+        .any(|(_, evidence_revision_id)| evidence_revision_id != evidence_id)
+    {
+        return false;
+    }
+    normalized_nonempty_claim_ids(
+        claim_rows
+            .iter()
+            .map(|(claim_id, _)| claim_id.clone())
+            .collect(),
+    )
+    .is_some_and(|evidence_claim_ids| evidence_claim_ids == resume_claim_ids)
+}
+
+fn normalized_nonempty_claim_ids(claim_ids: Vec<String>) -> Option<Vec<String>> {
+    let mut claim_ids = claim_ids
+        .into_iter()
+        .map(|claim_id| claim_id.trim().to_string())
+        .filter(|claim_id| !claim_id.is_empty())
+        .collect::<Vec<_>>();
+    claim_ids.sort();
+    claim_ids.dedup();
+    (!claim_ids.is_empty()).then_some(claim_ids)
 }
 
 fn frozen_receipt_string(application: &JobApplication, pointer: &str) -> Option<String> {
@@ -433,4 +485,57 @@ fn frozen_receipt_string(application: &JobApplication, pointer: &str) -> Option<
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
+}
+
+#[cfg(test)]
+mod execution_authority_tests {
+    use super::claim_sets_match_evidence;
+
+    #[test]
+    fn claim_sets_require_an_exact_nonempty_revision_bound_match() {
+        let rows = vec![
+            ("claim-b".to_string(), "evidence-1".to_string()),
+            ("claim-a".to_string(), "evidence-1".to_string()),
+        ];
+
+        assert!(claim_sets_match_evidence(
+            Some(vec![
+                " claim-a ".to_string(),
+                "claim-b".to_string(),
+                "claim-a".to_string(),
+            ]),
+            &rows,
+            "evidence-1",
+        ));
+        assert!(!claim_sets_match_evidence(None, &rows, "evidence-1"));
+        assert!(!claim_sets_match_evidence(
+            Some(Vec::new()),
+            &rows,
+            "evidence-1",
+        ));
+        assert!(!claim_sets_match_evidence(
+            Some(vec!["claim-a".to_string()]),
+            &rows,
+            "evidence-1",
+        ));
+        assert!(!claim_sets_match_evidence(
+            Some(vec![
+                "claim-a".to_string(),
+                "claim-b".to_string(),
+                "claim-c".to_string(),
+            ]),
+            &rows,
+            "evidence-1",
+        ));
+
+        let wrong_revision = vec![
+            ("claim-a".to_string(), "evidence-1".to_string()),
+            ("claim-b".to_string(), "evidence-2".to_string()),
+        ];
+        assert!(!claim_sets_match_evidence(
+            Some(vec!["claim-a".to_string(), "claim-b".to_string()]),
+            &wrong_revision,
+            "evidence-1",
+        ));
+    }
 }
