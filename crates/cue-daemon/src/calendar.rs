@@ -127,7 +127,7 @@ impl CalendarSource for EnvFakeSource {
         };
         spec.split(';')
             .filter_map(|entry| {
-                let (title, start) = entry.trim().split_once('@')?;
+                let (title, start) = entry.trim().rsplit_once('@')?;
                 let start: u64 = start.trim().parse().ok()?;
                 Some(UpcomingEvent {
                     id: format!("fake-{}", title.trim()),

@@ -21,7 +21,8 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": false,
-        "contentProtected": true
+        "contentProtected": true,
+        "visible": false
       },
       {
         "label": "banner",
