@@ -225,24 +225,59 @@ async fn run_connection(
                 }
                 #[cfg(target_os = "macos")]
                 if line.contains("\"show_meeting_banner\"") {
-                    #[allow(deprecated)]
-                    use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
-                    use tauri_nspanel::WebviewWindowExt;
-                    if let Some(w) = app.get_webview_window("banner") {
-                        let _ = w.show();
-                        let _ = w.set_always_on_top(true);
-                        if let Ok(panel) = w.to_panel() {
-                            panel.set_level(4);
-                            panel.set_style_mask(0 | (1 << 7));
-                            #[allow(deprecated)]
-                            panel.set_collection_behaviour(
-                                NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
-                                    | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
-                            );
-                            panel.show();
-                            panel.order_front_regardless();
+                    let app_handle = app.clone();
+                    let _ = app_handle.clone().run_on_main_thread(move || {
+                        #[allow(deprecated)]
+                        use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
+                        use tauri_nspanel::WebviewWindowExt;
+                        if let Some(w) = app_handle.get_webview_window("banner") {
+                            let _ = w.show();
+                            let _ = w.set_always_on_top(true);
+                            if let Ok(panel) = w.to_panel() {
+                                panel.set_level(4);
+                                panel.set_style_mask(0 | (1 << 7));
+                                #[allow(deprecated)]
+                                panel.set_collection_behaviour(
+                                    NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
+                                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
+                                );
+                                panel.show();
+                                panel.order_front_regardless();
+                            }
                         }
-                    }
+                    });
+                } else if line.contains("\"show\"") || line.contains("\"toggle\"") || line.contains("\"boot\"") {
+                    let app_handle = app.clone();
+                    let _ = app_handle.clone().run_on_main_thread(move || {
+                        #[allow(deprecated)]
+                        use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
+                        use tauri_nspanel::WebviewWindowExt;
+                        if let Some(w) = app_handle.get_webview_window("meeting") {
+                            let _ = w.show();
+                            let _ = w.set_always_on_top(true);
+                            if let Ok(panel) = w.to_panel() {
+                                panel.set_level(4);
+                                panel.set_style_mask(0 | (1 << 7));
+                                #[allow(deprecated)]
+                                panel.set_collection_behaviour(
+                                    NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
+                                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
+                                );
+                                panel.show();
+                                panel.order_front_regardless();
+                            }
+                        }
+                    });
+                } else if line.contains("\"hide\"") {
+                    let app_handle = app.clone();
+                    let _ = app_handle.clone().run_on_main_thread(move || {
+                        use tauri_nspanel::ManagerExt;
+                        if let Ok(panel) = app_handle.get_webview_panel("meeting") {
+                            panel.order_out(None);
+                        } else if let Some(w) = app_handle.get_webview_window("meeting") {
+                            let _ = w.hide();
+                        }
+                    });
                 }
                 // Forward the raw command JSON to the web UI; it parses `type`.
                 let _ = app.emit("overlay://command", line.to_string());

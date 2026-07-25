@@ -29,36 +29,9 @@ mod ipc;
 #[allow(deprecated)]
 mod macos {
     use tauri::Manager;
-    use tauri_nspanel::{cocoa::appkit::NSWindowCollectionBehavior, WebviewWindowExt as PanelExt};
 
-    const NS_FLOAT_WINDOW_LEVEL: i32 = 4;
-    const NS_WINDOW_STYLE_MASK_BORDERLESS: i32 = 0;
-    const NS_WINDOW_STYLE_MASK_NONACTIVATING_PANEL: i32 = 1 << 7;
-    const NS_OVERLAY_STYLE_MASK: i32 =
-        NS_WINDOW_STYLE_MASK_BORDERLESS | NS_WINDOW_STYLE_MASK_NONACTIVATING_PANEL;
-
-    /// Float the meeting panel over everything as a non-activating panel (never
-    /// steals focus from the meeting app), joining all spaces.
     pub fn setup_panel(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         app.handle().plugin(tauri_nspanel::init())?;
-        // Panel-ify BOTH windows: the main "meeting" overlay AND the small
-        // "banner" window (the meeting-prep card). Same floating, capture-safe,
-        // all-spaces NSPanel treatment so the banner is a proper floating panel
-        // independent of the main overlay's state (the separate-window design).
-        // Only the MAIN "meeting" window is panel-ified at startup. The "banner"
-        // window starts HIDDEN, and converting a hidden window to an NSPanel here
-        // crashed the app at launch (SIGTRAP). The banner window's panel setup is
-        // deferred to its show path (ipc.rs), converting it only once it's visible.
-        let window = app
-            .get_webview_window("meeting")
-            .expect("meeting window");
-        let panel = window.to_panel()?;
-        panel.set_level(NS_FLOAT_WINDOW_LEVEL);
-        panel.set_style_mask(NS_OVERLAY_STYLE_MASK);
-        panel.set_collection_behaviour(
-            NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
-                | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
-        );
         Ok(())
     }
 
