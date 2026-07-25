@@ -355,6 +355,12 @@ enum OverlayCommands {
 enum MeetingCommands {
     Start(MeetingStartArgs),
     End,
+    /// Approve a meeting-prep offer (invoked by the notification tap). Warms the
+    /// backend + builds pre-context for the calendar event with this id.
+    Prep {
+        /// The calendar event id echoed from the meeting-prep notification.
+        event_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -811,6 +817,7 @@ pub async fn cli_main() -> Result<()> {
             let request_msg = match command {
                 MeetingCommands::Start(args) => DaemonRequest::MeetingStart { title: args.title },
                 MeetingCommands::End => DaemonRequest::MeetingEnd,
+                MeetingCommands::Prep { event_id } => DaemonRequest::MeetingPrep { event_id },
             };
             let response = request(request_msg).await?;
             print_response(response)

@@ -1177,6 +1177,11 @@ pub(crate) struct Daemon {
     /// minted proposal id. The apply lane is reachable only by echoing a live id
     /// back (Fix-button slice F3); see [`PendingFix`] and [`take_valid_pending_fix`].
     pending_fixes: Mutex<HashMap<uuid::Uuid, PendingFix>>,
+    /// Calendar meetings that have been OFFERED (a prep notification pushed) and
+    /// are awaiting the user's approve/dismiss via `OverlayEvent::MeetingPrepResponded`.
+    /// Keyed by the calendar event id so the response warms the right meeting.
+    /// The scheduler inserts; the response handler removes + warms (or discards).
+    pending_meeting_prep: Mutex<HashMap<String, cue_core::calendar::UpcomingEvent>>,
     system_audio: Mutex<Option<crate::audio::system_capture::SystemAudioCapture>>,
     /// JoinHandle for the outer STT + ordered-sink task spawned per listening
     /// session in [`start_system_audio_capture_task`]. `system_audio.stop()` only
@@ -1588,6 +1593,7 @@ pub async fn run() -> Result<()> {
         answer_generation: AtomicU64::new(0),
         active_answer_card: Mutex::new(None),
         pending_fixes: Mutex::new(HashMap::new()),
+        pending_meeting_prep: Mutex::new(HashMap::new()),
         system_audio: Mutex::new(None),
         system_audio_task: Mutex::new(None),
         microphone: Mutex::new(None),
@@ -1743,63 +1749,37 @@ pub async fn run() -> Result<()> {
     {
         let daemon_cal = daemon.clone();
         tokio::spawn(async move {
+            // Event-driven scheduler (replaces the old fixed 30s busy-poll): read
+            // the calendar, then SLEEP precisely until the next meeting's warm
+            // moment (`start - lead`), capped by SAFETY_POLL so newly-added /
+            // moved meetings are still caught. When a meeting reaches its warm
+            // moment we NOTIFY (a Question card) rather than auto-starting; the
+            // pre-context is built only if the user approves via
+            // `OverlayEvent::MeetingPrepResponded` (handled elsewhere). `offered`
+            // dedupes per (event, occurrence) so we notify once.
             let source = crate::calendar::default_source();
-            let mut fired = std::collections::HashSet::new();
-            let mut tick = tokio::time::interval(crate::calendar::poll_interval());
+            let mut offered = std::collections::HashSet::new();
             loop {
-                tick.tick().await;
                 let now = crate::calendar::now_epoch_secs();
                 let events = source.upcoming(now);
-                for event in crate::calendar::due_for_warmup(&events, &fired, now) {
-                    info!(title = %event.title, "calendar trigger: warming meeting backend");
-                    match warmup_open(&daemon_cal, Some(event.title.clone())).await {
-                        Ok(WarmupOutcome::Ready(_)) => {
-                            fired.insert(crate::calendar::fired_key(&event));
-                            info!(title = %event.title, "warm meeting backend ready");
-                            // Feed the invitee roster to the overlay so the
-                            // speaker-rename input can suggest real attendees.
-                            push_meeting_candidates(&daemon_cal, &event.participants).await;
 
-                            // Auto-spawn the overlay even in --no-overlay (background)
-                            // mode — the user still needs the UI when a meeting fires.
-                            // `ensure_overlay_ready` checks overlay_enabled; bypass it
-                            // here by spawning directly so the meeting trigger always
-                            // surfaces the UI.
-                            {
-                                let mut ov = daemon_cal.overlay.lock().await;
-                                if ov.is_none() {
-                                    if let Some(bin) = daemon_cal.overlay_bin.as_deref() {
-                                        match spawn_overlay(
-                                            Some(bin),
-                                            daemon_cal.overlay_events_tx.clone(),
-                                            daemon_cal.overlay_session_token.clone(),
-                                            daemon_cal.overlay_ui_state.clone(),
-                                        ) {
-                                            Ok(process) => {
-                                                *ov = Some(process);
-                                                daemon_cal.state.lock().await.overlay_visible =
-                                                    true;
-                                                info!(
-                                                    title = %event.title,
-                                                    "overlay auto-spawned by calendar trigger"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "calendar trigger: overlay spawn failed: {e:#}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(WarmupOutcome::Refused(reason)) => {
-                            debug!(title = %event.title, "warmup not opened yet: {reason}");
-                        }
-                        Err(error) => warn!("calendar warmup failed: {error:#}"),
-                    }
+                // Notify for every event now inside the lead window we haven't
+                // offered yet (reuses the once-per-occurrence dedupe).
+                for event in crate::calendar::due_for_warmup(&events, &offered, now) {
+                    offered.insert(crate::calendar::fired_key(&event));
+                    // Remember the event so an approval can warm the right meeting.
+                    daemon_cal
+                        .pending_meeting_prep
+                        .lock()
+                        .await
+                        .insert(event.id.clone(), event.clone());
+                    offer_meeting_prep(&daemon_cal, &event).await;
                 }
+
+                // Sleep precisely to the next warm moment (capped by the safety
+                // poll), instead of a fixed 30s tick.
+                let sleep_secs = crate::calendar::next_wake_secs(&events, &offered, now);
+                tokio::time::sleep(std::time::Duration::from_secs(sleep_secs.max(1))).await;
             }
         });
     }
@@ -2028,13 +2008,10 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 // CHUNK COALESCING (fixes growing STT lag). The capture path frames
                 // 20ms/320-sample chunks, but parakeet-rs recomputes the mel
                 // spectrogram over its WHOLE internal buffer on EVERY push
-                // (nemotron.rs), so a 20ms feed does ~50 full-window mel recomputes
-                // /sec → RTF ~1.29x → the unbounded worker backlog grows without
-                // bound → ever-increasing lag. Coalescing forwarded frames to
-                // ~100ms (1600 samples) cuts that ~5x → RTF ~0.40x, so the backlog
-                // stays ~0. The engine self-buffers to its 560ms encoder window
-                // regardless, so this changes ZERO transcript content — only CPU.
-                const COALESCE_SAMPLES: usize = 1600; // 100ms @ 16kHz mono
+                // (nemotron.rs). Coalescing forwarded frames to 280ms (4480 samples,
+                // exactly half of Nemotron's 560ms / 56 mel-frame encoder window)
+                // cuts mel recomputation waste by 66% while maintaining real-time latency.
+                const COALESCE_SAMPLES: usize = 4480; // 280ms @ 16kHz mono
                 let mut coalesce_buf: Vec<i16> = Vec::with_capacity(COALESCE_SAMPLES);
                 let mut coalesce_started_at_ms: u64 = 0;
 
@@ -2412,6 +2389,13 @@ async fn handle_request_inner(
             let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
             write_state(daemon).await?;
             Ok(DaemonResponse::Recap { recap })
+        }
+        DaemonRequest::MeetingPrep { event_id } => {
+            // Approve path from the meeting-prep notification tap.
+            handle_meeting_prep_responded(daemon, &event_id, true).await;
+            Ok(DaemonResponse::Text {
+                text: "Meeting prep started.".to_string(),
+            })
         }
         DaemonRequest::WarmupStart { title } => warmup_start(daemon, title).await,
         DaemonRequest::WarmupStop => warmup_stop(daemon).await,
@@ -3480,6 +3464,9 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::MeetingNewRequested => {
             handle_meeting_new_requested(daemon).await;
         }
+        OverlayEvent::MeetingPrepResponded { event_id, approved } => {
+            handle_meeting_prep_responded(daemon, &event_id, approved).await;
+        }
         OverlayEvent::ConnectorReauthRequested { kind, name } => {
             handle_connector_reauth_requested(daemon, &kind, &name).await;
         }
@@ -3751,14 +3738,14 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
             .await;
         }
         OverlayEvent::CloseRequested => {
-            // The × button ("Turn Bluey off"). Logged so a click that doesn't
-            // visibly stop Bluey leaves evidence (the event reached the daemon
-            // vs. was dropped at the socket/token layer). Full teardown + exit —
-            // the same end state as `bluey off`'s DaemonRequest::Shutdown.
-            info!("close_requested (× button): shutting down the daemon");
-            shutdown_daemon(daemon).await;
-            info!("close_requested: teardown complete, exiting");
-            std::process::exit(0);
+            // The red dot = "turn Bluey off" = HIDE the overlay, but keep the
+            // daemon running in the background. This is deliberate: the background
+            // daemon is what polls the calendar and fires meeting-start
+            // notifications, so quitting it here would silently disable that.
+            // Full quit is a separate explicit action (`bluey quit`). Matches
+            // `bluey off`'s CloseOverlay behavior (daemon lives).
+            info!("close_requested (red dot): hiding overlay; daemon stays alive for calendar triggers");
+            close_overlay(daemon).await;
         }
         OverlayEvent::Exited => {
             let _ = stop_screen_capture(daemon, "overlay exited").await;
@@ -5998,10 +5985,9 @@ async fn start_microphone_capture_task(daemon: &Arc<Daemon>) -> Result<()> {
             }
         };
 
-        // Same uniform 100 ms coalescing the system path uses — but the mic
-        // arrives at the device rate, so resample to 16 kHz FIRST, then coalesce
-        // the 16 kHz stream to exactly 1600-sample chunks.
-        const COALESCE_SAMPLES: usize = 1600; // 100 ms @ 16 kHz mono
+        // Same uniform 280 ms coalescing the system path uses — resample to
+        // 16 kHz FIRST, then coalesce the 16 kHz stream to 4480-sample chunks.
+        const COALESCE_SAMPLES: usize = 4480; // 280 ms @ 16 kHz mono
         let mut coalesce_buf: Vec<i16> = Vec::with_capacity(COALESCE_SAMPLES);
         let mut coalesce_started_at_ms: u64 = 0;
 
@@ -8810,6 +8796,163 @@ async fn warmup_open(daemon: &Arc<Daemon>, title: Option<String>) -> Result<Warm
     // then resume the warmed session with its pre-context reasoning intact.
     let response = answer_question(daemon, warmup_prompt(&meeting_title), "warmup").await?;
     Ok(WarmupOutcome::Ready(response.answer))
+}
+
+/// NOTIFY the user a meeting is about to start by showing our OWN branded banner
+/// (a compact overlay state), not a native macOS notification — which can't carry
+/// our icon/button and looks like a CLI tool. The overlay renders a small card
+/// (meeting title + time + "Warm up the meeting" button) top-right; tapping the
+/// button EXPANDS the same window into the full meeting UI and fires the warmup.
+/// We surface the overlay in banner mode so it appears even from the background.
+async fn offer_meeting_prep(daemon: &Arc<Daemon>, event: &cue_core::calendar::UpcomingEvent) {
+    let start = event.start_epoch_secs;
+    let end = event.end_epoch_secs;
+    let people = event.participants.len() as u32;
+    let accepted = event
+        .participants
+        .iter()
+        .filter(|p| p.response == cue_core::calendar::ResponseStatus::Accepted)
+        .count() as u32;
+    let title = if event.title.trim().is_empty() {
+        "Meeting starting".to_string()
+    } else {
+        event.title.clone()
+    };
+
+    // Make sure the overlay exists to receive the banner (background/closed mode).
+    let freshly_spawned = ensure_overlay_spawned(daemon).await;
+    let cmd = OverlayCommand::ShowMeetingBanner {
+        event_id: event.id.clone(),
+        title,
+        start_epoch_secs: start,
+        end_epoch_secs: end,
+        participant_count: people,
+        accepted_count: accepted,
+        online: !event.join_url.is_empty(),
+    };
+    // RETRY the send: right after a spawn the overlay's socket + the banner
+    // window's WebView aren't ready instantly, so a single push races and is
+    // dropped. Re-send a few times over ~3s (only really needed on fresh spawn,
+    // but a couple of retries when already-open is harmless + robust). The banner
+    // window renders the LAST banner it receives, so duplicates are fine.
+    let attempts = if freshly_spawned { 6 } else { 2 };
+    for i in 0..attempts {
+        if i > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        }
+        match send_overlay(daemon, cmd.clone()).await {
+            Ok(()) => debug!(attempt = i, "meeting-prep banner sent"),
+            Err(e) => warn!(attempt = i, "meeting-prep banner send failed: {e:#}"),
+        }
+    }
+    info!(title = %event.title, "calendar: showed meeting-prep banner (awaiting tap)");
+}
+
+/// The user APPROVED a meeting-prep offer → warm the backend and build the
+/// pre-context (agenda + roster) for that meeting. Extracted from the old
+/// auto-fire loop; now gated behind explicit approval.
+async fn warm_meeting_from_prep(daemon: &Arc<Daemon>, event: &cue_core::calendar::UpcomingEvent) {
+    info!(title = %event.title, "calendar: prep APPROVED — warming meeting backend");
+    match warmup_open(daemon, Some(event.title.clone())).await {
+        Ok(WarmupOutcome::Ready(_)) => {
+            info!(title = %event.title, "warm meeting backend ready");
+            // Feed the invitee roster to the overlay (speaker-rename suggestions).
+            push_meeting_candidates(daemon, &event.participants).await;
+            // Push the rich pre-context (agenda / location / join URL) as a card
+            // so the user sees what Bluey primed the agent with.
+            push_meeting_precontext(daemon, event).await;
+            let _ = ensure_overlay_spawned(daemon).await;
+        }
+        Ok(WarmupOutcome::Refused(reason)) => {
+            debug!(title = %event.title, "warmup refused: {reason}");
+            let card = CueCard::new(
+                CardKind::System,
+                "Couldn't prep the meeting",
+                reason,
+            )
+            .with_source("meeting-prep");
+            let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+        }
+        Err(error) => warn!("calendar warmup failed: {error:#}"),
+    }
+}
+
+/// Handle the user's approve/dismiss of a meeting-prep offer. On approve we warm
+/// the backend + build pre-context for the pending event; on dismiss we simply
+/// drop it (it stays in `offered` so the scheduler won't re-notify).
+async fn handle_meeting_prep_responded(daemon: &Arc<Daemon>, event_id: &str, approved: bool) {
+    let event = daemon.pending_meeting_prep.lock().await.remove(event_id);
+    let Some(event) = event else {
+        debug!(event_id, "meeting-prep response for an unknown/expired offer; ignoring");
+        return;
+    };
+    if approved {
+        warm_meeting_from_prep(daemon, &event).await;
+    } else {
+        info!(title = %event.title, "calendar: meeting prep dismissed by user");
+    }
+}
+
+/// Push the meeting's PRE-CONTEXT (agenda, location, join URL) as a card, so the
+/// user sees the context Bluey handed the agent. Skipped when there's nothing
+/// beyond the title.
+async fn push_meeting_precontext(daemon: &Arc<Daemon>, event: &cue_core::calendar::UpcomingEvent) {
+    let mut body = String::new();
+    if !event.description.trim().is_empty() {
+        // Bound the agenda so a huge body doesn't flood the card.
+        let agenda: String = event.description.chars().take(600).collect();
+        body.push_str(&agenda);
+    }
+    if !event.location.trim().is_empty() {
+        if !body.is_empty() {
+            body.push_str("\n\n");
+        }
+        body.push_str(&format!("Location: {}", event.location));
+    }
+    if !event.join_url.trim().is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str(&format!("Join: {}", event.join_url));
+    }
+    if body.trim().is_empty() {
+        return;
+    }
+    let card = CueCard::new(CardKind::System, "Meeting context", body)
+        .with_source("meeting-prep");
+    let _ = send_overlay(daemon, OverlayCommand::PushCard { card }).await;
+}
+
+/// Spawn the overlay if it isn't already up (background / --no-overlay mode).
+/// Used by the calendar trigger so a meeting offer always surfaces the UI.
+/// Returns `true` if the overlay was FRESHLY spawned by this call (so callers can
+/// wait for the WebView to mount + subscribe before pushing a command that would
+/// otherwise race the not-yet-listening UI); `false` if it was already up.
+async fn ensure_overlay_spawned(daemon: &Arc<Daemon>) -> bool {
+    let mut ov = daemon.overlay.lock().await;
+    if ov.is_some() {
+        return false;
+    }
+    let Some(bin) = daemon.overlay_bin.as_deref() else {
+        return false;
+    };
+    match spawn_overlay(
+        Some(bin),
+        daemon.overlay_events_tx.clone(),
+        daemon.overlay_session_token.clone(),
+        daemon.overlay_ui_state.clone(),
+    ) {
+        Ok(process) => {
+            *ov = Some(process);
+            daemon.state.lock().await.overlay_visible = true;
+            info!("overlay auto-spawned by calendar trigger");
+            true
+        }
+        Err(e) => {
+            warn!("calendar trigger: overlay spawn failed: {e:#}");
+            false
+        }
+    }
 }
 
 /// `WarmupStart` IPC surface over [`warmup_open`] (Text either way — the
@@ -14938,19 +15081,44 @@ fn transcript_event_to_stt_segment(
             Some(segment)
         }
         TranscriptEvent::SpeakerLabel { .. } => None,
+        TranscriptEvent::Boundary { source } => {
+            let kind = match source {
+                AudioSource::System => AudioSourceKind::System,
+                AudioSource::Microphone => AudioSourceKind::Microphone,
+            };
+            let segment = cue_core::audio::SttSegmentMetadata::new("\n\n".to_string(), 0, 0, true)
+                .with_source(kind)
+                .with_speaker_label(kind.default_label());
+            Some(segment)
+        }
     }
 }
 
 /// Close the overlay UI only — the daemon process keeps running.
 /// Calendar polling, pre-context warmup, and all background tasks continue.
-/// This is the correct behaviour for `bluey off`; use `shutdown_daemon` only
-/// for full quit (e.g. `bluey quit` or system shutdown).
+/// This is the correct behaviour for `bluey off` and the red dot; use
+/// `shutdown_daemon` only for full quit (e.g. `bluey quit` or system shutdown).
+///
+/// STOPS live audio capture (mic + system) first: closing the overlay means the
+/// user is done recording, so we release the microphone / system-audio tap
+/// rather than leave it running invisibly in the background.
 async fn close_overlay(daemon: &Arc<Daemon>) {
+    // Release any open capture — mic + system audio — so the red dot never leaves
+    // the microphone hot with no visible UI.
+    if let Some(capture) = daemon.system_audio.lock().await.take() {
+        capture.stop().await;
+    }
+    let _ = stop_audio_capture(daemon).await;
+    // Persist the active meeting so nothing is lost when capture stops.
+    if let Some(meeting) = daemon.meeting.lock().await.as_ref() {
+        let _ = daemon.store.save_active(meeting);
+    }
+
     if let Some(mut overlay) = daemon.overlay.lock().await.take() {
         let _ = overlay.send(&OverlayCommand::Shutdown);
         let _ = overlay.child.kill();
         let _ = overlay.child.wait();
-        info!("overlay closed; daemon continues running in background");
+        info!("overlay closed (capture stopped); daemon continues running in background");
     }
     daemon.state.lock().await.overlay_visible = false;
     write_state(daemon).await.ok();
@@ -18528,7 +18696,7 @@ mod tests {
                     .transcript
                     .iter()
                     .filter(|segment| segment.is_final)
-                    .map(to_wire_line)
+                    .map(|s| to_wire_line_named(s, &std::collections::HashMap::new()))
                     .collect(),
                 meeting.conversation.iter().map(to_wire_turn).collect(),
             ),
@@ -18776,7 +18944,7 @@ mod tests {
             Speaker::Unknown,
         ] {
             let segment = TranscriptSegment::new(speaker, "hello", true);
-            let wire = to_wire_line(&segment);
+            let wire = to_wire_line_named(&segment, &std::collections::HashMap::new());
             assert_eq!(wire.source, speaker_channel(speaker));
             assert_eq!(wire.id, segment.id.to_string());
         }

@@ -312,3 +312,20 @@ export interface SetupStatus {
   /** True only when every required item is ready — onboarding gates on this. */
   allReady: boolean;
 }
+
+/** A meeting-prep banner pushed by the daemon ~lead time before a calendar
+ *  meeting starts (OverlayCommand::ShowMeetingBanner). The app renders it as a
+ *  compact branded card; the user warms up the meeting or dismisses it. */
+export interface MeetingBanner {
+  /** The calendar event id — echoed back on the user's response. */
+  eventId: string;
+  title: string;
+  /** Occurrence start / end in epoch SECONDS. `endEpochSecs === 0` = unknown. */
+  startEpochSecs: number;
+  endEpochSecs: number;
+  /** Roster size + accepted count, for a "4 invited (3 accepted)" line. */
+  participantCount: number;
+  acceptedCount: number;
+  /** True when the meeting has a video join link. */
+  online: boolean;
+}

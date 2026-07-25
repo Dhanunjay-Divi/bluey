@@ -52,9 +52,22 @@ struct GraphEvent {
     #[serde(default)]
     start: Option<GraphDateTime>,
     #[serde(default)]
+    end: Option<GraphDateTime>,
+    #[serde(default)]
     attendees: Vec<GraphAttendee>,
     #[serde(default)]
     organizer: Option<GraphRecipient>,
+    /// Plain-text preview of the body (agenda) — pre-context without HTML.
+    #[serde(rename = "bodyPreview", default)]
+    body_preview: Option<String>,
+    #[serde(default)]
+    location: Option<GraphLocation>,
+    /// The Teams join info, when `isOnlineMeeting` is true.
+    #[serde(rename = "onlineMeeting", default)]
+    online_meeting: Option<GraphOnlineMeeting>,
+    /// Removed events (in a delta response) are tagged; we drop them.
+    #[serde(rename = "@removed", default)]
+    removed: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -66,10 +79,32 @@ struct GraphDateTime {
 }
 
 #[derive(Debug, Deserialize)]
+struct GraphLocation {
+    #[serde(rename = "displayName", default)]
+    display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphOnlineMeeting {
+    #[serde(rename = "joinUrl", default)]
+    join_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GraphAttendee {
     #[serde(rename = "emailAddress")]
     #[serde(default)]
     email_address: Option<GraphEmailAddress>,
+    #[serde(default)]
+    status: Option<GraphResponseStatus>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphResponseStatus {
+    /// `none` | `accepted` | `declined` | `tentativelyAccepted` | `notResponded`
+    /// | `organizer`.
+    #[serde(default)]
+    response: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -235,6 +270,11 @@ fn split_offset(clock: &str) -> Option<(&str, i64)> {
 /// Map one Graph event to an [`UpcomingEvent`]. Returns `None` when the start
 /// time is missing/unparseable (fail-soft: the caller skips it).
 fn map_event(ev: GraphEvent) -> Option<UpcomingEvent> {
+    // A delta response tags deletions with `@removed`; drop them so a cancelled
+    // meeting stops arming the trigger.
+    if ev.removed.is_some() {
+        return None;
+    }
     let start_epoch_secs = ev
         .start
         .as_ref()
@@ -268,34 +308,84 @@ fn map_event(ev: GraphEvent) -> Option<UpcomingEvent> {
         if is_organizer {
             organizer_seen = true;
         }
+        let response = map_ms_response(att.status.as_ref().and_then(|s| s.response.as_deref()));
         participants.push(Participant {
             name,
             email,
             is_organizer,
+            response,
         });
     }
 
     // Ensure the organizer is present in the roster even when Graph does not list
     // them among `attendees` (common: the organizer is not self-invited).
-    if !organizer_seen {
-        if let Some(org) = ev.organizer.as_ref().and_then(|o| o.email_address.as_ref()) {
-            let email = org.address.clone().unwrap_or_default();
-            if !email.is_empty() {
-                participants.push(Participant {
-                    name: org.name.clone().unwrap_or_default(),
-                    email,
-                    is_organizer: true,
-                });
-            }
-        }
+    let organizer_name = ev
+        .organizer
+        .as_ref()
+        .and_then(|o| o.email_address.as_ref())
+        .and_then(|e| e.name.clone())
+        .unwrap_or_default();
+    let organizer_email_str = ev
+        .organizer
+        .as_ref()
+        .and_then(|o| o.email_address.as_ref())
+        .and_then(|e| e.address.clone())
+        .unwrap_or_default();
+    if !organizer_seen && !organizer_email_str.is_empty() {
+        participants.push(Participant {
+            name: organizer_name.clone(),
+            email: organizer_email_str.clone(),
+            is_organizer: true,
+            response: cue_core::calendar::ResponseStatus::Accepted,
+        });
     }
+
+    // End (best-effort) for pre-context duration.
+    let end_epoch_secs = ev
+        .end
+        .as_ref()
+        .and_then(|d| d.date_time.as_deref())
+        .and_then(iso8601_to_epoch)
+        .unwrap_or(0);
+
+    let description = ev.body_preview.unwrap_or_default();
+    let location = ev
+        .location
+        .and_then(|l| l.display_name)
+        .unwrap_or_default();
+    // Join URL: the Teams `onlineMeeting.joinUrl`, else a URL sniffed from the
+    // location text (a pasted Zoom/Meet link).
+    let join_url = ev
+        .online_meeting
+        .and_then(|m| m.join_url)
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| super::google::sniff_url(&location))
+        .unwrap_or_default();
 
     Some(UpcomingEvent {
         id: ev.id,
         title: ev.subject.unwrap_or_default(),
         start_epoch_secs,
+        end_epoch_secs,
         participants,
+        description,
+        location,
+        join_url,
+        organizer_name,
+        organizer_email: organizer_email_str,
     })
+}
+
+/// Map Graph's `attendee.status.response` onto [`ResponseStatus`].
+fn map_ms_response(s: Option<&str>) -> cue_core::calendar::ResponseStatus {
+    use cue_core::calendar::ResponseStatus as R;
+    match s {
+        Some("accepted") | Some("organizer") => R::Accepted,
+        Some("declined") => R::Declined,
+        Some("tentativelyAccepted") => R::Tentative,
+        Some("notResponded") => R::NeedsAction,
+        _ => R::Unknown,
+    }
 }
 
 /// Parse a full Graph `calendarView` JSON body into `UpcomingEvent`s, skipping
@@ -329,7 +419,10 @@ pub async fn fetch_events(
             ("endDateTime", end.as_str()),
             ("$orderby", "start/dateTime"),
             ("$top", "50"),
-            ("$select", "id,subject,start,attendees,organizer"),
+            (
+                "$select",
+                "id,subject,start,end,attendees,organizer,bodyPreview,location,onlineMeeting,isOnlineMeeting",
+            ),
         ])
         .bearer_auth(access_token)
         // With this header Graph returns start/end dateTime in UTC.

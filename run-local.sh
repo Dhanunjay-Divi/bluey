@@ -28,7 +28,7 @@ cargo build --release -p cue-meeting-overlay --target "$TARGET"
 echo "==> Building + bundling system-audio helper (BlueyAudio.app)…"
 bash native/macos/cue-audio/bundle-app.sh "${BLUEY_CODESIGN_IDENTITY:--}" >/dev/null
 
-echo "==> Installing into $INSTALL…"
+echo "==> Installing into $INSTALL..."
 mkdir -p "$INSTALL" "$BIN"
 TGT="$ROOT/target/$TARGET/release"
 cp "$TGT/bluey"               "$INSTALL/bluey"

@@ -19,6 +19,7 @@ import type {
   ContinueResult,
   FixProposal,
   ListeningState,
+  MeetingBanner,
   MeetingState,
   MeetingSummary,
   MeetingViewState,
@@ -108,6 +109,14 @@ export interface MeetingClient {
    *  Returns an unsubscribe fn. Read-only VIEW replies (meeting_id present)
    *  are NOT delivered here. */
   onMeetingReseed(cb: (state: MeetingState) => void): () => void;
+  /** Subscribe to the daemon's MEETING-PREP BANNER pushes — shown ~3 min before a
+   *  calendar meeting. The app renders a compact branded banner; the user taps
+   *  "Warm up the meeting" (→ {@link respondMeetingPrep}(id, true), expands to the
+   *  full overlay) or dismisses (→ (id, false)). Returns an unsubscribe fn. */
+  onMeetingBanner(cb: (banner: MeetingBanner) => void): () => void;
+  /** Answer a meeting-prep banner: `approved` warms the backend + pre-context for
+   *  that calendar event; else it's dismissed. Fire-and-forget. */
+  respondMeetingPrep(eventId: string, approved: boolean): void;
 
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */

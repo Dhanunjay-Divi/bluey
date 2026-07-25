@@ -310,6 +310,26 @@ pub enum OverlayCommand {
     PushCard {
         card: CueCard,
     },
+    /// Show the branded MEETING-PREP BANNER — a compact overlay state (our own
+    /// card, NOT a native notification) shown ~lead time before a calendar
+    /// meeting starts. The UI renders it top-right (title + time range + a
+    /// "Warm up the meeting" button); tapping the button EXPANDS the same window
+    /// into the full meeting UI and emits [`OverlayEvent::MeetingPrepResponded`]
+    /// `{ approved: true }`; dismissing emits `{ approved: false }`. `event_id`
+    /// is echoed back so the daemon warms the right meeting.
+    ShowMeetingBanner {
+        event_id: String,
+        title: String,
+        /// Occurrence start / end (epoch seconds) for the time-range label. `0`
+        /// end = unknown (show start only).
+        start_epoch_secs: u64,
+        end_epoch_secs: u64,
+        /// Roster size + how many accepted, for a "4 invited (3 accepted)" line.
+        participant_count: u32,
+        accepted_count: u32,
+        /// True when the meeting has a video join URL (shows an "online" hint).
+        online: bool,
+    },
     UpdateCard {
         id: uuid::Uuid,
         body: String,
@@ -685,6 +705,17 @@ pub enum OverlayEvent {
     /// applied). Only `approved = true` against a live id drives an apply.
     FixApprovalResponded {
         proposal_id: uuid::Uuid,
+        approved: bool,
+    },
+    /// The user answered a calendar meeting-prep offer (pushed as a
+    /// [`OverlayCommand::PushCard`] `CardKind::Question` when a meeting is about
+    /// to start). `approved = true` → the daemon warms the backend and builds the
+    /// pre-context (agenda + roster) for that meeting; `false` dismisses it and
+    /// the meeting is marked handled so it won't re-offer. `event_id` is the
+    /// calendar event's stable id echoed from the offer so the daemon warms the
+    /// right meeting. Approval-gated by design: we never auto-start pre-context.
+    MeetingPrepResponded {
+        event_id: String,
         approved: bool,
     },
     /// UI responded to a BYOT billing disclosure modal pushed by

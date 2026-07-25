@@ -16,6 +16,11 @@ const MICROSOFT_CLIENT_ID: &str = match option_env!("BLUEY_MICROSOFT_CLIENT_ID")
     Some(id) => id,
     None => "PLACEHOLDER_MICROSOFT_CLIENT_ID",
 };
+/// Compile-time client SECRETS — `None` unless injected. The PKCE public-client
+/// flow needs none; a "web" OAuth client setup does. Never a placeholder string
+/// (an empty/placeholder secret would be SENT and rejected) — absent = omitted.
+const GOOGLE_CLIENT_SECRET: Option<&str> = option_env!("BLUEY_GOOGLE_CLIENT_SECRET");
+const MICROSOFT_CLIENT_SECRET: Option<&str> = option_env!("BLUEY_MICROSOFT_CLIENT_SECRET");
 
 /// The supported cloud calendar providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +40,12 @@ pub struct ProviderConfig {
     pub scope: String,
     /// PUBLIC OAuth client id (not a secret).
     pub client_id: String,
+    /// OPTIONAL client secret. The native PKCE public-client flow uses NO secret
+    /// (`None`) — the recommended, secretless design. Some provider setups
+    /// (a "web" OAuth client instead of a "desktop" one) require a secret at the
+    /// token endpoint; injected at build time via `BLUEY_{GOOGLE,MICROSOFT}_CLIENT_SECRET`
+    /// for those. Left `None` here → the token request omits it entirely.
+    pub client_secret: Option<String>,
     /// Extra params appended to the authorize URL (e.g. Google's
     /// `access_type=offline` + `prompt=consent` to guarantee a refresh token).
     pub extra_authorize_params: Vec<(String, String)>,
@@ -49,6 +60,7 @@ impl Provider {
                 token_url: "https://oauth2.googleapis.com/token".to_string(),
                 scope: "https://www.googleapis.com/auth/calendar.readonly".to_string(),
                 client_id: GOOGLE_CLIENT_ID.to_string(),
+                client_secret: GOOGLE_CLIENT_SECRET.map(str::to_string),
                 // Google only returns a refresh_token when BOTH access_type=offline
                 // and prompt=consent are present on the authorize request.
                 extra_authorize_params: vec![
@@ -64,6 +76,7 @@ impl Provider {
                 // the account for the connected-email label.
                 scope: "Calendars.Read offline_access openid profile".to_string(),
                 client_id: MICROSOFT_CLIENT_ID.to_string(),
+                client_secret: MICROSOFT_CLIENT_SECRET.map(str::to_string),
                 extra_authorize_params: Vec::new(),
             },
         }

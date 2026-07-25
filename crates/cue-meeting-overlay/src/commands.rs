@@ -418,3 +418,23 @@ fn bluey_shot_app_bundle() -> Option<std::path::PathBuf> {
     }
     None
 }
+
+/// Hide the meeting-prep banner window (called by the BannerWindow UI after the
+/// user warms up or dismisses). It's an NSPanel, so order it OUT via the panel
+/// (the webview `.hide()` doesn't reliably hide a panel). The window is reused
+/// (shown again on the next meeting), so we order-out rather than close it.
+#[tauri::command]
+pub fn hide_banner(app: AppHandle) {
+    #[cfg(target_os = "macos")]
+    {
+        use tauri_nspanel::ManagerExt;
+        if let Ok(panel) = app.get_webview_panel("banner") {
+            panel.order_out(None);
+            return;
+        }
+    }
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("banner") {
+        let _ = w.hide();
+    }
+}

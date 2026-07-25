@@ -223,6 +223,46 @@ async fn run_connection(
                 if line.is_empty() {
                     continue;
                 }
+                // A meeting-prep banner → reveal the dedicated banner window (it's
+                // hidden by default) so the card is visible independent of the main
+                // overlay's state. It's an NSPanel, so the webview-window `.show()`
+                // does NOT front it — use the PANEL's show (makeKeyAndOrderFront) +
+                // orderFrontRegardless so it appears even though the app is an
+                // accessory (non-activating). Cheap substring check avoids a full
+                // JSON parse on the hot command path.
+                #[cfg(target_os = "macos")]
+                if line.contains("\"show_meeting_banner\"") {
+                    use tauri_nspanel::ManagerExt;
+                    match app.get_webview_panel("banner") {
+                        Ok(panel) => {
+                            panel.show();
+                            panel.order_front_regardless();
+                            eprintln!(
+                                "[meeting-overlay] BANNER-DIAG: panel shown, is_visible={}",
+                                panel.is_visible()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[meeting-overlay] BANNER-DIAG: no 'banner' panel: {e:?}; \
+                                 falling back to window.show()"
+                            );
+                            if let Some(w) = app.get_webview_window("banner") {
+                                let _ = w.show();
+                                let _ = w.set_focus();
+                                if let Ok(pos) = w.outer_position() {
+                                    eprintln!(
+                                        "[meeting-overlay] BANNER-DIAG: window at {:?}, visible={:?}",
+                                        pos,
+                                        w.is_visible()
+                                    );
+                                }
+                            } else {
+                                eprintln!("[meeting-overlay] BANNER-DIAG: no 'banner' window either!");
+                            }
+                        }
+                    }
+                }
                 // Forward the raw command JSON to the web UI; it parses `type`.
                 let _ = app.emit("overlay://command", line.to_string());
             }

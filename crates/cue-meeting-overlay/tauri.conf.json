@@ -22,6 +22,24 @@
         "skipTaskbar": true,
         "shadow": false,
         "contentProtected": true
+      },
+      {
+        "label": "banner",
+        "title": "Bluey Meeting Banner",
+        "url": "index.html?banner",
+        "width": 440,
+        "height": 120,
+        "x": 980,
+        "y": 40,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": false,
+        "contentProtected": true,
+        "visible": false,
+        "focus": false
       }
     ],
     "security": { "csp": null },

@@ -238,14 +238,14 @@ export function OpenFloorScreen({
           <div className="fp-dots">
             <button
               className="fp-dot fp-dot-red"
-              title="Turn Bluey off"
-              aria-label="Turn Bluey off"
+              title="Close (Bluey keeps running in the background)"
+              aria-label="Close overlay; Bluey keeps running in the background"
               onClick={onTurnOff}
             />
             <button
               className="fp-dot fp-dot-amber"
-              title="Hide"
-              aria-label="Hide"
+              title="Minimize to pill"
+              aria-label="Minimize to pill"
               onClick={onCollapse}
             />
           </div>

@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { BannerWindow } from "./BannerWindow";
 import { MeetingProvider } from "./lib/meetingState";
 import { DataProvider } from "./lib/dataStore";
 import "./styles/aurora.css";
@@ -8,6 +9,13 @@ import "./styles/floorplan.css";
 
 const inTauri =
   typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+
+// The meeting-prep BANNER runs in its OWN small Tauri window (label "banner",
+// loaded with ?banner) so it's independent of the main overlay's state — no
+// race, no "buried behind the full screen." That window renders only the banner.
+const isBanner =
+  typeof window !== "undefined" &&
+  new URLSearchParams(window.location.search).has("banner");
 
 // Render first, so the window is never blank even if the env probes below race.
 // MeetingProvider sits ABOVE <App/> so the meeting's session state (transcript,
@@ -18,11 +26,15 @@ const inTauri =
 // instead of being thrown away and refetched on every mount.
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    <MeetingProvider>
-      <DataProvider>
-        <App />
-      </DataProvider>
-    </MeetingProvider>
+    {isBanner ? (
+      <BannerWindow />
+    ) : (
+      <MeetingProvider>
+        <DataProvider>
+          <App />
+        </DataProvider>
+      </MeetingProvider>
+    )}
   </StrictMode>,
 );
 

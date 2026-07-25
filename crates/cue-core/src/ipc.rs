@@ -45,6 +45,13 @@ pub enum DaemonRequest {
         title: Option<String>,
     },
     MeetingEnd,
+    /// The user tapped a meeting-prep system notification (via terminal-notifier
+    /// `-execute`, which runs `bluey meeting prep <event-id>`). Warms the backend
+    /// + builds the pre-context for the pending calendar event with this id. A
+    /// no-op if the offer expired. This is the notification's approve path.
+    MeetingPrep {
+        event_id: String,
+    },
     /// Open the WARM meeting-backend session (the no-push pivot): rotate the
     /// MCP memory token, register Bluey's server into the attached agent, and
     /// run the warm-up drive that becomes THE session in-meeting asks resume.

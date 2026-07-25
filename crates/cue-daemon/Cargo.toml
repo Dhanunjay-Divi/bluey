@@ -101,11 +101,6 @@ diarize = ["dep:cue-diarize"]
 # detector's ONNX classifier (SET 1). Ships in the MEETING build
 # (build-meeting.sh); pair with `parakeet-stt` (which links the ONNX runtime).
 local-memory = ["cue-rag/local-embed", "dep:ort", "dep:tokenizers"]
-# Real system-calendar reading via EventKit (macOS). Reads the user's connected
-# accounts (Outlook/Google/iCloud) through the OS Calendar, so an upcoming
-# meeting fires the warm-up trigger. Off by default (macOS-only, needs the TCC
-# usage string on the packaged app). Falls back to the env fake / no events.
-calendar = ["dep:objc2-event-kit", "dep:block2"]
 # Cloud OAuth calendar sources (Google/Microsoft) via the cue-calendar-cloud
 # crate. Off by default; cross-platform. Gates the CalendarConnect* IPC handlers
 # (the interactive connect flow + per-provider token store). Enable with
@@ -149,8 +144,6 @@ name = "whisper-stub"
 path = "src/bin/whisper_stub.rs"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-block2 = { version = "0.5", optional = true }
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication"] }
-objc2-event-kit = { version = "0.2", features = ["EKEventStore", "EKEvent", "EKCalendar", "EKCalendarItem", "EKParticipant", "EKObject", "EKTypes", "block2"], optional = true }
 objc2-foundation = "0.2"

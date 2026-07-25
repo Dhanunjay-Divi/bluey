@@ -41,7 +41,17 @@ mod macos {
     /// steals focus from the meeting app), joining all spaces.
     pub fn setup_panel(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         app.handle().plugin(tauri_nspanel::init())?;
-        let window = app.get_webview_window("meeting").expect("meeting window");
+        // Panel-ify BOTH windows: the main "meeting" overlay AND the small
+        // "banner" window (the meeting-prep card). Same floating, capture-safe,
+        // all-spaces NSPanel treatment so the banner is a proper floating panel
+        // independent of the main overlay's state (the separate-window design).
+        // Only the MAIN "meeting" window is panel-ified at startup. The "banner"
+        // window starts HIDDEN, and converting a hidden window to an NSPanel here
+        // crashed the app at launch (SIGTRAP). The banner window's panel setup is
+        // deferred to its show path (ipc.rs), converting it only once it's visible.
+        let window = app
+            .get_webview_window("meeting")
+            .expect("meeting window");
         let panel = window.to_panel()?;
         panel.set_level(NS_FLOAT_WINDOW_LEVEL);
         panel.set_style_mask(NS_OVERLAY_STYLE_MASK);
@@ -175,6 +185,7 @@ pub fn run() {
             commands::meeting_ask_cancel,
             commands::pick_context_files,
             commands::capture_screenshot,
+            commands::hide_banner,
             ipc::overlay_send,
         ])
         .setup(|app| {

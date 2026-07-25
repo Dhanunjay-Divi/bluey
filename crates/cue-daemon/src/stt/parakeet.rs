@@ -182,6 +182,11 @@ fn run_worker(
 
     // `blocking_recv` is correct here: this is a dedicated OS thread, not an
     // async task. The loop ends when the provider drops `audio_tx`.
+    let mut silent_ms = 0.0;
+    let mut has_spoken_since_last_boundary = false;
+    const SILENCE_GATE_MS: f64 = 400.0;
+    const RMS_THRESHOLD: f32 = 0.01;
+
     while let Some(chunk) = audio_rx.blocking_recv() {
         // STT: streaming, stateful — returns the incremental text for this chunk.
         // `push` already returns `None` for empty/whitespace-only text, so we only
@@ -191,27 +196,43 @@ fn run_worker(
         // DIAGNOSTIC: per-chunk RTF + backlog depth. If RTF ≥ 1.0 the worker is
         // over real-time and `backlog` climbs monotonically = the growing-lag bug.
         let audio_secs = chunk.len() as f64 / 16_000.0;
+        let audio_ms = audio_secs * 1000.0;
+
         // Silence signal for the assembler's boundary gate: RMS of this chunk.
-        // Computed here (raw f32 available) BEFORE inference. NEVER used to gate
-        // the engine feed — only to decide sentence boundaries downstream.
+        // Computed here (raw f32 available) BEFORE inference.
         let rms = if chunk.is_empty() {
             0.0
         } else {
             (chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32).sqrt()
         };
+
+        if rms < RMS_THRESHOLD {
+            silent_ms += audio_ms;
+        } else {
+            silent_ms = 0.0;
+        }
+
         let push_started = std::time::Instant::now();
         let backlog = audio_rx.len();
         let push_result = engine.push(&chunk);
         let rtf = push_started.elapsed().as_secs_f64() / audio_secs.max(1e-9);
         debug!(
             rtf = format!("{rtf:.2}"),
-            audio_ms = (audio_secs * 1000.0) as u64,
+            audio_ms = audio_ms as u64,
             backlog,
             "STTPERF push"
         );
-        let _ = rms; // silence gate no longer used on the direct-emit path
+        
         let chunk_text = match push_result {
-            Ok(Some(tc)) => Some(tc.text),
+            Ok(Some(tc)) => {
+                let text = tc.text.trim();
+                if !text.is_empty() {
+                    has_spoken_since_last_boundary = true;
+                    Some(tc.text)
+                } else {
+                    None
+                }
+            }
             Ok(None) => None,
             Err(e) => {
                 error!("parakeet transcribe_chunk error: {e}");
@@ -226,10 +247,6 @@ fn run_worker(
         // hold-the-tip (clean incremental text: "I ", "want ", "ultimately ").
         // This is the proven, duplication-free path: the engine already reunites
         // split words, so each delta is a whole new fragment that simply appends.
-        // (The sentence assembler that briefly sat here re-emitted a GROWING
-        // cumulative `prev` on every coalesce, which stacked prefix-duplicated
-        // lines — "Hey" / "Hey Daniel" / "Hey Daniel welcome". Direct emission
-        // trades sentence-prettiness for rock-solid correctness.)
         if let Some(text) = chunk_text {
             let ev = TranscriptEvent::Final {
                 text,
@@ -240,6 +257,17 @@ fn run_worker(
             if event_tx.send(Ok(ev)).is_err() {
                 break;
             }
+        }
+
+        // Emit Boundary if we've crossed the silence threshold AND we have 
+        // transcribed speech since the last boundary.
+        if silent_ms >= SILENCE_GATE_MS && has_spoken_since_last_boundary {
+            let ev = TranscriptEvent::Boundary { source };
+            if event_tx.send(Ok(ev)).is_err() {
+                break;
+            }
+            has_spoken_since_last_boundary = false;
+            silent_ms = 0.0;
         }
     }
 

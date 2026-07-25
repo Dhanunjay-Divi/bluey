@@ -35,136 +35,6 @@ pub const LOOKAHEAD_SECS: u64 = 600;
 /// Poll cadence.
 pub const POLL_SECS: u64 = 30;
 
-/// Real system-calendar source via EventKit (macOS, feature `calendar`). Reads
-/// the user's connected accounts (Outlook / Google / iCloud) through the OS
-/// Calendar — an Outlook meeting added on the Mac shows up here automatically.
-/// Requires the user's TCC consent; denied / not-yet-granted / any error returns
-/// an empty list (the trait's fail-soft contract — never crash, never loop).
-///
-/// Stateless by design: EventKit's `EKEventStore` is NOT `Send`/`Sync`, but the
-/// `CalendarSource` trait is `Send + 'static` (it runs on a tokio task). So the
-/// store is created fresh inside each `upcoming()` call (on that call's thread)
-/// and never held across an await/thread boundary. Creating a store is cheap
-/// relative to the poll cadence (30s).
-#[cfg(all(feature = "calendar", target_os = "macos"))]
-pub struct EventKitSource {
-    /// Fire the one-time access request the first time we read (so the macOS
-    /// permission prompt appears), tracked with an atomic so we don't re-request.
-    requested: std::sync::atomic::AtomicBool,
-}
-
-#[cfg(all(feature = "calendar", target_os = "macos"))]
-impl EventKitSource {
-    pub fn new() -> Self {
-        Self {
-            requested: std::sync::atomic::AtomicBool::new(false),
-        }
-    }
-}
-
-#[cfg(all(feature = "calendar", target_os = "macos"))]
-impl Default for EventKitSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(all(feature = "calendar", target_os = "macos"))]
-impl CalendarSource for EventKitSource {
-    fn upcoming(&self, now: u64) -> Vec<UpcomingEvent> {
-        use objc2::rc::autoreleasepool;
-        use objc2_event_kit::{EKAuthorizationStatus, EKEntityType, EKEventStore};
-        use objc2_foundation::NSDate;
-        use std::sync::atomic::Ordering;
-
-        autoreleasepool(|_| unsafe {
-            // Store lives only within this call (not Send — see the type doc).
-            let store = EKEventStore::new();
-
-            // First read: fire the access request so the OS prompt appears. The
-            // completion block is required by the API; we don't act on it — the
-            // next poll re-checks the authorization status.
-            if !self.requested.swap(true, Ordering::Relaxed) {
-                let completion = block2::RcBlock::new(
-                    |_granted: objc2::runtime::Bool, _err: *mut objc2_foundation::NSError| {},
-                );
-                // The API wants a raw `*mut Block`; RcBlock derefs to Block.
-                store.requestFullAccessToEventsWithCompletion(&*completion as *const _ as *mut _);
-            }
-
-            // Fail-soft until the user grants full access.
-            if EKEventStore::authorizationStatusForEntityType(EKEntityType::Event)
-                != EKAuthorizationStatus::FullAccess
-            {
-                return Vec::new();
-            }
-
-            let start = NSDate::dateWithTimeIntervalSince1970(now as f64);
-            let end = NSDate::dateWithTimeIntervalSince1970((now + LOOKAHEAD_SECS) as f64);
-            // `None` calendars = all of them (every connected account).
-            let predicate =
-                store.predicateForEventsWithStartDate_endDate_calendars(&start, &end, None);
-            let events = store.eventsMatchingPredicate(&predicate);
-            // Index-based iteration avoids extra objc2-foundation features.
-            let mut out = Vec::new();
-            for i in 0..events.count() {
-                let ev = events.objectAtIndex(i);
-                let start_secs = ev.startDate().timeIntervalSince1970();
-                if !start_secs.is_finite() || start_secs < 0.0 {
-                    continue;
-                }
-                // Stable id: the event identifier when present, else the title
-                // (dedupe is keyed by (id, occurrence_start), so a moved event
-                // still re-arms via the changed start).
-                let title = ev.title().to_string();
-                let id = ev
-                    .eventIdentifier()
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| format!("ek-{title}"));
-
-                // Participants: attendees + the organizer (names + emails), so
-                // Bluey can map speakers to real people and give the agent the
-                // roster. Any provider (Outlook/Google/iCloud) fills these.
-                let mut participants = Vec::new();
-                let organizer_email = ev.organizer().and_then(|o| participant_email(&o));
-                if let Some(attendees) = ev.attendees() {
-                    for j in 0..attendees.count() {
-                        let p = attendees.objectAtIndex(j);
-                        let name = p.name().map(|s| s.to_string()).unwrap_or_default();
-                        let email = participant_email(&p).unwrap_or_default();
-                        let is_organizer =
-                            !email.is_empty() && organizer_email.as_deref() == Some(email.as_str());
-                        participants.push(Participant {
-                            name,
-                            email,
-                            is_organizer,
-                        });
-                    }
-                }
-
-                out.push(UpcomingEvent {
-                    id,
-                    title,
-                    start_epoch_secs: start_secs as u64,
-                    participants,
-                });
-            }
-            out
-        })
-    }
-}
-
-/// Parse a participant's email from its EventKit `URL` (a `mailto:` NSURL).
-/// Returns None when the URL isn't a mailto or is absent.
-#[cfg(all(feature = "calendar", target_os = "macos"))]
-fn participant_email(p: &objc2_event_kit::EKParticipant) -> Option<String> {
-    // SAFETY: reading the participant's own URL + its string form.
-    unsafe {
-        let url = p.URL();
-        let s = url.absoluteString()?.to_string();
-        s.strip_prefix("mailto:").map(|e| e.to_string())
-    }
-}
 
 /// A source that never yields events — the fallback when neither the env fake
 /// nor a real calendar backend is available.
@@ -189,7 +59,13 @@ impl CalendarSource for NoopSource {
 /// calendar-poll task (an async context — see `app.rs`), so
 /// [`Handle::try_current`] resolves it without a signature change; if this were
 /// ever called off the runtime, the cloud branch is skipped (falling through to
-/// EventKit/Noop) rather than panicking.
+/// Noop) rather than panicking.
+///
+/// Sources, in priority order: the `BLUEY_CALENDAR_FAKE_EVENTS` test hook, then a
+/// connected cloud provider (Google / Microsoft OAuth — feature `cloud-calendar`),
+/// else a no-op. (Apple EventKit was removed: it only sees calendars the user
+/// added to macOS Calendar, so it's blind for most users and macOS-only — the
+/// cloud OAuth path reaches the real account and is cross-platform.)
 pub fn default_source() -> Box<dyn CalendarSource> {
     if std::env::var("BLUEY_CALENDAR_FAKE_EVENTS").is_ok() {
         return Box::new(EnvFakeSource);
@@ -200,11 +76,6 @@ pub fn default_source() -> Box<dyn CalendarSource> {
             return source;
         }
     }
-    #[cfg(all(feature = "calendar", target_os = "macos"))]
-    {
-        return Box::new(EventKitSource::new());
-    }
-    #[allow(unreachable_code)]
     Box::new(NoopSource)
 }
 
@@ -263,6 +134,7 @@ impl CalendarSource for EnvFakeSource {
                     title: title.trim().to_string(),
                     start_epoch_secs: start,
                     participants: Vec::new(), // the fake carries no roster
+                    ..Default::default()
                 })
             })
             .filter(|e| e.start_epoch_secs >= now && e.start_epoch_secs <= now + LOOKAHEAD_SECS)
@@ -294,6 +166,39 @@ pub fn due_for_warmup(
         .collect()
 }
 
+/// The maximum a scheduled sleep will ever last before we re-read the calendar,
+/// even if the next meeting is far off. This is the SAFETY POLL: it caps the
+/// sleep so a newly-added / moved meeting (that a sync missed) is still noticed
+/// within this bound. 5 minutes — cheap, and far leaner than the old 30s scan.
+pub const SAFETY_POLL_SECS: u64 = 300;
+
+/// Pure scheduler core: how many seconds to sleep before the next action.
+///
+/// Returns the delay until the SOONEST not-yet-fired event reaches its warm
+/// moment (`start - WARM_LEAD_SECS`), clamped to `[0, SAFETY_POLL_SECS]`. A
+/// past-due warm moment returns 0 (fire now). No upcoming events → the full
+/// safety-poll interval (just re-check the calendar later). This replaces the
+/// fixed 30s busy-poll: the daemon sleeps precisely to the next meeting instead
+/// of waking every 30s. Free of IO/time so it is unit-testable.
+pub fn next_wake_secs(
+    events: &[UpcomingEvent],
+    fired: &HashSet<(String, u64)>,
+    now_epoch_secs: u64,
+) -> u64 {
+    let soonest_warm_at = events
+        .iter()
+        .filter(|e| !fired.contains(&fired_key(e)))
+        // The warm moment; saturating so a meeting already inside the lead window
+        // maps to "now" (delay 0) rather than underflowing.
+        .map(|e| e.start_epoch_secs.saturating_sub(WARM_LEAD_SECS))
+        .min();
+
+    match soonest_warm_at {
+        Some(warm_at) => warm_at.saturating_sub(now_epoch_secs).min(SAFETY_POLL_SECS),
+        None => SAFETY_POLL_SECS,
+    }
+}
+
 pub fn now_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -321,6 +226,7 @@ mod tests {
             title: id.to_string(),
             start_epoch_secs: start,
             participants: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -381,5 +287,40 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].title, "Standup");
         std::env::remove_var("BLUEY_CALENDAR_FAKE_EVENTS");
+    }
+
+    #[test]
+    fn next_wake_sleeps_to_the_warm_moment_not_a_fixed_tick() {
+        let fired = HashSet::new();
+        let now = 1_000_000;
+
+        // No events → the full safety poll (just re-check later).
+        assert_eq!(next_wake_secs(&[], &fired, now), SAFETY_POLL_SECS);
+
+        // One event far out → sleep is CAPPED at the safety poll (not the raw
+        // distance), so a later-added meeting is still noticed.
+        let far = vec![event("x", now + 10_000)];
+        assert_eq!(next_wake_secs(&far, &fired, now), SAFETY_POLL_SECS);
+
+        // Event whose warm moment is 120s away (start-lead) → sleep exactly 120s.
+        let soon = vec![event("y", now + WARM_LEAD_SECS + 120)];
+        assert_eq!(next_wake_secs(&soon, &fired, now), 120);
+
+        // Already inside the lead window → wake now (0).
+        let due = vec![event("z", now + WARM_LEAD_SECS - 10)];
+        assert_eq!(next_wake_secs(&due, &fired, now), 0);
+
+        // The soonest of several drives the sleep.
+        let many = vec![
+            event("a", now + WARM_LEAD_SECS + 200),
+            event("b", now + WARM_LEAD_SECS + 40),
+            event("c", now + WARM_LEAD_SECS + 90),
+        ];
+        assert_eq!(next_wake_secs(&many, &fired, now), 40);
+
+        // A fired event is ignored → the NEXT unfired one drives the sleep.
+        let mut fired2 = HashSet::new();
+        fired2.insert(fired_key(&many[1])); // b (40s) consumed
+        assert_eq!(next_wake_secs(&many, &fired2, now), 90); // now c
     }
 }

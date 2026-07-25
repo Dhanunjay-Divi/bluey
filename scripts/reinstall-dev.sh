@@ -141,6 +141,7 @@ if [[ "$(uname -s)" == "Darwin" && -d native/macos/cue-audio/.build/BlueyAudio.a
   done
 fi
 
+
 # --- 4b. STABLE codesign identity for the daemon (TCC persistence) ---------
 # macOS TCC keys a permission grant (Screen Recording, Microphone) to the code
 # signature's IDENTIFIER. An ad-hoc `codesign --sign -` derives that identifier

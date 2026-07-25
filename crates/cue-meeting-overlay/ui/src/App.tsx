@@ -104,6 +104,7 @@ export function App() {
   const pillRef = useRef<HTMLDivElement>(null);
   useDragHeader(pillRef);
 
+
   // First-run onboarding is a compact centered card — shrink the OS window to it
   // while onboarding, then restore the full panel when it's done (fixes the card
   // rendering full-size in a large empty window).

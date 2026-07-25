@@ -1879,3 +1879,125 @@
     scroll-behavior: auto !important;
   }
 }
+
+/* =====================================================================
+ * Meeting-prep BANNER — a compact branded floating card (calendar trigger),
+ * shown ~3 min before a meeting. Our own window content (like Granola), not a
+ * native notification: Bluey mark, title + time, a "Warm up" button. Fixed
+ * top-right, above everything, with an entrance slide.
+ * =================================================================== */
+/* The banner FILLS its own small Tauri window (440×120), inset a little so the
+ * card's shadow + rounded corners show against the transparent window. */
+.fp-mbanner {
+  position: fixed;
+  inset: 8px;
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+  padding: 14px 14px 14px 0;
+  border-radius: 18px;
+  background: var(--glass-solid, var(--paper-2));
+  border: 1px solid var(--line);
+  box-shadow: var(--fp-shadow-anchor, 0 12px 32px rgba(28, 26, 25, 0.25));
+  font-family: var(--font);
+  animation: fp-mbanner-in 0.32s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+/* The solid accent bar = a scheduled calendar meeting (Granola's cue). */
+.fp-mbanner-bar {
+  flex: none;
+  width: 4px;
+  border-radius: 0 4px 4px 0;
+  background: var(--ok, #4e8d5b);
+}
+.fp-mbanner-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  justify-content: center;
+}
+.fp-mbanner-title {
+  font-family: var(--serif, Georgia, serif);
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--ink);
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fp-mbanner-time {
+  font-size: 13px;
+  font-weight: 560;
+  color: var(--ink-2);
+}
+.fp-mbanner-meta {
+  font-size: 11.5px;
+  color: var(--ink-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fp-mbanner-cta {
+  flex: none;
+  align-self: center;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border: none;
+  border-radius: 12px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 12.5px;
+  font-weight: 560;
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    opacity 0.12s ease,
+    transform 0.06s ease;
+}
+.fp-mbanner-cta:hover {
+  opacity: 0.9;
+}
+.fp-mbanner-cta:active {
+  transform: translateY(0.5px);
+}
+.fp-mbanner-dismiss {
+  flex: none;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin-top: -4px;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--ink-3);
+  cursor: pointer;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
+}
+.fp-mbanner-dismiss:hover {
+  background: var(--paper-sink);
+  color: var(--ink);
+}
+@keyframes fp-mbanner-in {
+  from {
+    opacity: 0;
+    transform: translateY(-10px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .fp-mbanner {
+    animation: none;
+  }
+}

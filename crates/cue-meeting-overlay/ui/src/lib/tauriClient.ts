@@ -182,6 +182,16 @@ type OverlayCommand =
     }
   | { type: "listening_state_changed"; state: string }
   | { type: "push_card"; card: WireCueCard }
+  | {
+      type: "show_meeting_banner";
+      event_id: string;
+      title: string;
+      start_epoch_secs: number;
+      end_epoch_secs: number;
+      participant_count: number;
+      accepted_count: number;
+      online: boolean;
+    }
   // Diarization resolved a speaker for an already-pushed transcript line
   // (labels lag lines by up to one live-diarize tick). `id` is the segment id
   // the transcript card was pushed with; `speaker` is the display label.
@@ -689,6 +699,38 @@ export function createTauriClient(): MeetingClient {
       // daemon replies with a meeting_id-absent set_meeting_state, delivered via
       // onMeetingReseed, which clears the transcript/Q&A/decisions/context.
       sendEvent({ type: "meeting_new_requested" });
+    },
+
+    onMeetingBanner(cb) {
+      // The daemon pushes show_meeting_banner ~lead time before a calendar
+      // meeting. Map the wire (snake_case) to the MeetingBanner shape.
+      const handler = (cmd: OverlayCommand) => {
+        if (cmd.type !== "show_meeting_banner") return;
+        const c = cmd as Extract<
+          OverlayCommand,
+          { type: "show_meeting_banner" }
+        >;
+        cb({
+          eventId: c.event_id,
+          title: c.title,
+          startEpochSecs: c.start_epoch_secs,
+          endEpochSecs: c.end_epoch_secs,
+          participantCount: c.participant_count,
+          acceptedCount: c.accepted_count,
+          online: c.online,
+        });
+      };
+      handlers.add(handler);
+      return () => handlers.delete(handler);
+    },
+
+    respondMeetingPrep: (eventId, approved) => {
+      // Warm (approve) or dismiss the meeting-prep banner. Fire-and-forget.
+      sendEvent({
+        type: "meeting_prep_responded",
+        event_id: eventId,
+        approved,
+      });
     },
 
     onListeningState(cb) {

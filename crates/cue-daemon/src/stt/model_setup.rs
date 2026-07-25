@@ -80,9 +80,11 @@ const DEFAULT_MODEL_BASE_URL: &str =
 
 /// Resolve the model directory: env override, else `<data_dir>/models/parakeet-en`.
 ///
-/// The default is the int8 English Nemotron (~1.1GB, verbatim, no punctuation).
-/// For polished output WITH punctuation/casing, point `BLUEY_PARAKEET_MODEL_DIR`
-/// at the **Multilingual Nemotron 3.5** export
+/// The default is the int8 English Nemotron (~1.1GB). This model has native
+/// support for punctuation and capitalization — the int8 quantization only
+/// changes encoder weight precision, the BPE tokenizer (including punctuation
+/// tokens) is unchanged from NVIDIA's base model. For multi-language support,
+/// point `BLUEY_PARAKEET_MODEL_DIR` at the **Multilingual Nemotron 3.5** export
 /// (`altunenes/parakeet-rs/nemotron-3.5-asr-streaming-0.6b-onnx`, HF). Same 0.6B
 /// param class and same `Nemotron::from_pretrained` API (variant auto-detected),
 /// but it ships fp32 only (~2.4GB, ~2× the memory) — so it stays opt-in, not the

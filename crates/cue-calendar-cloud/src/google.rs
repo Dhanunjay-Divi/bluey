@@ -53,12 +53,31 @@ struct RawEvent {
     ical_uid: Option<String>,
     #[serde(default)]
     summary: Option<String>,
+    /// The agenda/notes body — the richest pre-context signal.
+    #[serde(default)]
+    description: Option<String>,
+    /// Free-text location (a room, an address, or a bare join link).
+    #[serde(default)]
+    location: Option<String>,
     #[serde(default)]
     start: Option<EventDateTime>,
+    #[serde(default)]
+    end: Option<EventDateTime>,
     #[serde(default)]
     organizer: Option<RawOrganizer>,
     #[serde(default)]
     attendees: Vec<RawAttendee>,
+    /// Read-only Google Meet/Hangout link, when the event has one.
+    #[serde(rename = "hangoutLink", default)]
+    hangout_link: Option<String>,
+    /// Structured conference data (Meet + third-party). We read its entry points
+    /// for a video join URL when `hangoutLink` is absent.
+    #[serde(rename = "conferenceData", default)]
+    conference_data: Option<RawConferenceData>,
+    /// Cancelled events (in an incremental sync) carry `status == "cancelled"`;
+    /// we drop them so a deleted meeting stops triggering.
+    #[serde(default)]
+    status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +105,24 @@ struct RawAttendee {
     display_name: Option<String>,
     #[serde(default)]
     organizer: bool,
+    /// `accepted` | `declined` | `tentative` | `needsAction`.
+    #[serde(rename = "responseStatus", default)]
+    response_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawConferenceData {
+    #[serde(rename = "entryPoints", default)]
+    entry_points: Vec<RawEntryPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawEntryPoint {
+    /// `video` | `phone` | `sip` | `more`. We take the `video` URI.
+    #[serde(rename = "entryPointType", default)]
+    entry_point_type: Option<String>,
+    #[serde(default)]
+    uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +295,12 @@ fn split_offset(rest: &str) -> Option<(&str, i64)> {
 /// Map one raw event to an [`UpcomingEvent`], or `None` if it should be skipped
 /// (unparseable / all-day-only start). Fail-soft — never panics.
 fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
+    // Cancelled events (surfaced by incremental sync) are deletions — skip them
+    // so a removed meeting stops arming the trigger.
+    if raw.status.as_deref() == Some("cancelled") {
+        return None;
+    }
+
     // Start must be a parseable timed dateTime; all-day (`date`-only) and
     // unparseable events are skipped per the contract.
     let start = raw.start.as_ref()?;
@@ -268,6 +311,16 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
     }
     let start_epoch_secs = start_epoch as u64;
 
+    // End is best-effort (pre-context "how long is this"); unparseable = 0.
+    let end_epoch_secs = raw
+        .end
+        .as_ref()
+        .and_then(|e| e.date_time.as_deref())
+        .and_then(parse_rfc3339_to_epoch)
+        .filter(|&e| e >= 0)
+        .map(|e| e as u64)
+        .unwrap_or(0);
+
     // Prefer the stable iCalUID; fall back to the event id.
     let id = raw
         .ical_uid
@@ -275,6 +328,24 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
         .or_else(|| raw.id.filter(|s| !s.trim().is_empty()))?;
 
     let title = raw.summary.unwrap_or_default();
+    let description = raw.description.unwrap_or_default();
+    let location = raw.location.clone().unwrap_or_default();
+
+    // Join URL: prefer the Meet `hangoutLink`, else a `video` conference entry
+    // point, else a URL sniffed from the location text (Zoom/Teams pasted in).
+    let join_url = raw
+        .hangout_link
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            raw.conference_data.as_ref().and_then(|c| {
+                c.entry_points
+                    .iter()
+                    .find(|e| e.entry_point_type.as_deref() == Some("video"))
+                    .and_then(|e| e.uri.clone())
+            })
+        })
+        .or_else(|| raw.location.as_deref().and_then(sniff_url))
+        .unwrap_or_default();
 
     let mut participants: Vec<Participant> = raw
         .attendees
@@ -283,28 +354,32 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
             name: a.display_name.unwrap_or_default(),
             email: a.email.unwrap_or_default(),
             is_organizer: a.organizer,
+            response: map_google_response(a.response_status.as_deref()),
         })
         .collect();
 
     // Fold in the top-level organizer: mark the matching attendee, or add one.
+    let mut organizer_name = String::new();
+    let mut organizer_email = String::new();
     if let Some(org) = raw.organizer {
-        let org_email = org.email.unwrap_or_default();
-        let org_name = org.display_name.unwrap_or_default();
+        organizer_email = org.email.unwrap_or_default();
+        organizer_name = org.display_name.unwrap_or_default();
         let matched = participants
             .iter_mut()
-            .find(|p| !org_email.is_empty() && p.email.eq_ignore_ascii_case(&org_email));
+            .find(|p| !organizer_email.is_empty() && p.email.eq_ignore_ascii_case(&organizer_email));
         match matched {
             Some(p) => {
                 p.is_organizer = true;
-                if p.name.is_empty() && !org_name.is_empty() {
-                    p.name = org_name;
+                if p.name.is_empty() && !organizer_name.is_empty() {
+                    p.name = organizer_name.clone();
                 }
             }
-            None if !org_email.is_empty() || !org_name.is_empty() => {
+            None if !organizer_email.is_empty() || !organizer_name.is_empty() => {
                 participants.push(Participant {
-                    name: org_name,
-                    email: org_email,
+                    name: organizer_name.clone(),
+                    email: organizer_email.clone(),
                     is_organizer: true,
+                    response: cue_core::calendar::ResponseStatus::Accepted,
                 });
             }
             None => {}
@@ -315,8 +390,39 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
         id,
         title,
         start_epoch_secs,
+        end_epoch_secs,
         participants,
+        description,
+        location,
+        join_url,
+        organizer_name,
+        organizer_email,
     })
+}
+
+/// Map Google's `attendee.responseStatus` string onto [`ResponseStatus`].
+fn map_google_response(s: Option<&str>) -> cue_core::calendar::ResponseStatus {
+    use cue_core::calendar::ResponseStatus as R;
+    match s {
+        Some("accepted") => R::Accepted,
+        Some("declined") => R::Declined,
+        Some("tentative") => R::Tentative,
+        Some("needsAction") => R::NeedsAction,
+        _ => R::Unknown,
+    }
+}
+
+/// Best-effort: pull the first http(s) URL out of free text (a join link pasted
+/// into the location or body). Returns `None` when there's no URL. Shared with
+/// the Microsoft source.
+pub(crate) fn sniff_url(text: &str) -> Option<String> {
+    let start = text.find("http")?;
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '<' || c == '>' || c == '"')
+        .unwrap_or(rest.len());
+    let url = &rest[..end];
+    (url.starts_with("http://") || url.starts_with("https://")).then(|| url.to_string())
 }
 
 /// Parse a Google `events.list` JSON body into `UpcomingEvent`s, skipping any
@@ -632,6 +738,7 @@ mod tests {
             title: "T".into(),
             start_epoch_secs: 123,
             participants: Vec::new(),
+            ..Default::default()
         }]));
         let source = GoogleCalendarSource {
             snapshot: Arc::clone(&snapshot),

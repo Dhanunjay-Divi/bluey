@@ -57,6 +57,12 @@ pub enum TranscriptEvent {
         speaker: u32,
         source: AudioSource,
     },
+    /// A structural boundary indicating a pause in speech or speaker turn.
+    /// This signals downstream components that the previous utterance is complete
+    /// and ready for post-processing or formatting.
+    Boundary {
+        source: AudioSource,
+    },
 }
 
 /// Word-level timing information (seconds relative to stream start).
