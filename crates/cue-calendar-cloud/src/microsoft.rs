@@ -41,6 +41,8 @@ const GRAPH_ME_URL: &str = "https://graph.microsoft.com/v1.0/me";
 struct CalendarViewResponse {
     #[serde(default)]
     value: Vec<GraphEvent>,
+    #[serde(rename = "@odata.deltaLink", default)]
+    delta_link: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -403,43 +405,92 @@ fn parse_calendar_view(body: &str) -> Result<Vec<UpcomingEvent>> {
 /// Sets `Prefer: outlook.timezone="UTC"` so `start.dateTime` comes back in UTC,
 /// and requests only the fields we map. Fail-soft per item (see
 /// [`parse_calendar_view`]); a transport/HTTP error surfaces as `Err`.
+/// Outcome of a Microsoft Graph calendar query.
+#[derive(Debug)]
+pub enum FetchMicrosoftEventsOutcome {
+    Success {
+        events: Vec<UpcomingEvent>,
+        delta_link: Option<String>,
+    },
+    /// The delta token expired (HTTP 410 GONE); caller must trigger a full resync.
+    TokenGone,
+}
+
+/// Fetch events from Microsoft Graph, supporting both full query and `deltaLink` query.
+pub async fn fetch_events_with_delta(
+    access_token: &str,
+    now_epoch: u64,
+    lookahead_secs: u64,
+    delta_url: Option<&str>,
+) -> Result<FetchMicrosoftEventsOutcome> {
+    let client = reqwest::Client::new();
+    let resp = match delta_url {
+        Some(url) => {
+            client
+                .get(url)
+                .bearer_auth(access_token)
+                .header("Prefer", "outlook.timezone=\"UTC\"")
+                .send()
+                .await
+                .context("GET Graph deltaLink")?
+        }
+        None => {
+            let start = epoch_to_iso8601_utc(now_epoch);
+            let end = epoch_to_iso8601_utc(now_epoch.saturating_add(lookahead_secs));
+            client
+                .get(GRAPH_CALENDAR_VIEW_URL)
+                .query(&[
+                    ("startDateTime", start.as_str()),
+                    ("endDateTime", end.as_str()),
+                    ("$orderby", "start/dateTime"),
+                    ("$top", "50"),
+                    (
+                        "$select",
+                        "id,subject,start,end,attendees,organizer,bodyPreview,location,onlineMeeting,isOnlineMeeting",
+                    ),
+                ])
+                .bearer_auth(access_token)
+                .header("Prefer", "outlook.timezone=\"UTC\"")
+                .send()
+                .await
+                .context("GET Graph calendarView")?
+        }
+    };
+
+    let status = resp.status();
+    if status == reqwest::StatusCode::GONE {
+        return Ok(FetchMicrosoftEventsOutcome::TokenGone);
+    }
+
+    let body = resp
+        .text()
+        .await
+        .context("read Graph response body")?;
+    if !status.is_success() {
+        return Err(anyhow!("Graph calendar endpoint returned {status}: {body}"));
+    }
+
+    let parsed: CalendarViewResponse =
+        serde_json::from_str(&body).context("parse Graph calendarView JSON")?;
+    let delta_link = parsed.delta_link;
+    let events = parsed.value.into_iter().filter_map(map_event).collect();
+
+    Ok(FetchMicrosoftEventsOutcome::Success {
+        events,
+        delta_link,
+    })
+}
+
+/// Fetch upcoming events from the primary calendar as `UpcomingEvent`s.
 pub async fn fetch_events(
     access_token: &str,
     now_epoch: u64,
     lookahead_secs: u64,
 ) -> Result<Vec<UpcomingEvent>> {
-    let start = epoch_to_iso8601_utc(now_epoch);
-    let end = epoch_to_iso8601_utc(now_epoch.saturating_add(lookahead_secs));
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(GRAPH_CALENDAR_VIEW_URL)
-        .query(&[
-            ("startDateTime", start.as_str()),
-            ("endDateTime", end.as_str()),
-            ("$orderby", "start/dateTime"),
-            ("$top", "50"),
-            (
-                "$select",
-                "id,subject,start,end,attendees,organizer,bodyPreview,location,onlineMeeting,isOnlineMeeting",
-            ),
-        ])
-        .bearer_auth(access_token)
-        // With this header Graph returns start/end dateTime in UTC.
-        .header("Prefer", "outlook.timezone=\"UTC\"")
-        .send()
-        .await
-        .context("GET Graph calendarView")?;
-
-    let status = resp.status();
-    let body = resp
-        .text()
-        .await
-        .context("read Graph calendarView response body")?;
-    if !status.is_success() {
-        return Err(anyhow!("Graph calendarView returned {status}: {body}"));
+    match fetch_events_with_delta(access_token, now_epoch, lookahead_secs, None).await? {
+        FetchMicrosoftEventsOutcome::Success { events, .. } => Ok(events),
+        FetchMicrosoftEventsOutcome::TokenGone => Ok(Vec::new()),
     }
-    parse_calendar_view(&body)
 }
 
 /// Best-effort fetch of the connected account's email from Graph `/me`.
@@ -491,27 +542,40 @@ impl MicrosoftCalendarSource {
 
         handle.spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(REFRESH_INTERVAL_SECS));
+            let mut delta_link: Option<String> = None;
+
             loop {
                 ticker.tick().await;
                 let now = now_epoch_secs();
                 match valid_access_token(store.as_ref(), &cfg, now).await {
-                    Ok(token) => match fetch_events(&token, now, DEFAULT_LOOKAHEAD_SECS).await {
-                        Ok(events) => {
-                            *task_snapshot.lock().await = events;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
+                    Ok(token) => {
+                        match fetch_events_with_delta(&token, now, DEFAULT_LOOKAHEAD_SECS, delta_link.as_deref()).await {
+                            Ok(FetchMicrosoftEventsOutcome::Success { events, delta_link: new_link }) => {
+                                if let Some(link) = new_link {
+                                    delta_link = Some(link);
+                                }
+                                *task_snapshot.lock().await = events;
+                            }
+                            Ok(FetchMicrosoftEventsOutcome::TokenGone) => {
+                                tracing::info!("Microsoft Graph deltaLink expired (410 GONE) — performing baseline resync");
+                                delta_link = None;
+                                if let Ok(FetchMicrosoftEventsOutcome::Success { events, delta_link: new_link }) =
+                                    fetch_events_with_delta(&token, now, DEFAULT_LOOKAHEAD_SECS, None).await
+                                {
+                                    delta_link = new_link;
+                                    *task_snapshot.lock().await = events;
+                                }
+                            }
+                            Err(e) => tracing::warn!(
                                 error = %e,
-                                "Microsoft calendar fetch failed; keeping last snapshot"
-                            );
+                                "microsoft calendar events fetch failed; keeping last snapshot"
+                            ),
                         }
-                    },
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Microsoft calendar token unavailable; keeping last snapshot"
-                        );
                     }
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "microsoft calendar token unavailable; keeping last snapshot"
+                    ),
                 }
             }
         });

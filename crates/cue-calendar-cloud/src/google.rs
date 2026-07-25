@@ -43,6 +43,8 @@ const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 struct EventsResponse {
     #[serde(default)]
     items: Vec<RawEvent>,
+    #[serde(rename = "nextSyncToken", default)]
+    next_sync_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,34 +437,47 @@ fn parse_events_json(body: &str) -> Result<Vec<UpcomingEvent>> {
 
 // --- HTTP: events + email -----------------------------------------------
 
-/// Fetch upcoming events from the primary calendar as `UpcomingEvent`s.
-///
-/// `now_epoch` and `now_epoch + lookahead_secs` become the RFC3339 `timeMin` /
-/// `timeMax` window. Per-item parse failures are skipped, not fatal.
-pub async fn fetch_events(
+/// Outcome of a Google `events.list` query.
+#[derive(Debug)]
+pub enum FetchEventsOutcome {
+    Success {
+        events: Vec<UpcomingEvent>,
+        next_sync_token: Option<String>,
+    },
+    /// The `syncToken` expired (HTTP 410 GONE); caller must trigger a full resync.
+    TokenGone,
+}
+
+/// Fetch events from Google, supporting both full query and incremental `syncToken` query.
+pub async fn fetch_events_with_sync(
     access_token: &str,
     now_epoch: u64,
     lookahead_secs: u64,
-) -> Result<Vec<UpcomingEvent>> {
-    let time_min = epoch_to_rfc3339_utc(now_epoch);
-    let time_max = epoch_to_rfc3339_utc(now_epoch.saturating_add(lookahead_secs));
-
+    sync_token: Option<&str>,
+) -> Result<FetchEventsOutcome> {
     let client = reqwest::Client::new();
-    let resp = client
-        .get(EVENTS_URL)
-        .bearer_auth(access_token)
-        .query(&[
+    let mut req = client.get(EVENTS_URL).bearer_auth(access_token);
+
+    if let Some(token) = sync_token {
+        req = req.query(&[("syncToken", token), ("maxResults", "100")]);
+    } else {
+        let time_min = epoch_to_rfc3339_utc(now_epoch);
+        let time_max = epoch_to_rfc3339_utc(now_epoch.saturating_add(lookahead_secs));
+        req = req.query(&[
             ("timeMin", time_min.as_str()),
             ("timeMax", time_max.as_str()),
             ("singleEvents", "true"),
             ("orderBy", "startTime"),
             ("maxResults", "50"),
-        ])
-        .send()
-        .await
-        .context("GET Google calendar events")?;
+        ]);
+    }
 
+    let resp = req.send().await.context("GET Google calendar events")?;
     let status = resp.status();
+    if status == reqwest::StatusCode::GONE {
+        return Ok(FetchEventsOutcome::TokenGone);
+    }
+
     let body = resp
         .text()
         .await
@@ -470,7 +485,28 @@ pub async fn fetch_events(
     if !status.is_success() {
         return Err(anyhow!("Google events endpoint returned {status}: {body}"));
     }
-    parse_events_json(&body)
+
+    let parsed: EventsResponse =
+        serde_json::from_str(&body).context("parse Google events.list JSON")?;
+    let next_sync_token = parsed.next_sync_token;
+    let events = parsed.items.into_iter().filter_map(map_event).collect();
+
+    Ok(FetchEventsOutcome::Success {
+        events,
+        next_sync_token,
+    })
+}
+
+/// Fetch upcoming events from the primary calendar as `UpcomingEvent`s.
+pub async fn fetch_events(
+    access_token: &str,
+    now_epoch: u64,
+    lookahead_secs: u64,
+) -> Result<Vec<UpcomingEvent>> {
+    match fetch_events_with_sync(access_token, now_epoch, lookahead_secs, None).await? {
+        FetchEventsOutcome::Success { events, .. } => Ok(events),
+        FetchEventsOutcome::TokenGone => Ok(Vec::new()),
+    }
 }
 
 /// Fetch the connected account's email via the OAuth2 userinfo endpoint.
@@ -523,23 +559,44 @@ impl GoogleCalendarSource {
 
         handle.spawn(async move {
             let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
+            let mut sync_token: Option<String> = None;
+
             loop {
                 ticker.tick().await;
                 let now = now_epoch_secs();
                 match valid_access_token(store.as_ref(), &cfg, now).await {
-                    Ok(token) => match fetch_events(&token, now, LOOKAHEAD_SECS).await {
-                        Ok(events) => match task_snapshot.lock() {
-                            Ok(mut guard) => *guard = events,
+                    Ok(token) => {
+                        match fetch_events_with_sync(&token, now, LOOKAHEAD_SECS, sync_token.as_deref()).await {
+                            Ok(FetchEventsOutcome::Success { events, next_sync_token }) => {
+                                if let Some(nst) = next_sync_token {
+                                    sync_token = Some(nst);
+                                }
+                                match task_snapshot.lock() {
+                                    Ok(mut guard) => *guard = events,
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        "google calendar snapshot mutex poisoned; keeping last snapshot"
+                                    ),
+                                }
+                            }
+                            Ok(FetchEventsOutcome::TokenGone) => {
+                                tracing::info!("Google calendar syncToken expired (410 GONE) — performing baseline resync");
+                                sync_token = None;
+                                if let Ok(FetchEventsOutcome::Success { events, next_sync_token }) =
+                                    fetch_events_with_sync(&token, now, LOOKAHEAD_SECS, None).await
+                                {
+                                    sync_token = next_sync_token;
+                                    if let Ok(mut guard) = task_snapshot.lock() {
+                                        *guard = events;
+                                    }
+                                }
+                            }
                             Err(e) => tracing::warn!(
                                 error = %e,
-                                "google calendar snapshot mutex poisoned; keeping last snapshot"
+                                "google calendar events fetch failed; keeping last snapshot"
                             ),
-                        },
-                        Err(e) => tracing::warn!(
-                            error = %e,
-                            "google calendar events fetch failed; keeping last snapshot"
-                        ),
-                    },
+                        }
+                    }
                     Err(e) => tracing::warn!(
                         error = %e,
                         "google calendar token unavailable; keeping last snapshot"
