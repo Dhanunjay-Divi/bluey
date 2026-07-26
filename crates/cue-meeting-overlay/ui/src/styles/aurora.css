@@ -193,15 +193,23 @@ body {
 }
 
 body.dev-backdrop {
-  /* Dev/preview only — a calm aurora field so the glass has light to refract. */
-  background: radial-gradient(
-      900px 520px at 12% 0%,
-      rgba(167, 139, 250, 0.26),
-      transparent 60%
-    ),
-    radial-gradient(820px 520px at 88% 8%, rgba(124, 176, 255, 0.24), transparent 58%),
-    radial-gradient(760px 600px at 50% 108%, rgba(118, 227, 196, 0.22), transparent 60%),
-    linear-gradient(180deg, #f4f3fb, #eef0f7 55%, #f3f1f9);
+  /* Use a real macOS-style abstract background for the dev preview so screenshots look authentic. */
+  background: url("https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?q=80&w=2564&auto=format&fit=crop") center/cover no-repeat;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  min-height: 100vh;
+}
+
+body.dev-backdrop #root {
+  width: 460px;
+  max-width: 90vw;
+  height: 88vh;
+  max-height: 880px;
+  border-radius: 20px;
+  box-shadow: 0 30px 90px rgba(45, 35, 22, 0.25), 0 0 0 1px rgba(11, 11, 11, 0.08);
+  overflow: hidden;
 }
 
 /* The aurora wash that lives INSIDE every glass surface (the refraction). On a

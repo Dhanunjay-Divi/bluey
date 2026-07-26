@@ -119,6 +119,8 @@ export interface MeetingConversationTurn {
   answer: string;
   /** Grounding hint carried through from the daemon, when present. */
   source?: string;
+  /** The anchor segment id in the transcript timeline. */
+  anchorSegmentId?: string;
 }
 
 /** One verified decision from the active meeting's ledger — the Open Floor

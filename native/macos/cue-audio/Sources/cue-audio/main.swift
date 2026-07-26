@@ -122,7 +122,10 @@ private final class PCM16Writer {
         var output = Data()
         output.reserveCapacity(samples.count * 2)
         let ratio = 16_000.0 / sourceSampleRate
+        var maxPeak: Float = 0.0
         for sample in samples {
+            let absSample = abs(sample)
+            if absSample > maxPeak { maxPeak = absSample }
             carry += ratio
             while carry >= 1.0 {
                 let clamped = max(-1.0, min(1.0, sample.isFinite ? sample : 0.0))
@@ -673,13 +676,15 @@ private final class MicrophoneCapture {
         fputs("microphone: TCC authorization status = \(status.rawValue) "
             + "(0=notDetermined 1=restricted 2=denied 3=authorized)\n", stderr)
         if status == .notDetermined {
-            let sema = DispatchSemaphore(value: 0)
+            var finished = false
             var granted = false
             AVCaptureDevice.requestAccess(for: .audio) { ok in
                 granted = ok
-                sema.signal()
+                finished = true
             }
-            sema.wait()
+            while !finished {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+            }
             fputs("microphone: permission prompt result granted=\(granted)\n", stderr)
             if !granted {
                 throw NSError(
@@ -702,35 +707,36 @@ private final class MicrophoneCapture {
         // the converter would emit garbled audio.
         _ = enableEchoCancellation(on: input)
         let inputFormat = input.outputFormat(forBus: 0)
-        guard inputFormat.channelCount > 0 else {
-            throw NSError(domain: "BlueyAudio", code: 2, userInfo: [NSLocalizedDescriptionKey: "no microphone input format available"])
-        }
-        guard let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: false) else {
-            throw NSError(domain: "BlueyAudio", code: 3, userInfo: [NSLocalizedDescriptionKey: "failed to create target format"])
-        }
-        let converter = AVAudioConverter(from: inputFormat, to: targetFormat)
         fputs("microphone: input format \(inputFormat.sampleRate)Hz "
             + "\(inputFormat.channelCount)ch; tap installed\n", stderr)
 
         var tapFireCount = 0
-        input.installTap(onBus: 0, bufferSize: 1_024, format: inputFormat) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
             guard let self else { return }
             tapFireCount += 1
             if tapFireCount == 1 {
-                fputs("microphone: FIRST tap buffer received (frames=\(buffer.frameLength)) — audio is flowing\n", stderr)
+                fputs("microphone: FIRST tap buffer received (frames=\(buffer.frameLength), rate=\(buffer.format.sampleRate)Hz, ch=\(buffer.format.channelCount)) — audio is flowing\n", stderr)
             }
-            let ratio = targetFormat.sampleRate / buffer.format.sampleRate
-            let capacity = AVAudioFrameCount(max(1, Int(Double(buffer.frameLength) * ratio) + 8))
-            guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-            var consumed = false
-            converter?.convert(to: converted, error: nil) { _, status in
-                if consumed { status.pointee = .noDataNow; return nil }
-                consumed = true
-                status.pointee = .haveData
-                return buffer
+            guard buffer.frameLength > 0, let channelData = buffer.floatChannelData else { return }
+            let frameLength = Int(buffer.frameLength)
+            let channelCount = Int(buffer.format.channelCount)
+            let sampleRate = buffer.format.sampleRate > 0 ? buffer.format.sampleRate : 48_000.0
+
+            if channelCount == 1 {
+                let samples = Array(UnsafeBufferPointer(start: channelData[0], count: frameLength))
+                self.writer.writeMonoFloat(samples, sourceSampleRate: sampleRate)
+            } else if channelCount > 1 {
+                var mono = [Float](repeating: 0, count: frameLength)
+                for c in 0..<channelCount {
+                    let channelPtr = channelData[c]
+                    for f in 0..<frameLength {
+                        mono[f] += channelPtr[f]
+                    }
+                }
+                let scale = 1.0 / Float(channelCount)
+                for f in 0..<frameLength { mono[f] *= scale }
+                self.writer.writeMonoFloat(mono, sourceSampleRate: sampleRate)
             }
-            guard converted.frameLength > 0, let channel = converted.floatChannelData?[0] else { return }
-            self.writer.write48kFloat(channel, frameCount: Int(converted.frameLength))
         }
         engine.prepare()
         do {

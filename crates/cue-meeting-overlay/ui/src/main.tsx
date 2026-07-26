@@ -44,6 +44,7 @@ createRoot(document.getElementById("root")!).render(
 // capture-visible modes), so no body backdrop.
 if (!inTauri) {
   document.body.classList.add("dev-backdrop");
+  document.documentElement.setAttribute("data-floorplan", "true");
 }
 
 // No JS auto-resize: the panel FILLS the fixed-size window (pinned to all edges,

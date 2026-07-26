@@ -68,6 +68,7 @@ cp native/macos/cue-whisper/.build/bluey-whisper-macos "$DIST/bluey-whisper-maco
 cp native/macos/cue-picker/.build/bluey-file-picker-macos "$DIST/bluey-file-picker-macos"
 cp native/macos/cue-picker/.build/cue-file-picker-macos "$DIST/cue-file-picker-macos"
 cp -R native/macos/cue-picker/.build/BlueyFilePicker.app "$DIST/BlueyFilePicker.app"
+cp -R native/macos/cue-shot/.build/BlueyShot.app "$DIST/BlueyShot.app"
 
 # Diarization build: the daemon links Homebrew's libopenblas via an absolute
 # path. Stage the dylib next to the daemon and rewrite the load command to

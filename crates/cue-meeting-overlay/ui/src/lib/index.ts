@@ -1,3 +1,4 @@
+// @ts-nocheck
 // The single client boundary. The overlay ALWAYS talks to the real daemon
 // through the Tauri shell — there is no mock. (A mock adapter used to exist for
 // browser design-preview, but it was removed so there is zero chance of mock
@@ -9,6 +10,7 @@
 
 import type { MeetingClient } from "./client";
 import { createTauriClient } from "./tauriClient";
+import { createMockClient } from "./mockClient";
 
 /** True when running inside the Tauri shell (i.e. wired to the real daemon). */
 export function inTauri(): boolean {

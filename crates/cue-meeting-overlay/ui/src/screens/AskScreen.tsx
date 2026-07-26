@@ -443,18 +443,13 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           // drops the other.
           else client.startListening({ microphone: micInputOn, system: true });
         }}
-        micInputOn={micInputOn}
         onToggleMicInput={() => {
-          const next = !micInputOn;
-          setMicInputOn(next);
-          // Re-issue the start with BOTH flags: the daemon's start call takes
-          // the full source set, so sending only the changed one would drop the
-          // other source. When nothing is listening yet, turning the mic on
-          // starts capture with system audio too (the meeting is the point).
-          if (listenState === "listening" || next) {
-            client.startListening({ microphone: next, system: true });
+          const nextMic = !micInputOn;
+          setMicInputOn(nextMic);
+          if (!nextMic && listenState === "listening") {
+            client.startListening({ microphone: false, system: true });
           } else {
-            client.stopListening();
+            client.startListening({ microphone: nextMic, system: true });
           }
         }}
         listenState={listenState}

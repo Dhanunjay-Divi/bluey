@@ -113,11 +113,17 @@ export function OpenFloorScreen({
   // collapse→expand and reload from the snapshot on reopen.)
   useEffect(() => client.onMeetingCandidates(setCandidates), [client]);
 
-  // Follow the tail as content streams in, but only when already near the
-  // bottom — never yank the user up while they're reading earlier lines.
+  // Follow the tail as new content streams in, but DO NOT auto-scroll to the bottom
+  // on initial rehydration so mid-conversation Q&A and pinned cards are visible.
+  const hasMountedRef = useRef(false);
   useEffect(() => {
     const el = canvasRef.current;
     if (!el) return;
+    if (!hasMountedRef.current) {
+      hasMountedRef.current = true;
+      el.scrollTop = 0; // Start at top on mount so decisions, header & Q&A are visible
+      return;
+    }
     const nearBottom =
       el.scrollHeight - el.scrollTop - el.clientHeight < 160;
     if (nearBottom) el.scrollTop = el.scrollHeight;
@@ -179,20 +185,25 @@ export function OpenFloorScreen({
   };
 
   // ---- control-stack handlers ---------------------------------------------
+  const [systemInputOn, setSystemInputOn] = useState(true);
+
   const toggleSystemAudio = () => {
-    if (listenState === "listening" || listenState === "connecting") {
+    const nextSystem = !systemInputOn;
+    setSystemInputOn(nextSystem);
+    if (!nextSystem && !micInputOn) {
       client.stopListening();
-    } else if (listenState === "permission_denied") {
-      client.openPermissionSettings("screen_recording");
     } else {
-      client.startListening({ system: true, microphone: micInputOn });
+      client.startListening({ system: nextSystem, microphone: micInputOn });
     }
   };
   const toggleMic = () => {
-    const next = !micInputOn;
-    setMicInputOn(next);
-    // Keep system capture as-is; just flip whether our own mic is captured.
-    client.startListening({ system: true, microphone: next });
+    const nextMic = !micInputOn;
+    setMicInputOn(nextMic);
+    if (!nextMic && !systemInputOn) {
+      client.stopListening();
+    } else {
+      client.startListening({ system: systemInputOn, microphone: nextMic });
+    }
   };
 
   const cleanup = () => askRef.current?.cancel();

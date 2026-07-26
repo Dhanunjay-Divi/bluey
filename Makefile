@@ -88,6 +88,7 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release build-meeting-ove
 	cp target/aarch64-apple-darwin/release/cue-meeting-overlay staging-arm64/bin/cue-overlay-tauri 2>/dev/null || true
 	cp native/macos/cue-overlay/.build/bluey-overlay-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-overlay/.build/cue-overlay-macos staging-arm64/bin/ 2>/dev/null || true
+	cp -R native/macos/cue-audio/.build/BlueyAudio.app staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-audio/.build/bluey-audio-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-whisper/.build/cue-whisper staging-arm64/bin/ 2>/dev/null || true
@@ -95,6 +96,7 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release build-meeting-ove
 	cp native/macos/cue-picker/.build/bluey-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-picker/.build/cue-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
 	cp -R native/macos/cue-picker/.build/BlueyFilePicker.app staging-arm64/bin/ 2>/dev/null || true
+	cp -R native/macos/cue-shot/.build/BlueyShot.app staging-arm64/bin/ 2>/dev/null || true
 	cp scripts/install.sh staging-arm64/install.sh 2>/dev/null || cp dist/bluey-0.1.10-darwin-arm64/install.sh staging-arm64/install.sh 2>/dev/null || true
 	cp dist/bluey-0.1.10-darwin-arm64/README.txt staging-arm64/README.txt 2>/dev/null || true
 	tar -czf dist/bluey-$(VERSION)-darwin-arm64.tar.gz -C staging-arm64 .

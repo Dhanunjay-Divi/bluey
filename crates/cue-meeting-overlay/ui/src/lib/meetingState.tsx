@@ -233,6 +233,7 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
 
     const seededTurns: Turn[] = snap.conversation.map((t, i) => ({
       id: i + 1,
+      anchorSegmentId: t.anchorSegmentId,
       question: t.question,
       answer: {
         agentLabel: "Bluey",
@@ -273,6 +274,8 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
               id: l.id,
               source: l.source,
               speaker: l.speaker,
+              speakerId: l.speakerId,
+              memberIds: l.memberIds ?? (l.id ? [l.id] : undefined),
               text: l.text,
               final: true,
             },

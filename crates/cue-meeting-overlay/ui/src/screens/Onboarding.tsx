@@ -61,7 +61,16 @@ export function Onboarding({
           {/* progress dots */}
           <div style={{ display: "flex", gap: 6, marginBottom: 22 }}>
             {ORDER.map((s, i) => (
-              <span key={s} style={{ height: 3, flex: 1, borderRadius: 2, background: i <= idx ? "var(--tint)" : "var(--line-2)", transition: ".25s" }} />
+              <span
+                key={s}
+                style={{
+                  height: 3,
+                  flex: 1,
+                  borderRadius: 2,
+                  background: i <= idx ? "var(--brand, #c6613f)" : "var(--line-2, #ded9cf)",
+                  transition: ".25s",
+                }}
+              />
             ))}
           </div>
 
@@ -422,46 +431,76 @@ function CalendarStep({
 
 function Glyph({ children }: { children: React.ReactNode }) {
   return (
-    <span style={{ width: 40, height: 40, borderRadius: 12, display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 19, background: "var(--paper-sink, var(--glass-2))", color: "var(--ink)", boxShadow: "inset 0 0 0 1px var(--line)" }}>
+    <span
+      style={{
+        width: 42,
+        height: 42,
+        borderRadius: 12,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 20,
+        background: "rgba(198, 97, 63, 0.08)",
+        color: "var(--brand, #c6613f)",
+        boxShadow: "inset 0 0 0 1px rgba(198, 97, 63, 0.18)",
+      }}
+    >
       {children}
     </span>
   );
 }
 
-const h2 = { fontSize: 19, fontWeight: 600, letterSpacing: "-.02em", color: "var(--ink)", margin: "16px 0 8px" } as const;
-const p = { fontSize: 13.5, lineHeight: 1.6, color: "var(--ink-2)" } as const;
+const h2 = {
+  fontSize: 19,
+  fontWeight: 600,
+  letterSpacing: "-.02em",
+  color: "var(--ink, #1c1a19)",
+  margin: "16px 0 8px",
+} as const;
+
+const p = {
+  fontSize: 13.5,
+  lineHeight: 1.6,
+  color: "var(--ink-2, #3c3a38)",
+} as const;
+
 const primary = {
   fontSize: 13.5,
-  fontWeight: 560,
-  color: "var(--paper, #fff)",
-  background: "var(--ink)",
+  fontWeight: 580,
+  color: "var(--paper-2, #ffffff)",
+  background: "var(--brand, #c6613f)",
   border: "none",
   borderRadius: 11,
   padding: "10px 18px",
   cursor: "pointer",
-  boxShadow: "0 5px 14px -4px rgba(28,26,25,.35)",
+  boxShadow: "0 4px 14px -3px rgba(198, 97, 63, 0.4)",
+  transition: "all 0.2s ease",
 } as const;
+
 const ghost = {
   fontSize: 13.5,
-  fontWeight: 500,
-  color: "var(--ink-2)",
+  fontWeight: 520,
+  color: "var(--ink-2, #3c3a38)",
   background: "transparent",
-  border: "1px solid var(--line-2)",
+  border: "1px solid var(--line-2, #ded9cf)",
   borderRadius: 11,
   padding: "10px 16px",
   cursor: "pointer",
+  transition: "all 0.2s ease",
 } as const;
+
 const pickRow = {
   display: "flex",
   alignItems: "center",
   gap: 10,
   width: "100%",
   textAlign: "left",
-  border: "1px solid var(--line)",
-  background: "var(--glass-2)",
-  borderRadius: "var(--r)",
+  border: "1px solid var(--line, #ebe7df)",
+  background: "var(--paper-2, #fdfcfb)",
+  borderRadius: "var(--r, 12px)",
   padding: "11px 13px",
   cursor: "pointer",
+  transition: "all 0.2s ease",
 } as const;
 
 /** One setup prerequisite row: status dot, detail, live progress, and (when the
@@ -478,21 +517,54 @@ function SetupRow({
 }) {
   const color =
     item.state === "ready"
-      ? "var(--ok-ink, #2e9e5b)"
+      ? "var(--ok, #4e8d5b)"
       : item.state === "working"
-        ? "var(--tint-ink)"
-        : "var(--warn-ink, #d08700)";
+        ? "var(--brand, #c6613f)"
+        : "var(--ink-3, #8c867d)";
   return (
-    <div style={{ ...pickRow, cursor: "default", alignItems: "flex-start", flexDirection: "column", gap: 6 }}>
-      <div style={{ display: "flex", alignItems: "center", width: "100%", gap: 8 }}>
-        <span style={{ width: 7, height: 7, borderRadius: 4, background: color, flexShrink: 0 }} />
-        <span style={{ fontSize: 12.5 }}>{item.detail}</span>
+    <div
+      style={{
+        ...pickRow,
+        cursor: "default",
+        alignItems: "flex-start",
+        flexDirection: "column",
+        gap: 6,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          width: "100%",
+          gap: 8,
+        }}
+      >
+        <span
+          style={{
+            width: 7,
+            height: 7,
+            borderRadius: 4,
+            background: color,
+            flexShrink: 0,
+          }}
+        />
+        <span style={{ fontSize: 12.5, color: "var(--ink, #1c1a19)" }}>
+          {item.detail}
+        </span>
         {onFix && fixLabel && (
           <button
-            onClick={(e) => { e.stopPropagation(); onFix(); }}
+            onClick={(e) => {
+              e.stopPropagation();
+              onFix();
+            }}
             style={{
-              marginLeft: "auto", fontSize: 11.5, fontWeight: 560,
-              color: "var(--tint-ink)", background: "none", border: "none", cursor: "pointer",
+              marginLeft: "auto",
+              fontSize: 11.5,
+              fontWeight: 560,
+              color: "var(--brand, #c6613f)",
+              background: "none",
+              border: "none",
+              cursor: "pointer",
             }}
           >
             {fixLabel}
@@ -500,8 +572,23 @@ function SetupRow({
         )}
       </div>
       {item.percent !== null && (
-        <div style={{ width: "100%", height: 3, borderRadius: 2, background: "var(--line-2)" }}>
-          <div style={{ width: `${item.percent}%`, height: "100%", borderRadius: 2, background: "var(--tint)", transition: ".3s" }} />
+        <div
+          style={{
+            width: "100%",
+            height: 3,
+            borderRadius: 2,
+            background: "var(--line-2, #ded9cf)",
+          }}
+        >
+          <div
+            style={{
+              width: `${item.percent}%`,
+              height: "100%",
+              borderRadius: 2,
+              background: "var(--brand, #c6613f)",
+              transition: ".3s",
+            }}
+          />
         </div>
       )}
     </div>
