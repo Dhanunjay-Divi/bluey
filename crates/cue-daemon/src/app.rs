@@ -7709,8 +7709,31 @@ fn overlay_context_items(
             path: Some(item.path.clone()),
             thumbnail: thumbnails.get(&item.id).cloned(),
             anchor_segment_id: item.anchor_segment_id.clone(),
+            text_preview: context_text_excerpt(item),
         })
         .collect()
+}
+
+/// Bound the artifact's captured text for the overlay's click-to-preview
+/// lightbox. Image/diagram kinds preview via their thumbnail, so they carry no
+/// text excerpt; every other kind carries the first [`CONTEXT_PREVIEW_MAX_CHARS`]
+/// of `text_preview` so a large file can't bloat the command bus.
+fn context_text_excerpt(item: &cue_core::meeting::ContextArtifact) -> Option<String> {
+    use cue_core::meeting::ContextKind;
+    if matches!(item.kind, ContextKind::Image | ContextKind::Diagram) {
+        return None;
+    }
+    let text = item.text_preview.as_deref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    const CONTEXT_PREVIEW_MAX_CHARS: usize = 4000;
+    if text.chars().count() > CONTEXT_PREVIEW_MAX_CHARS {
+        let truncated: String = text.chars().take(CONTEXT_PREVIEW_MAX_CHARS).collect();
+        Some(format!("{truncated}\n\n… (truncated)"))
+    } else {
+        Some(text.to_string())
+    }
 }
 
 /// Map a [`ContextArtifact`] to its LEAN snapshot wire form — id/title/kind/path
@@ -7726,6 +7749,7 @@ fn to_wire_context_item(item: &cue_core::meeting::ContextArtifact) -> OverlayCon
         path: Some(item.path.clone()),
         thumbnail: None,
         anchor_segment_id: item.anchor_segment_id.clone(),
+        text_preview: context_text_excerpt(item),
     }
 }
 
@@ -9448,12 +9472,36 @@ async fn add_audio_transcript_segment_inner(
             // Dedup: a final removes the superseded partial from the same speaker.
             dedup_partial_on_final(meeting, speaker, text);
         }
+        // Same-speaker turn coalescing — extend the last segment IN PLACE so a
+        // run of fragments reads as one flowing line. EXCEPTION: never coalesce
+        // into a segment that an attachment (or Q&A turn) is ANCHORED to. An
+        // attachment pins itself after the last final segment's id; if the next
+        // same-source fragment then coalesced into that very segment, the pinned
+        // line would keep growing UNDERNEATH the attachment and the attachment
+        // would no longer sit at the boundary the user marked. Sealing the
+        // anchored segment makes the next fragment start a FRESH segment that
+        // flows BELOW the attachment — so "attach, then keep talking on the same
+        // source" pins correctly (previously it only worked when the next words
+        // came from a DIFFERENT source, which never coalesced). The attachment's
+        // id still resolves (it stays the sealed segment's id); new speech simply
+        // gets its own line after the pin.
         let mut coalesced = false;
-        if let Some(last) = meeting.transcript.last_mut() {
-            if last.speaker == speaker && last.is_final == segment.is_final {
+        if let Some(last) = meeting.transcript.last() {
+            let last_is_anchored = meeting
+                .context
+                .iter()
+                .any(|c| c.anchor_segment_id.as_deref() == Some(last.id.to_string().as_str()));
+            if !last_is_anchored
+                && last.speaker == speaker
+                && last.is_final == segment.is_final
+            {
                 let trimmed = text_raw.trim();
                 if !trimmed.is_empty() {
-                    if !last.text.is_empty() && !last.text.ends_with(' ') && !trimmed.starts_with(' ') {
+                    let last = meeting.transcript.last_mut().expect("last exists");
+                    if !last.text.is_empty()
+                        && !last.text.ends_with(' ')
+                        && !trimmed.starts_with(' ')
+                    {
                         last.text.push(' ');
                     }
                     last.text.push_str(trimmed);

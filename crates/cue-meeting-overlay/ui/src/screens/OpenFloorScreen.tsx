@@ -14,6 +14,7 @@
 // tab switch cannot wipe it.
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { getClient } from "../lib";
 import { useDragHeader } from "../lib/useDragHeader";
 import type {
@@ -704,6 +705,9 @@ function Attachments({
   items: ContextItem[];
   onRemove: (id: string) => void;
 }) {
+  // The attachment being previewed in the lightbox (null = closed). Clicking a
+  // chip body opens it; the ✕ still removes without opening (stopPropagation).
+  const [preview, setPreview] = useState<ContextItem | null>(null);
   return (
     <div className="fp-attach">
       <div className="fp-attach-kicker">
@@ -716,10 +720,12 @@ function Attachments({
             (item.kind === "image" || item.kind === "diagram") &&
             !!item.thumbnail;
           return (
-            <div
+            <button
+              type="button"
               className={`fp-attach-item${isImage ? " is-image" : ""}`}
               key={item.id}
-              title={item.path ?? item.title}
+              title={`Preview ${item.title}`}
+              onClick={() => setPreview(item)}
             >
               {isImage ? (
                 <img
@@ -733,18 +739,122 @@ function Attachments({
                 </span>
               )}
               <span className="fp-attach-title">{item.title}</span>
-              <button
+              <span
                 className="fp-attach-x"
+                role="button"
+                tabIndex={0}
                 aria-label={`Remove ${item.title}`}
-                onClick={() => onRemove(item.id)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onRemove(item.id);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    onRemove(item.id);
+                  }
+                }}
               >
                 <CloseIcon size={12} />
-              </button>
-            </div>
+              </span>
+            </button>
           );
         })}
       </div>
+      {preview && (
+        <AttachmentPreview item={preview} onClose={() => setPreview(null)} />
+      )}
     </div>
+  );
+}
+
+// ==========================================================================
+// Attachment lightbox — click a chip to see the full screenshot / file card.
+// On-theme (warm paper, --ink text, float shadow) to match the transcript
+// surface. Dismiss via the ✕, a backdrop click, or Escape. The image source is
+// the same inline data-URI thumbnail the chip carries (the overlay never gets a
+// full-resolution path), shown un-cropped and as large as the viewport allows.
+// ==========================================================================
+function AttachmentPreview({
+  item,
+  onClose,
+}: {
+  item: ContextItem;
+  onClose: () => void;
+}) {
+  const isImage =
+    (item.kind === "image" || item.kind === "diagram") && !!item.thumbnail;
+
+  // Close on Escape; restore focus to the document on unmount.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  // Portal to <body>: the attachment block (.fp-attach) animates, which makes it
+  // a containing block for `position: fixed`, so an in-tree backdrop resolved
+  // against that tiny box and collapsed to a pill. Rendering at the body escapes
+  // every transform/filter/animation ancestor so the backdrop fills the viewport.
+  return createPortal(
+    <div
+      className="fp-preview-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label={`Preview of ${item.title}`}
+      onMouseDown={(e) => {
+        // Only a click on the backdrop itself dismisses (not on the card).
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="fp-preview-card">
+        <div className="fp-preview-head">
+          <span className="fp-preview-kind" aria-hidden>
+            <AttachKindGlyph kind={item.kind} />
+          </span>
+          <span className="fp-preview-title" title={item.path ?? item.title}>
+            {item.title}
+          </span>
+          <button
+            type="button"
+            className="fp-preview-close"
+            aria-label="Close preview"
+            onClick={onClose}
+          >
+            <CloseIcon size={15} />
+          </button>
+        </div>
+        <div className="fp-preview-body">
+          {isImage ? (
+            <img
+              className="fp-preview-image"
+              src={item.thumbnail}
+              alt={item.title}
+            />
+          ) : item.textPreview ? (
+            // File CONTENT preview — the daemon-captured text excerpt, shown
+            // monospace so code/logs keep their shape. Scrolls within the card.
+            <pre className="fp-preview-text">{item.textPreview}</pre>
+          ) : (
+            // No extractable text (binary / unknown) — fall back to the file card.
+            <div className="fp-preview-file">
+              <span className="fp-preview-file-glyph" aria-hidden>
+                <AttachKindGlyph kind={item.kind} />
+              </span>
+              <span className="fp-preview-file-title">{item.title}</span>
+              {item.path && (
+                <span className="fp-preview-file-path">{item.path}</span>
+              )}
+              <span className="fp-preview-file-kind">{item.kind}</span>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 

@@ -167,6 +167,10 @@ export interface ContextItem {
    *  anchor into the timeline. Resolved against each grouped line's `memberIds`
    *  so it renders inline in the line that contains it. Absent → tail. */
   anchorSegmentId?: string;
+  /** A bounded text excerpt of the artifact (code/text/document kinds), shown in
+   *  the click-to-preview lightbox. Absent for image kinds (they preview via
+   *  `thumbnail`) and for artifacts with no extractable text. */
+  textPreview?: string;
 }
 
 export interface MeetingSummary {

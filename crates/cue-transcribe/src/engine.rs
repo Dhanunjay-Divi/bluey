@@ -34,6 +34,17 @@ const SAMPLE_RATE: f64 = 16_000.0;
 /// remainder arrived as a new chunk → "sl ash", "requ est", "langu age". A true
 /// end-of-utterance pause is reliably ≥700ms, so 8 chunks clears intra-word
 /// pauses while still endpointing promptly at real sentence ends.
+///
+/// DO NOT LOWER below 8. A brief experiment at 5 (~500ms) to shave tail latency
+/// REGRESSED word integrity on exactly this speaker profile: a careful speaker
+/// enunciating figures ("fif ty", "doll ars", "quest ion", "fin alising") holds
+/// intra-word gaps well past 500ms, so the tip flushed mid-word and the words
+/// split — verified live 2026-07-26. Word integrity dominates a ~300ms tail
+/// saving in a MEETING transcript (a split word is unreadable; a slightly late
+/// final word is not). Tail latency must be reduced elsewhere (e.g. the model
+/// window / coalesce path), never by flushing the held tip sooner. Sentence-final
+/// punctuation already flushes IMMEDIATELY via `ends_sentence`, so this threshold
+/// only governs pauses with NO terminal punctuation.
 const SILENCE_FLUSH_CHUNKS: u32 = 8;
 
 /// One streaming ASR engine, bound to a single audio source. Stateful — do not

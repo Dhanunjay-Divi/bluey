@@ -111,13 +111,115 @@ export interface TranscriptGrouper {
 
 export function createTranscriptGrouper(): TranscriptGrouper {
   let lines: GroupedLine[] = [];
-  const seen = new Set<string>();
+  // segment id -> the FULL accumulated text currently shown for that id.
+  //
+  // WIRE REALITY (verified against the daemon, app.rs:9436-9494): the daemon
+  // COALESCES a same-speaker run into ONE stored segment and re-broadcasts under
+  // that segment's STABLE id. Two DIFFERENT shapes reach us under the same id:
+  //   • LIVE: each card carries only the NEW fragment ("To the", " west side")
+  //     via `text_raw` — the delta, not the whole line.
+  //   • SEED (remount / rehydrate snapshot): one card carries the segment's FULL
+  //     accumulated text at once ("To the west side of the building").
+  // The id is deliberately stable (setSpeaker, attachment anchors, span assign
+  // all address segments by id), so the wire id MUST NOT change — a repeat id is
+  // a CONTINUATION, not a duplicate. The old `Set<id>` dropped every repeat, so
+  // only the first fragment of each turn ever rendered.
+  //
+  // Unifying rule: keep the full accumulated text per id and reconcile the line
+  // to it. A card is either (a) an exact resend of what we already have (drop),
+  // (b) a full-text seed that is a superset of / equal to the accumulation
+  // (adopt the longer of the two), or (c) a live delta to append. This is
+  // idempotent under out-of-order seed↔live interleave AND under a delta that
+  // repeats an EARLIER (not just the last) fragment.
+  const accumById = new Map<string, string>();
 
   const foldSegment = (seg: TranscriptLine, paused: boolean): FoldResult => {
-    if (seg.id && seen.has(seg.id)) {
-      return { history: toHistory(lines), caption: null };
+    const segId = seg.id;
+    if (segId) {
+      const acc = accumById.get(segId);
+      if (acc !== undefined) {
+        if (seg.text === acc) {
+          // Exact resend of the whole accumulation (remount / seam replay of the
+          // same card). Nothing new — drop. NOTE: we deliberately do NOT drop a
+          // delta merely because it equals a tail already present — a speaker
+          // genuinely repeats phrases ("save you twenty thousand dollars ...
+          // twenty thousand dollars"), and dropping the repeat would silently
+          // eat real speech.
+          return { history: toHistory(lines), caption: null };
+        }
+        // The NEW text this card contributes: a full-text seed (remount snapshot)
+        // supersedes the accumulation, so the delta is the suffix past `acc`; a
+        // live card carries just the delta already.
+        const isSeedSuperset =
+          seg.text.length > acc.length && seg.text.startsWith(acc);
+        const delta = isSeedSuperset ? seg.text.slice(acc.length) : seg.text;
+        accumById.set(segId, gluePunctuation(acc + delta));
+
+        // The LAST line carrying this id — a long coalesced turn may already have
+        // been split into several paragraph lines that ALL share the id, and the
+        // continuation must extend the most recent one, not the first (using
+        // findIndex here appended every later delta to the FIRST paragraph and
+        // never broke again — the "one giant top line" bug).
+        let idx = -1;
+        for (let i = lines.length - 1; i >= 0; i--) {
+          if (lines[i].ids.includes(segId)) {
+            idx = i;
+            break;
+          }
+        }
+        if (idx < 0) {
+          // Owning line aged out past MAX_LINES — record, drop the delta.
+          return { history: toHistory(lines), caption: null };
+        }
+        const owner = lines[idx];
+        // PARAGRAPH BREAK inside a coalesced turn: once the owning line has
+        // reached the length floor AND ends on sentence-final punctuation, the
+        // continuation starts a NEW line — otherwise a long same-speaker turn
+        // (all one segment id) grows into a single ever-expanding block pinned at
+        // the top (the "transcript populating on the top" bug). The new line
+        // carries the SAME id, so attachment / Q&A anchors that resolve by id
+        // still find a line — every line of the turn contains the id.
+        const isLastLine = idx === lines.length - 1;
+        const breakHere =
+          isLastLine &&
+          owner.text.length >= SENTENCE_MIN_CHARS &&
+          endsSentence(owner.text);
+
+        let next: GroupedLine[];
+        let currentText: string;
+        if (breakHere) {
+          const fresh: GroupedLine = {
+            ...seg,
+            // Drop a leading space so a fresh paragraph doesn't start indented.
+            text: gluePunctuation(delta).replace(/^\s+/, ""),
+            speaker: owner.speaker ?? seg.speaker,
+            speakerId: owner.speakerId ?? seg.speakerId,
+            ids: seg.id ? [seg.id] : [],
+          };
+          next = [...lines, fresh];
+          currentText = fresh.text;
+        } else {
+          const grown: GroupedLine = {
+            ...owner,
+            text: gluePunctuation(owner.text + delta),
+            // Adopt a label the line didn't have yet (diarize can land between the
+            // first fragment and a later coalesced delta).
+            speaker: owner.speaker ?? seg.speaker,
+            speakerId: owner.speakerId ?? seg.speakerId,
+          };
+          next = [...lines];
+          next[idx] = grown;
+          currentText = grown.text;
+        }
+        if (next.length > MAX_LINES) next = next.slice(-MAX_LINES);
+        lines = next;
+        return {
+          history: toHistory(next),
+          caption: { ...seg, text: tailCap(currentText) },
+        };
+      }
+      accumById.set(segId, seg.text);
     }
-    if (seg.id) seen.add(seg.id);
 
     const last = lines.length > 0 ? lines[lines.length - 1] : null;
     // Break a long line at a sentence end so the transcript reads as paragraphs,

@@ -78,6 +78,7 @@ interface WireContextItem {
   path?: string | null;
   thumbnail?: string | null;
   anchor_segment_id?: string | null;
+  text_preview?: string | null;
 }
 
 // One first-run setup prerequisite (daemon `SetupItem`).
@@ -275,6 +276,7 @@ function toContextItem(w: WireContextItem): ContextItem {
     path: w.path ?? undefined,
     thumbnail: w.thumbnail ?? undefined,
     anchorSegmentId: w.anchor_segment_id ?? undefined,
+    textPreview: w.text_preview ?? undefined,
   };
 }
 

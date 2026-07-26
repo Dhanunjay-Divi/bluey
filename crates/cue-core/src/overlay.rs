@@ -78,6 +78,13 @@ pub struct OverlayContextItem {
     /// because the UI groups segments into fewer lines. `None` → render at tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor_segment_id: Option<String>,
+    /// A text excerpt of the artifact for the click-to-preview lightbox (the
+    /// first chunk of a code/text/document file). `None` for image kinds (the
+    /// `thumbnail` is their preview) and for artifacts with no extractable text.
+    /// Bounded by the daemon before it reaches the wire so a huge file can't
+    /// bloat the command bus — the preview shows an excerpt, not the whole file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -896,6 +903,7 @@ mod tests {
                 path: Some("/tmp/GenAI Engineer JD.pdf".to_string()),
                 thumbnail: None,
                 anchor_segment_id: None,
+                text_preview: None,
             }],
             turns: 3,
         })
@@ -1317,6 +1325,7 @@ mod tests {
                 path: None,
                 thumbnail: None,
                 anchor_segment_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+                text_preview: None,
             }],
             meeting_id: None,
             read_only: false,
