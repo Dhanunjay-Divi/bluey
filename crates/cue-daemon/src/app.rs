@@ -2005,13 +2005,8 @@ async fn start_system_audio_capture_task(daemon: &Arc<Daemon>, pick: bool) -> Re
                 #[cfg(feature = "diarize")]
                 let mut live_diarizer = crate::diarize::spawn_live_diarizer(&daemon_sys.paths);
 
-                // CHUNK COALESCING (fixes growing STT lag). The capture path frames
-                // 20ms/320-sample chunks, but parakeet-rs recomputes the mel
-                // spectrogram over its WHOLE internal buffer on EVERY push
-                // (nemotron.rs). Coalescing forwarded frames to 280ms (4480 samples,
-                // exactly half of Nemotron's 560ms / 56 mel-frame encoder window)
-                // cuts mel recomputation waste by 66% while maintaining real-time latency.
-                const COALESCE_SAMPLES: usize = 4480; // 280ms @ 16kHz mono
+                // CHUNK COALESCING (100ms @ 16kHz mono = 1600 samples). Fast streaming push.
+                const COALESCE_SAMPLES: usize = 1600; // 100ms @ 16kHz mono
                 let mut coalesce_buf: Vec<i16> = Vec::with_capacity(COALESCE_SAMPLES);
                 let mut coalesce_started_at_ms: u64 = 0;
 
@@ -5985,9 +5980,8 @@ async fn start_microphone_capture_task(daemon: &Arc<Daemon>) -> Result<()> {
             }
         };
 
-        // Same uniform 280 ms coalescing the system path uses — resample to
-        // 16 kHz FIRST, then coalesce the 16 kHz stream to 4480-sample chunks.
-        const COALESCE_SAMPLES: usize = 4480; // 280 ms @ 16 kHz mono
+        // Fast 100ms coalescing (1600 samples @ 16kHz mono).
+        const COALESCE_SAMPLES: usize = 1600; // 100ms @ 16kHz mono
         let mut coalesce_buf: Vec<i16> = Vec::with_capacity(COALESCE_SAMPLES);
         let mut coalesce_started_at_ms: u64 = 0;
 
@@ -9439,9 +9433,29 @@ async fn add_audio_transcript_segment_inner(
             // Dedup: a final removes the superseded partial from the same speaker.
             dedup_partial_on_final(meeting, speaker, text);
         }
-        let transcript_segment = TranscriptSegment::new(speaker, text_raw, segment.is_final)
-            .with_audio_start_secs(audio_start_secs);
-        meeting.transcript.push(transcript_segment.clone());
+        let mut coalesced = false;
+        if let Some(last) = meeting.transcript.last_mut() {
+            if last.speaker == speaker && last.is_final == segment.is_final {
+                let trimmed = text_raw.trim();
+                if !trimmed.is_empty() {
+                    if !last.text.is_empty() && !last.text.ends_with(' ') && !trimmed.starts_with(' ') {
+                        last.text.push(' ');
+                    }
+                    last.text.push_str(trimmed);
+                    coalesced = true;
+                }
+            }
+        }
+
+        let transcript_segment = if coalesced {
+            meeting.transcript.last().cloned().expect("last exists")
+        } else {
+            let seg = TranscriptSegment::new(speaker, text_raw, segment.is_final)
+                .with_audio_start_secs(audio_start_secs);
+            meeting.transcript.push(seg.clone());
+            seg
+        };
+
         let analysis = analyze_segment(&transcript_segment, meeting);
         meeting.action_items.extend(analysis.action_items);
         meeting.decisions.extend(analysis.decisions);

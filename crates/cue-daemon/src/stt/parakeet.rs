@@ -184,7 +184,7 @@ fn run_worker(
     // async task. The loop ends when the provider drops `audio_tx`.
     let mut silent_ms = 0.0;
     let mut has_spoken_since_last_boundary = false;
-    const SILENCE_GATE_MS: f64 = 400.0;
+    const SILENCE_GATE_MS: f64 = 250.0;
     const RMS_THRESHOLD: f32 = 0.01;
 
     while let Some(chunk) = audio_rx.blocking_recv() {
