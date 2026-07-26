@@ -138,9 +138,18 @@ export function FloatingStack({
             <AttachIcon size={17} />
           </StackButton>
 
-          <StackButton label="Capture page" onClick={onCapturePage}>
-            <GlobeIcon size={17} />
-          </StackButton>
+          {/* Capture page (active-browser-tab scrape) — HIDDEN for now, revisit
+              later. TODO(agent-reach): consider re-building this on top of
+              Agent-Reach (github.com/Panniantong/Agent-Reach), a key-free CLI that
+              gives agents unified read/search over ~16 web platforms (Twitter/X,
+              Reddit, YouTube, GitHub, LinkedIn, RSS, Exa search, arbitrary URLs) —
+              so the user can pull a SPECIFIC url/source, not just the frontmost
+              tab. onCapturePage stays plumbed so re-enabling is a one-line flip. */}
+          {false && (
+            <StackButton label="Capture page" onClick={onCapturePage}>
+              <GlobeIcon size={17} />
+            </StackButton>
+          )}
 
           <StackButton
             label={

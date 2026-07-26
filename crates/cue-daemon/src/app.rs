@@ -14080,6 +14080,15 @@ $bitmap.Dispose()
     Ok(())
 }
 
+// TODO(agent-reach): the overlay "Capture page" button is currently HIDDEN in the
+// UI (FloatingStack.tsx / PlusMenu.tsx) pending a rework. Consider routing page /
+// web capture through Agent-Reach (github.com/Panniantong/Agent-Reach) — an
+// open-source, key-free CLI that gives agents unified read/search access to ~16
+// web platforms (Twitter/X, Reddit, YouTube, GitHub, LinkedIn, Instagram, RSS,
+// Exa web search, and arbitrary URLs). It would let the user pull a SPECIFIC URL
+// or social source (not just the frontmost browser tab) and covers logged-in /
+// JS-rendered content this AppleScript path can't. This per-browser AppleScript
+// capture stays as the macOS-native fallback for "grab whatever's on screen".
 #[cfg(target_os = "macos")]
 fn capture_active_page_platform() -> Result<ActivePageCapture> {
     let browser_order = macos_browser_order();

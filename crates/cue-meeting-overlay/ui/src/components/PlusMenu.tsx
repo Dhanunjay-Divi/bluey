@@ -60,12 +60,21 @@ export function PlusMenu({ onClose }: { onClose: () => void }) {
         label="Attach files"
         onClick={act(() => client.openAttachPicker())}
       />
-      <MenuItem
-        icon={<GlobeIcon size={15} />}
-        label="Capture page"
-        hint="⌥S"
-        onClick={act(() => client.capturePage())}
-      />
+      {/* Capture page (active-browser-tab scrape) — HIDDEN for now, revisit
+          later. TODO(agent-reach): consider re-building on top of Agent-Reach
+          (github.com/Panniantong/Agent-Reach), a key-free CLI giving agents
+          unified read/search over ~16 web platforms (Twitter/X, Reddit, YouTube,
+          GitHub, LinkedIn, RSS, Exa search, arbitrary URLs) so the user can pull
+          a SPECIFIC url/source, not just the frontmost tab. client.capturePage()
+          stays available so re-enabling is a one-line flip. */}
+      {false && (
+        <MenuItem
+          icon={<GlobeIcon size={15} />}
+          label="Capture page"
+          hint="⌥S"
+          onClick={act(() => client.capturePage())}
+        />
+      )}
       <MenuItem
         icon={<ScreenIcon size={15} />}
         label="Take a screenshot"
