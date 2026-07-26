@@ -9478,6 +9478,10 @@ async fn add_audio_transcript_segment_inner(
         (meeting.clone(), transcript_segment)
     };
 
+    eprintln!(
+        "[LATENCY DIAGNOSTIC] Speaker: {:?} | Text: {:?}",
+        committed_segment.speaker, committed_segment.text
+    );
     info!(
         speaker = ?committed_segment.speaker,
         is_final = committed_segment.is_final,

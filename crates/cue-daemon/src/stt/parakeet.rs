@@ -217,20 +217,16 @@ fn run_worker(
         let push_result = engine.push(&chunk);
         let push_ms = push_started.elapsed().as_millis();
         let rtf = push_started.elapsed().as_secs_f64() / audio_secs.max(1e-9);
-        tracing::info!(
-            source = ?source,
-            rtf = format!("{rtf:.2}"),
-            push_ms,
-            audio_ms = audio_ms as u64,
-            backlog,
-            "[LATENCY DIAGNOSTIC] STT engine push completed"
-        );
         
         let chunk_text = match push_result {
             Ok(Some(tc)) => {
                 let text = tc.text.trim();
                 if !text.is_empty() {
                     has_spoken_since_last_boundary = true;
+                    eprintln!(
+                        "[LATENCY DIAGNOSTIC] Source: {:?} | Push: {}ms | RTF: {:.2} | Backlog: {} | Decoded text: {:?}",
+                        source, push_ms, rtf, backlog, tc.text
+                    );
                     Some(tc.text)
                 } else {
                     None
@@ -242,7 +238,7 @@ fn run_worker(
                 let _ = event_tx.send(Err(SttError::Provider(format!(
                     "parakeet transcription failed: {e}"
                 ))));
-                None // Non-fatal: keep going on the next chunk.
+                None
             }
         };
 
