@@ -273,6 +273,8 @@ const SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
     include_str!("../../../infra/sqlite/server-runtime/035_jobs_global_candidate_index.sql");
 const SQLITE_JOBS_RESUME_SOURCE_ASSETS: &str =
     include_str!("../../../infra/sqlite/server-runtime/036_jobs_resume_source_assets.sql");
+const SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/037_jobs_auto_submit_authorizations.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1596,6 +1598,9 @@ const MIGRATIONS: &[&str] = &[
         SELECT RAISE(ABORT, 'Jobs resume claim evidence is immutable');
     END;
     "#,
+    // 0040 - Track-scoped, revisioned user authority for unattended
+    // application submission.
+    SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1956,6 +1961,8 @@ const POSTGRES_JOBS_MAILBOX_SYNC: &str =
     include_str!("../../../infra/postgres/server-runtime/015_jobs_mailbox_sync.sql");
 const POSTGRES_JOBS_EVIDENCE_IMMUTABILITY: &str =
     include_str!("../../../infra/postgres/server-runtime/016_jobs_evidence_immutability.sql");
+const POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/017_jobs_auto_submit_authorizations.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2008,6 +2015,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "016_jobs_evidence_immutability.sql",
         POSTGRES_JOBS_EVIDENCE_IMMUTABILITY,
+    ),
+    (
+        "017_jobs_auto_submit_authorizations.sql",
+        POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
     ),
 ];
 
@@ -2392,7 +2403,8 @@ mod sqlite_migration_replay_tests {
 mod postgres_migration_tests {
     use super::{
         POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS,
-        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
     };
 
     #[test]
@@ -2532,6 +2544,27 @@ mod postgres_migration_tests {
             assert!(sql.contains(required), "missing {required}");
             assert!(
                 SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX.contains(required),
+                "SQLite migration missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_submit_authorizations_are_track_scoped_and_single_active_revision() {
+        let (_, sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == "017_jobs_auto_submit_authorizations.sql")
+            .expect("Auto-submit authorization must exist before Jobs routes are served");
+
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_auto_submit_authorizations",
+            "UNIQUE(account_id, career_track_id, revision_no)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_auto_submit_authorizations_active",
+            "WHERE revoked_at_ms IS NULL",
+        ] {
+            assert!(sql.contains(required), "missing {required}");
+            assert!(
+                SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS.contains(required),
                 "SQLite migration missing {required}"
             );
         }

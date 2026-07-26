@@ -7,6 +7,12 @@ under `docs/release/`.
 
 ### Added
 
+- Added revisioned, Track-scoped Auto-submit authorization bound to one
+  verified application identity, current source resume, Career Track policy,
+  and confirmed candidate facts.
+- Added post-fill and immediate pre-submit ATS form read-back so silently
+  discarded answers or documents pause the application instead of producing an
+  incomplete submission.
 - Added server-owned Career Track authority that binds every track to one
   verified application identity and the current source resume revision.
 - Added canonical role, location, employment, engagement, authorization,
@@ -33,6 +39,10 @@ under `docs/release/`.
 
 ### Fixed
 
+- Prevented Review-first packet approval from becoming reusable Auto-submit
+  authority, and made legacy Auto-submit packets fail closed.
+- Prevented an ATS-controlled field that only appears filled from passing
+  validation when the employer form did not register the value.
 - Prevented stale Career Tracks from silently following a replaced resume.
 - Prevented unrelated or overlapping employment from inflating role-specific
   experience.

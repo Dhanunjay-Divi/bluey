@@ -79,9 +79,10 @@ describe("application workflow boundaries", () => {
   });
 
   it("downgrades Auto-submit unless both the job and a runner are authorized", () => {
-    expect(effectiveSubmissionMode(job(false), "auto_submit", runners(true))).toBe("review_first");
-    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(false))).toBe("review_first");
-    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true))).toBe("auto_submit");
+    expect(effectiveSubmissionMode(job(false), "auto_submit", runners(true), true)).toBe("review_first");
+    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(false), true)).toBe("review_first");
+    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), false)).toBe("review_first");
+    expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), true)).toBe("auto_submit");
   });
 
   it("recognizes only the structured, open final-review intervention", () => {

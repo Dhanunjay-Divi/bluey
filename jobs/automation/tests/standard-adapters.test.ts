@@ -137,6 +137,25 @@ describe("deterministic ATS application adapters", () => {
     expect(hookCalls).toBe(1);
     expect(page.submitClicks).toBe(0);
   });
+
+  it("blocks submission when a reactive form silently discards a filled value", async () => {
+    const page = new FixturePage(
+      PROVIDERS[4][1],
+      [field("first_name", "First name", true)],
+      "Application form",
+      true,
+      false,
+      ["first_name"],
+    );
+    const submitHooks: string[] = [];
+
+    const result = await executeApplication(context(page, [], submitHooks));
+
+    expect(result.receipt.status).toBe("needs_input");
+    expect(result.receipt.issues[0]?.message).toContain("did not register");
+    expect(page.submitClicks).toBe(0);
+    expect(submitHooks).toEqual([]);
+  });
 });
 
 function context(page: BrowserPage, events: string[], submitHooks?: string[]): AdapterContext {
@@ -181,9 +200,13 @@ class FixturePage implements BrowserPage {
     private body = "Application form",
     private readonly confirmsSubmission = true,
     startBeforeFinalStep = false,
+    ignoredWrites: string[] = [],
   ) {
     this.finalStep = !startBeforeFinalStep;
+    this.ignoredWrites = new Set(ignoredWrites);
   }
+
+  private readonly ignoredWrites: Set<string>;
 
   url(): string { return this.currentUrl; }
   async title(): Promise<string> { return "Software Engineer | Acme"; }
@@ -199,7 +222,9 @@ class FixturePage implements BrowserPage {
     const next = !this.finalStep && !/submit/i.test(selector) && /next|continue/i.test(selector);
     return {
       count: async () => control || submit || next ? 1 : 0,
-      fill: async (value) => { if (control) control.value = value; },
+      fill: async (value) => {
+        if (control && !this.ignoredWrites.has(selector)) control.value = value;
+      },
       click: async () => {
         if (next) {
           this.nextClicks += 1;
@@ -213,9 +238,17 @@ class FixturePage implements BrowserPage {
       textContent: async () => "",
       getAttribute: async () => null,
       isVisible: async () => Boolean(control || submit || next),
-      selectOption: async (value) => { if (control) control.value = value; },
-      setChecked: async (checked) => { if (control) control.checked = checked; },
-      setInputFiles: async (paths) => { if (control) control.value = paths[0]?.split("/").at(-1) || ""; },
+      selectOption: async (value) => {
+        if (control && !this.ignoredWrites.has(selector)) control.value = value;
+      },
+      setChecked: async (checked) => {
+        if (control && !this.ignoredWrites.has(selector)) control.checked = checked;
+      },
+      setInputFiles: async (paths) => {
+        if (control && !this.ignoredWrites.has(selector)) {
+          control.value = paths[0]?.split("/").at(-1) || "";
+        }
+      },
     };
   }
 }

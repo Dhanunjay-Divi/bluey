@@ -394,6 +394,22 @@ pub struct CareerTrack {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutoSubmitAuthorization {
+    pub id: String,
+    pub career_track_id: String,
+    pub application_identity_id: String,
+    pub source_resume_asset_id: String,
+    pub revision_no: i64,
+    pub authorized_at_ms: i64,
+    #[serde(default)]
+    pub revoked_at_ms: Option<i64>,
+    #[serde(default)]
+    pub status: String,
+    #[serde(skip_serializing, default)]
+    pub authority_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPosting {
     #[serde(default)]
     pub id: String,
@@ -1288,6 +1304,8 @@ pub struct JobsWorkspace {
     pub candidate_events: Vec<CandidateEvent>,
     pub integrations: Vec<JobsIntegration>,
     pub application_identities: Vec<ApplicationIdentity>,
+    #[serde(default)]
+    pub auto_submit_authorizations: Vec<AutoSubmitAuthorization>,
     pub mailbox_connections: Vec<MailboxConnection>,
     pub discovery_sources: Vec<DiscoverySourceSummary>,
     pub entitlement: JobsEntitlement,
@@ -1591,6 +1609,7 @@ include!("jobs/global_discovery.rs");
 include!("jobs/global_discovery_completion.rs");
 include!("jobs/global_materialization.rs");
 include!("jobs/resume_assets.rs");
+include!("jobs/auto_submit.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");

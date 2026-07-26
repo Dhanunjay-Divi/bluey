@@ -391,6 +391,77 @@ mod tests {
     }
 
     #[test]
+    fn auto_submit_authorization_is_track_scoped_and_stales_when_resume_changes() {
+        let pool = test_pool();
+        let mut profile = default_profile("jobs@example.com");
+        profile.onboarding_complete = true;
+        let first_asset = test_resume_source_asset("resume-source-auto-a", "candidate-a.pdf");
+        let (_, first_profile) =
+            save_resume_source_asset(&pool, "acct-jobs", &first_asset, &profile).unwrap();
+        let saved_profile = save_profile(&pool, "acct-jobs", &first_profile).unwrap();
+        assert!(saved_profile.onboarding_complete);
+        let track = list_tracks(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|track| track.id == "track-default")
+            .unwrap();
+        let track = bind_career_track_authority(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+            &track,
+        )
+        .unwrap();
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+
+        let authorized =
+            authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", &track.id).unwrap();
+        assert_eq!(authorized.status, "active");
+        assert_eq!(authorized.revision_no, 1);
+        assert_eq!(authorized.source_resume_asset_id, first_asset.id);
+        assert_eq!(
+            require_valid_auto_submit_authorization(
+                &pool,
+                "acct-jobs",
+                "jobs@example.com",
+                &track.id,
+            )
+            .unwrap()
+            .id,
+            authorized.id
+        );
+
+        let second_asset = test_resume_source_asset("resume-source-auto-b", "candidate-b.pdf");
+        save_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &second_asset,
+            &saved_profile,
+        )
+        .unwrap();
+        let stale =
+            list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].status, "needs_review");
+        assert!(require_valid_auto_submit_authorization(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+            &track.id,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Career Track details changed"));
+
+        assert!(revoke_auto_submit(&pool, "acct-jobs", &track.id).unwrap());
+        assert!(
+            list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn persisted_career_tracks_use_server_owned_role_normalization() {
         let pool = test_pool();
         let saved = upsert_authoritative_test_track(

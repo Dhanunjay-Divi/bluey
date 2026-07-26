@@ -151,6 +151,17 @@ export interface CareerTrack {
   updated_at_ms: number;
 }
 
+export interface AutoSubmitAuthorization {
+  id: string;
+  career_track_id: string;
+  application_identity_id: string;
+  source_resume_asset_id: string;
+  revision_no: number;
+  authorized_at_ms: number;
+  revoked_at_ms?: number;
+  status: "active" | "needs_review" | string;
+}
+
 export interface JobPosting {
   id: string;
   canonical_key: string;
@@ -470,6 +481,7 @@ export interface JobsWorkspace {
   preferences: JobPreferences;
   facts: CareerFact[];
   tracks: CareerTrack[];
+  auto_submit_authorizations: AutoSubmitAuthorization[];
   matches: JobPosting[];
   applications: JobApplication[];
   application_evidence: ApplicationEvidence[];

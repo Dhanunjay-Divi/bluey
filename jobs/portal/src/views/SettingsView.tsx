@@ -69,6 +69,8 @@ interface Props {
   onSavePreferences(preferences: JobPreferences): Promise<void>;
   onSaveTrack(track: CareerTrack): Promise<void>;
   onDeleteTrack(track: CareerTrack): Promise<void>;
+  onAuthorizeTrackAutoSubmit(track: CareerTrack): Promise<void>;
+  onRevokeTrackAutoSubmit(track: CareerTrack): Promise<void>;
   onCreateIdentity(identity: ApplicationIdentity): Promise<ApplicationIdentity>;
   onUpdateIdentity(identity: ApplicationIdentity): Promise<ApplicationIdentity>;
   onVerifyIdentity(identity: ApplicationIdentity, code: string): Promise<ApplicationIdentity>;
@@ -90,6 +92,8 @@ export function SettingsView({
   onSavePreferences,
   onSaveTrack,
   onDeleteTrack,
+  onAuthorizeTrackAutoSubmit,
+  onRevokeTrackAutoSubmit,
   onCreateIdentity,
   onUpdateIdentity,
   onVerifyIdentity,
@@ -122,6 +126,7 @@ export function SettingsView({
   const [saved, setSaved] = useState("");
   const [localError, setLocalError] = useState("");
   const [savingSearch, setSavingSearch] = useState(false);
+  const [autoSubmitBusyTrackId, setAutoSubmitBusyTrackId] = useState("");
   const [searchDirty, setSearchDirty] = useState(false);
   const roleSuggestions = useMemo(
     () => mergeCareerSuggestions(preferences.desired_roles, [profile.headline], profile.employment.map((entry) => entry.title), ROLE_SUGGESTIONS),
@@ -216,18 +221,71 @@ export function SettingsView({
             const identity = workspace.application_identities.find(
               (item) => item.id === track.application_identity_id,
             );
-            return <button key={track.id} onClick={() => { setEditingTrack(track); setTrackOpen(true); }}>
-              <span className="agent-orbit"><Bot size={18} /></span>
-              <div>
-                <b>{track.name}</b>
-                <p>{track.role}</p>
-                <small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small>
-                <small><MailCheck size={12} />{identity?.email || "Application email required"}</small>
-                <small className={authority.sourceStale ? "track-source-stale" : ""}><FileText size={12} />{authority.sourceStale ? "Resume changed · review this Track" : authority.sourceLabel}</small>
-              </div>
-              <span className={authority.sourceStale ? "agent-state warning" : track.active ? "agent-state active" : "agent-state"}>{authority.sourceStale ? "Review resume" : track.active ? "Active" : "Paused"}</span>
-              <ChevronRight size={17} />
-            </button>;
+            const autoSubmit = workspace.auto_submit_authorizations.find(
+              (authorization) => authorization.career_track_id === track.id,
+            );
+            const autoSubmitActive = autoSubmit?.status === "active";
+            const canAuthorize = track.active
+              && identity?.verification_status === "verified"
+              && !authority.sourceStale;
+            const autoSubmitDetail = autoSubmitActive
+              ? "Eligible certified jobs may queue automatically after every server check passes."
+              : autoSubmit?.status === "needs_review"
+                ? "This Track changed. Review its resume and application email before enabling again."
+                : "Review first stays on until you authorize this exact Track, resume, and application email.";
+            return (
+              <article className="track-settings-card" key={track.id}>
+                <button
+                  className="track-settings-main"
+                  onClick={() => { setEditingTrack(track); setTrackOpen(true); }}
+                >
+                  <span className="agent-orbit"><Bot size={18} /></span>
+                  <div>
+                    <b>{track.name}</b>
+                    <p>{track.role}</p>
+                    <small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small>
+                    <small><MailCheck size={12} />{identity?.email || "Application email required"}</small>
+                    <small className={authority.sourceStale ? "track-source-stale" : ""}><FileText size={12} />{authority.sourceStale ? "Resume changed · review this Track" : authority.sourceLabel}</small>
+                  </div>
+                  <span className={authority.sourceStale ? "agent-state warning" : track.active ? "agent-state active" : "agent-state"}>{authority.sourceStale ? "Review resume" : track.active ? "Active" : "Paused"}</span>
+                  <ChevronRight size={17} />
+                </button>
+                <div className="track-auto-submit">
+                  <span className={autoSubmitActive ? "track-auto-submit-icon active" : "track-auto-submit-icon"}>
+                    <ShieldCheck size={16} />
+                  </span>
+                  <div>
+                    <b>{autoSubmitActive ? "Auto-submit enabled" : autoSubmit?.status === "needs_review" ? "Auto-submit needs review" : "Review first"}</b>
+                    <small>{autoSubmitDetail}</small>
+                  </div>
+                  <button
+                    className={autoSubmitActive ? "button secondary compact" : "button primary compact"}
+                    disabled={autoSubmitBusyTrackId === track.id || (!autoSubmitActive && !canAuthorize)}
+                    title={!canAuthorize && !autoSubmitActive
+                      ? "Activate the Track, verify its application email, and review the current resume first."
+                      : undefined}
+                    onClick={() => {
+                      setLocalError("");
+                      setAutoSubmitBusyTrackId(track.id);
+                      const action = autoSubmitActive
+                        ? onRevokeTrackAutoSubmit(track)
+                        : onAuthorizeTrackAutoSubmit(track);
+                      void action
+                        .catch(showError(setLocalError))
+                        .finally(() => setAutoSubmitBusyTrackId(""));
+                    }}
+                  >
+                    {autoSubmitBusyTrackId === track.id
+                      ? "Saving..."
+                      : autoSubmitActive
+                        ? "Turn off"
+                        : autoSubmit?.status === "needs_review"
+                          ? "Review and enable"
+                          : "Enable Auto-submit"}
+                  </button>
+                </div>
+              </article>
+            );
           })}
           <div className="track-limit"><span>{workspace.tracks.length} of {workspace.entitlement.track_limit} agents</span><div><i style={{ width: `${Math.min(100, workspace.tracks.length / workspace.entitlement.track_limit * 100)}%` }} /></div></div>
         </div>

@@ -173,6 +173,17 @@ export const previewWorkspace: JobsWorkspace = {
       updated_at_ms: now - 7_000,
     },
   ],
+  auto_submit_authorizations: [
+    {
+      id: "auto-submit-track-1",
+      career_track_id: "track-1",
+      application_identity_id: "identity-primary",
+      source_resume_asset_id: "preview-source-resume",
+      revision_no: 1,
+      authorized_at_ms: now - 3_000,
+      status: "active",
+    },
+  ],
   matches: [
     {
       id: "job-1",

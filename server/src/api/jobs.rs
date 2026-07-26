@@ -68,6 +68,10 @@ pub fn router() -> Router<AppState> {
             "/api/jobs/tracks/:track_id",
             put(update_track).delete(delete_track),
         )
+        .route(
+            "/api/jobs/tracks/:track_id/auto-submit",
+            post(authorize_track_auto_submit).delete(revoke_track_auto_submit),
+        )
         .route("/api/jobs/matches", get(matches).post(save_match))
         .route("/api/jobs/matches/:job_id", get(match_detail))
         .route(
@@ -810,6 +814,31 @@ pub async fn delete_track(
     }
 }
 
+pub async fn authorize_track_auto_submit(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(track_id): Path<String>,
+) -> Result<Json<jobs::AutoSubmitAuthorization>, ApiError> {
+    jobs::authorize_auto_submit(&state.pool, &account.id, &account.email, &track_id)
+        .map(Json)
+        .map_err(domain_error)
+}
+
+pub async fn revoke_track_auto_submit(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(track_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    match jobs::revoke_auto_submit(&state.pool, &account.id, &track_id) {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err((
+            StatusCode::NOT_FOUND,
+            "Auto-submit is not enabled on this Career Track.".to_string(),
+        )),
+        Err(error) => Err(internal(error)),
+    }
+}
+
 pub async fn matches(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -1329,6 +1358,13 @@ pub async fn prepare_application(
         ));
     }
     if req.submission_mode == "auto_submit" {
+        jobs::require_valid_auto_submit_authorization(
+            &state.pool,
+            &account.id,
+            &account.email,
+            &prepared.posting.track_id,
+        )
+        .map_err(domain_error)?;
         let eligibility = prepared
             .application
             .receipt
@@ -2029,11 +2065,32 @@ fn freeze_approved_execution(
         "source": ats_kind(&posting.canonical_url),
         "compensation": posting.compensation,
     });
-    let checksum = approved_execution_checksum(&packet, &job)?;
+    let admission = if application.submission_mode == "auto_submit" {
+        let authorization = jobs::require_valid_auto_submit_authorization(
+            &state.pool,
+            account_id,
+            account_email,
+            &posting.track_id,
+        )
+        .map_err(domain_error)?;
+        json!({
+            "kind": "track_auto_submit",
+            "authorization_id": authorization.id,
+            "career_track_id": authorization.career_track_id,
+            "revision_no": authorization.revision_no,
+            "authority_fingerprint": authorization.authority_fingerprint,
+        })
+    } else {
+        json!({
+            "kind": "review_approval",
+        })
+    };
+    let checksum = approved_execution_checksum_v2(&packet, &job, &admission)?;
     let approved_execution = json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "approved_at_ms": jobs::now_ms(),
         "checksum": checksum,
+        "admission": admission,
         "packet": packet,
         "job": job,
     });
@@ -2061,7 +2118,11 @@ fn approved_execution_snapshot(
             StatusCode::CONFLICT,
             "Approve this exact application packet before starting a browser runner.".to_string(),
         ))?;
-    if approved.get("schema_version").and_then(Value::as_i64) != Some(1) {
+    let schema_version = approved
+        .get("schema_version")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if !matches!(schema_version, 1 | 2) {
         return Err((
             StatusCode::CONFLICT,
             "This approved packet uses an unsupported version. Prepare it again.".to_string(),
@@ -2088,7 +2149,26 @@ fn approved_execution_snapshot(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if checksum.len() != 64 || approved_execution_checksum(&packet, &job)? != checksum {
+    let expected_checksum = if schema_version == 1 {
+        if application.submission_mode == "auto_submit" {
+            return Err((
+                StatusCode::CONFLICT,
+                "Review and enable Auto-submit on this Career Track before starting.".to_string(),
+            ));
+        }
+        approved_execution_checksum(&packet, &job)?
+    } else {
+        let admission = approved
+            .get("admission")
+            .filter(|value| value.is_object())
+            .ok_or((
+                StatusCode::CONFLICT,
+                "The application approval proof is incomplete. Prepare it again.".to_string(),
+            ))?;
+        validate_approved_execution_admission(application, admission)?;
+        approved_execution_checksum_v2(&packet, &job, admission)?
+    };
+    if checksum.len() != 64 || expected_checksum != checksum {
         return Err((
             StatusCode::CONFLICT,
             "The approved application packet changed after review. Prepare it again.".to_string(),
@@ -2105,6 +2185,63 @@ fn approved_execution_checksum(packet: &Value, job: &Value) -> Result<String, Ap
     }));
     let bytes = serde_json::to_vec(&canonical).map_err(|error| internal(error.into()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn approved_execution_checksum_v2(
+    packet: &Value,
+    job: &Value,
+    admission: &Value,
+) -> Result<String, ApiError> {
+    let canonical = canonical_json_value(&json!({
+        "schema_version": 2,
+        "admission": admission,
+        "packet": packet,
+        "job": job,
+    }));
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| internal(error.into()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn validate_approved_execution_admission(
+    application: &JobApplication,
+    admission: &Value,
+) -> Result<(), ApiError> {
+    let kind = admission
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if application.submission_mode == "auto_submit" {
+        let complete = kind == "track_auto_submit"
+            && admission
+                .get("authorization_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            && admission
+                .get("career_track_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            && admission
+                .get("revision_no")
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value > 0)
+            && admission
+                .get("authority_fingerprint")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.len() == 64);
+        if !complete {
+            return Err((
+                StatusCode::CONFLICT,
+                "The Auto-submit authorization proof is incomplete. Review the Career Track again."
+                    .to_string(),
+            ));
+        }
+    } else if kind != "review_approval" {
+        return Err((
+            StatusCode::CONFLICT,
+            "Approve this exact application packet before starting a browser runner.".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn canonical_json_value(value: &Value) -> Value {
@@ -5962,6 +6099,49 @@ mod tests {
             (screenshot_key.to_string(), screenshot_sha),
         ]);
         (application, posting, resume, receipt, verified_objects)
+    }
+
+    #[test]
+    fn legacy_review_approval_remains_valid_but_legacy_auto_submit_fails_closed() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+
+        approved_execution_snapshot(&application).unwrap();
+
+        application.submission_mode = "auto_submit".to_string();
+        let error = approved_execution_snapshot(&application).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("enable Auto-submit"));
+    }
+
+    #[test]
+    fn auto_submit_admission_is_bound_into_the_approved_packet_checksum() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        application.submission_mode = "auto_submit".to_string();
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let job = application.receipt["approved_execution"]["job"].clone();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "auto-auth-one",
+            "career_track_id": "track-test",
+            "revision_no": 2,
+            "authority_fingerprint": "f".repeat(64)
+        });
+        let checksum = approved_execution_checksum_v2(&packet, &job, &admission).unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 2,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job
+        });
+
+        approved_execution_snapshot(&application).unwrap();
+
+        application.receipt["approved_execution"]["admission"]["revision_no"] = json!(3);
+        let error = approved_execution_snapshot(&application).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("changed after review"));
     }
 
     fn png_fixture() -> Vec<u8> {

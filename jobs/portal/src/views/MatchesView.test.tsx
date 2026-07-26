@@ -1,6 +1,12 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import type { DiscoverySource, DiscoverySourceHealth, JobPosting, RunnerAvailability } from "../types";
+import type {
+  AutoSubmitAuthorization,
+  DiscoverySource,
+  DiscoverySourceHealth,
+  JobPosting,
+  RunnerAvailability,
+} from "../types";
 import {
   canAutoSubmit,
   DiscoverySourceHealthList,
@@ -87,6 +93,16 @@ const runners = (available: boolean): RunnerAvailability => ({
   auto_submit_reason: available
     ? "Auto-submit is available."
     : "Auto-submit is not available in this release because your included runner is still in invited beta.",
+});
+
+const authorization = (status: AutoSubmitAuthorization["status"] = "active"): AutoSubmitAuthorization => ({
+  id: "authorization-1",
+  career_track_id: "track-1",
+  application_identity_id: "identity-1",
+  source_resume_asset_id: "resume-1",
+  revision_no: 1,
+  authorized_at_ms: 1,
+  status,
 });
 
 describe("discovery source health", () => {
@@ -226,9 +242,15 @@ describe("Career Track filtering and submission truth", () => {
   it("explains runner rollout separately from ATS eligibility", () => {
     const certified = match(true, "certified");
 
-    expect(canAutoSubmit(certified, runners(false))).toBe(false);
-    expect(autoSubmitUnavailableReason(certified, runners(false))).toContain("invited beta");
-    expect(canAutoSubmit(certified, runners(true))).toBe(true);
-    expect(autoSubmitUnavailableReason(certified, runners(true))).toBeUndefined();
+    expect(canAutoSubmit(certified, runners(false), [authorization()])).toBe(false);
+    expect(autoSubmitUnavailableReason(certified, runners(false), [authorization()])).toContain("invited beta");
+    expect(canAutoSubmit(certified, runners(true), [])).toBe(false);
+    expect(autoSubmitUnavailableReason(certified, runners(true), [])).toContain("Career Track");
+    expect(canAutoSubmit(certified, runners(true), [authorization("needs_review")])).toBe(false);
+    expect(autoSubmitUnavailableReason(certified, runners(true), [authorization("needs_review")])).toContain(
+      "changed",
+    );
+    expect(canAutoSubmit(certified, runners(true), [authorization()])).toBe(true);
+    expect(autoSubmitUnavailableReason(certified, runners(true), [authorization()])).toBeUndefined();
   });
 });

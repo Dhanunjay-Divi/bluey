@@ -14,10 +14,12 @@ export function effectiveSubmissionMode(
   job: JobPosting,
   requested: SubmissionMode,
   runners: RunnerAvailability,
+  trackAuthorized: boolean,
 ): SubmissionMode {
   return requested === "auto_submit"
     && job.eligibility?.can_auto_submit === true
     && runners.auto_submit_available
+    && trackAuthorized
     ? "auto_submit"
     : "review_first";
 }
