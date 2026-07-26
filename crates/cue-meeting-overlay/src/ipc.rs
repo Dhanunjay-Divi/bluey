@@ -98,6 +98,23 @@ pub async fn request(addr: &str, req: Value) -> Result<Value, String> {
 /// the socket-writer task.
 pub struct EventSender(pub Mutex<Option<mpsc::UnboundedSender<String>>>);
 
+/// The last `show_meeting_banner` command JSON, stored so the banner webview can
+/// PULL it on mount via [`get_pending_banner`]. Event delivery (`emit`/`emit_to`)
+/// to the banner webview proved unreliable — the banner window is `visible:false`
+/// at boot and its webview's event channel isn't wired when the daemon's
+/// show-banner burst fires, so 0 commands ever reached it (measured on-screen).
+/// A pull command sidesteps event timing entirely: the webview asks for the
+/// pending banner the moment its JS runs. Cleared on hide.
+pub struct PendingBanner(pub std::sync::Mutex<Option<String>>);
+
+/// The banner webview calls this on mount to fetch the current meeting-prep
+/// banner (the raw `show_meeting_banner` JSON line, same shape the event bus
+/// would have delivered). Returns `None` when no banner is pending.
+#[tauri::command]
+pub fn get_pending_banner(state: tauri::State<'_, PendingBanner>) -> Option<String> {
+    state.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+}
+
 /// JS calls this (via invoke) to send an `OverlayEvent` to the daemon. The arg is
 /// the event as a JSON STRING (no double-encoding, unlike `event.emit`). The
 /// socket writer injects the session `"token"` before sending.
@@ -223,27 +240,135 @@ async fn run_connection(
                 if line.is_empty() {
                     continue;
                 }
+                if line.contains("\"show_meeting_banner\"") {
+                    // Store for the pull-based get_pending_banner command (the
+                    // reliable delivery path — see PendingBanner docs).
+                    {
+                        use tauri::Manager;
+                        let pending = app.state::<PendingBanner>();
+                        *pending.0.lock().unwrap_or_else(|p| p.into_inner()) =
+                            Some(line.to_string());
+                    }
+                }
                 #[cfg(target_os = "macos")]
                 if line.contains("\"show_meeting_banner\"") {
+                    // GUARANTEED DELIVERY to the banner webview: the broadcast
+                    // `app.emit` below races the banner webview's listener (the
+                    // webview only starts loading when the window is first shown,
+                    // which is triggered by THIS very command), so the banner never
+                    // received any command (measured: 0 commands seen). Re-emit the
+                    // command DIRECTLY to the "banner" window on a short delay, a
+                    // few times, so it lands after the webview's listener is up.
+                    {
+                        let app_re = app.clone();
+                        let payload = line.to_string();
+                        std::thread::spawn(move || {
+                            for _ in 0..5 {
+                                std::thread::sleep(
+                                    std::time::Duration::from_millis(400),
+                                );
+                                let _ = app_re.emit_to(
+                                    "banner",
+                                    "overlay://command",
+                                    payload.clone(),
+                                );
+                            }
+                        });
+                    }
                     let app_handle = app.clone();
                     let _ = app_handle.clone().run_on_main_thread(move || {
                         #[allow(deprecated)]
                         use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
                         use tauri_nspanel::WebviewWindowExt;
-                        if let Some(w) = app_handle.get_webview_window("banner") {
-                            let _ = w.show();
+                        let Some(w) = app_handle.get_webview_window("banner") else {
+                            return;
+                        };
+                        {
+                            // Pin to the TOP-RIGHT of the current monitor like a
+                            // real system notification, instead of the hardcoded
+                            // x:980 (which assumes a screen width and can land
+                            // under the meeting overlay). 20px inset from the
+                            // top-right corner.
+                            match w.current_monitor() {
+                                Ok(Some(monitor)) => {
+                                    let scale = monitor.scale_factor();
+                                    let screen = monitor.size().to_logical::<f64>(scale);
+                                    let inset = 20.0;
+                                    let banner_w = 360.0;
+                                    let x = (screen.width - banner_w - inset).max(inset);
+                                    let _ = w.set_position(tauri::LogicalPosition::new(
+                                        x, inset,
+                                    ));
+                                }
+                                _ => {}
+                            }
+                            // DO NOT call w.show() — Tauri's show() activates the
+                            // app (makeKeyAndOrderFront) which yanks the user to the
+                            // app's Space / away from their fullscreen tab. Instead
+                            // configure the panel FIRST, then order it front WITHOUT
+                            // activating. Set collection behavior BEFORE ordering so
+                            // it lands on the CURRENT space, never switching spaces.
                             let _ = w.set_always_on_top(true);
                             if let Ok(panel) = w.to_panel() {
-                                panel.set_level(4);
+                                // Non-activating panel (bit 7) so it never becomes
+                                // key / steals focus.
                                 panel.set_style_mask(0 | (1 << 7));
+                                // Level 5 — ABOVE the meeting overlay (level 4).
+                                panel.set_level(5);
+                                // Appear on the user's CURRENT space without moving
+                                // them: CanJoinAllSpaces = show on whatever space is
+                                // active; Stationary + IgnoresCycle keep it out of
+                                // space-switch animation and Exposé cycling. No
+                                // FullScreenAuxiliary (it forced a space change).
                                 #[allow(deprecated)]
                                 panel.set_collection_behaviour(
-                                    NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
-                                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces,
+                                    NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+                                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary
+                                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle,
                                 );
-                                panel.show();
+                                // order_front_regardless surfaces the panel WITHOUT
+                                // activating the app or switching the Space.
                                 panel.order_front_regardless();
+                            } else {
+                                // Fallback if panel conversion fails: at least show.
+                                let _ = w.show();
                             }
+                            // Kill the native window shadow/border that to_panel()
+                            // re-adds — the banner is a transparent rounded card, so
+                            // a grey window-rect shadow around it looks broken. Set
+                            // it DIRECTLY on the banner's NSWindow (clear_window_chrome
+                            // ran at boot but to_panel() re-added the shadow).
+                            #[allow(unexpected_cfgs)]
+                            if let Ok(ptr) = w.ns_window() {
+                                use objc2::msg_send;
+                                use objc2::runtime::AnyObject;
+                                let ns = ptr as *mut AnyObject;
+                                if !ns.is_null() {
+                                    unsafe {
+                                        let _: () = msg_send![ns, setHasShadow: false];
+                                        let _: () = msg_send![ns, invalidateShadow];
+                                    }
+                                }
+                            }
+                            crate::macos::clear_window_chrome(&app_handle);
+                            // LOCAL-TEST ONLY: same to_panel() re-hide fix as the
+                            // meeting window — re-assert capture visibility for the
+                            // banner so it shows in screenshare when the escape
+                            // hatch is on. (The banner is user-facing; its
+                            // contentProtected=true default hides it from capture.)
+                            let capture_visible = std::env::var(
+                                "BLUEY_MEETING_CAPTURE_VISIBLE",
+                            )
+                            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                            .unwrap_or(false);
+                            if capture_visible {
+                                let _ = w.set_content_protected(false);
+                                crate::macos::set_sharing_read_only(&app_handle);
+                            }
+                            eprintln!(
+                                "[banner] final is_visible={:?}",
+                                w.is_visible()
+                            );
                         }
                     });
                 } else if line.contains("\"show\"") || line.contains("\"toggle\"") || line.contains("\"boot\"") {

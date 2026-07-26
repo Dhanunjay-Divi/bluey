@@ -164,6 +164,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(ipc::DaemonLink::default())
         .manage(ipc::EventSender(tokio::sync::Mutex::new(None)))
+        .manage(ipc::PendingBanner(std::sync::Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![
             commands::agent_list,
             commands::agent_attach,
@@ -181,6 +182,7 @@ pub fn run() {
             commands::pick_context_files,
             commands::capture_screenshot,
             commands::hide_banner,
+            ipc::get_pending_banner,
             ipc::overlay_send,
         ])
         .setup(|app| {

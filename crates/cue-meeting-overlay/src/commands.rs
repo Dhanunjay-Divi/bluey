@@ -425,6 +425,14 @@ fn bluey_shot_app_bundle() -> Option<std::path::PathBuf> {
 /// (shown again on the next meeting), so we order-out rather than close it.
 #[tauri::command]
 pub fn hide_banner(app: AppHandle) {
+    // Clear the stored pending banner so a later banner-webview mount / retry
+    // doesn't re-pull and re-show a dismissed banner.
+    {
+        use tauri::Manager;
+        if let Some(pending) = app.try_state::<crate::ipc::PendingBanner>() {
+            *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
     #[cfg(target_os = "macos")]
     {
         use tauri_nspanel::ManagerExt;

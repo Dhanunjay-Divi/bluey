@@ -17,6 +17,15 @@ const isBanner =
   typeof window !== "undefined" &&
   new URLSearchParams(window.location.search).has("banner");
 
+// The banner window renders <BannerWindow/> directly, bypassing <App/> which is
+// what normally stamps `data-floorplan` on :root. Without it, the warm-paper
+// token layer (--ink / --paper / --fp-live …) never resolves in the banner
+// window, so the CTA button rendered as a black box with invisible text. Stamp
+// it here for the banner path.
+if (isBanner && typeof document !== "undefined") {
+  document.documentElement.setAttribute("data-floorplan", "");
+}
+
 // Render first, so the window is never blank even if the env probes below race.
 // MeetingProvider sits ABOVE <App/> so the meeting's session state (transcript,
 // history, Q&A, detected question) is never unmounted by collapse/onboarding/tab

@@ -46,26 +46,42 @@ export function MeetingBannerCard({
   if (banner.online) meta.push("online");
 
   return (
-    <div className="fp-mbanner" data-floorplan="" role="alertdialog" aria-label="Meeting starting">
-      {/* Solid accent bar (calendar event) — Granola's cue for a scheduled item. */}
-      <span className="fp-mbanner-bar" aria-hidden />
-      <div className="fp-mbanner-body">
-        <div className="fp-mbanner-title">{banner.title}</div>
-        <div className="fp-mbanner-time">{range}</div>
-        <div className="fp-mbanner-meta">{meta.join(" · ")}</div>
+    <div
+      className="fp-mbanner"
+      data-floorplan=""
+      role="alertdialog"
+      aria-label="Upcoming meeting"
+    >
+      <div className="fp-mbanner-head">
+        <span className="fp-mbanner-eyebrow">
+          <SparkleIcon size={12} />
+          Upcoming meeting
+        </span>
+        <button
+          className="fp-mbanner-dismiss"
+          onClick={onDismiss}
+          title="Dismiss"
+          aria-label="Dismiss"
+        >
+          <CloseIcon size={13} />
+        </button>
       </div>
-      <button className="fp-mbanner-cta" onClick={onWarmUp}>
-        <SparkleIcon size={14} />
-        Warm up the meeting
-      </button>
-      <button
-        className="fp-mbanner-dismiss"
-        onClick={onDismiss}
-        title="Dismiss"
-        aria-label="Dismiss"
-      >
-        <CloseIcon size={13} />
-      </button>
+      <div className="fp-mbanner-title">{banner.title}</div>
+      <div className="fp-mbanner-meta">
+        <span className="fp-mbanner-time">{range}</span>
+        <span className="fp-mbanner-dot" aria-hidden>
+          ·
+        </span>
+        <span>{meta.join(" · ")}</span>
+      </div>
+      <div className="fp-mbanner-actions">
+        <button className="fp-mbanner-later" onClick={onDismiss}>
+          Not now
+        </button>
+        <button className="fp-mbanner-cta" onClick={onWarmUp}>
+          Open meeting
+        </button>
+      </div>
     </div>
   );
 }

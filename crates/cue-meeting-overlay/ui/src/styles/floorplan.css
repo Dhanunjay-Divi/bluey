@@ -2073,70 +2073,84 @@
  * =================================================================== */
 /* The banner FILLS its own small Tauri window (440×120), inset a little so the
  * card's shadow + rounded corners show against the transparent window. */
+/* Meeting-prep banner — a calm, minimal card aligned with the Open Floor theme
+   (warm paper, hairline border, serif title, one restrained accent). Not the old
+   Granola-style horizontal bar. Vertical rhythm: eyebrow → title → meta → actions. */
 .fp-mbanner {
   position: fixed;
-  inset: 8px;
-  display: flex;
-  align-items: stretch;
-  gap: 12px;
-  padding: 14px 14px 14px 0;
-  border-radius: 18px;
-  background: var(--glass-solid, var(--paper-2));
-  border: 1px solid var(--line);
-  box-shadow: var(--fp-shadow-anchor, 0 12px 32px rgba(28, 26, 25, 0.25));
-  font-family: var(--font);
-  animation: fp-mbanner-in 0.32s cubic-bezier(0.2, 0.9, 0.2, 1) both;
-}
-/* The solid accent bar = a scheduled calendar meeting (Granola's cue). */
-.fp-mbanner-bar {
-  flex: none;
-  width: 4px;
-  border-radius: 0 4px 4px 0;
-  background: var(--ok, #4e8d5b);
-}
-.fp-mbanner-body {
-  flex: 1 1 auto;
-  min-width: 0;
+  inset: 6px;
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  justify-content: center;
+  gap: 8px;
+  padding: 16px 16px 14px;
+  border-radius: 16px;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  box-shadow: var(--fp-shadow-float, 0 8px 24px rgba(45, 35, 22, 0.06));
+  font-family: var(--font);
+  animation: fp-mbanner-in 0.3s cubic-bezier(0.2, 0.9, 0.2, 1) both;
+}
+.fp-mbanner-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.fp-mbanner-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--fp-live);
 }
 .fp-mbanner-title {
   font-family: var(--serif, Georgia, serif);
-  font-size: 16px;
+  font-size: 18px;
   font-weight: 600;
+  letter-spacing: -0.01em;
   color: var(--ink);
-  line-height: 1.25;
+  line-height: 1.2;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.fp-mbanner-time {
-  font-size: 13px;
-  font-weight: 560;
-  color: var(--ink-2);
-}
 .fp-mbanner-meta {
-  font-size: 11.5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
   color: var(--ink-3);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.fp-mbanner-time {
+  color: var(--ink-2);
+  font-weight: 560;
+}
+.fp-mbanner-dot {
+  color: var(--ink-3);
+}
+.fp-mbanner-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
 .fp-mbanner-cta {
-  flex: none;
-  align-self: center;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  padding: 9px 14px;
+  padding: 8px 15px;
   border: none;
-  border-radius: 12px;
+  border-radius: 10px;
   background: var(--ink);
   color: var(--paper);
   font-size: 12.5px;
-  font-weight: 560;
+  font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
   transition:
@@ -2149,15 +2163,29 @@
 .fp-mbanner-cta:active {
   transform: translateY(0.5px);
 }
+.fp-mbanner-later {
+  padding: 8px 12px;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-weight: 560;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.12s ease, background 0.12s ease;
+}
+.fp-mbanner-later:hover {
+  background: var(--paper-sink);
+  color: var(--ink-2);
+}
 .fp-mbanner-dismiss {
   flex: none;
-  align-self: flex-start;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   width: 22px;
   height: 22px;
-  margin-top: -4px;
   border: none;
   border-radius: 50%;
   background: transparent;

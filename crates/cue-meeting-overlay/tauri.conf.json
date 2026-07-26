@@ -28,8 +28,8 @@
         "label": "banner",
         "title": "Bluey Meeting Banner",
         "url": "index.html?banner",
-        "width": 440,
-        "height": 120,
+        "width": 360,
+        "height": 168,
         "x": 980,
         "y": 40,
         "resizable": false,
@@ -38,7 +38,7 @@
         "alwaysOnTop": true,
         "skipTaskbar": true,
         "shadow": false,
-        "contentProtected": true,
+        "contentProtected": false,
         "visible": false,
         "focus": false
       }

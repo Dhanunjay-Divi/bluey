@@ -8885,7 +8885,15 @@ async fn offer_meeting_prep(daemon: &Arc<Daemon>, event: &cue_core::calendar::Up
 /// pre-context (agenda + roster) for that meeting. Extracted from the old
 /// auto-fire loop; now gated behind explicit approval.
 async fn warm_meeting_from_prep(daemon: &Arc<Daemon>, event: &cue_core::calendar::UpcomingEvent) {
-    info!(title = %event.title, "calendar: prep APPROVED — warming meeting backend");
+    info!(title = %event.title, "calendar: prep APPROVED — opening meeting overlay");
+    // The user tapped "Open meeting" — OPEN THE OVERLAY FIRST, unconditionally.
+    // Warmup can refuse (no agent attached) or fail, but the banner's whole
+    // promise is to open the meeting surface, so surfacing it must not depend on
+    // warmup succeeding (previously Show only ran on Ready, so a refused warmup
+    // left the button doing nothing visible).
+    let _ = ensure_overlay_spawned(daemon).await;
+    let _ = send_overlay(daemon, OverlayCommand::Show).await;
+
     match warmup_open(daemon, Some(event.title.clone())).await {
         Ok(WarmupOutcome::Ready(_)) => {
             info!(title = %event.title, "warm meeting backend ready");
@@ -8894,7 +8902,6 @@ async fn warm_meeting_from_prep(daemon: &Arc<Daemon>, event: &cue_core::calendar
             // Push the rich pre-context (agenda / location / join URL) as a card
             // so the user sees what Bluey primed the agent with.
             push_meeting_precontext(daemon, event).await;
-            let _ = ensure_overlay_spawned(daemon).await;
         }
         Ok(WarmupOutcome::Refused(reason)) => {
             debug!(title = %event.title, "warmup refused: {reason}");
