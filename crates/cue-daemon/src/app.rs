@@ -9478,6 +9478,13 @@ async fn add_audio_transcript_segment_inner(
         (meeting.clone(), transcript_segment)
     };
 
+    info!(
+        speaker = ?committed_segment.speaker,
+        is_final = committed_segment.is_final,
+        text = %committed_segment.text,
+        "[LATENCY DIAGNOSTIC] Transcript segment committed to meeting record"
+    );
+
     update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
     maybe_fire_ledger(daemon, &meeting_snapshot);
     maybe_fire_summary(daemon, &meeting_snapshot);

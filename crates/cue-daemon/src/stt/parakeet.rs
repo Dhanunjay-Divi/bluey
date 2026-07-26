@@ -215,12 +215,15 @@ fn run_worker(
         let push_started = std::time::Instant::now();
         let backlog = audio_rx.len();
         let push_result = engine.push(&chunk);
+        let push_ms = push_started.elapsed().as_millis();
         let rtf = push_started.elapsed().as_secs_f64() / audio_secs.max(1e-9);
-        debug!(
+        tracing::info!(
+            source = ?source,
             rtf = format!("{rtf:.2}"),
+            push_ms,
             audio_ms = audio_ms as u64,
             backlog,
-            "STTPERF push"
+            "[LATENCY DIAGNOSTIC] STT engine push completed"
         );
         
         let chunk_text = match push_result {
