@@ -710,26 +710,41 @@ fn is_near_duplicate_transcript(
     }
 
     let now_ms = clock::now_epoch_ms_string().parse::<u64>().unwrap_or(0);
-    // Cross-channel echo guard: when the mic and system-audio channels both
-    // capture the same sound (speakers bleeding into the mic, no AEC), the SAME
-    // words arrive twice with DIFFERENT sources/speakers (mic="You",
-    // system="Speaker N"), tearing the transcript into alternating fragments.
-    // So a duplicate is a recent, same-text segment REGARDLESS of speaker —
-    // BUT a cross-speaker match must be distinctive enough not to drop two
-    // different people legitimately saying a short shared phrase ("yes",
-    // "okay"), so cross-speaker requires a longer normalized match.
-    const CROSS_SPEAKER_MIN_LEN: usize = 12;
-    meeting.transcript.iter().rev().take(8).any(|segment| {
-        if !segment.is_final || transcript_age_ms(&segment.created_at, now_ms) > 8_000 {
+    let norm_new = normalize_transcript_text(text);
+    if norm_new.is_empty() {
+        return false;
+    }
+
+    meeting.transcript.iter().rev().take(12).any(|segment| {
+        if transcript_age_ms(&segment.created_at, now_ms) > 8_000 {
             return false;
         }
-        let prior = normalize_transcript_text(&segment.text);
-        if prior != normalized {
+        let norm_prior = normalize_transcript_text(&segment.text);
+        if norm_prior.is_empty() {
             return false;
         }
-        // Same speaker: any exact repeat is a dup. Different speaker (the echo
-        // case): only when the shared text is long enough to be distinctive.
-        segment.speaker == speaker || normalized.len() >= CROSS_SPEAKER_MIN_LEN
+
+        // Exact match
+        if norm_prior == norm_new {
+            return true;
+        }
+
+        // Cross-channel (mic vs system) echo detection: drop substring or heavy token overlaps
+        if segment.speaker != speaker {
+            if norm_prior.contains(&norm_new) || norm_new.contains(&norm_prior) {
+                return true;
+            }
+            let new_words: Vec<&str> = norm_new.split_whitespace().collect();
+            if new_words.len() >= 2 {
+                let prior_words: Vec<&str> = norm_prior.split_whitespace().collect();
+                let match_count = new_words.iter().filter(|w| prior_words.contains(w)).count();
+                if match_count * 2 >= new_words.len() {
+                    return true;
+                }
+            }
+        }
+
+        false
     })
 }
 
