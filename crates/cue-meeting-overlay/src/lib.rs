@@ -27,7 +27,7 @@ mod ipc;
 // behaviour is verified (screen-share invisibility). Scope the allow to this
 // module so the deprecation stays surfaced everywhere else.
 #[allow(deprecated)]
-mod macos {
+pub(crate) mod macos {
     use tauri::Manager;
 
     pub fn setup_panel(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +47,28 @@ mod macos {
                 if !ns.is_null() {
                     unsafe {
                         let _: () = msg_send![ns, setSharingType: 0u64 as NSUInteger];
+                    }
+                }
+            }
+        }
+    }
+
+    /// Force NSWindow.sharingType = .readOnly (1) — VISIBLE to screen capture —
+    /// on every window. LOCAL-TEST ONLY: called on the show path when
+    /// BLUEY_MEETING_CAPTURE_VISIBLE=1, because `to_panel()` re-creates the window
+    /// as an NSPanel whose default sharing excludes it from capture; the one-time
+    /// startup skip of `set_sharing_none` is not enough — the panel conversion
+    /// silently re-hides it, so we must positively re-assert visibility after it.
+    pub fn set_sharing_read_only(app: &tauri::AppHandle) {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use objc2_foundation::NSUInteger;
+        for (_label, window) in app.webview_windows() {
+            if let Ok(ptr) = window.ns_window() {
+                let ns = ptr as *mut AnyObject;
+                if !ns.is_null() {
+                    unsafe {
+                        let _: () = msg_send![ns, setSharingType: 1u64 as NSUInteger];
                     }
                 }
             }
@@ -204,8 +226,10 @@ pub fn run() {
                     "[meeting-overlay] BLUEY_MEETING_CAPTURE_VISIBLE=1 — overlay is \
                      VISIBLE to screen capture (LOCAL TEST ONLY, never ship)"
                 );
-                #[cfg(debug_assertions)]
-                win.open_devtools();
+                // NOTE: do NOT auto-open devtools here. Docked devtools consumed the
+                // window's top region, so the drag/resize top edge disappeared and
+                // the overlay couldn't be moved/expanded from the top in this mode.
+                // Devtools is still available on demand (right-click → Inspect).
             }
 
             // Connect to the daemon's Unix socket (when launched by the daemon)

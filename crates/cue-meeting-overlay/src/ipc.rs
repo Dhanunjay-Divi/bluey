@@ -266,6 +266,22 @@ async fn run_connection(
                                 panel.show();
                                 panel.order_front_regardless();
                             }
+                            // LOCAL-TEST ONLY: to_panel() re-hides the window from
+                            // screen capture (NSPanel default), overriding the
+                            // startup skip of set_sharing_none. When the escape
+                            // hatch is on, positively re-assert capture visibility
+                            // AFTER the panel conversion so the overlay actually
+                            // shows in Zoom/Teams/Meet. Never runs in production
+                            // (the env var must never be set there).
+                            let capture_visible = std::env::var(
+                                "BLUEY_MEETING_CAPTURE_VISIBLE",
+                            )
+                            .map(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+                            .unwrap_or(false);
+                            if capture_visible {
+                                let _ = w.set_content_protected(false);
+                                crate::macos::set_sharing_read_only(&app_handle);
+                            }
                         }
                     });
                 } else if line.contains("\"hide\"") {
