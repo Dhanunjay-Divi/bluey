@@ -17,19 +17,26 @@ TEMP_FILES=()
 PROBE_MARKERS=()
 
 cleanup_verifier() {
-  for marker in "${PROBE_MARKERS[@]}"; do
-    while IFS= read -r probe_pid; do
-      case "$probe_pid" in
-        ''|*[!0-9]*) continue ;;
-      esac
-      if [ "$probe_pid" -ne "$$" ]; then
-        kill "$probe_pid" 2>/dev/null || true
-      fi
-    done < <(/usr/bin/pgrep -f "$marker" 2>/dev/null || true)
-  done
-  for temp_file in "${TEMP_FILES[@]}"; do
-    rm -f "$temp_file"
-  done
+  # macOS ships Bash 3.2. With `set -u`, expanding an empty declared array as
+  # `"${array[@]}"` raises "unbound variable". The verifier commonly exits
+  # before creating launch-probe files, so guard both cleanup loops by length.
+  if [ "${#PROBE_MARKERS[@]}" -gt 0 ]; then
+    for marker in "${PROBE_MARKERS[@]}"; do
+      while IFS= read -r probe_pid; do
+        case "$probe_pid" in
+          ''|*[!0-9]*) continue ;;
+        esac
+        if [ "$probe_pid" -ne "$$" ]; then
+          kill "$probe_pid" 2>/dev/null || true
+        fi
+      done < <(/usr/bin/pgrep -f "$marker" 2>/dev/null || true)
+    done
+  fi
+  if [ "${#TEMP_FILES[@]}" -gt 0 ]; then
+    for temp_file in "${TEMP_FILES[@]}"; do
+      rm -f "$temp_file"
+    done
+  fi
 }
 trap cleanup_verifier EXIT
 

@@ -53,6 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/work/FUTURE-UPGRADES.md`.
 
 ### Fixed
+- **Clean macOS helper verification no longer fails during trap cleanup.**
+  `verify-app.sh` now guards empty cleanup arrays before expanding them, which
+  keeps the default no-launch verification path compatible with macOS Bash 3.2
+  under `set -u`.
 - **Overlay command, permission, and credential recovery hardening.** The native
   overlay now dispatches window actions only from an exact top-level command
   type, so transcript or card text cannot hide/show a window. Permission-denied
