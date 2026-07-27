@@ -1793,10 +1793,14 @@
   border-radius: 999px;
   background: var(--glass, var(--paper-2));
   color: var(--ink);
-  border: 1px solid var(--line);
+  /* Smooth ROUND shadow, NO border. The shape reads from the rounded fill + a
+     soft CSS shadow that hugs the border-radius. The rectangular box halo seen
+     before was the NATIVE window shadow (follows the square window frame); that
+     is killed on the show/collapse path in Rust, so only this round CSS shadow
+     shows. */
   box-shadow:
-    0 6px 20px rgba(28, 26, 25, 0.14),
-    0 1px 0 rgba(255, 255, 255, 0.04) inset;
+    0 8px 28px rgba(28, 26, 25, 0.18),
+    0 2px 8px rgba(28, 26, 25, 0.12);
   -webkit-app-region: drag;
   transition:
     box-shadow 0.22s ease,
@@ -2134,8 +2138,13 @@
   padding: 16px 16px 14px;
   border-radius: 16px;
   background: var(--paper);
-  border: 1px solid var(--line);
-  box-shadow: var(--fp-shadow-float, 0 8px 24px rgba(45, 35, 22, 0.06));
+  /* Smooth ROUND shadow, no border. The native (rectangular) window shadow is
+     killed on the banner show path in Rust, so this soft CSS shadow — which hugs
+     the border-radius — is the only one, a clean floating card, no boxed halo. */
+  box-shadow:
+    0 8px 28px rgba(28, 26, 25, 0.18),
+    0 2px 8px rgba(28, 26, 25, 0.12);
+  overflow: hidden;
   font-family: var(--font);
   animation: fp-mbanner-in 0.3s cubic-bezier(0.2, 0.9, 0.2, 1) both;
 }
@@ -2264,4 +2273,8 @@
   .fp-mbanner {
     animation: none;
   }
+}
+
+/* variant-c uses the current default */
+  position: absolute !important;
 }

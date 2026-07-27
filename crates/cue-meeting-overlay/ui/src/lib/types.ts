@@ -261,6 +261,9 @@ export interface AnswerChunk {
   /** true when the terminal body is an ERROR (provider/agent failure, policy
    *  block), not an answer — the UI renders a retryable error state. */
   error?: boolean;
+  /** true on the terminal chunk when the answer proposes a concrete
+   *  change/action — gates the "Fix this" affordance. */
+  fixable?: boolean;
 }
 
 /** Answer speed/depth, mapped 1:1 to the daemon's optional `mode` field on

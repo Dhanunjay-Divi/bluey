@@ -790,8 +790,13 @@ fn image_block_from_path(path: &std::path::Path) -> Option<ContentBlock> {
     let mime = image_mime_for_path(path)?;
     let bytes = std::fs::read(path).ok()?;
     let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-    let mut img = agent_client_protocol::schema::ImageContent::new(data, mime);
-    img.uri = Some(format!("file://{}", path.display()));
+    let mut img = agent_client_protocol::schema::ImageContent::new(data.clone(), mime);
+    // The `uri` must be a UNIVERSALLY VALID image URL. A `file://` path is NOT:
+    // agents that forward the uri to a cloud vision API (Codex → OpenAI) send it
+    // as `image_url`, and OpenAI/Anthropic reject `file://` with
+    // "Invalid image_url ... invalid format" (400). A `data:` URI embeds the
+    // bytes and is accepted everywhere, so use that instead of the local path.
+    img.uri = Some(format!("data:{mime};base64,{data}"));
     Some(ContentBlock::Image(img))
 }
 
@@ -826,7 +831,8 @@ mod tests {
     #[test]
     fn image_block_carries_base64_data_uri_and_mime() {
         // Write a tiny PNG-ish file and confirm the block base64s it, sets the
-        // mime from the extension, and records a file:// uri.
+        // mime from the extension, and records a `data:` uri (NOT `file://`,
+        // which a cloud vision agent rejects — the Codex `image_url` 400).
         let dir = std::env::temp_dir().join(format!("bluey-imgblk-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("shot.png");
@@ -836,16 +842,18 @@ mod tests {
         match block {
             ContentBlock::Image(img) => {
                 assert_eq!(img.mime_type, "image/png");
-                assert_eq!(
-                    img.uri.as_deref(),
-                    Some(format!("file://{}", path.display()).as_str())
-                );
                 // data is base64 of the bytes (non-empty, decodes back).
                 use base64::Engine;
                 let decoded = base64::engine::general_purpose::STANDARD
                     .decode(img.data.as_bytes())
                     .expect("valid base64");
                 assert_eq!(decoded, b"\x89PNG\r\n\x1a\nhello-bytes");
+                // The uri is a data: URI that any cloud/local agent accepts —
+                // never a file:// path (which OpenAI/Anthropic reject).
+                let uri = img.uri.as_deref().expect("uri");
+                assert!(uri.starts_with("data:image/png;base64,"), "uri: {uri}");
+                assert!(!uri.starts_with("file://"));
+                assert!(uri.ends_with(&img.data));
             }
             other => panic!("expected Image block, got {other:?}"),
         }

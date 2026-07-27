@@ -177,6 +177,7 @@ export function OpenFloorScreen({
       if (c.done) {
         draft.done = true;
         if (c.error) draft.error = true;
+        if (c.fixable) draft.fixable = true;
         setPhase("idle");
       }
       patch();
@@ -433,6 +434,7 @@ export function OpenFloorScreen({
         onAttach={() => client.openAttachPicker()}
         onCapturePage={() => client.capturePage()}
         onAsk={(q) => runAsk(q)}
+        onAskDirect={askDetected}
       />
 
       {/* ---- detected-question dock ---- */}
@@ -666,8 +668,10 @@ function QaBlock({
                 <CopyIcon size={14} />
                 Copy
               </button>
-              {/* "Fix this" only on a successful answer. */}
-              {!a.error && (
+              {/* "Fix this" only on a successful answer that actually proposes a
+                  concrete change/action (the daemon-resolved `fixable` flag), not
+                  on purely informational answers. */}
+              {!a.error && a.fixable && (
                 <button className="fp-qa-action" onClick={() => onFix(a.text)}>
                   <SparkleIcon size={14} />
                   Fix this

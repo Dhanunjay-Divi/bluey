@@ -88,6 +88,12 @@
   --paper: #f7f5f0;
   --paper-2: #fdfcfb;
   --paper-sink: #ebe7df;
+  /* Edge color for floating windows (pill/banner) that must read as a distinct
+     card on ANY background WITHOUT a drop-shadow. Darker than --line so it holds
+     an edge over light desktops and screenshares; paired with a 1px inset light
+     ring in the component. */
+  --card-edge: rgba(20, 22, 28, 0.18);
+  --card-ring: rgba(255, 255, 255, 0.35);
   --fp-live: #e0443e; /* the recording / LIVE red — the only chromatic color */
   --fp-avatar: #ebe7df;
   --fp-shadow-float: 0 8px 24px rgba(45, 35, 22, 0.06);
@@ -117,6 +123,9 @@
     --paper: #1a1714;
     --paper-2: #252119;
     --paper-sink: #14110e;
+    /* Dark mode: a lighter edge so the card separates from a dark background. */
+    --card-edge: rgba(255, 250, 240, 0.16);
+    --card-ring: rgba(255, 255, 255, 0.06);
     --fp-live: #e5675e;
     --fp-avatar: #322c24;
     --fp-shadow-float: 0 8px 24px rgba(0, 0, 0, 0.5);
@@ -141,6 +150,8 @@
   --paper: #f7f5f0;
   --paper-2: #fdfcfb;
   --paper-sink: #ebe7df;
+  --card-edge: rgba(20, 22, 28, 0.18);
+  --card-ring: rgba(255, 255, 255, 0.35);
   --fp-live: #e0443e;
   --fp-avatar: #ebe7df;
 }
@@ -160,6 +171,8 @@
   --paper: #1a1714;
   --paper-2: #252119;
   --paper-sink: #14110e;
+  --card-edge: rgba(255, 250, 240, 0.16);
+  --card-ring: rgba(255, 255, 255, 0.06);
   --fp-live: #e5675e;
   --fp-avatar: #322c24;
 }

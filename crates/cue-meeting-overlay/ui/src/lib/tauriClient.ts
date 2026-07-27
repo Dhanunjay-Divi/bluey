@@ -215,6 +215,9 @@ type OverlayCommand =
       done?: boolean;
       cost_label?: string | null;
       is_error?: boolean;
+      /** True when the answer proposes a concrete change/action — the UI shows
+       *  the "Fix this" affordance only then. Absent on old daemons → false. */
+      fixable?: boolean;
     }
   | {
       type: "set_answer_status";
@@ -1164,10 +1167,12 @@ export function createTauriClient(): MeetingClient {
           if (u.done) {
             // An error card carries the failure as its body; flag it so the UI
             // renders a distinct retryable error state instead of styling the
-            // failure message as if it were the answer.
+            // failure message as if it were the answer. `fixable` gates the
+            // "Fix this" affordance — only a completed, non-error, actionable
+            // answer carries it (the daemon derives it from the agent's tag).
             const doneChunk: AnswerChunk = u.is_error
               ? { done: true, error: true }
-              : { done: true };
+              : { done: true, fixable: u.fixable ?? false };
             onChunk(doneChunk);
             finish();
           }

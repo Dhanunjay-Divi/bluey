@@ -37,6 +37,7 @@ export function FloatingStack({
   onAttach,
   onCapturePage,
   onAsk,
+  onAskDirect,
 }: {
   listenState: ListeningState;
   systemInputOn: boolean;
@@ -51,6 +52,10 @@ export function FloatingStack({
   onAttach: () => void;
   onCapturePage: () => void;
   onAsk: (question: string) => void;
+  /** Tap-to-Ask: fire an Ask directly (the agent decides whether to answer a
+   *  detected question or summarize what was just discussed). Long-press opens
+   *  the type-a-question bar instead. */
+  onAskDirect: () => void;
 }) {
   const [asking, setAsking] = useState(false);
   const [text, setText] = useState("");
@@ -71,12 +76,44 @@ export function FloatingStack({
     setAsking(false);
   };
 
-  // A single click always opens/closes the input. The old single-vs-double-click
-  // timer made this shortcut feel unresponsive and a single click could appear
-  // to do nothing when there was no recent detected question.
-  const onAskClick = () => {
+  // Tap = Ask instantly (the agent decides whether to answer a detected question
+  // or summarize what was just discussed). Long-press = open the type-a-question
+  // search bar. A press-and-hold timer distinguishes them WITHOUT delaying the
+  // tap: the Ask fires on release only if the hold never crossed the long-press
+  // threshold, so the common tap has zero lag.
+  const LONG_PRESS_MS = 350;
+  const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const openedByHold = useRef(false);
+
+  const onAskPointerDown = () => {
     if (askStreaming) return;
-    setAsking((open) => !open);
+    openedByHold.current = false;
+    holdTimer.current = setTimeout(() => {
+      openedByHold.current = true;
+      setAsking(true); // long-press → open the search bar
+    }, LONG_PRESS_MS);
+  };
+
+  const onAskPointerUp = () => {
+    if (askStreaming) return;
+    if (holdTimer.current) {
+      clearTimeout(holdTimer.current);
+      holdTimer.current = null;
+    }
+    // If the search bar is already open, a tap just closes it. Otherwise a tap
+    // (no long-press) fires the direct Ask; a long-press already opened the bar.
+    if (asking) {
+      setAsking(false);
+    } else if (!openedByHold.current) {
+      onAskDirect();
+    }
+  };
+
+  const onAskPointerLeave = () => {
+    if (holdTimer.current) {
+      clearTimeout(holdTimer.current);
+      holdTimer.current = null;
+    }
   };
 
   const sys = systemAudioMeta(
@@ -153,11 +190,17 @@ export function FloatingStack({
           )}
 
           <StackButton
-            label={agentName ? `Ask ${agentName}` : "Ask Bluey"}
+            label={
+              agentName
+                ? `Ask ${agentName} — tap to ask, hold to type`
+                : "Ask Bluey — tap to ask, hold to type"
+            }
             anchor
             active={asking}
             disabled={askStreaming}
-            onClick={onAskClick}
+            onPointerDown={onAskPointerDown}
+            onPointerUp={onAskPointerUp}
+            onPointerLeave={onAskPointerLeave}
           >
             <SparkleIcon size={17} />
           </StackButton>
@@ -208,6 +251,9 @@ function StackButton({
   tone,
   disabled,
   onClick,
+  onPointerDown,
+  onPointerUp,
+  onPointerLeave,
 }: {
   children: React.ReactNode;
   label: string;
@@ -215,7 +261,12 @@ function StackButton({
   anchor?: boolean;
   tone?: "accent" | "live";
   disabled?: boolean;
-  onClick: () => void;
+  /** Simple click action. Mutually exclusive with the pointer handlers below
+   *  (the Ask button uses tap/long-press via pointer events instead). */
+  onClick?: () => void;
+  onPointerDown?: () => void;
+  onPointerUp?: () => void;
+  onPointerLeave?: () => void;
 }) {
   // A transient tap-pop on every click (the subtle "dopamine" feedback). The
   // class is toggled off after the animation so the NEXT click re-triggers it.
@@ -243,18 +294,36 @@ function StackButton({
       aria-label={label}
       aria-pressed={active}
       disabled={disabled}
-      onClick={() => {
-        setTapped(false);
-        // next frame → re-add so the animation restarts on every click
-        requestAnimationFrame(() => setTapped(true));
-        if (tapTimer.current) window.clearTimeout(tapTimer.current);
-        tapTimer.current = window.setTimeout(() => setTapped(false), 320);
-        onClick();
-      }}
+      onClick={
+        onClick
+          ? () => {
+              popAnimation();
+              onClick();
+            }
+          : undefined
+      }
+      onPointerDown={
+        onPointerDown
+          ? () => {
+              popAnimation();
+              onPointerDown();
+            }
+          : undefined
+      }
+      onPointerUp={onPointerUp}
+      onPointerLeave={onPointerLeave}
     >
       {children}
     </button>
   );
+
+  function popAnimation() {
+    setTapped(false);
+    // next frame → re-add so the animation restarts on every interaction
+    requestAnimationFrame(() => setTapped(true));
+    if (tapTimer.current) window.clearTimeout(tapTimer.current);
+    tapTimer.current = window.setTimeout(() => setTapped(false), 320);
+  }
 }
 
 // A capture/frame glyph for the screenshot control (corner brackets).

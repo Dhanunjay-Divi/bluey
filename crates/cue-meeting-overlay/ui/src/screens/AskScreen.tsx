@@ -384,12 +384,13 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
                     navigator.clipboard?.writeText(turn.answer.text)
                   }
                   onFix={
-                    // "Fix this" only on a completed, non-error answer — a fix
-                    // proposes against the diagnosis text. Fires requestFix; the
-                    // daemon drives the agent in propose-only mode and PUSHES a
-                    // proposal that MeetingProvider stores as `fixProposal`. In
-                    // beta the resulting card previews only (Apply disabled).
-                    turn.answer.done && !turn.answer.error
+                    // "Fix this" only on a completed, non-error answer that
+                    // actually proposes a concrete change/action (`fixable`, the
+                    // daemon-resolved flag) — not on informational answers. Fires
+                    // requestFix; the daemon drives the agent in propose-only mode
+                    // and PUSHES a proposal MeetingProvider stores as
+                    // `fixProposal`. In beta the resulting card previews only.
+                    turn.answer.done && !turn.answer.error && turn.answer.fixable
                       ? () => client.requestFix(turn.answer.text)
                       : undefined
                   }

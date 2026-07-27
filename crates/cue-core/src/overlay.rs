@@ -361,6 +361,13 @@ pub enum OverlayCommand {
         /// `#[serde(default)]` keeps old clients back-compatible.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// True when the answer proposes a concrete change/action the agent could
+        /// take next (a code fix, an edit, a follow-up) — the overlay shows the
+        /// "Fix this" affordance ONLY then, not on purely informational answers.
+        /// Derived from the agent's trailing `[[fix]]`/`[[info]]` tag with a
+        /// daemon-side heuristic fallback. `#[serde(default)]` = back-compatible.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fixable: bool,
     },
     /// The live status feed for an in-flight answer: the agent's real reasoning
     /// and tool/connector calls, keyed to the answer card `id`. Emitted as the

@@ -17,6 +17,8 @@ export interface AnswerState {
   /** True when `text` is an ERROR (provider/agent failure, policy block), not
    *  an answer — renders a distinct retryable error state. */
   error?: boolean;
+  /** True when the answer proposes a concrete change/action — gates "Fix this". */
+  fixable?: boolean;
 }
 
 export function AnswerCard({
