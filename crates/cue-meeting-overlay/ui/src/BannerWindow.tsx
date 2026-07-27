@@ -57,37 +57,47 @@ export function BannerWindow() {
   const [banner, setBanner] = useState<MeetingBanner | null>(null);
 
   useEffect(() => {
-    // Keep the event path too (works once wired), but the RELIABLE path is the
-    // pull below — event delivery to this NSPanel webview proved unreliable.
-    const off = client.onMeetingBanner(setBanner);
-
-    // PULL the pending banner on mount and re-poll briefly, since the webview may
-    // mount slightly before the daemon stores the banner. Stops once we have it.
+    // PUSH, not poll. The native side (ipc.rs) emits `overlay://banner` to THIS
+    // window in the same callback that orders the panel front — i.e. the moment
+    // the banner becomes visible, so emit-to-a-hidden-webview (the old
+    // unreliability) can't happen. We fill the slot only when it's empty; once a
+    // card is on screen the warm/dismiss handlers (advanceBannerWindow) own the
+    // transition, so a duplicate push must not overwrite or resurrect it.
     let stop = false;
-    let tries = 0;
-    const pull = async () => {
-      if (stop) return;
+    let unlisten: (() => void) | undefined;
+
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const handle = await listen<string>("overlay://banner", (event) => {
+          if (stop) return;
+          const pending = parseBanner(event.payload);
+          setBanner((current) => current ?? pending); // fill empty slot only
+        });
+        if (stop) handle();
+        else unlisten = handle;
+      } catch {
+        // not in Tauri (dev/preview) — no native push.
+      }
+
+      // ONE fetch on mount covers the fresh-spawn race: if the daemon stored the
+      // banner before this webview mounted (so its push fired into nothing), we
+      // pick it up here. No repeated polling — the push handles everything after.
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         const raw = await invoke<string | null>("get_pending_banner");
-        if (raw) {
+        if (!stop && raw) {
           const pending = parseBanner(raw);
-          if (pending) {
-            setBanner(pending);
-            return; // got it — stop polling
-          }
+          if (pending) setBanner((current) => current ?? pending);
         }
       } catch {
-        // not in Tauri / command missing — ignore
+        // not in Tauri / command missing — ignore.
       }
-      tries += 1;
-      if (tries < 20 && !stop) setTimeout(pull, 300);
-    };
-    void pull();
+    })();
 
     return () => {
       stop = true;
-      off();
+      unlisten?.();
     };
   }, [client]);
 

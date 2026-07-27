@@ -407,6 +407,9 @@ async fn run_connection(
                 #[cfg(target_os = "macos")]
                 if is_meeting_banner {
                     let app_handle = app.clone();
+                    // Own the raw banner JSON so the 'static main-thread closure can
+                    // push it to the webview after the panel is shown.
+                    let banner_line = line.to_string();
                     let _ = app_handle.clone().run_on_main_thread(move || {
                         #[allow(deprecated)]
                         use tauri_nspanel::cocoa::appkit::NSWindowCollectionBehavior;
@@ -457,13 +460,26 @@ async fn run_connection(
                                 // Level 5 — ABOVE the meeting overlay (level 4).
                                 panel.set_level(5);
                                 // Appear on the user's CURRENT space without moving
-                                // them: CanJoinAllSpaces = show on whatever space is
-                                // active; Stationary + IgnoresCycle keep it out of
-                                // space-switch animation and Exposé cycling. No
-                                // FullScreenAuxiliary (it forced a space change).
+                                // them, INCLUDING over another app's full-screen
+                                // window (a Zoom/Meet call — the case that matters
+                                // most for a meeting copilot):
+                                //   CanJoinAllSpaces  = show on whatever normal space
+                                //                       is active (like the menu bar);
+                                //   FullScreenAuxiliary = ALSO show on the SAME space
+                                //                       as another app's full-screen
+                                //                       window. Without this the panel
+                                //                       is invisible over full-screen
+                                //                       apps (the reported bug).
+                                //   Stationary + IgnoresCycle keep it out of
+                                //                       space-switch animation / Exposé.
+                                // FullScreenAuxiliary does NOT cause a space change on
+                                // its own — the earlier space-jump came from w.show()/
+                                // activation, which we avoid (non-activating panel +
+                                // order_front_regardless below).
                                 #[allow(deprecated)]
                                 panel.set_collection_behaviour(
                                     NSWindowCollectionBehavior::NSWindowCollectionBehaviorCanJoinAllSpaces
+                                        | NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
                                         | NSWindowCollectionBehavior::NSWindowCollectionBehaviorStationary
                                         | NSWindowCollectionBehavior::NSWindowCollectionBehaviorIgnoresCycle,
                                 );
@@ -509,9 +525,19 @@ async fn run_connection(
                                 let _ = w.set_content_protected(true);
                                 crate::macos::set_sharing_none(&app_handle);
                             }
-                            eprintln!(
-                                "[banner] final is_visible={:?}",
-                                w.is_visible()
+                            // PUSH the banner payload to the now-visible webview.
+                            // This is the reliable delivery path: emitting here —
+                            // AFTER order_front_regardless — reaches a live webview,
+                            // unlike an emit to the still-hidden window at boot
+                            // (which is why the old code fell back to polling). The
+                            // UI listens for `overlay://banner` and fills its empty
+                            // slot. Fires exactly once, at the moment of show — no
+                            // polling. `banner_line` is the raw show_meeting_banner
+                            // JSON, the same shape get_pending_banner returns.
+                            let _ = app_handle.emit_to(
+                                "banner",
+                                "overlay://banner",
+                                banner_line.clone(),
                             );
                         }
                     });
@@ -534,6 +560,24 @@ async fn run_connection(
                                 );
                                 panel.show();
                                 panel.order_front_regardless();
+                            }
+                            // Kill the NATIVE window shadow that to_panel() re-adds.
+                            // The overlay window is transparent + rounded (and when
+                            // collapsed it IS the pill), so a rectangular native
+                            // window shadow shows as a boxed halo around the rounded
+                            // content. The visible shadow must come from CSS (which
+                            // hugs the border-radius), never the window frame.
+                            #[allow(unexpected_cfgs)]
+                            if let Ok(ptr) = w.ns_window() {
+                                use objc2::msg_send;
+                                use objc2::runtime::AnyObject;
+                                let ns = ptr as *mut AnyObject;
+                                if !ns.is_null() {
+                                    unsafe {
+                                        let _: () = msg_send![ns, setHasShadow: false];
+                                        let _: () = msg_send![ns, invalidateShadow];
+                                    }
+                                }
                             }
                             // LOCAL-TEST ONLY: to_panel() re-hides the window from
                             // screen capture (NSPanel default), overriding the
