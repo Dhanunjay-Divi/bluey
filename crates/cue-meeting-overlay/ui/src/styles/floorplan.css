@@ -1793,14 +1793,8 @@
   border-radius: 999px;
   background: var(--glass, var(--paper-2));
   color: var(--ink);
-  /* Smooth ROUND shadow, NO border. The shape reads from the rounded fill + a
-     soft CSS shadow that hugs the border-radius. The rectangular box halo seen
-     before was the NATIVE window shadow (follows the square window frame); that
-     is killed on the show/collapse path in Rust, so only this round CSS shadow
-     shows. */
-  box-shadow:
-    0 8px 28px rgba(28, 26, 25, 0.18),
-    0 2px 8px rgba(28, 26, 25, 0.12);
+  /* No shadow, no border — the pill reads from its rounded fill alone. */
+  box-shadow: none;
   -webkit-app-region: drag;
   transition:
     box-shadow 0.22s ease,
@@ -2138,12 +2132,8 @@
   padding: 16px 16px 14px;
   border-radius: 16px;
   background: var(--paper);
-  /* Smooth ROUND shadow, no border. The native (rectangular) window shadow is
-     killed on the banner show path in Rust, so this soft CSS shadow — which hugs
-     the border-radius — is the only one, a clean floating card, no boxed halo. */
-  box-shadow:
-    0 8px 28px rgba(28, 26, 25, 0.18),
-    0 2px 8px rgba(28, 26, 25, 0.12);
+  /* No shadow, no border — clean floating card from its rounded fill alone. */
+  box-shadow: none;
   overflow: hidden;
   font-family: var(--font);
   animation: fp-mbanner-in 0.3s cubic-bezier(0.2, 0.9, 0.2, 1) both;
