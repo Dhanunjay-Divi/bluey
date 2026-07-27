@@ -7,7 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Codex meeting-memory in production.** The stable MCP token is now exported
+  into the daemon's environment (`BLUEY_MCP_TOKEN`), so a spawned Codex child
+  inherits it via `--bearer-token-env-var`. Previously the random per-boot token
+  lived only inside the daemon, so Codex's memory calls 401'd in production.
+- **Meeting-prep banner delivery.** The banner is now pushed to its webview the
+  instant the panel is ordered front (event-driven), replacing an unreliable
+  fixed-window poll that could give up before the banner arrived and render a
+  blank card. The banner also gains `FullScreenAuxiliary` so it appears over a
+  full-screen app (e.g. a Zoom/Meet call) without switching Spaces.
+- **Google calendar OAuth.** The token exchange/refresh now sends the
+  installed-app `client_secret` Google requires even under PKCE (Microsoft stays
+  secret-less), fixing "client_secret is missing" on Google connect.
+
 ### Added
+- **Stable MCP memory backend (register-once).** Bluey's loopback MCP memory
+  server now uses a STABLE per-install bearer token (persisted in the OS
+  keychain) and a STABLE port (persisted in settings), so its URL survives daemon
+  restarts. The server is registered into the attached agent exactly ONCE on
+  attach (plus a boot-time heal if an agent is already attached), not
+  re-registered every meeting. Deregistration moved to agent detach. This
+  eliminates the per-meeting `mcp add`/`remove` churn and the "client already
+  exists"/dead-port failures that could refuse a meeting warm-up.
 - **App-owned conversation memory.** Every in-meeting Q&A turn is stored in
   Bluey's own `conversation_turns` table (migration 012) and re-supplied to the
   agent each turn as a token-bounded block (rolling summary + verbatim tail).
