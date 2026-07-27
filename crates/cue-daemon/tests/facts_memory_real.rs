@@ -15,16 +15,16 @@ use cue_daemon::memory::FactsMemory;
 /// `BLUEY_DATA_DIR` is process-global env; parallel test threads racing
 /// `set_var` → `AppPaths::discover` could cross-contaminate stores. Each test
 /// holds this for its whole body (hence returned to the caller).
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 async fn memory_in(
     tag: &str,
 ) -> (
     FactsMemory,
     std::path::PathBuf,
-    std::sync::MutexGuard<'static, ()>,
+    tokio::sync::MutexGuard<'static, ()>,
 ) {
-    let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = ENV_LOCK.lock().await;
     // Isolated data dir so the test never touches the user's real store.
     let tmp = std::env::temp_dir().join(format!("bluey-facts-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("tmp dir");
