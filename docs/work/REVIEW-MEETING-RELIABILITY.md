@@ -47,6 +47,8 @@
 - The clean-install permission-deny/settings/retry path was exercised against
   the staged helper. It produced one source-specific prompt, reached an
   authorized sidecar state, kept one stable helper PID, and cleared the warning.
+- The audio status endpoint now derives continuous-source state from the same
+  native handles as the overlay, while leaving the chunk/REST runtime untouched.
 
 ---
 
@@ -137,6 +139,9 @@ native BlueyAudio bundle + strict verification; BlueyShot build/safe smoke
 
 clean reinstall + visible pill drag + real BlueyAudio microphone grant/retry
   ✅ passed; authorized helper PID stable and warning cleared
+
+focused continuous audio status tests
+  ✅ 9 passed; warning-denied daemon Clippy passed
 
 git diff --check
   ✅ passed

@@ -27,7 +27,7 @@ use cue_core::ai::{
     SafetyOutcome, TokenUsage,
 };
 use cue_core::app_paths::AppPaths;
-use cue_core::audio::AudioRuntimeMode;
+use cue_core::audio::{AudioPlatformCapability, AudioRuntimeMode};
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::overlay_ipc::ListeningState;
 use cue_core::{
@@ -1984,6 +1984,13 @@ fn should_clear_native_audio_session(
     !system_running && !microphone_running && !runtime_running
 }
 
+fn reset_status_for_new_native_audio_session(audio: &mut AudioPipelineStatus, session_id: String) {
+    audio.capture = AudioCaptureStatus::idle();
+    audio.session_id = Some(session_id);
+    audio.transcript_segments_emitted = 0;
+    audio.updated_at = clock::now_epoch_ms_string();
+}
+
 /// Ensure either native audio source has one shared listening-session id and
 /// one shared meeting. System audio and microphone are peers: whichever source
 /// starts first owns creation, while adding the other source reuses the same
@@ -1995,7 +2002,7 @@ async fn ensure_native_audio_session(daemon: &Arc<Daemon>) -> Result<String> {
             (session_id, false)
         } else {
             let session_id = format!("audio-{}", clock::now_epoch_ms_string());
-            audio.session_id = Some(session_id.clone());
+            reset_status_for_new_native_audio_session(&mut audio, session_id.clone());
             (session_id, true)
         }
     };
@@ -2812,7 +2819,7 @@ async fn handle_request_inner(
             })
         }
         DaemonRequest::AudioStatus => Ok(DaemonResponse::AudioStatus {
-            status: daemon.audio.lock().await.clone(),
+            status: current_audio_pipeline_status(daemon).await,
         }),
         DaemonRequest::AudioStart {
             enable_system,
@@ -6506,6 +6513,217 @@ async fn microphone_capture_running(daemon: &Arc<Daemon>) -> bool {
         .await
         .as_ref()
         .is_some_and(crate::audio::capture::MicrophoneCapture::is_running)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuousAudioSourceStatus {
+    Inactive,
+    Starting,
+    Running,
+}
+
+impl ContinuousAudioSourceStatus {
+    fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
+}
+
+fn continuous_status_from_helper(
+    status: crate::audio::system_capture::CaptureStatus,
+) -> ContinuousAudioSourceStatus {
+    match status {
+        crate::audio::system_capture::CaptureStatus::Starting => {
+            ContinuousAudioSourceStatus::Starting
+        }
+        crate::audio::system_capture::CaptureStatus::Running => {
+            ContinuousAudioSourceStatus::Running
+        }
+        crate::audio::system_capture::CaptureStatus::PermissionDenied
+        | crate::audio::system_capture::CaptureStatus::Failed
+        | crate::audio::system_capture::CaptureStatus::Stopped => {
+            ContinuousAudioSourceStatus::Inactive
+        }
+    }
+}
+
+async fn system_audio_source_status(daemon: &Arc<Daemon>) -> ContinuousAudioSourceStatus {
+    daemon
+        .system_audio
+        .lock()
+        .await
+        .as_ref()
+        .map(|capture| continuous_status_from_helper(capture.status()))
+        .unwrap_or(ContinuousAudioSourceStatus::Inactive)
+}
+
+async fn microphone_audio_source_status(daemon: &Arc<Daemon>) -> ContinuousAudioSourceStatus {
+    let helper_status = {
+        let helper = daemon.microphone_helper.lock().await;
+        match helper.as_ref() {
+            Some(MicCaptureHandle::Helper(capture)) => {
+                continuous_status_from_helper(capture.status())
+            }
+            Some(MicCaptureHandle::Cpal(capture)) if capture.is_running() => {
+                ContinuousAudioSourceStatus::Running
+            }
+            _ => ContinuousAudioSourceStatus::Inactive,
+        }
+    };
+    if helper_status.is_active() {
+        return helper_status;
+    }
+    if daemon
+        .microphone
+        .lock()
+        .await
+        .as_ref()
+        .is_some_and(crate::audio::capture::MicrophoneCapture::is_running)
+    {
+        ContinuousAudioSourceStatus::Running
+    } else {
+        ContinuousAudioSourceStatus::Inactive
+    }
+}
+
+/// Reconcile the legacy aggregate status with the continuous native source
+/// handles used by the overlay. The source handles are authoritative: the
+/// aggregate `audio` record predates them and otherwise remains `Idle` while a
+/// real native helper is streaming.
+async fn current_audio_pipeline_status(daemon: &Arc<Daemon>) -> AudioPipelineStatus {
+    let runtime_was_live = daemon.audio_runtime.lock().await.stop.is_some();
+    let (system, microphone) = tokio::join!(
+        system_audio_source_status(daemon),
+        microphone_audio_source_status(daemon)
+    );
+    // Clone after the handle snapshots. Each start publishes its shared
+    // session id immediately after the handle, so this ordering minimizes the
+    // brief active-handle/session-not-yet-published race.
+    let current = daemon.audio.lock().await.clone();
+    // Recheck after the source and aggregate snapshots. If a chunk runtime
+    // started during this read, either observation protects its authoritative
+    // provider, counters, devices, and session from continuous synthesis.
+    let runtime_live = runtime_was_live || daemon.audio_runtime.lock().await.stop.is_some();
+    let permission_denied_source = *daemon.audio_permission_denied_source.lock().await;
+    reconcile_continuous_audio_status(
+        current,
+        runtime_live,
+        system,
+        microphone,
+        permission_denied_source,
+    )
+}
+
+fn reconcile_continuous_audio_status(
+    current: AudioPipelineStatus,
+    runtime_live: bool,
+    system: ContinuousAudioSourceStatus,
+    microphone: ContinuousAudioSourceStatus,
+    permission_denied_source: Option<AudioSourceKind>,
+) -> AudioPipelineStatus {
+    // The chunk/REST runtime owns a complete aggregate record. Never overwrite
+    // its provider, counters, devices, or session identity with native-handle
+    // synthesis.
+    if runtime_live {
+        return current;
+    }
+    let mut current = current;
+    current.capture.permission_denied_source = permission_denied_source;
+    if !system.is_active() && !microphone.is_active() {
+        // A source-switch gap retains the shared id and must stay untouched.
+        // Terminal cleanup clears that id; only then is a stale synthesized
+        // native record safe to mark stopped.
+        return if current.runtime_mode == AudioRuntimeMode::Native && current.session_id.is_none() {
+            current.stopped()
+        } else {
+            current
+        };
+    }
+    let Some(session_id) = current.session_id.clone() else {
+        // Do not invent a session identity during the tiny handle-publication
+        // race. The next status request will observe the real shared id.
+        return current;
+    };
+
+    let system_active = system.is_active();
+    let microphone_active = microphone.is_active();
+    let config = AudioCaptureConfig::from_enabled_sources(system_active, microphone_active);
+    let devices = cue_core::audio::default_planned_devices();
+    let source_label = match (system_active, microphone_active) {
+        (true, true) => "system audio and microphone",
+        (true, false) => "system audio",
+        (false, true) => "microphone",
+        (false, false) => unreachable!("at least one continuous source is active"),
+    };
+    let capture_running = matches!(system, ContinuousAudioSourceStatus::Running)
+        || matches!(microphone, ContinuousAudioSourceStatus::Running);
+    let platform_note = if capture_running {
+        format!("Continuous native {source_label} capture is active.")
+    } else {
+        format!("Continuous native {source_label} capture is starting.")
+    };
+    let active_backend = devices
+        .iter()
+        .find(|device| {
+            (system_active && device.source == AudioSourceKind::System)
+                || (microphone_active && device.source == AudioSourceKind::Microphone)
+        })
+        .map(|device| device.backend);
+    let mut status = AudioPipelineStatus::native(
+        session_id.clone(),
+        config,
+        devices,
+        "continuous-streaming-stt",
+        platform_note.clone(),
+    );
+    status.platform = AudioPlatformCapability::native_available(active_backend, platform_note);
+    status.transcript_segments_emitted = current.transcript_segments_emitted;
+    status.capture.permission_denied_source = current.capture.permission_denied_source;
+    status.capture.started_at = current.capture.started_at.clone().or_else(|| {
+        session_id
+            .strip_prefix("audio-")
+            .filter(|timestamp| {
+                timestamp
+                    .chars()
+                    .all(|character| character.is_ascii_digit())
+            })
+            .map(str::to_string)
+    });
+    if system_active {
+        carry_audio_source_telemetry(&mut status.capture.system, &current.capture.system);
+    }
+    if microphone_active {
+        carry_audio_source_telemetry(&mut status.capture.microphone, &current.capture.microphone);
+    }
+    if system == ContinuousAudioSourceStatus::Starting {
+        status.capture.system.state = cue_core::AudioSourceState::Ready;
+    }
+    if microphone == ContinuousAudioSourceStatus::Starting {
+        status.capture.microphone.state = cue_core::AudioSourceState::Ready;
+    }
+    if !capture_running {
+        status.capture.state = cue_core::AudioCaptureState::Starting;
+        status.backend_ready = false;
+        status.note = Some(format!("Continuous {source_label} capture is starting."));
+    } else {
+        status.note = Some(format!(
+            "Continuous {source_label} capture with live speech-to-text."
+        ));
+    }
+    status
+}
+
+fn carry_audio_source_telemetry(
+    target: &mut cue_core::AudioSourceStatus,
+    previous: &cue_core::AudioSourceStatus,
+) {
+    target.chunks_captured = previous.chunks_captured;
+    target.chunks_dropped = previous.chunks_dropped;
+    target.last_sequence = previous.last_sequence;
+    target.last_audio_at.clone_from(&previous.last_audio_at);
+    target.last_error.clone_from(&previous.last_error);
+    if previous.device_id.is_some() {
+        target.device_id.clone_from(&previous.device_id);
+    }
 }
 
 /// Stop only system audio, leaving microphone capture and the meeting alive.
@@ -18114,6 +18332,209 @@ mod tests {
                 stop_microphone: false,
             }
         );
+    }
+
+    #[test]
+    fn continuous_audio_status_reports_live_microphone_as_native() {
+        let mut current = AudioPipelineStatus::idle();
+        current.session_id = Some("audio-1234".to_string());
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Running,
+            None,
+        );
+
+        assert_eq!(status.runtime_mode, AudioRuntimeMode::Native);
+        assert!(status.backend_ready);
+        assert!(status.platform.native_capture_available);
+        assert_eq!(
+            status.platform.native_backend,
+            Some(cue_core::AudioBackend::CoreAudio)
+        );
+        assert!(!status.config.system.enabled);
+        assert!(status.config.microphone.enabled);
+        assert_eq!(status.capture.started_at.as_deref(), Some("1234"));
+        assert_eq!(
+            status.capture.microphone.state,
+            cue_core::AudioSourceState::Capturing
+        );
+        assert_eq!(
+            status.capture.system.state,
+            cue_core::AudioSourceState::Disabled
+        );
+        assert_eq!(
+            status.stt_provider.as_deref(),
+            Some("continuous-streaming-stt")
+        );
+    }
+
+    #[test]
+    fn continuous_audio_status_reports_starting_before_first_pcm() {
+        let mut current = AudioPipelineStatus::idle();
+        current.session_id = Some("audio-1234".to_string());
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Starting,
+            None,
+        );
+
+        assert_eq!(status.runtime_mode, AudioRuntimeMode::Native);
+        assert!(!status.backend_ready);
+        assert!(status.platform.native_capture_available);
+        assert_eq!(status.capture.state, cue_core::AudioCaptureState::Starting);
+        assert_eq!(
+            status.capture.microphone.state,
+            cue_core::AudioSourceState::Ready
+        );
+    }
+
+    #[test]
+    fn continuous_audio_status_preserves_chunk_runtime_exactly_during_transition() {
+        let mut current = AudioPipelineStatus::simulated(
+            "chunk-session",
+            AudioCaptureConfig::from_enabled_sources(true, true),
+        );
+        current.transcript_segments_emitted = 9;
+        current.capture.microphone.chunks_captured = 4;
+        let expected = current.clone();
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            true,
+            ContinuousAudioSourceStatus::Running,
+            ContinuousAudioSourceStatus::Running,
+            Some(AudioSourceKind::Microphone),
+        );
+
+        assert_eq!(status, expected);
+    }
+
+    #[test]
+    fn continuous_audio_status_new_session_resets_cross_session_telemetry() {
+        let mut status = AudioPipelineStatus::native(
+            "audio-old",
+            AudioCaptureConfig::from_enabled_sources(false, true),
+            cue_core::audio::default_planned_devices(),
+            "continuous-streaming-stt",
+            "native",
+        );
+        status.session_id = None;
+        status.transcript_segments_emitted = 9;
+        status.capture.started_at = Some("old-start".to_string());
+        status.capture.microphone.chunks_captured = 7;
+        status.capture.microphone.last_sequence = Some(6);
+
+        reset_status_for_new_native_audio_session(&mut status, "audio-new".to_string());
+
+        assert_eq!(status.session_id.as_deref(), Some("audio-new"));
+        assert_eq!(status.transcript_segments_emitted, 0);
+        assert_eq!(status.capture, AudioCaptureStatus::idle());
+    }
+
+    #[test]
+    fn continuous_audio_status_reports_inactive_permission_denial() {
+        let current = AudioPipelineStatus::idle();
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Inactive,
+            Some(AudioSourceKind::Microphone),
+        );
+
+        assert_eq!(
+            status.capture.permission_denied_source,
+            Some(AudioSourceKind::Microphone)
+        );
+    }
+
+    #[test]
+    fn continuous_audio_status_preserves_session_during_source_switch_gap() {
+        let mut current = AudioPipelineStatus::idle();
+        current.session_id = Some("audio-1234".to_string());
+        current.transcript_segments_emitted = 5;
+        let expected = current.clone();
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Inactive,
+            None,
+        );
+
+        assert_eq!(status, expected);
+    }
+
+    #[test]
+    fn continuous_audio_status_stops_terminal_session_after_cleanup_clears_id() {
+        let mut current = AudioPipelineStatus::native(
+            "audio-1234",
+            AudioCaptureConfig::from_enabled_sources(false, true),
+            cue_core::audio::default_planned_devices(),
+            "continuous-streaming-stt",
+            "native",
+        );
+        current.session_id = None;
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Inactive,
+            None,
+        );
+
+        assert_eq!(status.runtime_mode, AudioRuntimeMode::Idle);
+        assert_eq!(status.capture.state, cue_core::AudioCaptureState::Stopped);
+        assert!(!status.backend_ready);
+    }
+
+    #[test]
+    fn continuous_audio_status_preserves_same_session_telemetry_after_toggle() {
+        let mut current = AudioPipelineStatus::idle();
+        current.session_id = Some("audio-1234".to_string());
+        current.transcript_segments_emitted = 11;
+        current.capture.microphone.chunks_captured = 7;
+        current.capture.microphone.chunks_dropped = 2;
+        current.capture.microphone.last_sequence = Some(19);
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Running,
+            None,
+        );
+
+        assert_eq!(status.session_id.as_deref(), Some("audio-1234"));
+        assert_eq!(status.transcript_segments_emitted, 11);
+        assert_eq!(status.capture.microphone.chunks_captured, 7);
+        assert_eq!(status.capture.microphone.chunks_dropped, 2);
+        assert_eq!(status.capture.microphone.last_sequence, Some(19));
+    }
+
+    #[test]
+    fn continuous_audio_status_does_not_invent_session_during_start_race() {
+        let current = AudioPipelineStatus::idle();
+        let expected = current.clone();
+
+        let status = reconcile_continuous_audio_status(
+            current,
+            false,
+            ContinuousAudioSourceStatus::Inactive,
+            ContinuousAudioSourceStatus::Starting,
+            None,
+        );
+
+        assert_eq!(status, expected);
     }
 
     #[test]

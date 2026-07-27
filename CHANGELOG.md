@@ -53,6 +53,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/work/FUTURE-UPGRADES.md`.
 
 ### Fixed
+- **Live audio diagnostics now follow the real native source handles.**
+  `bluey audio status` reconciles the continuous microphone/system capture
+  lifecycle instead of returning the daemon's stale boot-time aggregate state.
+  Starting helpers remain `Starting`, running sources report native capture,
+  and chunk-runtime sessions retain their original provider and telemetry.
 - **macOS microphone permission now reaches the real helper.**
   `BlueyAudio.app` is signed with the hardened-runtime
   `com.apple.security.device.audio-input` entitlement in development and

@@ -22,6 +22,8 @@
   dismissal/approval to the exact calendar occurrence.
 - Keep system-audio and microphone state authoritative across daemon IPC and the
   React overlay, including microphone-only sessions and source-specific stops.
+- Reconcile CLI audio diagnostics with those authoritative continuous source
+  handles without overwriting the separate chunk/runtime pipeline.
 - Keep source capture/task generations paired during shutdown, prevent the
   system idle watchdog from archiving an active microphone session, and fail a
   source start if its STT provider cannot initialize.
@@ -104,6 +106,10 @@ Final branch-tip verification completed on 2026-07-26:
       helper produced one proper `BlueyAudio` prompt, the user-approved grant
       reached `authorized`, and one helper PID remained stable while the
       warning cleared.
+- [x] Continuous audio status regression tests — 9 passed, covering starting,
+      running microphone-only, chunk-runtime isolation, source-switch gaps,
+      terminal cleanup, same-session telemetry, new-session resets, inactive
+      permission denial, and handle/session publication races.
 
 ## Deviations from Plan
 
