@@ -3,10 +3,12 @@
 # System Audio Recording and Microphone TCC grants.
 #
 # A certificate-backed signature with the stable sh.bluey.audio identifier keeps
-# the helper's designated requirement stable across rebuilds. The restricted
-# persistent-content-capture entitlement is intentionally OFF by default: Apple
-# documents it for approved VNC apps, and macOS refuses to launch a process that
-# claims it without a matching embedded provisioning profile.
+# the helper's designated requirement stable across rebuilds. Microphone capture
+# always requires the ordinary audio-input entitlement under the hardened
+# runtime. The restricted persistent-content-capture entitlement is intentionally
+# OFF by default: Apple documents it for approved VNC apps, and macOS refuses to
+# launch a process that claims it without a matching embedded provisioning
+# profile.
 #
 # Optional build controls:
 #   BLUEY_AUDIO_SWIFT_TRIPLE  Swift target triple (for example
@@ -113,6 +115,21 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# Hardened-runtime microphone access is denied before macOS can present a prompt
+# unless the requester carries this entitlement. Keep it in every signature
+# variant, including ad-hoc development bundles, so verification and runtime
+# behavior match.
+cat >"$ENTITLEMENTS" <<'ENT'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
+ENT
+
 if [ "$REQUIRE_PERSISTENT" = "1" ]; then
   profile_plist="$(mktemp -t bluey-audio-profile)"
   cleanup_profile_plist() {
@@ -150,20 +167,16 @@ if [ "$REQUIRE_PERSISTENT" = "1" ]; then
   esac
 
   cp "$PROFILE" "$APP/Contents/embedded.provisionprofile"
-  cat >"$ENTITLEMENTS" <<'ENT'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>com.apple.developer.persistent-content-capture</key>
-  <true/>
-</dict>
-</plist>
-ENT
+  /usr/libexec/PlistBuddy \
+    -c "Add :com.apple.developer.persistent-content-capture bool true" \
+    "$ENTITLEMENTS"
 fi
 
 if [ "$SIGN_ID" = "-" ]; then
-  codesign --force --deep --sign - --identifier "sh.bluey.audio" "$APP"
+  codesign --force --deep --sign - \
+    --identifier "sh.bluey.audio" \
+    --entitlements "$ENTITLEMENTS" \
+    "$APP"
 elif [ "$REQUIRE_PERSISTENT" = "1" ]; then
   codesign --force --deep --sign "$SIGN_ID" \
     --identifier "sh.bluey.audio" \
@@ -171,10 +184,11 @@ elif [ "$REQUIRE_PERSISTENT" = "1" ]; then
     --options runtime \
     "$APP"
 else
-  # Certificate-backed and stable, but deliberately free of restricted
-  # entitlements so macOS does not require a provisioning profile to launch it.
+  # Certificate-backed and stable. audio-input is an ordinary microphone
+  # entitlement and does not require a provisioning profile.
   codesign --force --deep --sign "$SIGN_ID" \
     --identifier "sh.bluey.audio" \
+    --entitlements "$ENTITLEMENTS" \
     --options runtime \
     "$APP"
 fi

@@ -53,6 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/work/FUTURE-UPGRADES.md`.
 
 ### Fixed
+- **macOS microphone permission now reaches the real helper.**
+  `BlueyAudio.app` is signed with the hardened-runtime
+  `com.apple.security.device.audio-input` entitlement in development and
+  certificate-backed builds, and the helper verifier rejects artifacts that
+  omit it. This prevents macOS from denying an already-enabled microphone grant
+  before the permission prompt or capture session can start.
 - **Clean macOS helper verification no longer fails during trap cleanup.**
   `verify-app.sh` now guards empty cleanup arrays before expanding them, which
   keeps the default no-launch verification path compatible with macOS Bash 3.2

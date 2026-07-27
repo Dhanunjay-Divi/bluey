@@ -2,7 +2,7 @@
 
 **Commit range:** `2fa8c0bc..meeting-main`
 **Reviewer:** Codex multi-agent final review
-**Date:** 2026-07-26
+**Date:** 2026-07-27
 
 ## Per-Task Review
 
@@ -44,8 +44,9 @@
   failures.
 - Permission denial no longer enters an automatic relaunch loop; the user can
   open the relevant settings pane and explicitly retry only the denied source.
-- Real macOS permission-deny/settings/retry UI interaction requires an external
-  TCC state transition and remains a final manual smoke gate, not a code blocker.
+- The clean-install permission-deny/settings/retry path was exercised against
+  the staged helper. It produced one source-specific prompt, reached an
+  authorized sidecar state, kept one stable helper PID, and cleared the warning.
 
 ---
 
@@ -64,8 +65,9 @@
 - Audio capture generations, STT initialization, source shutdown, and idle
   watchdog behavior have focused regression coverage.
 - The arm64 BlueyAudio and BlueyShot helpers build with stable signed identities.
-  Signature, designated requirement, architecture, plist, direct no-capture,
-  and LaunchServices no-capture checks passed.
+  Signature, designated requirement, required audio-input entitlement,
+  architecture, plist, direct no-capture, and LaunchServices no-capture checks
+  passed.
 
 ---
 
@@ -85,8 +87,8 @@
   account/device routing, and authenticated device nudges are implemented.
 - Server calendar tests and warning-denied Clippy passed. Modified install,
   build, native helper, and release scripts passed syntax and packaging checks.
-- The final clean-install visible-mode interaction remains an operational smoke
-  step. No implementation blocker was identified.
+- Clean reinstall, visible overlay startup, source control, and collapsed-pill
+  movement were exercised against the staged branch build.
 
 ---
 
@@ -133,6 +135,9 @@ npx --yes prettier@3.6.2 --check <18 changed UI files>
 native BlueyAudio bundle + strict verification; BlueyShot build/safe smoke
   ✅ passed
 
+clean reinstall + visible pill drag + real BlueyAudio microphone grant/retry
+  ✅ passed; authorized helper PID stable and warning cleared
+
 git diff --check
   ✅ passed
 ```
@@ -140,16 +145,14 @@ git diff --check
 ## Overall Verdict
 
 🟢 **ACCEPT** — No code blockers remain in the reviewed scope. Live provider
-OAuth and real macOS permission UI interaction are externally gated manual
-verification steps and must be completed before a production release claim.
+OAuth is externally gated on registered public-client applications and must be
+completed before a production release claim.
 
 ## Follow-ups for Next Batch
 
 - Register Google Desktop and Microsoft public-client applications, configure
   their public client IDs, and run interactive consent, refresh, attendee, and
   conferencing-ID smoke tests.
-- Run the final clean-install visible-mode pill drag, source-toggle, banner, and
-  macOS permission recovery smoke.
 - Add webhook subscription renewal, tenant/device ownership routing, and an
   authenticated device nudge before treating webhooks as a low-latency delivery
   transport.

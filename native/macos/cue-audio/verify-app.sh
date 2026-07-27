@@ -130,7 +130,16 @@ if printf '%s' "$compact_entitlements" \
   | grep -Fq '<key>com.apple.developer.persistent-content-capture</key><true/>'; then
   has_persistent=1
 fi
+has_audio_input=0
+if printf '%s' "$compact_entitlements" \
+  | grep -Fq '<key>com.apple.security.device.audio-input</key><true/>'; then
+  has_audio_input=1
+fi
 
+if [ "$has_audio_input" != "1" ]; then
+  echo "verify-app: microphone helper is missing audio-input entitlement" >&2
+  exit 1
+fi
 if [ "$has_persistent" = "1" ] && [ ! -f "$PROFILE" ]; then
   echo "verify-app: restricted persistent-content-capture entitlement lacks an embedded profile" >&2
   exit 1

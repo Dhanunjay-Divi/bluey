@@ -9,7 +9,8 @@
   allow an intentional retry after the user fixes the relevant system setting,
   without restarting an unaffected source.
 - Preserve stable helper identities and signatures across development installs
-  and release packaging.
+  and release packaging, including the hardened-runtime audio-input entitlement
+  required for macOS to authorize the microphone helper.
 - Provision and prewarm the local Parakeet model before capture, while sharing
   one model load across system-audio and microphone decoders.
 - Make the collapsed overlay pill draggable, suppress click-after-drag, repair
@@ -55,7 +56,7 @@
 | `crates/cue-meeting-overlay/ui/src/` | Modified | Repair dragging, controls, source-state restoration, onboarding, and screen clamping. |
 | `crates/cue-meeting-overlay/capabilities/` and generated schemas | Modified | Grant the banner only its required event capability. |
 | `crates/cue-meeting-overlay/tauri.conf.json` | Modified | Restore default capture protection. |
-| `native/macos/cue-audio/` | Modified | Classify permission outcomes and produce a stable signed helper bundle. |
+| `native/macos/cue-audio/` | Modified | Classify permission outcomes and produce a stable, entitled signed helper bundle. |
 | `native/macos/cue-shot/build.sh` | Modified | Preserve a stable screenshot-helper signing identity. |
 | `crates/cue-calendar-cloud/` | Modified | Harden PKCE, keychain storage, pagination, delta merge, and provider lifecycle. |
 | `server/src/api/calendar.rs` | Modified | Validate webhook identity tokens and bound payloads. |
@@ -88,17 +89,21 @@ Final branch-tip verification completed on 2026-07-26:
       `BlueyAudio.app` with stable bundle ID `sh.bluey.audio` and Team ID
       `FS65MX3B6M`.
 - [x] Strict `native/macos/cue-audio/verify-app.sh` verification — signature,
-      designated requirement, arm64 architecture, direct no-capture probe, and
-      LaunchServices no-capture probe all passed.
+      designated requirement, required audio-input entitlement, arm64
+      architecture, direct no-capture probe, and LaunchServices no-capture
+      probe all passed.
 - [x] `bash native/macos/cue-shot/build.sh` — signed arm64 helper build and safe
       no-capture executable smoke passed.
 - [x] Native plist lint, helper architecture checks, and modified shell-script
       syntax checks — passed.
 - [x] `git diff --check` — passed for staged and unstaged changes.
-- [ ] Visible-mode pill drag, source toggles, banner interaction, and real
-      macOS permission-deny/settings/retry UI smoke — pending the final clean
-      install and external TCC interaction. The helper-level permission and
-      no-capture probes are green; no code blocker was found.
+- [x] Clean-install visible-mode pill drag and source-toggle smoke — passed.
+      The pill moved from `{720,60}` to `{382,182}` without expanding.
+- [x] Real macOS microphone deny/settings/retry smoke — passed on 2026-07-27.
+      TCC first exposed the missing audio-input entitlement, the corrected
+      helper produced one proper `BlueyAudio` prompt, the user-approved grant
+      reached `authorized`, and one helper PID remained stable while the
+      warning cleared.
 
 ## Deviations from Plan
 
@@ -115,8 +120,6 @@ Final branch-tip verification completed on 2026-07-26:
   subscription creation, renewal, and device relay are implemented.
 - Add the release signing certificate secrets documented by the release
   workflow before publishing a distributable macOS archive.
-- Run one clean macOS permission-deny, settings-recovery, and explicit-retry
-  scenario against the final signed helper bundle.
 - Run one interactive Google and Microsoft consent/refresh scenario after test
   public-client registrations are available.
 
