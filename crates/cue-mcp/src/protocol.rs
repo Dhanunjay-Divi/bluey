@@ -69,7 +69,8 @@ async fn handle_request(
         return respond(StatusCode::FORBIDDEN, json!({"error": "loopback only"}));
     }
 
-    // Bearer token: rotated per meeting by the daemon.
+    // Bearer token: a stable per-install secret the daemon persists (not rotated
+    // per meeting). Re-read every request so a manual revoke takes effect at once.
     let expected = token.read().await.clone();
     let auth = req
         .headers()

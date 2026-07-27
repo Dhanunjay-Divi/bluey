@@ -79,6 +79,12 @@ pub struct CueSettings {
     /// answers route through Bluey's normal providers.
     #[serde(default)]
     pub attached_agent: Option<String>,
+    /// Loopback port the Bluey MCP memory server binds to, persisted so the
+    /// server URL is STABLE across daemon restarts (a one-time agent
+    /// registration keeps pointing at it). `None` on first run → the daemon
+    /// binds an ephemeral port and writes the resolved value back here.
+    #[serde(default)]
+    pub mcp_port: Option<u16>,
     /// Agent bridge: the session id to resume on the attached agent, if the
     /// user attached with a session to continue. `None` means start a fresh
     /// session. Cleared on detach. Also cleared when a NEW meeting is minted so
@@ -190,6 +196,7 @@ impl Default for CueSettings {
             disguise_mode: "activity".to_string(),
             allow_agent_session_history: true,
             attached_agent: None,
+            mcp_port: None,
             attached_session: None,
             search_prefer_session: None,
             attached_model: None,

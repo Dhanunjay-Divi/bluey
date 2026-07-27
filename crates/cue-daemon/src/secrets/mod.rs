@@ -28,6 +28,21 @@ pub fn delete_api_key(provider: &str) -> Result<()> {
     }
 }
 
+/// Keychain provider slug for Bluey's stable MCP memory-server bearer token.
+/// (Reuses the `stt_{provider}` account format — the string is load-bearing for
+/// existing entries, so we pass a distinct provider rather than change it.)
+const MCP_TOKEN_PROVIDER: &str = "mcp_bearer";
+
+/// Persist the stable MCP bearer token (a per-install secret, generated once).
+pub fn store_mcp_token(token: &str) -> Result<()> {
+    store_api_key(MCP_TOKEN_PROVIDER, token)
+}
+
+/// Load the persisted MCP bearer token, if one has been generated.
+pub fn load_mcp_token() -> Result<Option<String>> {
+    load_api_key(MCP_TOKEN_PROVIDER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

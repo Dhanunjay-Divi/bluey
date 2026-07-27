@@ -47,7 +47,14 @@ pub async fn register_bluey_memory(
 ) -> Result<RegisterOutcome> {
     match kind {
         AgentKind::ClaudeCode | AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent => {
-            // User scope: valid regardless of drive cwd; removed on close.
+            // User scope: valid regardless of drive cwd; removed on detach.
+            // Remove-then-add makes registration IDEMPOTENT: `claude mcp add`
+            // fails "already exists" if a bluey-memory entry is present (e.g. a
+            // stale dead-port entry from a previous install). Since registration
+            // now runs ONCE per attach (not per meeting), this is a cheap, correct
+            // heal — not per-meeting churn. The remove is best-effort.
+            run_best_effort(cwd, "claude", &["mcp", "remove", "--scope", "user", BLUEY_SERVER_NAME])
+                .await;
             run(
                 cwd,
                 "claude",
@@ -68,6 +75,8 @@ pub async fn register_bluey_memory(
             Ok(RegisterOutcome::Registered)
         }
         AgentKind::Copilot => {
+            // Idempotent remove-then-add (see Claude above).
+            run_best_effort(cwd, "copilot", &["mcp", "remove", BLUEY_SERVER_NAME]).await;
             run(
                 cwd,
                 "copilot",
@@ -87,7 +96,9 @@ pub async fn register_bluey_memory(
         }
         AgentKind::Codex => {
             // Token via env (never plaintext in config) — codex's own
-            // `--bearer-token-env-var` mechanism; the drive sets the env.
+            // `--bearer-token-env-var` mechanism; the daemon exports the stable
+            // token so the child inherits it. Idempotent remove-then-add.
+            run_best_effort(cwd, "codex", &["mcp", "remove", BLUEY_SERVER_NAME]).await;
             run(
                 cwd,
                 "codex",
@@ -160,9 +171,9 @@ pub async fn register_bluey_memory(
     }
 }
 
-/// Remove Bluey's server from `kind`'s MCP config (meeting end / token burn).
-/// Best-effort by design: a failed removal must never block meeting teardown —
-/// the rotated token already makes any stale registration useless.
+/// Remove Bluey's server from `kind`'s MCP config (called on agent DETACH, not
+/// per meeting — the token is stable now). Best-effort by design: a failed
+/// removal must never block detach.
 pub async fn deregister_bluey_memory(kind: &AgentKind, cwd: &Path) -> Result<()> {
     match kind {
         AgentKind::ClaudeCode | AgentKind::ClaudeCodeApp | AgentKind::ClaudeCodeAgent => {
@@ -245,6 +256,14 @@ async fn run(cwd: &Path, binary: &str, args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Run a command whose failure is EXPECTED and harmless — the `mcp remove`
+/// before an `mcp add` (idempotent register). If bluey-memory isn't registered
+/// the remove exits non-zero; that must not abort the add, which is the
+/// operation that actually matters (and surfaces its own failure via [`run`]).
+async fn run_best_effort(cwd: &Path, binary: &str, args: &[&str]) {
+    let _ = run(cwd, binary, args).await;
 }
 
 /// Merge `{ <section>: { bluey-memory: <entry> } }` into a JSON config file,

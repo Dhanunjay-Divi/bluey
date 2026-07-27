@@ -60,7 +60,16 @@ pub trait MeetingMemorySource: Send + Sync + 'static {
     async fn search_agent_history(&self, query: &str, limit: usize) -> Vec<AgentHistoryHitOut>;
 }
 
-/// A running MCP server: bound address + rotating bearer token + shutdown.
+/// A running MCP server: bound loopback address + bearer token + shutdown.
+///
+/// The token is a STABLE per-install secret (persisted in the OS keychain by the
+/// daemon), not a per-meeting value. Registration into the agent happens once on
+/// attach, so the `(port, token)` written into the agent config must stay valid
+/// across daemon restarts — the daemon persists both. [`rotate_token`] remains
+/// as an explicit manual "revoke a leaked token" escape hatch, not a per-meeting
+/// operation. The server is loopback-only (see `protocol.rs` Host allow-list),
+/// so a long-lived token is an acceptable trust boundary (any local process that
+/// could read it already runs as the user).
 pub struct McpServerHandle {
     addr: SocketAddr,
     token: Arc<RwLock<String>>,
@@ -73,13 +82,20 @@ impl McpServerHandle {
         format!("http://{}/mcp", self.addr)
     }
 
+    /// The bound loopback port. Persisted by the daemon so the URL is stable
+    /// across restarts (a one-time agent registration keeps pointing at it).
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+
     /// The current bearer token (written into the agent's config/header).
     pub async fn token(&self) -> String {
         self.token.read().await.clone()
     }
 
-    /// Rotate the bearer token (called per meeting so a stale registration
-    /// cannot read a later meeting's memory).
+    /// Replace the bearer token in place. NOT called per meeting — the token is
+    /// stable. Retained only as a manual "revoke + re-register" action so a user
+    /// who suspects the token leaked can burn it on demand.
     pub async fn rotate_token(&self, new_token: String) {
         *self.token.write().await = new_token;
     }
@@ -290,7 +306,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn auth_is_enforced_and_token_rotates() {
+    async fn auth_is_enforced_and_manual_revoke_rotates_token() {
         let handle = start().await;
         let ping = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"});
 
@@ -300,11 +316,35 @@ mod tests {
         let (status, _) = rpc(&handle, "test-token", ping.clone()).await;
         assert_eq!(status, 200);
 
-        handle.rotate_token("next-meeting-token".to_string()).await;
+        // rotate_token is now a MANUAL revoke path (no longer per-meeting), but it
+        // must still invalidate the old token and accept the new one.
+        handle.rotate_token("revoked-and-replaced".to_string()).await;
         let (status, _) = rpc(&handle, "test-token", ping.clone()).await;
-        assert_eq!(status, 401, "old token must die on rotation");
-        let (status, _) = rpc(&handle, "next-meeting-token", ping).await;
+        assert_eq!(status, 401, "old token must die on manual revoke");
+        let (status, _) = rpc(&handle, "revoked-and-replaced", ping).await;
         assert_eq!(status, 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fixed_token_authenticates_across_a_simulated_restart() {
+        // Path B: the daemon persists a stable token and seeds a fresh server with
+        // it on each boot. Two servers started with the SAME fixed token must both
+        // accept it — i.e. a one-time registration survives a daemon restart.
+        let ping = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping"});
+        let first = serve(Arc::new(FakeSource), "stable-token".to_string(), None)
+            .await
+            .expect("serve first");
+        let (status, _) = rpc(&first, "stable-token", ping.clone()).await;
+        assert_eq!(status, 200);
+        drop(first); // simulate daemon restart
+
+        let second = serve(Arc::new(FakeSource), "stable-token".to_string(), None)
+            .await
+            .expect("serve second");
+        // port() is exposed so the daemon can persist the bound port.
+        assert!(second.port() > 0, "bound port is readable for persistence");
+        let (status, _) = rpc(&second, "stable-token", ping).await;
+        assert_eq!(status, 200, "the same stable token authenticates after restart");
     }
 
     #[tokio::test(flavor = "multi_thread")]
