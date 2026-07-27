@@ -941,8 +941,12 @@ pub async fn cli_main() -> Result<()> {
         Commands::Calendar { command } => {
             let request_msg = match command {
                 CalendarCommands::Status => DaemonRequest::CalendarConnectStatus,
-                CalendarCommands::Connect { provider } => DaemonRequest::CalendarConnectStart { provider },
-                CalendarCommands::Disconnect { provider } => DaemonRequest::CalendarDisconnect { provider },
+                CalendarCommands::Connect { provider } => {
+                    DaemonRequest::CalendarConnectStart { provider }
+                }
+                CalendarCommands::Disconnect { provider } => {
+                    DaemonRequest::CalendarDisconnect { provider }
+                }
             };
             let response = request(request_msg).await?;
             print_response(response)
@@ -4228,7 +4232,9 @@ const LAUNCH_AGENT_LABEL: &str = "com.bluey.daemon";
 
 fn launch_agent_plist_path() -> Result<std::path::PathBuf> {
     let home = std::env::var("HOME").context("HOME env var not set")?;
-    let dir = std::path::Path::new(&home).join("Library").join("LaunchAgents");
+    let dir = std::path::Path::new(&home)
+        .join("Library")
+        .join("LaunchAgents");
     std::fs::create_dir_all(&dir).context("create ~/Library/LaunchAgents")?;
     Ok(dir.join(format!("{LAUNCH_AGENT_LABEL}.plist")))
 }
@@ -4260,9 +4266,7 @@ fn resolve_daemon_bin_for_install() -> Result<std::path::PathBuf> {
             }
         }
     }
-    anyhow::bail!(
-        "bluey-daemon not found; run `bash run-local.sh` first to build + install it"
-    )
+    anyhow::bail!("bluey-daemon not found; run `bash run-local.sh` first to build + install it")
 }
 
 /// Install a macOS LaunchAgent that auto-starts `bluey-daemon --no-overlay`
@@ -4354,8 +4358,11 @@ fn bluey_install_login_item() -> Result<()> {
         // launchctl may fail if the agent is already loaded; that's fine.
         println!("⚠️  launchctl load returned non-zero (agent may already be loaded).");
         println!("   Plist written to: {}", plist_path.display());
-        println!("   If problems persist, run: launchctl unload -w {} && launchctl load -w {}",
-            plist_path.display(), plist_path.display());
+        println!(
+            "   If problems persist, run: launchctl unload -w {} && launchctl load -w {}",
+            plist_path.display(),
+            plist_path.display()
+        );
     }
 
     Ok(())

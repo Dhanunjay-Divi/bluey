@@ -205,7 +205,10 @@ pub fn plan_install(agent: &AgentKind) -> Option<InstallPlan> {
 /// Whether a command is available on `PATH`. Read-only; never executes the
 /// target — uses a `--version`-free `command -v`-style probe via `which`.
 fn binary_on_path(binary: &str) -> bool {
-    if crate::hermetic_runtime::agent_bin_dir().join(binary).is_file() {
+    if crate::hermetic_runtime::agent_bin_dir()
+        .join(binary)
+        .is_file()
+    {
         return true;
     }
     Command::new("which")

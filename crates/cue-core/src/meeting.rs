@@ -618,7 +618,6 @@ impl MeetingRecord {
     }
 }
 
-
 fn tail_chars(text: &str, max_chars: usize) -> String {
     if max_chars == 0 {
         return String::new();

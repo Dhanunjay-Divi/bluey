@@ -186,11 +186,8 @@ pub(crate) fn live_tick(daemon: &Arc<Daemon>, handle: &mut LiveDiarizerHandle) {
             // Recompute the start from `audio_samples` so both share one clock:
             // the window holds the most-recent `window.len()` samples, so on the
             // audio clock it starts `window.len()` samples before "now".
-            let now_secs = d
-                .audio_samples
-                .load(std::sync::atomic::Ordering::Relaxed)
-                as f64
-                / 16_000.0;
+            let now_secs =
+                d.audio_samples.load(std::sync::atomic::Ordering::Relaxed) as f64 / 16_000.0;
             let start = (now_secs - window.len() as f64 / 16_000.0).max(0.0);
             debug!(
                 samples = window.len(),
@@ -828,9 +825,14 @@ pub(crate) async fn reenroll_speaker_from_spans(
     let now_ms = cue_core::clock::now_epoch_ms_string()
         .parse::<i64>()
         .unwrap_or(0);
-    if let Err(e) =
-        db.upsert_meeting_speaker(session_id, speaker_id, &centroid, spans.len() as i64, dur_ms, now_ms)
-    {
+    if let Err(e) = db.upsert_meeting_speaker(
+        session_id,
+        speaker_id,
+        &centroid,
+        spans.len() as i64,
+        dur_ms,
+        now_ms,
+    ) {
         warn!("reassign-span: upsert_meeting_speaker failed: {e:#}");
     } else {
         info!(
