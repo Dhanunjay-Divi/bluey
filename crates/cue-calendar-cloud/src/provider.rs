@@ -1,11 +1,19 @@
 //! Provider configuration — pure data, no I/O.
 //!
 //! Endpoints, scopes, and the PUBLIC client id for each supported OAuth
-//! calendar provider. Client ids are public identifiers (there is NO client
-//! secret in the native public-client flow). Every binary first checks its
-//! runtime environment, then falls back to the id baked into the build. This
-//! lets operators configure an already-built release without putting a client
-//! secret on the desktop or rebuilding Bluey.
+//! calendar provider. Client ids are public identifiers. Every binary first
+//! checks its runtime environment, then falls back to the id baked into the
+//! build. This lets operators configure an already-built release without
+//! rebuilding Bluey.
+//!
+//! Google's Installed/Desktop OAuth clients are additionally issued a
+//! `client_secret` that its token endpoint REQUIRES even under PKCE (a
+//! PKCE-only exchange fails with "client_secret is missing"). Per Google's own
+//! documentation this "secret" is not confidential for installed apps — it is
+//! meant to be embedded in the distributed client. We source it from
+//! `BLUEY_GOOGLE_CLIENT_SECRET` (runtime) or the build-time equivalent, exactly
+//! like the client id, and never commit it to source. Microsoft public clients
+//! are genuinely secret-less and carry no secret.
 
 use anyhow::{bail, Result};
 
@@ -23,6 +31,13 @@ const BUILT_MICROSOFT_CLIENT_ID: &str = match option_env!("BLUEY_MICROSOFT_CLIEN
     None => MICROSOFT_PLACEHOLDER,
 };
 
+/// Compile-time fallback for Google's installed-app client secret (see the
+/// module docs — not confidential for desktop clients). Empty when unset.
+const BUILT_GOOGLE_CLIENT_SECRET: &str = match option_env!("BLUEY_GOOGLE_CLIENT_SECRET") {
+    Some(secret) => secret,
+    None => "",
+};
+
 fn resolve_client_id(runtime_value: Option<String>, built_value: &str) -> String {
     runtime_value
         .map(|value| value.trim().to_string())
@@ -32,6 +47,19 @@ fn resolve_client_id(runtime_value: Option<String>, built_value: &str) -> String
 
 fn configured_client_id(runtime_key: &str, built_value: &str) -> String {
     resolve_client_id(std::env::var(runtime_key).ok(), built_value)
+}
+
+/// Resolve an OAuth client secret: runtime env wins over the build-time value,
+/// and an all-whitespace/empty result becomes `None` (no secret is sent).
+fn configured_client_secret(runtime_key: &str, built_value: &str) -> Option<String> {
+    std::env::var(runtime_key)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let built = built_value.trim();
+            (!built.is_empty()).then(|| built.to_string())
+        })
 }
 
 fn looks_like_microsoft_application_id(value: &str) -> bool {
@@ -65,6 +93,10 @@ pub struct ProviderConfig {
     pub scope: String,
     /// PUBLIC OAuth client id (not a secret).
     pub client_id: String,
+    /// OAuth client secret, sent in the token exchange when present. Required by
+    /// Google's installed-app token endpoint even under PKCE; `None` for
+    /// genuinely secret-less public clients (Microsoft). See module docs.
+    pub client_secret: Option<String>,
     /// Host used in the native loopback redirect. Microsoft public clients are
     /// registered with `http://localhost`; Google desktop clients use the
     /// literal loopback address.
@@ -126,6 +158,10 @@ impl Provider {
                 // calendar data remains strictly read-only.
                 scope: "https://www.googleapis.com/auth/calendar.readonly openid email".to_string(),
                 client_id: configured_client_id("BLUEY_GOOGLE_CLIENT_ID", BUILT_GOOGLE_CLIENT_ID),
+                client_secret: configured_client_secret(
+                    "BLUEY_GOOGLE_CLIENT_SECRET",
+                    BUILT_GOOGLE_CLIENT_SECRET,
+                ),
                 loopback_host: "127.0.0.1".to_string(),
                 // Google only returns a refresh_token when BOTH access_type=offline
                 // and prompt=consent are present on the authorize request.
@@ -149,6 +185,8 @@ impl Provider {
                     "BLUEY_MICROSOFT_CLIENT_ID",
                     BUILT_MICROSOFT_CLIENT_ID,
                 ),
+                // Microsoft public clients are genuinely secret-less under PKCE.
+                client_secret: None,
                 loopback_host: "localhost".to_string(),
                 extra_authorize_params: vec![("prompt".to_string(), "select_account".to_string())],
             },

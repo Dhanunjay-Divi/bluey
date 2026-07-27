@@ -22,6 +22,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO="$PWD"
 
+# Load local OAuth client credentials (gitignored) so both the build
+# (compile-time option_env! fallbacks) and the launched daemon (runtime
+# std::env::var) see BLUEY_GOOGLE_CLIENT_ID / BLUEY_GOOGLE_CLIENT_SECRET /
+# BLUEY_MICROSOFT_CLIENT_ID without the operator re-exporting them each session.
+# Absent file is fine — a release configured another way just skips this.
+if [[ -f "$REPO/.bluey.env" ]]; then
+  # shellcheck disable=SC1091
+  source "$REPO/.bluey.env"
+  echo "reinstall-dev: loaded OAuth credentials from .bluey.env"
+fi
+
 # On Apple Silicon the default rustup toolchain is x86_64; its emulated binaries
 # silently misbehave (ort/Parakeet). ALWAYS build the native arm64 target. On an
 # Intel Mac this resolves to the x86_64 triple.

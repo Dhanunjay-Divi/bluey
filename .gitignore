@@ -31,3 +31,9 @@ server/*.db-wal
 
 # Local Claude Code session config and personal agent rules.
 .claude/
+
+# Local OAuth client credentials (public client ids + Google installed-app
+# secret). Injected into the daemon environment at launch; never committed.
+.bluey.env
+.env
+.env.local

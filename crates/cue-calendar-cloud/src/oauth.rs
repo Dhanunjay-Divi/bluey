@@ -48,8 +48,10 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// POST the token endpoint (form-encoded, no client secret) and parse the JSON
-/// response. Shared by exchange + refresh.
+/// POST the token endpoint (form-encoded) and parse the JSON response. Shared by
+/// exchange + refresh. A `client_secret` is included only when the provider
+/// supplies one (Google installed-app clients require it even under PKCE;
+/// Microsoft public clients omit it).
 async fn post_token_form(token_url: &str, form: &[(&str, &str)]) -> Result<TokenResponse> {
     let client = reqwest::Client::builder()
         .timeout(HTTP_TIMEOUT)
@@ -109,24 +111,30 @@ pub async fn exchange_code(
     code: &str,
     verifier: &str,
 ) -> Result<TokenResponse> {
-    let form = [
+    let mut form = vec![
         ("grant_type", "authorization_code"),
         ("code", code),
         ("redirect_uri", redirect_uri),
         ("client_id", cfg.client_id.as_str()),
         ("code_verifier", verifier),
     ];
+    if let Some(secret) = cfg.client_secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
     post_token_form(&cfg.token_url, &form).await
 }
 
 /// Refresh an access token (`grant_type=refresh_token`). Google may omit a new
 /// refresh_token in the response — callers keep the prior one in that case.
 pub async fn refresh(cfg: &ProviderConfig, refresh_token: &str) -> Result<TokenResponse> {
-    let form = [
+    let mut form = vec![
         ("grant_type", "refresh_token"),
         ("refresh_token", refresh_token),
         ("client_id", cfg.client_id.as_str()),
     ];
+    if let Some(secret) = cfg.client_secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
     post_token_form(&cfg.token_url, &form).await
 }
 
@@ -482,7 +490,33 @@ mod tests {
             form.get("code_verifier").map(String::as_str),
             Some("verifier-._~")
         );
+        // No secret configured in the test env → PKCE-only form (Microsoft-style).
         assert!(!form.contains_key("client_secret"));
+    }
+
+    #[tokio::test]
+    async fn exchange_code_includes_client_secret_when_provider_supplies_one() {
+        let response = r#"{"access_token":"a","refresh_token":"r","expires_in":1800}"#;
+        let (token_url, server) = spawn_token_endpoint(200, response).await;
+        let mut cfg = configured(Provider::Google);
+        cfg.token_url = token_url;
+        cfg.client_secret = Some("GOCSPX-installed-app-secret".to_string());
+
+        exchange_code(&cfg, "http://127.0.0.1:49152", "code", "verifier")
+            .await
+            .expect("exchange with installed-app secret");
+
+        let request = server.await.expect("mock token endpoint task");
+        let form = url::form_urlencoded::parse(request.body.as_bytes())
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            form.get("client_secret").map(String::as_str),
+            Some("GOCSPX-installed-app-secret"),
+            "Google installed-app token exchange must send client_secret"
+        );
+        // The PKCE verifier is still present — secret augments PKCE, not replaces.
+        assert_eq!(form.get("code_verifier").map(String::as_str), Some("verifier"));
     }
 
     #[tokio::test]
