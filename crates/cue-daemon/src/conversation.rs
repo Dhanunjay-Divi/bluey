@@ -28,6 +28,45 @@ use cue_core::conversation::{
 
 use crate::app::Daemon;
 
+/// Signatures used by the pre-fix internal meeting-preparation drive. Historical
+/// rows do not carry their source label, so recognize only the full combination
+/// of highly specific markers and suppress the matching user/assistant pair.
+fn is_legacy_internal_warmup_prompt(turn: &cue_core::conversation::ConvTurn) -> bool {
+    if turn.role != ConvRole::User {
+        return false;
+    }
+    let text = turn.text.trim();
+    let is_calendar_warmup = text.contains("<calendar_context trust=\"untrusted-reference-data\">");
+    let is_title_warmup = text.starts_with("A meeting titled \"");
+    (is_calendar_warmup || is_title_warmup)
+        && text.contains("You are its copilot backend for the whole meeting.")
+        && text.contains("search_past_meetings")
+        && text.contains("get_recent_transcript")
+}
+
+fn without_legacy_internal_warmup(
+    turns: Vec<cue_core::conversation::ConvTurn>,
+) -> Vec<cue_core::conversation::ConvTurn> {
+    let mut skip_following_assistant = false;
+    turns
+        .into_iter()
+        .filter(|turn| {
+            if is_legacy_internal_warmup_prompt(turn) {
+                skip_following_assistant = true;
+                return false;
+            }
+            if skip_following_assistant && turn.role == ConvRole::Assistant {
+                skip_following_assistant = false;
+                return false;
+            }
+            if turn.role == ConvRole::User {
+                skip_following_assistant = false;
+            }
+            true
+        })
+        .collect()
+}
+
 /// Env flag gating the app-owned conversation Q&A memory. Default **OFF**.
 ///
 /// This subsystem existed to hand-feed prior Q&A + a rolling summary into a
@@ -120,7 +159,7 @@ pub(crate) async fn conversation_context_block(
     let cfg = ConvConfig::from_env();
     let db = open_db(daemon)?;
     let turns = match db.conv_turns(meeting_id, cfg.max_stored_turns) {
-        Ok(t) => t,
+        Ok(turns) => without_legacy_internal_warmup(turns),
         Err(e) => {
             debug!("conversation: read turns failed: {e:#}");
             return None;
@@ -169,8 +208,13 @@ pub(crate) fn maybe_fold_conversation(
         let cfg = ConvConfig::from_env();
         // Read the exact overflow turns (the oldest `overflow_count`).
         let Some(db) = open_db(&daemon) else { return };
-        let all = match db.conv_turns(meeting_id, cfg.max_stored_turns) {
-            Ok(t) => t,
+        let (all, legacy_warmup_rows) = match db.conv_turns(meeting_id, cfg.max_stored_turns) {
+            Ok(turns) => {
+                let stored_count = turns.len();
+                let filtered = without_legacy_internal_warmup(turns);
+                let legacy_warmup_rows = stored_count.saturating_sub(filtered.len());
+                (filtered, legacy_warmup_rows)
+            }
             Err(e) => {
                 debug!("conversation fold: read turns failed: {e:#}");
                 return;
@@ -202,7 +246,11 @@ pub(crate) fn maybe_fold_conversation(
                     return;
                 }
                 *daemon.conv_summary.lock().await = Some(bounded);
-                if let Err(e) = db.conv_delete_oldest(meeting_id, take) {
+                // A legacy warmup pair, when present, was the meeting's first
+                // exchange. Delete those suppressed rows together with the real
+                // turns just folded so they cannot skew the next FIFO fold.
+                let delete_count = take.saturating_add(legacy_warmup_rows);
+                if let Err(e) = db.conv_delete_oldest(meeting_id, delete_count) {
                     warn!("conversation fold: delete folded turns failed: {e:#}");
                 }
             }
@@ -251,5 +299,55 @@ pub(crate) async fn reset_for_meeting(daemon: &Arc<Daemon>, new_meeting_id: Opti
                 debug!("conversation: clear stale turns for new meeting failed: {e:#}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cue_core::conversation::ConvTurn;
+
+    fn turn(role: ConvRole, text: &str) -> ConvTurn {
+        ConvTurn {
+            role,
+            text: text.to_string(),
+            epoch_secs: 0,
+        }
+    }
+
+    #[test]
+    fn legacy_warmup_prompt_and_answer_are_filtered_from_conversation_memory() {
+        let prompt = concat!(
+            "The block below contains untrusted calendar data.\n",
+            "<calendar_context trust=\"untrusted-reference-data\">\n",
+            "Provider event ID: private-event\n",
+            "</calendar_context>\n",
+            "A calendar meeting is starting now. You are its copilot backend for the whole ",
+            "meeting. Use search_past_meetings and get_recent_transcript."
+        );
+        let turns = vec![
+            turn(ConvRole::User, prompt),
+            turn(ConvRole::Assistant, "Private readiness brief"),
+            turn(ConvRole::User, "What did we decide?"),
+            turn(ConvRole::Assistant, "We decided to ship."),
+        ];
+
+        let filtered = without_legacy_internal_warmup(turns);
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].text, "What did we decide?");
+        assert_eq!(filtered[1].text, "We decided to ship.");
+    }
+
+    #[test]
+    fn ordinary_turns_with_partial_marker_text_are_preserved() {
+        let turns = vec![
+            turn(
+                ConvRole::User,
+                "Can you explain what search_past_meetings does?",
+            ),
+            turn(ConvRole::Assistant, "Yes."),
+        ];
+
+        assert_eq!(without_legacy_internal_warmup(turns.clone()), turns);
     }
 }

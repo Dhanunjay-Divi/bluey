@@ -9,13 +9,46 @@ import { getClient } from "./lib";
 import type { MeetingBanner } from "./lib/types";
 import { MeetingBannerCard } from "./components/MeetingBannerCard";
 
-/** Hide the native banner window (reused for the next meeting, so hide ≠ close). */
-async function hideBannerWindow() {
+function parseBanner(raw: string): MeetingBanner | null {
+  try {
+    const c = JSON.parse(raw) as {
+      event_id: string;
+      title: string;
+      start_epoch_secs: number;
+      end_epoch_secs: number;
+      participant_count: number;
+      accepted_count: number;
+      online: boolean;
+    };
+    return {
+      eventId: c.event_id,
+      title: c.title,
+      startEpochSecs: c.start_epoch_secs,
+      endEpochSecs: c.end_epoch_secs,
+      participantCount: c.participant_count,
+      acceptedCount: c.accepted_count,
+      online: c.online,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Advance the occurrence queue; the native window hides only when it is empty. */
+async function advanceBannerWindow(
+  eventId: string,
+  startEpochSecs: number,
+): Promise<MeetingBanner | null> {
   try {
     const { invoke } = await import("@tauri-apps/api/core");
-    await invoke("hide_banner");
+    const next = await invoke<string | null>("hide_banner", {
+      eventId,
+      startEpochSecs,
+    });
+    return next ? parseBanner(next) : null;
   } catch {
     // Not in Tauri (dev/preview) — nothing to hide.
+    return null;
   }
 }
 
@@ -38,25 +71,11 @@ export function BannerWindow() {
         const { invoke } = await import("@tauri-apps/api/core");
         const raw = await invoke<string | null>("get_pending_banner");
         if (raw) {
-          const c = JSON.parse(raw) as {
-            event_id: string;
-            title: string;
-            start_epoch_secs: number;
-            end_epoch_secs: number;
-            participant_count: number;
-            accepted_count: number;
-            online: boolean;
-          };
-          setBanner({
-            eventId: c.event_id,
-            title: c.title,
-            startEpochSecs: c.start_epoch_secs,
-            endEpochSecs: c.end_epoch_secs,
-            participantCount: c.participant_count,
-            acceptedCount: c.accepted_count,
-            online: c.online,
-          });
-          return; // got it — stop polling
+          const pending = parseBanner(raw);
+          if (pending) {
+            setBanner(pending);
+            return; // got it — stop polling
+          }
         }
       } catch {
         // not in Tauri / command missing — ignore
@@ -81,14 +100,18 @@ export function BannerWindow() {
     <MeetingBannerCard
       banner={banner}
       onWarmUp={() => {
-        client.respondMeetingPrep(banner.eventId, true);
+        client.respondMeetingPrep(banner.eventId, banner.startEpochSecs, true);
         setBanner(null);
-        void hideBannerWindow();
+        void advanceBannerWindow(banner.eventId, banner.startEpochSecs).then(
+          setBanner,
+        );
       }}
       onDismiss={() => {
-        client.respondMeetingPrep(banner.eventId, false);
+        client.respondMeetingPrep(banner.eventId, banner.startEpochSecs, false);
         setBanner(null);
-        void hideBannerWindow();
+        void advanceBannerWindow(banner.eventId, banner.startEpochSecs).then(
+          setBanner,
+        );
       }}
     />
   );

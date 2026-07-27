@@ -10,8 +10,11 @@
 //! lines convert epoch↔UTC calendar for the `startDateTime`/`endDateTime` query
 //! window and to parse Graph's `start.dateTime`. With the
 //! `Prefer: outlook.timezone="UTC"` request header, Graph returns those times in
-//! UTC, so we parse the wall-clock components as UTC directly.
+//! UTC, so we parse the wall-clock components as UTC directly. The same header
+//! requests immutable event ids so moves between calendars do not change the
+//! cache/dedupe identity.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,10 +22,10 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use crate::oauth::{connect_interactive, valid_access_token};
+use crate::oauth::{connect_interactive, valid_access_token_serialized};
 use crate::provider::Provider;
 use crate::tokens::{CalTokenStore, CalTokens, KeyringCalStore};
-use cue_core::calendar::{CalendarSource, Participant, UpcomingEvent};
+use cue_core::calendar::{CalendarProvider, CalendarSource, Participant, UpcomingEvent};
 
 /// Default lookahead window (seconds) for the calendar view: 10 minutes, enough
 /// to arm the warmup trigger ahead of a meeting start.
@@ -30,10 +33,16 @@ pub const DEFAULT_LOOKAHEAD_SECS: u64 = 600;
 
 /// How often the background task refreshes the cached snapshot.
 const REFRESH_INTERVAL_SECS: u64 = 45;
+/// Graph delta tokens are bound to their initial calendar-view range. Rebuild
+/// the baseline periodically so the 10-minute lookahead continues to advance.
+const BASELINE_REFRESH_SECS: u64 = 300;
+const MAX_PAGES_PER_SYNC: usize = 100;
 
 /// Microsoft Graph base (v1.0, NOT beta).
-const GRAPH_CALENDAR_VIEW_URL: &str = "https://graph.microsoft.com/v1.0/me/calendarView";
+const GRAPH_CALENDAR_DELTA_URL: &str = "https://graph.microsoft.com/v1.0/me/calendarView/delta";
 const GRAPH_ME_URL: &str = "https://graph.microsoft.com/v1.0/me";
+const GRAPH_CALENDAR_PREFER: &str =
+    "outlook.timezone=\"UTC\", IdType=\"ImmutableId\", odata.maxpagesize=100";
 
 // --- Graph JSON shapes ---------------------------------------------------
 
@@ -41,6 +50,8 @@ const GRAPH_ME_URL: &str = "https://graph.microsoft.com/v1.0/me";
 struct CalendarViewResponse {
     #[serde(default)]
     value: Vec<GraphEvent>,
+    #[serde(rename = "@odata.nextLink", default)]
+    next_link: Option<String>,
     #[serde(rename = "@odata.deltaLink", default)]
     delta_link: Option<String>,
 }
@@ -90,6 +101,10 @@ struct GraphLocation {
 struct GraphOnlineMeeting {
     #[serde(rename = "joinUrl", default)]
     join_url: Option<String>,
+    /// The conference id exposed by Graph's `onlineMeetingInfo` event field.
+    /// This is distinct from both the Graph event id and the unstable join URL.
+    #[serde(rename = "conferenceId", default)]
+    conference_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -277,6 +292,9 @@ fn map_event(ev: GraphEvent) -> Option<UpcomingEvent> {
     if ev.removed.is_some() {
         return None;
     }
+    if ev.id.trim().is_empty() {
+        return None;
+    }
     let start_epoch_secs = ev
         .start
         .as_ref()
@@ -351,21 +369,30 @@ fn map_event(ev: GraphEvent) -> Option<UpcomingEvent> {
         .unwrap_or(0);
 
     let description = ev.body_preview.unwrap_or_default();
-    let location = ev
-        .location
-        .and_then(|l| l.display_name)
+    let location = ev.location.and_then(|l| l.display_name).unwrap_or_default();
+    let meeting_id = ev
+        .online_meeting
+        .as_ref()
+        .and_then(|meeting| meeting.conference_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
         .unwrap_or_default();
     // Join URL: the Teams `onlineMeeting.joinUrl`, else a URL sniffed from the
     // location text (a pasted Zoom/Meet link).
     let join_url = ev
         .online_meeting
-        .and_then(|m| m.join_url)
+        .as_ref()
+        .and_then(|meeting| meeting.join_url.clone())
         .filter(|s| !s.trim().is_empty())
         .or_else(|| super::google::sniff_url(&location))
         .unwrap_or_default();
 
     Some(UpcomingEvent {
+        provider_event_id: ev.id.clone(),
         id: ev.id,
+        provider: CalendarProvider::Microsoft,
+        meeting_id,
         title: ev.subject.unwrap_or_default(),
         start_epoch_secs,
         end_epoch_secs,
@@ -392,24 +419,94 @@ fn map_ms_response(s: Option<&str>) -> cue_core::calendar::ResponseStatus {
 
 /// Parse a full Graph `calendarView` JSON body into `UpcomingEvent`s, skipping
 /// any item that fails to map (fail-soft per item).
+#[cfg(test)]
 fn parse_calendar_view(body: &str) -> Result<Vec<UpcomingEvent>> {
     let parsed: CalendarViewResponse =
         serde_json::from_str(body).context("parse Graph calendarView JSON")?;
     Ok(parsed.value.into_iter().filter_map(map_event).collect())
 }
 
+fn event_changes(events: Vec<GraphEvent>) -> (Vec<UpcomingEvent>, Vec<String>) {
+    let mut upserts = Vec::new();
+    let mut removed_ids = Vec::new();
+    for event in events {
+        if event.removed.is_some() {
+            if !event.id.trim().is_empty() {
+                removed_ids.push(event.id);
+            }
+            continue;
+        }
+        if let Some(event) = map_event(event) {
+            upserts.push(event);
+        }
+    }
+    (upserts, removed_ids)
+}
+
+fn apply_event_changes(
+    cache: &mut HashMap<String, UpcomingEvent>,
+    upserts: Vec<UpcomingEvent>,
+    removed_ids: Vec<String>,
+    replace: bool,
+) {
+    if replace {
+        cache.clear();
+    }
+    for id in removed_ids {
+        cache.remove(&id);
+    }
+    for event in upserts {
+        cache.insert(event.id.clone(), event);
+    }
+}
+
+fn snapshot_from_cache(
+    cache: &HashMap<String, UpcomingEvent>,
+    now_epoch: u64,
+) -> Vec<UpcomingEvent> {
+    let mut events = cache
+        .values()
+        .filter(|event| {
+            event.start_epoch_secs >= now_epoch
+                && event.start_epoch_secs <= now_epoch.saturating_add(DEFAULT_LOOKAHEAD_SECS)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event.start_epoch_secs);
+    events
+}
+
+fn validate_graph_delta_url(url: &str) -> Result<()> {
+    let parsed = url::Url::parse(url).context("parse Microsoft Graph delta URL")?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("graph.microsoft.com") {
+        return Err(anyhow!("Microsoft Graph returned an invalid delta URL"));
+    }
+    if parsed.path() != "/v1.0/me/calendarView/delta" {
+        return Err(anyhow!(
+            "Microsoft Graph delta URL used an unexpected resource path"
+        ));
+    }
+    Ok(())
+}
+
+fn with_graph_calendar_preferences(request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    request.header("Prefer", GRAPH_CALENDAR_PREFER)
+}
+
 // --- HTTP calls ----------------------------------------------------------
 
 /// Fetch upcoming events from Graph `calendarView` in `[now, now + lookahead]`.
 ///
-/// Sets `Prefer: outlook.timezone="UTC"` so `start.dateTime` comes back in UTC,
-/// and requests only the fields we map. Fail-soft per item (see
-/// [`parse_calendar_view`]); a transport/HTTP error surfaces as `Err`.
+/// Sets `Prefer: outlook.timezone="UTC", IdType="ImmutableId"` so
+/// `start.dateTime` comes back in UTC and event ids stay stable across calendar
+/// moves, and uses only the query parameters Graph permits on the initial delta
+/// call. Fail-soft per item; a transport/HTTP error surfaces as `Err`.
 /// Outcome of a Microsoft Graph calendar query.
 #[derive(Debug)]
 pub enum FetchMicrosoftEventsOutcome {
     Success {
         events: Vec<UpcomingEvent>,
+        removed_ids: Vec<String>,
         delta_link: Option<String>,
     },
     /// The delta token expired (HTTP 410 GONE); caller must trigger a full resync.
@@ -423,62 +520,67 @@ pub async fn fetch_events_with_delta(
     lookahead_secs: u64,
     delta_url: Option<&str>,
 ) -> Result<FetchMicrosoftEventsOutcome> {
-    let client = reqwest::Client::new();
-    let resp = match delta_url {
-        Some(url) => {
-            client
-                .get(url)
-                .bearer_auth(access_token)
-                .header("Prefer", "outlook.timezone=\"UTC\"")
-                .send()
-                .await
-                .context("GET Graph deltaLink")?
-        }
-        None => {
-            let start = epoch_to_iso8601_utc(now_epoch);
-            let end = epoch_to_iso8601_utc(now_epoch.saturating_add(lookahead_secs));
-            client
-                .get(GRAPH_CALENDAR_VIEW_URL)
-                .query(&[
-                    ("startDateTime", start.as_str()),
-                    ("endDateTime", end.as_str()),
-                    ("$orderby", "start/dateTime"),
-                    ("$top", "50"),
-                    (
-                        "$select",
-                        "id,subject,start,end,attendees,organizer,bodyPreview,location,onlineMeeting,isOnlineMeeting",
-                    ),
-                ])
-                .bearer_auth(access_token)
-                .header("Prefer", "outlook.timezone=\"UTC\"")
-                .send()
-                .await
-                .context("GET Graph calendarView")?
-        }
-    };
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build Microsoft Graph HTTP client")?;
+    let start = epoch_to_iso8601_utc(now_epoch);
+    let end = epoch_to_iso8601_utc(now_epoch.saturating_add(lookahead_secs));
+    let mut next_url = delta_url.map(str::to_string);
+    let mut events = Vec::new();
+    let mut removed_ids = Vec::new();
 
-    let status = resp.status();
-    if status == reqwest::StatusCode::GONE {
-        return Ok(FetchMicrosoftEventsOutcome::TokenGone);
+    for _ in 0..MAX_PAGES_PER_SYNC {
+        let request = if let Some(url) = next_url.as_deref() {
+            validate_graph_delta_url(url)?;
+            client.get(url)
+        } else {
+            client.get(GRAPH_CALENDAR_DELTA_URL).query(&[
+                ("startDateTime", start.as_str()),
+                ("endDateTime", end.as_str()),
+            ])
+        };
+        let response = with_graph_calendar_preferences(request.bearer_auth(access_token))
+            .send()
+            .await
+            .context("GET Microsoft Graph calendar delta")?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::GONE {
+            return Ok(FetchMicrosoftEventsOutcome::TokenGone);
+        }
+        let body = response
+            .text()
+            .await
+            .context("read Microsoft Graph response body")?;
+        if !status.is_success() {
+            return Err(anyhow!("Microsoft Graph Calendar returned HTTP {status}"));
+        }
+
+        let parsed: CalendarViewResponse =
+            serde_json::from_str(&body).context("parse Graph calendar delta JSON")?;
+        let (page_events, page_removed_ids) = event_changes(parsed.value);
+        events.extend(page_events);
+        removed_ids.extend(page_removed_ids);
+
+        if let Some(url) = parsed.next_link {
+            validate_graph_delta_url(&url)?;
+            next_url = Some(url);
+            continue;
+        }
+        if let Some(url) = parsed.delta_link.as_deref() {
+            validate_graph_delta_url(url)?;
+        }
+        return Ok(FetchMicrosoftEventsOutcome::Success {
+            events,
+            removed_ids,
+            delta_link: parsed.delta_link,
+        });
     }
 
-    let body = resp
-        .text()
-        .await
-        .context("read Graph response body")?;
-    if !status.is_success() {
-        return Err(anyhow!("Graph calendar endpoint returned {status}: {body}"));
-    }
-
-    let parsed: CalendarViewResponse =
-        serde_json::from_str(&body).context("parse Graph calendarView JSON")?;
-    let delta_link = parsed.delta_link;
-    let events = parsed.value.into_iter().filter_map(map_event).collect();
-
-    Ok(FetchMicrosoftEventsOutcome::Success {
-        events,
-        delta_link,
-    })
+    Err(anyhow!(
+        "Microsoft Graph pagination exceeded {MAX_PAGES_PER_SYNC} pages"
+    ))
 }
 
 /// Fetch upcoming events from the primary calendar as `UpcomingEvent`s.
@@ -498,7 +600,10 @@ pub async fn fetch_events(
 /// Reads `mail`, falling back to `userPrincipalName`. Any error yields an empty
 /// string (the email is only a UI label), so callers can `unwrap_or_default`.
 pub async fn fetch_email(access_token: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("build Graph profile HTTP client")?;
     let resp = client
         .get(GRAPH_ME_URL)
         .bearer_auth(access_token)
@@ -506,10 +611,10 @@ pub async fn fetch_email(access_token: &str) -> Result<String> {
         .await
         .context("GET Graph /me")?;
     let status = resp.status();
-    let body = resp.text().await.context("read Graph /me response body")?;
     if !status.is_success() {
-        return Err(anyhow!("Graph /me returned {status}: {body}"));
+        return Err(anyhow!("Graph /me returned HTTP {status}"));
     }
+    let body = resp.text().await.context("read Graph /me response body")?;
     let me: GraphMe = serde_json::from_str(&body).context("parse Graph /me JSON")?;
     Ok(me
         .mail
@@ -528,42 +633,103 @@ pub async fn fetch_email(access_token: &str) -> Result<String> {
 /// good snapshot is retained and a warning is logged.
 pub struct MicrosoftCalendarSource {
     snapshot: Arc<Mutex<Vec<UpcomingEvent>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl MicrosoftCalendarSource {
     /// Spawn the background refresh task on `handle` and return the source.
     ///
     /// `store` supplies (and persists refreshed) tokens; the task calls
-    /// [`valid_access_token`] then [`fetch_events`] each tick.
-    pub fn spawn(store: Arc<dyn CalTokenStore>, handle: tokio::runtime::Handle) -> Self {
+    /// [`valid_access_token`] then [`fetch_events`] each tick until shutdown.
+    pub fn spawn(
+        store: Arc<dyn CalTokenStore>,
+        token_operation: Arc<tokio::sync::Mutex<()>>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
         let snapshot: Arc<Mutex<Vec<UpcomingEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let task_snapshot = Arc::clone(&snapshot);
+        let task_snapshot = Arc::downgrade(&snapshot);
         let cfg = Provider::Microsoft.config();
 
-        handle.spawn(async move {
+        let task = handle.spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(REFRESH_INTERVAL_SECS));
             let mut delta_link: Option<String> = None;
+            let mut baseline_started_at = 0u64;
+            let mut event_cache: HashMap<String, UpcomingEvent> = HashMap::new();
 
             loop {
                 ticker.tick().await;
+                let Some(task_snapshot) = task_snapshot.upgrade() else {
+                    break;
+                };
                 let now = now_epoch_secs();
-                match valid_access_token(store.as_ref(), &cfg, now).await {
+                match valid_access_token_serialized(
+                    store.as_ref(),
+                    &cfg,
+                    now,
+                    token_operation.as_ref(),
+                )
+                .await
+                {
                     Ok(token) => {
-                        match fetch_events_with_delta(&token, now, DEFAULT_LOOKAHEAD_SECS, delta_link.as_deref()).await {
-                            Ok(FetchMicrosoftEventsOutcome::Success { events, delta_link: new_link }) => {
-                                if let Some(link) = new_link {
-                                    delta_link = Some(link);
+                        let baseline_due = delta_link.is_none()
+                            || now
+                                >= baseline_started_at.saturating_add(BASELINE_REFRESH_SECS);
+                        let request_link = if baseline_due {
+                            None
+                        } else {
+                            delta_link.as_deref()
+                        };
+                        match fetch_events_with_delta(
+                            &token,
+                            now,
+                            DEFAULT_LOOKAHEAD_SECS,
+                            request_link,
+                        )
+                        .await
+                        {
+                            Ok(FetchMicrosoftEventsOutcome::Success {
+                                events,
+                                removed_ids,
+                                delta_link: new_link,
+                            }) => {
+                                apply_event_changes(
+                                    &mut event_cache,
+                                    events,
+                                    removed_ids,
+                                    baseline_due,
+                                );
+                                if baseline_due {
+                                    baseline_started_at = now;
                                 }
-                                *task_snapshot.lock().await = events;
+                                delta_link = new_link;
+                                *task_snapshot.lock().await =
+                                    snapshot_from_cache(&event_cache, now);
                             }
                             Ok(FetchMicrosoftEventsOutcome::TokenGone) => {
                                 tracing::info!("Microsoft Graph deltaLink expired (410 GONE) — performing baseline resync");
                                 delta_link = None;
-                                if let Ok(FetchMicrosoftEventsOutcome::Success { events, delta_link: new_link }) =
-                                    fetch_events_with_delta(&token, now, DEFAULT_LOOKAHEAD_SECS, None).await
+                                if let Ok(FetchMicrosoftEventsOutcome::Success {
+                                    events,
+                                    removed_ids,
+                                    delta_link: new_link,
+                                }) = fetch_events_with_delta(
+                                    &token,
+                                    now,
+                                    DEFAULT_LOOKAHEAD_SECS,
+                                    None,
+                                )
+                                .await
                                 {
+                                    apply_event_changes(
+                                        &mut event_cache,
+                                        events,
+                                        removed_ids,
+                                        true,
+                                    );
+                                    baseline_started_at = now;
                                     delta_link = new_link;
-                                    *task_snapshot.lock().await = events;
+                                    *task_snapshot.lock().await =
+                                        snapshot_from_cache(&event_cache, now);
                                 }
                             }
                             Err(e) => tracing::warn!(
@@ -580,33 +746,67 @@ impl MicrosoftCalendarSource {
             }
         });
 
-        Self { snapshot }
+        Self {
+            snapshot,
+            task: Some(task),
+        }
     }
 
-    /// Connect Microsoft interactively: run the PKCE/loopback flow, enrich the
-    /// account email via Graph `/me`, persist to the Microsoft keyring, and
-    /// return the tokens (already saved). `open_browser` is the daemon's
-    /// browser shell-out (injected so this crate has no browser dependency).
-    pub async fn connect(open_browser: impl Fn(&str)) -> Result<CalTokens> {
+    /// Cancel and join the poller before credential removal. This prevents an
+    /// in-flight access-token refresh from recreating a cleared keychain entry.
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Authorize Microsoft interactively and enrich the account email without
+    /// persisting. The daemon stops the old poller before it installs these
+    /// credentials, preventing stale refresh-token writes during reconnect.
+    pub async fn authorize(open_browser: impl FnOnce(&str) -> Result<()>) -> Result<CalTokens> {
         let mut tokens = connect_interactive(Provider::Microsoft, open_browser).await?;
         // Best-effort email enrichment (the flow returns an empty email).
         if let Ok(email) = fetch_email(&tokens.access).await {
             tokens.email = email;
         }
+        Ok(tokens)
+    }
+
+    /// Backward-compatible standalone connect. Daemon reconnects use
+    /// [`Self::authorize`] so lifecycle ordering stays under one owner.
+    pub async fn connect(open_browser: impl FnOnce(&str) -> Result<()>) -> Result<CalTokens> {
+        let tokens = Self::authorize(open_browser).await?;
         let store = KeyringCalStore::new(Provider::Microsoft.keyring_service());
         store.save(&tokens)?;
         Ok(tokens)
     }
 }
 
+impl Drop for MicrosoftCalendarSource {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
 impl CalendarSource for MicrosoftCalendarSource {
-    fn upcoming(&self, _now_epoch_secs: u64) -> Vec<UpcomingEvent> {
+    fn upcoming(&self, now_epoch_secs: u64) -> Vec<UpcomingEvent> {
         // Clone the cached snapshot without blocking: try_lock avoids any stall
         // if the background task momentarily holds the lock (it only holds it to
         // swap in a fresh Vec). On contention we return an empty list this tick
         // (fail-soft) rather than block the daemon poll.
         match self.snapshot.try_lock() {
-            Ok(guard) => guard.clone(),
+            Ok(guard) => guard
+                .iter()
+                .filter(|event| {
+                    event.start_epoch_secs >= now_epoch_secs
+                        && event.start_epoch_secs
+                            <= now_epoch_secs.saturating_add(DEFAULT_LOOKAHEAD_SECS)
+                })
+                .cloned()
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -670,13 +870,18 @@ mod tests {
               "id": "AAMkEVT1",
               "subject": "Weekly Sync",
               "start": { "dateTime": "2026-07-17T15:00:00.0000000", "timeZone": "UTC" },
+              "onlineMeeting": {
+                "conferenceId": "987654321",
+                "joinUrl": "https://teams.microsoft.com/l/meetup-join/opaque-token"
+              },
               "organizer": {
                 "emailAddress": { "name": "Alice Organizer", "address": "alice@contoso.com" }
               },
               "attendees": [
                 {
                   "type": "required",
-                  "emailAddress": { "name": "Bob Attendee", "address": "bob@contoso.com" }
+                  "emailAddress": { "name": "Bob Attendee", "address": "bob@contoso.com" },
+                  "status": { "response": "accepted" }
                 },
                 {
                   "type": "required",
@@ -691,10 +896,24 @@ mod tests {
         assert_eq!(events.len(), 1);
         let ev = &events[0];
         assert_eq!(ev.id, "AAMkEVT1");
+        assert_eq!(ev.provider, CalendarProvider::Microsoft);
+        assert_eq!(ev.provider_event_id, "AAMkEVT1");
+        assert_eq!(ev.meeting_id, "987654321");
+        assert_eq!(
+            ev.join_url,
+            "https://teams.microsoft.com/l/meetup-join/opaque-token"
+        );
         assert_eq!(ev.title, "Weekly Sync");
         // 2026-07-17T15:00:00Z = 1_784_300_400.
         assert_eq!(ev.start_epoch_secs, 1_784_300_400);
         assert_eq!(ev.participants.len(), 2);
+        let mut attendee_emails = ev
+            .participants
+            .iter()
+            .map(|participant| participant.email.as_str())
+            .collect::<Vec<_>>();
+        attendee_emails.sort_unstable();
+        assert_eq!(attendee_emails, ["alice@contoso.com", "bob@contoso.com"]);
 
         let bob = ev
             .participants
@@ -703,6 +922,7 @@ mod tests {
             .expect("bob present");
         assert_eq!(bob.name, "Bob Attendee");
         assert!(!bob.is_organizer);
+        assert_eq!(bob.response, cue_core::calendar::ResponseStatus::Accepted);
 
         let alice = ev
             .participants
@@ -752,11 +972,101 @@ mod tests {
     }
 
     #[test]
+    fn teams_join_url_is_not_parsed_as_a_meeting_id() {
+        let events = parse_calendar_view(
+            r#"{"value":[{
+                "id":"immutable-event-id",
+                "start":{"dateTime":"2026-07-17T16:30:00Z"},
+                "onlineMeeting":{
+                    "joinUrl":"https://teams.microsoft.com/l/meetup-join/opaque-token"
+                }
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(events[0].id, "immutable-event-id");
+        assert_eq!(
+            events[0].join_url,
+            "https://teams.microsoft.com/l/meetup-join/opaque-token"
+        );
+        assert!(
+            events[0].meeting_id.is_empty(),
+            "meeting id requires Graph's structured conferenceId"
+        );
+    }
+
+    #[test]
     fn parse_calendar_view_empty_value_is_ok() {
         let events = parse_calendar_view(r#"{"value":[]}"#).expect("parse ok");
         assert!(events.is_empty());
         // Missing `value` also fails soft to empty.
         let events = parse_calendar_view(r#"{}"#).expect("parse ok");
         assert!(events.is_empty());
+    }
+
+    #[test]
+    fn incremental_changes_preserve_unchanged_events_and_apply_removals() {
+        let baseline = serde_json::from_str::<CalendarViewResponse>(
+            r#"{"value":[
+                {"id":"keep","subject":"Keep",
+                 "start":{"dateTime":"2026-07-17T16:30:00Z"}},
+                {"id":"change","subject":"Old",
+                 "start":{"dateTime":"2026-07-17T16:31:00Z"}}
+            ]}"#,
+        )
+        .unwrap();
+        let (events, removed) = event_changes(baseline.value);
+        let mut cache = HashMap::new();
+        apply_event_changes(&mut cache, events, removed, true);
+
+        let delta = serde_json::from_str::<CalendarViewResponse>(
+            r#"{"value":[
+                {"id":"change","subject":"New",
+                 "start":{"dateTime":"2026-07-17T16:32:00Z"}},
+                {"id":"keep","@removed":{"reason":"deleted"}}
+            ]}"#,
+        )
+        .unwrap();
+        let (events, removed) = event_changes(delta.value);
+        apply_event_changes(&mut cache, events, removed, false);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache["change"].title, "New");
+        assert!(!cache.contains_key("keep"));
+    }
+
+    #[test]
+    fn graph_delta_url_must_stay_on_official_https_origin() {
+        assert!(validate_graph_delta_url(
+            "https://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=abc"
+        )
+        .is_ok());
+        assert!(validate_graph_delta_url(
+            "https://attacker.example/v1.0/me/calendarView/delta?$deltatoken=abc"
+        )
+        .is_err());
+        assert!(validate_graph_delta_url(
+            "http://graph.microsoft.com/v1.0/me/calendarView/delta?$deltatoken=abc"
+        )
+        .is_err());
+        assert!(validate_graph_delta_url(
+            "https://graph.microsoft.com/v1.0/me/messages?$deltatoken=abc"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn calendar_requests_require_immutable_graph_event_ids() {
+        let request =
+            with_graph_calendar_preferences(reqwest::Client::new().get(GRAPH_CALENDAR_DELTA_URL))
+                .build()
+                .unwrap();
+        let prefer = request
+            .headers()
+            .get("Prefer")
+            .and_then(|value| value.to_str().ok())
+            .expect("Prefer header");
+        assert!(prefer.contains("outlook.timezone=\"UTC\""));
+        assert!(prefer.contains("IdType=\"ImmutableId\""));
+        assert!(prefer.contains("odata.maxpagesize=100"));
     }
 }

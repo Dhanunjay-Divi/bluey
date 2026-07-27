@@ -1,28 +1,31 @@
 //! Transient single-shot loopback listener for the OAuth redirect (RFC 8252).
 //!
 //! The native app can't register a public https redirect, so the provider
-//! redirects the browser back to `http://127.0.0.1:PORT/?code=...&state=...`.
+//! redirects the browser back to a loopback URI with `code` + `state`.
 //! We bind an ephemeral loopback port BEFORE opening the browser (so the caller
 //! can build `redirect_uri` with the real port), then accept exactly one
 //! authorization redirect, verify `state` (CSRF guard), and serve a minimal
 //! "you can close this tab" page. The listener is torn down as soon as the
 //! code arrives — it exists only for the ~60s consent window.
 
-use std::net::SocketAddr;
+use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use url::Url;
 
-/// Bind a transient listener on `127.0.0.1:0` and return it together with the
-/// OS-assigned port, so the caller can build `redirect_uri=http://127.0.0.1:PORT`
-/// before opening the browser.
-pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
-    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let listener = TcpListener::bind(addr)
+/// Bind a transient provider-compatible loopback host and return it with the
+/// OS-assigned port. Google desktop clients use `127.0.0.1`; Microsoft's
+/// mobile/desktop platform registers `localhost`. Binding the same hostname
+/// placed in the redirect URI avoids an IPv4/IPv6 mismatch on Microsoft flows.
+pub async fn bind_loopback(host: &str) -> Result<(TcpListener, u16)> {
+    if !matches!(host, "127.0.0.1" | "localhost") {
+        bail!("unsupported OAuth loopback host");
+    }
+    let listener = TcpListener::bind((host, 0))
         .await
-        .with_context(|| format!("bind loopback OAuth listener on {addr}"))?;
+        .with_context(|| format!("bind loopback OAuth listener on {host}"))?;
     let port = listener
         .local_addr()
         .context("read bound loopback port")?
@@ -40,14 +43,27 @@ pub async fn bind_loopback() -> Result<(TcpListener, u16)> {
 /// `state` mismatches is a hard error (possible CSRF), served a 400.
 pub async fn accept_code(listener: TcpListener, expected_state: &str) -> Result<String> {
     loop {
-        let (mut stream, _peer) = listener
+        let (mut stream, peer) = listener
             .accept()
             .await
             .context("accept OAuth redirect connection")?;
+        if !peer.ip().is_loopback() {
+            tracing::warn!(%peer, "rejected non-loopback OAuth callback");
+            continue;
+        }
 
-        let request_line = match read_request_line(&mut stream).await {
-            Ok(line) => line,
-            Err(error) => {
+        let request_line = match tokio::time::timeout(
+            Duration::from_secs(5),
+            read_request_line(&mut stream),
+        )
+        .await
+        {
+            Ok(Ok(line)) => line,
+            Err(_) => {
+                tracing::debug!("ignoring timed-out loopback request");
+                continue;
+            }
+            Ok(Err(error)) => {
                 tracing::debug!("ignoring unreadable loopback request: {error:#}");
                 continue;
             }
@@ -61,9 +77,8 @@ pub async fn accept_code(listener: TcpListener, expected_state: &str) -> Result<
             }
         };
 
-        let parsed = parse_redirect_query(&target);
-        match parsed {
-            Some(RedirectParams { code, state }) => {
+        match parse_redirect_query(&target) {
+            Some(RedirectResult::Code { code, state }) => {
                 if state.as_deref() != Some(expected_state) {
                     let _ = respond(
                         &mut stream,
@@ -77,11 +92,37 @@ pub async fn accept_code(listener: TcpListener, expected_state: &str) -> Result<
                 let _ = respond(&mut stream, 200, "text/html; charset=utf-8", SUCCESS_PAGE).await;
                 return Ok(code);
             }
+            Some(RedirectResult::Error {
+                error,
+                description,
+                state,
+            }) => {
+                if state.as_deref() != Some(expected_state) {
+                    let _ = respond(
+                        &mut stream,
+                        400,
+                        "text/plain",
+                        "State mismatch. Please retry connecting from Bluey.",
+                    )
+                    .await;
+                    bail!("OAuth state mismatch (possible CSRF); redirect rejected");
+                }
+                let _ = respond(&mut stream, 400, "text/html; charset=utf-8", ERROR_PAGE).await;
+                let description = description
+                    .as_deref()
+                    .map(sanitize_oauth_message)
+                    .filter(|value| !value.is_empty());
+                return Err(match description {
+                    Some(description) => {
+                        anyhow!("authorization was rejected ({error}): {description}")
+                    }
+                    None => anyhow!("authorization was rejected ({error})"),
+                });
+            }
             None => {
-                // No code (favicon, prefetch, or an error redirect we don't
-                // handle here). Acknowledge and keep waiting for the real one.
+                // No OAuth response (favicon, prefetch, or the odd double
+                // request some browsers make). Acknowledge and keep waiting.
                 let _ = respond(&mut stream, 204, "text/plain", "").await;
-                continue;
             }
         }
     }
@@ -89,32 +130,72 @@ pub async fn accept_code(listener: TcpListener, expected_state: &str) -> Result<
 
 /// The minimal success page shown in the browser once the code is captured.
 const SUCCESS_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
 <title>Bluey connected</title></head>\
 <body style=\"font-family:-apple-system,system-ui,sans-serif;text-align:center;padding:3rem\">\
-<h2>You can close this tab.</h2><p>Bluey is connected.</p></body></html>";
+<h2>Calendar connected.</h2><p>You can close this tab and return to Bluey.</p></body></html>";
 
-struct RedirectParams {
-    code: String,
-    state: Option<String>,
+const ERROR_PAGE: &str = "<!doctype html><html><head><meta charset=\"utf-8\">\
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+<title>Bluey connection cancelled</title></head>\
+<body style=\"font-family:-apple-system,system-ui,sans-serif;text-align:center;padding:3rem\">\
+<h2>Calendar was not connected.</h2><p>Return to Bluey to retry or skip this step.</p></body></html>";
+
+enum RedirectResult {
+    Code {
+        code: String,
+        state: Option<String>,
+    },
+    Error {
+        error: String,
+        description: Option<String>,
+        state: Option<String>,
+    },
+}
+
+fn sanitize_oauth_message(message: &str) -> String {
+    message
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(300)
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 /// Read only the HTTP request line (`GET /path?query HTTP/1.1`). We don't need
 /// headers or a body — the auth code rides in the query string.
 async fn read_request_line(stream: &mut TcpStream) -> Result<String> {
-    let mut buf = [0u8; 4096];
-    let n = stream
-        .read(&mut buf)
-        .await
-        .context("read loopback request bytes")?;
-    if n == 0 {
-        bail!("empty loopback request");
+    const MAX_REQUEST_LINE_BYTES: usize = 4_096;
+    let mut line = Vec::with_capacity(512);
+    let mut chunk = [0u8; 512];
+    loop {
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .context("read loopback request bytes")?;
+        if n == 0 {
+            bail!("incomplete loopback request line");
+        }
+        line.extend_from_slice(&chunk[..n]);
+        if let Some(newline) = line.iter().position(|byte| *byte == b'\n') {
+            if newline >= MAX_REQUEST_LINE_BYTES {
+                bail!("loopback request line exceeded {MAX_REQUEST_LINE_BYTES} bytes");
+            }
+            line.truncate(newline);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+            let line = String::from_utf8(line).context("decode loopback request line")?;
+            if line.trim().is_empty() {
+                bail!("empty loopback request line");
+            }
+            return Ok(line);
+        }
+        if line.len() >= MAX_REQUEST_LINE_BYTES {
+            bail!("loopback request line exceeded {MAX_REQUEST_LINE_BYTES} bytes");
+        }
     }
-    let text = String::from_utf8_lossy(&buf[..n]);
-    let line = text
-        .lines()
-        .next()
-        .ok_or_else(|| anyhow!("no request line in loopback request"))?;
-    Ok(line.to_string())
 }
 
 /// Extract the request target (second whitespace-delimited token of the
@@ -123,22 +204,32 @@ fn request_target(request_line: &str) -> Option<String> {
     request_line.split_whitespace().nth(1).map(str::to_string)
 }
 
-/// Parse `code`/`state` out of the request target's query string, if a `code`
-/// is present. Resolves the (relative) target against a dummy loopback base so
-/// the `url` crate can parse the query.
-fn parse_redirect_query(target: &str) -> Option<RedirectParams> {
+/// Parse either a successful `code` response or an OAuth `error` response.
+/// Requests without either field are browser noise and return `None`.
+fn parse_redirect_query(target: &str) -> Option<RedirectResult> {
     let base = Url::parse("http://127.0.0.1/").ok()?;
     let url = base.join(target).ok()?;
     let mut code = None;
     let mut state = None;
-    for (k, v) in url.query_pairs() {
-        match k.as_ref() {
-            "code" => code = Some(v.into_owned()),
-            "state" => state = Some(v.into_owned()),
+    let mut error = None;
+    let mut description = None;
+    for (key, value) in url.query_pairs() {
+        match key.as_ref() {
+            "code" => code = Some(value.into_owned()),
+            "state" => state = Some(value.into_owned()),
+            "error" => error = Some(value.into_owned()),
+            "error_description" => description = Some(value.into_owned()),
             _ => {}
         }
     }
-    code.map(|code| RedirectParams { code, state })
+    if let Some(error) = error {
+        return Some(RedirectResult::Error {
+            error,
+            description,
+            state,
+        });
+    }
+    code.map(|code| RedirectResult::Code { code, state })
 }
 
 /// Write a minimal HTTP/1.1 response and close the connection.
@@ -158,6 +249,9 @@ async fn respond(
         "HTTP/1.1 {status} {reason}\r\n\
          Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
+         Cache-Control: no-store\r\n\
+         Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'\r\n\
+         X-Content-Type-Options: nosniff\r\n\
          Connection: close\r\n\r\n{body}",
         len = body.len(),
     );
@@ -185,8 +279,13 @@ mod tests {
     #[test]
     fn parse_redirect_query_pulls_code_and_state() {
         let params = parse_redirect_query("/?code=the-code&state=the-state").expect("has code");
-        assert_eq!(params.code, "the-code");
-        assert_eq!(params.state.as_deref(), Some("the-state"));
+        match params {
+            RedirectResult::Code { code, state } => {
+                assert_eq!(code, "the-code");
+                assert_eq!(state.as_deref(), Some("the-state"));
+            }
+            RedirectResult::Error { .. } => panic!("expected code"),
+        }
     }
 
     #[test]
@@ -198,19 +297,75 @@ mod tests {
     #[test]
     fn parse_redirect_query_url_decodes_values() {
         let params = parse_redirect_query("/?code=a%2Fb%2Bc&state=s").expect("has code");
-        assert_eq!(params.code, "a/b+c");
+        match params {
+            RedirectResult::Code { code, .. } => assert_eq!(code, "a/b+c"),
+            RedirectResult::Error { .. } => panic!("expected code"),
+        }
+    }
+
+    #[test]
+    fn parse_redirect_query_captures_provider_error() {
+        let params = parse_redirect_query(
+            "/?error=access_denied&error_description=User%20cancelled&state=s",
+        )
+        .expect("has error");
+        match params {
+            RedirectResult::Error {
+                error,
+                description,
+                state,
+            } => {
+                assert_eq!(error, "access_denied");
+                assert_eq!(description.as_deref(), Some("User cancelled"));
+                assert_eq!(state.as_deref(), Some("s"));
+            }
+            RedirectResult::Code { .. } => panic!("expected error"),
+        }
     }
 
     #[tokio::test]
     async fn bind_loopback_returns_nonzero_port() {
-        let (listener, port) = bind_loopback().await.expect("bind");
+        let (listener, port) = bind_loopback("127.0.0.1").await.expect("bind");
         assert_ne!(port, 0);
         assert_eq!(listener.local_addr().unwrap().port(), port);
     }
 
     #[tokio::test]
+    async fn microsoft_localhost_redirect_reaches_the_bound_listener() {
+        let (listener, port) = bind_loopback("localhost").await.expect("bind");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        TcpStream::connect(("localhost", port))
+            .await
+            .expect("connect via the redirect hostname");
+        let (_, peer) = accept.await.expect("join").expect("accept");
+        assert!(peer.ip().is_loopback());
+    }
+
+    #[tokio::test]
+    async fn request_line_can_arrive_in_multiple_tcp_reads() {
+        let (listener, port) = bind_loopback("127.0.0.1").await.expect("bind");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_request_line(&mut stream).await
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        client.write_all(b"GET /?code=frag").await.expect("part 1");
+        tokio::task::yield_now().await;
+        client
+            .write_all(b"mented&state=s HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .expect("part 2");
+        assert_eq!(
+            server.await.expect("join").expect("line"),
+            "GET /?code=fragmented&state=s HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
     async fn accept_code_captures_code_and_verifies_state() {
-        let (listener, port) = bind_loopback().await.expect("bind");
+        let (listener, port) = bind_loopback("127.0.0.1").await.expect("bind");
         let state = "expected-state".to_string();
 
         let server = tokio::spawn({
@@ -240,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_code_rejects_state_mismatch() {
-        let (listener, port) = bind_loopback().await.expect("bind");
+        let (listener, port) = bind_loopback("127.0.0.1").await.expect("bind");
         let server = tokio::spawn(async move { accept_code(listener, "good-state").await });
 
         let mut client = TcpStream::connect(("127.0.0.1", port))
@@ -259,8 +414,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn accept_code_surfaces_provider_denial_without_timeout() {
+        let (listener, port) = bind_loopback("127.0.0.1").await.expect("bind");
+        let server = tokio::spawn(async move { accept_code(listener, "good-state").await });
+
+        let mut client = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect");
+        client
+            .write_all(
+                b"GET /?error=access_denied&error_description=User%20cancelled&state=good-state HTTP/1.1\r\n\r\n",
+            )
+            .await
+            .expect("send");
+        let mut response = Vec::new();
+        let _ = client.read_to_end(&mut response).await;
+        assert!(String::from_utf8_lossy(&response).contains("400"));
+
+        let error = server
+            .await
+            .expect("join")
+            .expect_err("provider denial must fail");
+        assert!(error.to_string().contains("access_denied"));
+        assert!(error.to_string().contains("User cancelled"));
+    }
+
+    #[tokio::test]
     async fn accept_code_ignores_favicon_then_captures_code() {
-        let (listener, port) = bind_loopback().await.expect("bind");
+        let (listener, port) = bind_loopback("127.0.0.1").await.expect("bind");
         let server = tokio::spawn(async move { accept_code(listener, "st").await });
 
         // First: a favicon request with no code — must be ignored (204).

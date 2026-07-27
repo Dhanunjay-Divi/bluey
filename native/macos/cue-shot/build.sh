@@ -13,14 +13,23 @@
 #   - NSScreenCaptureUsageDescription is MANDATORY or macOS kills the app.
 #   - Launch it via `/usr/bin/open -n <BlueyShot.app>` (NOT the inner binary) so
 #     macOS reads the bundle identity and attributes the capture to sh.bluey.shot.
-#   - Ad-hoc signing with a STABLE --identifier keeps the grant across rebuilds
-#     (a per-build content hash would reset it every time).
+#   - A certificate-backed signature keeps the app's code requirement stable
+#     across rebuilds. An ad-hoc signature can still be tied to changing code,
+#     even when its identifier text is pinned.
 #
-# Usage:  bash build.sh
+# Usage:  bash build.sh ["Apple Development: You (TEAMID)"]
 # Result: .build/BlueyShot.app  (launch: open -n .build/BlueyShot.app --args --out <png>)
 set -euo pipefail
 cd "$(dirname "$0")"
 
+SIGN_ID="${1:-${BLUEY_CODESIGN_IDENTITY:-}}"
+if [ -z "$SIGN_ID" ] && command -v security >/dev/null 2>&1; then
+  SIGN_ID="$(
+    security find-identity -v -p codesigning 2>/dev/null \
+      | awk -F '"' '/^[[:space:]]*[0-9]+\)/ && NF >= 2 { print $2; exit }'
+  )" || true
+fi
+SIGN_ID="${SIGN_ID:--}"
 APP=".build/BlueyShot.app"
 # Compile the Swift capture binary (a real Mach-O — a shell wrapper around
 # `screencapture` would attribute the capture to a child process, not this
@@ -52,9 +61,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# `--deep` is required for the bundle to LAUNCH via `open`. A STABLE --identifier
-# keeps the TCC grant across rebuilds (ad-hoc content-hash ids reset it).
-codesign --force --deep --sign - --identifier "sh.bluey.shot" "$APP"
+# `--deep` is required for the bundle to launch via `open`. Prefer a real
+# identity so Screen Recording remains associated with the same designated
+# requirement across rebuilds; retain ad-hoc as a no-certificate fallback.
+if [ "$SIGN_ID" = "-" ]; then
+  codesign --force --deep --sign - --identifier "sh.bluey.shot" "$APP"
+else
+  codesign --force --deep --sign "$SIGN_ID" \
+    --identifier "sh.bluey.shot" \
+    --options runtime \
+    "$APP"
+fi
 
 echo "$APP"
+echo "  signed with: $SIGN_ID"
 echo "  run: open -n $APP --args --out /tmp/shot.png"

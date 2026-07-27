@@ -165,14 +165,14 @@ fn line_too_long_rejected_before_parsing() {
 }
 
 #[test]
-fn attach_files_requested_dropped_when_idle() {
+fn native_picker_files_are_accepted_when_idle() {
     let state = idle_state(); // Idle
     let line =
         format!(r#"{{"type":"attach_files_requested","paths":["/tmp/foo"],"token":"{TOK}"}}"#);
     let result = validate_line(&line, TOK, state.as_ref());
     assert!(
-        matches!(result, Err(OverlayLineReject::StateNotAllowed { .. })),
-        "AttachFilesRequested must be dropped in Idle state, got {result:?}"
+        result.is_ok(),
+        "authenticated native-picker files must be accepted in Idle, got {result:?}"
     );
 }
 
@@ -352,7 +352,7 @@ fn instructions_requested_accepted_from_instructions_open() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn handler_transition_idle_to_attach_open_unblocks_attach_files() {
+fn native_picker_files_do_not_depend_on_legacy_attach_state() {
     // Simulate the wiring in app.rs:
     //   1. Daemon owns Arc<Mutex<OverlayUiState>>.
     //   2. spawn_overlay clones the same Arc into the reader thread.
@@ -363,16 +363,16 @@ fn handler_transition_idle_to_attach_open_unblocks_attach_files() {
     let daemon_state = Arc::new(Mutex::new(OverlayUiState::Idle));
     let reader_state = daemon_state.clone();
 
-    // Step 1: while still Idle, AttachFilesRequested is rejected.
+    // Step 1: the overlay-owned picker returns directly while Idle.
     let line = format!(r#"{{"type":"attach_files_requested","paths":["/tmp/x"],"token":"{TOK}"}}"#);
     let r1 = validate_line(&line, TOK, reader_state.as_ref());
-    assert!(matches!(r1, Err(OverlayLineReject::StateNotAllowed { .. })));
+    assert!(r1.is_ok());
 
     // Step 2: handler-side mutation simulating
     //   *daemon.overlay_ui_state.lock() = OverlayUiState::AttachOpen;
     *daemon_state.lock() = OverlayUiState::AttachOpen;
 
-    // Step 3: reader sees the mutation through its clone of the SAME Arc.
+    // Step 3: the legacy AttachOpen state also remains compatible.
     let r2 = validate_line(&line, TOK, reader_state.as_ref());
     assert!(
         r2.is_ok(),
@@ -381,9 +381,9 @@ fn handler_transition_idle_to_attach_open_unblocks_attach_files() {
 }
 
 #[test]
-fn handler_transition_back_to_idle_blocks_late_attach_files() {
-    // After a successful attach submit, the handler reverts state to Idle.
-    // A late stray AttachFilesRequested (e.g. duplicate event) must be rejected.
+fn returning_to_idle_keeps_native_picker_results_valid() {
+    // After a legacy attach submit, the handler reverts state to Idle. A later
+    // authenticated overlay-owned picker result must still be accepted.
     let daemon_state = Arc::new(Mutex::new(OverlayUiState::AttachOpen));
     let reader_state = daemon_state.clone();
 
@@ -396,9 +396,9 @@ fn handler_transition_back_to_idle_blocks_late_attach_files() {
     // Step 2: handler reverts to Idle after processing the submit.
     *daemon_state.lock() = OverlayUiState::Idle;
 
-    // Step 3: any later stray AttachFilesRequested is rejected.
+    // Step 3: a later result from the overlay-owned picker is accepted.
     let r2 = validate_line(&line, TOK, reader_state.as_ref());
-    assert!(matches!(r2, Err(OverlayLineReject::StateNotAllowed { .. })));
+    assert!(r2.is_ok());
 }
 
 #[test]

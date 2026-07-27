@@ -18,6 +18,7 @@ import type {
   ContextItem,
   ContinueResult,
   FixProposal,
+  ListeningSources,
   ListeningState,
   MeetingBanner,
   MeetingState,
@@ -111,12 +112,16 @@ export interface MeetingClient {
   onMeetingReseed(cb: (state: MeetingState) => void): () => void;
   /** Subscribe to the daemon's MEETING-PREP BANNER pushes — shown ~3 min before a
    *  calendar meeting. The app renders a compact branded banner; the user taps
-   *  "Warm up the meeting" (→ {@link respondMeetingPrep}(id, true), expands to the
-   *  full overlay) or dismisses (→ (id, false)). Returns an unsubscribe fn. */
+   *  "Warm up the meeting" (→ {@link respondMeetingPrep}, expands to the full
+   *  overlay) or dismisses. Returns an unsubscribe fn. */
   onMeetingBanner(cb: (banner: MeetingBanner) => void): () => void;
   /** Answer a meeting-prep banner: `approved` warms the backend + pre-context for
-   *  that calendar event; else it's dismissed. Fire-and-forget. */
-  respondMeetingPrep(eventId: string, approved: boolean): void;
+   *  that exact calendar occurrence; else it's dismissed. Fire-and-forget. */
+  respondMeetingPrep(
+    eventId: string,
+    startEpochSecs: number,
+    approved: boolean,
+  ): void;
 
   // ---- the live loop ----
   /** Subscribe to live transcript lines; returns an unsubscribe fn. */
@@ -232,8 +237,12 @@ export interface MeetingClient {
 
   // ---- listening (mic / system audio capture) ----
   /** Subscribe to the daemon's listening state; returns an unsubscribe fn.
-   *  State mirrors the daemon: idle | connecting | listening | paused | failed. */
-  onListeningState(cb: (state: ListeningState) => void): () => void;
+   *  State mirrors the daemon: idle | connecting | listening | paused | failed
+   *  | permission_denied. Per-source details can also identify a denied
+   *  secondary source while the aggregate state remains listening. */
+  onListeningState(
+    cb: (state: ListeningState, sources?: ListeningSources) => void,
+  ): () => void;
   /** Start audio capture. Optionally select sources (Audio tab toggles);
    *  omitted = both mic + system (the daemon's defaults). */
   startListening(sources?: { microphone?: boolean; system?: boolean }): void;

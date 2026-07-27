@@ -22,6 +22,8 @@ cue-cloud-client = { path = "../cue-cloud-client" }
 fix-path-env = { git = "https://github.com/tauri-apps/fix-path-env-rs", branch = "dev" }
 thiserror.workspace = true
 keyring.workspace = true
+libc.workspace = true
+open = "5.3"
 parking_lot.workspace = true
 async-trait.workspace = true
 bytemuck.workspace = true

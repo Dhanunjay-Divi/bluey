@@ -139,8 +139,35 @@ pub async fn build_stt_chain(
                 Ok(app_paths) => {
                     match super::model_setup::ensure_parakeet_model(&app_paths).await {
                         Ok(paths) => {
-                            let p = super::parakeet::ParakeetProvider::connect(paths, source);
-                            providers.push(Box::new(p));
+                            // Do not publish a provider as Connected until its
+                            // shared weights and first inference window are
+                            // actually ready. Startup prewarm normally makes
+                            // this a cheap cache hit; an immediate Listen click
+                            // waits here instead of launching capture and
+                            // building an unbounded queue of stale audio behind
+                            // the cold model load.
+                            let prewarm_paths = paths.clone();
+                            match tokio::task::spawn_blocking(move || {
+                                super::parakeet::prewarm(&prewarm_paths)
+                            })
+                            .await
+                            {
+                                Ok(Ok(())) => {
+                                    let provider =
+                                        super::parakeet::ParakeetProvider::connect(paths, source);
+                                    providers.push(Box::new(provider));
+                                }
+                                Ok(Err(error)) => tracing::warn!(
+                                    provider = "parakeet",
+                                    error = %error,
+                                    "parakeet model failed to initialize; skipping"
+                                ),
+                                Err(error) => tracing::warn!(
+                                    provider = "parakeet",
+                                    error = %error,
+                                    "parakeet model initialization task failed; skipping"
+                                ),
+                            }
                         }
                         Err(e) => tracing::warn!(
                             provider = "parakeet",
@@ -174,6 +201,47 @@ fn use_mock_stt() -> bool {
     std::env::var("BLUEY_USE_MOCK_STT")
         .map(|v| v == "1")
         .unwrap_or(false)
+}
+
+/// Whether daemon startup should eagerly provision and prewarm Parakeet.
+///
+/// Match the factory's local-backstop policy without forcing a large model
+/// download/resident allocation on users who selected a cloud or LocalWhisper
+/// provider. An explicit `BLUEY_STT_PARAKEET=1` always opts in; an explicit
+/// disable always opts out.
+#[cfg(feature = "parakeet-stt")]
+pub fn should_prewarm_parakeet() -> bool {
+    let parakeet_enabled = is_parakeet_enabled();
+    let forced_on = env_bool("BLUEY_STT_PARAKEET").unwrap_or(false);
+    let mock_enabled = use_mock_stt();
+    let deepgram_configured = env_stt_key().is_some();
+    let openai_configured = is_openai_fallback_enabled() && openai_key().is_some();
+    let local_whisper_configured = is_local_whisper_enabled();
+    prewarm_policy(
+        parakeet_enabled,
+        forced_on,
+        mock_enabled,
+        deepgram_configured,
+        openai_configured,
+        local_whisper_configured,
+    )
+}
+
+#[cfg(feature = "parakeet-stt")]
+fn prewarm_policy(
+    parakeet_enabled: bool,
+    forced_on: bool,
+    mock_enabled: bool,
+    deepgram_configured: bool,
+    openai_configured: bool,
+    local_whisper_configured: bool,
+) -> bool {
+    parakeet_enabled
+        && (forced_on
+            || !(mock_enabled
+                || deepgram_configured
+                || openai_configured
+                || local_whisper_configured))
 }
 
 /// Runtime switch for the on-device Parakeet provider (build-feature-gated too).
@@ -262,5 +330,28 @@ mod tests {
             Some(300)
         );
         assert_eq!(optional_u32_from_value(None, Some(300)), Some(300));
+    }
+
+    #[cfg(feature = "parakeet-stt")]
+    #[test]
+    fn parakeet_prewarm_matches_local_backstop_policy() {
+        assert!(prewarm_policy(true, false, false, false, false, false));
+        assert!(!prewarm_policy(false, false, false, false, false, false));
+
+        for selected_non_parakeet in 0..4 {
+            let mut selected = [false; 4];
+            selected[selected_non_parakeet] = true;
+            assert!(!prewarm_policy(
+                true,
+                false,
+                selected[0],
+                selected[1],
+                selected[2],
+                selected[3],
+            ));
+        }
+
+        // Explicit local preference wins even when a cloud key is present.
+        assert!(prewarm_policy(true, true, false, true, true, true));
     }
 }

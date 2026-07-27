@@ -45,6 +45,10 @@ mkdir -p "$OUT/bin"
 # Lay the flat staged binaries + .app bundles + OpenBLAS dylib under bin/ (the
 # layout install.sh expects). cp -R carries the .app bundles and any dylib.
 cp -R "$STAGED"/. "$OUT/bin"/
+if [[ "$(uname -s)" == "Darwin" && -d "$OUT/bin/BlueyAudio.app" ]]; then
+  BLUEY_VERIFY_LAUNCH=1 \
+    bash native/macos/cue-audio/verify-app.sh "$OUT/bin/BlueyAudio.app"
+fi
 
 # Ship the question-detection classifier next to the daemon binary
 # (bin/models/qdetect-en — the daemon's exe-adjacent resolution path). It is

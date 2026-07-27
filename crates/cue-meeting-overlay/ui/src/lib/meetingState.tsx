@@ -42,6 +42,7 @@ import {
 } from "./transcriptGrouping";
 import type {
   AnswerStatusStep,
+  AudioPermissionSource,
   ContextItem,
   FixProposal,
   ListeningState,
@@ -121,6 +122,20 @@ interface MeetingStateValue {
    *  here so it survives the collapse→expand remount. */
   micInputOn: boolean;
   setMicInputOn: (on: boolean) => void;
+  /** Whether call/system audio is selected. Kept beside mic state so minimizing
+   *  and re-expanding the conditional screen cannot reset one source while the
+   *  daemon continues capturing it. */
+  systemInputOn: boolean;
+  setSystemInputOn: (on: boolean) => void;
+  /** Which source is blocked by an OS privacy gate, when the daemon can
+   *  identify it. Null preserves compatibility with older daemon builds. */
+  permissionDeniedSource: AudioPermissionSource | null;
+  /** Sources whose Settings pane has already been opened for the current
+   *  denial. Their next click performs a real capture retry. */
+  permissionSettingsOpenedFor: AudioPermissionSource[];
+  /** Handle the Settings half of permission recovery. Returns true when it
+   *  opened Settings; false means the caller should issue the capture retry. */
+  preparePermissionRetry: (source: AudioPermissionSource) => boolean;
 }
 
 const MeetingStateContext = createContext<MeetingStateValue | null>(null);
@@ -140,6 +155,11 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   // transition; we hold the latest so a remounted screen reads the TRUTH.
   const [listenState, setListenState] = useState<ListeningState>("idle");
   const [micInputOn, setMicInputOn] = useState(false);
+  const [systemInputOn, setSystemInputOn] = useState(false);
+  const [permissionDeniedSource, setPermissionDeniedSource] =
+    useState<AudioPermissionSource | null>(null);
+  const [permissionSettingsOpenedFor, setPermissionSettingsOpenedFor] =
+    useState<AudioPermissionSource[]>([]);
   // Attached context, seeded from the snapshot (reopen/reseed) and kept live by
   // onContextItems. Lives here so it survives a collapse→expand and reloads on
   // reopen — the live push alone never re-delivers already-attached artifacts.
@@ -165,6 +185,26 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     patch: Pick<Turn, "answer" | "statusSteps" | "statusDone">,
   ) =>
     setTurns((prev) => prev.map((t) => (t.id === id ? { ...t, ...patch } : t)));
+
+  const preparePermissionRetry = (source: AudioPermissionSource): boolean => {
+    const sourceIsDenied =
+      permissionDeniedSource === source ||
+      (permissionDeniedSource === null && listenState === "permission_denied");
+    if (!sourceIsDenied) {
+      return false;
+    }
+    if (permissionSettingsOpenedFor.includes(source)) {
+      return false;
+    }
+
+    setPermissionSettingsOpenedFor((current) =>
+      current.includes(source) ? current : [...current, source],
+    );
+    client.openPermissionSettings(
+      source === "system" ? "screen_recording" : "microphone",
+    );
+    return true;
+  };
 
   // Fold one finalized segment into the grouped history and refresh the caption.
   // Shared by the seed (no id-dedup needed but harmless) and the live sub (where
@@ -347,7 +387,47 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
   // Capture state — subscribed ONCE at the provider so the latest daemon-pushed
   // state persists across a collapse→expand (the screen that used to own this
   // reset it to "idle" on every remount, desyncing the toggle from reality).
-  useEffect(() => client.onListeningState(setListenState), [client]);
+  useEffect(
+    () =>
+      client.onListeningState((state, sources) => {
+        setListenState(state);
+        const nextDeniedSource = sources?.permissionDeniedSource;
+        if (nextDeniedSource) {
+          setPermissionDeniedSource(nextDeniedSource);
+          setPermissionSettingsOpenedFor((current) =>
+            current.filter((source) => source === nextDeniedSource),
+          );
+        } else if (state === "permission_denied") {
+          // Older daemons do not identify the denied source. Preserve the
+          // Settings-opened markers so their next click can retry capture
+          // instead of reopening System Settings indefinitely.
+          setPermissionDeniedSource(null);
+        } else {
+          setPermissionDeniedSource(null);
+          setPermissionSettingsOpenedFor([]);
+        }
+        if (sources) {
+          setSystemInputOn(sources.system);
+          setMicInputOn(sources.microphone);
+        }
+        // A full stop or failed start means no microphone capture is alive.
+        // Keeping the optimistic mic toggle set across these daemon states made
+        // the shortcut look active after Stop, permission denial, or a helper
+        // failure.
+        if (
+          state === "idle" ||
+          state === "paused" ||
+          state === "failed" ||
+          state === "permission_denied"
+        ) {
+          if (!sources) {
+            setMicInputOn(false);
+            setSystemInputOn(false);
+          }
+        }
+      }),
+    [client],
+  );
 
   // Live context push (attach/screenshot/remove). Seeded separately from the
   // snapshot (below) so a reopen reloads persisted context; this keeps it fresh.
@@ -413,6 +493,11 @@ export function MeetingProvider({ children }: { children: ReactNode }) {
     listenState,
     micInputOn,
     setMicInputOn,
+    systemInputOn,
+    setSystemInputOn,
+    permissionDeniedSource,
+    permissionSettingsOpenedFor,
+    preparePermissionRetry,
   };
 
   return (

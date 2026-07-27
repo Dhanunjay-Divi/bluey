@@ -1,0 +1,9 @@
+{
+  "identifier": "banner",
+  "description": "Meeting-prep banner capabilities — receive daemon events.",
+  "windows": ["banner"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

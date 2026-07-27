@@ -181,7 +181,13 @@ type OverlayCommand =
       items: WireContextItem[];
       turns?: number;
     }
-  | { type: "listening_state_changed"; state: string }
+  | {
+      type: "listening_state_changed";
+      state: string;
+      system?: boolean;
+      microphone?: boolean;
+      permission_denied_source?: string;
+    }
   | { type: "push_card"; card: WireCueCard }
   | {
       type: "show_meeting_banner";
@@ -386,9 +392,15 @@ export function createTauriClient(): MeetingClient {
           return;
         }
         for (const h of [...handlers]) h(cmd);
-      }).then((fn) => {
-        unlistenBus = fn;
       })
+        .then((fn) => {
+          unlistenBus = fn;
+        })
+        .catch((error: unknown) => {
+          // A capability/configuration mistake must not become an unhandled
+          // rejection that leaves every request silently waiting forever.
+          console.error("[tauriClient] overlay command listener failed", error);
+        })
     : Promise.resolve();
   // Best-effort teardown if the window unloads (the shell also cleans up).
   if (typeof window !== "undefined") {
@@ -514,8 +526,10 @@ export function createTauriClient(): MeetingClient {
       const rows = await invoke<CalendarConnection[]>("calendar_status");
       return rows.map((r) => ({
         provider: r.provider,
+        configured: r.configured,
         connected: r.connected,
         email: r.email,
+        error: r.error,
       }));
     },
 
@@ -726,11 +740,12 @@ export function createTauriClient(): MeetingClient {
       return () => handlers.delete(handler);
     },
 
-    respondMeetingPrep: (eventId, approved) => {
+    respondMeetingPrep: (eventId, startEpochSecs, approved) => {
       // Warm (approve) or dismiss the meeting-prep banner. Fire-and-forget.
       sendEvent({
         type: "meeting_prep_responded",
         event_id: eventId,
+        start_epoch_secs: startEpochSecs,
         approved,
       });
     },
@@ -755,7 +770,20 @@ export function createTauriClient(): MeetingClient {
           s === "permission_denied"
             ? s
             : "idle";
-        cb(known);
+        cb(
+          known,
+          typeof c.system === "boolean" && typeof c.microphone === "boolean"
+            ? {
+                system: c.system,
+                microphone: c.microphone,
+                permissionDeniedSource:
+                  c.permission_denied_source === "system" ||
+                  c.permission_denied_source === "microphone"
+                    ? c.permission_denied_source
+                    : undefined,
+              }
+            : undefined,
+        );
       };
       handlers.add(handler);
       return () => handlers.delete(handler);
@@ -834,7 +862,8 @@ export function createTauriClient(): MeetingClient {
       // ACP. A thumbnail chip appears via the set_context_items push.
       void invoke<string>("capture_screenshot")
         .then((path) => {
-          if (path) sendEvent({ type: "attach_files_requested", paths: [path] });
+          if (path)
+            sendEvent({ type: "attach_files_requested", paths: [path] });
         })
         .catch((error) => {
           console.error("capture_screenshot failed", error);
@@ -847,10 +876,7 @@ export function createTauriClient(): MeetingClient {
       // FULL current list, so the composer chip strip is a pure mirror of it.
       const handler = (cmd: OverlayCommand) => {
         if (cmd.type !== "set_context_items") return;
-        const c = cmd as Extract<
-          OverlayCommand,
-          { type: "set_context_items" }
-        >;
+        const c = cmd as Extract<OverlayCommand, { type: "set_context_items" }>;
         cb(c.items.map(toContextItem));
       };
       handlers.add(handler);

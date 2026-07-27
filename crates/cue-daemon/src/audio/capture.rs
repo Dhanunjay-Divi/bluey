@@ -227,6 +227,12 @@ impl MicrophoneCapture {
         self.sample_rate
     }
 
+    pub fn is_running(&self) -> bool {
+        self.thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    }
+
     /// Signal the capture thread to exit and wait for it. Called
     /// automatically on drop if not invoked explicitly.
     pub fn stop(mut self) {

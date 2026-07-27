@@ -8,7 +8,7 @@
 //! Restart-on-crash with exponential backoff mirrors the overlay pattern.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,11 +24,62 @@ const CHUNK_SAMPLES: usize = 320;
 const CHUNK_BYTES: usize = CHUNK_SAMPLES * 2;
 /// Maximum consecutive restart attempts before giving up.
 const MAX_RESTART_ATTEMPTS: u32 = 5;
+/// Keep helper diagnostics bounded while continuing to drain stderr so the
+/// child cannot block on a full pipe.
+const MAX_HELPER_STDERR_BYTES: usize = 16 * 1024;
 
 /// Handle to a running system audio capture session.
 pub struct SystemAudioCapture {
     stop: Arc<AtomicBool>,
     task: Option<JoinHandle<()>>,
+    status: CaptureStatusHandle,
+}
+
+/// Observable lifecycle of a native audio helper.
+///
+/// Spawning the supervisor is not proof that macOS granted access or that PCM
+/// is flowing. The daemon observes this state so it can keep the overlay on
+/// "connecting" until the first bytes arrive and report terminal failures
+/// instead of leaving a stale "listening" indicator behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CaptureStatus {
+    Starting = 0,
+    Running = 1,
+    PermissionDenied = 2,
+    Failed = 3,
+    Stopped = 4,
+}
+
+#[derive(Clone)]
+pub struct CaptureStatusHandle {
+    value: Arc<AtomicU8>,
+}
+
+impl CaptureStatusHandle {
+    fn new(status: CaptureStatus) -> Self {
+        Self {
+            value: Arc::new(AtomicU8::new(status as u8)),
+        }
+    }
+
+    fn set(&self, status: CaptureStatus) {
+        self.value.store(status as u8, Ordering::Release);
+    }
+
+    pub fn get(&self) -> CaptureStatus {
+        match self.value.load(Ordering::Acquire) {
+            0 => CaptureStatus::Starting,
+            1 => CaptureStatus::Running,
+            2 => CaptureStatus::PermissionDenied,
+            3 => CaptureStatus::Failed,
+            _ => CaptureStatus::Stopped,
+        }
+    }
+
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value)
+    }
 }
 
 /// Which capture the native helper runs — selects the helper's `--source` arg
@@ -38,6 +89,14 @@ pub struct SystemAudioCapture {
 enum CaptureRole {
     System,
     Microphone,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureSessionOutcome {
+    Clean,
+    RetryableFailure,
+    PermissionDenied,
+    NonRetryableFailure,
 }
 
 impl CaptureRole {
@@ -67,14 +126,25 @@ impl SystemAudioCapture {
         let binary = resolve_binary()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let status = CaptureStatusHandle::new(CaptureStatus::Starting);
+        let task_status = status.clone();
 
         let task = tokio::spawn(async move {
-            supervisor_loop(binary, sender, stop_clone, pick, CaptureRole::System).await;
+            supervisor_loop(
+                binary,
+                sender,
+                stop_clone,
+                pick,
+                CaptureRole::System,
+                task_status,
+            )
+            .await;
         });
 
         Ok(Self {
             stop,
             task: Some(task),
+            status,
         })
     }
 
@@ -94,22 +164,56 @@ impl SystemAudioCapture {
         let binary = resolve_binary()?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let status = CaptureStatusHandle::new(CaptureStatus::Starting);
+        let task_status = status.clone();
 
         let task = tokio::spawn(async move {
-            supervisor_loop(binary, sender, stop_clone, false, CaptureRole::Microphone).await;
+            supervisor_loop(
+                binary,
+                sender,
+                stop_clone,
+                false,
+                CaptureRole::Microphone,
+                task_status,
+            )
+            .await;
         });
 
         Ok(Self {
             stop,
             task: Some(task),
+            status,
         })
+    }
+
+    pub fn status(&self) -> CaptureStatus {
+        self.status.get()
+    }
+
+    pub fn status_handle(&self) -> CaptureStatusHandle {
+        self.status.clone()
+    }
+
+    /// True while the supervisor is starting or actively receiving PCM.
+    pub fn is_active(&self) -> bool {
+        matches!(
+            self.status(),
+            CaptureStatus::Starting | CaptureStatus::Running
+        ) && self.task.as_ref().is_some_and(|task| !task.is_finished())
     }
 
     /// Signal the capture to stop and wait for the task to finish.
     pub async fn stop(mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+        self.status.set(CaptureStatus::Stopped);
+        if let Some(mut task) = self.task.take() {
+            if tokio::time::timeout(Duration::from_secs(3), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
         }
     }
 
@@ -125,9 +229,12 @@ impl SystemAudioCapture {
         let samples = read_wav_i16(&path)?;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
+        let status = CaptureStatusHandle::new(CaptureStatus::Starting);
+        let task_status = status.clone();
         let task = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(20));
             let mut base_ms: u64 = 0;
+            task_status.set(CaptureStatus::Running);
             for frame in samples.chunks(CHUNK_SAMPLES) {
                 if stop_clone.load(Ordering::Acquire) {
                     break;
@@ -144,10 +251,16 @@ impl SystemAudioCapture {
                     break;
                 }
             }
+            if stop_clone.load(Ordering::Acquire) {
+                task_status.set(CaptureStatus::Stopped);
+            } else {
+                task_status.set(CaptureStatus::Failed);
+            }
         });
         Ok(Self {
             stop,
             task: Some(task),
+            status,
         })
     }
 }
@@ -192,6 +305,7 @@ fn read_wav_i16(path: &str) -> std::io::Result<Vec<i16>> {
 impl Drop for SystemAudioCapture {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.status.set(CaptureStatus::Stopped);
     }
 }
 
@@ -357,54 +471,233 @@ async fn supervisor_loop(
     stop: Arc<AtomicBool>,
     pick: bool,
     role: CaptureRole,
+    status: CaptureStatusHandle,
 ) {
     let mut consecutive_failures: u32 = 0;
 
     loop {
         if stop.load(Ordering::Acquire) {
+            status.set(CaptureStatus::Stopped);
             return;
         }
+        status.set(CaptureStatus::Starting);
 
         // The MIC helper MUST be launched as the .app bundle (macOS reads
         // NSMicrophoneUsageDescription from the bundle Info.plist — a bare exec
         // lacks it and macOS traps on mic access), so it uses the open+socket
         // transport. SYSTEM audio works fine as a bare exec over stdout.
         #[cfg(target_os = "macos")]
-        let clean = if role == CaptureRole::Microphone {
+        let outcome = if role == CaptureRole::Microphone {
             if let Some(bundle) = macos_app_bundle_path() {
-                run_mic_socket_session(&bundle, &sender, &stop).await
+                run_mic_socket_session(&bundle, &sender, &stop, &status).await
             } else {
                 // No bundle (dev build with only a bare binary) — fall back to
                 // stdout. The mic will trap without the plist, but this keeps a
                 // plain checkout from failing to spawn; system audio still works.
-                run_stdout_session(&binary, pick, role, &sender, &stop).await
+                run_stdout_session(&binary, pick, role, &sender, &stop, &status).await
             }
         } else {
-            run_stdout_session(&binary, pick, role, &sender, &stop).await
+            run_stdout_session(&binary, pick, role, &sender, &stop, &status).await
         };
         #[cfg(not(target_os = "macos"))]
-        let clean = run_stdout_session(&binary, pick, role, &sender, &stop).await;
+        let outcome = run_stdout_session(&binary, pick, role, &sender, &stop, &status).await;
 
-        if stop.load(Ordering::Acquire) || clean {
+        if stop.load(Ordering::Acquire) {
+            status.set(CaptureStatus::Stopped);
             return;
+        }
+
+        match outcome {
+            CaptureSessionOutcome::PermissionDenied => {
+                status.set(CaptureStatus::PermissionDenied);
+                tracing::error!(
+                    ?role,
+                    "native audio capture permission denied; waiting for an explicit retry"
+                );
+                return;
+            }
+            CaptureSessionOutcome::NonRetryableFailure => {
+                status.set(CaptureStatus::Failed);
+                tracing::error!(
+                    ?role,
+                    "native audio helper failed during setup; waiting for an explicit retry"
+                );
+                return;
+            }
+            CaptureSessionOutcome::Clean => {
+                // A continuous helper that exits without an explicit stop is no
+                // longer a live capture even when it returned exit code zero.
+                status.set(CaptureStatus::Failed);
+                return;
+            }
+            CaptureSessionOutcome::RetryableFailure => {}
         }
 
         consecutive_failures += 1;
         if consecutive_failures > MAX_RESTART_ATTEMPTS {
+            status.set(CaptureStatus::Failed);
             tracing::error!(
+                ?role,
                 attempts = consecutive_failures,
-                "system audio helper failed too many times; giving up"
+                "native audio helper failed too many times; giving up"
             );
             return;
         }
 
         let delay = restart_delay(consecutive_failures - 1);
         tracing::warn!(
+            ?role,
             attempt = consecutive_failures,
             delay_ms = delay.as_millis() as u64,
-            "system audio helper exited unexpectedly; respawning"
+            "native audio helper exited unexpectedly; respawning"
         );
-        tokio::time::sleep(delay).await;
+        if wait_for_stop(&stop, delay).await {
+            status.set(CaptureStatus::Stopped);
+            return;
+        }
+    }
+}
+
+async fn collect_helper_stderr(mut stderr: tokio::process::ChildStderr) -> String {
+    let mut captured = Vec::with_capacity(MAX_HELPER_STDERR_BYTES);
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match stderr.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => {
+                let remaining = MAX_HELPER_STDERR_BYTES.saturating_sub(captured.len());
+                captured.extend_from_slice(&chunk[..read.min(remaining)]);
+            }
+            Err(error) => {
+                tracing::debug!(%error, "failed to read native audio helper stderr");
+                break;
+            }
+        }
+    }
+    String::from_utf8_lossy(&captured).into_owned()
+}
+
+fn classify_helper_exit(
+    status: std::io::Result<std::process::ExitStatus>,
+    stderr: &str,
+) -> CaptureSessionOutcome {
+    match status {
+        Ok(status)
+            if is_system_audio_permission_denied(status)
+                || is_system_audio_permission_denied_message(stderr) =>
+        {
+            CaptureSessionOutcome::PermissionDenied
+        }
+        Ok(status) if status.success() => CaptureSessionOutcome::Clean,
+        Ok(_) if is_terminal_helper_failure_message(stderr) => {
+            CaptureSessionOutcome::NonRetryableFailure
+        }
+        Ok(_) | Err(_) => CaptureSessionOutcome::RetryableFailure,
+    }
+}
+
+fn is_terminal_helper_failure_message(message: &str) -> bool {
+    let message = message.to_lowercase();
+    [
+        "bad cpu type",
+        "code signature",
+        "codesign",
+        "dyld",
+        "exec format",
+        "image not found",
+        "library not loaded",
+        "no matching profile",
+        "operation not permitted",
+        "provisioning profile",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn classify_helper_spawn_error(error: &std::io::Error) -> CaptureSessionOutcome {
+    use std::io::ErrorKind;
+
+    let terminal_kind = matches!(
+        error.kind(),
+        ErrorKind::NotFound
+            | ErrorKind::PermissionDenied
+            | ErrorKind::InvalidInput
+            | ErrorKind::Unsupported
+    );
+    let terminal_message = is_terminal_helper_failure_message(&error.to_string());
+
+    if terminal_kind || terminal_message {
+        CaptureSessionOutcome::NonRetryableFailure
+    } else {
+        CaptureSessionOutcome::RetryableFailure
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct TempPathCleanup(PathBuf);
+
+#[cfg(target_os = "macos")]
+impl Drop for TempPathCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn microphone_setup_outcome(status_path: &std::path::Path) -> CaptureSessionOutcome {
+    match microphone_helper_status(status_path).as_deref() {
+        Some("permission_denied") => CaptureSessionOutcome::PermissionDenied,
+        Some(_) | None => CaptureSessionOutcome::NonRetryableFailure,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn microphone_helper_status(status_path: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(status_path)
+        .ok()?
+        .lines()
+        .next()
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "macos")]
+fn microphone_helper_pid(status_path: &std::path::Path) -> Option<libc::pid_t> {
+    let status = std::fs::read_to_string(status_path).ok()?;
+    let pid = status
+        .lines()
+        .find_map(|line| line.strip_prefix("pid="))?
+        .parse::<libc::pid_t>()
+        .ok()?;
+    (pid > 1 && pid != std::process::id() as libc::pid_t).then_some(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn terminate_microphone_helper(status_path: &std::path::Path) {
+    if let Some(pid) = microphone_helper_pid(status_path) {
+        // SAFETY: `pid` is a positive helper-owned process identifier read from
+        // this launch's unique status handshake. SIGTERM is best-effort.
+        let result = unsafe { libc::kill(pid, libc::SIGTERM) };
+        if result != 0 {
+            tracing::debug!(
+                pid,
+                error = %std::io::Error::last_os_error(),
+                "mic: detached helper was already gone"
+            );
+        }
+    }
+}
+
+async fn wait_for_stop(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return true;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
     }
 }
 
@@ -415,7 +708,8 @@ async fn run_stdout_session(
     role: CaptureRole,
     sender: &UnboundedSender<AudioChunk>,
     stop: &Arc<AtomicBool>,
-) -> bool {
+    capture_status: &CaptureStatusHandle,
+) -> CaptureSessionOutcome {
     let mut cmd = Command::new(binary);
     if pick {
         cmd.args(["--pick", "--continuous"]);
@@ -428,40 +722,71 @@ async fn run_stdout_session(
     }
     let mut child = match cmd
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
     {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(error = %e, "failed to spawn native audio helper");
-            return false;
+            return classify_helper_spawn_error(&e);
         }
     };
     let Some(mut stdout) = child.stdout.take() else {
-        return false;
+        let _ = child.kill().await;
+        return CaptureSessionOutcome::NonRetryableFailure;
     };
+    let stderr_task = child
+        .stderr
+        .take()
+        .map(|stderr| tokio::spawn(collect_helper_stderr(stderr)));
     let mut buf = vec![0u8; CHUNK_BYTES.max(8192)];
     let mut offset = 0usize;
+    let mut stopped_intentionally = false;
     loop {
         if stop.load(Ordering::Acquire) {
             let _ = child.kill().await;
-            return true;
+            stopped_intentionally = true;
+            break;
         }
-        match stdout.read(&mut buf[offset..]).await {
-            Ok(0) => break, // EOF
-            Ok(n) => {
+        let read =
+            tokio::time::timeout(Duration::from_millis(250), stdout.read(&mut buf[offset..])).await;
+        match read {
+            Ok(Ok(0)) => break, // EOF
+            Ok(Ok(n)) => {
+                capture_status.set(CaptureStatus::Running);
                 offset += n;
                 if !drain_frames(&mut buf, &mut offset, sender, role) {
                     let _ = child.kill().await;
-                    return true;
+                    stopped_intentionally = true;
+                    break;
                 }
             }
-            Err(_) => break,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, ?role, "failed to read native audio helper output");
+                let _ = child.kill().await;
+                break;
+            }
+            Err(_) => continue,
         }
     }
     let status = child.wait().await;
-    matches!(status, Ok(s) if s.success())
+    let helper_stderr = match stderr_task {
+        Some(task) => task.await.unwrap_or_default(),
+        None => String::new(),
+    };
+    if !helper_stderr.trim().is_empty() {
+        tracing::debug!(
+            ?role,
+            stderr = %helper_stderr.trim(),
+            "native audio helper diagnostics"
+        );
+    }
+    if stopped_intentionally {
+        CaptureSessionOutcome::Clean
+    } else {
+        classify_helper_exit(status, &helper_stderr)
+    }
 }
 
 /// macOS bundle + UNIX-socket transport for the MIC helper. Binds a socket,
@@ -473,16 +798,28 @@ async fn run_mic_socket_session(
     bundle: &std::path::Path,
     sender: &UnboundedSender<AudioChunk>,
     stop: &Arc<AtomicBool>,
-) -> bool {
+    capture_status: &CaptureStatusHandle,
+) -> CaptureSessionOutcome {
     use tokio::net::UnixListener;
 
-    let socket_path = std::env::temp_dir().join(format!("bluey-mic-{}.sock", std::process::id()));
+    let session_suffix = epoch_ms();
+    let socket_path = std::env::temp_dir().join(format!(
+        "bluey-mic-{}-{session_suffix}.sock",
+        std::process::id()
+    ));
+    let status_path = std::env::temp_dir().join(format!(
+        "bluey-mic-{}-{session_suffix}.status",
+        std::process::id()
+    ));
     let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&status_path);
+    let _socket_cleanup = TempPathCleanup(socket_path.clone());
+    let _status_cleanup = TempPathCleanup(status_path.clone());
     let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!(error = %e, "mic: failed to bind capture socket");
-            return false;
+            return CaptureSessionOutcome::RetryableFailure;
         }
     };
 
@@ -495,6 +832,8 @@ async fn run_mic_socket_session(
         .args(["--source", "microphone", "--continuous"])
         .arg("--socket")
         .arg(&socket_path)
+        .arg("--status-file")
+        .arg(&status_path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::inherit());
     tracing::info!(
@@ -505,25 +844,32 @@ async fn run_mic_socket_session(
     if !matches!(cmd.status().await, Ok(s) if s.success()) {
         tracing::warn!("mic: `open` failed to launch BlueyAudio.app");
         let _ = std::fs::remove_file(&socket_path);
-        return false;
+        return CaptureSessionOutcome::NonRetryableFailure;
     }
     tracing::info!("mic: `open` returned OK; waiting for helper to connect to the socket…");
 
-    let accept = tokio::time::timeout(Duration::from_secs(15), listener.accept()).await;
-    let (mut conn, _addr) = match accept {
-        Ok(Ok(pair)) => pair,
-        Ok(Err(e)) => {
-            tracing::warn!(error = %e, "mic: socket accept failed");
-            let _ = std::fs::remove_file(&socket_path);
-            return false;
+    let accept_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let (mut conn, _addr) = loop {
+        if stop.load(Ordering::Acquire) {
+            terminate_microphone_helper(&status_path);
+            return CaptureSessionOutcome::Clean;
         }
-        Err(_) => {
+        if tokio::time::Instant::now() >= accept_deadline {
             tracing::warn!(
                 "mic: helper did not connect before timeout — BlueyAudio.app likely \
                  crashed on launch (missing NSMicrophoneUsageDescription?) or was denied"
             );
-            let _ = std::fs::remove_file(&socket_path);
-            return false;
+            terminate_microphone_helper(&status_path);
+            return microphone_setup_outcome(&status_path);
+        }
+        match tokio::time::timeout(Duration::from_millis(250), listener.accept()).await {
+            Ok(Ok(pair)) => break pair,
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "mic: socket accept failed");
+                terminate_microphone_helper(&status_path);
+                return CaptureSessionOutcome::RetryableFailure;
+            }
+            Err(_) => {}
         }
     };
     tracing::info!("mic: helper connected — reading audio frames");
@@ -539,9 +885,11 @@ async fn run_mic_socket_session(
     let mut peak_abs: i32 = 0;
     let mut last_report = std::time::Instant::now();
     let mut reported_first_audio = false;
-    let clean = loop {
+    let mut microphone_authorized_at = None;
+    let outcome = loop {
         if stop.load(Ordering::Acquire) {
-            break true;
+            terminate_microphone_helper(&status_path);
+            break CaptureSessionOutcome::Clean;
         }
         // Short read timeout so the stop flag is checked promptly even when the
         // mic is silent.
@@ -553,9 +901,14 @@ async fn run_mic_socket_session(
                     total_bytes,
                     "mic: helper closed the stream (EOF) — it exited"
                 );
-                break false;
+                break if total_bytes == 0 {
+                    microphone_setup_outcome(&status_path)
+                } else {
+                    CaptureSessionOutcome::RetryableFailure
+                };
             } // EOF: helper exited
             Ok(Ok(n)) => {
+                capture_status.set(CaptureStatus::Running);
                 total_bytes += n as u64;
                 // Sample peak amplitude over the freshly-read bytes (i16 LE PCM).
                 let fresh = &buf[offset..offset + n];
@@ -589,15 +942,50 @@ async fn run_mic_socket_session(
                 }
                 offset += n;
                 if !drain_frames(&mut buf, &mut offset, sender, CaptureRole::Microphone) {
-                    break true; // receiver dropped
+                    break CaptureSessionOutcome::Clean; // receiver dropped
                 }
             }
-            Ok(Err(_)) => break false,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "mic: failed to read helper stream");
+                break if total_bytes == 0 {
+                    microphone_setup_outcome(&status_path)
+                } else {
+                    CaptureSessionOutcome::RetryableFailure
+                };
+            }
+            Err(_) if total_bytes == 0 => {
+                match microphone_helper_status(&status_path).as_deref() {
+                    Some("permission_denied") => {
+                        terminate_microphone_helper(&status_path);
+                        break CaptureSessionOutcome::PermissionDenied;
+                    }
+                    Some("failed") => {
+                        terminate_microphone_helper(&status_path);
+                        break CaptureSessionOutcome::NonRetryableFailure;
+                    }
+                    Some("authorized") => {
+                        let authorized_at =
+                            *microphone_authorized_at.get_or_insert_with(tokio::time::Instant::now);
+                        if authorized_at.elapsed() >= Duration::from_secs(10) {
+                            tracing::warn!(
+                                "mic: authorized helper produced no PCM before the startup deadline"
+                            );
+                            terminate_microphone_helper(&status_path);
+                            break CaptureSessionOutcome::NonRetryableFailure;
+                        }
+                    }
+                    // `starting` / `permission_checking`: the macOS consent
+                    // prompt is open. Do not count user decision time against
+                    // the post-authorization PCM startup watchdog.
+                    Some(_) | None => {}
+                }
+                continue;
+            }
             Err(_) => continue, // read timeout — re-check stop
         }
     };
     let _ = std::fs::remove_file(&socket_path);
-    clean
+    outcome
 }
 
 fn epoch_ms() -> u64 {
@@ -727,20 +1115,29 @@ pub fn is_system_audio_permission_denied(status: std::process::ExitStatus) -> bo
 /// Check if stderr output from the system audio helper indicates permission denial.
 pub fn is_system_audio_permission_denied_message(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    lower.contains("permission")
-        || lower.contains("screen recording")
-        || lower.contains("screencapturekit")
+    lower.contains("permission denied")
+        || lower.contains("permission not granted")
+        || lower.contains("access denied")
+        || lower.contains("access not granted")
         || lower.contains("not authorized")
+        || lower.contains("screen recording permission")
+        || lower.contains("system audio recording permission")
 }
 
 #[cfg(test)]
 mod permission_tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    fn microphone_status_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bluey-microphone-status-test-{}-{name}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn detects_permission_denied_exit_code() {
-        // We can't easily construct ExitStatus with a specific code in tests
-        // on all platforms, so test the message classifier instead.
         assert!(is_system_audio_permission_denied_message(
             "permission denied"
         ));
@@ -750,6 +1147,9 @@ mod permission_tests {
         assert!(is_system_audio_permission_denied_message(
             "ScreenCaptureKit error: not authorized"
         ));
+        assert!(is_system_audio_permission_denied_message(
+            "Screen Recording permission required"
+        ));
     }
 
     #[test]
@@ -757,7 +1157,151 @@ mod permission_tests {
         assert!(!is_system_audio_permission_denied_message(
             "device not found"
         ));
+        assert!(!is_system_audio_permission_denied_message(
+            "permission status unavailable"
+        ));
         assert!(!is_system_audio_permission_denied_message("timeout"));
         assert!(!is_system_audio_permission_denied_message(""));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn explicit_microphone_denial_is_reported_as_permission_denied() {
+        let path = microphone_status_path("denied");
+        let _cleanup = TempPathCleanup(path.clone());
+        std::fs::write(&path, "permission_denied\n").unwrap();
+
+        assert_eq!(
+            microphone_setup_outcome(&path),
+            CaptureSessionOutcome::PermissionDenied
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn microphone_launch_failures_are_not_mislabeled_as_permission_denied() {
+        let failed_path = microphone_status_path("failed");
+        let missing_path = microphone_status_path("missing");
+        let _failed_cleanup = TempPathCleanup(failed_path.clone());
+        let _missing_cleanup = TempPathCleanup(missing_path.clone());
+        std::fs::write(&failed_path, "failed\n").unwrap();
+        let _ = std::fs::remove_file(&missing_path);
+
+        assert_eq!(
+            microphone_setup_outcome(&failed_path),
+            CaptureSessionOutcome::NonRetryableFailure
+        );
+        assert_eq!(
+            microphone_setup_outcome(&missing_path),
+            CaptureSessionOutcome::NonRetryableFailure
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn microphone_status_handshake_carries_a_valid_helper_pid() {
+        let path = microphone_status_path("pid");
+        let _cleanup = TempPathCleanup(path.clone());
+        std::fs::write(&path, "authorized\npid=424242\n").unwrap();
+        assert_eq!(microphone_helper_pid(&path), Some(424242));
+
+        std::fs::write(&path, format!("authorized\npid={}\n", std::process::id())).unwrap();
+        assert_eq!(microphone_helper_pid(&path), None);
+    }
+
+    #[tokio::test]
+    async fn restart_wait_observes_stop_without_waiting_for_full_backoff() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let setter = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            setter.store(true, Ordering::Release);
+        });
+
+        let started = tokio::time::Instant::now();
+        assert!(wait_for_stop(&stop, Duration::from_secs(2)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_exit_is_not_retryable() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(PERMISSION_DENIED_EXIT_CODE << 8);
+        assert_eq!(
+            classify_helper_exit(Ok(status), ""),
+            CaptureSessionOutcome::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unrelated_helper_failure_remains_retryable() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        assert_eq!(
+            classify_helper_exit(Ok(status), "device not found"),
+            CaptureSessionOutcome::RetryableFailure
+        );
+    }
+
+    #[test]
+    fn terminal_spawn_errors_are_not_retried() {
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidInput,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            let error = std::io::Error::new(kind, "helper launch failed");
+            assert_eq!(
+                classify_helper_spawn_error(&error),
+                CaptureSessionOutcome::NonRetryableFailure
+            );
+        }
+    }
+
+    #[test]
+    fn signing_and_profile_spawn_errors_are_not_retried() {
+        for message in [
+            "code signature invalid",
+            "No matching profile found",
+            "provisioning profile does not match",
+        ] {
+            let error = std::io::Error::other(message);
+            assert_eq!(
+                classify_helper_spawn_error(&error),
+                CaptureSessionOutcome::NonRetryableFailure
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_and_dyld_child_exits_are_not_retried() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(1 << 8);
+        for message in [
+            "No matching profile found",
+            "code signature invalid",
+            "dyld: Library not loaded: libonnxruntime.dylib",
+        ] {
+            assert_eq!(
+                classify_helper_exit(Ok(status), message),
+                CaptureSessionOutcome::NonRetryableFailure
+            );
+        }
+    }
+
+    #[test]
+    fn transient_spawn_errors_remain_retryable() {
+        let error = std::io::Error::other("temporary launch service interruption");
+        assert_eq!(
+            classify_helper_spawn_error(&error),
+            CaptureSessionOutcome::RetryableFailure
+        );
     }
 }

@@ -30,11 +30,15 @@ pub mod microsoft;
 
 // --- Public API (code against these exact paths) -------------------------
 
-pub use oauth::{connect_interactive, exchange_code, refresh, valid_access_token, TokenResponse};
+pub use oauth::{
+    connect_interactive, exchange_code, refresh, valid_access_token, valid_access_token_serialized,
+    TokenResponse,
+};
 pub use pkce::{random_state, Pkce};
 pub use provider::{Provider, ProviderConfig};
 pub use tokens::{
-    is_expired, CalTokenStore, CalTokens, KeyringCalStore, MemoryCalStore, DEFAULT_EXPIRY_SKEW_SECS,
+    is_expired, CachedCalStore, CalTokenStore, CalTokens, KeyringCalStore, MemoryCalStore,
+    DEFAULT_EXPIRY_SKEW_SECS,
 };
 
 // Re-export the shared calendar types so B/C (and any consumer) can name them

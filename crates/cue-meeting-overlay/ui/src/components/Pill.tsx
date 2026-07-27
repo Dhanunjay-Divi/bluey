@@ -3,9 +3,16 @@
 // glance (listening status + the latest heard line) and offers one-tap controls
 // (mic toggle, expand) so the user rarely needs to expand mid-meeting.
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type MutableRefObject,
+  type RefObject,
+} from "react";
 import type { MeetingClient } from "../lib/client";
 import type { AgentSummary, ListeningState } from "../lib/types";
+import { useMeetingState } from "../lib/meetingState";
 import { Glass, Mark, Waveform } from "./primitives";
 import { SystemAudioIcon, StopIcon } from "./icons";
 
@@ -24,6 +31,8 @@ function statusOf(state: ListeningState): {
       return { color: "#f5b942", label: "paused", live: false };
     case "failed":
       return { color: "#ef5a5a", label: "audio issue", live: false };
+    case "permission_denied":
+      return { color: "#ef5a5a", label: "permission needed", live: false };
     default:
       return { color: "var(--ink-4)", label: "idle", live: false };
   }
@@ -34,13 +43,27 @@ export function Pill({
   attached,
   onExpand,
   dragRef,
+  didDragRef,
 }: {
   client: MeetingClient;
   attached: AgentSummary | null;
   onExpand: () => void;
   dragRef: RefObject<HTMLDivElement | null>;
+  didDragRef: MutableRefObject<boolean>;
 }) {
-  const [listen, setListen] = useState<ListeningState>("idle");
+  const {
+    listenState: persistedListen,
+    systemInputOn: persistedSystem,
+    micInputOn: persistedMicrophone,
+    permissionDeniedSource,
+    permissionSettingsOpenedFor,
+    preparePermissionRetry,
+  } = useMeetingState();
+  const [listen, setListen] = useState<ListeningState>(persistedListen);
+  const [sources, setSources] = useState({
+    system: persistedSystem,
+    microphone: persistedMicrophone,
+  });
   const [latest, setLatest] = useState<string>("");
   // A brief flash when a new line lands — ambient "something happened" feedback.
   const [flash, setFlash] = useState(false);
@@ -55,16 +78,43 @@ export function Pill({
     text: "",
     at: 0,
   });
+  // The collapsed pill is conditionally mounted, while MeetingProvider remains
+  // alive. Seed from its last daemon payload so collapse never resets a live
+  // mic-only/system-only selection while waiting for another push.
   useEffect(() => {
-    const offState = client.onListeningState(setListen);
+    setListen(persistedListen);
+    setSources({
+      system: persistedSystem,
+      microphone: persistedMicrophone,
+    });
+  }, [persistedListen, persistedSystem, persistedMicrophone]);
+  useEffect(() => {
+    const offState = client.onListeningState((state, nextSources) => {
+      setListen(state);
+      if (nextSources) {
+        setSources(nextSources);
+        return;
+      }
+      // Compatibility with aggregate-only daemon builds: this pill's sole
+      // capture shortcut has always represented system audio.
+      if (state === "listening" || state === "connecting") {
+        setSources((current) => ({ ...current, system: true }));
+      } else if (
+        state === "idle" ||
+        state === "paused" ||
+        state === "failed" ||
+        state === "permission_denied"
+      ) {
+        setSources({ system: false, microphone: false });
+      }
+    });
     const offLine = client.onTranscript((line) => {
       if (!line.text) return;
       const now = Date.now();
       const cur = lineRef.current;
       const sameSpeaker = cur.source === line.source && cur.text !== "";
       const paused = now - cur.at > 2500;
-      const text =
-        sameSpeaker && !paused ? cur.text + line.text : line.text;
+      const text = sameSpeaker && !paused ? cur.text + line.text : line.text;
       lineRef.current = { source: line.source, text, at: now };
       // Show the recent tail so the latest words stay visible in the small pill.
       const trimmed = text.replace(/^\s+/, "");
@@ -80,10 +130,29 @@ export function Pill({
     };
   }, [client]);
 
-  const s = statusOf(listen);
-  // v1 captures SYSTEM audio (not the mic) — the toggle reflects whether that
-  // live capture is on, and routes start/stop through the same daemon path.
-  const capturing = listen === "listening" || listen === "connecting";
+  const permissionIssue =
+    permissionDeniedSource !== null || listen === "permission_denied";
+  const systemPermissionDenied =
+    permissionDeniedSource === "system" ||
+    (permissionDeniedSource === null && listen === "permission_denied");
+  const systemSettingsOpened = permissionSettingsOpenedFor.includes("system");
+  const s = permissionIssue
+    ? {
+        color: "#ef5a5a",
+        label: "permission needed",
+        live: false,
+      }
+    : statusOf(listen);
+  // This shortcut controls SYSTEM audio only. The aggregate state may remain
+  // "listening" while the microphone is the sole active source.
+  const systemCapturing = sources.system;
+  const expandUnlessDragged = () => {
+    if (didDragRef.current) {
+      didDragRef.current = false;
+      return;
+    }
+    onExpand();
+  };
 
   return (
     <div style={{ position: "fixed", inset: 4, display: "flex" }}>
@@ -121,11 +190,12 @@ export function Pill({
         {/* tap-to-expand body (also the drag handle) — brand + latest heard line */}
         <div
           ref={dragRef}
-          onClick={onExpand}
+          onClick={expandUnlessDragged}
           role="button"
           aria-label="Expand Bluey"
           tabIndex={0}
           onKeyDown={(e) => {
+            if (e.key === " ") e.preventDefault();
             if (e.key === "Enter" || e.key === " ") onExpand();
           }}
           style={{
@@ -135,6 +205,8 @@ export function Pill({
             flex: 1,
             minWidth: 0,
             cursor: "grab",
+            userSelect: "none",
+            WebkitUserSelect: "none",
           }}
         >
           {attached ? <Waveform /> : <Mark size={17} />}
@@ -149,26 +221,57 @@ export function Pill({
               minWidth: 0,
             }}
           >
-            {latest || (s.live ? "listening…" : "Bluey · tap to open")}
+            {permissionIssue
+              ? "Permission needed · tap to open"
+              : listen === "failed"
+                ? "Audio issue · tap to open"
+                : latest || (s.live ? "listening…" : "Bluey · tap to open")}
           </span>
         </div>
 
         {/* listen toggle — start/stop system-audio capture without expanding */}
         <button
-          aria-label={capturing ? "Stop listening" : "Listen to system audio"}
-          title={capturing ? "Stop listening" : "Listen (system audio)"}
+          aria-label={
+            systemPermissionDenied
+              ? systemSettingsOpened
+                ? "Retry system audio"
+                : "Grant system audio permission"
+              : systemCapturing
+                ? "Stop system audio"
+                : "Listen to system audio"
+          }
+          title={
+            systemPermissionDenied
+              ? systemSettingsOpened
+                ? "Retry system audio"
+                : "Grant system audio permission"
+              : systemCapturing
+                ? "Stop system audio"
+                : "Listen (system audio)"
+          }
           onClick={(e) => {
             e.stopPropagation();
-            if (capturing) client.stopListening();
-            else client.startListening({ microphone: false, system: true });
+            if (systemPermissionDenied && preparePermissionRetry("system")) {
+              return;
+            }
+            const system = !systemCapturing;
+            setSources((current) => ({ ...current, system }));
+            if (!system && !sources.microphone) {
+              client.stopListening();
+            } else {
+              client.startListening({
+                microphone: sources.microphone,
+                system,
+              });
+            }
           }}
           style={{
             width: 28,
             height: 28,
             borderRadius: 999,
             border: "none",
-            background: capturing ? "var(--tint-wash)" : "transparent",
-            color: capturing ? "var(--tint-ink)" : "var(--ink-3)",
+            background: systemCapturing ? "var(--tint-wash)" : "transparent",
+            color: systemCapturing ? "var(--tint-ink)" : "var(--ink-3)",
             cursor: "pointer",
             flex: "none",
             display: "inline-flex",
@@ -176,7 +279,11 @@ export function Pill({
             justifyContent: "center",
           }}
         >
-          {capturing ? <StopIcon size={15} /> : <SystemAudioIcon size={15} />}
+          {systemCapturing ? (
+            <StopIcon size={15} />
+          ) : (
+            <SystemAudioIcon size={15} />
+          )}
         </button>
       </Glass>
     </div>

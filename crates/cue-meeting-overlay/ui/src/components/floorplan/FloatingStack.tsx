@@ -9,7 +9,7 @@
 // client method — no new backend. Motion is spring-y and reduced-motion safe.
 
 import { useEffect, useRef, useState } from "react";
-import type { ListeningState } from "../../lib/types";
+import type { AudioPermissionSource, ListeningState } from "../../lib/types";
 import {
   AlertIcon,
   AttachIcon,
@@ -25,7 +25,10 @@ import {
 
 export function FloatingStack({
   listenState,
+  systemInputOn,
   micInputOn,
+  permissionDeniedSource,
+  permissionSettingsOpenedFor,
   askStreaming,
   agentName,
   onToggleSystemAudio,
@@ -34,10 +37,12 @@ export function FloatingStack({
   onAttach,
   onCapturePage,
   onAsk,
-  onAskRecent,
 }: {
   listenState: ListeningState;
+  systemInputOn: boolean;
   micInputOn: boolean;
+  permissionDeniedSource: AudioPermissionSource | null;
+  permissionSettingsOpenedFor: AudioPermissionSource[];
   askStreaming: boolean;
   agentName?: string;
   onToggleSystemAudio: () => void;
@@ -46,27 +51,14 @@ export function FloatingStack({
   onAttach: () => void;
   onCapturePage: () => void;
   onAsk: (question: string) => void;
-  /** Single-click on Ask → answer the most recent meeting question immediately
-   *  (no input). Double-click opens the typing bar. */
-  onAskRecent: () => void;
 }) {
   const [asking, setAsking] = useState(false);
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
-  // Disambiguate single vs double click on the Ask anchor: a single click fires
-  // after a short delay UNLESS a second click arrives first (→ double).
-  const clickTimer = useRef<number | null>(null);
 
   useEffect(() => {
     if (asking) inputRef.current?.focus();
   }, [asking]);
-
-  useEffect(
-    () => () => {
-      if (clickTimer.current) window.clearTimeout(clickTimer.current);
-    },
-    [],
-  );
 
   const submit = () => {
     const q = text.trim();
@@ -79,30 +71,25 @@ export function FloatingStack({
     setAsking(false);
   };
 
-  // Ask anchor click routing. If the typing bar is already open, a click just
-  // closes it. Otherwise: wait ~230ms; if no second click lands, treat as a
-  // SINGLE click → answer the recent question. A second click cancels the timer
-  // and opens the typing bar (DOUBLE click).
+  // A single click always opens/closes the input. The old single-vs-double-click
+  // timer made this shortcut feel unresponsive and a single click could appear
+  // to do nothing when there was no recent detected question.
   const onAskClick = () => {
     if (askStreaming) return;
-    if (asking) {
-      setAsking(false);
-      return;
-    }
-    if (clickTimer.current) {
-      // second click → double: cancel the pending single, open the input.
-      window.clearTimeout(clickTimer.current);
-      clickTimer.current = null;
-      setAsking(true);
-      return;
-    }
-    clickTimer.current = window.setTimeout(() => {
-      clickTimer.current = null;
-      onAskRecent();
-    }, 230);
+    setAsking((open) => !open);
   };
 
-  const sys = systemAudioMeta(listenState);
+  const sys = systemAudioMeta(
+    listenState,
+    systemInputOn,
+    permissionDeniedSource,
+    permissionSettingsOpenedFor.includes("system"),
+  );
+  const microphonePermissionDenied =
+    !micInputOn &&
+    (permissionDeniedSource === "microphone" ||
+      (listenState === "permission_denied" &&
+        permissionDeniedSource !== "system"));
 
   return (
     <div className="fp-stack">
@@ -110,7 +97,7 @@ export function FloatingStack({
         <div className="fp-stack-col">
           <StackButton
             label={sys.label}
-            active={listenState === "listening"}
+            active={systemInputOn && listenState === "listening"}
             tone={sys.tone}
             onClick={onToggleSystemAudio}
           >
@@ -118,7 +105,15 @@ export function FloatingStack({
           </StackButton>
 
           <StackButton
-            label={micInputOn ? "Mute your mic" : "Capture your voice"}
+            label={
+              microphonePermissionDenied
+                ? permissionSettingsOpenedFor.includes("microphone")
+                  ? "Retry microphone"
+                  : "Grant Microphone"
+                : micInputOn
+                  ? "Mute your mic"
+                  : "Capture your voice"
+            }
             active={micInputOn}
             tone={micInputOn ? "accent" : undefined}
             onClick={onToggleMic}
@@ -126,7 +121,13 @@ export function FloatingStack({
             {/* Distinct on/off glyph — a slashed mic when muted — plus a
                 pop animation keyed to the state so the toggle feels alive. */}
             <span key={micInputOn ? "on" : "off"} className="fp-mic-glyph">
-              {micInputOn ? <MicIcon size={17} /> : <MicOffIcon size={17} />}
+              {microphonePermissionDenied ? (
+                <AlertIcon size={16} />
+              ) : micInputOn ? (
+                <MicIcon size={17} />
+              ) : (
+                <MicOffIcon size={17} />
+              )}
             </span>
           </StackButton>
 
@@ -152,11 +153,7 @@ export function FloatingStack({
           )}
 
           <StackButton
-            label={
-              agentName
-                ? `Ask ${agentName} — click to answer the last question, double-click to type`
-                : "Click to answer the last question, double-click to type"
-            }
+            label={agentName ? `Ask ${agentName}` : "Ask Bluey"}
             anchor
             active={asking}
             disabled={askStreaming}
@@ -285,22 +282,50 @@ function ScreenshotGlyph() {
 
 // Per-state visual for the system-audio button (mirrors the glass composer's
 // micMeta, so connecting/failed/denied are never silently swallowed).
-function systemAudioMeta(state: ListeningState): {
+function systemAudioMeta(
+  state: ListeningState,
+  systemInputOn: boolean,
+  permissionDeniedSource: AudioPermissionSource | null,
+  permissionRetryReady: boolean,
+): {
   glyph: React.ReactNode;
   label: string;
   tone?: "live";
 } {
+  if (
+    permissionDeniedSource === "system" ||
+    (state === "permission_denied" && permissionDeniedSource !== "microphone")
+  ) {
+    return {
+      glyph: <AlertIcon size={16} />,
+      label: permissionRetryReady
+        ? "Retry system audio"
+        : "Grant Screen Recording",
+    };
+  }
+  if (state === "failed") {
+    return { glyph: <AlertIcon size={16} />, label: "Audio failed — retry" };
+  }
+  if (!systemInputOn) {
+    return {
+      glyph: <SystemAudioIcon size={17} />,
+      label: "Listen to the call",
+    };
+  }
   switch (state) {
     case "listening":
-      return { glyph: <StopIcon size={16} />, label: "Stop listening", tone: "live" };
+      return {
+        glyph: <StopIcon size={16} />,
+        label: "Stop listening",
+        tone: "live",
+      };
     case "connecting":
       return { glyph: <Spin />, label: "Connecting…" };
-    case "failed":
-      return { glyph: <AlertIcon size={16} />, label: "Audio failed — retry" };
-    case "permission_denied":
-      return { glyph: <AlertIcon size={16} />, label: "Grant Screen Recording" };
     default:
-      return { glyph: <SystemAudioIcon size={17} />, label: "Listen to the call" };
+      return {
+        glyph: <SystemAudioIcon size={17} />,
+        label: "Listen to the call",
+      };
   }
 }
 
@@ -311,4 +336,3 @@ function Spin() {
     </span>
   );
 }
-

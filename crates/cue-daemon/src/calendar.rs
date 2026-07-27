@@ -26,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 // cloud calendar crate (`cue-calendar-cloud`) can implement `CalendarSource`
 // without a dependency cycle. Everything below (EventKit / env-fake / no-op
 // sources, dedupe, and the warm-fire trigger core) stays in the daemon.
-pub use cue_core::calendar::{CalendarSource, Participant, UpcomingEvent};
+pub use cue_core::calendar::{CalendarProvider, CalendarSource, Participant, UpcomingEvent};
 
 /// Fire the warm drive this many seconds before the event starts.
 pub const WARM_LEAD_SECS: u64 = 180;
@@ -34,7 +34,6 @@ pub const WARM_LEAD_SECS: u64 = 180;
 pub const LOOKAHEAD_SECS: u64 = 600;
 /// Poll cadence.
 pub const POLL_SECS: u64 = 30;
-
 
 /// A source that never yields events — the fallback when neither the env fake
 /// nor a real calendar backend is available.
@@ -46,13 +45,12 @@ impl CalendarSource for NoopSource {
     }
 }
 
-/// Pick the calendar source the daemon should poll, in priority order:
+/// Pick the calendar source the daemon should poll:
 /// 1. the env fake when `BLUEY_CALENDAR_FAKE_EVENTS` is set (the deterministic
 ///    test hook wins first so a test never races a real calendar);
-/// 2. a connected cloud OAuth calendar (feature `cloud-calendar`) — Google, then
-///    Microsoft — when that provider has tokens stored in its keychain;
-/// 3. the real EventKit source (feature `calendar`, macOS);
-/// 4. a no-op (the trigger stays dormant rather than erroring).
+/// 2. a dynamic cloud source (feature `cloud-calendar`) that can activate or
+///    deactivate Google/Microsoft immediately after onboarding;
+/// 3. a no-op (the trigger stays dormant rather than erroring).
 ///
 /// The cloud branch needs the daemon's tokio [`Handle`] to spawn the source's
 /// background refresh task. `default_source()` is called from within the daemon's
@@ -72,49 +70,454 @@ pub fn default_source() -> Box<dyn CalendarSource> {
     }
     #[cfg(feature = "cloud-calendar")]
     {
-        if let Some(source) = cloud_source() {
-            return source;
+        if let Some(source) = DynamicCloudSource::new() {
+            return Box::new(source);
         }
     }
     Box::new(NoopSource)
 }
 
-/// Build a cloud calendar source when a provider is connected (tokens present in
-/// its per-provider keychain), preferring Google, then Microsoft. Returns `None`
-/// when neither is connected or when no tokio runtime handle is available (so the
-/// caller falls through to EventKit / no-op). Keychain-read errors are treated as
-/// "not connected" (fail-soft) — never a panic.
 #[cfg(feature = "cloud-calendar")]
-fn cloud_source() -> Option<Box<dyn CalendarSource>> {
-    use cue_calendar_cloud::google::GoogleCalendarSource;
-    use cue_calendar_cloud::microsoft::MicrosoftCalendarSource;
-    use cue_calendar_cloud::{CalTokenStore, KeyringCalStore, Provider};
+struct CloudSources {
+    google_initialized: bool,
+    microsoft_initialized: bool,
+    google: Option<cue_calendar_cloud::google::GoogleCalendarSource>,
+    microsoft: Option<cue_calendar_cloud::microsoft::MicrosoftCalendarSource>,
+    google_store: Option<std::sync::Arc<dyn cue_calendar_cloud::CalTokenStore>>,
+    microsoft_store: Option<std::sync::Arc<dyn cue_calendar_cloud::CalTokenStore>>,
+    google_token_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+    microsoft_token_operation: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+#[cfg(feature = "cloud-calendar")]
+impl Default for CloudSources {
+    fn default() -> Self {
+        Self {
+            google_initialized: false,
+            microsoft_initialized: false,
+            google: None,
+            microsoft: None,
+            google_store: None,
+            microsoft_store: None,
+            google_token_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            microsoft_token_operation: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+#[cfg(feature = "cloud-calendar")]
+fn cloud_sources() -> std::sync::Arc<std::sync::Mutex<CloudSources>> {
+    static SOURCES: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<CloudSources>>> =
+        std::sync::OnceLock::new();
+    std::sync::Arc::clone(
+        SOURCES.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(CloudSources::default()))),
+    )
+}
+
+#[cfg(feature = "cloud-calendar")]
+fn cached_store_from_keychain(
+    provider: cue_calendar_cloud::Provider,
+) -> anyhow::Result<std::sync::Arc<dyn cue_calendar_cloud::CalTokenStore>> {
+    use cue_calendar_cloud::{CachedCalStore, KeyringCalStore};
     use std::sync::Arc;
 
-    // Spawning the source's background refresh task needs a runtime handle; if
-    // we're somehow off the runtime, skip the cloud branch rather than panic.
-    let handle = tokio::runtime::Handle::try_current().ok()?;
+    let backend: Arc<dyn cue_calendar_cloud::CalTokenStore> =
+        Arc::new(KeyringCalStore::new(provider.keyring_service()));
+    let store = CachedCalStore::load_from(backend)?;
+    Ok(Arc::new(store))
+}
 
-    // A provider is "connected" iff its keychain store holds tokens. A keyring
-    // error reads as not-connected (fail-soft) instead of failing the pick.
-    let is_connected = |provider: Provider| -> bool {
-        matches!(
-            KeyringCalStore::new(provider.keyring_service()).load(),
-            Ok(Some(_))
-        )
+#[cfg(feature = "cloud-calendar")]
+fn new_cached_store_with_tokens(
+    provider: cue_calendar_cloud::Provider,
+    tokens: cue_calendar_cloud::CalTokens,
+) -> std::sync::Arc<dyn cue_calendar_cloud::CalTokenStore> {
+    use cue_calendar_cloud::{CachedCalStore, KeyringCalStore};
+    use std::sync::Arc;
+
+    let backend: Arc<dyn cue_calendar_cloud::CalTokenStore> =
+        Arc::new(KeyringCalStore::new(provider.keyring_service()));
+    Arc::new(CachedCalStore::with_tokens(backend, tokens))
+}
+
+/// Complete the destructive half of a reconnect in one auditable order:
+/// terminate the previous poller, then serialize the replacement token write.
+/// The caller may only publish/spawn the replacement source after this returns.
+#[cfg(feature = "cloud-calendar")]
+async fn stop_then_save_calendar_tokens<S, Shutdown, ShutdownFuture>(
+    previous: Option<S>,
+    store: &std::sync::Arc<dyn cue_calendar_cloud::CalTokenStore>,
+    token_operation: &std::sync::Arc<tokio::sync::Mutex<()>>,
+    tokens: &cue_calendar_cloud::CalTokens,
+    shutdown: Shutdown,
+) -> anyhow::Result<()>
+where
+    Shutdown: FnOnce(S) -> ShutdownFuture,
+    ShutdownFuture: std::future::Future<Output = ()>,
+{
+    if let Some(previous) = previous {
+        shutdown(previous).await;
+    }
+    let _token_guard = token_operation.lock().await;
+    store.save(tokens)
+}
+
+#[cfg(feature = "cloud-calendar")]
+fn initialize_cloud_sources(
+    sources: &std::sync::Arc<std::sync::Mutex<CloudSources>>,
+    handle: &tokio::runtime::Handle,
+) {
+    use cue_calendar_cloud::google::GoogleCalendarSource;
+    use cue_calendar_cloud::microsoft::MicrosoftCalendarSource;
+    use cue_calendar_cloud::Provider;
+
+    let (load_google, load_microsoft) = match sources.lock() {
+        Ok(guard) => (!guard.google_initialized, !guard.microsoft_initialized),
+        Err(error) => {
+            tracing::warn!(%error, "calendar source registry mutex poisoned");
+            return;
+        }
     };
 
-    if is_connected(Provider::Google) {
-        let store: Arc<dyn CalTokenStore> =
-            Arc::new(KeyringCalStore::new(Provider::Google.keyring_service()));
-        return Some(Box::new(GoogleCalendarSource::spawn(store, handle)));
+    if load_google {
+        match Provider::Google
+            .config()
+            .validate()
+            .and_then(|_| cached_store_from_keychain(Provider::Google))
+        {
+            Ok(store) => {
+                if let Ok(mut guard) = sources.lock() {
+                    if !guard.google_initialized {
+                        let connected = store.load().ok().flatten().is_some();
+                        let token_operation = std::sync::Arc::clone(&guard.google_token_operation);
+                        let source = connected.then(|| {
+                            GoogleCalendarSource::spawn(
+                                std::sync::Arc::clone(&store),
+                                token_operation,
+                                handle.clone(),
+                            )
+                        });
+                        guard.google = source;
+                        guard.google_store = Some(store);
+                        guard.google_initialized = true;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Google calendar source initialization deferred");
+            }
+        }
     }
-    if is_connected(Provider::Microsoft) {
-        let store: Arc<dyn CalTokenStore> =
-            Arc::new(KeyringCalStore::new(Provider::Microsoft.keyring_service()));
-        return Some(Box::new(MicrosoftCalendarSource::spawn(store, handle)));
+    if load_microsoft {
+        match Provider::Microsoft
+            .config()
+            .validate()
+            .and_then(|_| cached_store_from_keychain(Provider::Microsoft))
+        {
+            Ok(store) => {
+                if let Ok(mut guard) = sources.lock() {
+                    if !guard.microsoft_initialized {
+                        let connected = store.load().ok().flatten().is_some();
+                        let token_operation =
+                            std::sync::Arc::clone(&guard.microsoft_token_operation);
+                        let source = connected.then(|| {
+                            MicrosoftCalendarSource::spawn(
+                                std::sync::Arc::clone(&store),
+                                token_operation,
+                                handle.clone(),
+                            )
+                        });
+                        guard.microsoft = source;
+                        guard.microsoft_store = Some(store);
+                        guard.microsoft_initialized = true;
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Microsoft calendar source initialization deferred");
+            }
+        }
     }
-    None
+}
+
+/// Activate a newly connected provider immediately. Without this hook the
+/// calendar poll retained the `NoopSource` selected at daemon startup, so normal
+/// onboarding did nothing until Bluey restarted.
+#[cfg(feature = "cloud-calendar")]
+pub async fn activate_cloud_provider(
+    provider: &str,
+    tokens: cue_calendar_cloud::CalTokens,
+) -> anyhow::Result<()> {
+    use cue_calendar_cloud::google::GoogleCalendarSource;
+    use cue_calendar_cloud::microsoft::MicrosoftCalendarSource;
+    use cue_calendar_cloud::Provider;
+
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| anyhow::anyhow!("calendar runtime unavailable: {error}"))?;
+    let sources = cloud_sources();
+    initialize_cloud_sources(&sources, &handle);
+    match provider {
+        "google" => {
+            let (previous, existing_store, token_operation) = {
+                let mut guard = sources
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+                (
+                    guard.google.take(),
+                    guard.google_store.clone(),
+                    std::sync::Arc::clone(&guard.google_token_operation),
+                )
+            };
+            let store = existing_store
+                .unwrap_or_else(|| new_cached_store_with_tokens(Provider::Google, tokens.clone()));
+            let save_result = stop_then_save_calendar_tokens(
+                previous,
+                &store,
+                &token_operation,
+                &tokens,
+                GoogleCalendarSource::shutdown,
+            )
+            .await;
+            if let Err(error) = save_result {
+                if let Ok(mut guard) = sources.lock() {
+                    guard.google_initialized = false;
+                }
+                return Err(error.context("persist replacement Google calendar credentials"));
+            }
+            let source =
+                GoogleCalendarSource::spawn(std::sync::Arc::clone(&store), token_operation, handle);
+            let mut guard = sources
+                .lock()
+                .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+            guard.google = Some(source);
+            guard.google_store = Some(store);
+            guard.google_initialized = true;
+        }
+        "microsoft" => {
+            let (previous, existing_store, token_operation) = {
+                let mut guard = sources
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+                (
+                    guard.microsoft.take(),
+                    guard.microsoft_store.clone(),
+                    std::sync::Arc::clone(&guard.microsoft_token_operation),
+                )
+            };
+            let store = existing_store.unwrap_or_else(|| {
+                new_cached_store_with_tokens(Provider::Microsoft, tokens.clone())
+            });
+            let save_result = stop_then_save_calendar_tokens(
+                previous,
+                &store,
+                &token_operation,
+                &tokens,
+                MicrosoftCalendarSource::shutdown,
+            )
+            .await;
+            if let Err(error) = save_result {
+                if let Ok(mut guard) = sources.lock() {
+                    guard.microsoft_initialized = false;
+                }
+                return Err(error.context("persist replacement Microsoft calendar credentials"));
+            }
+            let source = MicrosoftCalendarSource::spawn(
+                std::sync::Arc::clone(&store),
+                token_operation,
+                handle,
+            );
+            let mut guard = sources
+                .lock()
+                .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+            guard.microsoft = Some(source);
+            guard.microsoft_store = Some(store);
+            guard.microsoft_initialized = true;
+        }
+        other => anyhow::bail!("unknown calendar provider \"{other}\""),
+    }
+    Ok(())
+}
+
+/// Stop and join a provider, then clear the same shared store its poller used.
+/// Merely dropping the snapshot or clearing a separate keyring handle is
+/// insufficient: an in-flight refresh could otherwise recreate credentials.
+#[cfg(feature = "cloud-calendar")]
+pub async fn deactivate_cloud_provider(provider: &str) -> anyhow::Result<()> {
+    use cue_calendar_cloud::Provider;
+
+    let sources = cloud_sources();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        initialize_cloud_sources(&sources, &handle);
+    }
+    match provider {
+        "google" => {
+            let (previous, existing_store, token_operation) = {
+                let mut guard = sources
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+                guard.google_initialized = true;
+                (
+                    guard.google.take(),
+                    guard.google_store.clone(),
+                    std::sync::Arc::clone(&guard.google_token_operation),
+                )
+            };
+            if let Some(previous) = previous {
+                previous.shutdown().await;
+            }
+            let store = match existing_store {
+                Some(store) => store,
+                None => cached_store_from_keychain(Provider::Google)?,
+            };
+            {
+                let _token_guard = token_operation.lock().await;
+                store.clear()?;
+            }
+            if let Ok(mut guard) = sources.lock() {
+                guard.google_store = Some(store);
+            }
+        }
+        "microsoft" => {
+            let (previous, existing_store, token_operation) = {
+                let mut guard = sources
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+                guard.microsoft_initialized = true;
+                (
+                    guard.microsoft.take(),
+                    guard.microsoft_store.clone(),
+                    std::sync::Arc::clone(&guard.microsoft_token_operation),
+                )
+            };
+            if let Some(previous) = previous {
+                previous.shutdown().await;
+            }
+            let store = match existing_store {
+                Some(store) => store,
+                None => cached_store_from_keychain(Provider::Microsoft)?,
+            };
+            {
+                let _token_guard = token_operation.lock().await;
+                store.clear()?;
+            }
+            if let Ok(mut guard) = sources.lock() {
+                guard.microsoft_store = Some(store);
+            }
+        }
+        other => anyhow::bail!("unknown calendar provider \"{other}\""),
+    }
+    Ok(())
+}
+
+/// Validate one provider through the exact store + refresh serialization lock
+/// used by its live poller. Returns the connected account email, `None` when no
+/// credentials are stored, and an error when stored credentials cannot refresh.
+#[cfg(feature = "cloud-calendar")]
+pub async fn validate_cloud_provider(
+    provider: &str,
+    now_epoch: u64,
+) -> anyhow::Result<Option<String>> {
+    use cue_calendar_cloud::{valid_access_token_serialized, Provider};
+
+    let provider_enum = match provider {
+        "google" => Provider::Google,
+        "microsoft" => Provider::Microsoft,
+        other => anyhow::bail!("unknown calendar provider \"{other}\""),
+    };
+    let config = provider_enum.config();
+    config.validate()?;
+
+    let handle = tokio::runtime::Handle::try_current()
+        .map_err(|error| anyhow::anyhow!("calendar runtime unavailable: {error}"))?;
+    let sources = cloud_sources();
+    initialize_cloud_sources(&sources, &handle);
+    let (store, token_operation) = {
+        let guard = sources
+            .lock()
+            .map_err(|_| anyhow::anyhow!("calendar source registry mutex poisoned"))?;
+        match provider_enum {
+            Provider::Google => (
+                guard.google_store.clone(),
+                std::sync::Arc::clone(&guard.google_token_operation),
+            ),
+            Provider::Microsoft => (
+                guard.microsoft_store.clone(),
+                std::sync::Arc::clone(&guard.microsoft_token_operation),
+            ),
+        }
+    };
+    let Some(store) = store else {
+        return Ok(None);
+    };
+    if store.load()?.is_none() {
+        return Ok(None);
+    }
+
+    valid_access_token_serialized(store.as_ref(), &config, now_epoch, token_operation.as_ref())
+        .await?;
+    Ok(store.load()?.map(|tokens| tokens.email))
+}
+
+#[cfg(feature = "cloud-calendar")]
+struct DynamicCloudSource {
+    sources: std::sync::Arc<std::sync::Mutex<CloudSources>>,
+    handle: tokio::runtime::Handle,
+}
+
+#[cfg(feature = "cloud-calendar")]
+impl DynamicCloudSource {
+    fn new() -> Option<Self> {
+        let handle = tokio::runtime::Handle::try_current().ok()?;
+        let sources = cloud_sources();
+        initialize_cloud_sources(&sources, &handle);
+        Some(Self { sources, handle })
+    }
+}
+
+#[cfg(feature = "cloud-calendar")]
+impl CalendarSource for DynamicCloudSource {
+    fn upcoming(&self, now_epoch_secs: u64) -> Vec<UpcomingEvent> {
+        // Retry only providers whose prior initialization ended in a transient
+        // configuration/keychain failure.
+        initialize_cloud_sources(&self.sources, &self.handle);
+        let Ok(guard) = self.sources.lock() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        if let Some(source) = guard.google.as_ref() {
+            events.extend(
+                source
+                    .upcoming(now_epoch_secs)
+                    .into_iter()
+                    .map(|event| namespace_provider_event(event, CalendarProvider::Google)),
+            );
+        }
+        if let Some(source) = guard.microsoft.as_ref() {
+            events.extend(
+                source
+                    .upcoming(now_epoch_secs)
+                    .into_iter()
+                    .map(|event| namespace_provider_event(event, CalendarProvider::Microsoft)),
+            );
+        }
+        events.sort_by_key(|event| event.start_epoch_secs);
+        events
+    }
+}
+
+/// Give an occurrence a globally unique Bluey identity without corrupting the
+/// exact provider id that calendar/MCP connectors need for lookup.
+#[cfg(feature = "cloud-calendar")]
+fn namespace_provider_event(mut event: UpcomingEvent, provider: CalendarProvider) -> UpcomingEvent {
+    let provider_event_id = if event.provider_event_id.trim().is_empty() {
+        event.id.clone()
+    } else {
+        event.provider_event_id.clone()
+    };
+    event.provider = provider;
+    event.provider_event_id = provider_event_id.clone();
+    event.id = format!("{}:{provider_event_id}", provider.as_str());
+    event
 }
 
 /// The env-driven fake (`BLUEY_CALENDAR_FAKE_EVENTS="Standup@1783560000;…"`).
@@ -129,8 +532,11 @@ impl CalendarSource for EnvFakeSource {
             .filter_map(|entry| {
                 let (title, start) = entry.trim().rsplit_once('@')?;
                 let start: u64 = start.trim().parse().ok()?;
+                let provider_event_id = format!("fake-{}", title.trim());
                 Some(UpcomingEvent {
-                    id: format!("fake-{}", title.trim()),
+                    id: format!("fake:{provider_event_id}"),
+                    provider: CalendarProvider::Fake,
+                    provider_event_id,
                     title: title.trim().to_string(),
                     start_epoch_secs: start,
                     participants: Vec::new(), // the fake carries no roster
@@ -167,10 +573,11 @@ pub fn due_for_warmup(
 }
 
 /// The maximum a scheduled sleep will ever last before we re-read the calendar,
-/// even if the next meeting is far off. This is the SAFETY POLL: it caps the
-/// sleep so a newly-added / moved meeting (that a sync missed) is still noticed
-/// within this bound. 5 minutes — cheap, and far leaner than the old 30s scan.
-pub const SAFETY_POLL_SECS: u64 = 300;
+/// even if the next meeting is far off. Cloud sources refresh their snapshots
+/// independently, so the scheduler must revisit those snapshots at the normal
+/// poll cadence. Otherwise a source activated after onboarding, or a newly
+/// created meeting, could remain invisible here for five minutes.
+pub const SAFETY_POLL_SECS: u64 = POLL_SECS;
 
 /// Pure scheduler core: how many seconds to sleep before the next action.
 ///
@@ -228,6 +635,93 @@ mod tests {
             participants: Vec::new(),
             ..Default::default()
         }
+    }
+
+    #[cfg(feature = "cloud-calendar")]
+    #[test]
+    fn dynamic_source_namespaces_ids_without_corrupting_provider_identity() {
+        for (provider, expected_prefix) in [
+            (CalendarProvider::Google, "google"),
+            (CalendarProvider::Microsoft, "microsoft"),
+        ] {
+            let raw = format!("{expected_prefix}-provider-event");
+            let event = UpcomingEvent {
+                id: raw.clone(),
+                provider,
+                provider_event_id: raw.clone(),
+                ..Default::default()
+            };
+
+            let namespaced = namespace_provider_event(event, provider);
+            assert_eq!(namespaced.id, format!("{expected_prefix}:{raw}"));
+            assert_eq!(namespaced.provider, provider);
+            assert_eq!(namespaced.provider_event_id, raw);
+        }
+    }
+
+    #[cfg(feature = "cloud-calendar")]
+    #[test]
+    fn dynamic_source_recovers_raw_id_for_legacy_provider_event() {
+        let event = UpcomingEvent {
+            id: "legacy-graph-id".to_string(),
+            ..Default::default()
+        };
+        let namespaced = namespace_provider_event(event, CalendarProvider::Microsoft);
+        assert_eq!(namespaced.id, "microsoft:legacy-graph-id");
+        assert_eq!(namespaced.provider_event_id, "legacy-graph-id");
+    }
+
+    #[cfg(feature = "cloud-calendar")]
+    #[tokio::test]
+    async fn reconnect_stops_old_source_before_publishing_new_tokens() {
+        use cue_calendar_cloud::{CalTokenStore, CalTokens};
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingStore {
+            lifecycle: Arc<Mutex<Vec<&'static str>>>,
+        }
+
+        impl CalTokenStore for RecordingStore {
+            fn save(&self, _tokens: &CalTokens) -> anyhow::Result<()> {
+                self.lifecycle.lock().unwrap().push("save");
+                Ok(())
+            }
+
+            fn load(&self) -> anyhow::Result<Option<CalTokens>> {
+                Ok(None)
+            }
+
+            fn clear(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let lifecycle = Arc::new(Mutex::new(Vec::new()));
+        let store: Arc<dyn CalTokenStore> = Arc::new(RecordingStore {
+            lifecycle: Arc::clone(&lifecycle),
+        });
+        let token_operation = Arc::new(tokio::sync::Mutex::new(()));
+        let tokens = CalTokens {
+            access: "replacement-access".into(),
+            refresh: "replacement-refresh".into(),
+            expires_at_epoch: 1_800_000_000,
+            email: "person@example.com".into(),
+        };
+        let shutdown_lifecycle = Arc::clone(&lifecycle);
+
+        stop_then_save_calendar_tokens(
+            Some(()),
+            &store,
+            &token_operation,
+            &tokens,
+            move |_| async move {
+                shutdown_lifecycle.lock().unwrap().push("stop");
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(*lifecycle.lock().unwrap(), vec!["stop", "save"]);
     }
 
     #[test]
@@ -302,9 +796,10 @@ mod tests {
         let far = vec![event("x", now + 10_000)];
         assert_eq!(next_wake_secs(&far, &fired, now), SAFETY_POLL_SECS);
 
-        // Event whose warm moment is 120s away (start-lead) → sleep exactly 120s.
+        // Event whose warm moment is 120s away is capped at the normal poll
+        // cadence so a newly-refreshed cloud snapshot is observed promptly.
         let soon = vec![event("y", now + WARM_LEAD_SECS + 120)];
-        assert_eq!(next_wake_secs(&soon, &fired, now), 120);
+        assert_eq!(next_wake_secs(&soon, &fired, now), POLL_SECS);
 
         // Already inside the lead window → wake now (0).
         let due = vec![event("z", now + WARM_LEAD_SECS - 10)];
@@ -312,15 +807,27 @@ mod tests {
 
         // The soonest of several drives the sleep.
         let many = vec![
-            event("a", now + WARM_LEAD_SECS + 200),
-            event("b", now + WARM_LEAD_SECS + 40),
-            event("c", now + WARM_LEAD_SECS + 90),
+            event("a", now + WARM_LEAD_SECS + 25),
+            event("b", now + WARM_LEAD_SECS + 5),
+            event("c", now + WARM_LEAD_SECS + 15),
         ];
-        assert_eq!(next_wake_secs(&many, &fired, now), 40);
+        assert_eq!(next_wake_secs(&many, &fired, now), 5);
 
         // A fired event is ignored → the NEXT unfired one drives the sleep.
         let mut fired2 = HashSet::new();
-        fired2.insert(fired_key(&many[1])); // b (40s) consumed
-        assert_eq!(next_wake_secs(&many, &fired2, now), 90); // now c
+        fired2.insert(fired_key(&many[1])); // b (5s) consumed
+        assert_eq!(next_wake_secs(&many, &fired2, now), 15); // now c
+    }
+
+    #[test]
+    fn newly_synced_events_are_observed_within_the_normal_poll_cadence() {
+        let now = 3_000_000;
+        let fired = HashSet::new();
+
+        assert_eq!(next_wake_secs(&[], &fired, now), POLL_SECS);
+        assert_eq!(
+            next_wake_secs(&[event("far-away", now + 10_000)], &fired, now),
+            POLL_SECS
+        );
     }
 }

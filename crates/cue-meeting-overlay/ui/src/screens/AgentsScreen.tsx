@@ -8,6 +8,7 @@ import { HistoryScreen } from "./HistoryScreen";
 import { CoverageMeter } from "../components/CoverageMeter";
 import { AgentLogo } from "../components/AgentLogo";
 import type { AgentSummary } from "../lib/types";
+import { CalendarAccounts } from "./Onboarding";
 
 const CAP: Record<string, { label: string; bg: string; fg: string }> = {
   drive: { label: "Ready", bg: "#e7f8f1", fg: "var(--ok)" },
@@ -82,6 +83,16 @@ export function AgentsScreen({
       }}
     >
       <CoverageMeter attachedKind={attached?.kind ?? null} />
+      <div
+        style={{
+          padding: "12px 13px",
+          borderRadius: "var(--r-lg)",
+          background: "var(--glass-2)",
+          border: "1px solid var(--line)",
+        }}
+      >
+        <CalendarAccounts management />
+      </div>
       {agents.map((a) => {
         const cap = CAP[a.capability] ?? CAP.read_only;
         return (

@@ -170,6 +170,23 @@ export function createMockClient(): MeetingClient {
     context: mockContext,
   };
 
+  type ListeningSources = { system: boolean; microphone: boolean };
+  type ListeningSubscriber = (
+    state: ListeningState,
+    sources?: ListeningSources,
+  ) => void;
+  let mockListeningState: ListeningState = "listening";
+  let mockListeningSources: ListeningSources = {
+    system: true,
+    microphone: false,
+  };
+  const listeningSubscribers = new Set<ListeningSubscriber>();
+  const publishListeningState = () => {
+    for (const subscriber of listeningSubscribers) {
+      subscriber(mockListeningState, { ...mockListeningSources });
+    }
+  };
+
   return {
     async listAgents() {
       return mockAgents;
@@ -206,7 +223,14 @@ export function createMockClient(): MeetingClient {
     async setSessionHistoryConsent() {},
     async calendarConnect() {},
     async calendarStatus() {
-      return [{ provider: "google", connected: true, email: "dev@bluey.ai" }];
+      return [
+        {
+          provider: "google",
+          configured: true,
+          connected: true,
+          email: "dev@bluey.ai",
+        },
+      ];
     },
     async calendarDisconnect() {},
     async meetingState() {
@@ -279,7 +303,12 @@ export function createMockClient(): MeetingClient {
     onSetupStatus(cb) {
       cb({
         model: { state: "ready", detail: "Loaded", percent: null, kind: null },
-        agent: { state: "ready", detail: "Claude Code", percent: null, kind: "claude_code" },
+        agent: {
+          state: "ready",
+          detail: "Claude Code",
+          percent: null,
+          kind: "claude_code",
+        },
         allReady: true,
       });
       return () => {};
@@ -298,11 +327,28 @@ export function createMockClient(): MeetingClient {
       return { cancel() {} };
     },
     onListeningState(cb) {
-      cb("listening");
-      return () => {};
+      listeningSubscribers.add(cb);
+      cb(mockListeningState, { ...mockListeningSources });
+      return () => {
+        listeningSubscribers.delete(cb);
+      };
     },
-    startListening() {},
-    stopListening() {},
+    startListening(sources) {
+      mockListeningSources = {
+        microphone: sources?.microphone ?? true,
+        system: sources?.system ?? true,
+      };
+      mockListeningState =
+        mockListeningSources.system || mockListeningSources.microphone
+          ? "listening"
+          : "idle";
+      publishListeningState();
+    },
+    stopListening() {
+      mockListeningSources = { system: false, microphone: false };
+      mockListeningState = "idle";
+      publishListeningState();
+    },
     turnOff() {},
     openPermissionSettings() {},
     pickSystemAudio() {},

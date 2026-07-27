@@ -6,7 +6,7 @@
 //!   BLUEY_TEST_WAV=/abs/path/to/clip.wav \
 //!   cargo test -p cue-transcribe --test wav_transcribe -- --nocapture
 
-use cue_transcribe::SttEngine;
+use cue_transcribe::{SttEngine, SttEngineHandle};
 
 fn decode_wav_i16(path: &str) -> Vec<i16> {
     let mut r = hound::WavReader::open(path).expect("open wav");
@@ -44,4 +44,22 @@ fn transcribes_a_wav() {
         transcript.len() > 5,
         "expected a non-trivial transcript, got: {transcript:?}"
     );
+}
+
+#[test]
+fn prewarms_model_with_disposable_stream_state() {
+    let Ok(model_dir) = std::env::var("BLUEY_PARAKEET_MODEL_DIR") else {
+        eprintln!("skip: BLUEY_PARAKEET_MODEL_DIR not set");
+        return;
+    };
+
+    let load_started = std::time::Instant::now();
+    let handle = SttEngineHandle::load(&model_dir).expect("load shared engine handle");
+    let load_elapsed = load_started.elapsed();
+
+    let warm_started = std::time::Instant::now();
+    handle.warm_up().expect("prewarm one encoder window");
+    let warm_elapsed = warm_started.elapsed();
+
+    eprintln!("Parakeet timing: model load={load_elapsed:?}, disposable warmup={warm_elapsed:?}");
 }

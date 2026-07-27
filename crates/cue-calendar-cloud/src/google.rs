@@ -15,6 +15,7 @@
 //! this crate or `cue-core`, and the spec forbids adding one, so RFC3339 UTC is
 //! formatted/parsed from epoch seconds directly.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -23,7 +24,10 @@ use serde::Deserialize;
 
 use crate::provider::Provider;
 use crate::tokens::{CalTokenStore, CalTokens, KeyringCalStore};
-use crate::{connect_interactive, valid_access_token, CalendarSource, Participant, UpcomingEvent};
+use crate::{
+    connect_interactive, valid_access_token_serialized, CalendarSource, Participant, UpcomingEvent,
+};
+use cue_core::calendar::CalendarProvider;
 
 /// How far ahead we ask Google for events. The daemon's own EventKit source uses
 /// `LOOKAHEAD_SECS = 600`; `cue-core` does not re-export that constant, so we
@@ -33,6 +37,10 @@ pub const LOOKAHEAD_SECS: u64 = 600;
 /// Background refresh cadence for the snapshot task (~45s, within the spec's
 /// 30–60s window and comfortably under the 30s daemon poll's tolerance).
 const REFRESH_INTERVAL: Duration = Duration::from_secs(45);
+/// Delta tokens inherit the initial time window. Re-baseline periodically so
+/// the rolling 10-minute view advances instead of becoming stale forever.
+const BASELINE_REFRESH_SECS: u64 = 300;
+const MAX_PAGES_PER_SYNC: usize = 100;
 
 const EVENTS_URL: &str = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
@@ -43,6 +51,8 @@ const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 struct EventsResponse {
     #[serde(default)]
     items: Vec<RawEvent>,
+    #[serde(rename = "nextPageToken", default)]
+    next_page_token: Option<String>,
     #[serde(rename = "nextSyncToken", default)]
     next_sync_token: Option<String>,
 }
@@ -114,6 +124,10 @@ struct RawAttendee {
 
 #[derive(Debug, Deserialize)]
 struct RawConferenceData {
+    /// Stable conferencing identity. For Google Meet this is the familiar
+    /// ten-letter code (for example `aaa-bbbb-ccc`).
+    #[serde(rename = "conferenceId", default)]
+    conference_id: Option<String>,
     #[serde(rename = "entryPoints", default)]
     entry_points: Vec<RawEntryPoint>,
 }
@@ -125,6 +139,10 @@ struct RawEntryPoint {
     entry_point_type: Option<String>,
     #[serde(default)]
     uri: Option<String>,
+    /// Structured provider fallback when `conferenceData.conferenceId` is
+    /// absent. Do not derive this from the join URL.
+    #[serde(rename = "meetingCode", default)]
+    meeting_code: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -323,15 +341,41 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
         .map(|e| e as u64)
         .unwrap_or(0);
 
-    // Prefer the stable iCalUID; fall back to the event id.
+    // The provider event id identifies one concrete recurring occurrence.
+    // iCalUID can be shared by every occurrence in a recurring series, so it is
+    // only a fallback when Google omits the normal id.
     let id = raw
-        .ical_uid
+        .id
         .filter(|s| !s.trim().is_empty())
-        .or_else(|| raw.id.filter(|s| !s.trim().is_empty()))?;
+        .or_else(|| raw.ical_uid.filter(|s| !s.trim().is_empty()))?;
 
     let title = raw.summary.unwrap_or_default();
     let description = raw.description.unwrap_or_default();
     let location = raw.location.clone().unwrap_or_default();
+
+    // Conferencing identity is independent of the provider event id. Prefer
+    // Google's conference-level id, then the structured video entry-point
+    // meeting code. Join URLs are intentionally not parsed into an id.
+    let meeting_id = raw
+        .conference_data
+        .as_ref()
+        .and_then(|conference| {
+            conference
+                .conference_id
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    conference
+                        .entry_points
+                        .iter()
+                        .find(|entry| entry.entry_point_type.as_deref() == Some("video"))
+                        .and_then(|entry| entry.meeting_code.as_deref())
+                        .filter(|value| !value.trim().is_empty())
+                })
+        })
+        .map(str::trim)
+        .map(str::to_string)
+        .unwrap_or_default();
 
     // Join URL: prefer the Meet `hangoutLink`, else a `video` conference entry
     // point, else a URL sniffed from the location text (Zoom/Teams pasted in).
@@ -366,9 +410,9 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
     if let Some(org) = raw.organizer {
         organizer_email = org.email.unwrap_or_default();
         organizer_name = org.display_name.unwrap_or_default();
-        let matched = participants
-            .iter_mut()
-            .find(|p| !organizer_email.is_empty() && p.email.eq_ignore_ascii_case(&organizer_email));
+        let matched = participants.iter_mut().find(|p| {
+            !organizer_email.is_empty() && p.email.eq_ignore_ascii_case(&organizer_email)
+        });
         match matched {
             Some(p) => {
                 p.is_organizer = true;
@@ -389,7 +433,10 @@ fn map_event(raw: RawEvent) -> Option<UpcomingEvent> {
     }
 
     Some(UpcomingEvent {
+        provider_event_id: id.clone(),
         id,
+        provider: CalendarProvider::Google,
+        meeting_id,
         title,
         start_epoch_secs,
         end_epoch_secs,
@@ -429,10 +476,71 @@ pub(crate) fn sniff_url(text: &str) -> Option<String> {
 
 /// Parse a Google `events.list` JSON body into `UpcomingEvent`s, skipping any
 /// item that fails to map (pure — no I/O, unit-tested).
+#[cfg(test)]
 fn parse_events_json(body: &str) -> Result<Vec<UpcomingEvent>> {
     let parsed: EventsResponse =
         serde_json::from_str(body).context("parse Google events.list JSON")?;
     Ok(parsed.items.into_iter().filter_map(map_event).collect())
+}
+
+fn event_changes(items: Vec<RawEvent>) -> (Vec<UpcomingEvent>, Vec<String>) {
+    let mut upserts = Vec::new();
+    let mut removed_ids = Vec::new();
+    for event in items {
+        if event.status.as_deref() == Some("cancelled") {
+            if let Some(id) = event
+                .id
+                .as_ref()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    event
+                        .ical_uid
+                        .as_ref()
+                        .filter(|value| !value.trim().is_empty())
+                })
+            {
+                removed_ids.push(id.clone());
+            }
+            continue;
+        }
+        if let Some(event) = map_event(event) {
+            upserts.push(event);
+        }
+    }
+    (upserts, removed_ids)
+}
+
+fn apply_event_changes(
+    cache: &mut HashMap<String, UpcomingEvent>,
+    upserts: Vec<UpcomingEvent>,
+    removed_ids: Vec<String>,
+    replace: bool,
+) {
+    if replace {
+        cache.clear();
+    }
+    for id in removed_ids {
+        cache.remove(&id);
+    }
+    for event in upserts {
+        cache.insert(event.id.clone(), event);
+    }
+}
+
+fn snapshot_from_cache(
+    cache: &HashMap<String, UpcomingEvent>,
+    now_epoch: u64,
+) -> Vec<UpcomingEvent> {
+    let mut events = cache
+        .values()
+        .filter(|event| {
+            event.start_epoch_secs >= now_epoch
+                && event.start_epoch_secs <= now_epoch.saturating_add(LOOKAHEAD_SECS)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event.start_epoch_secs);
+    events
 }
 
 // --- HTTP: events + email -----------------------------------------------
@@ -442,6 +550,7 @@ fn parse_events_json(body: &str) -> Result<Vec<UpcomingEvent>> {
 pub enum FetchEventsOutcome {
     Success {
         events: Vec<UpcomingEvent>,
+        removed_ids: Vec<String>,
         next_sync_token: Option<String>,
     },
     /// The `syncToken` expired (HTTP 410 GONE); caller must trigger a full resync.
@@ -455,46 +564,73 @@ pub async fn fetch_events_with_sync(
     lookahead_secs: u64,
     sync_token: Option<&str>,
 ) -> Result<FetchEventsOutcome> {
-    let client = reqwest::Client::new();
-    let mut req = client.get(EVENTS_URL).bearer_auth(access_token);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("build Google Calendar HTTP client")?;
+    let time_min = epoch_to_rfc3339_utc(now_epoch);
+    let time_max = epoch_to_rfc3339_utc(now_epoch.saturating_add(lookahead_secs));
+    let mut page_token: Option<String> = None;
+    let mut events = Vec::new();
+    let mut removed_ids = Vec::new();
 
-    if let Some(token) = sync_token {
-        req = req.query(&[("syncToken", token), ("maxResults", "100")]);
-    } else {
-        let time_min = epoch_to_rfc3339_utc(now_epoch);
-        let time_max = epoch_to_rfc3339_utc(now_epoch.saturating_add(lookahead_secs));
-        req = req.query(&[
-            ("timeMin", time_min.as_str()),
-            ("timeMax", time_max.as_str()),
-            ("singleEvents", "true"),
-            ("orderBy", "startTime"),
-            ("maxResults", "50"),
-        ]);
+    for _ in 0..MAX_PAGES_PER_SYNC {
+        let mut request = client.get(EVENTS_URL).bearer_auth(access_token);
+        if let Some(token) = sync_token {
+            request = request.query(&[
+                ("syncToken", token),
+                ("singleEvents", "true"),
+                ("showDeleted", "true"),
+                ("maxResults", "100"),
+            ]);
+        } else {
+            request = request.query(&[
+                ("timeMin", time_min.as_str()),
+                ("timeMax", time_max.as_str()),
+                ("singleEvents", "true"),
+                ("orderBy", "startTime"),
+                ("showDeleted", "true"),
+                ("maxResults", "100"),
+            ]);
+        }
+        if let Some(token) = page_token.as_deref() {
+            request = request.query(&[("pageToken", token)]);
+        }
+
+        let response = request.send().await.context("GET Google calendar events")?;
+        let status = response.status();
+        if status == reqwest::StatusCode::GONE {
+            return Ok(FetchEventsOutcome::TokenGone);
+        }
+        let body = response
+            .text()
+            .await
+            .context("read Google events response body")?;
+        if !status.is_success() {
+            return Err(anyhow!("Google Calendar returned HTTP {status}"));
+        }
+
+        let parsed: EventsResponse =
+            serde_json::from_str(&body).context("parse Google events.list JSON")?;
+        let (page_events, page_removed_ids) = event_changes(parsed.items);
+        events.extend(page_events);
+        removed_ids.extend(page_removed_ids);
+
+        match parsed.next_page_token {
+            Some(next_page_token) => page_token = Some(next_page_token),
+            None => {
+                return Ok(FetchEventsOutcome::Success {
+                    events,
+                    removed_ids,
+                    next_sync_token: parsed.next_sync_token,
+                });
+            }
+        }
     }
 
-    let resp = req.send().await.context("GET Google calendar events")?;
-    let status = resp.status();
-    if status == reqwest::StatusCode::GONE {
-        return Ok(FetchEventsOutcome::TokenGone);
-    }
-
-    let body = resp
-        .text()
-        .await
-        .context("read Google events response body")?;
-    if !status.is_success() {
-        return Err(anyhow!("Google events endpoint returned {status}: {body}"));
-    }
-
-    let parsed: EventsResponse =
-        serde_json::from_str(&body).context("parse Google events.list JSON")?;
-    let next_sync_token = parsed.next_sync_token;
-    let events = parsed.items.into_iter().filter_map(map_event).collect();
-
-    Ok(FetchEventsOutcome::Success {
-        events,
-        next_sync_token,
-    })
+    Err(anyhow!(
+        "Google Calendar pagination exceeded {MAX_PAGES_PER_SYNC} pages"
+    ))
 }
 
 /// Fetch upcoming events from the primary calendar as `UpcomingEvent`s.
@@ -514,7 +650,13 @@ pub async fn fetch_events(
 /// Best-effort: any failure (network, non-2xx, missing field) yields an empty
 /// string so a connect never fails just because the label lookup did.
 pub async fn fetch_email(access_token: &str) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return Ok(String::new()),
+    };
     let resp = match client
         .get(USERINFO_URL)
         .bearer_auth(access_token)
@@ -544,33 +686,71 @@ pub async fn fetch_email(access_token: &str) -> Result<String> {
 /// so a transient network blip never empties the calendar mid-meeting.
 pub struct GoogleCalendarSource {
     snapshot: Arc<Mutex<Vec<UpcomingEvent>>>,
+    task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl GoogleCalendarSource {
     /// Spawn the background refresh task on `handle` and return the source.
     ///
-    /// The task loops forever: `valid_access_token` → `fetch_events` → store.
-    /// It holds only a `Weak`-free `Arc` clone of the snapshot and the store, so
-    /// it lives as long as the process (matching the daemon's other sources).
-    pub fn spawn(store: Arc<dyn CalTokenStore>, handle: tokio::runtime::Handle) -> Self {
+    /// The task loops through `valid_access_token` → `fetch_events` → store
+    /// until the source is dropped or explicitly shut down.
+    pub fn spawn(
+        store: Arc<dyn CalTokenStore>,
+        token_operation: Arc<tokio::sync::Mutex<()>>,
+        handle: tokio::runtime::Handle,
+    ) -> Self {
         let snapshot: Arc<Mutex<Vec<UpcomingEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let task_snapshot = Arc::clone(&snapshot);
+        let task_snapshot = Arc::downgrade(&snapshot);
         let cfg = Provider::Google.config();
 
-        handle.spawn(async move {
+        let task = handle.spawn(async move {
             let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
             let mut sync_token: Option<String> = None;
+            let mut baseline_started_at = 0u64;
+            let mut event_cache: HashMap<String, UpcomingEvent> = HashMap::new();
 
             loop {
                 ticker.tick().await;
+                let Some(task_snapshot) = task_snapshot.upgrade() else {
+                    break;
+                };
                 let now = now_epoch_secs();
-                match valid_access_token(store.as_ref(), &cfg, now).await {
+                match valid_access_token_serialized(
+                    store.as_ref(),
+                    &cfg,
+                    now,
+                    token_operation.as_ref(),
+                )
+                .await
+                {
                     Ok(token) => {
-                        match fetch_events_with_sync(&token, now, LOOKAHEAD_SECS, sync_token.as_deref()).await {
-                            Ok(FetchEventsOutcome::Success { events, next_sync_token }) => {
-                                if let Some(nst) = next_sync_token {
-                                    sync_token = Some(nst);
+                        let baseline_due = sync_token.is_none()
+                            || now
+                                >= baseline_started_at.saturating_add(BASELINE_REFRESH_SECS);
+                        let request_token = if baseline_due {
+                            None
+                        } else {
+                            sync_token.as_deref()
+                        };
+                        match fetch_events_with_sync(&token, now, LOOKAHEAD_SECS, request_token)
+                            .await
+                        {
+                            Ok(FetchEventsOutcome::Success {
+                                events,
+                                removed_ids,
+                                next_sync_token,
+                            }) => {
+                                apply_event_changes(
+                                    &mut event_cache,
+                                    events,
+                                    removed_ids,
+                                    baseline_due,
+                                );
+                                if baseline_due {
+                                    baseline_started_at = now;
                                 }
+                                sync_token = next_sync_token;
+                                let events = snapshot_from_cache(&event_cache, now);
                                 match task_snapshot.lock() {
                                     Ok(mut guard) => *guard = events,
                                     Err(e) => tracing::warn!(
@@ -582,10 +762,22 @@ impl GoogleCalendarSource {
                             Ok(FetchEventsOutcome::TokenGone) => {
                                 tracing::info!("Google calendar syncToken expired (410 GONE) — performing baseline resync");
                                 sync_token = None;
-                                if let Ok(FetchEventsOutcome::Success { events, next_sync_token }) =
+                                if let Ok(FetchEventsOutcome::Success {
+                                    events,
+                                    removed_ids,
+                                    next_sync_token,
+                                }) =
                                     fetch_events_with_sync(&token, now, LOOKAHEAD_SECS, None).await
                                 {
+                                    apply_event_changes(
+                                        &mut event_cache,
+                                        events,
+                                        removed_ids,
+                                        true,
+                                    );
+                                    baseline_started_at = now;
                                     sync_token = next_sync_token;
+                                    let events = snapshot_from_cache(&event_cache, now);
                                     if let Ok(mut guard) = task_snapshot.lock() {
                                         *guard = events;
                                     }
@@ -605,15 +797,28 @@ impl GoogleCalendarSource {
             }
         });
 
-        Self { snapshot }
+        Self {
+            snapshot,
+            task: Some(task),
+        }
     }
 
-    /// Connect a Google account interactively, enrich the email label, persist
-    /// the tokens to the per-provider keyring, and return them.
+    /// Cancel the poller and wait until it can no longer refresh or persist
+    /// credentials. Disconnect calls this before clearing the keychain.
+    pub async fn shutdown(mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+
+    /// Authorize a Google account interactively and enrich its email label,
+    /// without persisting. The daemon uses this during reconnect so it can stop
+    /// the old poller before replacing credentials.
     ///
     /// `open_browser` is injected by the caller (the daemon shells out to
     /// `open`/`xdg-open`/`start`). D calls this from the IPC connect handler.
-    pub async fn connect(open_browser: impl Fn(&str)) -> Result<CalTokens> {
+    pub async fn authorize(open_browser: impl FnOnce(&str) -> Result<()>) -> Result<CalTokens> {
         let mut tokens = connect_interactive(Provider::Google, open_browser).await?;
         // Best-effort email enrichment for the connected-account UI label.
         if tokens.email.trim().is_empty() {
@@ -621,6 +826,13 @@ impl GoogleCalendarSource {
                 tokens.email = email;
             }
         }
+        Ok(tokens)
+    }
+
+    /// Backward-compatible standalone connect: authorize, then persist. Daemon
+    /// reconnects call [`Self::authorize`] and own the stop-before-save ordering.
+    pub async fn connect(open_browser: impl FnOnce(&str) -> Result<()>) -> Result<CalTokens> {
+        let tokens = Self::authorize(open_browser).await?;
         let store = KeyringCalStore::new(Provider::Google.keyring_service());
         store
             .save(&tokens)
@@ -629,12 +841,27 @@ impl GoogleCalendarSource {
     }
 }
 
+impl Drop for GoogleCalendarSource {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.as_ref() {
+            task.abort();
+        }
+    }
+}
+
 impl CalendarSource for GoogleCalendarSource {
-    fn upcoming(&self, _now_epoch_secs: u64) -> Vec<UpcomingEvent> {
+    fn upcoming(&self, now_epoch_secs: u64) -> Vec<UpcomingEvent> {
         // Non-blocking, sync: just clone the last good snapshot. A poisoned lock
         // is treated as "no events" (fail-soft) rather than panicking.
         match self.snapshot.lock() {
-            Ok(guard) => guard.clone(),
+            Ok(guard) => guard
+                .iter()
+                .filter(|event| {
+                    event.start_epoch_secs >= now_epoch_secs
+                        && event.start_epoch_secs <= now_epoch_secs.saturating_add(LOOKAHEAD_SECS)
+                })
+                .cloned()
+                .collect(),
             Err(_) => Vec::new(),
         }
     }
@@ -698,6 +925,17 @@ mod tests {
           "iCalUID": "ical-uid-1@google.com",
           "summary": "Design Review",
           "start": { "dateTime": "2026-07-17T16:30:00Z" },
+          "hangoutLink": "https://meet.google.com/abc-defg-hij",
+          "conferenceData": {
+            "conferenceId": "abc-defg-hij",
+            "entryPoints": [
+              {
+                "entryPointType": "video",
+                "uri": "https://meet.google.com/abc-defg-hij",
+                "meetingCode": "fallback-code"
+              }
+            ]
+          },
           "organizer": { "email": "boss@example.com", "displayName": "The Boss" },
           "attendees": [
             { "email": "alice@example.com", "displayName": "Alice", "organizer": false },
@@ -714,6 +952,15 @@ mod tests {
           "id": "evt-2",
           "summary": "Standup",
           "start": { "dateTime": "2026-07-17T09:00:00-07:00" },
+          "conferenceData": {
+            "entryPoints": [
+              {
+                "entryPointType": "video",
+                "uri": "https://meet.google.com/standup-code",
+                "meetingCode": "standup-code"
+              }
+            ]
+          },
           "organizer": { "email": "alice@example.com", "displayName": "Alice A." },
           "attendees": [
             { "email": "ALICE@example.com", "displayName": "Alice", "organizer": true },
@@ -729,13 +976,27 @@ mod tests {
         // The all-day event is skipped; two timed events remain.
         assert_eq!(events.len(), 2);
 
-        // Event 1: iCalUID wins over id; organizer added as a participant.
+        // Event 1: provider id identifies the occurrence; organizer is added.
         let e1 = &events[0];
-        assert_eq!(e1.id, "ical-uid-1@google.com");
+        assert_eq!(e1.id, "evt-1");
+        assert_eq!(e1.provider, CalendarProvider::Google);
+        assert_eq!(e1.provider_event_id, "evt-1");
+        assert_eq!(e1.meeting_id, "abc-defg-hij");
+        assert_eq!(e1.join_url, "https://meet.google.com/abc-defg-hij");
         assert_eq!(e1.title, "Design Review");
         assert_eq!(e1.start_epoch_secs, 1_784_305_800); // 2026-07-17T16:30:00Z
                                                         // 2 attendees + the organizer (not previously present) = 3.
         assert_eq!(e1.participants.len(), 3);
+        let mut emails = e1
+            .participants
+            .iter()
+            .map(|participant| participant.email.as_str())
+            .collect::<Vec<_>>();
+        emails.sort_unstable();
+        assert_eq!(
+            emails,
+            ["alice@example.com", "bob@example.com", "boss@example.com"]
+        );
         let organizer = e1
             .participants
             .iter()
@@ -748,6 +1009,12 @@ mod tests {
             .participants
             .iter()
             .any(|p| p.email == "alice@example.com" && !p.is_organizer));
+        let bob = e1
+            .participants
+            .iter()
+            .find(|participant| participant.email == "bob@example.com")
+            .expect("Bob attendee present");
+        assert_eq!(bob.response, cue_core::calendar::ResponseStatus::Accepted);
     }
 
     #[test]
@@ -755,6 +1022,7 @@ mod tests {
         let events = parse_events_json(SAMPLE).unwrap();
         let e2 = &events[1];
         assert_eq!(e2.id, "evt-2");
+        assert_eq!(e2.meeting_id, "standup-code");
         // 09:00:00-07:00 == 16:00:00Z on 2026-07-17.
         assert_eq!(e2.start_epoch_secs, 1_784_304_000);
         // Organizer email matches an existing attendee (case-insensitively), so
@@ -765,6 +1033,24 @@ mod tests {
         assert!(organizers[0]
             .email
             .eq_ignore_ascii_case("alice@example.com"));
+    }
+
+    #[test]
+    fn join_url_is_not_reinterpreted_as_a_conference_id() {
+        let events = parse_events_json(
+            r#"{"items":[{
+                "id":"event-id",
+                "start":{"dateTime":"2026-07-17T16:30:00Z"},
+                "hangoutLink":"https://meet.google.com/url-only-code"
+            }]}"#,
+        )
+        .unwrap();
+        assert_eq!(events[0].id, "event-id");
+        assert_eq!(events[0].join_url, "https://meet.google.com/url-only-code");
+        assert!(
+            events[0].meeting_id.is_empty(),
+            "meeting id requires structured conference data"
+        );
     }
 
     #[test]
@@ -789,6 +1075,50 @@ mod tests {
     }
 
     #[test]
+    fn incremental_changes_preserve_unchanged_events_and_apply_deletions() {
+        let baseline = serde_json::from_str::<EventsResponse>(
+            r#"{"items":[
+                {"id":"keep","summary":"Keep","start":{"dateTime":"2026-07-17T16:30:00Z"}},
+                {"id":"change","summary":"Old","start":{"dateTime":"2026-07-17T16:31:00Z"}}
+            ]}"#,
+        )
+        .unwrap();
+        let (events, removed) = event_changes(baseline.items);
+        let mut cache = HashMap::new();
+        apply_event_changes(&mut cache, events, removed, true);
+
+        let delta = serde_json::from_str::<EventsResponse>(
+            r#"{"items":[
+                {"id":"change","summary":"New","start":{"dateTime":"2026-07-17T16:32:00Z"}},
+                {"id":"gone","status":"cancelled"},
+                {"id":"keep","status":"cancelled"}
+            ]}"#,
+        )
+        .unwrap();
+        let (events, removed) = event_changes(delta.items);
+        apply_event_changes(&mut cache, events, removed, false);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache["change"].title, "New");
+        assert!(!cache.contains_key("keep"));
+    }
+
+    #[test]
+    fn recurring_occurrences_use_distinct_provider_ids() {
+        let events = parse_events_json(
+            r#"{"items":[
+                {"id":"series_20260717","iCalUID":"series@example.com",
+                 "start":{"dateTime":"2026-07-17T16:30:00Z"}},
+                {"id":"series_20260718","iCalUID":"series@example.com",
+                 "start":{"dateTime":"2026-07-18T16:30:00Z"}}
+            ]}"#,
+        )
+        .unwrap();
+        assert_eq!(events[0].id, "series_20260717");
+        assert_eq!(events[1].id, "series_20260718");
+    }
+
+    #[test]
     fn source_upcoming_clones_snapshot() {
         let snapshot = Arc::new(Mutex::new(vec![UpcomingEvent {
             id: "x".into(),
@@ -799,6 +1129,7 @@ mod tests {
         }]));
         let source = GoogleCalendarSource {
             snapshot: Arc::clone(&snapshot),
+            task: None,
         };
         let got = source.upcoming(0);
         assert_eq!(got.len(), 1);

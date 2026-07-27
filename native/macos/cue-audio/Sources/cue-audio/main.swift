@@ -11,6 +11,28 @@ private enum CaptureSource: String {
     case microphone
 }
 
+private let permissionDeniedExitCode: Int32 = 3
+// Keep this outside the small setup-error range used by capture construction.
+private let systemPermissionDeniedErrorCode = 1_001
+
+private func exitCode(for error: Error, source: CaptureSource) -> Int32 {
+    let nsError = error as NSError
+    guard nsError.domain == "BlueyAudio" else { return 1 }
+
+    switch source {
+    case .microphone:
+        // Codes 10 and 11 are the explicit denied/restricted authorization
+        // failures from ensureMicrophonePermission().
+        return [10, 11].contains(nsError.code) ? permissionDeniedExitCode : 1
+    case .system:
+        // Only the explicit kAudioDevicePermissionsError mapping is a proven
+        // privacy denial. Other process-tap failures are setup/audio errors and
+        // must not send the user through the grant flow again.
+        return nsError.code == systemPermissionDeniedErrorCode
+            ? permissionDeniedExitCode : 1
+    }
+}
+
 private enum Mode {
     case capture
     /// Interactive: present SCContentSharingPicker, print the chosen app's
@@ -23,6 +45,13 @@ private struct Args {
     var durationMs: Int = 3_000
     var continuous: Bool = false
     var mode: Mode = .capture
+    /// Code-signing/LaunchServices smoke path. Exits before touching any capture
+    /// API, so install verification never creates a TCC permission prompt.
+    var launchProbe: Bool = false
+    /// Unique verifier-owned file written by `--launch-probe`. Requiring this
+    /// authenticated handshake prevents an older helper that ignores the flag
+    /// from being mistaken for a successful no-capture probe.
+    var launchProbeOutput: String?
     /// When set (system capture), restrict capture to this app's audio only,
     /// instead of the whole display. Chosen via `--pick`.
     var appBundleId: String?
@@ -35,6 +64,10 @@ private struct Args {
     /// connects back over this socket to deliver PCM. (System audio does not need
     /// this — the Core Audio tap works from a bare exec over stdout.)
     var socketPath: String?
+    /// Optional daemon-owned status sidecar for the bundle-launched microphone
+    /// path. It distinguishes a proven TCC denial from signing/launch/setup
+    /// failures that must not be mislabeled as another permission prompt.
+    var statusPath: String?
 }
 
 private func parseArgs() -> Args {
@@ -54,6 +87,12 @@ private func parseArgs() -> Args {
             parsed.continuous = true
         case "--pick":
             parsed.mode = .pick
+        case "--launch-probe":
+            parsed.launchProbe = true
+        case "--launch-probe-output":
+            if let value = iterator.next(), !value.isEmpty {
+                parsed.launchProbeOutput = value
+            }
         case "--app-bundle":
             if let value = iterator.next(), !value.isEmpty {
                 parsed.appBundleId = value
@@ -62,11 +101,56 @@ private func parseArgs() -> Args {
             if let value = iterator.next(), !value.isEmpty {
                 parsed.socketPath = value
             }
+        case "--status-file":
+            if let value = iterator.next(), !value.isEmpty {
+                parsed.statusPath = value
+            }
         default:
             break
         }
     }
     return parsed
+}
+
+private func writeHelperStatus(_ status: String, to outputPath: String?) {
+    guard let outputPath, !outputPath.isEmpty else { return }
+    let report = """
+    \(status)
+    pid=\(ProcessInfo.processInfo.processIdentifier)
+
+    """
+    do {
+        try report.write(
+            to: URL(fileURLWithPath: outputPath),
+            atomically: true,
+            encoding: .utf8
+        )
+    } catch {
+        fputs("bluey audio helper: status handshake failed: \(error)\n", stderr)
+    }
+}
+
+private func completeLaunchProbe(outputPath: String?) -> Int32 {
+    guard let outputPath, !outputPath.isEmpty else {
+        fputs("bluey audio helper: --launch-probe-output is required\n", stderr)
+        return 5
+    }
+    let marker = """
+    bluey-audio-launch-probe-v1
+    pid=\(ProcessInfo.processInfo.processIdentifier)
+
+    """
+    do {
+        try marker.write(
+            to: URL(fileURLWithPath: outputPath),
+            atomically: true,
+            encoding: .utf8
+        )
+        return 0
+    } catch {
+        fputs("bluey audio helper: launch probe handshake failed: \(error)\n", stderr)
+        return 5
+    }
 }
 
 /// Connect to the daemon's UNIX-domain socket and return a `FileHandle` for
@@ -101,6 +185,42 @@ private func connectSocket(_ path: String) -> FileHandle? {
         return nil
     }
     return FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+}
+
+private func ensureMicrophonePermission() throws {
+    // Without an explicit authorization request the engine can start while its
+    // input remains silent, which looks like a successful helper launch to the
+    // daemon. Check exactly once after publishing the socket/PID handshake but
+    // before starting capture, so a denial becomes a terminal setup failure
+    // instead of a connect/EOF/relaunch loop.
+    let status = AVCaptureDevice.authorizationStatus(for: .audio)
+    fputs("microphone: TCC authorization status = \(status.rawValue) "
+        + "(0=notDetermined 1=restricted 2=denied 3=authorized)\n", stderr)
+    if status == .notDetermined {
+        var finished = false
+        var granted = false
+        AVCaptureDevice.requestAccess(for: .audio) { ok in
+            granted = ok
+            finished = true
+        }
+        while !finished {
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        fputs("microphone: permission prompt result granted=\(granted)\n", stderr)
+        if !granted {
+            throw NSError(
+                domain: "BlueyAudio", code: 10,
+                userInfo: [NSLocalizedDescriptionKey: "microphone access denied by the user"]
+            )
+        }
+    } else if status != .authorized {
+        throw NSError(
+            domain: "BlueyAudio", code: 11,
+            userInfo: [NSLocalizedDescriptionKey:
+                "microphone access not authorized (status \(status.rawValue)); "
+                + "grant Microphone to BlueyAudio in System Settings → Privacy"]
+        )
+    }
 }
 
 /// Writes 16 kHz mono i16 LE PCM to a sink (stdout by default, or the daemon's
@@ -364,9 +484,11 @@ private final class SystemAudioCapture {
         var newTapID = AudioObjectID(kAudioObjectUnknown)
         let tapErr = AudioHardwareCreateProcessTap(tapDescription, &newTapID)
         guard tapErr == noErr, newTapID != AudioObjectID(kAudioObjectUnknown) else {
+            let errorCode = tapErr == kAudioDevicePermissionsError
+                ? systemPermissionDeniedErrorCode : 20
             throw NSError(
                 domain: "BlueyAudio",
-                code: 11,
+                code: errorCode,
                 userInfo: [NSLocalizedDescriptionKey: "AudioHardwareCreateProcessTap failed (OSStatus \(tapErr))"]
             )
         }
@@ -666,39 +788,7 @@ private final class MicrophoneCapture {
     }
 
     func run() throws {
-        // Microphone TCC gate. Without an EXPLICIT authorization request the
-        // engine "starts" but the input tap never receives buffers (macOS returns
-        // a silent/empty input when mic access is denied), so the helper streams
-        // ZERO bytes and exits — the daemon then sees EOF and crash-loops. We
-        // request access synchronously and refuse to proceed if it isn't granted,
-        // logging the exact status so the failure is visible, not silent.
-        let status = AVCaptureDevice.authorizationStatus(for: .audio)
-        fputs("microphone: TCC authorization status = \(status.rawValue) "
-            + "(0=notDetermined 1=restricted 2=denied 3=authorized)\n", stderr)
-        if status == .notDetermined {
-            var finished = false
-            var granted = false
-            AVCaptureDevice.requestAccess(for: .audio) { ok in
-                granted = ok
-                finished = true
-            }
-            while !finished {
-                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.1))
-            }
-            fputs("microphone: permission prompt result granted=\(granted)\n", stderr)
-            if !granted {
-                throw NSError(
-                    domain: "BlueyAudio", code: 10,
-                    userInfo: [NSLocalizedDescriptionKey:
-                        "microphone access denied by the user"])
-            }
-        } else if status != .authorized {
-            throw NSError(
-                domain: "BlueyAudio", code: 11,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "microphone access not authorized (status \(status.rawValue)); "
-                    + "grant Microphone to BlueyAudio in System Settings → Privacy"])
-        }
+        try ensureMicrophonePermission()
 
         let input = engine.inputNode
         // Enable AEC BEFORE reading the input format: the VoiceProcessingIO unit
@@ -874,10 +964,9 @@ private final class SourcePicker: NSObject, SCContentSharingPickerObserver, SCSt
 private func run() async -> Int32 {
     let args = parseArgs()
 
-    // Ignore SIGPIPE so a write to a closed socket (daemon gone) returns EPIPE
-    // instead of killing the process — `PCM16Writer.writeAll` then exits cleanly.
-    // Harmless in stdout mode.
-    signal(SIGPIPE, SIG_IGN)
+    if args.launchProbe {
+        return completeLaunchProbe(outputPath: args.launchProbeOutput)
+    }
 
     // PERMISSION MODEL — this matters, and was subtly WRONG before.
     //
@@ -966,7 +1055,7 @@ private func run() async -> Int32 {
         return 0
     } catch {
         fputs("bluey audio helper failed: \(error.localizedDescription)\n", stderr)
-        return 1
+        return exitCode(for: error, source: args.source)
     }
 }
 
@@ -980,6 +1069,12 @@ private func run() async -> Int32 {
 // type (Swift rejects a file-scope `let` whose type is private).
 private func runMicrophoneOnMainThread() {
     let parsed = parseArgs()
+
+    // Publish the helper PID before connecting so the daemon can terminate this
+    // detached LaunchServices process even if shutdown races socket setup or a
+    // first-use permission prompt.
+    writeHelperStatus("starting", to: parsed.statusPath)
+
     let sink: FileHandle
     if let socketPath = parsed.socketPath {
         guard let connected = connectSocket(socketPath) else {
@@ -990,6 +1085,25 @@ private func runMicrophoneOnMainThread() {
     } else {
         sink = FileHandle.standardOutput
     }
+
+    // Connect to the daemon before macOS presents a first-use prompt. The
+    // daemon can then keep one stable helper/session alive while the user
+    // decides, and an explicit sidecar state distinguishes denial from an AMFI,
+    // LaunchServices, architecture, or engine setup failure.
+    writeHelperStatus("permission_checking", to: parsed.statusPath)
+    do {
+        try ensureMicrophonePermission()
+        writeHelperStatus("authorized", to: parsed.statusPath)
+    } catch {
+        let code = exitCode(for: error, source: .microphone)
+        writeHelperStatus(
+            code == permissionDeniedExitCode ? "permission_denied" : "failed",
+            to: parsed.statusPath
+        )
+        fputs("bluey audio helper failed: \(error.localizedDescription)\n", stderr)
+        exit(code)
+    }
+
     do {
         let capture = MicrophoneCapture(
             durationMs: parsed.durationMs,
@@ -997,12 +1111,19 @@ private func runMicrophoneOnMainThread() {
             sink: sink
         )
         try capture.run() // continuous mode parks on the main run loop inside
+        writeHelperStatus("stopped", to: parsed.statusPath)
         exit(0)
     } catch {
+        writeHelperStatus("failed", to: parsed.statusPath)
         fputs("bluey audio helper failed: \(error.localizedDescription)\n", stderr)
-        exit(1)
+        exit(exitCode(for: error, source: .microphone))
     }
 }
+
+// Ignore SIGPIPE for every mode, including the synchronous microphone branch.
+// A daemon socket close should surface EPIPE to PCM16Writer instead of killing
+// the detached helper before it can write its final status.
+signal(SIGPIPE, SIG_IGN)
 
 if CommandLine.arguments.contains("microphone") {
     runMicrophoneOnMainThread()

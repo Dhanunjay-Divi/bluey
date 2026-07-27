@@ -13,10 +13,10 @@
 #   scripts/reinstall-dev.sh            # rebuild + reinstall, then restart the daemon
 #   scripts/reinstall-dev.sh --no-start # rebuild + reinstall only (don't (re)start)
 #
-# Honors the same install location as scripts/install.sh:
-#   BLUEY_BIN_DIR   symlink dir (default: ~/.local/bin) — used to LOCATE the real
-#                   install dir via the `bluey` symlink, so this always targets the
-#                   exact dir `bluey on` runs from.
+# Install location controls:
+#   BLUEY_BIN_DIR         symlink dir (default: ~/.local/bin).
+#   BLUEY_DEV_INSTALL_BIN bootstrap install bin when the `bluey` link does not
+#                         exist (default: ~/.local/bluey-dev/local/bin).
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -28,8 +28,9 @@ REPO="$PWD"
 TARGET="$(rustc -vV | awk '/host:/{print $2}')"
 # On-device STT lives behind this feature — a plain build ships an STT-less daemon
 # that falls through to the cloud "sign in" gate and transcribes nothing.
-# local-memory adds the keyless cross-meeting facts memory (bge-small via ort).
-DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory"
+# local-memory adds keyless cross-meeting facts; cloud-calendar keeps the dev
+# install feature-equivalent to the onboarding UI it embeds.
+DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory cue-daemon/cloud-calendar"
 # Speaker diarization (cue-daemon/diarize) is OPT-IN via BLUEY_DIARIZE_BUILD=1 —
 # it links Homebrew arm64 OpenBLAS + a CoreML backend, so it's off by default
 # (a plain reinstall stays lean). With it on, real per-speaker labels replace the
@@ -49,20 +50,34 @@ for arg in "$@"; do
   esac
 done
 
-# --- locate the real install dir via the `bluey` symlink (robust to config) ---
+# --- locate the real install dir, bootstrapping a clean dev install if needed ---
 bin_dir="${BLUEY_BIN_DIR:-$HOME/.local/bin}"
 link="$bin_dir/bluey"
-if [[ ! -L "$link" ]]; then
-  printf 'reinstall-dev: no bluey symlink at %s — run scripts/install.sh once first.\n' "$link" >&2
-  exit 1
+if [[ -L "$link" ]]; then
+  link_target="$(readlink "$link")"
+  if [[ "$link_target" != /* ]]; then
+    link_target="$(cd "$(dirname "$link")" && pwd)/$link_target"
+  fi
+  install_bin="$(dirname "$link_target")"
+else
+  install_bin="${BLUEY_DEV_INSTALL_BIN:-$HOME/.local/bluey-dev/local/bin}"
+  case "$install_bin" in
+    ""|"/"|"$HOME"|"$HOME/")
+      printf 'reinstall-dev: refusing unsafe install dir: %s\n' "$install_bin" >&2
+      exit 1
+      ;;
+  esac
+  mkdir -p "$install_bin" "$bin_dir"
+  ln -sfn "$install_bin/bluey" "$link"
+  ln -sfn "$install_bin/bluey-daemon" "$bin_dir/bluey-daemon"
+  printf 'reinstall-dev: bootstrapped clean dev links in %s\n' "$bin_dir"
 fi
-install_bin="$(dirname "$(readlink "$link")")"
-[[ -d "$install_bin" ]] || { printf 'reinstall-dev: install dir %s missing.\n' "$install_bin" >&2; exit 1; }
+mkdir -p "$install_bin"
 printf 'reinstall-dev: target install dir = %s (target-triple %s)\n' "$install_bin" "$TARGET"
 
 # --- 1. build the overlay UI dist (the overlay binary embeds it) ---
-printf 'reinstall-dev: building overlay UI dist…\n'
-( cd crates/cue-meeting-overlay/ui && npx vite build )
+printf 'reinstall-dev: installing locked overlay dependencies + building UI dist…\n'
+( cd crates/cue-meeting-overlay/ui && npm ci && npm run build )
 
 # --- 2. build the Rust binaries (arm64 + STT feature) ---
 printf 'reinstall-dev: building daemon + CLI + overlay (%s, %s)…\n' "$TARGET" "$DAEMON_FEATURES"
@@ -75,7 +90,7 @@ cargo build --target "$TARGET" --features "$DAEMON_FEATURES" \
 # BlueyAudio.app). Built + staged beside the overlay so it resolves at runtime.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   printf 'reinstall-dev: building BlueyShot.app screenshot helper…\n'
-  bash native/macos/cue-shot/build.sh >/dev/null
+  bash native/macos/cue-shot/build.sh "${BLUEY_CODESIGN_IDENTITY:-}" >/dev/null
 fi
 
 # --- 2c. build the BlueyAudio.app mic/system-audio helper (macOS) ---
@@ -87,18 +102,49 @@ fi
 # garbage. Built + staged like BlueyShot.app so the resolver finds it at runtime.
 if [[ "$(uname -s)" == "Darwin" ]]; then
   printf 'reinstall-dev: building BlueyAudio.app audio helper…\n'
-  bash native/macos/cue-audio/build.sh >/dev/null
+  bash native/macos/cue-audio/bundle-app.sh \
+    "${BLUEY_CODESIGN_IDENTITY:-}" >/dev/null
+  BLUEY_VERIFY_LAUNCH=1 \
+    bash native/macos/cue-audio/verify-app.sh \
+    native/macos/cue-audio/.build/BlueyAudio.app
 fi
 
 out="$REPO/target/$TARGET/debug"
 
 # --- 3. stop the running daemon BEFORE overwriting its binary ---
-if [[ "$start_after" -eq 1 ]] && "$link" status >/dev/null 2>&1; then
+# `bluey off` closes only the overlay; it deliberately leaves the daemon alive.
+# Copying over that live executable made a "successful" reinstall keep serving
+# the old code until a later reboot. Always request the full shutdown, including
+# for --no-start, and fail rather than silently installing beneath a stale
+# process.
+if pgrep -x bluey-daemon >/dev/null 2>&1; then
   printf 'reinstall-dev: stopping running daemon…\n'
-  "$link" off >/dev/null 2>&1 || true
+  "$link" quit >/dev/null 2>&1 || true
+  for _ in $(seq 1 50); do
+    pgrep -x bluey-daemon >/dev/null 2>&1 || break
+    sleep 0.1
+  done
+  if pgrep -x bluey-daemon >/dev/null 2>&1; then
+    printf 'reinstall-dev: daemon did not stop; refusing to overwrite the live binary.\n' >&2
+    exit 1
+  fi
 fi
 pkill -f cue-meeting-overlay 2>/dev/null || true
-sleep 1
+for helper_name in BlueyAudio BlueyShot; do
+  if pgrep -x "$helper_name" >/dev/null 2>&1; then
+    printf 'reinstall-dev: stopping detached %s helper…\n' "$helper_name"
+    pkill -TERM -x "$helper_name" 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      pgrep -x "$helper_name" >/dev/null 2>&1 || break
+      sleep 0.1
+    done
+    if pgrep -x "$helper_name" >/dev/null 2>&1; then
+      printf 'reinstall-dev: %s did not stop; refusing to replace its bundle.\n' \
+        "$helper_name" >&2
+      exit 1
+    fi
+  fi
+done
 
 # --- 4. copy the fresh binaries over the install ---
 for b in bluey bluey-daemon cue-meeting-overlay; do
@@ -106,14 +152,19 @@ for b in bluey bluey-daemon cue-meeting-overlay; do
     cp "$out/$b" "$install_bin/$b"
     printf 'reinstall-dev: installed %s\n' "$b"
   else
-    printf 'reinstall-dev: WARN missing build artifact %s (skipped)\n' "$out/$b" >&2
+    printf 'reinstall-dev: missing required build artifact %s\n' "$out/$b" >&2
+    exit 1
   fi
 done
 
 # --- 4a. stage BlueyShot.app beside the overlay in BOTH the target dir (where
 # the daemon launches the overlay from) and the install dir, so the overlay's
 # bundle resolver finds it at runtime. ---
-if [[ "$(uname -s)" == "Darwin" && -d native/macos/cue-shot/.build/BlueyShot.app ]]; then
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if [[ ! -d native/macos/cue-shot/.build/BlueyShot.app ]]; then
+    printf 'reinstall-dev: missing required BlueyShot.app build artifact\n' >&2
+    exit 1
+  fi
   for dest in "$out" "$install_bin"; do
     rm -rf "$dest/BlueyShot.app"
     cp -R native/macos/cue-shot/.build/BlueyShot.app "$dest/" \
@@ -124,21 +175,27 @@ fi
 # --- 4a-audio. stage BlueyAudio.app beside the DAEMON (its bundle resolver,
 # macos_app_bundle_path, searches current_exe().parent()). Without this the mic +
 # system-audio helper can't launch → SILENT capture + "system audio helper failed
-# too many times" → garbage STT. Give it the SAME stable-identifier codesign as
-# the daemon/overlay so its Microphone TCC grant persists across rebuilds (a
-# per-build hash identifier makes macOS re-prompt every time). ---
-if [[ "$(uname -s)" == "Darwin" && -d native/macos/cue-audio/.build/BlueyAudio.app ]]; then
+# too many times" → garbage STT. bundle-app.sh signs it with a stable certificate
+# when one is available. Preserve that signature while staging it; replacing it
+# with an ad-hoc signature here would invalidate the existing TCC grant. ---
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  if [[ ! -d native/macos/cue-audio/.build/BlueyAudio.app ]]; then
+    printf 'reinstall-dev: missing required BlueyAudio.app build artifact\n' >&2
+    exit 1
+  fi
   for dest in "$out" "$install_bin"; do
     rm -rf "$dest/BlueyAudio.app"
     cp -R native/macos/cue-audio/.build/BlueyAudio.app "$dest/" \
       && printf 'reinstall-dev: staged BlueyAudio.app in %s\n' "$dest"
-    if command -v codesign >/dev/null 2>&1; then
-      codesign --force --deep --sign - --identifier "sh.bluey.audio" \
-        "$dest/BlueyAudio.app" >/dev/null 2>&1 \
-        && printf 'reinstall-dev: signed BlueyAudio.app (sh.bluey.audio) in %s\n' "$dest" \
-        || printf 'reinstall-dev: WARN codesign of BlueyAudio.app in %s failed\n' "$dest" >&2
-    fi
+    bash native/macos/cue-audio/verify-app.sh "$dest/BlueyAudio.app"
   done
+
+  # Static codesign verification is not enough: amfid rejects a restricted
+  # entitlement without a matching profile only when the executable launches.
+  # Probe the exact installed copy through LaunchServices before restarting.
+  BLUEY_VERIFY_LAUNCH=1 \
+    bash native/macos/cue-audio/verify-app.sh \
+    "$install_bin/BlueyAudio.app"
 fi
 
 
@@ -173,7 +230,7 @@ fi
 # --- 5. (re)start ---
 if [[ "$start_after" -eq 1 ]]; then
   printf 'reinstall-dev: starting daemon…\n'
-  "$link" on || true
+  "$link" on
   printf 'reinstall-dev: done - %s now runs the fresh build.\n' "'bluey on'"
 else
   printf 'reinstall-dev: done (not started; run %s when ready).\n' "'bluey on'"

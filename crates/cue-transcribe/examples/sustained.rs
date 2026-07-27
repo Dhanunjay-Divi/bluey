@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Instant;
 fn wav(p: &str) -> Vec<i16> {
     let mut r = hound::WavReader::open(p).unwrap();
     r.samples::<i16>().map(|s| s.unwrap()).collect()

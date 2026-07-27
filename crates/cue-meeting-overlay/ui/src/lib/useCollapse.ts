@@ -3,7 +3,7 @@
 // change needed). The expanded size is remembered so re-expanding restores
 // whatever the user had resized to, falling back to the configured default.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 const DEFAULT_EXPANDED = { width: 540, height: 760 };
 const PILL = { width: 232, height: 60 };
@@ -36,8 +36,30 @@ async function tauriWindow() {
 async function setWindowSize(size: Size) {
   try {
     const win = await tauriWindow();
-    const { LogicalSize } = await import("@tauri-apps/api/dpi");
+    const { LogicalSize, PhysicalPosition } = await import(
+      "@tauri-apps/api/dpi"
+    );
+    const { currentMonitor } = await import("@tauri-apps/api/window");
     await win.setSize(new LogicalSize(size.width, size.height));
+
+    // A pill can be dragged right against any monitor edge. Growing that same
+    // window back into the full panel in place used to leave most of it
+    // off-screen. Clamp every morph/expand to the current monitor's work area
+    // after resizing, preserving the user's position whenever it already fits.
+    const monitor = await currentMonitor();
+    if (!monitor) return;
+    const position = await win.outerPosition();
+    const width = Math.round(size.width * monitor.scaleFactor);
+    const height = Math.round(size.height * monitor.scaleFactor);
+    const minX = monitor.workArea.position.x;
+    const minY = monitor.workArea.position.y;
+    const maxX = Math.max(minX, minX + monitor.workArea.size.width - width);
+    const maxY = Math.max(minY, minY + monitor.workArea.size.height - height);
+    const x = Math.min(Math.max(position.x, minX), maxX);
+    const y = Math.min(Math.max(position.y, minY), maxY);
+    if (x !== position.x || y !== position.y) {
+      await win.setPosition(new PhysicalPosition(x, y));
+    }
   } catch {
     // Non-Tauri (browser dev) — no-op.
   }
@@ -70,29 +92,61 @@ async function currentExpandedSize(): Promise<Size> {
 /** `collapsed` state + toggles that also resize the OS window. */
 export function useCollapse() {
   const [collapsed, setCollapsed] = useState(false);
-  // Remember the expanded size across a collapse so re-expand restores it.
-  const [expandedSize, setExpandedSize] = useState<Size>(DEFAULT_EXPANDED);
+  // These values coordinate async Tauri calls without waiting for React state
+  // to re-render. Window resizes are serialized and generation checked so a
+  // slow pill resize can never finish after, and overwrite, a newer expand.
+  const collapsedRef = useRef(false);
+  const expandedSizeRef = useRef<Size>(DEFAULT_EXPANDED);
+  const resizeRef = useRef({
+    generation: 0,
+    tail: Promise.resolve(),
+  });
 
-  const collapse = useCallback(async () => {
-    const size = await currentExpandedSize();
-    setExpandedSize(size);
-    setCollapsed(true);
-    await setWindowSize(PILL);
+  const beginResize = useCallback(() => {
+    resizeRef.current.generation += 1;
+    return resizeRef.current.generation;
   }, []);
 
+  const queueResize = useCallback((generation: number, size: Size) => {
+    const run = resizeRef.current.tail
+      .catch(() => undefined)
+      .then(async () => {
+        if (generation !== resizeRef.current.generation) return;
+        await setWindowSize(size);
+      });
+    resizeRef.current.tail = run;
+    return run;
+  }, []);
+
+  const collapse = useCallback(async () => {
+    const generation = beginResize();
+    const size = await currentExpandedSize();
+    // expand() may have superseded this intent while the native size read was
+    // in flight. In that case, neither state nor window size may move backward.
+    if (generation !== resizeRef.current.generation) return;
+    expandedSizeRef.current = size;
+    collapsedRef.current = true;
+    setCollapsed(true);
+    await queueResize(generation, PILL);
+  }, [beginResize, queueResize]);
+
   const expand = useCallback(async () => {
+    const generation = beginResize();
+    collapsedRef.current = false;
     setCollapsed(false);
-    await setWindowSize(expandedSize);
-  }, [expandedSize]);
+    await queueResize(generation, expandedSizeRef.current);
+  }, [beginResize, queueResize]);
 
   // Resize the collapsed pill window to one of its morph variants. No-op unless
   // collapsed (the pill only owns the window while collapsed). The pill component
   // calls this as its derived state changes (idle → detected → thinking → peek).
   const setPillSize = useCallback(
     async (size: PillSize) => {
-      await setWindowSize(PILL_SIZES[size]);
+      if (!collapsedRef.current) return;
+      const generation = beginResize();
+      await queueResize(generation, PILL_SIZES[size]);
     },
-    [],
+    [beginResize, queueResize],
   );
 
   return { collapsed, collapse, expand, setPillSize };

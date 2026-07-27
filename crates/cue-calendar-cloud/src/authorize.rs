@@ -64,10 +64,10 @@ mod tests {
             Some("http://127.0.0.1:54321")
         );
         assert_eq!(p.get("response_type").map(String::as_str), Some("code"));
-        assert_eq!(
-            p.get("scope").map(String::as_str),
-            Some("https://www.googleapis.com/auth/calendar.readonly")
-        );
+        let scope = p.get("scope").expect("scope");
+        assert!(scope.contains("https://www.googleapis.com/auth/calendar.readonly"));
+        assert!(scope.contains("openid"));
+        assert!(scope.contains("email"));
         assert_eq!(
             p.get("code_challenge").map(String::as_str),
             Some("the-challenge")
@@ -93,8 +93,8 @@ mod tests {
             Some("S256")
         );
         assert!(p.get("scope").unwrap().contains("Calendars.Read"));
-        assert!(p.get("access_type").is_none());
-        assert!(p.get("prompt").is_none());
+        assert!(!p.contains_key("access_type"));
+        assert_eq!(p.get("prompt").map(String::as_str), Some("select_account"));
     }
 
     #[test]

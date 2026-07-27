@@ -34,8 +34,9 @@ cd "$ROOT"
 # it links arm64 OpenBLAS (Homebrew). Diarization models (~60MB) download on
 # first run; runtime is gated by BLUEY_DIARIZE=1.
 # parakeet-stt = on-device STT; local-memory = keyless cross-meeting facts
-# memory (local bge-small embedder — reuses the same ONNX runtime).
-DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory"
+# memory (local bge-small embedder — reuses the same ONNX runtime);
+# cloud-calendar = Google/Microsoft onboarding, token refresh, and live sync.
+DAEMON_FEATURES="cue-daemon/parakeet-stt cue-daemon/local-memory cue-daemon/cloud-calendar"
 if [ "${BLUEY_DIARIZE_BUILD:-0}" = "1" ]; then
   DAEMON_FEATURES="$DAEMON_FEATURES cue-daemon/diarize"
   export PKG_CONFIG_PATH="/opt/homebrew/opt/openblas/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
@@ -58,11 +59,15 @@ cargo build --release -p cue-meeting-overlay
 
 # Native helpers the daemon needs (NOT the interview overlay):
 #   cue-audio   — system-audio capture (ships as a signed .app for the TCC grant)
+#   cue-shot    — screenshot capture (signed .app for the Screen Recording grant)
 #   cue-whisper — the whisper helper
 #   cue-picker  — the file picker
 # The interview overlay (native/macos/cue-overlay) is DELIBERATELY NOT built here.
-bash native/macos/cue-audio/build.sh >/dev/null
-bash native/macos/cue-audio/bundle-app.sh "${BLUEY_CODESIGN_IDENTITY:--}" >/dev/null
+bash native/macos/cue-audio/bundle-app.sh "${BLUEY_CODESIGN_IDENTITY:-}" >/dev/null
+BLUEY_VERIFY_LAUNCH=1 \
+  bash native/macos/cue-audio/verify-app.sh \
+  native/macos/cue-audio/.build/BlueyAudio.app
+bash native/macos/cue-shot/build.sh "${BLUEY_CODESIGN_IDENTITY:-}" >/dev/null
 bash native/macos/cue-whisper/build.sh >/dev/null
 bash native/macos/cue-picker/build.sh >/dev/null
 
@@ -88,6 +93,8 @@ cp target/release/cue-meeting-overlay "$DIST/cue-overlay-tauri"
 cp native/macos/cue-audio/.build/bluey-audio-macos "$DIST/bluey-audio-macos"
 cp native/macos/cue-audio/.build/cue-audio-macos "$DIST/cue-audio-macos"
 cp -R native/macos/cue-audio/.build/BlueyAudio.app "$DIST/BlueyAudio.app"
+BLUEY_VERIFY_LAUNCH=1 \
+  bash native/macos/cue-audio/verify-app.sh "$DIST/BlueyAudio.app"
 
 # Whisper helper.
 cp native/macos/cue-whisper/.build/cue-whisper "$DIST/cue-whisper"

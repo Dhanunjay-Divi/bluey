@@ -45,10 +45,14 @@ export interface SourceCoverageInfo {
 export interface CalendarConnection {
   /** "google" | "microsoft" */
   provider: string;
-  /** true when tokens for this provider are stored on-device. */
+  /** true when runtime/build configuration has a valid public OAuth client ID. */
+  configured: boolean;
+  /** true when stored credentials can supply a live access token. */
   connected: boolean;
   /** connected account email for the label (empty when unknown/disconnected). */
   email: string;
+  /** sanitized setup/credential health error, when action is needed. */
+  error?: string;
 }
 
 /** One prior session, summarized for the resume picker. */
@@ -71,6 +75,17 @@ export type ListeningState =
   // A required macOS permission (Screen Recording for system audio, or
   // Microphone) is not granted — the overlay shows a "grant access" flow.
   | "permission_denied";
+
+export type AudioPermissionSource = "system" | "microphone";
+
+/** Per-source capture truth carried with each aggregate listening state. */
+export interface ListeningSources {
+  system: boolean;
+  microphone: boolean;
+  /** Present when the daemon can identify a blocked source. It can accompany
+   *  `listening` while the other source remains live. Older daemons omit it. */
+  permissionDeniedSource?: AudioPermissionSource;
+}
 
 /** A normalized transcript line surfaced during a live meeting. */
 /** A calendar attendee offered as a tap-to-pick name in the speaker-rename UI. */

@@ -93,6 +93,11 @@ export function OpenFloorScreen({
     listenState,
     micInputOn,
     setMicInputOn,
+    systemInputOn,
+    setSystemInputOn,
+    permissionDeniedSource,
+    permissionSettingsOpenedFor,
+    preparePermissionRetry,
   } = useMeetingState();
 
   // ---- local (view-owned) state -------------------------------------------
@@ -125,8 +130,7 @@ export function OpenFloorScreen({
       el.scrollTop = 0; // Start at top on mount so decisions, header & Q&A are visible
       return;
     }
-    const nearBottom =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
     if (nearBottom) el.scrollTop = el.scrollHeight;
   }, [history, turns, transcript]);
 
@@ -151,7 +155,8 @@ export function OpenFloorScreen({
       id,
       // Pin this exchange after whatever transcript is on screen right now, so
       // it stays anchored where it was asked and later lines flow below it.
-      anchorSegmentId: history.length > 0 ? history[history.length - 1].id : undefined,
+      anchorSegmentId:
+        history.length > 0 ? history[history.length - 1].id : undefined,
       question: displayQuestion ?? question,
       sendQuestion: displayQuestion ? question : undefined,
       answer: { ...draft },
@@ -186,9 +191,8 @@ export function OpenFloorScreen({
   };
 
   // ---- control-stack handlers ---------------------------------------------
-  const [systemInputOn, setSystemInputOn] = useState(true);
-
   const toggleSystemAudio = () => {
+    if (preparePermissionRetry("system")) return;
     const nextSystem = !systemInputOn;
     setSystemInputOn(nextSystem);
     if (!nextSystem && !micInputOn) {
@@ -198,6 +202,7 @@ export function OpenFloorScreen({
     }
   };
   const toggleMic = () => {
+    if (!micInputOn && preparePermissionRetry("microphone")) return;
     const nextMic = !micInputOn;
     setMicInputOn(nextMic);
     if (!nextMic && !systemInputOn) {
@@ -214,8 +219,7 @@ export function OpenFloorScreen({
   const isEmpty =
     history.length === 0 && turns.length === 0 && contextItems.length === 0;
   const showDock = detectedQ !== null && phase === "idle";
-  const capturing =
-    listenState === "listening" || listenState === "connecting";
+  const capturing = listenState === "listening" || listenState === "connecting";
 
   // Interleave the Q&A turns INTO the transcript at the point each was asked, so
   // an exchange stays pinned where it happened and later lines flow below it.
@@ -225,7 +229,6 @@ export function OpenFloorScreen({
     () => buildTimeline(history, turns, contextItems),
     [history, turns, contextItems],
   );
-
 
   // Distinct diarized speakers seen so far — the "reassign this line to…" targets
   // in the speaker editor. Labelled by the first line that named each speaker id.
@@ -282,7 +285,12 @@ export function OpenFloorScreen({
             onClick={() => {
               // Archives the current meeting + starts fresh. Guard when there's
               // real content so a stray click can't wipe a live transcript.
-              if (history.length > 0 && !confirm("Start a new meeting? The current transcript will be saved to History.")) {
+              if (
+                history.length > 0 &&
+                !confirm(
+                  "Start a new meeting? The current transcript will be saved to History.",
+                )
+              ) {
                 return;
               }
               client.newMeeting();
@@ -413,7 +421,10 @@ export function OpenFloorScreen({
       {/* ---- floating control stack ---- */}
       <FloatingStack
         listenState={listenState}
+        systemInputOn={systemInputOn}
         micInputOn={micInputOn}
+        permissionDeniedSource={permissionDeniedSource}
+        permissionSettingsOpenedFor={permissionSettingsOpenedFor}
         askStreaming={phase !== "idle"}
         agentName={agent?.displayName}
         onToggleSystemAudio={toggleSystemAudio}
@@ -422,7 +433,6 @@ export function OpenFloorScreen({
         onAttach={() => client.openAttachPicker()}
         onCapturePage={() => client.capturePage()}
         onAsk={(q) => runAsk(q)}
-        onAskRecent={askDetected}
       />
 
       {/* ---- detected-question dock ---- */}
@@ -633,10 +643,7 @@ function QaBlock({
           <div className="fp-qa-error">
             <div className="fp-qa-error-kicker">Couldn't answer</div>
             <div className="fp-qa-error-text">{a.text}</div>
-            <button
-              className="fp-qa-error-retry"
-              onClick={() => onRetry(turn)}
-            >
+            <button className="fp-qa-error-retry" onClick={() => onRetry(turn)}>
               Try again
             </button>
           </div>
@@ -661,10 +668,7 @@ function QaBlock({
               </button>
               {/* "Fix this" only on a successful answer. */}
               {!a.error && (
-                <button
-                  className="fp-qa-action"
-                  onClick={() => onFix(a.text)}
-                >
+                <button className="fp-qa-action" onClick={() => onFix(a.text)}>
                   <SparkleIcon size={14} />
                   Fix this
                 </button>
@@ -939,7 +943,9 @@ function buildTimeline(
   const turnsByAfter = new Map<number, Turn[]>();
   for (const t of turns) {
     const after = anchorIndexOf(t.anchorSegmentId);
-    (turnsByAfter.get(after) ?? turnsByAfter.set(after, []).get(after)!).push(t);
+    (turnsByAfter.get(after) ?? turnsByAfter.set(after, []).get(after)!).push(
+      t,
+    );
   }
   for (const arr of turnsByAfter.values()) arr.sort((a, b) => a.id - b.id);
 
@@ -947,13 +953,14 @@ function buildTimeline(
   const attachByAfter = new Map<number, ContextItem[]>();
   for (const item of attachments) {
     const after = anchorIndexOf(item.anchorSegmentId);
-    (
-      attachByAfter.get(after) ?? attachByAfter.set(after, []).get(after)!
-    ).push(item);
+    (attachByAfter.get(after) ?? attachByAfter.set(after, []).get(after)!).push(
+      item,
+    );
   }
 
   const emitAfter = (idx: number, out: TimelineItem[]) => {
-    for (const t of turnsByAfter.get(idx) ?? []) out.push({ kind: "qa", turn: t });
+    for (const t of turnsByAfter.get(idx) ?? [])
+      out.push({ kind: "qa", turn: t });
     const att = attachByAfter.get(idx);
     if (att && att.length) out.push({ kind: "attach", items: att });
   };
@@ -973,8 +980,7 @@ function countSpeakers(history: TranscriptLine[]): number {
   const seen = new Set<string>();
   for (const l of history) {
     const key =
-      l.speaker?.trim() ||
-      (l.speakerId != null ? `#${l.speakerId}` : l.source);
+      l.speaker?.trim() || (l.speakerId != null ? `#${l.speakerId}` : l.source);
     if (key) seen.add(key);
   }
   return seen.size;

@@ -59,17 +59,25 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     appendTurn,
     patchTurn,
     turnSeq,
+    listenState: persistedListenState,
+    systemInputOn: persistedSystemInputOn,
+    micInputOn: persistedMicInputOn,
+    permissionDeniedSource,
+    permissionSettingsOpenedFor,
+    preparePermissionRetry,
   } = useMeetingState();
   // (The caption scroll refs went with the ambient-caption block — the bottom
   // `LiveTranscriptBar` owns transcript scrolling + auto-follow now.)
   const [phase, setPhase] = useState<Phase>("idle");
   const [connectors, setConnectors] = useState<string[]>([]);
-  const [listenState, setListenState] = useState<ListeningState>("idle");
+  const [listenState, setListenState] =
+    useState<ListeningState>(persistedListenState);
+  const [systemInputOn, setSystemInputOn] = useState(persistedSystemInputOn);
   // Microphone capture (YOUR voice) is an independent source from the system
   // audio the listen button toggles. Tracked here so the two buttons can be
   // toggled separately and the current pair is re-sent on every change (the
   // daemon's start takes both flags at once).
-  const [micInputOn, setMicInputOn] = useState(false);
+  const [micInputOn, setMicInputOn] = useState(persistedMicInputOn);
   // Attached context artifacts (the "+" menu: files, screenshots, pages), pushed
   // by the daemon as set_context_items. Rendered as ChatGPT-style chips above the
   // composer input; the strip is a pure mirror of the daemon's list.
@@ -84,6 +92,14 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
     () => client.onAgentInstall((offer) => setInstallOffer(offer)),
     [client],
   );
+  // AskScreen unmounts when another legacy tab is selected. Restore the
+  // provider's last source-aware daemon payload on remount and follow it across
+  // the narrow render→subscription window.
+  useEffect(() => {
+    setListenState(persistedListenState);
+    setSystemInputOn(persistedSystemInputOn);
+    setMicInputOn(persistedMicInputOn);
+  }, [persistedListenState, persistedSystemInputOn, persistedMicInputOn]);
   // The attached agent's selectable models ("auto" is always element [0]) and
   // the current pick. Fetched when the agent changes; the Composer shows the
   // picker beside the speed pills only when there is more than one choice.
@@ -112,9 +128,32 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
   // bottom, thinking scrolls up" symptom.
   const feedPinnedRef = useRef(true);
 
-  // onListeningState stays HERE — listenState is view-local. (onTranscript and
-  // onForMeQuestion moved to MeetingProvider as the single owner.)
-  useEffect(() => client.onListeningState(setListenState), [client]);
+  // onListeningState stays HERE — capture state is view-local in this legacy
+  // screen. Consume the daemon's source payload as well as the aggregate state
+  // so a mic-only session never paints or stops system audio (and vice versa).
+  useEffect(
+    () =>
+      client.onListeningState((state, sources) => {
+        setListenState(state);
+        if (sources) {
+          setSystemInputOn(sources.system);
+          setMicInputOn(sources.microphone);
+          return;
+        }
+        if (state === "listening" || state === "connecting") {
+          setSystemInputOn(true);
+        } else if (
+          state === "idle" ||
+          state === "paused" ||
+          state === "failed" ||
+          state === "permission_denied"
+        ) {
+          setSystemInputOn(false);
+          setMicInputOn(false);
+        }
+      }),
+    [client],
+  );
   // Follow the newest turn as the feed grows — but ONLY when pinned to the
   // bottom, so scrolling up to read reasoning is not fought. No smooth
   // behavior: the per-token animation read as a "snap/jump" on each chunk.
@@ -195,30 +234,27 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
         statusDone,
       });
 
-    askRef.current = client.ask(
-      question,
-      (c) => {
-        if (c.status) steps = c.status;
-        if (c.statusDone !== undefined) statusDone = c.statusDone;
-        if (c.text) {
-          draft.text += c.text;
-          setPhase("answering");
-        }
-        if (c.tool) draft.tools = [...draft.tools, c.tool];
-        if (c.source)
-          draft.sources = [...draft.sources, c.source as AnswerSource];
-        if (c.done) {
-          draft.done = true;
-          if (c.error) draft.error = true;
-          // Answer finished → return to idle so the live caption (gated on
-          // phase==="idle") reappears. The answer itself persists in the feed
-          // above (turns are appended, not cleared). Without this, phase stayed
-          // "answering" forever and the transcript vanished after the first ask.
-          setPhase("idle");
-        }
-        patch();
-      },
-    );
+    askRef.current = client.ask(question, (c) => {
+      if (c.status) steps = c.status;
+      if (c.statusDone !== undefined) statusDone = c.statusDone;
+      if (c.text) {
+        draft.text += c.text;
+        setPhase("answering");
+      }
+      if (c.tool) draft.tools = [...draft.tools, c.tool];
+      if (c.source)
+        draft.sources = [...draft.sources, c.source as AnswerSource];
+      if (c.done) {
+        draft.done = true;
+        if (c.error) draft.error = true;
+        // Answer finished → return to idle so the live caption (gated on
+        // phase==="idle") reappears. The answer itself persists in the feed
+        // above (turns are appended, not cleared). Without this, phase stayed
+        // "answering" forever and the transcript vanished after the first ask.
+        setPhase("idle");
+      }
+      patch();
+    });
   };
 
   const askDetected = () => {
@@ -359,7 +395,11 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
                   }
                   onRetry={
                     turn.answer.error
-                      ? () => runAsk(turn.sendQuestion ?? turn.question, turn.sendQuestion ? turn.question : undefined)
+                      ? () =>
+                          runAsk(
+                            turn.sendQuestion ?? turn.question,
+                            turn.sendQuestion ? turn.question : undefined,
+                          )
                       : undefined
                   }
                 />
@@ -430,29 +470,41 @@ export function AskScreen({ agent }: { agent: AgentSummary | null }) {
           // Debounce: ignore clicks while a start is mid-flight (connecting),
           // so a non-responsive moment doesn't fire a burst of start events.
           if (listenState === "connecting") return;
-          // Permission denied → the mic click opens Settings (the recovery the
-          // old "+"-menu "Grant Screen Recording…" item used to offer).
-          if (listenState === "permission_denied") {
-            client.openPermissionSettings("screen_recording");
-            return;
-          }
-          if (listenState === "listening") client.stopListening();
+          // First click opens the denied source's Settings pane; after the user
+          // grants access, the next click falls through and retries capture.
+          if (preparePermissionRetry("system")) return;
           // This button is SYSTEM audio (the other people in the call — the
-          // question trigger). The microphone is the separate button beside it,
-          // whose current state rides along so toggling one never silently
-          // drops the other.
-          else client.startListening({ microphone: micInputOn, system: true });
+          // question trigger). Preserve the microphone selection exactly;
+          // aggregate "listening" can mean mic-only and must not imply Stop All.
+          const system = !systemInputOn;
+          setSystemInputOn(system);
+          if (!system && !micInputOn) {
+            client.stopListening();
+          } else {
+            client.startListening({ microphone: micInputOn, system });
+          }
         }}
         onToggleMicInput={() => {
+          if (!micInputOn && preparePermissionRetry("microphone")) return;
           const nextMic = !micInputOn;
           setMicInputOn(nextMic);
-          if (!nextMic && listenState === "listening") {
-            client.startListening({ microphone: false, system: true });
+          if (!nextMic && !systemInputOn) {
+            client.stopListening();
           } else {
-            client.startListening({ microphone: nextMic, system: true });
+            client.startListening({
+              microphone: nextMic,
+              system: systemInputOn,
+            });
           }
         }}
-        listenState={listenState}
+        micInputOn={micInputOn}
+        permissionDeniedSource={permissionDeniedSource}
+        permissionSettingsOpenedFor={permissionSettingsOpenedFor}
+        listenState={
+          systemInputOn || (listenState === "permission_denied" && !micInputOn)
+            ? listenState
+            : "idle"
+        }
       />
     </div>
   );

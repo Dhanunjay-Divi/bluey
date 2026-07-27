@@ -282,10 +282,10 @@ pub async fn pick_context_files(app: AppHandle) -> Result<Vec<String>, String> {
                 "Attachable files",
                 &[
                     // Text / code / docs
-                    "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift",
-                    "c", "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt",
-                    "kts", "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json",
-                    "html", "css", "scss", "pdf", "doc", "docx", "rtf",
+                    "md", "markdown", "txt", "log", "csv", "tsv", "rst", "adoc", "rs", "swift", "c",
+                    "h", "cpp", "hpp", "js", "jsx", "ts", "tsx", "py", "go", "java", "kt", "kts",
+                    "cs", "rb", "php", "sql", "sh", "ps1", "toml", "yaml", "yml", "json", "html",
+                    "css", "scss", "pdf", "doc", "docx", "rtf",
                     // Images — sent to the agent as pixels over ACP
                     "png", "jpg", "jpeg", "gif", "webp", "heic", "bmp",
                 ],
@@ -424,25 +424,31 @@ fn bluey_shot_app_bundle() -> Option<std::path::PathBuf> {
 /// (the webview `.hide()` doesn't reliably hide a panel). The window is reused
 /// (shown again on the next meeting), so we order-out rather than close it.
 #[tauri::command]
-pub fn hide_banner(app: AppHandle) {
-    // Clear the stored pending banner so a later banner-webview mount / retry
-    // doesn't re-pull and re-show a dismissed banner.
-    {
-        use tauri::Manager;
-        if let Some(pending) = app.try_state::<crate::ipc::PendingBanner>() {
-            *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        }
+pub fn hide_banner(
+    app: AppHandle,
+    event_id: Option<String>,
+    start_epoch_secs: Option<i64>,
+) -> Option<String> {
+    use tauri::Manager;
+
+    // Advance only the matching occurrence. If another due meeting is queued,
+    // return it directly and keep the panel visible.
+    let next = app
+        .try_state::<crate::ipc::PendingBanner>()
+        .and_then(|pending| pending.dismiss(event_id, start_epoch_secs));
+    if next.is_some() {
+        return next;
     }
     #[cfg(target_os = "macos")]
     {
         use tauri_nspanel::ManagerExt;
         if let Ok(panel) = app.get_webview_panel("banner") {
             panel.order_out(None);
-            return;
+            return None;
         }
     }
-    use tauri::Manager;
     if let Some(w) = app.get_webview_window("banner") {
         let _ = w.hide();
     }
+    None
 }

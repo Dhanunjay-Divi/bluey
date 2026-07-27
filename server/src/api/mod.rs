@@ -1,6 +1,6 @@
 //! HTTP API. Builds the axum router with all routes wired in.
 
-use axum::{middleware::from_fn, routing::get, Router};
+use axum::{extract::DefaultBodyLimit, middleware::from_fn, routing::get, Router};
 use std::sync::Arc;
 
 use crate::{auth, config::Config, db::DbPool};
@@ -44,11 +44,19 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         // for backward compat. Both return identical JSON.
         .route("/health", get(admin::health))
         .route("/admin/health", get(admin::health))
-        .route("/webhook/calendar/google", axum::routing::post(calendar::google_webhook))
+        .route(
+            "/webhook/calendar/google",
+            axum::routing::post(calendar::google_webhook),
+        )
         .route(
             "/webhook/calendar/microsoft",
             axum::routing::get(calendar::microsoft_webhook_get)
-                .post(calendar::microsoft_webhook_post),
+                .post(calendar::microsoft_webhook_post)
+                // Reject oversized notification bodies before Axum allocates
+                // and buffers them for the Bytes extractor.
+                .layer(DefaultBodyLimit::max(
+                    calendar::MAX_MICROSOFT_NOTIFICATION_BODY_LEN,
+                )),
         )
         .route(
             "/auth/signup",

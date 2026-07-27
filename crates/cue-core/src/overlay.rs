@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::agent_ui::{AgentConnectorInfo, AgentSessionSummary, AgentSummary, SetupStatus};
-use crate::{overlay_ipc::ListeningState, CueCard, CueCardArtifact};
+use crate::{overlay_ipc::ListeningState, AudioSourceKind, CueCard, CueCardArtifact};
 
 /// serde default for opt-in-by-default booleans (e.g. capture both audio sources
 /// unless the overlay explicitly disables one).
@@ -313,6 +313,15 @@ pub enum OverlayCommand {
     },
     ListeningStateChanged {
         state: ListeningState,
+        #[serde(default)]
+        system: bool,
+        #[serde(default)]
+        microphone: bool,
+        /// The source whose OS permission is denied. This can accompany
+        /// `listening` when the other source remains live, and is absent for
+        /// compatibility with older aggregate-only senders.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_denied_source: Option<AudioSourceKind>,
     },
     PushCard {
         card: CueCard,
@@ -718,11 +727,13 @@ pub enum OverlayEvent {
     /// [`OverlayCommand::PushCard`] `CardKind::Question` when a meeting is about
     /// to start). `approved = true` → the daemon warms the backend and builds the
     /// pre-context (agenda + roster) for that meeting; `false` dismisses it and
-    /// the meeting is marked handled so it won't re-offer. `event_id` is the
-    /// calendar event's stable id echoed from the offer so the daemon warms the
-    /// right meeting. Approval-gated by design: we never auto-start pre-context.
+    /// the meeting is marked handled so it won't re-offer. `event_id` plus
+    /// `start_epoch_secs` identify the exact calendar occurrence echoed from the
+    /// offer, so a moved/recurring event cannot consume another pending occurrence.
+    /// Approval-gated by design: we never auto-start pre-context.
     MeetingPrepResponded {
         event_id: String,
+        start_epoch_secs: u64,
         approved: bool,
     },
     /// UI responded to a BYOT billing disclosure modal pushed by
@@ -1035,13 +1046,70 @@ mod tests {
     fn listening_state_serializes_as_overlay_command() {
         let json = serde_json::to_string(&OverlayCommand::ListeningStateChanged {
             state: ListeningState::Listening,
+            system: true,
+            microphone: false,
+            permission_denied_source: None,
         })
         .expect("serialize overlay listening state command");
 
         assert_eq!(
             json,
-            r#"{"type":"listening_state_changed","state":"listening"}"#
+            r#"{"type":"listening_state_changed","state":"listening","system":true,"microphone":false}"#
         );
+    }
+
+    #[test]
+    fn permission_denied_state_serializes_source() {
+        let json = serde_json::to_value(OverlayCommand::ListeningStateChanged {
+            state: ListeningState::PermissionDenied,
+            system: false,
+            microphone: false,
+            permission_denied_source: Some(AudioSourceKind::Microphone),
+        })
+        .expect("serialize permission source");
+
+        assert_eq!(json["permission_denied_source"], "microphone");
+    }
+
+    #[test]
+    fn listening_state_can_report_a_denied_secondary_source() {
+        let json = serde_json::to_value(OverlayCommand::ListeningStateChanged {
+            state: ListeningState::Listening,
+            system: true,
+            microphone: false,
+            permission_denied_source: Some(AudioSourceKind::Microphone),
+        })
+        .expect("serialize secondary-source permission denial");
+
+        assert_eq!(json["state"], "listening");
+        assert_eq!(json["system"], true);
+        assert_eq!(json["microphone"], false);
+        assert_eq!(json["permission_denied_source"], "microphone");
+    }
+
+    #[test]
+    fn meeting_prep_response_serializes_occurrence_identity() {
+        let json = serde_json::to_string(&OverlayEvent::MeetingPrepResponded {
+            event_id: "calendar-event".to_string(),
+            start_epoch_secs: 1_784_000_000,
+            approved: true,
+        })
+        .expect("serialize meeting prep response");
+
+        assert_eq!(
+            json,
+            r#"{"type":"meeting_prep_responded","event_id":"calendar-event","start_epoch_secs":1784000000,"approved":true}"#
+        );
+        let decoded: OverlayEvent =
+            serde_json::from_str(&json).expect("decode meeting prep response");
+        assert!(matches!(
+            decoded,
+            OverlayEvent::MeetingPrepResponded {
+                event_id,
+                start_epoch_secs: 1_784_000_000,
+                approved: true,
+            } if event_id == "calendar-event"
+        ));
     }
 
     #[test]

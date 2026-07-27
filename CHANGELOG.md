@@ -53,6 +53,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/work/FUTURE-UPGRADES.md`.
 
 ### Fixed
+- **Overlay command, permission, and credential recovery hardening.** The native
+  overlay now dispatches window actions only from an exact top-level command
+  type, so transcript or card text cannot hide/show a window. Permission-denied
+  events identify the blocked audio source and offer the correct Settings pane
+  followed by a real retry. Calendar token saves, loads, and disconnects retry
+  every legacy credential cleanup, aggregate failures, and retain the secure
+  bundle on partial cleanup so stale credentials cannot be migrated back.
+- **Google/Microsoft calendar onboarding and sync.** Meeting, development, and
+  release builds now include `cloud-calendar`; OAuth fails fast when public
+  client IDs are missing, propagates browser/provider errors, stores one atomic
+  token bundle in the OS keychain, and activates or disconnects live sources
+  without a daemon restart. Google and Microsoft incremental sync now preserve
+  unchanged events, follow pagination, apply deletions, and periodically advance
+  the rolling meeting window. The meeting-prep scheduler now observes refreshed
+  cloud snapshots within 30 seconds instead of sleeping for up to five minutes.
+  Provider operations are serialized, transient
+  keychain initialization is retryable, and status distinguishes missing config
+  or unusable authorization from a healthy connection. Calendar accounts remain
+  manageable after onboarding, while public webhook ingress validates
+  channel/client-state tokens and rejects placeholder credentials. Reconnect now
+  stops the previous poller before publishing replacement tokens, and status,
+  polling, and disconnect share one serialized provider store. Internal calendar
+  warmup prompts never enter Bluey's meeting history, app-owned conversation
+  memory, local RAG, or cloud sync; legacy warmup turns are filtered on read.
+  Raw provider occurrence IDs remain distinct from Bluey's namespaced dedupe IDs.
+- **Meeting overlay pill and shortcut controls.** Dragging the collapsed pill no
+  longer triggers its expand click, so it can be placed freely on screen. The
+  expanded window is clamped to the active display, the floating Ask shortcut
+  now opens its input on one click, and system-audio/mic toggles change only the
+  requested source instead of restarting or leaking the other native helper.
+  Authoritative per-source state now survives collapse/expand, microphone-only
+  capture creates a valid meeting session, and stopping the final source
+  archives the meeting cleanly. Permission/audio failures remain visible while
+  collapsed, and resize intents are serialized so a stale pill morph cannot
+  shrink a newly expanded panel.
+- **Meeting-prep banners are delivered once and stay private.** The banner
+  webview now has its required event capability, ignores daemon retry duplicates
+  after dismissal, queues simultaneous offers, and scopes responses to the exact
+  calendar occurrence. It receives only banner commands, retains capture
+  protection in normal mode, and positions itself inside the cursor display's
+  work area.
+- **macOS capture permissions no longer enter re-prompt/relaunch loops.**
+  `BlueyAudio.app` and the Screen Recording helper now keep stable
+  certificate-backed code requirements when available, development and archive
+  installs preserve valid bundle signatures, and permission/setup failures stop
+  audio-helper respawning until an explicit retry. Clean Make and GitHub release
+  builds now require, stage, and verify the signed audio app beside the daemon
+  and in dashboard resources, then sign and strictly verify the fully assembled
+  outer macOS app. The restricted `persistent-content-capture` entitlement is
+  now opt-in and requires a validated matching provisioning profile; a
+  permission-free direct/LaunchServices probe catches AMFI launch failures
+  before installation. Onboarding now explains the two distinct first-use
+  audio grants.
+- **On-device transcription starts warm without duplicate model loads.**
+  Keyless local-STT builds now provision and prewarm Parakeet during startup,
+  single-flight simultaneous microphone/system initialization, and keep
+  transcript content out of synchronous inference-thread diagnostics. Configured
+  cloud/LocalWhisper users retain the existing no-local-download behavior.
+  Source-specific STT providers are created before capture begins, so an
+  initialization failure is surfaced instead of showing a false `Listening`
+  state while silently discarding PCM.
+- **Multi-source capture shutdown and idle races.** Capture and task handles are
+  removed as one generation before asynchronous shutdown, preventing an older
+  terminal monitor or rapid off/on toggle from stealing a replacement task.
+  The system-audio idle watchdog also defers while microphone capture is active,
+  so it cannot archive a meeting based only on quiet system audio.
+- **Cross-channel transcript retries no longer erase real replies.** Deduplication
+  compares final events only and requires longer content before treating exact
+  text from different speakers or capture sources as a retry, so a short reply
+  such as "okay" remains visible while true same-source retries are suppressed.
+- **Development reinstall no longer leaves an older daemon serving the overlay.**
+  The reinstall script requests a full quit, waits for daemon exit, and fails
+  before replacing binaries if a stale process remains. Visible dev-overlay
+  startup also verifies the explicit overlay path without a blocking
+  current-directory lookup before daemon IPC binds.
 - **Live-memory concurrency fixes (adversarial review findings).** (1) The
   rolling-summary inflight guard now clears via a Drop guard, so a panic
   anywhere in the pass can no longer leave the flag stuck true and silently

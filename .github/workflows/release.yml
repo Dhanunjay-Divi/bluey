@@ -82,8 +82,138 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-release-
 
+      - name: Validate calendar OAuth configuration
+        shell: bash
+        env:
+          BLUEY_GOOGLE_CLIENT_ID: ${{ vars.BLUEY_GOOGLE_CLIENT_ID }}
+          BLUEY_MICROSOFT_CLIENT_ID: ${{ vars.BLUEY_MICROSOFT_CLIENT_ID }}
+        run: |
+          test -n "$BLUEY_GOOGLE_CLIENT_ID" || {
+            echo "::error::Repository variable BLUEY_GOOGLE_CLIENT_ID is required"
+            exit 1
+          }
+          test -n "$BLUEY_MICROSOFT_CLIENT_ID" || {
+            echo "::error::Repository variable BLUEY_MICROSOFT_CLIENT_ID is required"
+            exit 1
+          }
+          case "$BLUEY_GOOGLE_CLIENT_ID" in
+            ?*.apps.googleusercontent.com) ;;
+            *)
+              echo "::error::BLUEY_GOOGLE_CLIENT_ID is not a Google OAuth client ID"
+              exit 1
+              ;;
+          esac
+          if [[ ! "$BLUEY_MICROSOFT_CLIENT_ID" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
+            echo "::error::BLUEY_MICROSOFT_CLIENT_ID must be an application GUID"
+            exit 1
+          fi
+          if [ "$BLUEY_MICROSOFT_CLIENT_ID" = "00000000-0000-0000-0000-000000000000" ]; then
+            echo "::error::BLUEY_MICROSOFT_CLIENT_ID cannot be the nil GUID placeholder"
+            exit 1
+          fi
+
+      - name: Configure macOS helper signing
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        env:
+          BLUEY_CODESIGN_P12_BASE64: ${{ secrets.BLUEY_MACOS_CODESIGN_P12_BASE64 }}
+          BLUEY_CODESIGN_P12_PASSWORD: ${{ secrets.BLUEY_MACOS_CODESIGN_P12_PASSWORD }}
+          BLUEY_AUDIO_PROFILE_BASE64: ${{ secrets.BLUEY_MACOS_AUDIO_PROVISIONING_PROFILE_BASE64 }}
+          BLUEY_REQUIRE_PERSISTENT_CAPTURE: ${{ vars.BLUEY_REQUIRE_PERSISTENT_CAPTURE_ENTITLEMENT }}
+        run: |
+          require_persistent="${BLUEY_REQUIRE_PERSISTENT_CAPTURE:-0}"
+          case "$require_persistent" in
+            0|1) ;;
+            *)
+              echo "::error::BLUEY_REQUIRE_PERSISTENT_CAPTURE_ENTITLEMENT must be 0 or 1"
+              exit 1
+              ;;
+          esac
+
+          if [ -z "$BLUEY_CODESIGN_P12_BASE64" ] || \
+             [ -z "$BLUEY_CODESIGN_P12_PASSWORD" ]; then
+            if [ "$GITHUB_REF_TYPE" = "tag" ] || [ "$require_persistent" = "1" ]; then
+              echo "::error::Tagged macOS releases and restricted entitlements require BLUEY_MACOS_CODESIGN_P12_BASE64 and BLUEY_MACOS_CODESIGN_P12_PASSWORD"
+              exit 1
+            fi
+            echo "::warning::No macOS signing certificate configured; manual build will use an ad-hoc helper signature"
+            echo "BLUEY_CODESIGN_IDENTITY=-" >> "$GITHUB_ENV"
+            echo "BLUEY_REQUIRE_STABLE_CODESIGN=0" >> "$GITHUB_ENV"
+            echo "BLUEY_REQUIRE_PERSISTENT_CAPTURE_ENTITLEMENT=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          umask 077
+          keychain="$RUNNER_TEMP/bluey-signing.keychain-db"
+          certificate="$RUNNER_TEMP/bluey-signing.p12"
+          keychain_password="$(uuidgen)"
+          keep_keychain=0
+          cleanup_signing_setup() {
+            rm -f "$certificate"
+            if [ "$keep_keychain" != "1" ]; then
+              security delete-keychain "$keychain" >/dev/null 2>&1 || true
+            fi
+          }
+          trap cleanup_signing_setup EXIT
+
+          printf '%s' "$BLUEY_CODESIGN_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" \
+            -k "$keychain" \
+            -P "$BLUEY_CODESIGN_P12_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          identity="$(
+            security find-identity -v -p codesigning "$keychain" \
+              | awk '/^[[:space:]]*[0-9]+\\)/ { print $2; exit }'
+          )"
+          test -n "$identity" || {
+            echo "::error::The imported PKCS#12 contains no usable code-signing identity"
+            exit 1
+          }
+
+          echo "BLUEY_CODESIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "BLUEY_REQUIRE_STABLE_CODESIGN=1" >> "$GITHUB_ENV"
+          echo "BLUEY_CODESIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+          if [ "$require_persistent" = "1" ]; then
+            if [ -z "$BLUEY_AUDIO_PROFILE_BASE64" ]; then
+              echo "::error::Persistent Content Capture requires BLUEY_MACOS_AUDIO_PROVISIONING_PROFILE_BASE64"
+              exit 1
+            fi
+            profile="$RUNNER_TEMP/BlueyAudio.provisionprofile"
+            profile_plist="$RUNNER_TEMP/BlueyAudio-profile.plist"
+            printf '%s' "$BLUEY_AUDIO_PROFILE_BASE64" | base64 --decode > "$profile"
+            security cms -D -i "$profile" > "$profile_plist" || {
+              echo "::error::BlueyAudio provisioning profile is invalid"
+              exit 1
+            }
+            echo "BLUEY_AUDIO_PROVISIONING_PROFILE=$profile" >> "$GITHUB_ENV"
+            echo "BLUEY_REQUIRE_PERSISTENT_CAPTURE_ENTITLEMENT=1" >> "$GITHUB_ENV"
+          else
+            if [ -n "$BLUEY_AUDIO_PROFILE_BASE64" ]; then
+              echo "::warning::Ignoring the audio provisioning profile because the restricted entitlement is disabled"
+            fi
+            echo "BLUEY_REQUIRE_PERSISTENT_CAPTURE_ENTITLEMENT=0" >> "$GITHUB_ENV"
+          fi
+          keep_keychain=1
+
       - name: Build daemon and CLI
-        run: cargo build --release --target ${{ matrix.target }} -p cue-daemon -p cue-cli
+        env:
+          BLUEY_GOOGLE_CLIENT_ID: ${{ vars.BLUEY_GOOGLE_CLIENT_ID }}
+          BLUEY_MICROSOFT_CLIENT_ID: ${{ vars.BLUEY_MICROSOFT_CLIENT_ID }}
+        run: >-
+          cargo build --release --target ${{ matrix.target }}
+          -p cue-daemon -p cue-cli
+          --features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar
 
       - name: Build macOS dashboard app
         if: matrix.os == 'macos-latest'
@@ -97,11 +227,35 @@ jobs:
 
       - name: Build macOS native helpers
         if: matrix.os == 'macos-latest'
+        shell: bash
         run: |
+          case "${{ matrix.target }}" in
+            aarch64-apple-darwin)
+              audio_swift_triple="arm64-apple-macosx14.0"
+              audio_arch="arm64"
+              ;;
+            x86_64-apple-darwin)
+              audio_swift_triple="x86_64-apple-macosx14.0"
+              audio_arch="x86_64"
+              ;;
+            *)
+              echo "::error::Unsupported macOS audio target: ${{ matrix.target }}"
+              exit 1
+              ;;
+          esac
+
           shopt -s nullglob
           for helper in native/macos/*/build.sh; do
+            case "$helper" in */cue-audio/build.sh) continue ;; esac
             bash "$helper"
           done
+          BLUEY_AUDIO_SWIFT_TRIPLE="$audio_swift_triple" \
+            bash native/macos/cue-audio/bundle-app.sh \
+            "$BLUEY_CODESIGN_IDENTITY"
+          BLUEY_EXPECTED_ARCHS="$audio_arch" BLUEY_VERIFY_LAUNCH=1 \
+            bash native/macos/cue-audio/verify-app.sh \
+            native/macos/cue-audio/.build/BlueyAudio.app
+          echo "BLUEY_RELEASE_AUDIO_ARCH=$audio_arch" >> "$GITHUB_ENV"
 
       - name: Build Windows native helpers
         if: matrix.os == 'windows-latest'
@@ -131,6 +285,12 @@ jobs:
             fi
           done
           if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            cp -R native/macos/cue-audio/.build/BlueyAudio.app \
+              staging/bin/BlueyAudio.app
+            BLUEY_EXPECTED_ARCHS="$BLUEY_RELEASE_AUDIO_ARCH" \
+              bash native/macos/cue-audio/verify-app.sh \
+              staging/bin/BlueyAudio.app
+
             APP_SRC=""
             for app_dir in "target/${{ matrix.target }}/release/bundle/macos" "target/release/bundle/macos"; do
               if [ -d "$app_dir" ]; then
@@ -150,6 +310,11 @@ jobs:
             mkdir -p staging/Bluey.app/Contents/Resources
             cp staging/bin/bluey staging/Bluey.app/Contents/Resources/bluey-cli
             cp staging/bin/bluey-daemon staging/Bluey.app/Contents/Resources/bluey-daemon
+            cp -R staging/bin/BlueyAudio.app \
+              staging/Bluey.app/Contents/Resources/BlueyAudio.app
+            BLUEY_EXPECTED_ARCHS="$BLUEY_RELEASE_AUDIO_ARCH" \
+              bash native/macos/cue-audio/verify-app.sh \
+              staging/Bluey.app/Contents/Resources/BlueyAudio.app
             for helper in \
               bluey-overlay-macos cue-overlay-macos \
               bluey-audio-macos cue-audio-macos \
@@ -162,8 +327,38 @@ jobs:
               cp -R "target/release/BlueyOverlay.app" \
                 staging/Bluey.app/Contents/Resources/BlueyOverlay.app
             fi
+
+            # The Tauri bundle was signed before the release-only CLI, daemon,
+            # helper executables, and nested apps were copied into Resources.
+            # Re-sign the completed code graph so the outer resource seal covers
+            # the exact artifact that is archived and published. Preserve nested
+            # bundle identifiers and TCC entitlements while rotating signatures.
+            codesign_args=(
+              --force
+              --deep
+              --options runtime
+              --preserve-metadata=identifier,entitlements
+              --sign "$BLUEY_CODESIGN_IDENTITY"
+            )
+            if [ "$BLUEY_CODESIGN_IDENTITY" != "-" ]; then
+              codesign_args+=(--timestamp)
+            fi
+            codesign "${codesign_args[@]}" staging/Bluey.app
+            codesign --verify --deep --strict --verbose=2 staging/Bluey.app
+            BLUEY_EXPECTED_ARCHS="$BLUEY_RELEASE_AUDIO_ARCH" \
+              BLUEY_VERIFY_LAUNCH=1 \
+              bash native/macos/cue-audio/verify-app.sh \
+              staging/Bluey.app/Contents/Resources/BlueyAudio.app
           fi
           tar -czf "bluey-${VERSION}-${{ matrix.platform }}.tar.gz" -C staging .
+
+      - name: Remove macOS signing material
+        if: always() && matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          if [ -n "${BLUEY_CODESIGN_KEYCHAIN:-}" ]; then
+            security delete-keychain "$BLUEY_CODESIGN_KEYCHAIN" || true
+          fi
 
       - name: Package (Windows)
         if: matrix.os == 'windows-latest'

@@ -1,5 +1,10 @@
 # IMPL: CLOUD-CALENDAR — Cloud OAuth Calendar (Google + Microsoft)
 
+> Historical implementation record: this document describes the original A–E
+> cloud-calendar landing. The later reliability work supersedes its original
+> single-provider/EventKit selection, token-store, polling, and validation
+> details. See `IMPL-CALENDAR-OAUTH-RELIABILITY.md` for the current behavior.
+
 A native public-client OAuth calendar integration for Bluey: "Connect Google" /
 "Connect Microsoft" in onboarding, so an upcoming meeting on a cloud calendar
 fires the existing warm meeting-backend trigger. Built across five work items
@@ -20,25 +25,26 @@ D's connect seam and wire the cloud source into `default_source()`.
 - Move the shared calendar seam types (`CalendarSource` / `UpcomingEvent` /
   `Participant`) into `cue-core::calendar` so the new crate can implement the trait
   without a `cue-daemon` dependency cycle.
-- Gate everything behind a `cloud-calendar` cargo feature on `cue-daemon`
-  (cross-platform, off by default — unlike the macOS-only `calendar`/EventKit
-  feature).
+- Keep the integration behind the cross-platform `cloud-calendar` cargo feature
+  on `cue-daemon`, and enable that feature in every supported development,
+  meeting, and release build path.
 - Add IPC (`CalendarConnectStart` / `CalendarConnectStatus` / `CalendarDisconnect`
   → `CalendarStatus`), the daemon handlers, the Tauri commands, and the onboarding
   UI connect buttons + connected-account label.
-- (E) Select a connected cloud calendar in `default_source()` ahead of EventKit,
-  and drive the connect handler through the source-level `connect` constructors so
-  the connected-account email is enriched and persisted.
+- Aggregate connected Google and Microsoft sources concurrently through a
+  dynamic registry, and activate or deactivate a provider immediately after
+  onboarding without requiring a daemon restart.
 
 **Does NOT:**
 
-- Ship real OAuth client IDs. The build uses public placeholder client ids; a
-  developer must register the app and inject real ids (see **Developer
-  prerequisite**). Without them, the live connect flow cannot authenticate.
+- Invent or commit real OAuth client IDs. Source builds retain public placeholder
+  fallbacks; runtime environment values override build-time values, and release
+  CI requires registered public IDs (see **Developer prerequisite**).
 - Write events anywhere or request write scopes — read-only calendar access only
   (`calendar.readonly` / `Calendars.Read`).
-- Touch `web/` or the EventKit path. The EventKit source, the env-fake test hook,
-  and the warmup trigger core (dedupe, poll loop, warm-drive) are unchanged.
+- Move OAuth codes, bearer tokens, event bodies, or attendee data through the
+  Bluey server. Cloud sync remains on-device; the public webhook endpoints are
+  authenticated doorbells only.
 - Add heavy dependencies. PKCE is hand-rolled from crates already present
   (`sha2`, `base64`, `url`, `getrandom`, `keyring`); HTTP reuses `reqwest`. No
   `oauth2`, no `chrono`/`time` (RFC3339/ISO-8601 is hand-rolled).
@@ -49,14 +55,14 @@ D's connect seam and wire the cloud source into `default_source()`.
 
 1. Generates a PKCE `code_verifier` + `code_challenge = base64url_nopad(sha256(verifier))`
    and a random `state`.
-2. Binds a transient single-shot `TcpListener` on `127.0.0.1:0`, reads the bound
-   port, and forms `redirect_uri = http://127.0.0.1:PORT`.
+2. Binds a transient single-shot loopback listener. Google desktop clients use
+   `127.0.0.1`; Microsoft public clients use the registered `localhost` host.
 3. Builds the provider authorize URL (`client_id`, `redirect_uri`,
    `response_type=code`, `scope`, `code_challenge`, `code_challenge_method=S256`,
    `state`, plus Google's `access_type=offline` + `prompt=consent` to guarantee a
-   refresh token) and opens it in the system browser (the daemon shells out to
-   `open`/`xdg-open`/`start`; the crate itself stays browser-agnostic via an
-   injected `open_browser` closure).
+   refresh token) and opens it through a shell-free, cross-platform browser
+   launcher. The crate stays browser-agnostic through an injected
+   `open_browser` closure.
 4. The provider redirects back to the loopback listener with `code` + `state`; the
    listener verifies `state`, captures `code`, and serves a "you can close this
    tab" page, then tears down (~2min consent window, bounded by a 120s timeout on
@@ -64,12 +70,14 @@ D's connect seam and wire the cloud source into `default_source()`.
 5. Exchanges the code at the token endpoint (`grant_type=authorization_code`,
    `code_verifier`, NO client secret) for access + refresh tokens.
 
-**On-device keychain tokens.** Tokens live only in the OS keychain, namespaced per
-provider (`bluey_calendar_google` / `bluey_calendar_microsoft`) so a Google and a
-Microsoft connection never collide. Stored fields: access, refresh, absolute
-expiry (epoch), and the connected-account email (a non-secret UI label). Refresh
-is proactive: `valid_access_token` refreshes ~60s ahead of expiry
-(`grant_type=refresh_token`) and persists the rotated token.
+**On-device keychain tokens.** Each provider stores one versioned, atomic token
+bundle in the OS keychain under its own service
+(`bluey_calendar_google` / `bluey_calendar_microsoft`). A process-local cached
+store avoids repeated multi-read keychain access, and a one-time migration
+removes legacy entries without reintroducing plaintext fallback storage. The
+bundle contains access, refresh, absolute expiry, and the connected-account
+email. `valid_access_token` refreshes ahead of expiry and atomically persists a
+rotated bundle.
 
 **Background-refreshed snapshot source.** The `CalendarSource::upcoming()` seam is
 SYNC and must never block the daemon poll, but HTTP + token refresh are async. Each
@@ -98,14 +106,16 @@ The crate depends on `cue-core` (for the shared calendar types) and NEVER on
 cycle.
 
 - **Google:** authorize `accounts.google.com/o/oauth2/v2/auth`, token
-  `oauth2.googleapis.com/token`, scope `.../auth/calendar.readonly`, events via
-  `calendar/v3/calendars/primary/events` (`singleEvents=true`,
-  `orderBy=startTime`). Email via `oauth2/v2/userinfo`.
+  `oauth2.googleapis.com/token`, scopes
+  `.../auth/calendar.readonly openid email`, events via
+  `calendar/v3/calendars/primary/events` with baseline and incremental
+  pagination. Email comes from `oauth2/v2/userinfo`.
 - **Microsoft:** authorize/token under `login.microsoftonline.com/common/oauth2/v2.0`
   (tenant `common` = personal + work/school), scope
-  `Calendars.Read offline_access openid profile`, events via
-  `graph.microsoft.com/v1.0/me/calendarView` with `Prefer: outlook.timezone="UTC"`.
-  Email via Graph `/me` (`mail` → `userPrincipalName`).
+  `Calendars.Read User.Read offline_access openid profile`, events via
+  `graph.microsoft.com/v1.0/me/calendarView` delta queries with UTC timestamps
+  and immutable event IDs. Email comes from Graph `/me`
+  (`mail` → `userPrincipalName`).
 
 ## Feature flag: `cloud-calendar`
 
@@ -118,32 +128,29 @@ cue-calendar-cloud = { path = "../cue-calendar-cloud", optional = true }
 cloud-calendar = ["dep:cue-calendar-cloud"]
 ```
 
-Off by default — the default build compiles with the cloud code fully `cfg`'d out
-(no dead-code/unused warnings). Enable with `--features cloud-calendar`. Cross-
-platform, unlike the macOS-only `calendar` feature.
+The feature remains optional at the crate level so a minimal daemon can compile
+without cloud dependencies. Bluey's supported development, meeting, macOS,
+Windows, Makefile, and release workflow paths explicitly enable it so the
+onboarding UI never targets a daemon that cannot service calendar requests.
 
 ## The seam into `default_source()`
 
-`crates/cue-daemon/src/calendar.rs`. Priority order (env-fake test hook still wins
-FIRST so deterministic tests never race a real calendar):
+`crates/cue-daemon/src/calendar.rs`. Priority order (the env-fake test hook still
+wins first so deterministic tests never race a real calendar):
 
 1. `BLUEY_CALENDAR_FAKE_EVENTS` → `EnvFakeSource`.
-2. **(new, feature `cloud-calendar`)** a connected cloud calendar via
-   `cloud_source()` — Google then Microsoft — when that provider has tokens in its
-   keychain (`KeyringCalStore::new(provider.keyring_service()).load()` returns
-   `Some`).
-3. EventKit (`calendar` feature, macOS).
-4. `NoopSource`.
+2. **(feature `cloud-calendar`)** `DynamicCloudSource`, which merges the current
+   snapshots from every connected Google and Microsoft source.
+3. `NoopSource`.
 
-`cloud_source()` obtains the tokio runtime handle via
-`tokio::runtime::Handle::try_current()` (the sole call site is inside the daemon's
-calendar-poll `tokio::spawn` task — an async context — so `try_current()` resolves
-without any signature change; if ever called off the runtime it returns `None` and
-falls through rather than panicking). It then `spawn`s the connected provider's
-source with an `Arc<dyn CalTokenStore>` over the keychain. Keychain-read errors
-read as "not connected" (fail-soft), never a panic. **No signature change to
-`default_source()` was needed** — the non-cloud paths (env-fake / EventKit / noop)
-do not touch the handle.
+`DynamicCloudSource` obtains the Tokio runtime handle without changing the
+`default_source()` signature. A provider connected during onboarding replaces
+or starts its source immediately; disconnect stops and joins that provider
+before clearing credentials. Transient configuration or keychain failures leave
+the provider eligible for a later initialization retry. Provider IDs are
+namespaced before the two snapshots are merged, preventing cross-provider
+dedupe collisions. The meeting-prep scheduler re-reads refreshed snapshots at
+least every 30 seconds.
 
 ## IPC surface (D)
 
@@ -154,8 +161,8 @@ do not touch the handle.
 - `DaemonRequest::CalendarConnectStatus` — one row per provider.
 - `DaemonRequest::CalendarDisconnect { provider }` — clear that provider's tokens.
 - `DaemonResponse::CalendarStatus { connections: Vec<CalendarConnection> }` where
-  `CalendarConnection { provider, connected, email }` (a serde wire DTO in
-  `cue-core::calendar`; tokens never appear on the wire).
+  `CalendarConnection { provider, configured, connected, email, error }` is a
+  serde wire DTO in `cue-core::calendar`; tokens never appear on the wire.
 
 Daemon handlers `calendar_connect_start` / `calendar_connect_status` /
 `calendar_disconnect` live in `crates/cue-daemon/src/app.rs`, feature-gated: a real
@@ -168,61 +175,69 @@ built / every provider disconnected.
 Tauri commands `calendar_connect` / `calendar_status` / `calendar_disconnect` in
 `crates/cue-meeting-overlay/src/commands.rs` bridge the overlay to the daemon IPC.
 The onboarding screen (`crates/cue-meeting-overlay/ui/src/screens/Onboarding.tsx`,
-with `client.ts` / `tauriClient.ts` / `types.ts`) renders per-provider connect
-buttons and the connected-account label from `CalendarStatus`.
+with `client.ts` / `tauriClient.ts` / `types.ts`) renders per-provider
+configuration, connection health, actionable errors, and connected-account
+labels. The same reconnect/disconnect controls remain available later in
+persistent account settings.
 
-## E1: reconciled connect seam
+## Current connected-source activation seam
 
-D coded `calendar_connect_start` against A's lower-level `connect_interactive`
-(B/C had not landed yet) and left a `// SEAM (E): confirm connect signature`
-marker. E switched the handler to the source-level constructors
-`GoogleCalendarSource::connect(open_browser)` /
-`MicrosoftCalendarSource::connect(open_browser)` (Option 1). These wrap the same
-PKCE + loopback flow but ADDITIONALLY (a) enrich `CalTokens.email` via a
-userinfo/Graph `/me` call and (b) persist the tokens to the per-provider keychain
-themselves — so the handler no longer needs D's separate `KeyringCalStore.save`,
-and the follow-up `CalendarConnectStatus` reports a populated email for the
-connected-account label. The 120s connect timeout is preserved. Both the connect
-constructors and `CalendarConnectStatus` read/write the SAME keyring service
-(`Provider::_.keyring_service()`), so status correctly reflects a fresh connect.
+The source-level `GoogleCalendarSource::connect` and
+`MicrosoftCalendarSource::connect` constructors drive the same bounded PKCE
+flow, enrich `CalTokens.email`, and persist the provider bundle. The daemon then
+passes the returned tokens to `activate_cloud_provider`, replacing any prior
+source and beginning sync immediately. Status validates that stored
+authorization can still yield an access token instead of reporting health from
+token presence alone. Connect, status, and disconnect are serialized per
+provider so a late OAuth completion cannot undo a queued disconnect.
 
-## Build & Test
+## Final validation
 
-All commands run with `--target aarch64-apple-darwin` (this is an arm64 Mac; the
-native toolchain avoids the emulated-x86_64 ort/Parakeet trap).
+Final branch-tip verification completed on 2026-07-26:
 
-```bash
-cargo build -p cue-core                                    # ✅ success
-cargo build -p cue-calendar-cloud                          # ✅ success
-cargo build -p cue-daemon                                  # ✅ success (default; cloud fully cfg'd out, no warnings)
-cargo build -p cue-daemon --features cloud-calendar        # ✅ success (the real integration)
-cargo test  -p cue-calendar-cloud                          # ✅ 42 passed (A/B/C: PKCE, URL, loopback, JSON→UpcomingEvent, token round-trip)
-cargo test  -p cue-core --lib ipc                          # ✅ 27 passed (incl. D's calendar_request/status round-trips)
-cargo test  -p cue-daemon --lib calendar                   # ✅ 3 passed (env_fake_source_parses_and_windows, fires_once_per_occurrence…, moved_event_rearms…)
-cargo test  -p cue-daemon                                  # ✅ default suite green
-cargo clippy -p cue-core -p cue-calendar-cloud -p cue-daemon -- -D warnings          # ✅ clean (default features)
-cargo clippy -p cue-daemon --features cloud-calendar -- -D warnings                  # ✅ clean
-cargo fmt   -p cue-core -p cue-calendar-cloud -p cue-daemon                          # ✅ applied, --check clean
-```
+- [x] `cargo fmt --all -- --check` — passed for the full workspace.
+- [x] `cargo test -p cue-calendar-cloud` — 68 passed, 0 failed.
+- [x] `cargo test -p cue-core` — 163 passed, 0 failed, including the calendar
+      and IPC serialization coverage.
+- [x] `cargo test -p cue-daemon --features parakeet-stt,local-memory,cloud-calendar` —
+      423 passed, 0 failed, 18 intentionally ignored; all 8 calendar tests
+      passed within this suite.
+- [x] `cargo clippy -p cue-calendar-cloud --all-targets -- -D warnings` —
+      passed.
+- [x] `cargo clippy -p cue-daemon --all-targets --features parakeet-stt,local-memory,cloud-calendar -- -D warnings` —
+      passed.
+- [x] `(cd server && cargo test calendar)` — 8 passed, 0 failed, 130 filtered;
+      server all-target Clippy passed with warnings denied.
+- [x] Calendar onboarding/settings UI formatting and production build — all 18
+      changed UI files passed Prettier, and Vite built 78 modules successfully
+      with three pre-existing non-fatal mixed-import advisories.
+- [x] `git diff --check` — passed for staged and unstaged changes.
+
+Live Google and Microsoft consent, refresh rotation, and event retrieval remain
+externally gated by registered public client IDs and interactive provider test
+accounts. The missing-client-ID path fails fast with actionable errors, and the
+external live-consent gate is not a code blocker.
 
 ## Developer prerequisite (REQUIRED to authenticate live)
 
 Client IDs are PUBLIC identifiers (there is NO client secret in this native
-public-client flow), but they are app-specific: the build ships **placeholder**
-ids and a developer must register Bluey with each provider and inject the real
-public client ids.
+public-client flow), but they are app-specific. Source builds retain placeholder
+fallbacks; release CI requires registered IDs, while local/dev binaries can
+receive them from the daemon's runtime environment or at build time.
 
 - **Google:** register an OAuth 2.0 **Desktop app** client in Google Cloud Console
   (APIs & Services → Credentials), enable the Google Calendar API, and add the
-  `calendar.readonly` scope on the consent screen. Copy the client id.
+  `calendar.readonly`, `openid`, and `email` scopes on the consent screen. Copy
+  the client id.
 - **Microsoft:** register an app in the Azure Portal (Entra ID → App registrations)
   as a **public client** (mobile & desktop, "allow public client flows" / no
   secret), supported account type `common`, redirect type "Mobile and desktop
-  applications" (loopback `http://127.0.0.1`), and grant delegated Microsoft Graph
-  `Calendars.Read` + `offline_access` + `openid` + `profile`. Copy the application
-  (client) id.
+  applications" (loopback `http://localhost`), and grant delegated Microsoft Graph
+  `Calendars.Read` + `User.Read` + `offline_access` + `openid` + `profile`. Copy
+  the application (client) id.
 
-Inject them at build time via env (compile-time `option_env!` fallbacks in
+Supply them through the daemon's runtime environment or inject them at build
+time (compile-time `option_env!` fallbacks in
 `crates/cue-calendar-cloud/src/provider.rs`):
 
 ```bash
@@ -231,8 +246,12 @@ BLUEY_MICROSOFT_CLIENT_ID=<azure-public-client-id> \
   cargo build -p cue-daemon --features cloud-calendar --target aarch64-apple-darwin
 ```
 
-Without these, `provider.rs` falls back to `PLACEHOLDER_GOOGLE_CLIENT_ID` /
-`PLACEHOLDER_MICROSOFT_CLIENT_ID` and the live consent step will not authenticate.
+At runtime, a non-empty environment value takes precedence over the value baked
+into any build, including release binaries. Restart the daemon after changing
+its environment. Without either source, `provider.rs` falls back to
+`PLACEHOLDER_GOOGLE_CLIENT_ID` / `PLACEHOLDER_MICROSOFT_CLIENT_ID` and the live
+consent step fails immediately with a configuration error before opening a
+broken consent page. See `docs/deploy/CALENDAR-OAUTH.md`.
 
 ## Tested vs. needs-a-live-account
 
@@ -242,15 +261,19 @@ Without these, `provider.rs` falls back to `PLACEHOLDER_GOOGLE_CLIENT_ID` /
 - Provider config (endpoints, scopes, offline/consent params, distinct keyring
   services).
 - Authorize-URL building (percent-encoding, required params, S256).
-- Loopback listener: bind non-zero port, capture code + verify state, reject state
-  mismatch, ignore favicon then capture.
+- Loopback listener: provider-specific host, bounded request reads, OAuth denial
+  handling, capture code + verify state, reject state mismatch, and ignore
+  favicon before capture.
 - Token endpoint response deserialization; `to_cal_tokens` refresh carry-forward;
   `valid_access_token` cached/expired/no-token branches; `is_expired` skew +
   overflow saturation.
-- JSON → `UpcomingEvent` mapping for both providers (organizer folding, all-day
-  skip, per-item fail-soft, empty bodies).
-- Token store round-trip (`MemoryCalStore`); IPC round-trips (D); the daemon
-  calendar dedupe/window core, with the env-fake hook winning first.
+- JSON → `UpcomingEvent` mapping for both providers, including stable provider
+  occurrence IDs, conferencing IDs, organizer and attendee email/RSVP data,
+  all-day skip, per-item fail-soft, and empty bodies.
+- Paginated baseline/incremental merge, deletions, expired-token resync, Graph
+  continuation validation, and periodic rolling-window baselines.
+- Atomic cached token-store behavior and legacy migration; IPC round-trips; the
+  daemon calendar dedupe/window core, with the env-fake hook winning first.
 
 **Needs a live account (not automatable here — requires real client IDs +
 per-provider app registration + interactive consent):**
@@ -263,37 +286,33 @@ per-provider app registration + interactive consent):**
 - `default_source()` selecting a live cloud source and the background snapshot task
   populating real events that fire the warm trigger.
 
-## End-to-end state
+## Implementation status
 
-Builds green on the DEFAULT feature set and on `--features cloud-calendar`; the
-default build has the cloud code fully `cfg`'d out (no dead-code/unused warnings).
-All hermetic tests pass; clippy is clean on both feature sets; `cargo fmt` is
-applied. The feature **needs real public client IDs + per-provider app
-registration** (Google Cloud Console Desktop client, Azure public-client app) to
-authenticate a live account.
+The on-device OAuth, token, incremental-sync, dynamic-source, and meeting-prep
+paths are implemented. Final-tip validation remains pending in the checklist
+above. Real consent still requires registered Google Desktop and Microsoft
+public-client applications and interactive test accounts.
 
 ## Deviations from Plan
 
 | Deviation | Rationale |
 |-----------|-----------|
-| `default_source()` signature unchanged (no threaded `Handle` param) | The only call site is inside the daemon's calendar-poll `tokio::spawn` task (async context), so `Handle::try_current()` resolves the runtime handle in the cloud branch alone; the non-cloud paths never need a handle. Off-runtime callers fall through to EventKit/noop instead of panicking. |
-| Connect handler uses source-level `connect` (not `connect_interactive`) | B/C's `connect` also enriches `CalTokens.email` and persists to the keyring, giving a populated connected-account label and removing the handler's separate `save`. Same PKCE flow + same keyring service underneath. |
+| `default_source()` signature unchanged (no threaded `Handle` param) | Its daemon call site runs inside Tokio, so the dynamic cloud source can obtain the current handle. Off-runtime callers safely fall through to `NoopSource`. |
+| Polling remains authoritative | The server webhook routes authenticate and acknowledge doorbells, but there is no subscription lifecycle or authenticated device-nudge relay. |
 
 ## Known Follow-ups
 
-- Inject real client IDs and register the app with both providers before shipping
-  (see **Developer prerequisite**); until then the connect flow cannot authenticate.
+- Register both provider applications and configure real public client IDs before
+  a live consent test (see **Developer prerequisite**).
 - macOS packaging: the loopback consent flow needs outbound network + the ability
   to open the system browser from the packaged daemon; verify in the signed `.app`.
 - Live-account integration/smoke test once real client IDs exist (out of scope for
   a hermetic CI run).
-- A pre-existing `cue-cli` `cargo fmt` drift was flagged by A; it is outside the
-  A–E touched files and was intentionally NOT modified here.
 
 ## Review Checklist (for reviewer)
 
 - [ ] Files match the scope described above
 - [ ] No unrelated changes included
 - [ ] Tests cover acceptance criteria from plan
-- [ ] Code style matches CLAUDE.md rules
+- [ ] Code style matches AGENTS.md rules
 - [ ] No TODOs without linked task IDs

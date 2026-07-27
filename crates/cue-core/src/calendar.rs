@@ -16,17 +16,25 @@ use serde::{Deserialize, Serialize};
 /// The connection state of ONE cloud-calendar provider, surfaced to the UI via
 /// [`crate::ipc::DaemonResponse::CalendarStatus`]. A wire DTO (serde), unlike the
 /// poll-source seam types below — it carries only non-secret connection metadata
-/// (which provider, whether it is connected, and the connected account email for
-/// the label). Tokens never appear here; they live in the OS keychain.
+/// (which provider, whether this build is configured, whether credentials are
+/// currently usable, and the connected account email for the label). Tokens
+/// never appear here; they live in the OS keychain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarConnection {
     /// Provider id: `"google"` or `"microsoft"`.
     pub provider: String,
-    /// True when tokens for this provider are stored on-device.
+    /// True when the current runtime/build configuration has a valid public
+    /// OAuth client ID.
+    #[serde(default)]
+    pub configured: bool,
+    /// True when credentials exist and can supply a live access token.
     pub connected: bool,
     /// The connected account's email for the UI label (empty when unknown or
     /// not connected).
     pub email: String,
+    /// Sanitized configuration/credential health error, when action is needed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// An invitee's RSVP to the meeting, when the calendar exposes it. Maps Google's
@@ -58,14 +66,53 @@ pub struct Participant {
     pub response: ResponseStatus,
 }
 
+/// Provider owning a calendar occurrence and its raw event identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CalendarProvider {
+    #[default]
+    Unknown,
+    Google,
+    Microsoft,
+    Fake,
+}
+
+impl CalendarProvider {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Google => "google",
+            Self::Microsoft => "microsoft",
+            Self::Fake => "fake",
+        }
+    }
+}
+
 /// One upcoming meeting occurrence. Carries as much PRE-CONTEXT as the source
 /// exposes — title, agenda, location, join URL, roster — so Bluey can brief the
 /// agent before the meeting starts. All fields beyond the original core four
 /// default to empty so existing sources compile unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct UpcomingEvent {
-    /// Stable event id (iCalUID / EventKit identifier / fake title).
+    /// Bluey's stable, globally namespaced occurrence identity. The dynamic
+    /// aggregate source prefixes the raw provider id (for example
+    /// `google:<id>`) so two connected providers cannot collide. This remains
+    /// the internal dedupe/UI-response key and must never be passed to a provider
+    /// connector as if it were the provider's own id.
     pub id: String,
+    /// Calendar provider that owns [`Self::provider_event_id`].
+    pub provider: CalendarProvider,
+    /// Exact provider event/occurrence id, without Bluey's namespace prefix.
+    /// Google connectors require the Google event id; Graph connectors require
+    /// the immutable Graph id. Keep this distinct from both [`Self::id`] and the
+    /// conferencing [`Self::meeting_id`].
+    pub provider_event_id: String,
+    /// Conferencing meeting id/code exposed by the provider (Google Meet
+    /// `conferenceData.conferenceId` / `entryPoints[].meetingCode`, Microsoft
+    /// Teams `onlineMeeting.conferenceId`). Empty when unavailable; callers
+    /// must not substitute the provider event id or parse an unstable join URL.
+    /// This is internal correlation metadata, not a user-facing label.
+    pub meeting_id: String,
     pub title: String,
     /// Occurrence start (epoch seconds) — part of the dedupe key so a MOVED
     /// event re-arms.

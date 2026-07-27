@@ -47,7 +47,7 @@ pub enum DaemonRequest {
     MeetingEnd,
     /// The user tapped a meeting-prep system notification (via terminal-notifier
     /// `-execute`, which runs `bluey meeting prep <event-id>`). Warms the backend
-    /// + builds the pre-context for the pending calendar event with this id. A
+    /// and builds the pre-context for the pending calendar event with this id. A
     /// no-op if the offer expired. This is the notification's approve path.
     MeetingPrep {
         event_id: String,
@@ -421,13 +421,17 @@ mod tests {
             connections: vec![
                 CalendarConnection {
                     provider: "google".to_string(),
+                    configured: true,
                     connected: true,
                     email: "person@example.com".to_string(),
+                    error: None,
                 },
                 CalendarConnection {
                     provider: "microsoft".to_string(),
+                    configured: true,
                     connected: false,
                     email: String::new(),
+                    error: None,
                 },
             ],
         };

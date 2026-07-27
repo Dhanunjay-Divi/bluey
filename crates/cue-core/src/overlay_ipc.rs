@@ -26,6 +26,10 @@ pub enum OverlayMessage {
     },
     ListeningStateChanged {
         state: ListeningState,
+        #[serde(default)]
+        system: bool,
+        #[serde(default)]
+        microphone: bool,
     },
     TranscriptPartial {
         source: String,
@@ -287,6 +291,28 @@ mod tests {
     fn listening_state_serializes_snake_case() {
         let s = serde_json::to_string(&ListeningState::Listening).unwrap();
         assert_eq!(s, r#""listening""#);
+    }
+
+    #[test]
+    fn listening_state_sources_roundtrip_and_old_messages_default_off() {
+        let message = OverlayMessage::ListeningStateChanged {
+            state: ListeningState::Listening,
+            system: false,
+            microphone: true,
+        };
+        let line = encode_ndjson(&message).unwrap();
+        assert_eq!(decode_ndjson(&line).unwrap(), message);
+
+        let legacy =
+            decode_ndjson(r#"{"type":"listening_state_changed","state":"listening"}"#).unwrap();
+        assert_eq!(
+            legacy,
+            OverlayMessage::ListeningStateChanged {
+                state: ListeningState::Listening,
+                system: false,
+                microphone: false,
+            }
+        );
     }
 
     #[test]

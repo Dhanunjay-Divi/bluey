@@ -8,18 +8,25 @@
 # We package the "bluey" / "bluey-daemon" variants.
 
 .PHONY: build-daemon-release build-dashboard-release build-helpers-release \
+        build-audio-binary-darwin-arm64 build-audio-binary-darwin-x86_64 \
+        build-audio-app-darwin-arm64 build-audio-app-darwin-x86_64 \
         build-meeting-overlay-ui build-meeting-overlay-release \
         build-meeting-overlay-darwin-arm64 build-meeting-overlay-darwin-x86_64 \
-        build-darwin-arm64 build-darwin-x86_64 build-windows-x86_64 build-all \
-        package-darwin-arm64 package-darwin-x86_64 package-windows-x86_64
+        build-darwin-arm64 build-darwin-x86_64 build-darwin-universal \
+        build-windows-x86_64 build-all package-darwin-arm64 \
+        package-darwin-x86_64 package-darwin-universal package-windows-x86_64
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+# Release packages must use a certificate-backed BlueyAudio.app so macOS TCC
+# sees the same designated requirement after an update. Local archive smoke
+# tests can explicitly opt into the ad-hoc fallback.
+MACOS_RELEASE_REQUIRE_STABLE = $(if $(filter 1,$(BLUEY_ALLOW_ADHOC_RELEASE)),0,1)
 
 # `cue-daemon/parakeet-stt` is package-qualified: it enables the parakeet-stt
-# feature on cue-daemon only (cue-cli has no such feature). On-device STT is
-# compiled in; model weights (~600MB) are fetched at first run, not bundled.
+# feature on cue-daemon only (cue-cli has no such feature). cloud-calendar keeps
+# the packaged daemon aligned with the Google/Microsoft onboarding UI.
 build-daemon-release:
-	cargo build --release -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt
+	cargo build --release -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar
 
 # Tauri build runs from crates/cue-dashboard where tauri.conf.json lives.
 build-dashboard-release:
@@ -48,7 +55,39 @@ build-meeting-overlay-release: build-meeting-overlay-ui
 	cargo build --release -p cue-meeting-overlay
 
 build-helpers-release:
-	@for s in native/macos/*/build.sh; do [ -f "$$s" ] && bash "$$s" || true; done
+	@for s in native/macos/*/build.sh; do \
+		case "$$s" in */cue-audio/build.sh) continue ;; esac; \
+		[ -f "$$s" ] && bash "$$s" || true; \
+	done
+
+# BlueyAudio.app is built separately from the other native helpers because it
+# must match the package architecture and must retain a certificate-backed code
+# requirement. bundle-app.sh also stages the target-matched bare aliases.
+build-audio-binary-darwin-arm64:
+	cd native/macos/cue-audio && \
+		swift build -c release --triple arm64-apple-macosx14.0
+
+build-audio-binary-darwin-x86_64:
+	cd native/macos/cue-audio && \
+		swift build -c release --triple x86_64-apple-macosx14.0
+
+build-audio-app-darwin-arm64:
+	BLUEY_AUDIO_SWIFT_TRIPLE=arm64-apple-macosx14.0 \
+		bash native/macos/cue-audio/bundle-app.sh "$${BLUEY_CODESIGN_IDENTITY:-}"
+	BLUEY_REQUIRE_STABLE_CODESIGN="$(MACOS_RELEASE_REQUIRE_STABLE)" \
+		BLUEY_EXPECTED_ARCHS=arm64 \
+		BLUEY_VERIFY_LAUNCH=1 \
+		bash native/macos/cue-audio/verify-app.sh \
+		native/macos/cue-audio/.build/BlueyAudio.app
+
+build-audio-app-darwin-x86_64:
+	BLUEY_AUDIO_SWIFT_TRIPLE=x86_64-apple-macosx14.0 \
+		bash native/macos/cue-audio/bundle-app.sh "$${BLUEY_CODESIGN_IDENTITY:-}"
+	BLUEY_REQUIRE_STABLE_CODESIGN="$(MACOS_RELEASE_REQUIRE_STABLE)" \
+		BLUEY_EXPECTED_ARCHS=x86_64 \
+		BLUEY_VERIFY_LAUNCH=1 \
+		bash native/macos/cue-audio/verify-app.sh \
+		native/macos/cue-audio/.build/BlueyAudio.app
 
 # arm64 is the MVP target for on-device STT. parakeet-stt uses the native
 # prebuilt ONNX Runtime (ort-defaults) on Apple Silicon; nothing extra to ship.
@@ -65,7 +104,7 @@ build-darwin-x86_64:
 	cargo build --release --target x86_64-apple-darwin -p cue-daemon -p cue-cli --features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar
 
 build-windows-x86_64:
-	cargo build --release --target x86_64-pc-windows-msvc -p cue-daemon -p cue-cli
+	cargo build --release --target x86_64-pc-windows-msvc -p cue-daemon -p cue-cli --features cue-daemon/cloud-calendar
 
 build-all: build-darwin-arm64 build-darwin-x86_64
 
@@ -75,7 +114,8 @@ build-all: build-darwin-arm64 build-darwin-x86_64
 build-meeting-overlay-darwin-arm64: build-meeting-overlay-ui
 	cargo build --release --target aarch64-apple-darwin -p cue-meeting-overlay
 
-package-darwin-arm64: build-darwin-arm64 build-helpers-release build-meeting-overlay-darwin-arm64
+package-darwin-arm64: build-darwin-arm64 build-helpers-release \
+		build-audio-app-darwin-arm64 build-meeting-overlay-darwin-arm64
 	mkdir -p dist staging-arm64/bin
 	cp target/aarch64-apple-darwin/release/bluey-daemon staging-arm64/bin/ 2>/dev/null || \
 		cp target/aarch64-apple-darwin/release/cue-daemon staging-arm64/bin/bluey-daemon
@@ -88,9 +128,13 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release build-meeting-ove
 	cp target/aarch64-apple-darwin/release/cue-meeting-overlay staging-arm64/bin/cue-overlay-tauri 2>/dev/null || true
 	cp native/macos/cue-overlay/.build/bluey-overlay-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-overlay/.build/cue-overlay-macos staging-arm64/bin/ 2>/dev/null || true
-	cp -R native/macos/cue-audio/.build/BlueyAudio.app staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-audio/.build/bluey-audio-macos staging-arm64/bin/ 2>/dev/null || true
-	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/ 2>/dev/null || true
+	cp -R native/macos/cue-audio/.build/BlueyAudio.app staging-arm64/bin/
+	cp native/macos/cue-audio/.build/bluey-audio-macos staging-arm64/bin/
+	cp native/macos/cue-audio/.build/cue-audio-macos staging-arm64/bin/
+	BLUEY_REQUIRE_STABLE_CODESIGN="$(MACOS_RELEASE_REQUIRE_STABLE)" \
+		BLUEY_EXPECTED_ARCHS=arm64 \
+		bash native/macos/cue-audio/verify-app.sh \
+		staging-arm64/bin/BlueyAudio.app
 	cp native/macos/cue-whisper/.build/cue-whisper staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-whisper/.build/bluey-whisper-macos staging-arm64/bin/ 2>/dev/null || true
 	cp native/macos/cue-picker/.build/bluey-file-picker-macos staging-arm64/bin/ 2>/dev/null || true
@@ -108,7 +152,8 @@ package-darwin-arm64: build-darwin-arm64 build-helpers-release build-meeting-ove
 build-meeting-overlay-darwin-x86_64: build-meeting-overlay-ui
 	cargo build --release --target x86_64-apple-darwin -p cue-meeting-overlay
 
-package-darwin-x86_64: build-darwin-x86_64 build-meeting-overlay-darwin-x86_64
+package-darwin-x86_64: build-darwin-x86_64 \
+		build-audio-app-darwin-x86_64 build-meeting-overlay-darwin-x86_64
 	mkdir -p dist staging-x86/bin
 	cp target/x86_64-apple-darwin/release/bluey-daemon staging-x86/bin/ 2>/dev/null || \
 		cp target/x86_64-apple-darwin/release/cue-daemon staging-x86/bin/bluey-daemon
@@ -116,12 +161,21 @@ package-darwin-x86_64: build-darwin-x86_64 build-meeting-overlay-darwin-x86_64
 		cp target/x86_64-apple-darwin/release/cue staging-x86/bin/bluey
 	cp target/x86_64-apple-darwin/release/cue-meeting-overlay staging-x86/bin/cue-meeting-overlay 2>/dev/null || true
 	cp target/x86_64-apple-darwin/release/cue-meeting-overlay staging-x86/bin/cue-overlay-tauri 2>/dev/null || true
+	cp -R native/macos/cue-audio/.build/BlueyAudio.app staging-x86/bin/
+	cp native/macos/cue-audio/.build/bluey-audio-macos staging-x86/bin/
+	cp native/macos/cue-audio/.build/cue-audio-macos staging-x86/bin/
+	BLUEY_REQUIRE_STABLE_CODESIGN="$(MACOS_RELEASE_REQUIRE_STABLE)" \
+		BLUEY_EXPECTED_ARCHS=x86_64 \
+		bash native/macos/cue-audio/verify-app.sh \
+		staging-x86/bin/BlueyAudio.app
 	tar -czf dist/bluey-$(VERSION)-darwin-x86_64.tar.gz -C staging-x86 .
 	rm -rf staging-x86
 
 build-darwin-universal: build-darwin-arm64 build-darwin-x86_64 \
+		build-audio-binary-darwin-arm64 build-audio-binary-darwin-x86_64 \
 		build-meeting-overlay-darwin-arm64 build-meeting-overlay-darwin-x86_64
-	@bash scripts/build-macos-universal.sh
+	@BLUEY_REQUIRE_STABLE_CODESIGN="$(MACOS_RELEASE_REQUIRE_STABLE)" \
+		bash scripts/build-macos-universal.sh
 
 package-darwin-universal: build-darwin-universal
 	mkdir -p dist staging-universal/bin
@@ -131,6 +185,11 @@ package-darwin-universal: build-darwin-universal
 	cp dist/bluey-macos-universal/cue-meeting-overlay staging-universal/bin/cue-overlay-tauri 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-overlay-macos staging-universal/bin/bluey-overlay-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-audio-macos staging-universal/bin/bluey-audio-macos 2>/dev/null || true
+	cp -R dist/bluey-macos-universal/BlueyAudio.app staging-universal/bin/
+	BLUEY_REQUIRE_STABLE_CODESIGN="$(MACOS_RELEASE_REQUIRE_STABLE)" \
+		BLUEY_EXPECTED_ARCHS="arm64 x86_64" \
+		bash native/macos/cue-audio/verify-app.sh \
+		staging-universal/bin/BlueyAudio.app
 	cp dist/bluey-macos-universal/bluey-whisper-macos staging-universal/bin/bluey-whisper-macos 2>/dev/null || true
 	cp dist/bluey-macos-universal/bluey-file-picker-macos staging-universal/bin/bluey-file-picker-macos 2>/dev/null || true
 	cp -R dist/bluey-macos-universal/BlueyFilePicker.app staging-universal/bin/ 2>/dev/null || true

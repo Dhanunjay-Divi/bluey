@@ -151,11 +151,13 @@ ln -sfn "$target/bin/bluey-daemon" "$bin_dir/bluey-daemon"
 
 # ── Make macOS launch these binaries without an "Apple could not verify" popup ──
 #
-# The binaries are ad-hoc signed, NOT Apple-notarized (no Developer account). Two
-# things make macOS block them, and each needs its own cure:
-#   1. codesign --force --sign -  — re-seal each Mach-O. AirDrop/download plus the
-#      diarize install_name_tool rewrite invalidate the shipped signature; an
-#      unsigned/broken-signature binary is killed on launch. Ad-hoc needs no cert.
+# Some binaries are ad-hoc signed and are not Apple-notarized. Two things can
+# make macOS block them, and each needs its own cure:
+#   1. Preserve every valid shipped .app signature. BlueyAudio may carry a stable
+#      Developer signature so its TCC grant survives updates; force-signing it
+#      ad-hoc here destroys that identity. Only re-seal an app if verification
+#      proves its shipped signature is missing or invalid. Bare Mach-O files may
+#      still need ad-hoc re-sealing after install_name_tool mutations.
 #   2. xattr -dr com.apple.quarantine — REMOVE the quarantine flag. This is what
 #      actually silences the "cannot verify" popup: ad-hoc signing alone does NOT
 #      satisfy Gatekeeper (spctl still rejects it), so quarantine MUST be gone or
@@ -168,9 +170,12 @@ ln -sfn "$target/bin/bluey-daemon" "$bin_dir/bluey-daemon"
 # the quarantine xattr, but doing the strip last guarantees nothing re-quarantines
 # a file after we cleared it. Best-effort throughout: never fail the install.
 if command -v codesign >/dev/null 2>&1; then
-  # .app bundles first (deep, so their nested Mach-O + resources are sealed).
+  # Preserve valid .app signatures (especially BlueyAudio's stable TCC identity).
+  # Fall back to a deep ad-hoc seal only for unsigned or damaged legacy bundles.
   while IFS= read -r app; do
-    codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
+    if ! codesign --verify --deep --strict "$app" >/dev/null 2>&1; then
+      codesign --force --deep --sign - "$app" >/dev/null 2>&1 || true
+    fi
   done < <(find "$target/bin" -maxdepth 1 -name '*.app' -type d 2>/dev/null)
   # Then every bare Mach-O in bin/ (a top-level dylib like OpenBLAS is signed too).
   while IFS= read -r f; do

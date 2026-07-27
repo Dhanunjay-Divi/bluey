@@ -98,21 +98,173 @@ pub async fn request(addr: &str, req: Value) -> Result<Value, String> {
 /// the socket-writer task.
 pub struct EventSender(pub Mutex<Option<mpsc::UnboundedSender<String>>>);
 
-/// The last `show_meeting_banner` command JSON, stored so the banner webview can
-/// PULL it on mount via [`get_pending_banner`]. Event delivery (`emit`/`emit_to`)
-/// to the banner webview proved unreliable — the banner window is `visible:false`
-/// at boot and its webview's event channel isn't wired when the daemon's
-/// show-banner burst fires, so 0 commands ever reached it (measured on-screen).
-/// A pull command sidesteps event timing entirely: the webview asks for the
-/// pending banner the moment its JS runs. Cleared on hide.
-pub struct PendingBanner(pub std::sync::Mutex<Option<String>>);
+/// Pending meeting-prep banners plus a bounded dismissal tombstone set.
+///
+/// The daemon deliberately retries delivery while an overlay boots. Without
+/// dedupe, each retry re-orders the panel and a retry arriving after "Not now"
+/// immediately reopens the dismissed banner. A queue preserves simultaneous due
+/// meetings, while occurrence keys make retries idempotent without suppressing
+/// a rescheduled/recurring event that reuses the provider's event ID.
+#[derive(Default)]
+pub struct PendingBanner(std::sync::Mutex<PendingBannerState>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaemonCommandKind {
+    MeetingBanner,
+    ShowMeeting,
+    HideMeeting,
+    Other,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BannerOfferKey {
+    event_id: String,
+    start_epoch_secs: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ParsedDaemonCommand {
+    kind: DaemonCommandKind,
+    banner_key: Option<BannerOfferKey>,
+}
+
+impl ParsedDaemonCommand {
+    /// Parse an incoming daemon line exactly once. Native window actions are
+    /// selected only from the top-level tagged `type`; transcript/card content
+    /// must never be able to masquerade as a show/hide/banner command.
+    fn parse(raw: &str) -> Self {
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return Self {
+                kind: DaemonCommandKind::Other,
+                banner_key: None,
+            };
+        };
+        let Some(command_type) = value
+            .as_object()
+            .and_then(|object| object.get("type"))
+            .and_then(Value::as_str)
+        else {
+            return Self {
+                kind: DaemonCommandKind::Other,
+                banner_key: None,
+            };
+        };
+
+        let kind = match command_type {
+            "show_meeting_banner" => DaemonCommandKind::MeetingBanner,
+            "show" | "toggle" | "boot" => DaemonCommandKind::ShowMeeting,
+            "hide" => DaemonCommandKind::HideMeeting,
+            _ => DaemonCommandKind::Other,
+        };
+        let banner_key = (kind == DaemonCommandKind::MeetingBanner)
+            .then(|| {
+                Some(BannerOfferKey {
+                    event_id: value.get("event_id")?.as_str()?.to_owned(),
+                    start_epoch_secs: value.get("start_epoch_secs")?.as_i64()?,
+                })
+            })
+            .flatten();
+
+        Self { kind, banner_key }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingBannerOffer {
+    raw: String,
+    key: Option<BannerOfferKey>,
+}
+
+#[derive(Default)]
+struct PendingBannerState {
+    queued: std::collections::VecDeque<PendingBannerOffer>,
+    dismissed: std::collections::VecDeque<BannerOfferKey>,
+}
+
+impl PendingBanner {
+    /// Queue a new banner. Returns true only when it became the current offer
+    /// and the native panel should be presented now.
+    fn store_if_new(&self, raw: &str, key: Option<BannerOfferKey>) -> bool {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(key) = key.as_ref() {
+            if state
+                .queued
+                .iter()
+                .any(|offer| offer.key.as_ref() == Some(key))
+                || state.dismissed.contains(key)
+            {
+                return false;
+            }
+        } else if state.queued.iter().any(|offer| offer.raw == raw) {
+            return false;
+        }
+        let became_current = state.queued.is_empty();
+        state.queued.push_back(PendingBannerOffer {
+            raw: raw.to_owned(),
+            key,
+        });
+        became_current
+    }
+
+    pub fn current(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .queued
+            .front()
+            .map(|offer| offer.raw.clone())
+    }
+
+    /// Dismiss only the matching current occurrence and return the next queued
+    /// offer. A stale UI acknowledgement leaves the actual current offer intact.
+    pub fn dismiss(
+        &self,
+        event_id: Option<String>,
+        start_epoch_secs: Option<i64>,
+    ) -> Option<String> {
+        let mut state = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let current = state.queued.front()?;
+        let matches_current = match (event_id.as_deref(), start_epoch_secs) {
+            (Some(event_id), Some(start)) => current
+                .key
+                .as_ref()
+                .is_some_and(|key| key.event_id == event_id && key.start_epoch_secs == start),
+            // Backward-compatible acknowledgement from an older banner UI.
+            (Some(event_id), None) => current
+                .key
+                .as_ref()
+                .is_some_and(|key| key.event_id == event_id),
+            (None, _) => true,
+        };
+        if !matches_current {
+            return Some(current.raw.clone());
+        }
+
+        let dismissed = state.queued.pop_front()?;
+        if let Some(key) = dismissed.key {
+            if !state.dismissed.contains(&key) {
+                state.dismissed.push_back(key);
+                while state.dismissed.len() > 128 {
+                    state.dismissed.pop_front();
+                }
+            }
+        }
+        state.queued.front().map(|offer| offer.raw.clone())
+    }
+}
 
 /// The banner webview calls this on mount to fetch the current meeting-prep
 /// banner (the raw `show_meeting_banner` JSON line, same shape the event bus
 /// would have delivered). Returns `None` when no banner is pending.
 #[tauri::command]
 pub fn get_pending_banner(state: tauri::State<'_, PendingBanner>) -> Option<String> {
-    state.0.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    state.current()
 }
 
 /// JS calls this (via invoke) to send an `OverlayEvent` to the daemon. The arg is
@@ -240,41 +392,20 @@ async fn run_connection(
                 if line.is_empty() {
                     continue;
                 }
-                if line.contains("\"show_meeting_banner\"") {
+                let parsed = ParsedDaemonCommand::parse(line);
+                let is_meeting_banner = parsed.kind == DaemonCommandKind::MeetingBanner;
+                if is_meeting_banner {
                     // Store for the pull-based get_pending_banner command (the
                     // reliable delivery path — see PendingBanner docs).
-                    {
-                        use tauri::Manager;
-                        let pending = app.state::<PendingBanner>();
-                        *pending.0.lock().unwrap_or_else(|p| p.into_inner()) =
-                            Some(line.to_string());
+                    let pending = app.state::<PendingBanner>();
+                    if !pending.store_if_new(line, parsed.banner_key.clone()) {
+                        // Daemon boot retries are expected. Do not re-order a
+                        // visible panel or resurrect an event the user dismissed.
+                        continue;
                     }
                 }
                 #[cfg(target_os = "macos")]
-                if line.contains("\"show_meeting_banner\"") {
-                    // GUARANTEED DELIVERY to the banner webview: the broadcast
-                    // `app.emit` below races the banner webview's listener (the
-                    // webview only starts loading when the window is first shown,
-                    // which is triggered by THIS very command), so the banner never
-                    // received any command (measured: 0 commands seen). Re-emit the
-                    // command DIRECTLY to the "banner" window on a short delay, a
-                    // few times, so it lands after the webview's listener is up.
-                    {
-                        let app_re = app.clone();
-                        let payload = line.to_string();
-                        std::thread::spawn(move || {
-                            for _ in 0..5 {
-                                std::thread::sleep(
-                                    std::time::Duration::from_millis(400),
-                                );
-                                let _ = app_re.emit_to(
-                                    "banner",
-                                    "overlay://command",
-                                    payload.clone(),
-                                );
-                            }
-                        });
-                    }
+                if is_meeting_banner {
                     let app_handle = app.clone();
                     let _ = app_handle.clone().run_on_main_thread(move || {
                         #[allow(deprecated)]
@@ -289,18 +420,28 @@ async fn run_connection(
                             // x:980 (which assumes a screen width and can land
                             // under the meeting overlay). 20px inset from the
                             // top-right corner.
-                            match w.current_monitor() {
-                                Ok(Some(monitor)) => {
-                                    let scale = monitor.scale_factor();
-                                    let screen = monitor.size().to_logical::<f64>(scale);
-                                    let inset = 20.0;
-                                    let banner_w = 360.0;
-                                    let x = (screen.width - banner_w - inset).max(inset);
-                                    let _ = w.set_position(tauri::LogicalPosition::new(
-                                        x, inset,
-                                    ));
-                                }
-                                _ => {}
+                            let cursor_monitor = w
+                                .cursor_position()
+                                .ok()
+                                .and_then(|cursor| {
+                                    w.monitor_from_point(cursor.x, cursor.y)
+                                        .ok()
+                                        .flatten()
+                                });
+                            if let Some(monitor) =
+                                cursor_monitor.or_else(|| w.current_monitor().ok().flatten())
+                            {
+                                let scale = monitor.scale_factor();
+                                let work = monitor.work_area();
+                                let origin = work.position.to_logical::<f64>(scale);
+                                let size = work.size.to_logical::<f64>(scale);
+                                let inset = 20.0;
+                                let banner_w = 360.0;
+                                let x =
+                                    origin.x + (size.width - banner_w - inset).max(inset);
+                                let y = origin.y + inset;
+                                let _ =
+                                    w.set_position(tauri::LogicalPosition::new(x, y));
                             }
                             // DO NOT call w.show() — Tauri's show() activates the
                             // app (makeKeyAndOrderFront) which yanks the user to the
@@ -312,7 +453,7 @@ async fn run_connection(
                             if let Ok(panel) = w.to_panel() {
                                 // Non-activating panel (bit 7) so it never becomes
                                 // key / steals focus.
-                                panel.set_style_mask(0 | (1 << 7));
+                                panel.set_style_mask(1 << 7);
                                 // Level 5 — ABOVE the meeting overlay (level 4).
                                 panel.set_level(5);
                                 // Appear on the user's CURRENT space without moving
@@ -364,6 +505,9 @@ async fn run_connection(
                             if capture_visible {
                                 let _ = w.set_content_protected(false);
                                 crate::macos::set_sharing_read_only(&app_handle);
+                            } else {
+                                let _ = w.set_content_protected(true);
+                                crate::macos::set_sharing_none(&app_handle);
                             }
                             eprintln!(
                                 "[banner] final is_visible={:?}",
@@ -371,7 +515,7 @@ async fn run_connection(
                             );
                         }
                     });
-                } else if line.contains("\"show\"") || line.contains("\"toggle\"") || line.contains("\"boot\"") {
+                } else if parsed.kind == DaemonCommandKind::ShowMeeting {
                     let app_handle = app.clone();
                     let _ = app_handle.clone().run_on_main_thread(move || {
                         #[allow(deprecated)]
@@ -382,7 +526,7 @@ async fn run_connection(
                             let _ = w.set_always_on_top(true);
                             if let Ok(panel) = w.to_panel() {
                                 panel.set_level(4);
-                                panel.set_style_mask(0 | (1 << 7));
+                                panel.set_style_mask(1 << 7);
                                 #[allow(deprecated)]
                                 panel.set_collection_behaviour(
                                     NSWindowCollectionBehavior::NSWindowCollectionBehaviorFullScreenAuxiliary
@@ -406,10 +550,13 @@ async fn run_connection(
                             if capture_visible {
                                 let _ = w.set_content_protected(false);
                                 crate::macos::set_sharing_read_only(&app_handle);
+                            } else {
+                                let _ = w.set_content_protected(true);
+                                crate::macos::set_sharing_none(&app_handle);
                             }
                         }
                     });
-                } else if line.contains("\"hide\"") {
+                } else if parsed.kind == DaemonCommandKind::HideMeeting {
                     let app_handle = app.clone();
                     let _ = app_handle.clone().run_on_main_thread(move || {
                         use tauri_nspanel::ManagerExt;
@@ -420,8 +567,15 @@ async fn run_connection(
                         }
                     });
                 }
-                // Forward the raw command JSON to the web UI; it parses `type`.
-                let _ = app.emit("overlay://command", line.to_string());
+                // Keep transcript/cards/answers out of the banner webview. The
+                // banner receives only its dedicated command; the meeting window
+                // receives the normal daemon command bus.
+                let target = if is_meeting_banner {
+                    "banner"
+                } else {
+                    "meeting"
+                };
+                let _ = app.emit_to(target, "overlay://command", line.to_string());
             }
             Ok(None) => {
                 eprintln!("[meeting-overlay] daemon socket closed (EOF)");
@@ -469,4 +623,90 @@ async fn send_event(
     let _ = guard.write_all(line.as_bytes()).await;
     let _ = guard.write_all(b"\n").await;
     let _ = guard.flush().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DaemonCommandKind, ParsedDaemonCommand, PendingBanner};
+
+    fn banner(event_id: &str, start: i64) -> String {
+        format!(
+            r#"{{"type":"show_meeting_banner","event_id":"{event_id}","start_epoch_secs":{start},"title":"Review"}}"#
+        )
+    }
+
+    fn store(pending: &PendingBanner, raw: &str) -> bool {
+        let parsed = ParsedDaemonCommand::parse(raw);
+        pending.store_if_new(raw, parsed.banner_key)
+    }
+
+    #[test]
+    fn command_dispatch_uses_only_exact_top_level_type() {
+        for (raw, expected) in [
+            (r#"{"type":"show"}"#, DaemonCommandKind::ShowMeeting),
+            (r#"{"type":"toggle"}"#, DaemonCommandKind::ShowMeeting),
+            (r#"{"type":"boot"}"#, DaemonCommandKind::ShowMeeting),
+            (r#"{"type":"hide"}"#, DaemonCommandKind::HideMeeting),
+            (
+                r#"{"type":"show_meeting_banner","event_id":"e","start_epoch_secs":1}"#,
+                DaemonCommandKind::MeetingBanner,
+            ),
+        ] {
+            assert_eq!(ParsedDaemonCommand::parse(raw).kind, expected);
+        }
+    }
+
+    #[test]
+    fn command_dispatch_ignores_adversarial_payload_values() {
+        for raw in [
+            r#"{"type":"push_transcript","text":"hide"}"#,
+            r#"{"type":"push_card","card":{"title":"show","body":"toggle"}}"#,
+            r#"{"type":"push_card","text":"show_meeting_banner"}"#,
+            r#"{"payload":{"type":"boot"}}"#,
+            r#"{"type":"show_meeting_banner_suffix"}"#,
+            r#"not json but says "hide""#,
+        ] {
+            let parsed = ParsedDaemonCommand::parse(raw);
+            assert_eq!(parsed.kind, DaemonCommandKind::Other, "{raw}");
+            assert_eq!(parsed.banner_key, None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn pending_banner_dedupes_retries_and_tombstones_dismissal() {
+        let pending = PendingBanner::default();
+        let first = banner("event-1", 100);
+        assert!(store(&pending, &first));
+        assert!(!store(&pending, &first));
+        assert_eq!(pending.current().as_deref(), Some(first.as_str()));
+
+        assert!(pending
+            .dismiss(Some("event-1".to_owned()), Some(100))
+            .is_none());
+        assert!(pending.current().is_none());
+        assert!(!store(&pending, &first));
+
+        // A moved/recurring occurrence with the same provider ID remains valid.
+        let next = banner("event-1", 200);
+        assert!(store(&pending, &next));
+        assert_eq!(pending.current().as_deref(), Some(next.as_str()));
+    }
+
+    #[test]
+    fn pending_banner_queues_due_meetings_and_ignores_stale_dismissals() {
+        let pending = PendingBanner::default();
+        let first = banner("event-1", 100);
+        let second = banner("event-2", 110);
+        assert!(store(&pending, &first));
+        // Queued successfully, but should not replace/re-present the current.
+        assert!(!store(&pending, &second));
+        assert_eq!(pending.current().as_deref(), Some(first.as_str()));
+
+        let current = pending.dismiss(Some("stale".to_owned()), Some(99));
+        assert_eq!(current.as_deref(), Some(first.as_str()));
+
+        let next = pending.dismiss(Some("event-1".to_owned()), Some(100));
+        assert_eq!(next.as_deref(), Some(second.as_str()));
+        assert_eq!(pending.current().as_deref(), Some(second.as_str()));
+    }
 }

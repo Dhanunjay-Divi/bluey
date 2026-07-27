@@ -112,7 +112,9 @@
   padding: 0;
   cursor: pointer;
   position: relative;
-  transition: filter 0.15s ease, transform 0.12s ease;
+  transition:
+    filter 0.15s ease,
+    transform 0.12s ease;
 }
 .fp-dot:hover {
   filter: brightness(0.92);
@@ -183,7 +185,10 @@
   background: var(--paper-2);
   color: var(--ink-2);
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 0.12s ease;
 }
 .fp-iconbtn:hover {
   background: var(--paper-sink);
@@ -306,7 +311,9 @@
   padding: 2px 9px;
   border-radius: var(--r-pill);
   cursor: pointer;
-  transition: background 0.15s ease, border-color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
 }
 .fp-connector-more:hover {
   background: var(--paper-sink);
@@ -578,7 +585,9 @@
   box-shadow: 0 1px 4px rgba(28, 26, 25, 0.14);
   color: var(--ink-3);
   cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
 }
 /* On image tiles the remove button floats over the top-right corner. */
 .fp-attach-item.is-image .fp-attach-x {
@@ -598,11 +607,15 @@
   font: inherit;
   appearance: none;
   -webkit-appearance: none;
-  transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  transition:
+    border-color 0.12s ease,
+    box-shadow 0.12s ease;
 }
 .fp-attach-item:hover {
   border-color: color-mix(in srgb, var(--ink-3) 40%, var(--line));
-  box-shadow: var(--fp-shadow-float), 0 0 0 1px var(--line);
+  box-shadow:
+    var(--fp-shadow-float),
+    0 0 0 1px var(--line);
 }
 .fp-attach-item:focus-visible {
   outline: 2px solid var(--fp-live);
@@ -635,7 +648,9 @@
   border-radius: 16px;
   background: var(--paper);
   border: 1px solid var(--line);
-  box-shadow: var(--fp-shadow-float), 0 24px 60px rgba(28, 26, 25, 0.28);
+  box-shadow:
+    var(--fp-shadow-float),
+    0 24px 60px rgba(28, 26, 25, 0.28);
   overflow: hidden;
   animation: fp-preview-pop 0.2s cubic-bezier(0.2, 0.9, 0.3, 1) both;
 }
@@ -690,7 +705,9 @@
   background: var(--paper-2);
   color: var(--ink-3);
   cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
 }
 .fp-preview-close:hover {
   background: var(--paper-sink);
@@ -776,8 +793,9 @@
   background: var(--paper);
   border: 1px solid var(--line);
   color: var(--ink);
-  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
-    "Liberation Mono", monospace;
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
+    monospace;
   font-size: 13px;
   line-height: 1.6;
   white-space: pre;
@@ -794,7 +812,9 @@
 .fp-speaker-renameable {
   cursor: pointer;
   border-radius: 4px;
-  transition: color 0.15s ease, background 0.15s ease;
+  transition:
+    color 0.15s ease,
+    background 0.15s ease;
 }
 .fp-speaker-renameable:hover {
   color: var(--ink);
@@ -843,7 +863,9 @@
   border-radius: 7px;
   padding: 6px 9px;
   cursor: pointer;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition:
+    background 0.12s ease,
+    color 0.12s ease;
 }
 .fp-speaker-cand:hover {
   background: var(--paper-sink);
@@ -1009,7 +1031,9 @@
   color: var(--ink-2);
   font-size: 12.5px;
   cursor: pointer;
-  transition: background 0.12s ease, border-color 0.12s ease;
+  transition:
+    background 0.12s ease,
+    border-color 0.12s ease;
 }
 .fp-speditor-new:hover {
   background: var(--paper-sink);
@@ -1268,7 +1292,10 @@
   border-radius: 9px;
   padding: 6px 11px;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease, transform 0.12s ease;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease,
+    transform 0.12s ease;
 }
 .fp-qa-action:hover {
   background: var(--paper-sink);
@@ -1433,8 +1460,11 @@
   justify-content: center;
   cursor: pointer;
   box-shadow: var(--fp-shadow-float);
-  transition: transform 0.14s cubic-bezier(0.2, 0.9, 0.2, 1),
-    background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  transition:
+    transform 0.14s cubic-bezier(0.2, 0.9, 0.2, 1),
+    background 0.15s ease,
+    color 0.15s ease,
+    box-shadow 0.15s ease;
   animation: fp-pop-in 0.32s cubic-bezier(0.2, 0.9, 0.2, 1) both;
 }
 .fp-fab:hover {
@@ -1483,7 +1513,8 @@
   background: var(--fp-live);
   color: #fff;
   border-color: var(--fp-live);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--fp-live) 16%, transparent),
+  box-shadow:
+    0 0 0 4px color-mix(in srgb, var(--fp-live) 16%, transparent),
     var(--fp-shadow-float);
 }
 .fp-fab-live:hover {
@@ -1542,7 +1573,9 @@
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: transform 0.12s ease, opacity 0.15s ease;
+  transition:
+    transform 0.12s ease,
+    opacity 0.15s ease;
 }
 .fp-ask-send:hover {
   transform: scale(1.06);
@@ -1611,7 +1644,10 @@
   border-radius: 10px;
   padding: 8px 14px;
   cursor: pointer;
-  transition: transform 0.12s ease, background 0.15s ease, color 0.15s ease;
+  transition:
+    transform 0.12s ease,
+    background 0.15s ease,
+    color 0.15s ease;
 }
 .fp-btn:active {
   transform: scale(0.97);
@@ -1690,7 +1726,9 @@
   padding: 5px 14px;
   border-radius: 9px;
   cursor: pointer;
-  transition: background 0.15s ease, color 0.15s ease;
+  transition:
+    background 0.15s ease,
+    color 0.15s ease;
 }
 .fp-drawer-tab.is-on {
   color: var(--ink);
@@ -1809,6 +1847,10 @@
   box-shadow: 0 0 7px var(--fp-live);
   animation: fp-pulse 1.6s ease-in-out infinite;
 }
+.fp-pill-dot.is-issue {
+  background: var(--red, #ef5a5a);
+  box-shadow: 0 0 7px color-mix(in srgb, var(--red, #ef5a5a) 52%, transparent);
+}
 .fp-pill-spin {
   display: inline-flex;
   animation: fp-spin 0.9s linear infinite;
@@ -1856,6 +1898,9 @@
 .fp-pill-caption.is-muted {
   color: var(--ink-3);
 }
+.fp-pill-caption.is-issue {
+  color: var(--red, #ef5a5a);
+}
 .fp-pill-clamp {
   white-space: nowrap;
   overflow: hidden;
@@ -1876,7 +1921,9 @@
   background: transparent;
   color: var(--ink-3);
   -webkit-app-region: no-drag;
-  transition: background 0.16s ease, color 0.16s ease;
+  transition:
+    background 0.16s ease,
+    color 0.16s ease;
 }
 .fp-pill-toggle:hover {
   background: var(--paper-sink);
@@ -1898,7 +1945,9 @@
   background: var(--ink);
   color: var(--paper);
   -webkit-app-region: no-drag;
-  transition: transform 0.14s ease, opacity 0.14s ease;
+  transition:
+    transform 0.14s ease,
+    opacity 0.14s ease;
   animation: fp-pop-in 0.22s cubic-bezier(0.22, 1, 0.36, 1);
 }
 .fp-pill-cta:hover {
@@ -2173,7 +2222,9 @@
   font-weight: 560;
   cursor: pointer;
   white-space: nowrap;
-  transition: color 0.12s ease, background 0.12s ease;
+  transition:
+    color 0.12s ease,
+    background 0.12s ease;
 }
 .fp-mbanner-later:hover {
   background: var(--paper-sink);

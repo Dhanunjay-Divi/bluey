@@ -12,7 +12,9 @@ fi
 # `cue-daemon/parakeet-stt`, which silently ships an STT-less daemon: `Listen`
 # then falls through to the cloud "sign in for transcription" gate and produces
 # ZERO transcript, even though on-device STT is the intended keyless default.
-# The packaged installer already builds with this feature (scripts/build-macos.sh);
-# the dev run-local path must match, or `bluey on` transcribes nothing locally.
-cargo build --features cue-daemon/parakeet-stt >/dev/null
+# The packaged installer also includes the cloud calendar provider; keeping both
+# features here prevents onboarding from calling a daemon that can only reply
+# "cloud calendar not built".
+cargo build \
+  --features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar >/dev/null
 exec ./target/debug/bluey run "$@"

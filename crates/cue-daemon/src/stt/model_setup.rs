@@ -44,6 +44,10 @@ pub struct ModelProgress {
 /// Process-wide progress bus. Lazily created; if no one has subscribed the
 /// `send` is a cheap no-op (broadcast drops when there are no receivers).
 static PROGRESS_TX: OnceLock<broadcast::Sender<ModelProgress>> = OnceLock::new();
+/// Serializes first-run provisioning inside one daemon. Startup prewarm and an
+/// immediately-clicked Listen action can otherwise both download to the same
+/// `.part` path and race the final rename.
+static PROVISION_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 fn progress_tx() -> &'static broadcast::Sender<ModelProgress> {
     PROGRESS_TX.get_or_init(|| broadcast::channel(64).0)
@@ -116,6 +120,19 @@ pub async fn ensure_parakeet_model(paths: &AppPaths) -> Result<ParakeetPaths> {
 
     if model_present(&model_dir) {
         info!(dir = %model_dir.display(), "parakeet model already present; skipping download");
+        return Ok(parakeet_paths(model_dir));
+    }
+
+    let _provision_guard = PROVISION_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    // Another caller may have completed provisioning while this task waited.
+    if model_present(&model_dir) {
+        info!(
+            dir = %model_dir.display(),
+            "parakeet model provisioned by concurrent startup task"
+        );
         return Ok(parakeet_paths(model_dir));
     }
 

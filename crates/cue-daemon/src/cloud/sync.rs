@@ -22,6 +22,11 @@ use crate::storage::MeetingStore;
 const MAX_SYNC_RECORDS_PER_BATCH: usize = 450;
 const MAX_TEXT_PREVIEW_CHARS: usize = 16_000;
 const MAX_RESPONSE_CHARS: usize = 128_000;
+const INTERNAL_WARMUP_SOURCE: &str = "warmup";
+
+fn is_syncable_conversation_turn(turn: &ConversationTurn) -> bool {
+    turn.source.as_deref() != Some(INTERNAL_WARMUP_SOURCE)
+}
 
 #[derive(Debug, Clone)]
 pub struct LocalSyncSummary {
@@ -212,7 +217,11 @@ fn build_sync_batches(
             }
         }
 
-        for turn in &meeting.conversation {
+        for turn in meeting
+            .conversation
+            .iter()
+            .filter(|turn| is_syncable_conversation_turn(turn))
+        {
             let fallback_id = format!("turn-{}", turn.id);
             if seen_response_ids.contains(&fallback_id) {
                 continue;
@@ -564,5 +573,25 @@ mod tests {
         let batches = build_sync_batches(&[meeting], &HashMap::new());
         assert_eq!(batches[0].cue_responses.len(), 1);
         assert!(batches[0].cue_responses[0].response_id.starts_with("turn-"));
+    }
+
+    #[test]
+    fn internal_warmup_turn_is_never_synced_or_indexed() {
+        let secret_prompt = "Provider event ID: google-private\nAttendee: person@example.com";
+        let mut meeting = MeetingRecord::new(Some("Private prep".into()));
+        meeting.conversation.push(ConversationTurn::new(
+            secret_prompt,
+            "Ready.",
+            Some(INTERNAL_WARMUP_SOURCE.into()),
+            Some("test".into()),
+        ));
+
+        let batches = build_sync_batches(&[meeting], &HashMap::new());
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].cue_responses.is_empty());
+        assert!(batches[0].rag_chunks.is_empty());
+        let encoded = serde_json::to_string(&batches).expect("serialize sync batches");
+        assert!(!encoded.contains("google-private"));
+        assert!(!encoded.contains("person@example.com"));
     }
 }

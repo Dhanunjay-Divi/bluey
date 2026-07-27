@@ -3,7 +3,7 @@
 // privacy stated upfront, each step a single clear action. Progressive, not a
 // scary wall of permissions.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Glass, Mark } from "../components/primitives";
 import { AgentLogo } from "../components/AgentLogo";
 import {
@@ -11,9 +11,20 @@ import {
   type AgentInstallOffer,
 } from "../components/AgentInstallCard";
 import { getClient } from "../lib";
-import type { AgentSummary, SetupStatus } from "../lib/types";
+import type {
+  AgentSummary,
+  CalendarConnection,
+  SetupStatus,
+} from "../lib/types";
 
-type Step = "welcome" | "mic" | "attach" | "setup" | "calendar" | "consent" | "ready";
+type Step =
+  | "welcome"
+  | "mic"
+  | "attach"
+  | "setup"
+  | "calendar"
+  | "consent"
+  | "ready";
 const ORDER: Step[] = [
   "welcome",
   "mic",
@@ -36,7 +47,9 @@ export function Onboarding({
   const [step, setStep] = useState<Step>("welcome");
   // The daemon answers requestAgentInstall with a push_agent_install offer;
   // render the SAME consent card AskScreen uses so nothing installs unasked.
-  const [installOffer, setInstallOffer] = useState<AgentInstallOffer | null>(null);
+  const [installOffer, setInstallOffer] = useState<AgentInstallOffer | null>(
+    null,
+  );
   const [setup, setSetup] = useState<SetupStatus | null>(null);
   const idx = ORDER.indexOf(step);
   const next = () => setStep(ORDER[Math.min(idx + 1, ORDER.length - 1)]);
@@ -56,7 +69,15 @@ export function Onboarding({
     // Fill the window and center the card — the panel IS the window (no empty
     // box around it), matching the main shell + the interview overlay.
     <div style={{ position: "fixed", inset: 7, display: "flex" }}>
-      <Glass radius="var(--r-xl)" style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center" }}>
+      <Glass
+        radius="var(--r-xl)"
+        style={{
+          flex: 1,
+          display: "flex",
+          flexDirection: "column",
+          justifyContent: "center",
+        }}
+      >
         <div style={{ padding: "26px 26px 22px" }}>
           {/* progress dots */}
           <div style={{ display: "flex", gap: 6, marginBottom: 22 }}>
@@ -67,7 +88,10 @@ export function Onboarding({
                   height: 3,
                   flex: 1,
                   borderRadius: 2,
-                  background: i <= idx ? "var(--brand, #c6613f)" : "var(--line-2, #ded9cf)",
+                  background:
+                    i <= idx
+                      ? "var(--brand, #c6613f)"
+                      : "var(--line-2, #ded9cf)",
                   transition: ".25s",
                 }}
               />
@@ -78,7 +102,7 @@ export function Onboarding({
             <Body
               icon={<Mark size={40} />}
               title="Bluey for meetings"
-              text="Answers come from your own coding agent and its connectors — grounded in your real repo, tickets and tools. Everything runs on this machine. Nothing leaves."
+              text="Answers come from your own coding agent and its connectors — grounded in your real repo, tickets and tools. Meeting data stays local by default; only providers and connectors you explicitly enable receive the context they need."
               cta="Get started"
               onCta={next}
             />
@@ -87,18 +111,14 @@ export function Onboarding({
           {step === "mic" && (
             <Body
               icon={<Glyph>🎙</Glyph>}
-              title="Let Bluey hear the call"
-              text="Bluey listens to your system audio locally to catch questions as they come up. Audio is transcribed on your machine and never uploaded."
-              cta="Allow microphone"
+              title="Allow audio access"
+              text="Bluey uses System Audio Recording to hear the call and Microphone to hear you. macOS may ask once for each. On-device transcription is the default; audio is sent off-device only if you explicitly configure a cloud transcription provider."
+              cta="Allow both"
               secondary="Skip for now"
               onCta={() => {
-                // Request BOTH sources so macOS actually prompts for each.
-                // This step is titled "Let Bluey hear the call" and claims to
-                // allow the microphone, but it previously passed
-                // `microphone: false` — so the mic prompt was NEVER triggered,
-                // TCC recorded "not requested yet", and macOS then fed silent
-                // audio to a capture that looked successful in the logs. The
-                // symptom was "transcription doesn't work even with mic".
+                // Request both explicitly, with copy that explains macOS owns
+                // two independent grants. A system-audio prompt followed by a
+                // microphone prompt is expected only on first use.
                 client.startListening({ microphone: true, system: true });
                 next();
               }}
@@ -110,8 +130,18 @@ export function Onboarding({
             <div>
               <Glyph>⌘</Glyph>
               <h2 style={h2}>Attach your agent</h2>
-              <p style={p}>Pick the coding agent you already use. Bluey drives your own session, so it knows your projects.</p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
+              <p style={p}>
+                Pick the coding agent you already use. Bluey drives your own
+                session, so it knows your projects.
+              </p>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 7,
+                  marginTop: 16,
+                }}
+              >
                 {(agents ?? []).slice(0, 4).map((a) => {
                   // `needs_reauth` = the CLI is installed but signed out. Attaching
                   // it "works" and then every ask fails, so say so HERE and let the
@@ -134,14 +164,30 @@ export function Onboarding({
                       }}
                       style={pickRow}
                     >
-                      <span style={{ display: "inline-flex", alignItems: "center" }}>
+                      <span
+                        style={{ display: "inline-flex", alignItems: "center" }}
+                      >
                         <AgentLogo kind={a.kind} size={16} />
                       </span>
-                      <span style={{ fontSize: 13, fontWeight: 540 }}>{a.displayName}</span>
-                      <span style={{ marginLeft: "auto", fontSize: 11, color: needsLogin ? "var(--warn-ink, #d08700)" : "var(--ink-3)" }}>
-                        {needsLogin ? "Sign in" : `${a.sessionCount ?? 0} sessions`}
+                      <span style={{ fontSize: 13, fontWeight: 540 }}>
+                        {a.displayName}
                       </span>
-                      <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                      <span
+                        style={{
+                          marginLeft: "auto",
+                          fontSize: 11,
+                          color: needsLogin
+                            ? "var(--warn-ink, #d08700)"
+                            : "var(--ink-3)",
+                        }}
+                      >
+                        {needsLogin
+                          ? "Sign in"
+                          : `${a.sessionCount ?? 0} sessions`}
+                      </span>
+                      <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>
+                        →
+                      </span>
                     </button>
                   );
                 })}
@@ -153,16 +199,40 @@ export function Onboarding({
                 {agents !== null && agents.length === 0 && (
                   <div>
                     <p style={p}>
-                      No coding agent found on this Mac. Bluey answers <em>through</em> your
-                      own agent, so you'll need one installed.
+                      No coding agent found on this Mac. Bluey answers{" "}
+                      <em>through</em> your own agent, so you'll need one
+                      installed.
                     </p>
-                    <button style={pickRow} onClick={() => client.requestAgentInstall()}>
-                      <span style={{ fontSize: 13, fontWeight: 540 }}>Install one for me</span>
-                      <span style={{ marginLeft: "auto", color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                    <button
+                      style={pickRow}
+                      onClick={() => client.requestAgentInstall()}
+                    >
+                      <span style={{ fontSize: 13, fontWeight: 540 }}>
+                        Install one for me
+                      </span>
+                      <span
+                        style={{
+                          marginLeft: "auto",
+                          color: "var(--tint-ink)",
+                          fontSize: 13,
+                        }}
+                      >
+                        →
+                      </span>
                     </button>
                     <button style={{ ...pickRow, marginTop: 7 }} onClick={next}>
-                      <span style={{ fontSize: 13, color: "var(--ink-3)" }}>I'll do it later</span>
-                      <span style={{ marginLeft: "auto", color: "var(--ink-3)", fontSize: 13 }}>→</span>
+                      <span style={{ fontSize: 13, color: "var(--ink-3)" }}>
+                        I'll do it later
+                      </span>
+                      <span
+                        style={{
+                          marginLeft: "auto",
+                          color: "var(--ink-3)",
+                          fontSize: 13,
+                        }}
+                      >
+                        →
+                      </span>
                     </button>
                   </div>
                 )}
@@ -192,7 +262,14 @@ export function Onboarding({
                 Bluey transcribes on this Mac and answers through your agent.
                 Both need to be ready before a meeting.
               </p>
-              <div style={{ display: "flex", flexDirection: "column", gap: 7, marginTop: 16 }}>
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: 7,
+                  marginTop: 16,
+                }}
+              >
                 {setup === null && <p style={p}>Checking…</p>}
                 {setup && (
                   <>
@@ -201,9 +278,16 @@ export function Onboarding({
                       item={setup.agent}
                       onFix={
                         setup.agent.state === "missing"
-                          ? () => client.requestAgentInstall(setup.agent.kind ?? undefined)
-                          : setup.agent.state === "needs_login" && setup.agent.kind
-                            ? () => client.requestAgentLogin(setup.agent.kind as string)
+                          ? () =>
+                              client.requestAgentInstall(
+                                setup.agent.kind ?? undefined,
+                              )
+                          : setup.agent.state === "needs_login" &&
+                              setup.agent.kind
+                            ? () =>
+                                client.requestAgentLogin(
+                                  setup.agent.kind as string,
+                                )
                             : undefined
                       }
                       fixLabel={
@@ -218,19 +302,31 @@ export function Onboarding({
                 )}
               </div>
               <button
-                style={{ ...pickRow, marginTop: 14, opacity: setup?.allReady ? 1 : 0.55 }}
+                style={{
+                  ...pickRow,
+                  marginTop: 14,
+                  opacity: setup?.allReady ? 1 : 0.55,
+                }}
                 onClick={next}
               >
                 <span style={{ fontSize: 13, fontWeight: 540 }}>
                   {setup?.allReady ? "Continue" : "Continue anyway"}
                 </span>
-                <span style={{ marginLeft: "auto", color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                <span
+                  style={{
+                    marginLeft: "auto",
+                    color: "var(--tint-ink)",
+                    fontSize: 13,
+                  }}
+                >
+                  →
+                </span>
               </button>
             </div>
           )}
 
           {step === "calendar" && (
-            <CalendarStep onNext={next} onSkip={next} />
+            <CalendarAccounts onNext={next} onSkip={next} />
           )}
 
           {step === "consent" && (
@@ -289,72 +385,188 @@ function Body({
       <h2 style={h2}>{title}</h2>
       <p style={p}>{text}</p>
       <div style={{ display: "flex", gap: 9, marginTop: 20 }}>
-        <button onClick={onCta} style={primary}>{cta}</button>
-        {secondary && <button onClick={onSecondary} style={ghost}>{secondary}</button>}
+        <button onClick={onCta} style={primary}>
+          {cta}
+        </button>
+        {secondary && (
+          <button onClick={onSecondary} style={ghost}>
+            {secondary}
+          </button>
+        )}
       </div>
     </div>
   );
 }
 
 // One cloud-calendar provider the onboarding step can connect.
-type CalProvider = { id: string; label: string };
+type CalProvider = { id: string; label: string; clientIdEnv: string };
 const CAL_PROVIDERS: CalProvider[] = [
-  { id: "google", label: "Google Calendar" },
-  { id: "microsoft", label: "Microsoft Calendar" },
+  {
+    id: "google",
+    label: "Google Calendar",
+    clientIdEnv: "BLUEY_GOOGLE_CLIENT_ID",
+  },
+  {
+    id: "microsoft",
+    label: "Microsoft Calendar",
+    clientIdEnv: "BLUEY_MICROSOFT_CLIENT_ID",
+  },
 ];
 
 // Per-provider connect state. `email` is set once connected (from calendarStatus);
 // `error` holds the daemon's failure message so the UI can render, not crash.
 type CalState = {
-  status: "idle" | "connecting" | "connected" | "error";
+  status: "idle" | "connecting" | "connected" | "disconnecting" | "error";
+  configured?: boolean;
   email?: string;
   error?: string;
 };
 
+function calendarError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.trim() || "Calendar connection failed. Please try again.";
+}
+
+function missingCalendarConfigGuidance(provider: CalProvider): string {
+  return [
+    `${provider.label} is unavailable in this install.`,
+    "Install a calendar-enabled Bluey release.",
+    `Developers and administrators can set ${provider.clientIdEnv} in the Bluey daemon environment and restart Bluey.`,
+    "Use a registered public/desktop client ID—never a client secret.",
+  ].join(" ");
+}
+
 // The calendar onboarding step: "Connect Google / Microsoft Calendar" buttons.
 // Connecting is optional (Skip advances) — a cloud calendar lets Bluey warm up
 // ahead of meetings, but a user with the macOS calendar connected doesn't need it.
-function CalendarStep({
+export function CalendarAccounts({
   onNext,
   onSkip,
+  management = false,
 }: {
-  onNext: () => void;
-  onSkip: () => void;
+  onNext?: () => void;
+  onSkip?: () => void;
+  management?: boolean;
 }) {
   const client = getClient();
   const [state, setState] = useState<Record<string, CalState>>({});
+  const [loading, setLoading] = useState(true);
+  const [statusError, setStatusError] = useState<string>();
+  // React StrictMode replays mount effects in development. Reuse the same IPC
+  // promise across that replay so one screen visit performs one Keychain read.
+  const initialStatusRequest = useRef<Promise<CalendarConnection[]> | null>(
+    null,
+  );
   const anyConnected = CAL_PROVIDERS.some(
     (p) => state[p.id]?.status === "connected",
   );
+  const busy = CAL_PROVIDERS.some((provider) => {
+    const status = state[provider.id]?.status;
+    return status === "connecting" || status === "disconnecting";
+  });
+
+  const applyStatus = (rows: CalendarConnection[]) => {
+    setState((current) => {
+      const next = { ...current };
+      for (const provider of CAL_PROVIDERS) {
+        const row = rows.find(
+          (candidate) => candidate.provider === provider.id,
+        );
+        next[provider.id] = row?.connected
+          ? {
+              status: "connected",
+              configured: row.configured,
+              email: row.email || undefined,
+            }
+          : {
+              status: row?.error ? "error" : "idle",
+              configured: row?.configured,
+              error: row?.error,
+            };
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setStatusError(undefined);
+    const request = initialStatusRequest.current ?? client.calendarStatus();
+    initialStatusRequest.current = request;
+    request
+      .then((rows) => {
+        if (active) applyStatus(rows);
+      })
+      .catch((error: unknown) => {
+        if (active) setStatusError(calendarError(error));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [client]);
 
   const connect = async (id: string) => {
+    if (busy) return;
+    setStatusError(undefined);
     setState((s) => ({ ...s, [id]: { status: "connecting" } }));
     try {
       await client.calendarConnect(id);
-      // Pull the connected email for the label; tolerate a status read failing.
-      let email: string | undefined;
-      try {
-        const rows = await client.calendarStatus();
-        email = rows.find((r) => r.provider === id)?.email || undefined;
-      } catch {
-        email = undefined;
+      const rows = await client.calendarStatus();
+      const connected = rows.find((row) => row.provider === id);
+      if (!connected?.connected) {
+        throw new Error(
+          "Authorization finished, but Bluey could not verify the saved account. Try connecting again.",
+        );
       }
-      setState((s) => ({ ...s, [id]: { status: "connected", email } }));
-    } catch (e) {
-      // Render the daemon's error (e.g. "cloud calendar not built", a timeout,
-      // or an OAuth failure) instead of throwing out of the click handler.
-      const error = e instanceof Error ? e.message : String(e);
-      setState((s) => ({ ...s, [id]: { status: "error", error } }));
+      applyStatus(rows);
+    } catch (error: unknown) {
+      setState((s) => ({
+        ...s,
+        [id]: { status: "error", error: calendarError(error) },
+      }));
+    }
+  };
+
+  const disconnect = async (id: string) => {
+    if (busy) return;
+    setStatusError(undefined);
+    setState((current) => ({
+      ...current,
+      [id]: {
+        ...current[id],
+        status: "disconnecting",
+      },
+    }));
+    try {
+      await client.calendarDisconnect(id);
+      const rows = await client.calendarStatus();
+      applyStatus(rows);
+    } catch (error: unknown) {
+      setState((current) => ({
+        ...current,
+        [id]: {
+          ...current[id],
+          status: "connected",
+          error: calendarError(error),
+        },
+      }));
     }
   };
 
   return (
     <div>
-      <Glyph>📅</Glyph>
-      <h2 style={h2}>Connect your calendar</h2>
+      {!management && <Glyph>📅</Glyph>}
+      <h2 style={management ? managementHeading : h2}>
+        {management ? "Calendar accounts" : "Connect your calendar"}
+      </h2>
       <p style={p}>
-        Bluey warms up an answer ahead of each meeting from your calendar. Connect
-        a cloud calendar, or skip if your calendar is already on this Mac.
+        {management
+          ? "Reconnect or disconnect the Google and Microsoft accounts Bluey uses for meeting prep."
+          : "Bluey can prepare your meeting context before a call starts. Your browser will open for Google or Microsoft consent, then return you here."}
       </p>
       <div
         style={{
@@ -367,16 +579,24 @@ function CalendarStep({
         {CAL_PROVIDERS.map((prov) => {
           const st = state[prov.id]?.status ?? "idle";
           const connecting = st === "connecting";
+          const disconnecting = st === "disconnecting";
           const connected = st === "connected";
+          const configured = state[prov.id]?.configured !== false;
+          const visibleError = configured
+            ? state[prov.id]?.error
+            : missingCalendarConfigGuidance(prov);
           return (
             <div key={prov.id}>
               <button
-                onClick={() => connect(prov.id)}
-                disabled={connecting || connected}
+                onClick={() =>
+                  connected ? disconnect(prov.id) : connect(prov.id)
+                }
+                disabled={loading || busy || !configured}
                 style={{
                   ...pickRow,
-                  cursor: connecting || connected ? "default" : "pointer",
-                  opacity: connecting ? 0.7 : 1,
+                  cursor:
+                    loading || busy || !configured ? "default" : "pointer",
+                  opacity: connecting || disconnecting || !configured ? 0.7 : 1,
                 }}
               >
                 <span style={{ fontSize: 13, fontWeight: 540 }}>
@@ -386,20 +606,30 @@ function CalendarStep({
                   style={{
                     marginLeft: "auto",
                     fontSize: 11,
-                    color: connected ? "var(--mint-ink,#2e7d63)" : "var(--ink-3)",
+                    color: connected
+                      ? "var(--mint-ink,#2e7d63)"
+                      : "var(--ink-3)",
                   }}
                 >
                   {connecting
                     ? "Connecting…"
-                    : connected
-                      ? (state[prov.id]?.email ?? "Connected")
-                      : ""}
+                    : disconnecting
+                      ? "Disconnecting…"
+                      : connected
+                        ? `${state[prov.id]?.email ?? "Connected"} · Disconnect`
+                        : !configured
+                          ? "Not configured"
+                          : loading
+                            ? "Checking…"
+                            : "Connect"}
                 </span>
                 {!connected && (
-                  <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>→</span>
+                  <span style={{ color: "var(--tint-ink)", fontSize: 13 }}>
+                    →
+                  </span>
                 )}
               </button>
-              {st === "error" && (
+              {visibleError && (
                 <p
                   style={{
                     fontSize: 11.5,
@@ -408,23 +638,37 @@ function CalendarStep({
                     margin: "5px 2px 0",
                   }}
                 >
-                  {state[prov.id]?.error ?? "Connection failed."}
+                  {visibleError}
                 </p>
               )}
             </div>
           );
         })}
       </div>
-      <div style={{ display: "flex", gap: 9, marginTop: 20 }}>
-        <button onClick={onNext} style={primary}>
-          {anyConnected ? "Continue" : "Next"}
-        </button>
-        {!anyConnected && (
-          <button onClick={onSkip} style={ghost}>
-            Skip for now
+      {statusError && (
+        <p
+          style={{
+            fontSize: 11.5,
+            lineHeight: 1.5,
+            color: "var(--danger-ink,#c0392b)",
+            margin: "7px 2px 0",
+          }}
+        >
+          Could not read calendar status: {statusError}
+        </p>
+      )}
+      {!management && (
+        <div style={{ display: "flex", gap: 9, marginTop: 20 }}>
+          <button onClick={onNext} disabled={busy} style={primary}>
+            {anyConnected ? "Continue" : "Next"}
           </button>
-        )}
-      </div>
+          {!anyConnected && !busy && (
+            <button onClick={onSkip} disabled={loading} style={ghost}>
+              Skip for now
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -456,6 +700,12 @@ const h2 = {
   letterSpacing: "-.02em",
   color: "var(--ink, #1c1a19)",
   margin: "16px 0 8px",
+} as const;
+
+const managementHeading = {
+  ...h2,
+  fontSize: 15,
+  marginTop: 0,
 } as const;
 
 const p = {

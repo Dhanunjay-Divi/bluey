@@ -1,25 +1,33 @@
 // Make a frameless NSPanel draggable by its header.
 //
-// A borderless transparent NSPanel has no titlebar, and CSS
-// `-webkit-app-region: drag` is NOT honored on it — so we replicate the proven
-// interview-overlay approach: watch for a left-press that MOVES past a small
-// threshold on the header, then hand off to the OS via `window.startDragging()`.
-// A press without movement still fires the underlying control's click (we never
-// preventDefault), so buttons in the header keep working.
+// A borderless transparent NSPanel has no titlebar. Tauri's native
+// A small movement threshold keeps ordinary clicks working on collapsed pills.
+// Once crossed, hand the pointer gesture to the native window and report that
+// the eventual click came from a drag so click-to-expand surfaces can consume
+// it.
 
-import type { RefObject } from "react";
-import { useEffect } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { MutableRefObject, RefObject } from "react";
+import { useEffect, useRef } from "react";
 
 const DRAG_THRESHOLD = 4; // px
 
-export function useDragHeader(ref: RefObject<HTMLElement | null>): void {
+export function useDragHeader(
+  ref: RefObject<HTMLElement | null>,
+  active = true,
+): MutableRefObject<boolean> {
+  const didDrag = useRef(false);
+
   useEffect(() => {
+    if (!active) return;
     const zone = ref.current;
     if (!zone) return;
-    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window))
+      return;
 
     const onDown = (ev: MouseEvent) => {
       if (ev.button !== 0) return;
+      didDrag.current = false;
       const startX = ev.clientX;
       const startY = ev.clientY;
       let dragging = false;
@@ -30,10 +38,11 @@ export function useDragHeader(ref: RefObject<HTMLElement | null>): void {
           Math.abs(mv.clientY - startY) > DRAG_THRESHOLD
         ) {
           dragging = true;
+          didDrag.current = true;
           cleanup();
-          void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
-            void getCurrentWindow().startDragging().catch(() => {});
-          });
+          void getCurrentWindow()
+            .startDragging()
+            .catch(() => {});
         }
       };
       const onUp = () => cleanup();
@@ -47,5 +56,7 @@ export function useDragHeader(ref: RefObject<HTMLElement | null>): void {
 
     zone.addEventListener("mousedown", onDown);
     return () => zone.removeEventListener("mousedown", onDown);
-  }, [ref]);
+  }, [active, ref]);
+
+  return didDrag;
 }

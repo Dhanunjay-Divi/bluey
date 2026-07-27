@@ -164,7 +164,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(ipc::DaemonLink::default())
         .manage(ipc::EventSender(tokio::sync::Mutex::new(None)))
-        .manage(ipc::PendingBanner(std::sync::Mutex::new(None)))
+        .manage(ipc::PendingBanner::default())
         .invoke_handler(tauri::generate_handler![
             commands::agent_list,
             commands::agent_attach,

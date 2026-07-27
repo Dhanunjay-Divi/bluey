@@ -4,8 +4,9 @@
 # Combines arm64 + x86_64 builds via `lipo -create` into universal binaries.
 # This script does NOT compile: it lipo's the per-target release binaries built
 # by `make build-darwin-arm64` / `make build-darwin-x86_64`, which already pass
-# `--features cue-daemon/parakeet-stt`. So on-device STT is inherited here with
-# no extra flag. (Intel-mac caveat: the x86_64 half links parakeet via
+# `--features cue-daemon/parakeet-stt,cue-daemon/cloud-calendar`. So on-device
+# STT and calendar onboarding are inherited here with no extra flag.
+# (Intel-mac caveat: the x86_64 half links parakeet via
 # load-dynamic and needs a libonnxruntime dylib at runtime — not staged; arm64
 # is the MVP target.)
 # Inputs:
@@ -17,7 +18,9 @@
 #   native/macos/cue-picker/.build/{arm64,x86_64}-apple-macosx/release/cue-picker
 #
 # Output:
-#   dist/bluey-macos-universal/{bluey,bluey-daemon,cue-meeting-overlay,bluey-overlay-macos,bluey-audio-macos,bluey-whisper-macos,bluey-file-picker-macos}
+#   dist/bluey-macos-universal/{bluey,bluey-daemon,cue-meeting-overlay,
+#   bluey-overlay-macos,bluey-audio-macos,BlueyAudio.app,
+#   bluey-whisper-macos,bluey-file-picker-macos}
 
 set -euo pipefail
 
@@ -65,6 +68,17 @@ ARM_AUDIO="native/macos/cue-audio/.build/arm64-apple-macosx/release/cue-audio"
 X86_AUDIO="native/macos/cue-audio/.build/x86_64-apple-macosx/release/cue-audio"
 if [[ -f "$ARM_AUDIO" && -f "$X86_AUDIO" ]]; then
     lipo -create "$ARM_AUDIO" "$X86_AUDIO" -output "$OUT/bluey-audio-macos"
+
+    # Wrap the universal helper in the same stable, certificate-backed app
+    # identity used by the per-architecture packages. TCC grants belong to this
+    # bundle; the bare binary remains only as a legacy fallback.
+    BLUEY_AUDIO_APP_BINARY="$ROOT/$OUT/bluey-audio-macos" \
+        bash native/macos/cue-audio/bundle-app.sh \
+        "${BLUEY_CODESIGN_IDENTITY:-}" >/dev/null
+    cp -R native/macos/cue-audio/.build/BlueyAudio.app "$OUT/BlueyAudio.app"
+    BLUEY_EXPECTED_ARCHS="arm64 x86_64" \
+        BLUEY_VERIFY_LAUNCH=1 \
+        bash native/macos/cue-audio/verify-app.sh "$OUT/BlueyAudio.app"
 else
     echo "warn: audio arch builds not both present; skipping audio in universal" >&2
 fi

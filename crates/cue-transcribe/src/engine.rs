@@ -19,6 +19,15 @@ use anyhow::{anyhow, Result};
 use parakeet_rs::Nemotron;
 
 const SAMPLE_RATE: f64 = 16_000.0;
+/// The production daemon feeds uniform 100 ms frames. Prewarming with the same
+/// shape exercises the exact mel/encoder path that the first live utterance
+/// will use.
+const STREAM_CHUNK_SAMPLES: usize = 1_600;
+/// Nemotron's streaming encoder commits every 560 ms (56 × 10 ms mel frames).
+/// Feed at least this much disposable silence so ONNX initializes its kernels
+/// and working buffers before real meeting audio arrives.
+const MODEL_WINDOW_SAMPLES: usize = 8_960;
+const PREWARM_CHUNKS: usize = MODEL_WINDOW_SAMPLES.div_ceil(STREAM_CHUNK_SAMPLES);
 
 /// How many CONSECUTIVE empty (silence) chunks must arrive before the held tip
 /// is flushed as an utterance end. A single empty ~100ms chunk is NOT enough — a
@@ -129,6 +138,23 @@ impl SttEngineHandle {
             )
         })?;
         Ok(Self { inner })
+    }
+
+    /// Exercise one full encoder window against a disposable decoder state.
+    ///
+    /// Loading the ONNX sessions maps the model weights, but the first inference
+    /// still initializes execution plans, kernels, and working buffers. Running
+    /// silence through a temporary stream pays that cold cost before the user
+    /// speaks. The temporary [`SttEngine`] is then dropped, so every real source
+    /// still starts with clean encoder/decoder state and transcript quality is
+    /// unchanged.
+    pub fn warm_up(&self) -> Result<()> {
+        let mut engine = SttEngine::from_shared(self);
+        let silence = [0.0_f32; STREAM_CHUNK_SAMPLES];
+        for _ in 0..PREWARM_CHUNKS {
+            let _ = engine.push(&silence)?;
+        }
+        Ok(())
     }
 }
 
@@ -346,7 +372,17 @@ pub struct TranscriptChunk {
 
 #[cfg(test)]
 mod tests {
-    use super::{ends_sentence, flush_boundary, glue_punctuation};
+    use super::{
+        ends_sentence, flush_boundary, glue_punctuation, MODEL_WINDOW_SAMPLES, PREWARM_CHUNKS,
+        STREAM_CHUNK_SAMPLES,
+    };
+
+    #[test]
+    fn prewarm_covers_exactly_one_streaming_encoder_window() {
+        let warmed_samples = PREWARM_CHUNKS * STREAM_CHUNK_SAMPLES;
+        assert!(warmed_samples >= MODEL_WINDOW_SAMPLES);
+        assert!(warmed_samples - MODEL_WINDOW_SAMPLES < STREAM_CHUNK_SAMPLES);
+    }
 
     #[test]
     fn glue_punctuation_attaches_stray_punct() {

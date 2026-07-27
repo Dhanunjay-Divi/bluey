@@ -21,3 +21,6 @@ keyring.workspace = true
 # direct dependency of `cue-core` at this exact version, so it adds no new
 # crate to the tree.
 sha2 = "0.10"
+
+[dev-dependencies]
+tempfile.workspace = true

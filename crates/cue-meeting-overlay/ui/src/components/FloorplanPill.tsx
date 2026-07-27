@@ -13,7 +13,7 @@
 // the rest of the UI and needs no palette of its own.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { RefObject } from "react";
+import type { MutableRefObject, RefObject } from "react";
 import type { MeetingClient } from "../lib/client";
 import type { AgentSummary, ListeningState } from "../lib/types";
 import { useMeetingState } from "../lib/meetingState";
@@ -21,10 +21,17 @@ import type { PillSize } from "../lib/useCollapse";
 import { SparkleIcon, SpinnerIcon, SystemAudioIcon, StopIcon } from "./icons";
 
 /** The derived pill state, most-urgent first. */
-type PillPhase = "answering" | "peek" | "detected" | "listening" | "idle";
+type PillPhase =
+  | "issue"
+  | "answering"
+  | "peek"
+  | "detected"
+  | "listening"
+  | "idle";
 
 /** Which morph-window size each phase wants. */
 const PHASE_SIZE: Record<PillPhase, PillSize> = {
+  issue: "compact",
   answering: "alert",
   peek: "peek",
   detected: "alert",
@@ -43,46 +50,114 @@ export function FloorplanPill({
   onExpand,
   setPillSize,
   dragRef,
+  didDragRef,
 }: {
   client: MeetingClient;
   attached: AgentSummary | null;
   onExpand: () => void;
   setPillSize: (size: PillSize) => void;
   dragRef: RefObject<HTMLDivElement | null>;
+  didDragRef: MutableRefObject<boolean>;
 }) {
-  const { transcript, detectedQ, turns } = useMeetingState();
-  const [listen, setListen] = useState<ListeningState>("idle");
-  useEffect(() => client.onListeningState(setListen), [client]);
+  const {
+    transcript,
+    detectedQ,
+    turns,
+    listenState: persistedListen,
+    systemInputOn: persistedSystem,
+    micInputOn: persistedMicrophone,
+    permissionDeniedSource,
+    permissionSettingsOpenedFor,
+    preparePermissionRetry,
+  } = useMeetingState();
+  const [listen, setListen] = useState<ListeningState>(persistedListen);
+  const [sources, setSources] = useState({
+    system: persistedSystem,
+    microphone: persistedMicrophone,
+  });
+  // The pill mounts only when the panel collapses. Seed and synchronize it from
+  // the never-unmounted provider so capture that started before collapse is
+  // correct even before the next daemon push arrives.
+  useEffect(() => {
+    setListen(persistedListen);
+    setSources({
+      system: persistedSystem,
+      microphone: persistedMicrophone,
+    });
+  }, [persistedListen, persistedSystem, persistedMicrophone]);
+  useEffect(
+    () =>
+      client.onListeningState((state, nextSources) => {
+        setListen(state);
+        if (nextSources) {
+          setSources(nextSources);
+          return;
+        }
+        // Compatibility with an older daemon that only sent the aggregate
+        // state: the collapsed shortcut historically controlled system audio.
+        if (state === "listening" || state === "connecting") {
+          setSources((current) => ({ ...current, system: true }));
+        } else if (
+          state === "idle" ||
+          state === "paused" ||
+          state === "failed" ||
+          state === "permission_denied"
+        ) {
+          setSources({ system: false, microphone: false });
+        }
+      }),
+    [client],
+  );
 
   // The newest turn drives the answering/peek states.
   const lastTurn = turns.length ? turns[turns.length - 1] : null;
-  const answering = !!lastTurn && !lastTurn.answer.done && !lastTurn.answer.error;
+  const answering =
+    !!lastTurn && !lastTurn.answer.done && !lastTurn.answer.error;
   // Show a fresh answer as a "peek" only briefly after it lands, then fall
   // through to the ambient states — the pill shouldn't camp on a stale answer.
   const [peekTurnId, setPeekTurnId] = useState<number | null>(null);
   useEffect(() => {
     if (!lastTurn) return;
-    if (lastTurn.answer.done && lastTurn.answer.text && !lastTurn.answer.error) {
+    if (
+      lastTurn.answer.done &&
+      lastTurn.answer.text &&
+      !lastTurn.answer.error
+    ) {
       setPeekTurnId(lastTurn.id);
       const t = window.setTimeout(() => setPeekTurnId(null), 6000);
       return () => window.clearTimeout(t);
     }
-  }, [lastTurn?.id, lastTurn?.answer.done, lastTurn?.answer.text, lastTurn?.answer.error]);
+  }, [
+    lastTurn?.id,
+    lastTurn?.answer.done,
+    lastTurn?.answer.text,
+    lastTurn?.answer.error,
+  ]);
   const peeking =
     !!lastTurn && lastTurn.id === peekTurnId && lastTurn.answer.done;
 
   const capturing = listen === "listening" || listen === "connecting";
+  const systemCapturing = sources.system;
   const live = listen === "listening";
+  const permissionIssue =
+    permissionDeniedSource !== null || listen === "permission_denied";
+  const systemPermissionDenied =
+    permissionDeniedSource === "system" ||
+    (permissionDeniedSource === null && listen === "permission_denied");
+  const systemSettingsOpened = permissionSettingsOpenedFor.includes("system");
+  const issue = listen === "failed" || permissionIssue;
 
-  const phase: PillPhase = answering
-    ? "answering"
-    : peeking
-    ? "peek"
-    : detectedQ
-    ? "detected"
-    : capturing
-    ? "listening"
-    : "idle";
+  const phase: PillPhase = issue
+    ? "issue"
+    : answering
+      ? "answering"
+      : peeking
+        ? "peek"
+        : detectedQ
+          ? "detected"
+          : capturing
+            ? "listening"
+            : "idle";
 
   // Drive the OS window morph as the phase changes. Debounced by the phase
   // value itself (effect only re-runs when the mapped size changes).
@@ -123,13 +198,17 @@ export function FloorplanPill({
     () => (transcript?.text ? tail(transcript.text, 64) : ""),
     [transcript?.text],
   );
+  const expandUnlessDragged = () => {
+    if (didDragRef.current) {
+      didDragRef.current = false;
+      return;
+    }
+    onExpand();
+  };
 
   return (
     <div className="fp-pill-root" data-phase={phase}>
-      <div
-        className={`fp-pill${flash ? " is-flash" : ""}`}
-        data-phase={phase}
-      >
+      <div className={`fp-pill${flash ? " is-flash" : ""}`} data-phase={phase}>
         {/* LEADING — the state glyph (also the accent anchor). */}
         <span className="fp-pill-lead" aria-hidden>
           {phase === "answering" ? (
@@ -140,8 +219,18 @@ export function FloorplanPill({
             <SparkleIcon size={15} />
           ) : (
             <span
-              className={`fp-pill-dot${live ? " is-live" : ""}`}
-              title={live ? "listening" : "idle"}
+              className={`fp-pill-dot${live ? " is-live" : ""}${
+                issue ? " is-issue" : ""
+              }`}
+              title={
+                permissionIssue
+                  ? "permission needed"
+                  : listen === "failed"
+                    ? "audio issue"
+                    : live
+                      ? "listening"
+                      : "idle"
+              }
             />
           )}
         </span>
@@ -149,14 +238,16 @@ export function FloorplanPill({
         {/* BODY — tap to expand; also the drag handle. Content morphs by phase. */}
         <div
           ref={dragRef}
-          onClick={onExpand}
+          onClick={expandUnlessDragged}
           role="button"
           aria-label="Open Bluey"
           tabIndex={0}
           onKeyDown={(e) => {
+            if (e.key === " ") e.preventDefault();
             if (e.key === "Enter" || e.key === " ") onExpand();
           }}
           className="fp-pill-body"
+          style={{ userSelect: "none", WebkitUserSelect: "none" }}
         >
           {phase === "answering" && (
             <>
@@ -184,20 +275,28 @@ export function FloorplanPill({
           )}
 
           {phase === "listening" && (
-            <span className="fp-pill-caption">
-              {caption || "listening…"}
+            <span className="fp-pill-caption">{caption || "listening…"}</span>
+          )}
+
+          {phase === "issue" && (
+            <span className="fp-pill-caption is-issue">
+              {permissionIssue
+                ? "Permission needed · tap to open"
+                : "Audio issue · tap to open"}
             </span>
           )}
 
           {phase === "idle" && (
             <span className="fp-pill-caption is-muted">
-              {attached ? `${attached.displayName} · tap to open` : "Bluey · tap to open"}
+              {attached
+                ? `${attached.displayName} · tap to open`
+                : "Bluey · tap to open"}
             </span>
           )}
         </div>
 
         {/* TRAILING — the one-tap affordance for this phase. */}
-        {(phase === "detected" || phase === "peek") ? (
+        {phase === "detected" || phase === "peek" ? (
           <button
             type="button"
             className="fp-pill-cta"
@@ -212,16 +311,47 @@ export function FloorplanPill({
         ) : phase === "answering" ? null : (
           <button
             type="button"
-            className={`fp-pill-toggle${capturing ? " is-on" : ""}`}
-            aria-label={capturing ? "Stop listening" : "Listen to system audio"}
-            title={capturing ? "Stop listening" : "Listen (system audio)"}
+            className={`fp-pill-toggle${systemCapturing ? " is-on" : ""}`}
+            aria-label={
+              systemPermissionDenied
+                ? systemSettingsOpened
+                  ? "Retry system audio"
+                  : "Grant system audio permission"
+                : systemCapturing
+                  ? "Stop system audio"
+                  : "Listen to system audio"
+            }
+            title={
+              systemPermissionDenied
+                ? systemSettingsOpened
+                  ? "Retry system audio"
+                  : "Grant system audio permission"
+                : systemCapturing
+                  ? "Stop system audio"
+                  : "Listen (system audio)"
+            }
             onClick={(e) => {
               e.stopPropagation();
-              if (capturing) client.stopListening();
-              else client.startListening({ microphone: false, system: true });
+              if (systemPermissionDenied && preparePermissionRetry("system")) {
+                return;
+              }
+              const system = !systemCapturing;
+              setSources((current) => ({ ...current, system }));
+              if (!system && !sources.microphone) {
+                client.stopListening();
+              } else {
+                client.startListening({
+                  microphone: sources.microphone,
+                  system,
+                });
+              }
             }}
           >
-            {capturing ? <StopIcon size={14} /> : <SystemAudioIcon size={14} />}
+            {systemCapturing ? (
+              <StopIcon size={14} />
+            ) : (
+              <SystemAudioIcon size={14} />
+            )}
           </button>
         )}
       </div>

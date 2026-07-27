@@ -62,8 +62,8 @@ export function App() {
   // ~/.bluey + Application Support does NOT reset onboarding (the flag
   // survives, and the next launch skips straight to the main app), and clearing
   // the WebView store re-triggers onboarding for an already-set-up user.
-  // `install.sh --reset` clears the WebView store too; the real fix is to move
-  // this flag into daemon settings so there is one source of truth.
+  // A factory reset must clear this WebView store explicitly; the real fix is
+  // to move this flag into daemon settings so there is one source of truth.
   const [onboarding, setOnboarding] = useState(
     () => !localStorage.getItem("bluey.onboarded"),
   );
@@ -102,8 +102,9 @@ export function App() {
   // Collapse to a compact pill (X) / re-expand (click the pill).
   const { collapsed, collapse, expand, setPillSize } = useCollapse();
   const pillRef = useRef<HTMLDivElement>(null);
-  useDragHeader(pillRef);
-
+  // The pill is conditionally mounted. Re-run the hook after collapse commits so
+  // its ref points at a real element; on the initial expanded render it is null.
+  const pillWasDragged = useDragHeader(pillRef, collapsed);
 
   // First-run onboarding is a compact centered card — shrink the OS window to it
   // while onboarding, then restore the full panel when it's done (fixes the card
@@ -133,6 +134,7 @@ export function App() {
             onExpand={() => void expand()}
             setPillSize={(s) => void setPillSize(s)}
             dragRef={pillRef}
+            didDragRef={pillWasDragged}
           />
         ) : (
           <Pill
@@ -140,6 +142,7 @@ export function App() {
             attached={attached}
             onExpand={() => void expand()}
             dragRef={pillRef}
+            didDragRef={pillWasDragged}
           />
         ))}
 
@@ -163,7 +166,12 @@ export function App() {
         <div style={{ position: "fixed", inset: 0, display: "flex" }}>
           <Glass
             radius="var(--r-xl)"
-            style={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 0 }}
+            style={{
+              flex: 1,
+              display: "flex",
+              flexDirection: "column",
+              minHeight: 0,
+            }}
           >
             <OpenFloorScreen
               agent={attached}

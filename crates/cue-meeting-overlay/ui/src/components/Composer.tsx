@@ -2,7 +2,11 @@
 // ⌘↵ hint, send. Submits on Enter (⌘↵ or plain Enter) when there's text.
 
 import { useState, type ReactNode } from "react";
-import type { ContextItem, ListeningState } from "../lib/types";
+import type {
+  AudioPermissionSource,
+  ContextItem,
+  ListeningState,
+} from "../lib/types";
 import { PlusMenu } from "./PlusMenu";
 import { ModelPicker } from "./ModelPicker";
 import {
@@ -23,6 +27,8 @@ export function Composer({
   onToggleMicInput,
   micInputOn = false,
   listenState = "idle",
+  permissionDeniedSource,
+  permissionSettingsOpenedFor = [],
   models,
   selectedModel,
   onModelChange,
@@ -51,6 +57,12 @@ export function Composer({
   /** Daemon listening-pipeline state — drives the mic button's visual state so a
    *  connecting/failed start is never silently swallowed. */
   listenState?: ListeningState;
+  /** Source blocked by the current OS permission gate. Null/undefined means an
+   *  older daemon could not disambiguate it. */
+  permissionDeniedSource?: AudioPermissionSource | null;
+  /** Sources whose Settings pane has already been opened; their controls now
+   *  say Retry and issue a fresh capture request. */
+  permissionSettingsOpenedFor?: AudioPermissionSource[];
   /** Selectable models for the attached agent (element [0] is always "auto").
    *  The picker is shown only when there is more than one choice; omit / pass ≤1
    *  entry to hide it (e.g. no agent attached, or an
@@ -63,6 +75,24 @@ export function Composer({
 }) {
   const [text, setText] = useState("");
   const [plusOpen, setPlusOpen] = useState(false);
+  const systemPermissionDenied =
+    permissionDeniedSource === "system" ||
+    (listenState === "permission_denied" &&
+      permissionDeniedSource !== "microphone");
+  const microphonePermissionDenied =
+    !micInputOn &&
+    (permissionDeniedSource === "microphone" ||
+      (listenState === "permission_denied" &&
+        permissionDeniedSource !== "system"));
+  const systemButtonState: ListeningState = systemPermissionDenied
+    ? "permission_denied"
+    : listenState === "permission_denied"
+      ? "idle"
+      : listenState;
+  const systemMeta = micMeta(
+    systemButtonState,
+    permissionSettingsOpenedFor.includes("system"),
+  );
   const submit = () => {
     const t = text.trim();
     if (!t) return;
@@ -191,47 +221,69 @@ export function Composer({
         />
         <button
           onClick={onMic}
-          aria-label={micMeta(listenState).label}
-          aria-pressed={listenState === "listening"}
-          aria-busy={listenState === "connecting"}
-          title={micMeta(listenState).title}
+          aria-label={systemMeta.label}
+          aria-pressed={systemButtonState === "listening"}
+          aria-busy={systemButtonState === "connecting"}
+          title={systemMeta.title}
           style={{
             ...iconBtn,
-            background: micMeta(listenState).bg,
-            color: micMeta(listenState).fg,
+            background: systemMeta.bg,
+            color: systemMeta.fg,
           }}
         >
           <span
             style={{
               display: "inline-flex",
               animation:
-                listenState === "connecting"
+                systemButtonState === "connecting"
                   ? "aurora-spin 1.1s linear infinite"
                   : undefined,
             }}
           >
-            {micMeta(listenState).glyph}
+            {systemMeta.glyph}
           </span>
         </button>
         {onToggleMicInput && (
           <button
             onClick={onToggleMicInput}
             aria-label={
-              micInputOn ? "Stop microphone input" : "Start microphone input"
+              microphonePermissionDenied
+                ? permissionSettingsOpenedFor.includes("microphone")
+                  ? "Retry microphone input"
+                  : "Grant Microphone access"
+                : micInputOn
+                  ? "Stop microphone input"
+                  : "Start microphone input"
             }
             aria-pressed={micInputOn}
             title={
-              micInputOn
-                ? "Microphone on — your voice is captured (click to stop)"
-                : "Microphone off — click to capture your voice too"
+              microphonePermissionDenied
+                ? permissionSettingsOpenedFor.includes("microphone")
+                  ? "Microphone access changed — click to retry capture"
+                  : "Microphone permission needed — click to open Settings"
+                : micInputOn
+                  ? "Microphone on — your voice is captured (click to stop)"
+                  : "Microphone off — click to capture your voice too"
             }
             style={{
               ...iconBtn,
-              background: micInputOn ? "rgba(99,102,241,.14)" : "transparent",
-              color: micInputOn ? "var(--tint-ink)" : "var(--ink-2)",
+              background: microphonePermissionDenied
+                ? "rgba(184,117,3,.14)"
+                : micInputOn
+                  ? "rgba(99,102,241,.14)"
+                  : "transparent",
+              color: microphonePermissionDenied
+                ? "#b87503"
+                : micInputOn
+                  ? "var(--tint-ink)"
+                  : "var(--ink-2)",
             }}
           >
-            <MicIcon size={16} />
+            {microphonePermissionDenied ? (
+              <AlertIcon size={16} />
+            ) : (
+              <MicIcon size={16} />
+            )}
           </button>
         )}
         <span
@@ -380,7 +432,10 @@ function contextKindGlyph(kind: string): string {
 
 // Per-state visual for the mic button, so a connecting/failed start is visible
 // (the bug before: any non-"listening" state silently snapped back to off).
-function micMeta(state: ListeningState): {
+function micMeta(
+  state: ListeningState,
+  permissionRetryReady: boolean,
+): {
   glyph: ReactNode;
   label: string;
   title: string;
@@ -415,8 +470,12 @@ function micMeta(state: ListeningState): {
     case "permission_denied":
       return {
         glyph: <AlertIcon size={16} />,
-        label: "Grant Screen Recording — click to open Settings",
-        title: "Screen Recording permission needed — click to open Settings",
+        label: permissionRetryReady
+          ? "Retry system audio"
+          : "Grant Screen Recording — click to open Settings",
+        title: permissionRetryReady
+          ? "Screen Recording access changed — click to retry capture"
+          : "Screen Recording permission needed — click to open Settings",
         bg: "rgba(184,117,3,.14)",
         fg: "#b87503",
       };

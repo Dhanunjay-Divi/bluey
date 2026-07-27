@@ -21,7 +21,7 @@
 //! docs/DECISION-VOICE-STT-STACK.md.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use cue_core::pcm::{AudioChunk, AudioSource};
@@ -29,61 +29,132 @@ use cue_core::stt::{ConnectionState, SttError, SttProvider, TranscriptEvent};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
-/// Process-wide shared Nemotron weights (loaded once, backed by an `Arc` inside
-/// `SttEngineHandle`). The first STT source to start pays the ~650 MB load; every
-/// later source spawns a `from_shared` engine reusing these weights, so mic +
-/// system audio cost ONE model in RAM. Keyed by model dir so a different model
-/// path (rare) loads its own handle rather than mis-sharing.
-static SHARED_STT_HANDLE: OnceLock<Mutex<Option<(PathBuf, cue_transcribe::SttEngineHandle)>>> =
+enum SharedModelState<T> {
+    Empty,
+    Loading,
+    Ready { dir: PathBuf, value: T },
+}
+
+/// A blocking, process-local single-flight cache for expensive model loads.
+///
+/// The loader runs without holding the mutex. Concurrent microphone/system
+/// workers wait on the condition variable and then clone the one finished
+/// handle, instead of loading two ~650 MB copies at once.
+struct SharedModelCache<T> {
+    state: Mutex<SharedModelState<T>>,
+    ready: Condvar,
+}
+
+impl<T> Default for SharedModelCache<T> {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(SharedModelState::Empty),
+            ready: Condvar::new(),
+        }
+    }
+}
+
+impl<T: Clone> SharedModelCache<T> {
+    fn get_or_try_init<E>(
+        &self,
+        dir: &Path,
+        load: impl FnOnce(&Path) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut load = Some(load);
+        loop {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match &*state {
+                SharedModelState::Ready {
+                    dir: cached_dir,
+                    value,
+                } if cached_dir == dir => return Ok(value.clone()),
+                SharedModelState::Loading => {
+                    state = self
+                        .ready
+                        .wait(state)
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    drop(state);
+                }
+                SharedModelState::Empty | SharedModelState::Ready { .. } => {
+                    *state = SharedModelState::Loading;
+                    drop(state);
+
+                    let result = load
+                        .take()
+                        .expect("the cache loader is consumed only by the winning caller")(
+                        dir
+                    );
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    match &result {
+                        Ok(value) => {
+                            *state = SharedModelState::Ready {
+                                dir: dir.to_path_buf(),
+                                value: value.clone(),
+                            };
+                        }
+                        Err(_) => *state = SharedModelState::Empty,
+                    }
+                    self.ready.notify_all();
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+/// Process-wide shared Nemotron weights (backed by an `Arc` inside
+/// `SttEngineHandle`). The first load also runs a disposable silent encoder
+/// window, so later real streams reuse both the weights and the initialized ONNX
+/// execution path.
+static SHARED_STT_HANDLE: OnceLock<SharedModelCache<cue_transcribe::SttEngineHandle>> =
     OnceLock::new();
 
-/// Get a streaming engine for `dir`, sharing weights with any engine already
-/// loaded for the same dir. Loads the handle on first use (per dir). Falls back
-/// to a dedicated `SttEngine::load` only if the handle can't be built (so a
-/// single source is never blocked by the sharing machinery).
+fn shared_handle_for(dir: &Path) -> anyhow::Result<cue_transcribe::SttEngineHandle> {
+    SHARED_STT_HANDLE
+        .get_or_init(SharedModelCache::default)
+        .get_or_try_init(dir, |model_dir| {
+            let load_started = std::time::Instant::now();
+            let handle = cue_transcribe::SttEngineHandle::load(model_dir)?;
+            let load_ms = load_started.elapsed().as_millis();
+
+            let warm_started = std::time::Instant::now();
+            handle.warm_up()?;
+            tracing::info!(
+                dir = %model_dir.display(),
+                load_ms,
+                warm_ms = warm_started.elapsed().as_millis(),
+                "Parakeet model loaded and inference path prewarmed"
+            );
+            Ok(handle)
+        })
+}
+
+/// Load and prewarm the process-wide Parakeet model before capture begins.
+///
+/// Safe to call repeatedly and concurrently. Once ready, this is only a cheap
+/// handle clone; a simultaneous source startup waits for the same single-flight
+/// load rather than allocating duplicate model weights.
+pub fn prewarm(paths: &ParakeetPaths) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
+    let _ = shared_handle_for(&paths.nemotron_dir)?;
+    tracing::info!(
+        dir = %paths.nemotron_dir.display(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "Parakeet STT prewarm ready"
+    );
+    Ok(())
+}
+
+/// Get a clean streaming engine for `dir`, sharing the process-wide prewarmed
+/// weights with every other source.
 fn shared_engine_for(dir: &Path) -> anyhow::Result<cue_transcribe::SttEngine> {
-    let slot = SHARED_STT_HANDLE.get_or_init(|| Mutex::new(None));
-
-    // FAST PATH: take the lock, check the cache, RELEASE it. Never hold the lock
-    // across the load.
-    {
-        let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((cached_dir, h)) = guard.as_ref() {
-            if cached_dir == dir {
-                return Ok(cue_transcribe::SttEngine::from_shared(h));
-            }
-        }
-    }
-
-    // SLOW PATH: load OUTSIDE the lock.
-    //
-    // DEADLOCK FIX (2026-07-20, found live on an Intel Mac): this previously
-    // held the mutex across `SttEngineHandle::load` — a ~650 MB, multi-second
-    // blocking load. Mic and system audio start at the SAME instant, so source
-    // A took the lock and began loading while source B blocked on it. Both
-    // threads sat in `__psynch_mutexwait` and NEITHER ever reached the code that
-    // logs success or failure: the daemon log dead-ended at "parakeet model
-    // already present", RSS stayed at 31 MB (model never resident), and
-    // transcription silently never started. Loading off-lock means a concurrent
-    // start can never block on a load.
-    //
-    // Cost of the race: if both sources miss the cache simultaneously they may
-    // each load once, and the last writer wins. That is a bounded, one-time
-    // duplicate load — strictly better than a hang, and the steady state is
-    // still one shared handle.
-    let handle = cue_transcribe::SttEngineHandle::load(dir)?;
-
-    {
-        let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
-        match guard.as_ref() {
-            // Someone else finished first — prefer THEIR handle so both sources
-            // converge on one set of weights.
-            Some((cached_dir, existing)) if cached_dir == dir => {
-                return Ok(cue_transcribe::SttEngine::from_shared(existing));
-            }
-            _ => *guard = Some((dir.to_path_buf(), handle.clone())),
-        }
-    }
+    let handle = shared_handle_for(dir)?;
     Ok(cue_transcribe::SttEngine::from_shared(&handle))
 }
 
@@ -215,17 +286,27 @@ fn run_worker(
         let push_started = std::time::Instant::now();
         let backlog = audio_rx.len();
         let push_result = engine.push(&chunk);
-        let push_ms = push_started.elapsed().as_millis();
-        let rtf = push_started.elapsed().as_secs_f64() / audio_secs.max(1e-9);
-        
+        let push_elapsed = push_started.elapsed();
+        let push_ms = push_elapsed.as_millis();
+        let rtf = push_elapsed.as_secs_f64() / audio_secs.max(1e-9);
+
         let chunk_text = match push_result {
             Ok(Some(tc)) => {
                 let text = tc.text.trim();
                 if !text.is_empty() {
                     has_spoken_since_last_boundary = true;
-                    eprintln!(
-                        "[LATENCY DIAGNOSTIC] Source: {:?} | Push: {}ms | RTF: {:.2} | Backlog: {} | Decoded text: {:?}",
-                        source, push_ms, rtf, backlog, tc.text
+                    // Keep latency telemetry off stderr: eprintln! synchronously
+                    // locks and writes on the inference thread, adding avoidable
+                    // work to the hot path. It also leaked meeting text into the
+                    // terminal. Debug fields retain the useful timing/backlog
+                    // signal without recording transcript content.
+                    debug!(
+                        ?source,
+                        push_ms,
+                        rtf,
+                        backlog,
+                        emitted_chars = tc.text.len(),
+                        "Parakeet streaming push"
                     );
                     Some(tc.text)
                 } else {
@@ -258,7 +339,7 @@ fn run_worker(
             }
         }
 
-        // Emit Boundary if we've crossed the silence threshold AND we have 
+        // Emit Boundary if we've crossed the silence threshold AND we have
         // transcribed speech since the last boundary.
         if silent_ms >= SILENCE_GATE_MS && has_spoken_since_last_boundary {
             let ev = TranscriptEvent::Boundary { source };
@@ -311,5 +392,81 @@ impl SttProvider for ParakeetProvider {
         self.audio_tx = None;
         self.state = ConnectionState::Closed;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SharedModelCache;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn concurrent_sources_share_one_model_load() {
+        const WORKERS: usize = 8;
+        let cache = Arc::new(SharedModelCache::<usize>::default());
+        let starts = Arc::new(Barrier::new(WORKERS));
+        let loads = Arc::new(AtomicUsize::new(0));
+
+        let workers = (0..WORKERS)
+            .map(|_| {
+                let cache = cache.clone();
+                let starts = starts.clone();
+                let loads = loads.clone();
+                std::thread::spawn(move || {
+                    starts.wait();
+                    cache
+                        .get_or_try_init(Path::new("/test/model"), |_| {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(25));
+                            Ok::<usize, ()>(42)
+                        })
+                        .expect("single-flight load")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            assert_eq!(worker.join().expect("worker join"), 42);
+        }
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn failed_model_load_unblocks_a_later_retry() {
+        let cache = SharedModelCache::<usize>::default();
+        let first = cache.get_or_try_init(Path::new("/test/model"), |_| {
+            Err::<usize, &'static str>("load failed")
+        });
+        assert_eq!(first, Err("load failed"));
+
+        let retried = cache
+            .get_or_try_init(Path::new("/test/model"), |_| Ok::<usize, &'static str>(7))
+            .expect("retry after failed load");
+        assert_eq!(retried, 7);
+    }
+
+    #[test]
+    fn a_different_model_directory_gets_its_own_load() {
+        let cache = SharedModelCache::<usize>::default();
+        let loads = AtomicUsize::new(0);
+
+        let first = cache
+            .get_or_try_init(Path::new("/test/model-a"), |_| {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok::<usize, ()>(1)
+            })
+            .expect("first model");
+        let second = cache
+            .get_or_try_init(Path::new("/test/model-b"), |_| {
+                loads.fetch_add(1, Ordering::SeqCst);
+                Ok::<usize, ()>(2)
+            })
+            .expect("second model");
+
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
     }
 }
