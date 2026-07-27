@@ -79,6 +79,7 @@ parakeet-rs = { version = "0.3", optional = true, default-features = false }
 futures-util.workspace = true
 tokio-tungstenite.workspace = true
 url.workspace = true
+sonora = "0.1.0"
 
 # Intel macOS has NO prebuilt ONNX Runtime binary in `ort`, so on that target we
 # load ONNX Runtime dynamically at runtime (`load-dynamic`) instead of linking a

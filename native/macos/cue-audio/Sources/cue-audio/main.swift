@@ -723,7 +723,7 @@ private final class SystemAudioCapture {
     }
 }
 
-private final class MicrophoneCapture {
+private final class MicrophoneCapture: NSObject {
     private let duration: TimeInterval
     private let continuous: Bool
     private let writer: PCM16Writer
@@ -733,6 +733,7 @@ private final class MicrophoneCapture {
         self.duration = TimeInterval(durationMs) / 1_000.0
         self.continuous = continuous
         self.writer = PCM16Writer(handle: sink)
+        super.init()
     }
 
     /// Enables Apple's VoiceProcessingIO acoustic echo cancellation on the input
@@ -787,9 +788,12 @@ private final class MicrophoneCapture {
         }
     }
 
-    func run() throws {
-        try ensureMicrophonePermission()
-
+    /// Install AEC + the mono-downmixing tap on the CURRENT input device and start
+    /// the engine. Factored out of `run()` so it can be re-run when the audio
+    /// route changes mid-meeting (headphones plugged/unplugged) — each call
+    /// re-enables AEC for the NEW device (a speaker route needs echo cancellation;
+    /// a headphone route has no echo path) and re-reads the new format.
+    private func startTapAndEngine() throws {
         let input = engine.inputNode
         // Enable AEC BEFORE reading the input format: the VoiceProcessingIO unit
         // imposes its own sample rate and channel count, so a format captured
@@ -799,6 +803,16 @@ private final class MicrophoneCapture {
         let inputFormat = input.outputFormat(forBus: 0)
         fputs("microphone: input format \(inputFormat.sampleRate)Hz "
             + "\(inputFormat.channelCount)ch; tap installed\n", stderr)
+        // Diagnose the "AEC enabled but echo still leaks" case: VoiceProcessingIO
+        // expects a normal 1-2 channel voice mic. A high channel count means the
+        // input is an AGGREGATE / virtual device (e.g. a loopback like BlackHole,
+        // or an aggregate that includes system-audio) — AEC cannot model the echo
+        // path on that, so system audio bleeds into the mic despite AEC being on.
+        if inputFormat.channelCount > 2 {
+            fputs("microphone: WARNING input device is \(inputFormat.channelCount)ch "
+                + "(aggregate/virtual) — VoiceProcessingIO AEC is unreliable on "
+                + "non-voice inputs; echo may leak. Prefer the built-in mic.\n", stderr)
+        }
 
         var tapFireCount = 0
         input.installTap(onBus: 0, bufferSize: 1_024, format: nil) { [weak self] buffer, _ in
@@ -829,15 +843,47 @@ private final class MicrophoneCapture {
             }
         }
         engine.prepare()
+        try engine.start()
+        fputs("microphone: engine.start() OK isRunning=\(engine.isRunning) — waiting for tap buffers\n", stderr)
+    }
+
+    /// Tear down the tap + engine so the route change can re-bind the new device,
+    /// then rebuild against the new hardware.
+    @objc private func handleConfigurationChange() {
+        fputs("microphone: audio route changed mid-session — reconfiguring (AEC re-applied for new device)\n", stderr)
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
         do {
-            try engine.start()
-            fputs("microphone: engine.start() OK isRunning=\(engine.isRunning) — waiting for tap buffers\n", stderr)
+            try startTapAndEngine()
+        } catch {
+            fputs("microphone: reconfigure after route change FAILED: \(error.localizedDescription)\n", stderr)
+        }
+    }
+
+    func run() throws {
+        try ensureMicrophonePermission()
+
+        do {
+            try startTapAndEngine()
         } catch {
             fputs("microphone: engine.start() FAILED: \(error.localizedDescription)\n", stderr)
             throw error
         }
 
         if continuous {
+            // Handle mid-meeting device switches (plug/unplug headphones, AirPods
+            // connecting, default-input change). macOS fires this when the engine's
+            // hardware route changes; we tear down and rebuild against the new
+            // device so AEC is re-applied correctly (a speaker route needs echo
+            // cancellation; a headphone route has no echo path) and the tap keeps
+            // producing audio instead of silently going stale. Only the long-lived
+            // continuous mode needs this.
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(handleConfigurationChange),
+                name: .AVAudioEngineConfigurationChange,
+                object: engine
+            )
             // Park on the CURRENT thread's run loop to keep the process alive.
             // This method is invoked on the MAIN thread (see main.swift) so this
             // services the main run loop AVAudioEngine needs. (Previously this was
@@ -848,7 +894,7 @@ private final class MicrophoneCapture {
         } else {
             Thread.sleep(forTimeInterval: duration)
             engine.stop()
-            input.removeTap(onBus: 0)
+            engine.inputNode.removeTap(onBus: 0)
         }
     }
 }
