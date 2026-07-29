@@ -152,6 +152,20 @@ pub struct CueSettings {
     #[serde(default = "default_live_memory_enabled")]
     pub live_memory_enabled: bool,
 
+    /// Live rolling SUMMARY on/off — toggled live from the agent-bar controls, no
+    /// restart. Default ON. When off, the background summarizer stops calling the
+    /// agent; the meeting is transcript-only for summaries. Read fresh on each
+    /// summary boundary, so a mid-meeting toggle takes effect on the next pass.
+    #[serde(default = "default_true")]
+    pub summary_enabled: bool,
+
+    /// Key Decisions (LEDGER) extraction on/off — toggled live, no restart.
+    /// Default ON. When off, the background decision-finder stops calling the
+    /// agent. Read fresh on each ledger boundary, so a mid-meeting toggle takes
+    /// effect on the next pass.
+    #[serde(default = "default_true")]
+    pub ledger_enabled: bool,
+
     /// Ephemeral drive (PLAN conversation-memory WAVE 3): when `true`, the
     /// answer drive asks the attached agent to write NOTHING to its own session
     /// store (persona + Q&A don't accumulate in `~/.claude` etc.) and starts a
@@ -205,6 +219,8 @@ impl Default for CueSettings {
             my_names: Vec::new(),
             auto_trigger_enabled: false,
             live_memory_enabled: true,
+            summary_enabled: true,
+            ledger_enabled: true,
             ephemeral_drive: false,
             diarize_enabled: true,
         }

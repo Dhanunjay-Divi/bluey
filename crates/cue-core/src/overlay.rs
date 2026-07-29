@@ -584,6 +584,21 @@ pub enum OverlayEvent {
     RemoveContextRequested {
         id: uuid::Uuid,
     },
+    /// UI added a free-text NOTE in the meeting (the Open Floor note composer).
+    /// Stored as a Text context artifact anchored at the current transcript
+    /// position, inlined into the agent prompt, and persisted to searchable
+    /// memory so it is recallable across meetings.
+    NoteAdded {
+        text: String,
+    },
+    /// UI toggled a live meeting-intelligence setting (the agent-bar controls).
+    /// `key` is one of "summary" / "decisions" / "auto_answer". Takes effect on
+    /// the next summary/ledger boundary — no restart. The daemon persists it so
+    /// the gate reads it fresh on each fire.
+    SettingToggled {
+        key: String,
+        enabled: bool,
+    },
     /// UI renamed a speaker in the active meeting (the "Reassign Speaker" flow).
     /// Persists to the diarization store so the name shows on the transcript AND
     /// enrolls the speaker's voiceprint for cross-meeting recognition. `speaker_id`
