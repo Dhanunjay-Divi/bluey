@@ -273,4 +273,10 @@ export interface MeetingClient {
   onContextItems(cb: (items: ContextItem[]) => void): () => void;
   /** Remove one attached context artifact by id (the chip's ✕). */
   removeContextItem(id: string): void;
+  /** Add a free-text note to the meeting — becomes inline context, feeds the
+   *  summary + Key Decisions, and is saved to searchable cross-meeting memory. */
+  addNote(text: string): void;
+  /** Toggle a live meeting-intelligence setting ("summary" | "decisions" |
+   *  "auto_answer"). Takes effect on the next pass — no restart. */
+  toggleSetting(key: string, enabled: boolean): void;
 }

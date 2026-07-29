@@ -360,5 +360,7 @@ export function createMockClient(): MeetingClient {
       return () => {};
     },
     removeContextItem() {},
+    addNote() {},
+    toggleSetting() {},
   };
 }

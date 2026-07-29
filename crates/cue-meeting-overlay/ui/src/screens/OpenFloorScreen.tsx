@@ -35,6 +35,7 @@ import { Markdown } from "../components/Markdown";
 import { repairStreamingMarkdown } from "../components/repairStreamingMarkdown";
 import {
   AttachIcon,
+  ChevronIcon,
   CloseIcon,
   CopyIcon,
   LayersIcon,
@@ -106,6 +107,13 @@ export function OpenFloorScreen({
   // Exactly ONE transcript line renders its speaker editor at a time (the
   // "4× rename" guard) — the timeline row whose id is `editingId`.
   const [editingId, setEditingId] = useState<string | null>(null);
+  // Agent-bar controls dropdown: live toggles for the background AI features.
+  // Optimistic local state (defaults ON, matching the daemon defaults); the
+  // daemon persists the truth and reads it fresh on each summary/ledger pass.
+  const [controlsOpen, setControlsOpen] = useState(false);
+  const [summaryOn, setSummaryOn] = useState(true);
+  const [decisionsOn, setDecisionsOn] = useState(true);
+  const [autoAnswerOn, setAutoAnswerOn] = useState(false);
 
   const askRef = useRef<{ cancel(): void } | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
@@ -159,6 +167,9 @@ export function OpenFloorScreen({
         history.length > 0 ? history[history.length - 1].id : undefined,
       question: displayQuestion ?? question,
       sendQuestion: displayQuestion ? question : undefined,
+      // A displayQuestion is passed ONLY by the meeting-detected path (someone
+      // else asked); a direct type/tap ask has none → that's the user asking.
+      askedByMe: displayQuestion === undefined,
       answer: { ...draft },
       statusSteps: steps,
       statusDone,
@@ -312,7 +323,13 @@ export function OpenFloorScreen({
 
       {/* ---- agent bar (floating pill) ---- */}
       <div className="fp-agentbar">
-        <div className="fp-agentbar-left">
+        <button
+          type="button"
+          className="fp-agentbar-left fp-agentbar-trigger"
+          aria-expanded={controlsOpen}
+          aria-label="Meeting controls"
+          onClick={() => setControlsOpen((v) => !v)}
+        >
           <span className="fp-agent-logo">
             <AgentLogo kind={agent?.kind} size={18} />
           </span>
@@ -336,9 +353,49 @@ export function OpenFloorScreen({
               </div>
             )}
           </div>
-        </div>
+          <span className={`fp-agent-caret${controlsOpen ? " is-open" : ""}`}>
+            <ChevronIcon size={14} />
+          </span>
+        </button>
         {agent && connectors.length > 0 && (
           <ConnectorRail connectors={connectors} />
+        )}
+
+        {/* Controls dropdown — drops down from the agent bar with an animation. */}
+        {controlsOpen && (
+          <div className="fp-agent-controls" role="menu">
+            <div className="fp-agent-controls-kicker">Live intelligence</div>
+            <ControlToggle
+              label="Rolling summary"
+              hint="Auto-summarize the meeting"
+              on={summaryOn}
+              onChange={(v) => {
+                setSummaryOn(v);
+                client.toggleSetting("summary", v);
+              }}
+            />
+            <ControlToggle
+              label="Key decisions"
+              hint="Extract decisions & owners"
+              on={decisionsOn}
+              onChange={(v) => {
+                setDecisionsOn(v);
+                client.toggleSetting("decisions", v);
+              }}
+            />
+            <ControlToggle
+              label="Auto-answer"
+              hint="Answer detected questions"
+              on={autoAnswerOn}
+              onChange={(v) => {
+                setAutoAnswerOn(v);
+                client.toggleSetting("auto_answer", v);
+              }}
+            />
+            <div className="fp-agent-controls-foot">
+              Off = transcript only — no AI runs in the background.
+            </div>
+          </div>
         )}
       </div>
 
@@ -435,6 +492,7 @@ export function OpenFloorScreen({
         onCapturePage={() => client.capturePage()}
         onAsk={(q) => runAsk(q)}
         onAskDirect={askDetected}
+        onNote={(t) => client.addNote(t)}
       />
 
       {/* ---- detected-question dock ---- */}
@@ -466,6 +524,38 @@ function EmptyState() {
 }
 
 // ==========================================================================
+// One labelled on/off row in the agent-bar controls dropdown.
+// ==========================================================================
+function ControlToggle({
+  label,
+  hint,
+  on,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  on: boolean;
+  onChange: (v: boolean) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className="fp-ctl-row"
+      role="menuitemcheckbox"
+      aria-checked={on}
+      onClick={() => onChange(!on)}
+    >
+      <span className="fp-ctl-text">
+        <span className="fp-ctl-label">{label}</span>
+        <span className="fp-ctl-hint">{hint}</span>
+      </span>
+      <span className={`fp-ctl-switch${on ? " is-on" : ""}`} aria-hidden>
+        <span className="fp-ctl-knob" />
+      </span>
+    </button>
+  );
+}
+
 // The Key Decisions ledger — a left-ruled inline block, rendered only when the
 // meeting has verified decisions.
 // ==========================================================================
@@ -628,7 +718,7 @@ function QaBlock({
     <div className="fp-qa">
       <div className="fp-qa-q">
         <span className="fp-qa-avatar" aria-hidden>
-          You
+          {turn.askedByMe ? "You" : "Them"}
         </span>
         <div className="fp-qa-question">{turn.question}</div>
       </div>

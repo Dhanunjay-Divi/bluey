@@ -95,9 +95,35 @@ export function App() {
   // agent sessions) and Agents (attach/select). null = closed. This is how those
   // surfaces are reached now that the floorplan replaces the glass tab panel.
   const [drawer, setDrawer] = useState<null | "history" | "agents">(null);
+  // A meeting the user tried to continue while audio is still recording. The
+  // daemon BLOCKS the switch (a live recording is never lost) — we surface a
+  // clear notice with a one-tap "Stop audio & continue" so the user isn't left
+  // wondering why continue "did nothing". null = no pending blocked continue.
+  const [blockedContinue, setBlockedContinue] = useState<
+    null | { id: string; agentKind?: string; agentSessionId?: string }
+  >(null);
   // Drag the frameless panel by its header (no titlebar to grab).
   const headerRef = useRef<HTMLDivElement>(null);
   useDragHeader(headerRef);
+
+  // Perform a continue, surfacing the blocked case as a visible notice instead
+  // of silently returning. `after` runs on success (re-attach etc.).
+  const doContinue = (
+    meeting: { id: string; agentKind?: string; agentSessionId?: string },
+    after: () => void,
+  ) => {
+    void client.continueMeeting(meeting.id).then((r) => {
+      if (r.blocked) {
+        setBlockedContinue({
+          id: meeting.id,
+          agentKind: meeting.agentKind,
+          agentSessionId: meeting.agentSessionId,
+        });
+        return;
+      }
+      after();
+    });
+  };
 
   // Collapse to a compact pill (X) / re-expand (click the pill).
   const { collapsed, collapse, expand, setPillSize } = useCollapse();
@@ -205,8 +231,7 @@ export function App() {
                   void attach(resumeKind, sid).then(() => setDrawer(null));
                 }}
                 onContinue={(meeting) => {
-                  void client.continueMeeting(meeting.id).then((r) => {
-                    if (r.blocked) return;
+                  doContinue(meeting, () => {
                     if (meeting.agentSessionId) {
                       const resumeKind = meeting.agentKind ?? attached?.kind;
                       if (resumeKind) {
@@ -340,16 +365,10 @@ export function App() {
                   // Continue a past meeting into the ACTIVE slot AND re-attach the
                   // agent thread it used — so continuing restores the FULL context
                   // (transcript + Q&A via the reseed, AND the agent conversation),
-                  // not just the transcript. On success the provider reseeds via
-                  // onMeetingReseed, so switching to Ask shows the continued
-                  // meeting. On blocked (a live recording), stay on History — the
-                  // daemon already pushed the guidance Warning card.
-                  void client.continueMeeting(meeting.id).then((r) => {
-                    if (r.blocked) return;
-                    // Re-attach the meeting's linked agent thread on the agent it
-                    // ACTUALLY used (kind from the link; fall back to the attached
-                    // agent for legacy links with no kind). No link → just show the
-                    // meeting content.
+                  // not just the transcript. On blocked (a live recording), surface
+                  // a clear "stop audio first" notice via doContinue instead of
+                  // silently doing nothing.
+                  doContinue(meeting, () => {
                     if (meeting.agentSessionId) {
                       const resumeKind = meeting.agentKind ?? attached?.kind;
                       if (resumeKind) {
@@ -382,6 +401,95 @@ export function App() {
           <ResizeGrip />
         </Glass>
       </div>
+
+      {/* BLOCKED-CONTINUE notice: the daemon refuses to switch meetings while a
+          recording is live (a live meeting is never lost). Tell the user clearly
+          and offer a one-tap "Stop audio & continue" so they don't have to hunt
+          for the mic/system toggles. */}
+      {blockedContinue && (
+        <div
+          style={{
+            position: "fixed",
+            left: 0,
+            right: 0,
+            bottom: 16,
+            display: "flex",
+            justifyContent: "center",
+            zIndex: 9999,
+            pointerEvents: "none",
+          }}
+        >
+          <div
+            style={{
+              pointerEvents: "auto",
+              maxWidth: 420,
+              background: "var(--paper, #fff)",
+              color: "var(--ink, #1c1a19)",
+              borderRadius: 12,
+              padding: "12px 14px",
+              boxShadow: "0 8px 28px rgba(28,26,25,0.22)",
+              fontFamily: "var(--font)",
+              fontSize: 13,
+              lineHeight: 1.4,
+            }}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 4 }}>
+              Still recording
+            </div>
+            <div style={{ opacity: 0.8, marginBottom: 10 }}>
+              Turn off the mic and system audio to continue a different meeting —
+              your current recording won’t be lost.
+            </div>
+            <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+              <button
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  color: "var(--ink-3, #6b6560)",
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+                onClick={() => setBlockedContinue(null)}
+              >
+                Not now
+              </button>
+              <button
+                style={{
+                  border: "none",
+                  background: "var(--fp-live, #d1483a)",
+                  color: "#fff",
+                  borderRadius: 8,
+                  padding: "6px 12px",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+                onClick={() => {
+                  const pending = blockedContinue;
+                  setBlockedContinue(null);
+                  // Stop audio, then retry the continue now that nothing is live.
+                  client.stopListening();
+                  setTimeout(() => {
+                    if (!pending) return;
+                    doContinue(pending, () => {
+                      if (pending.agentSessionId) {
+                        const resumeKind = pending.agentKind ?? attached?.kind;
+                        if (resumeKind) {
+                          void attach(resumeKind, pending.agentSessionId);
+                        }
+                      }
+                      setDrawer(null);
+                      setTab("Ask");
+                    });
+                  }, 400);
+                }}
+              >
+                Stop audio & continue
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </>
   );
 }

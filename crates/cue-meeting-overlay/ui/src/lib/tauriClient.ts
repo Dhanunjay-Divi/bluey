@@ -873,6 +873,23 @@ export function createTauriClient(): MeetingClient {
         });
     },
 
+    toggleSetting(key: string, enabled: boolean) {
+      // Live toggle of a meeting-intelligence setting (summary / decisions /
+      // auto_answer). Takes effect on the next summary/ledger pass — no restart.
+      sendEvent({ type: "setting_toggled", key, enabled });
+    },
+
+    addNote(text: string) {
+      // "+" → Add note: send the user's typed note to the daemon as a Text
+      // context artifact. It rides every context rail — anchored inline in the
+      // Open Floor, pushed into the agent prompt, folded into the summary +
+      // Key Decisions, and persisted to searchable cross-meeting memory. A chip
+      // appears via the set_context_items push, same as an attachment.
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      sendEvent({ type: "note_added", text: trimmed });
+    },
+
     onContextItems(cb) {
       // Persistent subscriber to the daemon's attached-context list. Every
       // set_context_items line (an attach, a screenshot, a remove) carries the

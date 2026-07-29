@@ -227,6 +227,142 @@
   min-width: 0;
 }
 
+/* The agent bar doubles as the controls trigger — reset button chrome. */
+.fp-agentbar-trigger {
+  appearance: none;
+  border: none;
+  background: transparent;
+  padding: 2px 4px;
+  margin: -2px -4px;
+  border-radius: 10px;
+  cursor: pointer;
+  flex: 1;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  transition: background 0.14s ease;
+}
+.fp-agentbar-trigger:hover {
+  background: var(--paper);
+}
+.fp-agent-caret {
+  flex: none;
+  margin-left: 6px;
+  color: var(--ink-3);
+  display: inline-flex;
+  transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fp-agent-caret.is-open {
+  transform: rotate(180deg);
+}
+
+/* ---- controls dropdown (drops from the agent bar) ---- */
+.fp-agent-controls {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 12px;
+  right: 12px;
+  z-index: 20;
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 10px 8px 8px;
+  box-shadow: 0 12px 30px rgba(28, 26, 25, 0.2);
+  transform-origin: top center;
+  animation: fp-controls-drop 0.18s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes fp-controls-drop {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scaleY(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scaleY(1);
+  }
+}
+.fp-agent-controls-kicker {
+  font-family: var(--serif);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+  padding: 2px 8px 6px;
+}
+.fp-agent-controls-foot {
+  font-size: 11px;
+  color: var(--ink-3);
+  padding: 8px 8px 2px;
+  border-top: 1px solid var(--line);
+  margin-top: 6px;
+  line-height: 1.35;
+}
+
+/* One toggle row. */
+.fp-ctl-row {
+  appearance: none;
+  border: none;
+  background: transparent;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px;
+  border-radius: 9px;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  transition: background 0.12s ease;
+}
+.fp-ctl-row:hover {
+  background: var(--paper-2);
+}
+.fp-ctl-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.fp-ctl-label {
+  font-size: 13px;
+  color: var(--ink);
+  font-weight: 500;
+}
+.fp-ctl-hint {
+  font-size: 11px;
+  color: var(--ink-3);
+}
+
+/* The switch. */
+.fp-ctl-switch {
+  flex: none;
+  width: 36px;
+  height: 21px;
+  border-radius: 999px;
+  background: var(--line);
+  position: relative;
+  transition: background 0.16s ease;
+}
+.fp-ctl-switch.is-on {
+  background: var(--fp-live);
+}
+.fp-ctl-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+  transition: transform 0.16s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.fp-ctl-switch.is-on .fp-ctl-knob {
+  transform: translateX(15px);
+}
+
 /* The square brand logo tile. */
 .fp-agent-logo {
   flex: none;

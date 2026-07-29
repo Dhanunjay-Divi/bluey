@@ -70,6 +70,11 @@ export interface Turn {
    *  "ask recent" path, where the sent text is an internal instruction and the
    *  shown text is a readable label. Absent → send `question` verbatim. */
   sendQuestion?: string;
+  /** Whether the LOCAL user asked this directly (typed / tapped Ask), vs. the
+   *  question being one DETECTED in the meeting (asked by someone else). Drives
+   *  the avatar: "You" only when the user actually asked. Absent → treat as the
+   *  meeting/other side, since the auto-detected path is the common trigger. */
+  askedByMe?: boolean;
   answer: AnswerState;
   statusSteps: AnswerStatusStep[];
   statusDone: boolean;
