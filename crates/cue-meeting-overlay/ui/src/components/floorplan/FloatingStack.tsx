@@ -38,6 +38,7 @@ export function FloatingStack({
   onCapturePage,
   onAsk,
   onAskDirect,
+  onNote,
 }: {
   listenState: ListeningState;
   systemInputOn: boolean;
@@ -56,14 +57,29 @@ export function FloatingStack({
    *  detected question or summarize what was just discussed). Long-press opens
    *  the type-a-question bar instead. */
   onAskDirect: () => void;
+  /** Add a free-text note to the meeting (becomes context + memory). */
+  onNote: (text: string) => void;
 }) {
   const [asking, setAsking] = useState(false);
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+  const [noting, setNoting] = useState(false);
+  const [noteText, setNoteText] = useState("");
+  const noteRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (asking) inputRef.current?.focus();
   }, [asking]);
+  useEffect(() => {
+    if (noting) noteRef.current?.focus();
+  }, [noting]);
+
+  const submitNote = () => {
+    const n = noteText.trim();
+    if (n) onNote(n);
+    setNoteText("");
+    setNoting(false);
+  };
 
   const submit = () => {
     const q = text.trim();
@@ -176,6 +192,27 @@ export function FloatingStack({
             <AttachIcon size={17} />
           </StackButton>
 
+          <StackButton
+            label="Add a note"
+            onClick={() => setNoting((v) => !v)}
+          >
+            {/* Lines-on-paper note glyph (no dedicated icon in the set). */}
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" aria-hidden>
+              <path
+                d="M5 3.5h11.5L20 7v13.5H5z"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinejoin="round"
+              />
+              <path
+                d="M8.5 10.5h7M8.5 14h7M8.5 17h4"
+                stroke="currentColor"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+              />
+            </svg>
+          </StackButton>
+
           {/* Capture page (active-browser-tab scrape) — HIDDEN for now, revisit
               later. TODO(agent-reach): consider re-building this on top of
               Agent-Reach (github.com/Panniantong/Agent-Reach), a key-free CLI that
@@ -233,6 +270,38 @@ export function FloatingStack({
               className="fp-ask-send"
               aria-label="Send"
               disabled={!text.trim()}
+            >
+              <SendIcon size={16} />
+            </button>
+          </form>
+        )}
+
+        {noting && (
+          <form
+            className="fp-ask-form fp-note-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              submitNote();
+            }}
+          >
+            <input
+              ref={noteRef}
+              className="fp-ask-input"
+              value={noteText}
+              onChange={(e) => setNoteText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setNoting(false);
+              }}
+              onBlur={() => {
+                if (!noteText.trim()) setNoting(false);
+              }}
+              placeholder="Add a note…"
+            />
+            <button
+              type="submit"
+              className="fp-ask-send"
+              aria-label="Add note"
+              disabled={!noteText.trim()}
             >
               <SendIcon size={16} />
             </button>

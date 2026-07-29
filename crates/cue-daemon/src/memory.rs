@@ -345,6 +345,31 @@ impl FactsMemory {
         Ok(report)
     }
 
+    /// Persist a USER-AUTHORED note into long-term memory so it is recallable
+    /// across meetings via the `search_past_meetings` / `search_meeting_decisions`
+    /// MCP tools. Unlike ledger facts (LLM-extracted + quote-verified), a note is
+    /// the user's own words, stored verbatim with a `[Note]` prefix so it is
+    /// distinguishable from extracted decisions in retrieval. Embedded on-device
+    /// and inserted with exact-hash dedup (a re-added identical note is a no-op).
+    /// Returns the new row id, or `None` if it deduped against an existing entry.
+    pub async fn add_note(&self, meeting_id: &str, text: &str) -> Result<Option<i64>> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let stored = format!("[Note] {text}");
+        let embedding = self
+            .embedder
+            .embed(&stored)
+            .await
+            .map_err(|e| anyhow::anyhow!("embed note: {e}"))?;
+        let id = self.store.insert_fact(meeting_id, &stored, &embedding)?;
+        if let Some(id) = id {
+            self.link_entities(id, &stored).await;
+        }
+        Ok(id)
+    }
+
     /// Pure-cosine baseline search (the pre-hybrid behavior). Kept as an
     /// eval/debug surface so retrieval changes stay MEASURED against the
     /// baseline (see `facts_memory_real::hybrid_beats_cosine_baseline`).

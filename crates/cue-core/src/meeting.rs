@@ -590,6 +590,73 @@ impl MeetingRecord {
         selected.join("\n")
     }
 
+    /// A labeled block of the meeting's NON-transcript content — user notes,
+    /// attached files, and screenshots — so the summarizer and ledger extractor
+    /// see them ALONGSIDE the spoken transcript, not just the words. Each entry is
+    /// tagged by kind (`[Note]` / `[Attachment]` / `[Screenshot]`) so the LLM knows
+    /// it is reference material added to the meeting, not something spoken. Bounded
+    /// to `max_chars`; returns an empty string when there is nothing to include.
+    pub fn context_block_bounded(&self, max_chars: usize) -> String {
+        if max_chars == 0 || self.context.is_empty() {
+            return String::new();
+        }
+        let mut lines: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        // Newest first so the most recent context survives the cap.
+        for artifact in self.context.iter().rev() {
+            let tag = match artifact.kind {
+                ContextKind::Image | ContextKind::Diagram => "Screenshot",
+                ContextKind::Text if artifact.path.trim().is_empty() => "Note",
+                _ => "Attachment",
+            };
+            // The body: a typed note's text is its text_preview; an attachment
+            // contributes its title + any caption note + extracted text preview.
+            let mut body = String::new();
+            if tag == "Note" {
+                if let Some(t) = artifact.text_preview.as_deref() {
+                    body.push_str(t.trim());
+                }
+            } else {
+                body.push_str(artifact.title.trim());
+                if let Some(n) = artifact.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                    body.push_str(" — ");
+                    body.push_str(n);
+                }
+                if let Some(t) = artifact
+                    .text_preview
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                {
+                    body.push_str(": ");
+                    body.push_str(t);
+                }
+            }
+            let body = body.trim();
+            if body.is_empty() {
+                continue;
+            }
+            let line = format!("[{tag}] {body}");
+            let line = if line.chars().count() > 600 {
+                line.chars().take(600).collect::<String>()
+            } else {
+                line
+            };
+            let sep = usize::from(!lines.is_empty());
+            let cost = sep + line.chars().count();
+            if used + cost > max_chars {
+                break;
+            }
+            lines.push(line);
+            used += cost;
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        lines.reverse();
+        format!("MEETING NOTES & ATTACHMENTS:\n{}", lines.join("\n"))
+    }
+
     pub fn push_conversation_turn(&mut self, turn: ConversationTurn) {
         self.conversation.push(turn);
         let excess = self.conversation.len().saturating_sub(80);
