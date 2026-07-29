@@ -647,6 +647,17 @@ export const previewWorkspace: JobsWorkspace = {
 };
 
 export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: string): JobsWorkspace {
+  if (scenario === "stale-discovery") {
+    return {
+      ...workspace,
+      discovery_sources: workspace.discovery_sources.map((source, index) => ({
+        ...source,
+        status: "active",
+        health: "healthy",
+        last_success_at_ms: now - (14 + index) * 60 * 60 * 1_000,
+      })),
+    };
+  }
   if (scenario === "onboarding") {
     return {
       ...workspace,

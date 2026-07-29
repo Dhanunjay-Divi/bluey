@@ -148,15 +148,15 @@ export function MatchesView({
     ? activeTracks[0]
     : workspace.tracks.find((track) => track.id === activeTrack);
   const healthySourceCount = workspace.discovery_sources.filter((source) => discoverySourceState(source) === "healthy").length;
-  const curatedSource = workspace.discovery_sources.find((source) => source.provider === "curated_feed");
+  const configuredSourceCount = workspace.discovery_sources.length;
   const discoveryReady = healthySourceCount > 0;
   const searchState = !selectedTrack ? "paused" : discoveryReady ? "active" : "manual";
   const searchStateLabel = !selectedTrack
     ? "TRACK PAUSED"
     : discoveryReady
       ? "DISCOVERY ACTIVE"
-      : curatedSource
-        ? "DISCOVERY STARTING"
+      : configuredSourceCount > 0
+        ? "UPDATES DELAYED"
         : "READY FOR A JOB LINK";
   const searchTitle = activeTrack === "all" && activeTracks.length > 1
     ? `${activeTracks.length} Career Tracks configured`
@@ -165,8 +165,8 @@ export function MatchesView({
     ? `${selectedTrack.role} · ${selectedTrack.locations.join(" · ") || "Location not set"}`
     : "Configure a Career Track before adding or importing matches.";
   const searchDetail = selectedTrack && !discoveryReady
-    ? curatedSource
-      ? `${trackScope}. Bluey is checking managed career feeds now; you can still add an urgent job link.`
+    ? configuredSourceCount > 0
+      ? `${trackScope}. Managed sources are behind schedule. Bluey is retrying; you can still add an urgent job link.`
       : `${trackScope}. Add a job link now; automatic discovery begins when a source is connected.`
     : trackScope;
 
@@ -443,12 +443,21 @@ function DiscoverySourceStateIcon({ state }: { state: DiscoverySourceHealth }) {
   return <Clock3 size={15} aria-hidden="true" />;
 }
 
-export function discoverySourceState(source: Pick<DiscoverySource, "status" | "health">): DiscoverySourceHealth {
-  return source.status === "paused" ? "paused" : source.health;
+export const DISCOVERY_SOURCE_STALE_AFTER_MS = 12 * 60 * 60 * 1_000;
+
+export function discoverySourceState(
+  source: Pick<DiscoverySource, "status" | "health" | "last_success_at_ms">,
+  nowMs = Date.now(),
+): DiscoverySourceHealth {
+  if (source.status === "paused") return "paused";
+  if (source.health !== "healthy") return source.health;
+  if (!source.last_success_at_ms) return "waiting";
+  if (source.last_success_at_ms < nowMs - DISCOVERY_SOURCE_STALE_AFTER_MS) return "degraded";
+  return "healthy";
 }
 
 export function discoverySourceAction(state: DiscoverySourceHealth): string {
-  if (state === "degraded") return "Bluey will retry. Paste urgent roles meanwhile.";
+  if (state === "degraded") return "Updates are delayed. Bluey is retrying; add an urgent job link meanwhile.";
   if (state === "paused") return "Contact support to resume it. Paste urgent roles meanwhile.";
   if (state === "waiting") return "Waiting for the first sync.";
   return "No action needed.";
