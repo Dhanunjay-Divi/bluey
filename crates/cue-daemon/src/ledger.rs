@@ -63,12 +63,14 @@ pub fn interval_turns() -> usize {
 /// `BLUEY_LEDGER_INTERVAL_WORDS`.
 pub const DEFAULT_INTERVAL_WORDS: usize = 350;
 
-/// Words between ledger passes (env `BLUEY_LEDGER_INTERVAL_WORDS`, min 100).
+/// Words between ledger passes (env `BLUEY_LEDGER_INTERVAL_WORDS`, min 20).
+/// The min guards against spamming the agent on tiny fragments; 20 lets a short
+/// (demo/quick) meeting still cross a boundary and run an extraction.
 pub fn interval_words() -> usize {
     env::var("BLUEY_LEDGER_INTERVAL_WORDS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .map(|n| n.max(100))
+        .map(|n| n.max(20))
         .unwrap_or(DEFAULT_INTERVAL_WORDS)
 }
 

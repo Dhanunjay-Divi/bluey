@@ -3924,6 +3924,12 @@ async fn handle_overlay_event(daemon: &Arc<Daemon>, event: OverlayEvent) -> Resu
         OverlayEvent::RemoveContextRequested { id } => {
             handle_remove_context_requested(daemon, id).await?;
         }
+        OverlayEvent::NoteAdded { text } => {
+            handle_note_added(daemon, &text).await?;
+        }
+        OverlayEvent::SettingToggled { key, enabled } => {
+            handle_setting_toggled(daemon, &key, enabled).await;
+        }
         OverlayEvent::RenameSpeakerRequested { speaker_id, name } => {
             handle_rename_speaker_requested(daemon, speaker_id, &name).await;
         }
@@ -9673,6 +9679,32 @@ pub(crate) fn live_memory_enabled(daemon: &Arc<Daemon>) -> bool {
         .unwrap_or(true)
 }
 
+/// Whether the live rolling SUMMARY should run. Requires both the master
+/// `live_memory_enabled` AND the per-feature `summary_enabled` (both read FRESH
+/// so a mid-meeting toggle takes effect on the next summary boundary — no
+/// restart). The `BLUEY_LEDGER` env, when set, still hard-forces the master gate
+/// (dev override) but the per-feature toggle is honored on top.
+pub(crate) fn summary_enabled(daemon: &Arc<Daemon>) -> bool {
+    if !live_memory_enabled(daemon) {
+        return false;
+    }
+    load_settings(&daemon.paths)
+        .map(|s| s.summary_enabled)
+        .unwrap_or(true)
+}
+
+/// Whether the Key Decisions LEDGER should run. Requires both `live_memory_enabled`
+/// AND the per-feature `ledger_enabled`. Read fresh — a mid-meeting toggle takes
+/// effect on the next ledger boundary, no restart.
+pub(crate) fn ledger_enabled(daemon: &Arc<Daemon>) -> bool {
+    if !live_memory_enabled(daemon) {
+        return false;
+    }
+    load_settings(&daemon.paths)
+        .map(|s| s.ledger_enabled)
+        .unwrap_or(true)
+}
+
 /// Whether **ephemeral drive** is on (WAVE 3): the answer drive asks the
 /// attached agent to persist NOTHING to its own session store and starts a
 /// fresh, non-resumed turn every time (the app-owned conversation block carries
@@ -10536,9 +10568,11 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
         interval = crate::ledger::interval_words(),
         "LEDGER-DEBUG: word threshold crossed → firing a ledger pass"
     );
-    // Settings read only on interval boundaries — never per-segment.
-    if !live_memory_enabled(daemon) {
-        info!("LEDGER-DEBUG: live_memory disabled → skipping (would have fired)");
+    // Settings read only on interval boundaries — never per-segment. Uses the
+    // per-feature gate so Key Decisions can be toggled off live without affecting
+    // the summary.
+    if !ledger_enabled(daemon) {
+        info!("LEDGER-DEBUG: ledger disabled → skipping (would have fired)");
         return;
     }
     // Mark this word boundary as fired now (before the async spawn) so rapid
@@ -10546,10 +10580,19 @@ fn maybe_fire_ledger(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     daemon
         .last_ledger_words
         .store(total_words, std::sync::atomic::Ordering::Relaxed);
-    let window = crate::ledger::build_window(&meeting.last_transcript_text_bounded(
+    let mut window_src = meeting.last_transcript_text_bounded(
         crate::ledger::interval_turns(),
         crate::ledger::WINDOW_MAX_CHARS,
-    ));
+    );
+    // Include notes + attachments + screenshots so a decision written in a NOTE
+    // (or an attachment) can be extracted too — and it quote-verifies against this
+    // same window (parse_and_verify checks extracted text against `window`).
+    let context_block = meeting.context_block_bounded(crate::ledger::WINDOW_MAX_CHARS / 3);
+    if !context_block.is_empty() {
+        window_src.push_str("\n\n");
+        window_src.push_str(&context_block);
+    }
+    let window = crate::ledger::build_window(&window_src);
     if window.trim().is_empty() {
         return;
     }
@@ -10756,7 +10799,8 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
         interval = crate::summary::interval_words(),
         "SUMMARY-DEBUG: word threshold crossed → firing a summary pass"
     );
-    if !live_memory_enabled(daemon) {
+    // Per-feature gate so Summary can be toggled off live, independent of Decisions.
+    if !summary_enabled(daemon) {
         return;
     }
     if daemon.summary_inflight.swap(true, SeqCst) {
@@ -10764,10 +10808,17 @@ fn maybe_fire_summary(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     }
     // Mark this boundary fired now so rapid successive segments don't re-launch.
     daemon.last_summary_words.store(total_words, Relaxed);
-    let window = meeting.last_transcript_text_bounded(
+    let mut window = meeting.last_transcript_text_bounded(
         crate::summary::interval_segments(),
         crate::summary::WINDOW_MAX_CHARS,
     );
+    // Fold the meeting's notes + attachments + screenshots into the window so the
+    // summary reflects EVERYTHING added to the meeting, not only spoken words.
+    let context_block = meeting.context_block_bounded(crate::summary::WINDOW_MAX_CHARS / 3);
+    if !context_block.is_empty() {
+        window.push_str("\n\n");
+        window.push_str(&context_block);
+    }
     // Skip an empty OR substance-free window (only backchannel/filler) — nothing
     // to summarize. MUST clear the inflight flag on this early return, or the
     // summary stays disabled for the session.
@@ -11096,6 +11147,30 @@ async fn maybe_trigger_for_me_question(daemon: &Arc<Daemon>, segment: &Transcrip
     // catching the disfluent/declarative questions regex misses. Speaker and
     // name gating stay entirely in cue-core (`detect_for_me_question_given`).
     let text = segment.text.trim();
+
+    // DEMO ALLOWLIST MODE (off unless BLUEY_DEMO_ALLOWLIST is set): a controlled
+    // recording where Bluey fires ONLY on specific scripted questions and stays
+    // silent on everything else. The env is a `||`-separated list of substrings;
+    // if the (lowercased) transcript line contains ANY of them and the line isn't
+    // the local user's own speech, we fire. When set, this SUPPRESSES the normal
+    // regex + classifier entirely. Leave unset for production.
+    if let Ok(spec) = std::env::var("BLUEY_DEMO_ALLOWLIST") {
+        if !spec.trim().is_empty() {
+            let low = text.to_lowercase();
+            let hit = spec
+                .split("||")
+                .map(|k| k.trim().to_lowercase())
+                .filter(|k| !k.is_empty())
+                .any(|k| low.contains(&k));
+            if hit && !segment.speaker.is_me() {
+                info!(q = %text, "DEMO allowlist: firing scripted question");
+                fire_for_me_question(daemon, None).await;
+            }
+        }
+        // Allowlist mode owns the decision — never fall through to normal detection.
+        return;
+    }
+
     #[allow(unused_mut)]
     let mut question_shaped = cue_core::is_question_shaped(text);
     #[cfg(feature = "local-memory")]
@@ -11354,6 +11429,83 @@ async fn handle_attach_requested(daemon: &Arc<Daemon>) -> Result<()> {
         info!("attach: no files selected (picker cancelled or nothing chosen)");
     }
     handle_attach_paths(daemon, paths).await
+}
+
+/// Toggle a live meeting-intelligence setting from the agent-bar controls.
+/// Persists to settings; the summary/ledger gates read it FRESH on each boundary,
+/// so the change takes effect on the next pass — no restart, mid-meeting.
+async fn handle_setting_toggled(daemon: &Arc<Daemon>, key: &str, enabled: bool) {
+    let mut settings = load_settings(&daemon.paths).unwrap_or_default();
+    match key {
+        "summary" => settings.summary_enabled = enabled,
+        "decisions" | "ledger" => settings.ledger_enabled = enabled,
+        "auto_answer" | "auto_trigger" => settings.auto_trigger_enabled = enabled,
+        other => {
+            warn!("SettingToggled: unknown key {other:?}");
+            return;
+        }
+    }
+    settings.touch();
+    if let Err(error) = save_settings(&daemon.paths, &settings) {
+        warn!("SettingToggled: failed to persist {key}: {error:#}");
+        return;
+    }
+    info!(key, enabled, "live setting toggled (takes effect next pass)");
+}
+
+/// Handle a user-typed NOTE from the Open Floor composer. The note becomes a
+/// Text context artifact (so it rides every existing rail: anchored inline,
+/// persisted with the meeting, pushed into the agent prompt, RAG-indexed, and
+/// rendered as a chip) AND is written to long-term searchable memory so it is
+/// recallable across meetings via the bluey-memory tools.
+async fn handle_note_added(daemon: &Arc<Daemon>, text: &str) -> Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(());
+    }
+    let artifact = match build_note_artifact(text) {
+        Ok(a) => a,
+        Err(error) => {
+            push_system_card(
+                daemon,
+                CardKind::Warning,
+                "Could not add note",
+                format!("{error:#}"),
+            )
+            .await;
+            return Ok(());
+        }
+    };
+
+    // Attach (storage + anchor + context envelope) and reflect in the overlay.
+    let meeting_snapshot = attach_context_artifacts(daemon, vec![artifact]).await?;
+    update_state_from_meeting(daemon, Some(&meeting_snapshot)).await?;
+    refresh_overlay_context_items(daemon, &meeting_snapshot).await;
+
+    // Persist to long-term searchable memory (recallable across meetings).
+    #[cfg(feature = "local-memory")]
+    {
+        let memory = daemon.facts_memory.lock().await.clone();
+        if let Some(memory) = memory {
+            let meeting_id = meeting_snapshot.id.to_string();
+            let note = text.to_string();
+            // Fire-and-forget: embedding is on-device but shouldn't block the UI ack.
+            tokio::spawn(async move {
+                if let Err(error) = memory.add_note(&meeting_id, &note).await {
+                    debug!("note memory persist failed: {error:#}");
+                }
+            });
+        }
+    }
+
+    push_system_card(
+        daemon,
+        CardKind::Context,
+        "Note added",
+        "Your note is now part of this meeting's context.".to_string(),
+    )
+    .await;
+    Ok(())
 }
 
 async fn handle_attach_paths(daemon: &Arc<Daemon>, paths: Vec<PathBuf>) -> Result<()> {
@@ -12031,6 +12183,27 @@ async fn answer_with_provider_runtime(
     if request.context.is_empty() {
         request.context =
             answer_context_for_question(daemon, &meeting_snapshot, &request.question).await;
+    }
+
+    // DIAGNOSTIC (info-level so it's always visible): what does the answer
+    // envelope actually contain? A "please provide the transcript" reply from the
+    // agent means this transcript slice was EMPTY — this pinpoints whether the
+    // meeting had segments and how much transcript reached the agent.
+    {
+        let seg_count = meeting_snapshot.transcript.len();
+        let transcript_ctx_chars: usize = request
+            .context
+            .iter()
+            .filter(|c| c.kind == AnswerContextKind::Transcript)
+            .map(|c| c.content.chars().count())
+            .sum();
+        info!(
+            meeting_id = %meeting_snapshot.id,
+            transcript_segments = seg_count,
+            context_items = request.context.len(),
+            transcript_ctx_chars,
+            "ANSWER-ENVELOPE: built context for ask"
+        );
     }
 
     let (visible_question_title, visible_question) =
@@ -15180,7 +15353,7 @@ fn answer_context_from_meeting_within(meeting: &MeetingRecord) -> Vec<AnswerCont
                 content.push_str(preview);
             }
             context.push(
-                AnswerContext::new(answer_context_kind(artifact.kind), content)
+                AnswerContext::new(answer_context_kind(artifact), content)
                     .with_title(artifact.title.clone())
                     .with_source(artifact.path.clone()),
             );
@@ -15190,8 +15363,14 @@ fn answer_context_from_meeting_within(meeting: &MeetingRecord) -> Vec<AnswerCont
     context
 }
 
-fn answer_context_kind(kind: ContextKind) -> AnswerContextKind {
-    match kind {
+fn answer_context_kind(artifact: &ContextArtifact) -> AnswerContextKind {
+    // A typed NOTE is a Text artifact with no file path — map it to UserNote so
+    // the agent sees it as the user's own note (its own char budget), distinct
+    // from an attached text FILE (also Text kind, but path-backed → Document).
+    if matches!(artifact.kind, ContextKind::Text) && artifact.path.trim().is_empty() {
+        return AnswerContextKind::UserNote;
+    }
+    match artifact.kind {
         ContextKind::Image | ContextKind::Diagram => AnswerContextKind::Screenshot,
         ContextKind::Code | ContextKind::Document | ContextKind::Text => {
             AnswerContextKind::Document
@@ -16974,6 +17153,16 @@ fn macos_overlay_launch_command(
         .arg(socket_path)
         .arg("--bluey-overlay-session-token")
         .arg(expected_token);
+    // LOCAL DEV/TEST ONLY, gated behind BLUEY_DEV_OVERLAY=1: the Tauri overlay
+    // (`cue-meeting-overlay`) reads capture-visibility from the
+    // BLUEY_MEETING_CAPTURE_VISIBLE env var (see cue-meeting-overlay lib.rs),
+    // NOT from a CLI arg, and this raw-command spawn path bypasses the
+    // `open <app>.app` path that would otherwise pass the visibility args. So
+    // forward the env var here when — and only when — the dev gate + request
+    // are both set. Default (unset) keeps the shipping invisible behavior.
+    if macos_overlay_capture_visible_for_debug() {
+        command.env("BLUEY_MEETING_CAPTURE_VISIBLE", "1");
+    }
     command
 }
 
@@ -17545,6 +17734,40 @@ fn build_context_artifact(
     .with_processing_status(ContextProcessingStatus::Pending);
 
     let artifact = enrich_context_artifact(artifact, &canonical_path, kind, metadata.len());
+    validate_context_artifact(&artifact)?;
+    Ok(artifact)
+}
+
+/// Build a user-authored NOTE as a Text [`ContextArtifact`] — the same record
+/// type as an attached file, but with no path: the note text lives in
+/// `text_preview` and the artifact is Ready immediately (no file to read). It
+/// then rides every existing context rail — anchored into the transcript,
+/// persisted with the meeting, inlined into the agent prompt (as a UserNote),
+/// indexed for RAG, and rendered inline in the Open Floor.
+fn build_note_artifact(text: &str) -> Result<ContextArtifact> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(anyhow!("note text is empty"));
+    }
+    // A short title from the first line so the chip reads well; the full note is
+    // the text_preview (what the agent + preview lightbox receive).
+    let title = {
+        let first = text.lines().next().unwrap_or(text).trim();
+        let head: String = first.chars().take(48).collect();
+        if head.len() < first.len() {
+            format!("Note: {head}…")
+        } else {
+            format!("Note: {head}")
+        }
+    };
+    let artifact = ContextArtifact::new(
+        ContextKind::Text,
+        String::new(), // no file path — notes are typed, not attached
+        title,
+        None,
+        None,
+    )
+    .with_text_preview(text); // sets text_preview + flips status to Ready
     validate_context_artifact(&artifact)?;
     Ok(artifact)
 }
@@ -18308,9 +18531,23 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
     }
 }
 
-/// Spawn a best-effort auto-recap via LLM after a session ends.
-/// If no LLM provider is configured, logs a warning and returns.
-fn spawn_auto_recap(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
+/// DISABLED (deferred): the end-of-meeting auto-recap. It still used the legacy
+/// cloud-LLM path (`build_recap_llm_from_env` → OpenAI), which never exists in
+/// the MCP-backend architecture — the attached agent is the only backend — so it
+/// only logged "no LLM provider configured" and did nothing. There is also no
+/// real meeting-end flow yet. Turned off for now; when meeting-end lands we will
+/// re-enable it driven through `memory_oneshot_via_agent` (the attached agent),
+/// like the rolling summary + ledger already are. Kept as a stub so its call
+/// sites stay valid.
+#[allow(dead_code)]
+fn spawn_auto_recap(_daemon: &Arc<Daemon>, _meeting: &MeetingRecord) {
+    // no-op — see doc comment above.
+}
+
+/// The old cloud-LLM auto-recap body, retained (dead) for when auto-recap is
+/// re-enabled through the attached agent instead. Not called.
+#[allow(dead_code)]
+fn spawn_auto_recap_legacy(daemon: &Arc<Daemon>, meeting: &MeetingRecord) {
     let transcript: String = meeting
         .transcript
         .iter()
