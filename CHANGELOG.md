@@ -5,6 +5,14 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Fixed
+
+- Made Bluey Jobs discovery workers independently supervised from API
+  maintenance, deployed from one retained immutable runtime artifact, and
+  monitored for both process availability and overdue source snapshots.
+- Made the Jobs portal derive source health from the last successful sync so a
+  historically healthy source cannot appear current after updates stop.
+
 ## [0.1.104] - 2026-07-19
 
 ### Added

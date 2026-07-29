@@ -8,6 +8,7 @@ import {
   JOB_IMPORT_DESCRIPTION,
   JOB_IMPORT_FALLBACK_LABEL,
   autoSubmitUnavailableReason,
+  DISCOVERY_SOURCE_STALE_AFTER_MS,
   discoverySourceAction,
   discoverySourceState,
   isCandidateLead,
@@ -18,14 +19,18 @@ import {
   visibleMatches,
 } from "./MatchesView";
 
-function source(status: DiscoverySource["status"], health: DiscoverySourceHealth): DiscoverySource {
+function source(
+  status: DiscoverySource["status"],
+  health: DiscoverySourceHealth,
+  lastSuccessAtMs: number | null = null,
+): DiscoverySource {
   return {
     id: `${status}-${health}`,
     provider: "greenhouse",
     config: { company: "Northwind" },
     status,
     health,
-    last_success_at_ms: null,
+    last_success_at_ms: lastSuccessAtMs,
   };
 }
 
@@ -90,16 +95,33 @@ const runners = (available: boolean): RunnerAvailability => ({
 });
 
 describe("discovery source health", () => {
-  it.each(["healthy", "degraded", "paused", "waiting"] as const)("preserves the %s server health state", (health) => {
-    expect(discoverySourceState(source("active", health))).toBe(health);
+  const now = Date.UTC(2026, 6, 29, 12);
+
+  it.each(["degraded", "paused", "waiting"] as const)("preserves the %s server health state", (health) => {
+    expect(discoverySourceState(source("active", health), now)).toBe(health);
+  });
+
+  it("keeps a recently successful healthy source healthy", () => {
+    expect(discoverySourceState(source("active", "healthy", now - 60_000), now)).toBe("healthy");
+  });
+
+  it("treats a healthy source without a successful sync as waiting", () => {
+    expect(discoverySourceState(source("active", "healthy"), now)).toBe("waiting");
+  });
+
+  it("treats an overdue healthy source as degraded", () => {
+    const overdue = now - DISCOVERY_SOURCE_STALE_AFTER_MS - 1;
+    expect(discoverySourceState(source("active", "healthy", overdue), now)).toBe("degraded");
   });
 
   it("treats a server-paused source as paused regardless of its prior health", () => {
-    expect(discoverySourceState(source("paused", "healthy"))).toBe("paused");
+    expect(discoverySourceState(source("paused", "healthy", now), now)).toBe("paused");
   });
 
   it("gives degraded and paused sources concise next steps", () => {
-    expect(discoverySourceAction("degraded")).toBe("Bluey will retry. Paste urgent roles meanwhile.");
+    expect(discoverySourceAction("degraded")).toBe(
+      "Updates are delayed. Bluey is retrying; add an urgent job link meanwhile.",
+    );
     expect(discoverySourceAction("paused")).toBe("Contact support to resume it. Paste urgent roles meanwhile.");
   });
 

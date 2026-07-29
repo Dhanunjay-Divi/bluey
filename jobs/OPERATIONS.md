@@ -97,10 +97,10 @@ BLUEY_JOBS_DISCOVERY_POLL_MS=5000
 Keep this file root-owned and mode `0640`, with group access limited to the
 service account. Do not put the signing key in this override; it remains in the
 shared root-managed Jobs environment.
-The example unit is part of `bluey-jobs-api.service`, so API maintenance also
-restarts the co-located worker after the listener is available. Confirm both
-units are active after deployment; do not leave the worker stopped after an API
-binary swap.
+The example unit is deliberately independent of `bluey-jobs-api.service`.
+API maintenance must not stop discovery indefinitely. The worker waits for the
+API listener, retries continuously with `Restart=always`, and remains enabled
+across reboots and API binary swaps.
 
 It leases only
 server-configured, host-pinned Greenhouse, Lever, Ashby, SmartRecruiters, and
@@ -143,6 +143,65 @@ queueing, or submission. Unknown portals, public lists, LinkedIn, Indeed,
 ZipRecruiter, Dice, and similar aggregators never gain submission authority from
 feed inclusion. Disable the systemd unit to stop shared-feed refresh without
 affecting direct account imports or the account-specific ATS discovery worker.
+
+### Durable discovery worker release
+
+Build one relocatable artifact containing both discovery workers:
+
+```bash
+ops/build-bluey-jobs-workers.sh /tmp/bluey-jobs-workers
+```
+
+Promote the exact archive and checksum together:
+
+```bash
+sudo ops/install-bluey-jobs-workers.sh \
+  /tmp/bluey-jobs-workers/jobs-workers-<commit>.tar.gz \
+  /tmp/bluey-jobs-workers/jobs-workers-<commit>.tar.gz.sha256
+```
+
+The installer verifies the checksum and archive paths, extracts one immutable
+release under `/opt/bluey-jobs-workers/releases`, points both worker services
+at that retained release through atomic `current` links, installs the service
+and health-check units, and rolls back both links if either service cannot
+start. It keeps three releases by default. Never point a production unit at a
+temporary build directory.
+
+Both workers use independent `Restart=always` services. They are ordered after
+the Jobs API but are not `PartOf` or `Requires` that service. The
+`bluey-jobs-discovery-health.timer` checks every 15 minutes that:
+
+- both retained release links resolve;
+- both worker services are active;
+- every active direct and global source has completed a successful sync within
+  12 hours.
+
+Run the same check during incident response:
+
+```bash
+sudo /usr/local/sbin/check-bluey-jobs-discovery.sh
+```
+
+The 12-hour limit is twice the slowest normal six-hour global cadence. A source
+older than that is delayed even when its last stored health value says
+`healthy`. The Jobs portal uses the same threshold and shows `Updates delayed`
+instead of presenting stale data as current.
+
+Rollback is an exact release-link switch:
+
+```bash
+sudo ln -sfn /opt/bluey-jobs-workers/releases/<previous-release> \
+  /opt/bluey-jobs-discovery/current
+sudo ln -sfn /opt/bluey-jobs-workers/releases/<previous-release> \
+  /opt/bluey-jobs-global-discovery/current
+sudo systemctl restart bluey-jobs-discovery.service
+sudo systemctl restart bluey-jobs-global-discovery.service
+sudo /usr/local/sbin/check-bluey-jobs-discovery.sh
+```
+
+Do not roll back database contents merely because one feed is delayed.
+Candidate-feed rows remain leads and still require original-employer
+revalidation before packet creation or submission.
 
 ### Discovery source lifecycle
 

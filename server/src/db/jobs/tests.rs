@@ -5175,8 +5175,8 @@ mod tests {
             connection_id: mailbox.id.clone(),
             provider: "gmail".to_string(),
             provider_subject: "google-subject-credential-test".to_string(),
-            access_token: "provider-access-token-secret".to_string(),
-            refresh_token: "provider-refresh-token-secret".to_string(),
+            access_token: "dummy-provider-access-token".to_string(),
+            refresh_token: "dummy-provider-refresh-token".to_string(),
             scopes: vec!["gmail.readonly".to_string()],
             expires_at_ms: now + 3_600_000,
             created_at_ms: now,
@@ -5192,7 +5192,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(!raw.contains("provider-access-token"));
+        assert!(!raw.contains("dummy-provider-access-token"));
         assert_eq!(
             jobs_provider_credential(&pool, "acct-jobs", &credential.connection_id)
                 .unwrap()
@@ -5233,8 +5233,8 @@ mod tests {
                 connection_id: String::new(),
                 provider: "gmail".to_string(),
                 provider_subject: "google-subject-atomic-setup".to_string(),
-                access_token: "atomic-access-token".to_string(),
-                refresh_token: "atomic-refresh-token".to_string(),
+                access_token: "dummy-atomic-access-token".to_string(),
+                refresh_token: "dummy-atomic-refresh-token".to_string(),
                 scopes: vec!["gmail.readonly".to_string()],
                 expires_at_ms: now + 3_600_000,
                 created_at_ms: now,
@@ -5249,7 +5249,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .refresh_token,
-            "atomic-refresh-token"
+            "dummy-atomic-refresh-token"
         );
         let sync = mailbox_sync_state(&pool, "acct-jobs", &mailbox.id)
             .unwrap()

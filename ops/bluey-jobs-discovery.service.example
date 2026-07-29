@@ -1,9 +1,9 @@
 [Unit]
 Description=Bluey Jobs public ATS discovery worker
 After=network-online.target bluey-jobs-api.service
-Wants=network-online.target
-Requires=bluey-jobs-api.service
-PartOf=bluey-jobs-api.service
+Wants=network-online.target bluey-jobs-api.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -14,7 +14,7 @@ EnvironmentFile=/etc/bluey-api/bluey-jobs.env
 EnvironmentFile=/etc/bluey-api/bluey-jobs-discovery.env
 Environment=NODE_ENV=production
 ExecStart=/usr/local/bin/node workflows/dist/discovery-worker.js
-Restart=on-failure
+Restart=always
 RestartSec=5s
 TimeoutStopSec=30s
 

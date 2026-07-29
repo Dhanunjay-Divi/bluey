@@ -1,0 +1,20 @@
+[Unit]
+Description=Verify Bluey Jobs discovery worker and source freshness
+After=network-online.target bluey-jobs-discovery.service bluey-jobs-global-discovery.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/check-bluey-jobs-discovery.sh
+User=root
+Group=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
