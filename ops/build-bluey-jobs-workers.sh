@@ -36,6 +36,7 @@ sha256_file() {
 command -v node >/dev/null 2>&1 || fail "node is required"
 command -v npm >/dev/null 2>&1 || fail "npm is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
+command -v python3 >/dev/null 2>&1 || fail "python3 is required"
 [[ "$RELEASE_ID" =~ ^[A-Za-z0-9._-]+$ ]] || fail "release ID contains unsafe characters"
 
 if [ "${BLUEY_ALLOW_DIRTY_WORKER_BUILD:-0}" != "1" ]; then
@@ -104,7 +105,8 @@ JSON
 
 mkdir -p "$OUTPUT_DIR"
 ARCHIVE="$OUTPUT_DIR/$RELEASE_ID.tar.gz"
-tar -C "$WORK_DIR" -czf "$ARCHIVE" "$RELEASE_ID"
+COPYFILE_DISABLE=1 tar -C "$WORK_DIR" -czf "$ARCHIVE" "$RELEASE_ID"
+"$ROOT/ops/verify-bluey-jobs-workers-archive.py" "$ARCHIVE" "$RELEASE_ID"
 (
     cd "$OUTPUT_DIR"
     archive_name="$(basename "$ARCHIVE")"

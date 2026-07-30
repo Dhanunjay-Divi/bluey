@@ -7,6 +7,8 @@ under `docs/release/`.
 
 ### Fixed
 
+- Rejected non-portable Bluey Jobs worker archives during the build so macOS
+  metadata cannot create a second hidden release root on Linux.
 - Made Bluey Jobs discovery workers independently supervised from API
   maintenance, deployed from one retained immutable runtime artifact, and
   monitored for both process availability and overdue source snapshots.
