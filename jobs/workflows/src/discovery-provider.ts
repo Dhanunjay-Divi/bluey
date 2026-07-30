@@ -6,7 +6,7 @@ import {
   type JobsFetch,
   type NormalizedJob,
   type PublicAtsSource,
-} from "@bluey/jobs-automation";
+} from "@bluey/jobs-automation/discovery-runtime";
 import {
   DiscoveryProviderError,
   type DiscoveryJob,

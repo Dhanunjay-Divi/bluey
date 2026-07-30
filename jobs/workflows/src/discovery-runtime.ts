@@ -5,7 +5,7 @@ import {
   fetchCuratedFeed,
   type CuratedFeedLead,
   type JobsFetch,
-} from "@bluey/jobs-automation";
+} from "@bluey/jobs-automation/discovery-runtime";
 import {
   type DiscoveredJobInput,
   type DiscoveryCompleteInput,

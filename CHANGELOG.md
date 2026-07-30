@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Fixed
 
+- Kept both Bluey Jobs discovery workers independent from resume/PDF rendering
+  dependencies so their Linux runtimes do not require an optional native canvas
+  binding.
 - Kept the Bluey Jobs global discovery worker independent from resume/PDF
   rendering dependencies so its Linux runtime no longer requires an optional
   native canvas binding.

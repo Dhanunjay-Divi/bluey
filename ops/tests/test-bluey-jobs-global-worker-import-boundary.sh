@@ -5,9 +5,25 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 AUTOMATION_DIST="$ROOT/jobs/automation/dist"
 WORKFLOWS_DIST="$ROOT/jobs/workflows/dist"
 
-if [ ! -f "$AUTOMATION_DIST/jobhive-runtime.js" ] ||
+if [ ! -f "$AUTOMATION_DIST/discovery-runtime.js" ] ||
+    [ ! -f "$AUTOMATION_DIST/jobhive-runtime.js" ] ||
+    [ ! -f "$WORKFLOWS_DIST/discovery-worker.js" ] ||
     [ ! -f "$WORKFLOWS_DIST/global-discovery-worker.js" ]; then
     printf 'Build the Jobs automation and workflows packages before this test.\n' >&2
+    exit 1
+fi
+
+if ! grep -Fq \
+    'from "@bluey/jobs-automation/discovery-runtime"' \
+    "$WORKFLOWS_DIST/discovery-runtime.js"; then
+    printf 'Direct discovery must use the discovery-only automation entry point.\n' >&2
+    exit 1
+fi
+
+if ! grep -Fq \
+    'from "@bluey/jobs-automation/discovery-runtime"' \
+    "$WORKFLOWS_DIST/discovery-provider.js"; then
+    printf 'ATS discovery must use the discovery-only automation entry point.\n' >&2
     exit 1
 fi
 
@@ -28,7 +44,7 @@ export async function resolve(specifier, context, nextResolve) {
     || specifier === "@pdf-lib/fontkit"
     || specifier.startsWith("pdfjs-dist/")
   ) {
-    throw new Error(`Global discovery imported the document runtime: ${specifier}`);
+    throw new Error(`Discovery worker imported the document runtime: ${specifier}`);
   }
   return nextResolve(specifier, context);
 }
@@ -37,6 +53,11 @@ EOF
 NODE_NO_WARNINGS=1 node \
   --experimental-loader "$LOADER" \
   --input-type=module \
+  --eval "await import('file://$WORKFLOWS_DIST/discovery-worker.js')"
+
+NODE_NO_WARNINGS=1 node \
+  --experimental-loader "$LOADER" \
+  --input-type=module \
   --eval "await import('file://$WORKFLOWS_DIST/global-discovery-worker.js')"
 
-printf 'Bluey Jobs global discovery import boundary: OK\n'
+printf 'Bluey Jobs discovery worker import boundaries: OK\n'
