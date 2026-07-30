@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS jobs_global_ingestion_runs (
     expected_rows         INTEGER NOT NULL DEFAULT 0,
     received_rows         INTEGER NOT NULL DEFAULT 0,
     received_batches      INTEGER NOT NULL DEFAULT 0,
+    rejected_rows         INTEGER NOT NULL DEFAULT 0,
+    rejection_summary_json TEXT NOT NULL DEFAULT '{}',
     expired_count         INTEGER NOT NULL DEFAULT 0,
     artifact_sha256       TEXT NOT NULL DEFAULT '',
     error_code            TEXT,

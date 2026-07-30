@@ -444,6 +444,26 @@ mod tests {
         }
     }
 
+    fn global_completion_evidence(
+        expected_rows: i64,
+        accepted_rows: Option<i64>,
+        rejected_rows: i64,
+        rejection_reasons: BTreeMap<String, i64>,
+    ) -> GlobalIngestionCompleteInput {
+        GlobalIngestionCompleteInput {
+            lease_token: "lease-token".to_string(),
+            replay_key: "replay-key".to_string(),
+            scheduled_for_ms: 1,
+            artifact_sha256: "a".repeat(64),
+            expected_rows,
+            accepted_rows,
+            rejected_rows,
+            rejection_reasons,
+            expected_batches: 1,
+            complete_snapshot: true,
+        }
+    }
+
     fn insert_global_candidate(
         pool: &DbPool,
         id: &str,
@@ -1088,6 +1108,9 @@ mod tests {
                 scheduled_for_ms: second.scheduled_for_ms,
                 artifact_sha256: artifact_sha256.clone(),
                 expected_rows: 1,
+                accepted_rows: None,
+                rejected_rows: 0,
+                rejection_reasons: BTreeMap::new(),
                 expected_batches: 1,
                 complete_snapshot: true,
             },
@@ -1105,6 +1128,9 @@ mod tests {
                 scheduled_for_ms: second.scheduled_for_ms,
                 artifact_sha256,
                 expected_rows: 1,
+                accepted_rows: None,
+                rejected_rows: 0,
+                rejection_reasons: BTreeMap::new(),
                 expected_batches: 1,
                 complete_snapshot: true,
             },
@@ -1127,6 +1153,166 @@ mod tests {
             .unwrap();
         assert_eq!(candidates, 1);
         assert_eq!(memberships, 1);
+    }
+
+    #[test]
+    fn global_ingestion_rejection_evidence_is_bounded_and_typed() {
+        let legacy = normalized_global_rejection_evidence(&global_completion_evidence(
+            1,
+            None,
+            0,
+            BTreeMap::new(),
+        ))
+        .unwrap();
+        assert_eq!(legacy.accepted_rows, 1);
+        assert_eq!(legacy.rejected_rows, 0);
+
+        let accepted = normalized_global_rejection_evidence(&global_completion_evidence(
+            1_000,
+            Some(999),
+            1,
+            BTreeMap::from([("missing_identity".to_string(), 1)]),
+        ))
+        .unwrap();
+        assert_eq!(accepted.accepted_rows, 999);
+        assert_eq!(accepted.rejected_rows, 1);
+
+        let unknown_reason = normalized_global_rejection_evidence(&global_completion_evidence(
+            1_000,
+            Some(999),
+            1,
+            BTreeMap::from([("parse_error".to_string(), 1)]),
+        ))
+        .unwrap_err();
+        assert!(unknown_reason
+            .to_string()
+            .contains("rejection reason is invalid"));
+
+        let excessive = normalized_global_rejection_evidence(&global_completion_evidence(
+            1_000,
+            Some(998),
+            2,
+            BTreeMap::from([("missing_identity".to_string(), 2)]),
+        ))
+        .unwrap_err();
+        assert!(excessive.to_string().contains("rejected too many rows"));
+
+        let mismatched = normalized_global_rejection_evidence(&global_completion_evidence(
+            1_000,
+            Some(999),
+            1,
+            BTreeMap::from([("missing_identity".to_string(), 2)]),
+        ))
+        .unwrap_err();
+        assert!(mismatched
+            .to_string()
+            .contains("rejection reasons do not reconcile"));
+    }
+
+    #[test]
+    fn global_ingestion_commits_one_quarantine_with_replay_safe_evidence() {
+        let pool = test_pool();
+        let artifact_sha256 = "b".repeat(64);
+        let sources = sync_global_discovery_sources(
+            &pool,
+            &[GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "ashby-quarantine".to_string(),
+                source_family: "ashby".to_string(),
+                artifact_url: "https://storage.stapply.ai/ashby.csv".to_string(),
+                artifact_sha256: artifact_sha256.clone(),
+                expected_rows: 2,
+                snapshot_at_ms: now_ms(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            }],
+        )
+        .unwrap();
+        let source_id = sources[0].id.clone();
+        let lease = lease_due_global_discovery_source(&pool, "quarantine-worker")
+            .unwrap()
+            .unwrap();
+        ingest_global_discovery_batch(
+            &pool,
+            &source_id,
+            &GlobalIngestionBatchInput {
+                lease_token: lease.lease_token.clone(),
+                replay_key: lease.replay_key.clone(),
+                scheduled_for_ms: lease.scheduled_for_ms,
+                batch_index: 0,
+                artifact_sha256: artifact_sha256.clone(),
+                jobs: vec![curated_discovered_job(
+                    "ashby-valid-job",
+                    "https://jobs.ashbyhq.com/acme/ashby-valid-job",
+                )],
+            },
+        )
+        .unwrap();
+        let completion = GlobalIngestionCompleteInput {
+            lease_token: lease.lease_token.clone(),
+            replay_key: lease.replay_key.clone(),
+            scheduled_for_ms: lease.scheduled_for_ms,
+            artifact_sha256: artifact_sha256.clone(),
+            expected_rows: 2,
+            accepted_rows: Some(1),
+            rejected_rows: 1,
+            rejection_reasons: BTreeMap::from([("missing_identity".to_string(), 1)]),
+            expected_batches: 1,
+            complete_snapshot: true,
+        };
+
+        let committed =
+            complete_global_discovery_ingestion(&pool, &source_id, &completion).unwrap();
+        assert_eq!(committed.status, "completed");
+        assert_eq!(committed.received_rows, 1);
+        assert_eq!(committed.rejected_rows, 1);
+        assert_eq!(
+            committed.rejection_reasons,
+            BTreeMap::from([("missing_identity".to_string(), 1)])
+        );
+        assert!(!committed.replayed);
+
+        let replayed =
+            complete_global_discovery_ingestion(&pool, &source_id, &completion).unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.rejected_rows, 1);
+
+        let conflicting = complete_global_discovery_ingestion(
+            &pool,
+            &source_id,
+            &GlobalIngestionCompleteInput {
+                accepted_rows: Some(2),
+                rejected_rows: 0,
+                rejection_reasons: BTreeMap::new(),
+                ..completion
+            },
+        )
+        .unwrap_err();
+        assert!(conflicting
+            .to_string()
+            .contains("completion replay conflicts with stored evidence"));
+
+        let conn = pool.get().unwrap();
+        let stored: (i64, String) = conn
+            .query_row(
+                "SELECT rejected_rows, rejection_summary_json
+                   FROM jobs_global_ingestion_runs WHERE id = ?1",
+                params![committed.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, 1);
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, i64>>(&stored.1).unwrap(),
+            BTreeMap::from([("missing_identity".to_string(), 1)])
+        );
+        let source_health: String = conn
+            .query_row(
+                "SELECT health FROM jobs_global_discovery_sources WHERE id = ?1",
+                params![source_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_health, "healthy");
     }
 
     #[test]
@@ -5393,9 +5579,8 @@ mod tests {
             .any(|(account_id, state)| {
                 account_id == "acct-jobs" && state.connection_id == mailbox.id
             }));
-        assert!(mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id)
-            .unwrap()
-            == false);
+        assert!(!mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id)
+            .unwrap());
     }
 
     #[test]

@@ -22,6 +22,8 @@ pub fn complete_global_discovery_ingestion(
     input: &GlobalIngestionCompleteInput,
 ) -> Result<GlobalIngestionRunResult> {
     validate_global_completion_input(input)?;
+    let rejection_evidence = normalized_global_rejection_evidence(input)?;
+    let rejection_summary_json = serde_json::to_string(&rejection_evidence.reasons)?;
     let artifact_sha256 = normalized_sha256(&input.artifact_sha256)?;
     let run_id = global_run_id(source_id, &input.replay_key);
     let now = now_ms();
@@ -35,6 +37,7 @@ pub fn complete_global_discovery_ingestion(
                 &run_id,
                 input,
                 &artifact_sha256,
+                &rejection_evidence,
             )? {
                 tx.commit()?;
                 return Ok(result);
@@ -49,7 +52,13 @@ pub fn complete_global_discovery_ingestion(
                 now,
             )?;
             let (received_rows, received_batches) =
-                validate_global_run_batches_sqlite(&tx, &run_id, input, &artifact_sha256)?;
+                validate_global_run_batches_sqlite(
+                    &tx,
+                    &run_id,
+                    input,
+                    &artifact_sha256,
+                    &rejection_evidence,
+                )?;
             let expired_count = expire_missing_global_memberships_sqlite(
                 &tx,
                 source_id,
@@ -59,10 +68,17 @@ pub fn complete_global_discovery_ingestion(
             )?;
             tx.execute(
                 "UPDATE jobs_global_ingestion_runs
-                    SET status = 'completed', expired_count = ?2, completed_at_ms = ?3,
-                        error_code = NULL
+                    SET status = 'completed', rejected_rows = ?2,
+                        rejection_summary_json = ?3, expired_count = ?4,
+                        completed_at_ms = ?5, error_code = NULL
                   WHERE id = ?1 AND status = 'running'",
-                params![run_id, expired_count, now],
+                params![
+                    run_id,
+                    rejection_evidence.rejected_rows,
+                    rejection_summary_json,
+                    expired_count,
+                    now
+                ],
             )?;
             let next_run_at = global_discovery_next_run_at(&source, now, 0);
             tx.execute(
@@ -81,6 +97,8 @@ pub fn complete_global_discovery_ingestion(
                 status: "completed".to_string(),
                 received_rows,
                 received_batches,
+                rejected_rows: rejection_evidence.rejected_rows,
+                rejection_reasons: rejection_evidence.reasons,
                 expired_count,
                 replayed: false,
             })
@@ -94,6 +112,7 @@ pub fn complete_global_discovery_ingestion(
                 &run_id,
                 input,
                 &artifact_sha256,
+                &rejection_evidence,
             )? {
                 tx.commit()?;
                 return Ok(result);
@@ -108,7 +127,13 @@ pub fn complete_global_discovery_ingestion(
                 now,
             )?;
             let (received_rows, received_batches) =
-                validate_global_run_batches_postgres(&mut tx, &run_id, input, &artifact_sha256)?;
+                validate_global_run_batches_postgres(
+                    &mut tx,
+                    &run_id,
+                    input,
+                    &artifact_sha256,
+                    &rejection_evidence,
+                )?;
             let expired_count = expire_missing_global_memberships_postgres(
                 &mut tx,
                 source_id,
@@ -118,10 +143,17 @@ pub fn complete_global_discovery_ingestion(
             )?;
             tx.execute(
                 "UPDATE jobs_global_ingestion_runs
-                    SET status = 'completed', expired_count = $2, completed_at_ms = $3,
-                        error_code = NULL
+                    SET status = 'completed', rejected_rows = $2,
+                        rejection_summary_json = $3, expired_count = $4,
+                        completed_at_ms = $5, error_code = NULL
                   WHERE id = $1 AND status = 'running'",
-                &[&run_id, &expired_count, &now],
+                &[
+                    &run_id,
+                    &rejection_evidence.rejected_rows,
+                    &rejection_summary_json,
+                    &expired_count,
+                    &now,
+                ],
             )?;
             let next_run_at = global_discovery_next_run_at(&source, now, 0);
             tx.execute(
@@ -140,6 +172,8 @@ pub fn complete_global_discovery_ingestion(
                 status: "completed".to_string(),
                 received_rows,
                 received_batches,
+                rejected_rows: rejection_evidence.rejected_rows,
+                rejection_reasons: rejection_evidence.reasons,
                 expired_count,
                 replayed: false,
             })
@@ -210,6 +244,8 @@ pub fn fail_global_discovery_ingestion(
                 status: "failed".to_string(),
                 received_rows,
                 received_batches,
+                rejected_rows: 0,
+                rejection_reasons: BTreeMap::new(),
                 expired_count: 0,
                 replayed: false,
             })
@@ -268,6 +304,8 @@ pub fn fail_global_discovery_ingestion(
                 status: "failed".to_string(),
                 received_rows,
                 received_batches,
+                rejected_rows: 0,
+                rejection_reasons: BTreeMap::new(),
                 expired_count: 0,
                 replayed: false,
             })
@@ -285,7 +323,53 @@ fn validate_global_completion_input(input: &GlobalIngestionCompleteInput) -> Res
         anyhow::bail!("global discovery completion is invalid")
     }
     normalized_sha256(&input.artifact_sha256)?;
+    normalized_global_rejection_evidence(input)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GlobalRejectionEvidence {
+    accepted_rows: i64,
+    rejected_rows: i64,
+    reasons: BTreeMap<String, i64>,
+}
+
+fn normalized_global_rejection_evidence(
+    input: &GlobalIngestionCompleteInput,
+) -> Result<GlobalRejectionEvidence> {
+    let accepted_rows = input.accepted_rows.unwrap_or(input.expected_rows);
+    if accepted_rows <= 0
+        || input.rejected_rows < 0
+        || accepted_rows.saturating_add(input.rejected_rows) != input.expected_rows
+    {
+        anyhow::bail!("global discovery rejection evidence does not reconcile")
+    }
+
+    let mut reason_total = 0_i64;
+    for (reason, count) in &input.rejection_reasons {
+        if reason != "missing_identity" || *count <= 0 {
+            anyhow::bail!("global discovery rejection reason is invalid")
+        }
+        reason_total = reason_total
+            .checked_add(*count)
+            .ok_or_else(|| anyhow::anyhow!("global discovery rejection total overflowed"))?;
+    }
+    if reason_total != input.rejected_rows
+        || (input.rejected_rows == 0 && !input.rejection_reasons.is_empty())
+    {
+        anyhow::bail!("global discovery rejection reasons do not reconcile")
+    }
+
+    let maximum_rejected = ((input.expected_rows + 999) / 1_000).clamp(1, 100);
+    if input.rejected_rows > maximum_rejected {
+        anyhow::bail!("global discovery rejected too many rows")
+    }
+
+    Ok(GlobalRejectionEvidence {
+        accepted_rows,
+        rejected_rows: input.rejected_rows,
+        reasons: input.rejection_reasons.clone(),
+    })
 }
 
 fn normalized_global_error_code(value: &str) -> Result<String> {
@@ -307,11 +391,13 @@ fn completed_global_run_sqlite(
     run_id: &str,
     input: &GlobalIngestionCompleteInput,
     artifact_sha256: &str,
+    rejection_evidence: &GlobalRejectionEvidence,
 ) -> Result<Option<GlobalIngestionRunResult>> {
     let row = tx
         .query_row(
             "SELECT source_id, replay_key, status, expected_rows, received_rows,
-                    received_batches, expired_count, artifact_sha256
+                    received_batches, rejected_rows, rejection_summary_json,
+                    expired_count, artifact_sha256
                FROM jobs_global_ingestion_runs WHERE id = ?1",
             params![run_id],
             |row| {
@@ -324,6 +410,8 @@ fn completed_global_run_sqlite(
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )
@@ -335,9 +423,12 @@ fn completed_global_run_sqlite(
     if row.0 != source_id
         || row.1 != input.replay_key
         || row.3 != input.expected_rows
-        || row.4 != input.expected_rows
+        || row.4 != rejection_evidence.accepted_rows
         || row.5 != input.expected_batches
-        || row.7 != artifact_sha256
+        || row.6 != rejection_evidence.rejected_rows
+        || serde_json::from_str::<BTreeMap<String, i64>>(&row.7)?
+            != rejection_evidence.reasons
+        || row.9 != artifact_sha256
     {
         anyhow::bail!("global discovery completion replay conflicts with stored evidence")
     }
@@ -347,7 +438,9 @@ fn completed_global_run_sqlite(
         status: row.2,
         received_rows: row.4,
         received_batches: row.5,
-        expired_count: row.6,
+        rejected_rows: row.6,
+        rejection_reasons: rejection_evidence.reasons.clone(),
+        expired_count: row.8,
         replayed: true,
     }))
 }
@@ -358,10 +451,12 @@ fn completed_global_run_postgres(
     run_id: &str,
     input: &GlobalIngestionCompleteInput,
     artifact_sha256: &str,
+    rejection_evidence: &GlobalRejectionEvidence,
 ) -> Result<Option<GlobalIngestionRunResult>> {
     let Some(row) = tx.query_opt(
         "SELECT source_id, replay_key, status, expected_rows, received_rows,
-                received_batches, expired_count, artifact_sha256
+                received_batches, rejected_rows, rejection_summary_json,
+                expired_count, artifact_sha256
            FROM jobs_global_ingestion_runs WHERE id = $1 FOR UPDATE",
         &[&run_id],
     )? else {
@@ -377,9 +472,12 @@ fn completed_global_run_postgres(
     if row.get::<_, String>(0) != source_id
         || row.get::<_, String>(1) != input.replay_key
         || expected_rows != input.expected_rows
-        || received_rows != input.expected_rows
+        || received_rows != rejection_evidence.accepted_rows
         || received_batches != input.expected_batches
-        || row.get::<_, String>(7) != artifact_sha256
+        || row.get::<_, i64>(6) != rejection_evidence.rejected_rows
+        || serde_json::from_str::<BTreeMap<String, i64>>(&row.get::<_, String>(7))?
+            != rejection_evidence.reasons
+        || row.get::<_, String>(9) != artifact_sha256
     {
         anyhow::bail!("global discovery completion replay conflicts with stored evidence")
     }
@@ -389,7 +487,9 @@ fn completed_global_run_postgres(
         status,
         received_rows,
         received_batches,
-        expired_count: row.get(6),
+        rejected_rows: row.get(6),
+        rejection_reasons: rejection_evidence.reasons.clone(),
+        expired_count: row.get(8),
         replayed: true,
     }))
 }
@@ -441,6 +541,8 @@ fn failed_global_run_sqlite(
         status: row.2,
         received_rows: row.3,
         received_batches: row.4,
+        rejected_rows: 0,
+        rejection_reasons: BTreeMap::new(),
         expired_count: 0,
         replayed: true,
     }))
@@ -482,6 +584,8 @@ fn failed_global_run_postgres(
         status,
         received_rows: row.get(3),
         received_batches: row.get(4),
+        rejected_rows: 0,
+        rejection_reasons: BTreeMap::new(),
         expired_count: 0,
         replayed: true,
     }))
@@ -492,6 +596,7 @@ fn validate_global_run_batches_sqlite(
     run_id: &str,
     input: &GlobalIngestionCompleteInput,
     artifact_sha256: &str,
+    rejection_evidence: &GlobalRejectionEvidence,
 ) -> Result<(i64, i64)> {
     let (status, expected_rows, received_rows, received_batches, artifact):
         (String, i64, i64, i64, String) = tx.query_row(
@@ -520,6 +625,7 @@ fn validate_global_run_batches_sqlite(
         summed_rows,
         input,
         artifact_sha256,
+        rejection_evidence,
     )?;
     Ok((received_rows, received_batches))
 }
@@ -529,6 +635,7 @@ fn validate_global_run_batches_postgres(
     run_id: &str,
     input: &GlobalIngestionCompleteInput,
     artifact_sha256: &str,
+    rejection_evidence: &GlobalRejectionEvidence,
 ) -> Result<(i64, i64)> {
     let run = tx.query_one(
         "SELECT status, expected_rows, received_rows, received_batches, artifact_sha256
@@ -555,6 +662,7 @@ fn validate_global_run_batches_postgres(
         batches.get(3),
         input,
         artifact_sha256,
+        rejection_evidence,
     )?;
     Ok((received_rows, received_batches))
 }
@@ -572,16 +680,17 @@ fn validate_global_run_counters(
     summed_rows: i64,
     input: &GlobalIngestionCompleteInput,
     artifact_sha256: &str,
+    rejection_evidence: &GlobalRejectionEvidence,
 ) -> Result<()> {
     if status != "running"
         || expected_rows != input.expected_rows
-        || received_rows != input.expected_rows
+        || received_rows != rejection_evidence.accepted_rows
         || received_batches != input.expected_batches
         || artifact != artifact_sha256
         || batch_count != input.expected_batches
         || minimum_index != 0
         || maximum_index != input.expected_batches - 1
-        || summed_rows != input.expected_rows
+        || summed_rows != rejection_evidence.accepted_rows
     {
         anyhow::bail!("global discovery completion counters do not match stored batches")
     }

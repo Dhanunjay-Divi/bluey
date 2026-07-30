@@ -73,7 +73,14 @@ class FakeApi implements GlobalDiscoveryWorkerApi {
 
   async complete(_sourceId: string, input: GlobalIngestionCompleteInput): Promise<GlobalIngestionRunResult> {
     this.completed.push(input);
-    return runResult(input.replay_key, input.expected_rows, input.expected_batches, "completed");
+    return runResult(
+      input.replay_key,
+      input.accepted_rows,
+      input.expected_batches,
+      "completed",
+      input.rejected_rows,
+      input.rejection_reasons,
+    );
   }
 
   async fail(_sourceId: string, input: GlobalIngestionFailureInput): Promise<GlobalIngestionRunResult> {
@@ -190,6 +197,9 @@ describe("global discovery worker runtime", () => {
     });
     expect(api.completed[0]).toMatchObject({
       expected_rows: 1,
+      accepted_rows: 1,
+      rejected_rows: 0,
+      rejection_reasons: {},
       expected_batches: 1,
       complete_snapshot: true,
       artifact_sha256: sha256,
@@ -199,6 +209,48 @@ describe("global discovery worker runtime", () => {
     expect(logger.events).toContainEqual(expect.objectContaining({
       event: "global_discovery_source_completed",
       rows: 1,
+      accepted_rows: 1,
+      rejected_rows: 0,
+      rejection_reasons: {},
+      batches: 1,
+    }));
+  });
+
+  it("quarantines a bounded missing-identity row while committing valid jobs", async () => {
+    const csv = candidateCsvWithMalformedIdentity();
+    const sha256 = createHash("sha256").update(csv).digest("hex");
+    const api = new FakeApi(lease(sha256, 2));
+    const logger = new RecordingLogger();
+    const runtime = new GlobalDiscoveryWorkerRuntime({
+      api,
+      stagingDirectory: await temporaryDirectory(),
+      manifestFetch: (async () => jsonResponse(manifestFixture(csv, sha256, 2))) as typeof fetch,
+      artifactFetch: (async () => new Response(csv, {
+        status: 200,
+        headers: { "content-length": String(Buffer.byteLength(csv)) },
+      })) as typeof fetch,
+      logger,
+      now: () => SNAPSHOT_AT_MS,
+    });
+
+    await expect(runtime.pollOnce()).resolves.toBe("completed");
+
+    expect(api.batches).toHaveLength(1);
+    expect(api.batches[0]?.jobs).toHaveLength(1);
+    expect(api.completed).toContainEqual(expect.objectContaining({
+      expected_rows: 2,
+      accepted_rows: 1,
+      rejected_rows: 1,
+      rejection_reasons: { missing_identity: 1 },
+      expected_batches: 1,
+    }));
+    expect(api.failed).toEqual([]);
+    expect(logger.events).toContainEqual(expect.objectContaining({
+      event: "global_discovery_source_completed",
+      rows: 2,
+      accepted_rows: 1,
+      rejected_rows: 1,
+      rejection_reasons: { missing_identity: 1 },
       batches: 1,
     }));
   });
@@ -298,9 +350,63 @@ describe("global discovery worker runtime", () => {
     expect(new Headers(requests[0]?.init?.headers).get("x-bluey-jobs-worker-nonce"))
       .not.toBe(new Headers(requests[1]?.init?.headers).get("x-bluey-jobs-worker-nonce"));
   });
+
+  it("accepts a legacy completion response with no quarantine evidence", async () => {
+    const fetcher: GlobalDiscoveryApiFetch = vi.fn(async () => jsonResponse({
+      run_id: "run-global-test",
+      replay_key: "replay-key-global",
+      status: "completed",
+      received_rows: 1,
+      received_batches: 1,
+      expired_count: 0,
+      replayed: false,
+    }));
+    const client = new GlobalDiscoveryApiClient({
+      origin: "https://jobs.internal",
+      signingKey: WORKER_KEY,
+      workerId: "global-discovery-test",
+      fetch: fetcher,
+    });
+
+    await expect(client.complete(
+      "source-global-lever",
+      completionInput(),
+    )).resolves.toMatchObject({
+      rejected_rows: 0,
+      rejection_reasons: {},
+    });
+  });
+
+  it("rejects completion responses whose quarantine evidence does not reconcile", async () => {
+    const fetcher: GlobalDiscoveryApiFetch = vi.fn(async () => jsonResponse({
+      run_id: "run-global-test",
+      replay_key: "replay-key-global",
+      status: "completed",
+      received_rows: 1,
+      received_batches: 1,
+      rejected_rows: 1,
+      rejection_reasons: {},
+      expired_count: 0,
+      replayed: false,
+    }));
+    const client = new GlobalDiscoveryApiClient({
+      origin: "https://jobs.internal",
+      signingKey: WORKER_KEY,
+      workerId: "global-discovery-test",
+      fetch: fetcher,
+    });
+
+    await expect(client.complete(
+      "source-global-lever",
+      completionInput(),
+    )).rejects.toMatchObject({
+      code: "invalid_response",
+      message: "Global discovery rejection evidence does not reconcile",
+    });
+  });
 });
 
-function source(sha256: string): GlobalDiscoverySourceRecord {
+function source(sha256: string, expectedRows = 1): GlobalDiscoverySourceRecord {
   return {
     id: "source-global-lever",
     provider: "jobhive",
@@ -309,7 +415,7 @@ function source(sha256: string): GlobalDiscoverySourceRecord {
       sourceFamily: "lever",
       artifactUrl: "https://storage.stapply.ai/jobhive/v1/lever/jobs.csv",
       artifactSha256: sha256,
-      expectedRows: 1,
+      expectedRows,
       snapshotAtMs: SNAPSHOT_AT_MS,
       requiresOriginalRevalidation: true,
     },
@@ -327,9 +433,9 @@ function source(sha256: string): GlobalDiscoverySourceRecord {
   };
 }
 
-function lease(sha256: string): GlobalDiscoverySourceLease {
+function lease(sha256: string, expectedRows = 1): GlobalDiscoverySourceLease {
   return {
-    source: source(sha256),
+    source: source(sha256, expectedRows),
     lease_token: "lease-token-global",
     replay_key: "replay-key-global",
     scheduled_for_ms: SNAPSHOT_AT_MS,
@@ -341,6 +447,8 @@ function runResult(
   receivedRows: number,
   receivedBatches: number,
   status: string,
+  rejectedRows = 0,
+  rejectionReasons: Record<string, number> = {},
 ): GlobalIngestionRunResult {
   return {
     run_id: "run-global-test",
@@ -348,8 +456,25 @@ function runResult(
     status,
     received_rows: receivedRows,
     received_batches: receivedBatches,
+    rejected_rows: rejectedRows,
+    rejection_reasons: rejectionReasons,
     expired_count: 0,
     replayed: false,
+  };
+}
+
+function completionInput(): GlobalIngestionCompleteInput {
+  return {
+    lease_token: "lease-token-global",
+    replay_key: "replay-key-global",
+    scheduled_for_ms: SNAPSHOT_AT_MS,
+    artifact_sha256: "a".repeat(64),
+    expected_rows: 1,
+    accepted_rows: 1,
+    rejected_rows: 0,
+    rejection_reasons: {},
+    expected_batches: 1,
+    complete_snapshot: true,
   };
 }
 
@@ -387,11 +512,40 @@ function candidateCsv(): string {
   return `${csvRow(headers)}\n${csvRow(row)}\n`;
 }
 
+function candidateCsvWithMalformedIdentity(): string {
+  const valid = candidateCsv().trimEnd();
+  const malformed = [
+    "https://jobs.ashbyhq.com/acme/missing-title",
+    "",
+    "Acme",
+    "ashby",
+    "ashby-missing-title",
+    "Remote",
+    "true",
+    "",
+    "",
+    "USD",
+    "",
+    "",
+    "Full-time",
+    "Engineering",
+    "",
+    "This row is structurally valid but has no title.",
+    SNAPSHOT_AT,
+    "REQ-INVALID",
+    "https://jobs.ashbyhq.com/acme/missing-title/application",
+    "Direct hire",
+    "{}",
+    "US",
+  ];
+  return `${valid}\n${csvRow(malformed)}\n`;
+}
+
 function csvRow(values: string[]): string {
   return values.map((value) => `"${value.replaceAll('"', '""')}"`).join(",");
 }
 
-function manifestFixture(csv: string, csvSha256: string): unknown {
+function manifestFixture(csv: string, csvSha256: string, rows = 1): unknown {
   return {
     version: "2.0",
     generated_at: SNAPSHOT_AT,
@@ -402,8 +556,8 @@ function manifestFixture(csv: string, csvSha256: string): unknown {
       schema_columns: headers,
       schema_version: "2.0",
       total_companies: 1,
-      total_jobs: 1,
-      total_jobs_raw: 1,
+      total_jobs: rows,
+      total_jobs_raw: rows,
     },
     all: {
       csv: "https://storage.stapply.ai/jobhive/v1/all.csv",
@@ -412,7 +566,7 @@ function manifestFixture(csv: string, csvSha256: string): unknown {
       size_bytes: 1,
       parquet_sha256: "b".repeat(64),
       parquet_size_bytes: 1,
-      rows: 1,
+      rows,
     },
     by_ats: {
       lever: {
@@ -422,7 +576,7 @@ function manifestFixture(csv: string, csvSha256: string): unknown {
         size_bytes: Buffer.byteLength(csv),
         parquet_sha256: "c".repeat(64),
         parquet_size_bytes: 1,
-        rows: 1,
+        rows,
       },
     },
   };
