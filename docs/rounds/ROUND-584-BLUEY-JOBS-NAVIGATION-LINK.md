@@ -50,7 +50,37 @@ Not changed:
 
 ## Deployment
 
-Deploy only `web/index.html` and `web/assets/bluey-site.css`. Preserve the
-existing Jobs bundle, signed releases, installers, APIs, and native artifacts.
+Deployed only `web/index.html` and `web/assets/bluey-site.css` to
+`/var/www/bluey` on 2026-07-30. The existing Jobs bundle, signed releases,
+installers, APIs, and native artifacts were preserved.
 
-Rollback by restoring the pre-deploy copies of those two static files.
+Pre-deploy backup:
+
+- `/var/backups/bluey-web/round584-before-20260730T210453Z`
+
+Pre-deploy SHA-256:
+
+- `index.html`:
+  `80c2d1136960bfd341806a1179a25bd325da6a15d63295a391faeaa60134bf70`
+- `assets/bluey-site.css`:
+  `317b00712e4ac625c08f0fda1856e7dd24ccf0ece11c20013b1620606397d6ab`
+
+Deployed SHA-256:
+
+- `index.html`:
+  `b55f33a7d0ce16162453887ab262d8c464507b7879ee777c78b712d26a037dbe`
+- `assets/bluey-site.css`:
+  `5d97974cebbfc303589d82c19234303642dbdbf4f871e82d6ece9bb387aaaf3c`
+
+Live verification:
+
+- `https://bluey.sh/` returns `200` HTML.
+- `https://bluey.sh/jobs/` returns `200` HTML.
+- The versioned stylesheet returns `200` CSS.
+- The live page contains all four Jobs links with the expected new-tab
+  security attributes.
+- A browser click from the landing header opened
+  `https://bluey.sh/jobs/` in a separate tab.
+- The 390 x 844 live landing header has zero horizontal overflow.
+
+Rollback by restoring the two files from the timestamped backup.
