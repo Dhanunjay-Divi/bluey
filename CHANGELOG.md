@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Fixed
 
+- Kept the Bluey Jobs global discovery worker independent from resume/PDF
+  rendering dependencies so its Linux runtime no longer requires an optional
+  native canvas binding.
 - Rejected non-portable Bluey Jobs worker archives during the build so macOS
   metadata cannot create a second hidden release root on Linux.
 - Made Bluey Jobs discovery workers independently supervised from API

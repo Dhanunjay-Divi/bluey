@@ -10,7 +10,7 @@ import {
   type JobhiveCandidateRow,
   type JobhiveManifest,
   type JobhiveSourceSnapshot,
-} from "@bluey/jobs-automation";
+} from "@bluey/jobs-automation/jobhive-runtime";
 import {
   GlobalDiscoveryApiError,
   type GlobalDiscoveredJobInput,

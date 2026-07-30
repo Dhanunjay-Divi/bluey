@@ -19,6 +19,10 @@
       "types": "./dist/interview-prep.d.ts",
       "import": "./dist/interview-prep.js"
     },
+    "./jobhive-runtime": {
+      "types": "./dist/jobhive-runtime.d.ts",
+      "import": "./dist/jobhive-runtime.js"
+    },
     "./worker-auth": {
       "types": "./dist/worker-auth.d.ts",
       "import": "./dist/worker-auth.js"
