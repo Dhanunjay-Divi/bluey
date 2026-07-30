@@ -28,6 +28,10 @@ under `docs/release/`.
 - Split workspace and server tests across isolated GitHub runners and removed
   duplicate feature-push executions when a pull request already supplies the
   same required CI gates.
+- Kept Bluey Jobs match filters stable across refresh, back/forward navigation,
+  direct links, themes, mobile layouts, and pagination; hid inactive Career
+  Tracks, normalized workplace values, included 100% matches, and separated a
+  filtered-empty result from an empty discovery account.
 - Activated bounded global-feed row quarantine in production so malformed rows
   are recorded with typed, replay-safe evidence while valid Ashby and Lever
   snapshots continue to publish and remain healthy.

@@ -751,6 +751,7 @@ export default function App() {
           element={
             <MatchesView
               workspace={workspace}
+              previewSearch={previewSearch}
               onAddJob={addJob}
               onPrepare={prepareApplication}
               onSaveCandidateEvent={saveCandidateEvent}
