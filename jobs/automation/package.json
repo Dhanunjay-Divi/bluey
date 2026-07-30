@@ -19,6 +19,10 @@
       "types": "./dist/interview-prep.d.ts",
       "import": "./dist/interview-prep.js"
     },
+    "./discovery-runtime": {
+      "types": "./dist/discovery-runtime.d.ts",
+      "import": "./dist/discovery-runtime.js"
+    },
     "./jobhive-runtime": {
       "types": "./dist/jobhive-runtime.d.ts",
       "import": "./dist/jobhive-runtime.js"
