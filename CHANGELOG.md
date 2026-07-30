@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Fixed
 
+- Activated bounded global-feed row quarantine in production so malformed rows
+  are recorded with typed, replay-safe evidence while valid Ashby and Lever
+  snapshots continue to publish and remain healthy.
 - Quarantined bounded semantically incomplete global-discovery rows with exact,
   replay-safe evidence so one malformed row no longer degrades an otherwise
   valid source snapshot.
