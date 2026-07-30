@@ -42,6 +42,9 @@ under `docs/release/`.
   direct links, themes, mobile layouts, and pagination; hid inactive Career
   Tracks, normalized workplace values, included 100% matches, and separated a
   filtered-empty result from an empty discovery account.
+- Restored hourly PostgreSQL replication to the bucket-scoped R2 backup
+  destination and verified a full remote read-back against the local archive
+  checksum without restarting production services.
 - Activated bounded global-feed row quarantine in production so malformed rows
   are recorded with typed, replay-safe evidence while valid Ashby and Lever
   snapshots continue to publish and remain healthy.
