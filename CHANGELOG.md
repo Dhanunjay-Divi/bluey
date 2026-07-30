@@ -14,6 +14,9 @@ under `docs/release/`.
 
 - Required the local `$bluey-ops` operating-memory preflight across Bluey agent
   entry points, work templates, and runbooks, with CI coverage for future docs.
+- Replaced the landing-page overlay mockup with a faithful, responsive preview
+  of the shipped Bluey host toolbar, answer workspace, caption rail, and
+  composer.
 
 ### Fixed
 
