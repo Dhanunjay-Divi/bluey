@@ -8977,3 +8977,92 @@
         justify-content: space-between;
       }
     }
+
+    /* Shared navigation bridge between the Bluey site and Bluey Jobs. */
+    #productSite .nav-links a.nav-jobs-link,
+    #accountApp .account-top a.nav-jobs-link,
+    #downloadApp .navlinks a.nav-jobs-link,
+    #policyApp .navlinks a.nav-jobs-link {
+      display: inline-flex;
+      align-items: center;
+      gap: .28rem;
+      color: var(--bluey-accent);
+      white-space: nowrap;
+    }
+
+    #productSite .nav-links a.nav-jobs-link:hover,
+    #accountApp .account-top a.nav-jobs-link:hover,
+    #downloadApp .navlinks a.nav-jobs-link:hover,
+    #policyApp .navlinks a.nav-jobs-link:hover {
+      color: #a5efff;
+    }
+
+    .nav-jobs-link svg {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 14px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .nav-jobs-label-short {
+      display: none;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-links a.nav-jobs-link,
+    html[data-bluey-theme="light"] #accountApp .account-top a.nav-jobs-link,
+    html[data-bluey-theme="light"] #downloadApp .navlinks a.nav-jobs-link,
+    html[data-bluey-theme="light"] #policyApp .navlinks a.nav-jobs-link {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-links a.nav-jobs-link:hover,
+    html[data-bluey-theme="light"] #accountApp .account-top a.nav-jobs-link:hover,
+    html[data-bluey-theme="light"] #downloadApp .navlinks a.nav-jobs-link:hover,
+    html[data-bluey-theme="light"] #policyApp .navlinks a.nav-jobs-link:hover {
+      color: #055f80;
+    }
+
+    @media (max-width: 600px) {
+      .nav-jobs-label-long {
+        display: none;
+      }
+
+      .nav-jobs-label-short {
+        display: inline;
+      }
+    }
+
+    @media (max-width: 520px) {
+      #productSite .nav {
+        padding: .85rem .75rem;
+        column-gap: .5rem;
+      }
+
+      #productSite .brand-wordmark {
+        width: 56px;
+      }
+
+      #productSite .nav-links {
+        gap: .45rem;
+      }
+
+      #productSite .nav-links a,
+      #productSite .nav-links .nav-signout {
+        font-size: .78rem;
+      }
+
+      #productSite .nav-links .btn-nav {
+        min-height: 30px;
+        padding: .42rem .6rem;
+        white-space: nowrap;
+      }
+    }
+
+    @media (max-width: 360px) {
+      #productSite .nav-links > a[href="/download"] {
+        display: none;
+      }
+    }

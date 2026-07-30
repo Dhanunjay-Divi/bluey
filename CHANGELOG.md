@@ -5,6 +5,11 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Added
+
+- Linked the Bluey landing, account, download, and policy headers to Bluey Jobs
+  with a compact, accessible new-tab action across desktop and mobile layouts.
+
 ### Changed
 
 - Required the local `$bluey-ops` operating-memory preflight across Bluey agent
