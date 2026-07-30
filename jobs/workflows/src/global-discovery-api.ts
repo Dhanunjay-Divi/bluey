@@ -85,6 +85,9 @@ export interface GlobalIngestionCompleteInput {
   scheduled_for_ms: number;
   artifact_sha256: string;
   expected_rows: number;
+  accepted_rows: number;
+  rejected_rows: number;
+  rejection_reasons: Record<string, number>;
   expected_batches: number;
   complete_snapshot: true;
 }
@@ -103,6 +106,8 @@ export interface GlobalIngestionRunResult {
   status: string;
   received_rows: number;
   received_batches: number;
+  rejected_rows: number;
+  rejection_reasons: Record<string, number>;
   expired_count: number;
   replayed: boolean;
 }
@@ -340,15 +345,39 @@ function parseBatchResult(value: unknown): GlobalIngestionBatchResult {
 
 function parseRunResult(value: unknown): GlobalIngestionRunResult {
   const result = record(value, "run result");
+  const rejectedRows = optionalInteger(result.rejected_rows, "rejected rows", 0, 5_000_000, 0);
+  const rejectionReasons = parseRejectionReasons(result.rejection_reasons);
+  if (Object.values(rejectionReasons).reduce((sum, count) => sum + count, 0) !== rejectedRows) {
+    throw invalidResponse("Global discovery rejection evidence does not reconcile");
+  }
   return {
     run_id: requiredString(result.run_id, "run ID", 200),
     replay_key: requiredString(result.replay_key, "replay key", 512),
     status: requiredString(result.status, "run status", 32),
     received_rows: requiredInteger(result.received_rows, "received rows", 0, 5_000_000),
     received_batches: requiredInteger(result.received_batches, "received batches", 0, 100_000),
+    rejected_rows: rejectedRows,
+    rejection_reasons: rejectionReasons,
     expired_count: requiredInteger(result.expired_count, "expired count", 0, 5_000_000),
     replayed: requiredBoolean(result.replayed, "replayed flag"),
   };
+}
+
+function parseRejectionReasons(value: unknown): Record<string, number> {
+  if (value === null || value === undefined) return {};
+  const reasons = record(value, "rejection reasons");
+  const entries = Object.entries(reasons);
+  if (entries.length > 16) {
+    throw invalidResponse("Global discovery rejection reasons are invalid");
+  }
+  const parsed: Record<string, number> = {};
+  for (const [reason, count] of entries) {
+    if (!/^[a-z0-9_]{1,80}$/.test(reason)) {
+      throw invalidResponse("Global discovery rejection reason is invalid");
+    }
+    parsed[reason] = requiredInteger(count, "rejection reason count", 1, 5_000_000);
+  }
+  return parsed;
 }
 
 function sourcePath(sourceId: string, action: string): string {
@@ -415,6 +444,17 @@ function requiredInteger(value: unknown, label: string, minimum: number, maximum
     throw invalidResponse(`Global discovery ${label} is invalid`);
   }
   return value;
+}
+
+function optionalInteger(
+  value: unknown,
+  label: string,
+  minimum: number,
+  maximum: number,
+  fallback: number,
+): number {
+  if (value === null || value === undefined) return fallback;
+  return requiredInteger(value, label, minimum, maximum);
 }
 
 function nullableInteger(value: unknown, label: string): number | null {

@@ -273,6 +273,8 @@ const SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX: &str =
     include_str!("../../../infra/sqlite/server-runtime/035_jobs_global_candidate_index.sql");
 const SQLITE_JOBS_RESUME_SOURCE_ASSETS: &str =
     include_str!("../../../infra/sqlite/server-runtime/036_jobs_resume_source_assets.sql");
+const SQLITE_JOBS_GLOBAL_INGESTION_QUARANTINE: &str =
+    include_str!("../../../infra/sqlite/server-runtime/039_jobs_global_ingestion_quarantine.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1580,6 +1582,8 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_provider_messages_status
         ON jobs_provider_messages(account_id, processing_status, updated_at_ms DESC);
     "#,
+    // 0039 - bounded semantic-row quarantine evidence for global discovery.
+    SQLITE_JOBS_GLOBAL_INGESTION_QUARANTINE,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1595,6 +1599,18 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    ensure_column(
+        &conn,
+        "jobs_global_ingestion_runs",
+        "rejected_rows",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_global_ingestion_runs",
+        "rejection_summary_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
     ensure_column(&conn, "stt_sessions", "started_at_ms", "INTEGER")?;
     ensure_column(&conn, "stt_sessions", "ended_at_ms", "INTEGER")?;
     ensure_column(&conn, "stt_sessions", "relay_close_reason", "TEXT")?;
@@ -1938,6 +1954,8 @@ const POSTGRES_JOBS_PROVIDER_CONNECTIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/014_jobs_provider_connections.sql");
 const POSTGRES_JOBS_MAILBOX_SYNC: &str =
     include_str!("../../../infra/postgres/server-runtime/015_jobs_mailbox_sync.sql");
+const POSTGRES_JOBS_GLOBAL_INGESTION_QUARANTINE: &str =
+    include_str!("../../../infra/postgres/server-runtime/016_jobs_global_ingestion_quarantine.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -1987,6 +2005,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         POSTGRES_JOBS_PROVIDER_CONNECTIONS,
     ),
     ("015_jobs_mailbox_sync.sql", POSTGRES_JOBS_MAILBOX_SYNC),
+    (
+        "016_jobs_global_ingestion_quarantine.sql",
+        POSTGRES_JOBS_GLOBAL_INGESTION_QUARANTINE,
+    ),
 ];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
@@ -2124,7 +2146,47 @@ mod blocking_boundary_tests {
 
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
-    use super::{open_pool, run_migrations};
+    use super::{ensure_column, open_pool, run_migrations};
+
+    #[test]
+    fn global_ingestion_quarantine_columns_upgrade_in_place() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE jobs_global_ingestion_runs (
+                id TEXT PRIMARY KEY,
+                source_id TEXT NOT NULL
+             );
+             INSERT INTO jobs_global_ingestion_runs (id, source_id)
+             VALUES ('run-legacy', 'source-legacy');",
+        )
+        .unwrap();
+
+        ensure_column(
+            &conn,
+            "jobs_global_ingestion_runs",
+            "rejected_rows",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
+        .unwrap();
+        ensure_column(
+            &conn,
+            "jobs_global_ingestion_runs",
+            "rejection_summary_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        .unwrap();
+
+        let upgraded: (i64, String) = conn
+            .query_row(
+                "SELECT rejected_rows, rejection_summary_json
+                   FROM jobs_global_ingestion_runs
+                  WHERE id = 'run-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(upgraded, (0, "{}".to_string()));
+    }
 
     #[test]
     fn data_repairs_do_not_update_rows_after_markers_exist() {
@@ -2369,8 +2431,9 @@ mod sqlite_migration_replay_tests {
 #[cfg(test)]
 mod postgres_migration_tests {
     use super::{
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS,
-        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
     };
 
     #[test]
@@ -2505,5 +2568,22 @@ mod postgres_migration_tests {
                 "SQLite migration missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn global_ingestion_quarantine_is_persisted_for_fresh_and_upgraded_postgres() {
+        for sql in [
+            POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+            POSTGRES_POST_JOBS_MIGRATIONS
+                .iter()
+                .find(|(version, _)| *version == "016_jobs_global_ingestion_quarantine.sql")
+                .map(|(_, sql)| *sql)
+                .expect("global ingestion quarantine migration must run before its worker starts"),
+        ] {
+            assert!(sql.contains("rejected_rows"));
+            assert!(sql.contains("rejection_summary_json"));
+        }
+        assert!(POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX
+            .contains("rejection_summary_json TEXT NOT NULL DEFAULT '{}'"));
     }
 }

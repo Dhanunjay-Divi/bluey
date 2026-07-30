@@ -39,7 +39,15 @@ export type GlobalDiscoveryPollOutcome = "completed" | "failed" | "idle";
 
 export type GlobalDiscoveryWorkerLogEvent =
   | { event: "global_discovery_manifest_synced"; source_count: number; row_count: number }
-  | { event: "global_discovery_source_completed"; source_fingerprint: string; rows: number; batches: number }
+  | {
+      event: "global_discovery_source_completed";
+      source_fingerprint: string;
+      rows: number;
+      accepted_rows: number;
+      rejected_rows: number;
+      rejection_reasons: Record<string, number>;
+      batches: number;
+    }
   | { event: "global_discovery_source_failed"; source_fingerprint: string; error_code: string }
   | { event: "global_discovery_poll_failed"; error_code: string };
 
@@ -80,6 +88,12 @@ interface GlobalSourceConfig {
   snapshotAtMs: number;
   requiresOriginalRevalidation: true;
 }
+
+type GlobalRejectionReason = "missing_identity";
+
+type GlobalRowClassification =
+  | { kind: "accepted"; job: GlobalDiscoveredJobInput }
+  | { kind: "rejected"; reason: GlobalRejectionReason };
 
 const consoleLogger: GlobalDiscoveryWorkerLogger = {
   log: (event) => console.log(JSON.stringify(event)),
@@ -212,13 +226,28 @@ export class GlobalDiscoveryWorkerRuntime {
       });
       verifiedPath = verified.path;
       let batchIndex = 0;
+      let processedRows = 0;
       let uploadedRows = 0;
+      let rejectedRows = 0;
+      const rejectionReasons: Record<string, number> = {};
       await streamVerifiedJobhiveCsv({
         verified,
         batchRows: this.uploadBatchRows,
         onBatch: async (rows) => {
+          processedRows += rows.length;
+          const acceptedJobs: GlobalDiscoveredJobInput[] = [];
+          for (const row of rows) {
+            const classification = globalJob(row, source.sourceFamily);
+            if (classification.kind === "accepted") {
+              acceptedJobs.push(classification.job);
+            } else {
+              rejectedRows += 1;
+              rejectionReasons[classification.reason] =
+                (rejectionReasons[classification.reason] ?? 0) + 1;
+            }
+          }
           for (const jobs of uploadBatches(
-            rows.map((row) => globalJob(row, source.sourceFamily)),
+            acceptedJobs,
             this.uploadBatchRows,
             this.uploadBatchBytes,
           )) {
@@ -238,7 +267,12 @@ export class GlobalDiscoveryWorkerRuntime {
           }
         },
       });
-      if (uploadedRows !== source.rows || batchIndex < 1) {
+      if (
+        processedRows !== source.rows
+        || uploadedRows + rejectedRows !== source.rows
+        || uploadedRows < 1
+        || batchIndex < 1
+      ) {
         throw new JobhiveArtifactError("row_count_mismatch", "Jobhive upload row count did not match its manifest");
       }
       const result = await this.api.complete(lease.source.id, {
@@ -246,17 +280,28 @@ export class GlobalDiscoveryWorkerRuntime {
         replay_key: lease.replay_key,
         scheduled_for_ms: lease.scheduled_for_ms,
         artifact_sha256: verified.sha256,
-        expected_rows: uploadedRows,
+        expected_rows: source.rows,
+        accepted_rows: uploadedRows,
+        rejected_rows: rejectedRows,
+        rejection_reasons: rejectionReasons,
         expected_batches: batchIndex,
         complete_snapshot: true,
       });
-      if (result.received_rows !== uploadedRows || result.received_batches !== batchIndex) {
+      if (
+        result.received_rows !== uploadedRows
+        || result.received_batches !== batchIndex
+        || result.rejected_rows !== rejectedRows
+        || !sameIntegerRecord(result.rejection_reasons, rejectionReasons)
+      ) {
         throw new Error("global_completion_ack_mismatch");
       }
       this.logger.log({
         event: "global_discovery_source_completed",
         source_fingerprint: sourceFingerprint,
-        rows: uploadedRows,
+        rows: source.rows,
+        accepted_rows: uploadedRows,
+        rejected_rows: rejectedRows,
+        rejection_reasons: rejectionReasons,
         batches: batchIndex,
       });
       return "completed";
@@ -381,25 +426,36 @@ function matchesLeaseSnapshot(
     && config.requiresOriginalRevalidation;
 }
 
-function globalJob(row: JobhiveCandidateRow, sourceFamily: string): GlobalDiscoveredJobInput {
+function globalJob(row: JobhiveCandidateRow, sourceFamily: string): GlobalRowClassification {
   const canonicalUrl = row.applyUrl || row.url;
-  if (!canonicalUrl || !row.company || !row.title) throw new JobhiveArtifactError("invalid_artifact", "Jobhive row is missing job identity");
+  if (!canonicalUrl || !row.company || !row.title) {
+    return { kind: "rejected", reason: "missing_identity" };
+  }
   const employmentEvidence = `${row.employmentType} ${row.commitment}`.trim();
   return {
-    external_id: row.atsId || row.requisitionId || createHash("sha256").update(canonicalUrl).digest("hex"),
-    canonical_url: canonicalUrl,
-    title: row.title,
-    company: row.company,
-    source_catalog_id: `jobhive:${sourceFamily}`,
-    requires_original_revalidation: true,
-    location: row.location || row.countryIso,
-    workplace: workplace(row),
-    description: row.description,
-    compensation: compensation(row),
-    employment_type: employmentType(employmentEvidence),
-    engagement_type: engagementType(employmentEvidence),
-    posted_at_ms: postedAt(row.postedAt),
+    kind: "accepted",
+    job: {
+      external_id: row.atsId || row.requisitionId || createHash("sha256").update(canonicalUrl).digest("hex"),
+      canonical_url: canonicalUrl,
+      title: row.title,
+      company: row.company,
+      source_catalog_id: `jobhive:${sourceFamily}`,
+      requires_original_revalidation: true,
+      location: row.location || row.countryIso,
+      workplace: workplace(row),
+      description: row.description,
+      compensation: compensation(row),
+      employment_type: employmentType(employmentEvidence),
+      engagement_type: engagementType(employmentEvidence),
+      posted_at_ms: postedAt(row.postedAt),
+    },
   };
+}
+
+function sameIntegerRecord(left: Record<string, number>, right: Record<string, number>): boolean {
+  const leftEntries = Object.entries(left).sort(([a], [b]) => a.localeCompare(b));
+  const rightEntries = Object.entries(right).sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify(leftEntries) === JSON.stringify(rightEntries);
 }
 
 function workplace(row: JobhiveCandidateRow): string {

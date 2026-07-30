@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Fixed
 
+- Quarantined bounded semantically incomplete global-discovery rows with exact,
+  replay-safe evidence so one malformed row no longer degrades an otherwise
+  valid source snapshot.
 - Kept both Bluey Jobs discovery workers independent from resume/PDF rendering
   dependencies so their Linux runtimes do not require an optional native canvas
   binding.

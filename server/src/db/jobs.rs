@@ -621,6 +621,12 @@ pub struct GlobalIngestionCompleteInput {
     pub scheduled_for_ms: i64,
     pub artifact_sha256: String,
     pub expected_rows: i64,
+    #[serde(default)]
+    pub accepted_rows: Option<i64>,
+    #[serde(default)]
+    pub rejected_rows: i64,
+    #[serde(default)]
+    pub rejection_reasons: BTreeMap<String, i64>,
     pub expected_batches: i64,
     #[serde(default)]
     pub complete_snapshot: bool,
@@ -642,6 +648,8 @@ pub struct GlobalIngestionRunResult {
     pub status: String,
     pub received_rows: i64,
     pub received_batches: i64,
+    pub rejected_rows: i64,
+    pub rejection_reasons: BTreeMap<String, i64>,
     pub expired_count: i64,
     pub replayed: bool,
 }
