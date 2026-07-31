@@ -574,6 +574,37 @@ mod tests {
         input
     }
 
+    fn prepare_archivable_global_candidate(
+        pool: &DbPool,
+        id: &str,
+    ) -> DiscoveredJobInput {
+        let input = insert_global_candidate(
+            pool,
+            id,
+            &format!("external-{id}"),
+            &format!("https://jobs.lever.co/acme/{id}"),
+            1,
+        );
+        let content_hash = "a".repeat(64);
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidates
+                SET availability_status = 'expired', content_hash = ?2,
+                    updated_at_ms = 1
+              WHERE id = ?1",
+            params![id, content_hash],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidate_memberships
+                SET availability_status = 'expired'
+              WHERE candidate_id = ?1",
+            params![id],
+        )
+        .unwrap();
+        input
+    }
+
     #[test]
     fn resume_import_facts_must_be_confirmed_before_entering_resume_claims() {
         let pool = test_pool();
@@ -1037,6 +1068,278 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_global_manifest_preserves_the_completed_run_schedule() {
+        let pool = test_pool();
+        let snapshot_at_ms = now_ms() - 60_000;
+        let input = GlobalDiscoverySourceInput {
+            provider: "jobhive".to_string(),
+            source_key: "lever-schedule".to_string(),
+            source_family: "lever".to_string(),
+            artifact_url: "https://storage.stapply.ai/lever.csv".to_string(),
+            artifact_sha256: "a".repeat(64),
+            expected_rows: 10,
+            snapshot_at_ms,
+            run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+        };
+        let source = sync_global_discovery_sources(&pool, std::slice::from_ref(&input))
+            .unwrap()
+            .remove(0);
+        let scheduled_at_ms = now_ms() + DAY_MS;
+        let stable_updated_at_ms = now_ms() - 30_000;
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_global_discovery_sources
+                    SET next_run_at_ms = ?2, updated_at_ms = ?3
+                  WHERE id = ?1",
+                params![source.id, scheduled_at_ms, stable_updated_at_ms],
+            )
+            .unwrap();
+
+        let unchanged = sync_global_discovery_sources(&pool, std::slice::from_ref(&input))
+            .unwrap()
+            .remove(0);
+        assert_eq!(unchanged.next_run_at_ms, scheduled_at_ms);
+        assert_eq!(unchanged.updated_at_ms, stable_updated_at_ms);
+
+        let mut metadata_only = input.clone();
+        metadata_only.artifact_url = "https://storage.stapply.ai/lever-current.csv".to_string();
+        metadata_only.snapshot_at_ms += 1_000;
+        let refreshed = sync_global_discovery_sources(&pool, &[metadata_only.clone()])
+            .unwrap()
+            .remove(0);
+        assert_eq!(refreshed.next_run_at_ms, scheduled_at_ms);
+        assert_eq!(
+            refreshed.config["artifactUrl"],
+            json!("https://storage.stapply.ai/lever-current.csv")
+        );
+
+        let changed_at_ms = now_ms();
+        metadata_only.artifact_sha256 = "b".repeat(64);
+        let changed = sync_global_discovery_sources(&pool, &[metadata_only])
+            .unwrap()
+            .remove(0);
+        assert!(changed.next_run_at_ms >= changed_at_ms);
+        assert!(changed.next_run_at_ms <= now_ms());
+    }
+
+    #[test]
+    fn unchanged_global_candidate_does_not_rewrite_the_canonical_payload() {
+        let pool = test_pool();
+        let source = sync_global_discovery_sources(
+            &pool,
+            &[GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "lever-noop-candidate".to_string(),
+                source_family: "lever".to_string(),
+                artifact_url: "https://storage.stapply.ai/lever.csv".to_string(),
+                artifact_sha256: "a".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms: now_ms(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            }],
+        )
+        .unwrap()
+        .remove(0);
+        let input = curated_discovered_job(
+            "lever-noop-candidate",
+            "https://jobs.lever.co/acme/lever-noop-candidate",
+        );
+        let first = normalize_global_candidate("jobhive", "lever", &input).unwrap();
+        let second = normalize_global_candidate("jobhive", "lever", &input).unwrap();
+        assert_eq!(first.content_hash, second.content_hash);
+        assert_ne!(first.candidate_json, second.candidate_json);
+
+        let first_seen_at_ms = now_ms() - 2_000;
+        let second_seen_at_ms = first_seen_at_ms + 1_000;
+        let mut conn = pool.get().unwrap();
+        for (run_id, replay_key, started_at_ms) in [
+            ("run-first", "replay-first", first_seen_at_ms),
+            ("run-second", "replay-second", second_seen_at_ms),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs_global_ingestion_runs (
+                    id, source_id, replay_key, status, expected_rows, received_rows,
+                    received_batches, artifact_sha256, started_at_ms
+                 ) VALUES (?1, ?2, ?3, 'running', 1, 0, 0, ?4, ?5)",
+                params![
+                    run_id,
+                    source.id,
+                    replay_key,
+                    "a".repeat(64),
+                    started_at_ms,
+                ],
+            )
+            .unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        upsert_global_candidate_sqlite(
+            &tx,
+            &source.id,
+            "run-first",
+            &first,
+            first_seen_at_ms,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let (stored_payload, stored_updated_at_ms): (String, i64) = conn
+            .query_row(
+                "SELECT candidate_json, updated_at_ms
+                   FROM jobs_global_candidates
+                  WHERE canonical_key = ?1",
+                params![first.canonical_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        upsert_global_candidate_sqlite(
+            &tx,
+            &source.id,
+            "run-second",
+            &second,
+            second_seen_at_ms,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let (payload_after_second_run, updated_at_after_second_run): (String, i64) = conn
+            .query_row(
+                "SELECT candidate_json, updated_at_ms
+                   FROM jobs_global_candidates
+                  WHERE canonical_key = ?1",
+                params![first.canonical_key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let (membership_seen_at_ms, membership_run_id): (i64, String) = conn
+            .query_row(
+                "SELECT last_seen_at_ms, last_seen_run_id
+                   FROM jobs_global_candidate_memberships
+                  WHERE source_id = ?1 AND external_id = ?2",
+                params![source.id, first.external_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(stored_payload, payload_after_second_run);
+        assert_eq!(stored_updated_at_ms, first_seen_at_ms);
+        assert_eq!(updated_at_after_second_run, first_seen_at_ms);
+        assert_eq!(membership_seen_at_ms, second_seen_at_ms);
+        assert_eq!(membership_run_id, "run-second");
+    }
+
+    #[test]
+    fn rediscovered_archived_global_candidate_restores_the_hot_payload() {
+        let pool = test_pool();
+        let source = sync_global_discovery_sources(
+            &pool,
+            &[GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "lever-rediscovered-candidate".to_string(),
+                source_family: "lever".to_string(),
+                artifact_url: "https://storage.stapply.ai/lever.csv".to_string(),
+                artifact_sha256: "a".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms: now_ms(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            }],
+        )
+        .unwrap()
+        .remove(0);
+        let input = curated_discovered_job(
+            "lever-rediscovered-candidate",
+            "https://jobs.lever.co/acme/lever-rediscovered-candidate",
+        );
+        let first = normalize_global_candidate("jobhive", "lever", &input).unwrap();
+        let rediscovered = normalize_global_candidate("jobhive", "lever", &input).unwrap();
+        let mut conn = pool.get().unwrap();
+        for (run_id, replay_key, started_at_ms) in [
+            ("run-before-archive", "replay-before-archive", 10_000),
+            ("run-after-archive", "replay-after-archive", 20_000),
+        ] {
+            conn.execute(
+                "INSERT INTO jobs_global_ingestion_runs (
+                    id, source_id, replay_key, status, expected_rows, received_rows,
+                    received_batches, artifact_sha256, started_at_ms
+                 ) VALUES (?1, ?2, ?3, 'running', 1, 0, 0, ?4, ?5)",
+                params![
+                    run_id,
+                    source.id,
+                    replay_key,
+                    "a".repeat(64),
+                    started_at_ms,
+                ],
+            )
+            .unwrap();
+        }
+        let tx = conn.transaction().unwrap();
+        upsert_global_candidate_sqlite(&tx, &source.id, "run-before-archive", &first, 10_000)
+            .unwrap();
+        tx.commit().unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidates
+                SET candidate_json = '{}', availability_status = 'expired',
+                    archive_state = 'archived', archive_storage_key = 'archive.json',
+                    archive_sha256 = ?2, archive_size_bytes = 1024, archived_at_ms = 15_000
+              WHERE canonical_key = ?1",
+            params![first.canonical_key, "b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidate_memberships
+                SET availability_status = 'expired'
+              WHERE source_id = ?1 AND external_id = ?2",
+            params![source.id, first.external_id],
+        )
+        .unwrap();
+
+        let tx = conn.transaction().unwrap();
+        upsert_global_candidate_sqlite(
+            &tx,
+            &source.id,
+            "run-after-archive",
+            &rediscovered,
+            20_000,
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let restored: (String, String, String, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT candidate_json, availability_status, archive_state,
+                        archive_storage_key, archived_at_ms
+                   FROM jobs_global_candidates
+                  WHERE canonical_key = ?1",
+                params![first.canonical_key],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let membership_status: String = conn
+            .query_row(
+                "SELECT availability_status
+                   FROM jobs_global_candidate_memberships
+                  WHERE source_id = ?1 AND external_id = ?2",
+                params![source.id, first.external_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(restored.0, rediscovered.candidate_json);
+        assert_eq!(restored.1, "unknown");
+        assert_eq!(restored.2, "hot");
+        assert!(restored.3.is_none());
+        assert!(restored.4.is_none());
+        assert_eq!(membership_status, "active");
+    }
+
+    #[test]
     fn global_ingestion_recovers_after_completion_response_is_lost() {
         let pool = test_pool();
         let artifact_sha256 = "a".repeat(64);
@@ -1388,6 +1691,319 @@ mod tests {
             )
             .unwrap();
         assert_eq!(materialization_count, 0);
+    }
+
+    #[test]
+    fn verified_archive_completion_replaces_only_heavy_candidate_fields() {
+        let pool = test_pool();
+        let input = prepare_archivable_global_candidate(&pool, "candidate-archive-complete");
+        let leases = claim_global_candidate_archive_jobs(
+            &pool,
+            "archive-worker",
+            100_000,
+            10,
+            60_000,
+            10,
+        )
+        .unwrap();
+        assert_eq!(leases.len(), 1);
+
+        assert!(complete_global_candidate_archive(
+            &pool,
+            &leases[0],
+            "bluey-cloud/global/jobs/candidates/candidate-archive-complete/archive.json",
+            &"b".repeat(64),
+            1_024,
+            100_001,
+        )
+        .unwrap());
+
+        let conn = pool.get().unwrap();
+        let archived: (String, String, String, i64, Option<i64>, String) = conn
+            .query_row(
+                "SELECT archive_state, archive_storage_key, archive_sha256,
+                        archive_size_bytes, archived_at_ms, candidate_json
+                   FROM jobs_global_candidates
+                  WHERE id = ?1",
+                params!["candidate-archive-complete"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(archived.0, "archived");
+        assert!(archived.1.ends_with("/archive.json"));
+        assert_eq!(archived.2, "b".repeat(64));
+        assert_eq!(archived.3, 1_024);
+        assert_eq!(archived.4, Some(100_001));
+        let tombstone: DiscoveredJobInput =
+            parse_json(archived.5, "archived global candidate tombstone").unwrap();
+        assert_eq!(tombstone.title, input.title);
+        assert_eq!(tombstone.company, input.company);
+        assert_eq!(tombstone.canonical_url, input.canonical_url);
+        assert!(tombstone.description.is_empty());
+        assert!(tombstone.compensation.is_empty());
+    }
+
+    #[test]
+    fn legacy_expired_candidate_hashes_before_archive() {
+        let pool = test_pool();
+        let candidate_id = "candidate-archive-legacy";
+        insert_global_candidate(
+            &pool,
+            candidate_id,
+            "external-archive-legacy",
+            "https://jobs.lever.co/acme/candidate-archive-legacy",
+            1,
+        );
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidates
+                SET availability_status = 'expired', content_hash = '', updated_at_ms = 1
+              WHERE id = ?1",
+            params![candidate_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidate_memberships
+                SET availability_status = 'expired'
+              WHERE candidate_id = ?1",
+            params![candidate_id],
+        )
+        .unwrap();
+        let candidate_json: String = conn
+            .query_row(
+                "SELECT candidate_json FROM jobs_global_candidates WHERE id = ?1",
+                params![candidate_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+
+        let lease = claim_global_candidate_archive_jobs(
+            &pool,
+            "archive-worker",
+            100_000,
+            10,
+            60_000,
+            1,
+        )
+        .unwrap()
+        .remove(0);
+
+        assert_eq!(lease.candidate_id, candidate_id);
+        assert_eq!(
+            lease.content_hash,
+            global_candidate_content_hash(&candidate_json).unwrap()
+        );
+        let stored_hash: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT content_hash FROM jobs_global_candidates WHERE id = ?1",
+                params![candidate_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_hash, lease.content_hash);
+    }
+
+    #[test]
+    fn corrupt_legacy_candidate_retries_without_blocking_valid_candidate() {
+        let pool = test_pool();
+        prepare_archivable_global_candidate(&pool, "candidate-archive-valid");
+        let candidate_id = "candidate-archive-corrupt";
+        insert_global_candidate(
+            &pool,
+            candidate_id,
+            "external-archive-corrupt",
+            "https://jobs.lever.co/acme/candidate-archive-corrupt",
+            1,
+        );
+        let corrupt_payload = "not-json";
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidates
+                SET availability_status = 'expired', content_hash = '',
+                    candidate_json = ?2, updated_at_ms = 1
+              WHERE id = ?1",
+            params![candidate_id, corrupt_payload],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidate_memberships
+                SET availability_status = 'expired'
+              WHERE candidate_id = ?1",
+            params![candidate_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let leases = claim_global_candidate_archive_jobs(
+            &pool,
+            "archive-worker",
+            100_000,
+            10,
+            60_000,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].candidate_id, "candidate-archive-valid");
+        let retry: (String, i64, i64, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT archive_state, archive_attempt_count,
+                        archive_next_attempt_at_ms, candidate_json
+                   FROM jobs_global_candidates
+                  WHERE id = ?1",
+                params![candidate_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(retry.0, "retry");
+        assert_eq!(retry.1, 1);
+        assert!(retry.2 > 100_000);
+        assert_eq!(retry.3, corrupt_payload);
+    }
+
+    #[test]
+    fn active_membership_blocks_global_candidate_archive() {
+        let pool = test_pool();
+        insert_global_candidate(
+            &pool,
+            "candidate-archive-active",
+            "external-active",
+            "https://jobs.lever.co/acme/candidate-archive-active",
+            1,
+        );
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_global_candidates
+                    SET availability_status = 'expired', content_hash = ?2,
+                        updated_at_ms = 1
+                  WHERE id = ?1",
+                params!["candidate-archive-active", "a".repeat(64)],
+            )
+            .unwrap();
+
+        let leases = claim_global_candidate_archive_jobs(
+            &pool,
+            "archive-worker",
+            100_000,
+            10,
+            60_000,
+            10,
+        )
+        .unwrap();
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn account_materialization_blocks_global_candidate_archive() {
+        let pool = test_pool();
+        save_profile(&pool, "acct-jobs", &default_profile("jobs@example.com")).unwrap();
+        insert_global_candidate(
+            &pool,
+            "candidate-archive-materialized",
+            "external-materialized",
+            "https://jobs.lever.co/acme/candidate-archive-materialized",
+            now_ms(),
+        );
+        let result =
+            materialize_global_candidates_for_account(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap();
+        assert_eq!(result.materialized_count, 1);
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidates
+                SET availability_status = 'expired', content_hash = ?2,
+                    updated_at_ms = 1
+              WHERE id = ?1",
+            params!["candidate-archive-materialized", "a".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_global_candidate_memberships
+                SET availability_status = 'expired'
+              WHERE candidate_id = ?1",
+            params!["candidate-archive-materialized"],
+        )
+        .unwrap();
+
+        let leases = claim_global_candidate_archive_jobs(
+            &pool,
+            "archive-worker",
+            100_000,
+            10,
+            60_000,
+            10,
+        )
+        .unwrap();
+        assert!(leases.is_empty());
+    }
+
+    #[test]
+    fn failed_global_candidate_archive_keeps_payload_and_schedules_retry() {
+        let pool = test_pool();
+        prepare_archivable_global_candidate(&pool, "candidate-archive-retry");
+        let original_payload: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT candidate_json FROM jobs_global_candidates WHERE id = ?1",
+                params!["candidate-archive-retry"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let lease = claim_global_candidate_archive_jobs(
+            &pool,
+            "archive-worker",
+            100_000,
+            10,
+            60_000,
+            1,
+        )
+        .unwrap()
+        .remove(0);
+
+        assert!(fail_global_candidate_archive(&pool, &lease, 100_001).unwrap());
+
+        let retry: (String, i64, i64, String, Option<String>) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT archive_state, archive_attempt_count,
+                        archive_next_attempt_at_ms, candidate_json, archive_lease_owner
+                   FROM jobs_global_candidates
+                  WHERE id = ?1",
+                params!["candidate-archive-retry"],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(retry.0, "retry");
+        assert_eq!(retry.1, 1);
+        assert!(retry.2 > 100_001);
+        assert_eq!(retry.3, original_payload);
+        assert!(retry.4.is_none());
     }
 
     #[test]

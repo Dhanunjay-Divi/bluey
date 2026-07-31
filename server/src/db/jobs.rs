@@ -1578,6 +1578,11 @@ fn decrypt_payload(raw: &str) -> Result<String> {
     String::from_utf8(plain).context("Bluey Jobs payload is not UTF-8")
 }
 
+#[cfg(test)]
+pub(crate) fn decrypt_payload_for_test(raw: &str) -> Result<String> {
+    decrypt_payload(raw)
+}
+
 fn parse_json_lossy<T: DeserializeOwned>(raw: &str) -> Option<T> {
     decrypt_payload(raw)
         .ok()
@@ -1592,6 +1597,7 @@ include!("jobs/discovery.rs");
 include!("jobs/global_discovery.rs");
 include!("jobs/global_discovery_completion.rs");
 include!("jobs/global_materialization.rs");
+include!("jobs/global_archive.rs");
 include!("jobs/resume_assets.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");

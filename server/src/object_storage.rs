@@ -97,6 +97,16 @@ impl ObjectStorage {
         )
     }
 
+    pub fn global_candidate_archive_key(&self, candidate_id: &str, content_hash: &str) -> String {
+        let prefix = self.config.key_prefix.trim_matches('/');
+        let suffix = format!("global/jobs/candidates/{candidate_id}/sha256/{content_hash}.json");
+        if prefix.is_empty() {
+            suffix
+        } else {
+            format!("{prefix}/{suffix}")
+        }
+    }
+
     pub fn key_belongs_to_account(&self, key: &str, account_id: &str) -> bool {
         let prefix = self.config.key_prefix.trim_matches('/');
         let expected = if prefix.is_empty() {
@@ -483,6 +493,11 @@ mod tests {
         assert_eq!(
             audit_key,
             format!("bluey-cloud/accounts/acct/sessions/session/audit/bundle/sha256/{hash}.json")
+        );
+        let archive_key = storage.global_candidate_archive_key("candidate", &hash);
+        assert_eq!(
+            archive_key,
+            format!("bluey-cloud/global/jobs/candidates/candidate/sha256/{hash}.json")
         );
     }
 

@@ -4,7 +4,7 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_mailbox_sync,
+    db, jobs_global_archive, jobs_mailbox_sync,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
@@ -19,6 +19,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env().context("load Bluey configuration")?;
+    let archive_storage_config = config.object_storage.clone();
     db::jobs::validate_data_encryption_config().context("validate Jobs data encryption")?;
     api::jobs_local_capability::validate_runtime_config()
         .context("validate Bluey Browser capability configuration")?;
@@ -61,6 +62,11 @@ async fn main() -> anyhow::Result<()> {
     );
     let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
     let mailbox_sync_worker = jobs_mailbox_sync::spawn_mailbox_sync_worker(pool.clone());
+    let global_archive_worker = jobs_global_archive::spawn_global_candidate_archive_worker(
+        pool.clone(),
+        archive_storage_config,
+    )
+    .context("start global job candidate archive worker")?;
 
     let app = api::build_jobs_router(pool, config);
     let addr = SocketAddr::new(host, port);
@@ -77,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
     .await
     .context("serve Bluey Jobs API")?;
     if let Some(worker) = mailbox_sync_worker {
+        worker.abort();
+    }
+    if let Some(worker) = global_archive_worker {
         worker.abort();
     }
     spend_truth_janitor.abort();
