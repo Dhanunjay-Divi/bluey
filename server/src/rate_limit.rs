@@ -868,7 +868,7 @@ pub async fn limit_jobs_api(
         Ok(()) => Ok(next.run(req).await),
         Err(retry) => {
             tracing::warn!(
-                account_id = %account.0.id,
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.0.id),
                 client = %client,
                 rate_class = ?rate_class,
                 method = %req.method(),

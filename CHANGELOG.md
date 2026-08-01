@@ -12,6 +12,18 @@ under `docs/release/`.
 
 ### Fixed
 
+- Restored Rust 1.97 warning-as-error compatibility across Linux, macOS, and
+  Windows builds by aligning platform-specific imports and helper functions
+  with their actual compile targets.
+- Restored the Linux system-audio integration stub without enabling unsupported
+  release capture, and replaced a raw Jobs rate-limit account log with its
+  canonical hashed observability identifier.
+- Made intentional system-audio shutdown abort diagnostic draining immediately,
+  keeping stalled-helper cancellation inside the public stop deadline under
+  loaded Linux CI runners.
+- Split workspace and server tests across isolated GitHub runners and removed
+  duplicate feature-push executions when a pull request already supplies the
+  same required CI gates.
 - Activated bounded global-feed row quarantine in production so malformed rows
   are recorded with typed, replay-safe evidence while valid Ashby and Lever
   snapshots continue to publish and remain healthy.

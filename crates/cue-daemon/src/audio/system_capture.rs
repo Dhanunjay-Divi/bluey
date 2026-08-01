@@ -44,6 +44,7 @@ const HELPER_DIAGNOSTIC_MAX_LINE_BYTES: usize = 4 * 1024;
 const HELPER_DIAGNOSTIC_MAX_PARSED_LINES: u64 = 256;
 const HELPER_DIAGNOSTIC_MAX_FIELD_CHARS: usize = 160;
 
+#[cfg(any(target_os = "macos", target_os = "windows", debug_assertions))]
 const AUDIO_HELPER_OVERRIDE_ENV_NAMES: &[&str] = &[
     "BLUEY_SYSTEM_AUDIO_BINARY",
     "BLUEY_AUDIO_HELPER_BIN",
@@ -301,7 +302,7 @@ fn find_platform_audio_helper_with(
     Ok(None)
 }
 
-#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[cfg(any(target_os = "macos", target_os = "windows", debug_assertions))]
 fn canonical_audio_helper(path: &Path) -> io::Result<PathBuf> {
     let canonical = path.canonicalize().map_err(|error| {
         io::Error::new(
@@ -382,7 +383,31 @@ fn push_named_candidates(candidates: &mut Vec<PathBuf>, dir: &Path, names: &[&st
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(all(not(any(target_os = "macos", target_os = "windows")), debug_assertions))]
+pub(crate) fn find_native_audio_helper() -> Option<PathBuf> {
+    let override_path = AUDIO_HELPER_OVERRIDE_ENV_NAMES
+        .iter()
+        .find_map(|name| std::env::var_os(name).filter(|value| !value.is_empty()))
+        .map(PathBuf::from)?;
+    match canonical_audio_helper(&override_path) {
+        Ok(path) => {
+            tracing::info!(
+                path = %path.display(),
+                "using audio helper binary override in development build"
+            );
+            Some(path)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "audio helper discovery rejected an untrusted candidate");
+            None
+        }
+    }
+}
+
+#[cfg(all(
+    not(any(target_os = "macos", target_os = "windows")),
+    not(debug_assertions)
+))]
 pub(crate) fn find_native_audio_helper() -> Option<PathBuf> {
     None
 }
@@ -1226,22 +1251,24 @@ async fn read_child_stdout_with_protocol(
         }
     }
 
-    let status = if intentional_stop {
+    if intentional_stop || stop.load(Ordering::Acquire) {
+        diagnostics_task.abort();
         terminate_helper_child(child).await;
-        None
-    } else {
-        match tokio::time::timeout(HELPER_EXIT_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "failed to wait for system audio helper");
-                None
-            }
-            Err(_) => {
-                tracing::warn!("system audio helper did not exit after closing stdout");
-                stdout_error = true;
-                terminate_helper_child(child).await;
-                None
-            }
+        let _ = diagnostics_task.await;
+        return HelperRunDisposition::Clean;
+    }
+
+    let status = match tokio::time::timeout(HELPER_EXIT_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to wait for system audio helper");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("system audio helper did not exit after closing stdout");
+            stdout_error = true;
+            terminate_helper_child(child).await;
+            None
         }
     };
     let diagnostics =
@@ -1265,7 +1292,7 @@ async fn read_child_stdout_with_protocol(
             }
         };
 
-    if intentional_stop || stop.load(Ordering::Acquire) {
+    if stop.load(Ordering::Acquire) {
         return HelperRunDisposition::Clean;
     }
     classify_helper_exit(
@@ -1887,8 +1914,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stalled_helper_read_is_interrupted_by_stop_notification() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30"])
+        let child = Command::new("sleep")
+            .arg("30")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -1918,7 +1945,7 @@ mod tests {
         tokio::task::yield_now().await;
         stop.store(true, Ordering::Release);
         stop_notify.notify_one();
-        let stopped = tokio::time::timeout(Duration::from_millis(250), task)
+        let stopped = tokio::time::timeout(STOP_TIMEOUT, task)
             .await
             .expect("stalled helper read exceeded stop deadline")
             .unwrap();

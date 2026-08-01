@@ -64,6 +64,7 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use tokio::process::Command as TokioCommand;
 use tokio::sync::{
     broadcast, mpsc, oneshot, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore,
@@ -189,8 +190,8 @@ fn remove_ai_filler_phrases(text: &str) -> String {
         for leading in [
             format!("{filler}, "),
             format!("{filler}. "),
-            format!("{}{}, ", &filler[..1].to_ascii_uppercase(), &filler[1..]),
-            format!("{}{}. ", &filler[..1].to_ascii_uppercase(), &filler[1..]),
+            format!("{}{}, ", filler[..1].to_ascii_uppercase(), &filler[1..]),
+            format!("{}{}. ", filler[..1].to_ascii_uppercase(), &filler[1..]),
         ] {
             if clean.starts_with(&leading) {
                 removed_leading = true;
