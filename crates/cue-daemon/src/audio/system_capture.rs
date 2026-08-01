@@ -44,6 +44,7 @@ const HELPER_DIAGNOSTIC_MAX_LINE_BYTES: usize = 4 * 1024;
 const HELPER_DIAGNOSTIC_MAX_PARSED_LINES: u64 = 256;
 const HELPER_DIAGNOSTIC_MAX_FIELD_CHARS: usize = 160;
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const AUDIO_HELPER_OVERRIDE_ENV_NAMES: &[&str] = &[
     "BLUEY_SYSTEM_AUDIO_BINARY",
     "BLUEY_AUDIO_HELPER_BIN",

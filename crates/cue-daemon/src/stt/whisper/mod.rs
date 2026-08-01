@@ -156,6 +156,7 @@ fn resolve_binary() -> Result<PathBuf, WhisperError> {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn canonical_packaged_executable(candidate: &Path, allowed_roots: &[PathBuf]) -> Option<PathBuf> {
     let canonical = canonical_executable(candidate)?;
     allowed_roots

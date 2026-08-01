@@ -12,6 +12,9 @@ under `docs/release/`.
 
 ### Fixed
 
+- Restored Rust 1.97 warning-as-error compatibility across Linux, macOS, and
+  Windows builds by aligning platform-specific imports and helper functions
+  with their actual compile targets.
 - Activated bounded global-feed row quarantine in production so malformed rows
   are recorded with typed, replay-safe evidence while valid Ashby and Lever
   snapshots continue to publish and remain healthy.
