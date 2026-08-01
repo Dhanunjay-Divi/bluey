@@ -1,5 +1,9 @@
 # Bluey Operations Runbook
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md`, inspect current repository and
+> production state, and treat this runbook as authority where memory differs.
+
 > **Secrets, server layout, smoke tests, daily ops.**
 > Mirrors Pinky's `OPERATIONS-RUNBOOK.md` shape but Bluey-only.
 >

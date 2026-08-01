@@ -1,5 +1,9 @@
 # Bluey
 
+> **Codex:** Start every Bluey task by loading the local `$bluey-ops` skill at
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md`, then verify its guidance against
+> the current repository state.
+
 Bluey is a consent-first live-context assistant for engineering meetings and
 technical work. Its native desktop overlay can answer from the conversation,
 screen context, files, code, and saved project context that the user chooses.

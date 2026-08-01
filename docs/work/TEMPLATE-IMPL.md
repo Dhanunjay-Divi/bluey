@@ -1,5 +1,8 @@
 # IMPL: [Task ID] — [Title]
 
+> **Codex preflight:** Load `$bluey-ops` before implementation and verify its
+> memory against the current repository state.
+
 ## Scope
 
 **Does:**

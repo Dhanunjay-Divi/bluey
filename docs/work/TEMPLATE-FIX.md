@@ -1,5 +1,8 @@
 # FIX-XXX: [Issue Title]
 
+> **Codex preflight:** Load `$bluey-ops` before diagnosis or implementation and
+> verify its memory against the current repository state.
+
 ## Issue
 
 <!-- One-line description + link to issue/task if applicable -->

@@ -1,5 +1,9 @@
 # Bluey Dispute, Refund, And Credit Evidence Runbook
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before handling billing evidence.
+> Current account, provider, and repository evidence remain authoritative.
+
 Date: 2026-07-02
 
 ## Purpose

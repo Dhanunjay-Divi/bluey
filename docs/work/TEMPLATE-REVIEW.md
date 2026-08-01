@@ -1,5 +1,8 @@
 # REVIEW: [Batch ID] — [Title]
 
+> **Codex preflight:** Load `$bluey-ops` before review and verify its memory
+> against the current repository state and commit range.
+
 **Commit range:** `abc1234..def5678`
 **Reviewer:** [name/agent]
 **Date:** YYYY-MM-DD

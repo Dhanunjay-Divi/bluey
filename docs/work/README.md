@@ -1,5 +1,9 @@
 # docs/work/ — Work Documentation Index
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before starting or reviewing a
+> Bluey work batch.
+
 This directory contains implementation records, review reports, and bug fix docs for every batch of work.
 
 ## What Lives Here
