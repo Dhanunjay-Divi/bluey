@@ -2,6 +2,10 @@
 
 Last updated: 2026-06-02
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before continuing this handoff.
+> Reconcile its memory against the current branch, code, and newest docs.
+
 Start here when joining the Bluey repo.
 
 ## Read First

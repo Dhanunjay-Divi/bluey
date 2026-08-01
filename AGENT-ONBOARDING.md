@@ -2,6 +2,11 @@
 
 Last updated: 2026-05-25
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before working in this repo.
+> Treat it as navigation and operating memory; current checked-in docs and code
+> remain authoritative.
+
 This file is the short onboarding path. For the complete current project state,
 read `AGENT-HANDOFF.md` and then
 `docs/rounds/END-TO-END-AGENT-CONTEXT-2026-05-25.md`.

@@ -5,6 +5,11 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Changed
+
+- Required the local `$bluey-ops` operating-memory preflight across Bluey agent
+  entry points, work templates, and runbooks, with CI coverage for future docs.
+
 ### Fixed
 
 - Activated bounded global-feed row quarantine in production so malformed rows

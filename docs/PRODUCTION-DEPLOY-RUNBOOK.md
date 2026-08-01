@@ -1,5 +1,10 @@
 # Bluey Server — Production Deployment Runbook
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before any deploy action. Recheck
+> the intended commit, artifact provenance, live flags, backups, and this current
+> runbook before changing production.
+
 > **Scope:** Stand up `bluey-server` on a single DigitalOcean droplet (or any single Linux host) behind Caddy with auto-TLS. Single binary + SQLite + reverse proxy.
 > **Audience:** Operator with sudo access to the deployment host.
 > **Estimated time:** 30-45 minutes from a fresh Ubuntu 24.04 droplet.

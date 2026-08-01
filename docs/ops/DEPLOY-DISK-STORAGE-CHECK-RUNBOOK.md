@@ -1,5 +1,9 @@
 # Bluey Deploy Disk And Storage Check Runbook
 
+> **Codex preflight:** Load `$bluey-ops` from
+> `/Users/uno/.codex/skills/bluey-ops/SKILL.md` before checking or changing
+> production storage. Reconcile its memory against this runbook and live state.
+
 Date: 2026-07-02
 
 ## Purpose
