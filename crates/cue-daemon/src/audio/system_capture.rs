@@ -1251,22 +1251,24 @@ async fn read_child_stdout_with_protocol(
         }
     }
 
-    let status = if intentional_stop {
+    if intentional_stop || stop.load(Ordering::Acquire) {
+        diagnostics_task.abort();
         terminate_helper_child(child).await;
-        None
-    } else {
-        match tokio::time::timeout(HELPER_EXIT_TIMEOUT, child.wait()).await {
-            Ok(Ok(status)) => Some(status),
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "failed to wait for system audio helper");
-                None
-            }
-            Err(_) => {
-                tracing::warn!("system audio helper did not exit after closing stdout");
-                stdout_error = true;
-                terminate_helper_child(child).await;
-                None
-            }
+        let _ = diagnostics_task.await;
+        return HelperRunDisposition::Clean;
+    }
+
+    let status = match tokio::time::timeout(HELPER_EXIT_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "failed to wait for system audio helper");
+            None
+        }
+        Err(_) => {
+            tracing::warn!("system audio helper did not exit after closing stdout");
+            stdout_error = true;
+            terminate_helper_child(child).await;
+            None
         }
     };
     let diagnostics =
@@ -1290,7 +1292,7 @@ async fn read_child_stdout_with_protocol(
             }
         };
 
-    if intentional_stop || stop.load(Ordering::Acquire) {
+    if stop.load(Ordering::Acquire) {
         return HelperRunDisposition::Clean;
     }
     classify_helper_exit(
@@ -1912,8 +1914,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn stalled_helper_read_is_interrupted_by_stop_notification() {
-        let child = Command::new("sh")
-            .args(["-c", "sleep 30"])
+        let child = Command::new("sleep")
+            .arg("30")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -1943,7 +1945,7 @@ mod tests {
         tokio::task::yield_now().await;
         stop.store(true, Ordering::Release);
         stop_notify.notify_one();
-        let stopped = tokio::time::timeout(Duration::from_millis(250), task)
+        let stopped = tokio::time::timeout(STOP_TIMEOUT, task)
             .await
             .expect("stalled helper read exceeded stop deadline")
             .unwrap();

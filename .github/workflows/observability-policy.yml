@@ -1,6 +1,6 @@
 name: Observability Policy
 
-# Runs on every PR + push to feat/* + main. Enforces the policy gates
+# Runs on every PR and push to main. Enforces the policy gates
 # that emerged from the Observability Round so new commits don't
 # silently regress field hygiene.
 #
@@ -14,7 +14,6 @@ on:
   push:
     branches:
       - main
-      - "feat/*"
   pull_request:
 
 jobs:
@@ -60,7 +59,7 @@ jobs:
       - name: Observability tracing-call policy gate
         run: python3 scripts/analyze-tracing-calls.py --check-only
 
-  tests:
+  workspace-tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -86,10 +85,64 @@ jobs:
 
       - name: Cache cargo target
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: observability-workspace-tests
+          workspaces: ". -> target"
 
       - name: cargo test workspace
         run: cargo test --all-targets
 
+  server-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux dependencies (Tauri)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+
+      - name: Cache cargo target
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: observability-server-tests
+          workspaces: "./server -> target"
+
       - name: cargo test server
         working-directory: server
         run: cargo test
+
+  tests:
+    if: ${{ always() }}
+    needs:
+      - workspace-tests
+      - server-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require workspace and server test gates
+        env:
+          WORKSPACE_TEST_RESULT: ${{ needs.workspace-tests.result }}
+          SERVER_TEST_RESULT: ${{ needs.server-tests.result }}
+        run: |
+          if [[ "$WORKSPACE_TEST_RESULT" != "success" ]]; then
+            echo "workspace-tests did not pass: $WORKSPACE_TEST_RESULT"
+            exit 1
+          fi
+          if [[ "$SERVER_TEST_RESULT" != "success" ]]; then
+            echo "server-tests did not pass: $SERVER_TEST_RESULT"
+            exit 1
+          fi
