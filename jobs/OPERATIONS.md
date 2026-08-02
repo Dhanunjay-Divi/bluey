@@ -334,7 +334,11 @@ and clears the archive metadata.
 This lifecycle is not a database backup. Keep the normal PostgreSQL backup and
 restore proof, R2 replication, lifecycle, deletion, and object-inventory
 procedures independently operational. Do not delete archived objects during
-the first rollout.
+the first rollout. A verified content-addressed object may remain unreferenced
+if the candidate changes after read-back but before the guarded PostgreSQL
+completion. Do not delete that object in the worker: a newer lease may be using
+the same deterministic key. Reconcile unreferenced objects through the bounded
+object-inventory process after confirming no database row references them.
 
 Before enabling production archival:
 

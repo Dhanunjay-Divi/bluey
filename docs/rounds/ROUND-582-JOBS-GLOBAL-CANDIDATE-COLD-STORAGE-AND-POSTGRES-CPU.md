@@ -68,6 +68,11 @@ The object contains the already encrypted candidate envelope. The worker:
 Any failure leaves the complete PostgreSQL body in place. Rediscovery restores
 the complete hot row and clears archive state.
 
+Because archive keys are content-addressed, a verified object can remain
+unreferenced when the row changes before the guarded database completion. The
+worker intentionally does not delete it: another lease may be using the same
+key. Bounded object-inventory reconciliation handles those objects separately.
+
 ## PostgreSQL And R2 Boundary
 
 PostgreSQL keeps:
@@ -143,6 +148,6 @@ The final pass completed:
 - Jobs privacy and client/server boundary checks;
 - Jobs dependency, license, and source-provenance checks.
 
-The repository's informational SQLite-boundary audit still reports 53
+The repository's informational SQLite-boundary audit still reports 55
 pre-existing mixed-backend references. This round does not claim the broader
 PostgreSQL-only migration is complete.

@@ -33,6 +33,9 @@
 - Completion is conditional on the same lease and content hash.
 - PostgreSQL is tombstoned only after exact R2 byte and SHA-256 read-back.
 - Failure retains the complete payload and schedules bounded retry.
+- Content-addressed objects left unreferenced by a guarded completion race are
+  reconciled through object inventory, avoiding a delete race with a newer
+  lease using the same key.
 
 ## Cross-Task Findings
 
@@ -65,9 +68,9 @@ Results:
 - Jobs privacy, client/server boundary, and dependency/license/provenance gates
   passed.
 - The supported SQLite-boundary audit passed in its informational mode and
-  reported 53 existing mixed-backend references. Strict PostgreSQL-only mode
-  is not a passing repository baseline and was not claimed as completed by
-  this batch.
+reported 55 existing mixed-backend references. Strict PostgreSQL-only mode
+is not a passing repository baseline and was not claimed as completed by
+this batch.
 
 ## Overall Verdict
 
