@@ -21,6 +21,10 @@ under `docs/release/`.
 
 ### Changed
 
+- Preserved the complete historical Bluey Jobs experimental worktree on a
+  dedicated remote snapshot branch and reconciled every remaining Codex-owned
+  branch against current main without merging obsolete runtime, generated
+  asset, or incomplete Coach/IPC changes.
 - Promoted the reviewed Round 586 Jobs authority and ATS form read-back build
   through a backed-up, exact-artifact manual deployment, while keeping model
   generation, Browser distribution, and mailbox synchronization disabled.
