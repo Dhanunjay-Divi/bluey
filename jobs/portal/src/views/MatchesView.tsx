@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   ArrowRight,
   BriefcaseBusiness,
@@ -38,9 +38,18 @@ import { Dialog } from "../components/Dialog";
 import { DiscoverySourceDialog } from "../components/DiscoverySourceDialog";
 import { effectiveSubmissionMode } from "../lib/application-flow";
 import { isJobPassed, matchPassReasons } from "../lib/candidate-events";
+import {
+  clearMatchViewFilters,
+  filterMatches,
+  hasMatchViewFilters,
+  readMatchFilters,
+  writeMatchFilters,
+  type MatchFilterState,
+} from "../lib/match-filters";
 
 interface Props {
   workspace: JobsWorkspace;
+  previewSearch: string;
   onAddJob(job: UserJobInput): Promise<JobPosting>;
   onPrepare(job: JobPosting, mode: string, submissionMode: string): Promise<void>;
   onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
@@ -56,26 +65,20 @@ export function visibleMatches<T>(matches: T[], count: number): T[] {
 
 export function MatchesView({
   workspace,
+  previewSearch,
   onAddJob,
   onPrepare,
   onSaveCandidateEvent,
   onSearchDiscoverySources,
   onConnectDiscoverySource,
 }: Props) {
-  const [query, setQuery] = useState("");
-  const [activeTrack, setActiveTrack] = useState("all");
+  const [searchParams, setSearchParams] = useSearchParams();
   const [selected, setSelected] = useState<JobPosting | null>(null);
   const [addOpen, setAddOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [mode, setMode] = useState(workspace.profile.resume_mode);
   const [submissionMode, setSubmissionMode] = useState(workspace.profile.default_submission_mode);
   const [filterOpen, setFilterOpen] = useState(false);
-  const [minimumScore, setMinimumScore] = useState(0);
-  const [workplace, setWorkplace] = useState("all");
-  const [onlyUnprepared, setOnlyUnprepared] = useState(false);
-  const [showOutsideTrack, setShowOutsideTrack] = useState(false);
-  const [density, setDensity] = useState<"comfortable" | "compact">("comfortable");
-  const [showPassed, setShowPassed] = useState(false);
   const [passTarget, setPassTarget] = useState<JobPosting | null>(null);
   const [passReasons, setPassReasons] = useState<string[]>([]);
   const [passNote, setPassNote] = useState("");
@@ -83,6 +86,35 @@ export function MatchesView({
   const [sourceOpen, setSourceOpen] = useState(false);
   const [visibleCount, setVisibleCount] = useState(MATCH_PAGE_SIZE);
   const [actionError, setActionError] = useState("");
+
+  const activeTracks = useMemo(
+    () => workspace.tracks.filter((track) => track.active),
+    [workspace.tracks],
+  );
+  const activeTrackIds = useMemo(
+    () => new Set(activeTracks.map((track) => track.id)),
+    [activeTracks],
+  );
+  const filters = useMemo(
+    () => readMatchFilters(searchParams, activeTrackIds),
+    [searchParams, activeTrackIds],
+  );
+  const {
+    query,
+    activeTrack,
+    minimumScore,
+    workplace,
+    onlyUnprepared,
+    showOutsideTrack,
+    density,
+    showPassed,
+  } = filters;
+  const updateFilters = (patch: Partial<MatchFilterState>) => {
+    setSearchParams(
+      writeMatchFilters(searchParams, { ...filters, ...patch }),
+      { replace: true },
+    );
+  };
 
   const preparedJobIds = useMemo(
     () => new Set(workspace.applications.map((application) => application.job_id)),
@@ -93,14 +125,32 @@ export function MatchesView({
     [workspace.matches, workspace.candidate_events],
   );
 
+  const activeTrackMatches = useMemo(
+    () => workspace.matches.filter((job) => activeTrackIds.has(job.track_id)),
+    [workspace.matches, activeTrackIds],
+  );
   const stateMatches = useMemo(
-    () => workspace.matches.filter((job) => isMatchVisibleByState(
+    () => activeTrackMatches.filter((job) => isMatchVisibleByState(
       job,
       workspace.preferences.max_posting_age_days,
       passedJobIds.has(job.id),
       showPassed,
     )),
-    [workspace.matches, workspace.preferences.max_posting_age_days, passedJobIds, showPassed],
+    [
+      activeTrackMatches,
+      workspace.preferences.max_posting_age_days,
+      passedJobIds,
+      showPassed,
+    ],
+  );
+  const passedVisibleCount = useMemo(
+    () => activeTrackMatches.filter((job) => isMatchVisibleByState(
+      job,
+      workspace.preferences.max_posting_age_days,
+      passedJobIds.has(job.id),
+      true,
+    )).length,
+    [activeTrackMatches, workspace.preferences.max_posting_age_days, passedJobIds],
   );
   const outsideCurrentTrackCount = useMemo(
     () => stateMatches.filter((job) => (
@@ -114,25 +164,16 @@ export function MatchesView({
     [showOutsideTrack, stateMatches],
   );
 
-  const filtered = useMemo(() => {
-    const needle = query.toLowerCase();
-    return activeMatches.filter((job) => {
-      const matchesTrack = activeTrack === "all" || job.track_id === activeTrack;
-      const matchesQuery = !needle || `${job.company} ${job.title} ${job.location}`.toLowerCase().includes(needle);
-      const matchesScore = job.match_score >= minimumScore;
-      const matchesWorkplace = workplace === "all" || job.workplace.toLowerCase().includes(workplace);
-      const matchesPacket = !onlyUnprepared || !preparedJobIds.has(job.id);
-      return matchesTrack && matchesQuery && matchesScore && matchesWorkplace && matchesPacket;
-    });
-  }, [activeMatches, activeTrack, query, minimumScore, workplace, onlyUnprepared, preparedJobIds]);
+  const filtered = useMemo(
+    () => filterMatches(activeMatches, filters, preparedJobIds),
+    [activeMatches, filters, preparedJobIds],
+  );
   const visibleJobs = visibleMatches(filtered, visibleCount);
   const hasOnlyExcludedMatches = !showOutsideTrack
     && outsideCurrentTrackCount > 0
     && filtered.length === 0
-    && !query
-    && minimumScore === 0
-    && workplace === "all"
-    && !onlyUnprepared;
+    && !hasMatchViewFilters(filters);
+  const hasViewFilters = hasMatchViewFilters(filters);
 
   useEffect(() => {
     setVisibleCount(MATCH_PAGE_SIZE);
@@ -143,10 +184,9 @@ export function MatchesView({
     + Number(workplace !== "all")
     + Number(onlyUnprepared)
     + Number(showOutsideTrack);
-  const activeTracks = workspace.tracks.filter((track) => track.active);
   const selectedTrack = activeTrack === "all"
     ? activeTracks[0]
-    : workspace.tracks.find((track) => track.id === activeTrack);
+    : activeTracks.find((track) => track.id === activeTrack);
   const healthySourceCount = workspace.discovery_sources.filter((source) => discoverySourceState(source) === "healthy").length;
   const configuredSourceCount = workspace.discovery_sources.length;
   const discoveryReady = healthySourceCount > 0;
@@ -247,7 +287,7 @@ export function MatchesView({
         <div><Target /><span><b>{filtered.length}</b><small>relevant jobs</small></span></div>
         <div><Sparkles /><span><b>{averageScore ? `${averageScore}%` : "—"}</b><small>average fit</small></span></div>
         <div><BriefcaseBusiness /><span><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><small>submitted</small></span></div>
-        <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>applications left this month</small></span><Link to={`../settings${window.location.search}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
+        <div className="metric-action"><span><b>{Math.max(0, workspace.entitlement.monthly_packet_limit - workspace.entitlement.used_packets)}</b><small>applications left this month</small></span><Link to={`../settings${previewSearch}#plans`}>Plan details<ChevronRight size={14} /></Link></div>
       </section>
 
       <section className={`search-status-band ${searchState}`} aria-label="Active search settings">
@@ -258,7 +298,7 @@ export function MatchesView({
           <div><dt>Fit</dt><dd>Experience + location</dd></div>
           <div><dt>Submission</dt><dd>Review first</dd></div>
         </dl>
-        <Link className="button secondary compact" to={`../settings${window.location.search}#tracks`}>Adjust search<ChevronRight size={14} /></Link>
+        <Link className="button secondary compact" to={`../settings${previewSearch}#tracks`}>Adjust search<ChevronRight size={14} /></Link>
       </section>
 
       <DiscoverySourceHealthList
@@ -268,16 +308,16 @@ export function MatchesView({
       />
 
       <section className="track-strip" aria-label="Career Tracks">
-        <button className={activeTrack === "all" ? "active" : ""} onClick={() => setActiveTrack("all")}><span>All matches</span><b>{activeMatches.length}</b></button>
-        {workspace.tracks.map((track) => <button key={track.id} className={activeTrack === track.id ? "active" : ""} onClick={() => setActiveTrack(track.id)}><span>{track.name}</span><b>{activeMatches.filter((job) => job.track_id === track.id).length}</b></button>)}
-        <Link className="add-track" title="Add Career Track" to={`../settings${window.location.search}#tracks`}><Plus size={15} /></Link>
+        <button className={activeTrack === "all" ? "active" : ""} onClick={() => updateFilters({ activeTrack: "all" })}><span>All matches</span><b>{activeMatches.length}</b></button>
+        {activeTracks.map((track) => <button key={track.id} className={activeTrack === track.id ? "active" : ""} onClick={() => updateFilters({ activeTrack: track.id })}><span>{track.name}</span><b>{activeMatches.filter((job) => job.track_id === track.id).length}</b></button>)}
+        <Link className="add-track" title="Add Career Track" to={`../settings${previewSearch}#tracks`}><Plus size={15} /></Link>
       </section>
 
       <section className="toolbar">
-        <label className="search-field"><Search size={17} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search company, role, or location" /></label>
-        {passedJobIds.size > 0 && <button className={`button secondary compact ${showPassed ? "active-filter" : ""}`} onClick={() => setShowPassed((current) => !current)}>{showPassed ? <Undo2 size={15} /> : null}{showPassed ? "Back to matches" : `Passed ${passedJobIds.size}`}</button>}
+        <label className="search-field"><Search size={17} /><input value={query} onChange={(event) => updateFilters({ query: event.target.value })} placeholder="Search company, role, or location" /></label>
+        {passedVisibleCount > 0 && <button className={`button secondary compact ${showPassed ? "active-filter" : ""}`} onClick={() => updateFilters({ showPassed: !showPassed })}>{showPassed ? <Undo2 size={15} /> : null}{showPassed ? "Back to matches" : `Passed ${passedVisibleCount}`}</button>}
         <button className={`button secondary compact ${activeFilterCount ? "active-filter" : ""}`} onClick={() => setFilterOpen(true)}><Filter size={15} />Filters{activeFilterCount ? <span className="filter-count">{activeFilterCount}</span> : null}</button>
-        <button className="icon-button" title={`Use ${density === "comfortable" ? "compact" : "comfortable"} rows`} onClick={() => setDensity((current) => current === "comfortable" ? "compact" : "comfortable")}><SlidersHorizontal size={17} /></button>
+        <button className="icon-button" title={`Use ${density === "comfortable" ? "compact" : "comfortable"} rows`} onClick={() => updateFilters({ density: density === "comfortable" ? "compact" : "comfortable" })}><SlidersHorizontal size={17} /></button>
       </section>
 
       <section className={`job-list ${density}`} aria-label="Job matches">
@@ -299,12 +339,32 @@ export function MatchesView({
             <h3>{outsideCurrentTrackCount} job{outsideCurrentTrackCount === 1 ? "" : "s"} outside this Career Track</h3>
             <p>Bluey excluded these jobs using your location, job type, experience, authorization, and other saved rules.</p>
             <div className="empty-actions">
-              <button className="button primary" onClick={() => setShowOutsideTrack(true)}>Review excluded jobs</button>
-              <Link className="button secondary" to={`../settings${window.location.search}#tracks`}>Adjust Career Track</Link>
+              <button className="button primary" onClick={() => updateFilters({ showOutsideTrack: true })}>Review excluded jobs</button>
+              <Link className="button secondary" to={`../settings${previewSearch}#tracks`}>Adjust Career Track</Link>
+            </div>
+          </div>
+        ) : hasViewFilters || activeTrack !== "all" || showPassed ? (
+          <div className="empty-state match-empty-state">
+            <Search />
+            <h3>{showPassed ? "No passed jobs in this view" : activeTrack !== "all" ? "No jobs in this Career Track" : "No jobs match these filters"}</h3>
+            <p>{showPassed ? "Return to active matches or choose another Career Track." : "Try a broader search, lower the minimum fit, or view every active Career Track."}</p>
+            <div className="empty-actions">
+              <button
+                className="button primary"
+                onClick={() => updateFilters({
+                  ...clearMatchViewFilters(filters),
+                  activeTrack: "all",
+                  showOutsideTrack: false,
+                  showPassed: false,
+                })}
+              >
+                Clear filters
+              </button>
+              <Link className="button secondary" to={`../settings${previewSearch}#tracks`}>Adjust Career Track</Link>
             </div>
           </div>
         ) : (
-          <div className="empty-state match-empty-state"><Search /><h3>{selectedTrack ? "Start with a job link" : "Create a Career Track first"}</h3><p>{selectedTrack ? "Paste a recent opening. Bluey verifies it, checks your hard filters, ranks the fit, and builds the application kit for review." : "A Career Track keeps each role, location, resume, and application stream separate."}</p><div className="empty-actions">{selectedTrack && <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={16} />Add job link</button>}<Link className="button secondary" to={`../settings${window.location.search}#tracks`}>{selectedTrack ? "Adjust Career Track" : "Create Career Track"}</Link></div><ol className="match-activation-flow"><li><b>1</b><span>Verify posting</span></li><li><b>2</b><span>Check hard filters</span></li><li><b>3</b><span>Rank the fit</span></li><li><b>4</b><span>Review application kit</span></li></ol></div>
+          <div className="empty-state match-empty-state"><Search /><h3>{selectedTrack ? "Start with a job link" : "Create a Career Track first"}</h3><p>{selectedTrack ? "Paste a recent opening. Bluey verifies it, checks your hard filters, ranks the fit, and builds the application kit for review." : "A Career Track keeps each role, location, resume, and application stream separate."}</p><div className="empty-actions">{selectedTrack && <button className="button primary" onClick={() => setAddOpen(true)}><Link2 size={16} />Add job link</button>}<Link className="button secondary" to={`../settings${previewSearch}#tracks`}>{selectedTrack ? "Adjust Career Track" : "Create Career Track"}</Link></div><ol className="match-activation-flow"><li><b>1</b><span>Verify posting</span></li><li><b>2</b><span>Check hard filters</span></li><li><b>3</b><span>Rank the fit</span></li><li><b>4</b><span>Review application kit</span></li></ol></div>
         ))}
       </section>
 
@@ -353,15 +413,15 @@ export function MatchesView({
       <AddJobDialog open={addOpen} onClose={() => setAddOpen(false)} trackId={selectedTrack?.id || ""} onSave={async (job) => { const saved = await onAddJob(job); setAddOpen(false); setSelected(saved); }} />
       <DiscoverySourceDialog
         open={sourceOpen}
-        tracks={workspace.tracks}
+        tracks={activeTracks}
         initialTrackId={selectedTrack?.id || ""}
         onClose={() => setSourceOpen(false)}
         onSearch={onSearchDiscoverySources}
         onConnect={onConnectDiscoverySource}
       />
       <Dialog open={filterOpen} title="Filter matches" description="Narrow this view without changing your Career Track." onClose={() => setFilterOpen(false)}>
-        <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="95" step="5" value={minimumScore} onChange={(event) => setMinimumScore(Number(event.target.value))} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => setWorkplace(event.target.value)}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => setOnlyUnprepared((current) => !current)}><span /></button></label><label className="setting-line simple"><div><b>Show jobs outside my rules</b><span>{outsideCurrentTrackCount ? `Review ${outsideCurrentTrackCount} job${outsideCurrentTrackCount === 1 ? "" : "s"} excluded by location, job type, experience, authorization, or other Career Track rules.` : "No jobs are currently excluded by your Career Track rules."}</span></div><button type="button" className={`toggle ${showOutsideTrack ? "on" : ""}`} role="switch" aria-checked={showOutsideTrack} onClick={() => setShowOutsideTrack((current) => !current)}><span /></button></label></div>
-        <div className="dialog-actions"><button className="button secondary" onClick={() => { setMinimumScore(0); setWorkplace("all"); setOnlyUnprepared(false); setShowOutsideTrack(false); }}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
+        <div className="dialog-form"><label><span>Minimum match score</span><div className="range-field"><input type="range" min="0" max="100" step="5" value={minimumScore} onChange={(event) => updateFilters({ minimumScore: Number(event.target.value) })} /><b>{minimumScore || "Any"}{minimumScore ? "%" : ""}</b></div></label><label><span>Workplace</span><select value={workplace} onChange={(event) => updateFilters({ workplace: event.target.value as MatchFilterState["workplace"] })}><option value="all">Any workplace</option><option value="remote">Remote</option><option value="hybrid">Hybrid</option><option value="on-site">On-site</option></select></label><label className="setting-line simple"><div><b>Only jobs not prepared</b><span>Hide applications you already prepared.</span></div><button type="button" className={`toggle ${onlyUnprepared ? "on" : ""}`} role="switch" aria-checked={onlyUnprepared} onClick={() => updateFilters({ onlyUnprepared: !onlyUnprepared })}><span /></button></label><label className="setting-line simple"><div><b>Show jobs outside my rules</b><span>{outsideCurrentTrackCount ? `Review ${outsideCurrentTrackCount} job${outsideCurrentTrackCount === 1 ? "" : "s"} excluded by location, job type, experience, authorization, or other Career Track rules.` : "No jobs are currently excluded by your Career Track rules."}</span></div><button type="button" className={`toggle ${showOutsideTrack ? "on" : ""}`} role="switch" aria-checked={showOutsideTrack} onClick={() => updateFilters({ showOutsideTrack: !showOutsideTrack })}><span /></button></label></div>
+        <div className="dialog-actions"><button className="button secondary" onClick={() => updateFilters({ ...clearMatchViewFilters(filters), showOutsideTrack: false })}>Reset</button><button className="button primary" onClick={() => setFilterOpen(false)}>Show {filtered.length} match{filtered.length === 1 ? "" : "es"}</button></div>
       </Dialog>
     </div>
   );
