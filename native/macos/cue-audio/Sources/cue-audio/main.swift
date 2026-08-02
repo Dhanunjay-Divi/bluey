@@ -8,6 +8,81 @@ private enum CaptureSource: String {
     case microphone
 }
 
+private enum NativeCaptureFailure: Error {
+    case systemStreamStopped
+}
+
+private func emitDiagnostic(_ payload: [String: Any]) {
+    guard
+        JSONSerialization.isValidJSONObject(payload),
+        var data = try? JSONSerialization.data(withJSONObject: payload, options: [])
+    else { return }
+    data.append(0x0A)
+    FileHandle.standardError.write(data)
+}
+
+private func emitReady(source: CaptureSource, backend: String) {
+    emitDiagnostic([
+        "event": "ready",
+        "source": source.rawValue,
+        "backend": backend,
+        "format": [
+            "sample_rate_hz": 16_000,
+            "channel_count": 1,
+            "sample_format": "i16",
+        ],
+    ])
+}
+
+private func emitStopped(source: CaptureSource, reason: String) {
+    emitDiagnostic([
+        "event": "stopped",
+        "source": source.rawValue,
+        "reason": reason,
+    ])
+}
+
+private func emitFailure(source: CaptureSource, error: Error) -> Int32 {
+    if let failure = error as? NativeCaptureFailure {
+        let code: String
+        switch failure {
+        case .systemStreamStopped:
+            code = "screen_capture_stopped"
+        }
+        emitDiagnostic([
+            "event": "error",
+            "source": source.rawValue,
+            "code": code,
+            "recoverable": false,
+        ])
+        return 1
+    }
+
+    let nsError = error as NSError
+    let normalized = error.localizedDescription.lowercased()
+    let permissionDenied = (nsError.domain == "BlueyAudio" && [4, 5].contains(nsError.code))
+        || normalized.contains("permission")
+        || normalized.contains("not authorized")
+        || normalized.contains("access denied")
+
+    if permissionDenied {
+        emitDiagnostic([
+            "event": "permission_denied",
+            "source": source.rawValue,
+            "permission": source == .microphone ? "microphone" : "screen_recording",
+        ])
+        return 3
+    }
+
+    emitDiagnostic([
+        "event": "error",
+        "source": source.rawValue,
+        "code": "native_capture_failed",
+        "recoverable": false,
+    ])
+    return 1
+}
+
 private struct Args {
     var source: CaptureSource = .system
     var durationMs: Int = 3_000
@@ -151,10 +226,100 @@ private final class PCM16Writer {
 }
 
 @available(macOS 13.0, *)
-private final class SystemAudioCapture: NSObject, SCStreamOutput {
+private enum SystemCaptureWaitResult {
+    case durationElapsed
+    case stoppedUnexpectedly
+}
+
+@available(macOS 13.0, *)
+private final class SystemCaptureLifecycle: @unchecked Sendable {
+    private enum State {
+        case starting
+        case capturing
+        case expectedStop
+        case unexpectedStop
+    }
+
+    private let lock = NSLock()
+    private var state = State.starting
+    private var nextWaiterID: UInt64 = 0
+    private var waiter: (
+        id: UInt64,
+        continuation: CheckedContinuation<SystemCaptureWaitResult, Never>
+    )?
+
+    func markReady() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .starting = state else { return false }
+        state = .capturing
+        return true
+    }
+
+    func wait(duration: TimeInterval?) async -> SystemCaptureWaitResult {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if case .unexpectedStop = state {
+                lock.unlock()
+                continuation.resume(returning: .stoppedUnexpectedly)
+                return
+            }
+
+            nextWaiterID &+= 1
+            let waiterID = nextWaiterID
+            waiter = (waiterID, continuation)
+            lock.unlock()
+
+            guard let duration else { return }
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + duration) { [weak self] in
+                self?.durationElapsed(for: waiterID)
+            }
+        }
+    }
+
+    func beginExpectedStop() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard case .capturing = state else { return false }
+        state = .expectedStop
+        return true
+    }
+
+    func reportUnexpectedStop() {
+        let continuation: CheckedContinuation<SystemCaptureWaitResult, Never>?
+        lock.lock()
+        switch state {
+        case .starting, .capturing:
+            state = .unexpectedStop
+            continuation = waiter?.continuation
+            waiter = nil
+        case .expectedStop, .unexpectedStop:
+            continuation = nil
+        }
+        lock.unlock()
+        continuation?.resume(returning: .stoppedUnexpectedly)
+    }
+
+    private func durationElapsed(for waiterID: UInt64) {
+        let continuation: CheckedContinuation<SystemCaptureWaitResult, Never>?
+        lock.lock()
+        if case .capturing = state, waiter?.id == waiterID {
+            continuation = waiter?.continuation
+            waiter = nil
+        } else {
+            continuation = nil
+        }
+        lock.unlock()
+        continuation?.resume(returning: .durationElapsed)
+    }
+}
+
+@available(macOS 13.0, *)
+private final class SystemAudioCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private let duration: TimeInterval
     private let continuous: Bool
     private let writer = PCM16Writer()
+    private let lifecycle = SystemCaptureLifecycle()
     private var stream: SCStream?
 
     init(durationMs: Int, continuous: Bool) {
@@ -180,20 +345,30 @@ private final class SystemAudioCapture: NSObject, SCStreamOutput {
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
         config.queueDepth = 3
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: nil)
+        let stream = SCStream(filter: filter, configuration: config, delegate: self)
         self.stream = stream
         try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: DispatchQueue(label: "sh.bluey.audio.system", qos: .userInitiated))
         try await stream.startCapture()
-
-        if continuous {
-            // Run until killed
-            while true {
-                try await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-        } else {
-            try await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
-            try await stream.stopCapture()
+        guard lifecycle.markReady() else {
+            throw NativeCaptureFailure.systemStreamStopped
         }
+        emitReady(source: .system, backend: "screen_capture_kit")
+
+        let waitResult = await lifecycle.wait(duration: continuous ? nil : duration)
+        switch waitResult {
+        case .stoppedUnexpectedly:
+            throw NativeCaptureFailure.systemStreamStopped
+        case .durationElapsed:
+            guard lifecycle.beginExpectedStop() else {
+                throw NativeCaptureFailure.systemStreamStopped
+            }
+            try await stream.stopCapture()
+            emitStopped(source: .system, reason: "duration_complete")
+        }
+    }
+
+    func stream(_ stream: SCStream, didStopWithError error: Error) {
+        lifecycle.reportUnexpectedStop()
     }
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
@@ -278,6 +453,7 @@ private final class MicrophoneCapture {
             )
         }
         try engine.start()
+        emitReady(source: .microphone, backend: "av_audio_engine")
 
         if continuous {
             // Keep the AVAudioEngine instance and its tap alive until the
@@ -291,6 +467,7 @@ private final class MicrophoneCapture {
             Thread.sleep(forTimeInterval: duration)
             engine.stop()
             input.removeTap(onBus: 0)
+            emitStopped(source: .microphone, reason: "duration_complete")
         }
     }
 }
@@ -301,7 +478,12 @@ private func run() async -> Int32 {
         switch args.source {
         case .system:
             guard #available(macOS 13.0, *) else {
-                fputs("system audio capture requires macOS 13+\n", stderr)
+                emitDiagnostic([
+                    "event": "error",
+                    "source": CaptureSource.system.rawValue,
+                    "code": "unsupported_os",
+                    "recoverable": false,
+                ])
                 return 2
             }
             let capture = SystemAudioCapture(durationMs: args.durationMs, continuous: args.continuous)
@@ -312,8 +494,7 @@ private func run() async -> Int32 {
         }
         return 0
     } catch {
-        fputs("bluey audio helper failed: \(error.localizedDescription)\n", stderr)
-        return 1
+        return emitFailure(source: args.source, error: error)
     }
 }
 

@@ -1,0 +1,16 @@
+# SHA-256  bytes  artifact
+fbeeb1fc108ef4808d0e3a7af72dfa1f5700645bfbb6809126e1183bb381cabc  180434644  final-round-desktop-2.4.0-arm64-mac.dmg
+8bd6406f790f7d79932a539c16c04e242ae22358e4ba6d24fcff0d6ddfcbb6c1  -  Final Round.app/Contents/Info.plist
+d453f6ee6479e973dcf6c333be8f199f006e3d63a5ed9762dc4e6884ea90b615  80124272  Final Round.app/Contents/Resources/app.asar
+1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3  2327524  Final Round.app/Contents/Resources/silero_vad.onnx
+81072a6167d45baa1a89053626b52d2d18598a3e33bb29b63bd619822db632a2  1240960  Final Round.app/Contents/Resources/audio_capture.node
+5c169223ca75e43668aff8dad1162eb5d12e366758ff0eb451eb58a889b72435  82864  Final Round.app/Contents/Resources/audio_detect.node
+025a0e0293f2e86ef2e2e91f624eb91fe42e5d19f144430bfe3bcd561543e287  116192  Final Round.app/Contents/Resources/keyboard_monitor.node
+547c9f8bff9e18cb088d8f0e468052aec185fa04722d6190341fb960628630da  129  Final Round.app/Contents/Resources/app-update.yml
+
+# Electron ASAR integrity metadata
+c553ca898295a163f5c641797ca72ed49982c65e684e653ef89256a5a157b565  1764500  SHA-256 of app.asar headerString; matches Info.plist ElectronAsarIntegrity
+
+# Provenance
+# Calculated 2026-07-12 with macOS shasum -a 256 and @electron/asar getRawHeader.
+# The DMG was mounted read-only; none of these artifacts was modified or retained.

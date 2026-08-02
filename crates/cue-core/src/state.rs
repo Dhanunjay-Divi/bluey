@@ -21,6 +21,8 @@ pub struct DaemonState {
     pub started_at: String,
     pub meeting: MeetingState,
     pub transcript_segments: usize,
+    #[serde(default)]
+    pub conversation_turns: usize,
     pub context_items: usize,
     pub answer_instructions_set: bool,
     pub action_items: usize,
@@ -40,6 +42,7 @@ impl DaemonState {
             started_at: clock::now_epoch_ms_string(),
             meeting: MeetingState::Idle,
             transcript_segments: 0,
+            conversation_turns: 0,
             context_items: 0,
             answer_instructions_set: false,
             action_items: 0,

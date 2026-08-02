@@ -1,0 +1,6 @@
+74410be0e746553441b9542fd5fc5c8719554139707f167a4fc51ee59de65ffe  /Users/uno/Downloads/exe_backtrack_code/final-round-desktop-2.4.0-setup.exe
+6ffc3dbdd347f432013fbb2c60cfe2b3c2620dff22e078675082a88e72edf3f0  payload-x64-exact/resources/app.asar
+6bf25dd7da7ec59189ea8f8c1583f54b14980608acbed404719c302197e3cb24  payload-x64-exact/finalround.exe
+fd895189e6cb2b9947f88fa6b782d0080adeadd8423c3ad643860df64504323b  payload-x64-exact/resources/audio_capture.node
+d2913f95d698e1eaedd1420ccde1525593d467f2ee35476f6a814baac02bd02f  payload-x64-exact/resources/audio_detect.node
+5c16d45482299c245269541e291d8bd2edb158f380c11143f27cd219147155cb  payload-x64-exact/resources/keyboard_monitor.node

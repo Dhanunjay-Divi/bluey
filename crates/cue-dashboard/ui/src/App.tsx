@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { HashRouter, Routes, Route, useNavigate } from "react-router-dom";
+import { HashRouter, Navigate, Routes, Route, useNavigate } from "react-router-dom";
 import { invoke } from "./lib/tauri";
 import { listen } from "@tauri-apps/api/event";
 import { DashboardLayout } from "./components/DashboardLayout";
@@ -14,8 +14,11 @@ import { UpdateToast } from "./components/UpdateToast";
 import { PermissionBanner } from "./components/PermissionBanner";
 import { Onboarding } from "./pages/Onboarding";
 import { Settings } from "./pages/Settings";
+import { Coach } from "./pages/Coach";
+import { ScreenContext } from "./pages/ScreenContext";
 import { InvisibilityToast } from "./components/InvisibilityToast";
 import { AutoDisguiseToast } from "./components/AutoDisguiseToast";
+import { JobsHandoffProvider } from "./components/JobsHandoffProvider";
 
 /** Listens for tray "navigate_to" events and routes accordingly. */
 function NavigateListener() {
@@ -98,16 +101,34 @@ function App() {
       .finally(() => setReady(true));
   }, []);
 
-  if (!ready) return null;
+  return (
+    <HashRouter>
+      <JobsHandoffProvider>
+        <AppContent
+          ready={ready}
+          showOnboarding={showOnboarding}
+          onOnboardingComplete={() => setShowOnboarding(false)}
+        />
+      </JobsHandoffProvider>
+    </HashRouter>
+  );
+}
 
-  if (showOnboarding) {
-    return <Onboarding onComplete={() => setShowOnboarding(false)} />;
-  }
+function AppContent({
+  ready,
+  showOnboarding,
+  onOnboardingComplete,
+}: {
+  ready: boolean;
+  showOnboarding: boolean;
+  onOnboardingComplete: () => void;
+}) {
+  if (!ready) return null;
+  if (showOnboarding) return <Onboarding onComplete={onOnboardingComplete} />;
 
   return (
     <>
-    <PermissionBanner />
-    <HashRouter>
+      <PermissionBanner />
       <NavigateListener />
       <HotkeyListener />
       <PermissionPoller />
@@ -116,11 +137,12 @@ function App() {
           <Route index element={<Home />} />
           <Route path="chats" element={<Chats />} />
           <Route path="session/:id" element={<SessionDetail />} />
-          <Route path="prompts" element={<Placeholder name="Prompts" />} />
+          <Route path="coach" element={<Coach />} />
+          <Route path="prompts" element={<Navigate to="/coach" replace />} />
           <Route path="shortcuts" element={<Placeholder name="Shortcuts" />} />
           <Route path="settings" element={<Settings />} />
           <Route path="responses" element={<Responses />} />
-          <Route path="screenshot" element={<Placeholder name="Screenshot" />} />
+          <Route path="screenshot" element={<ScreenContext />} />
           <Route path="audio" element={<Placeholder name="Audio" />} />
           <Route path="live" element={<LiveTranscript />} />
           <Route path="search" element={<Search />} />
@@ -130,7 +152,6 @@ function App() {
       <AutoDisguiseToast />
       <InvisibilityToast />
       <UpdateToast />
-    </HashRouter>
     </>
   );
 }

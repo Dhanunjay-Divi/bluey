@@ -213,6 +213,15 @@ export interface JobApplication {
   submitted_at_ms?: number;
 }
 
+export interface JobsBlueyHandoffIssueResponse {
+  schema_version: 1;
+  audience: "bluey-desktop-interview-prep-v1";
+  nonce: string;
+  deep_link_url: string;
+  expires_at_ms: number;
+  expires_in_seconds: number;
+}
+
 export interface BrowserSession {
   id: string;
   runner: "local" | "cloud";

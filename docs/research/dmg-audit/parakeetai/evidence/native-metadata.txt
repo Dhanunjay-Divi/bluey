@@ -1,0 +1,42 @@
+STATIC MACH-O METADATA — PARAKEETAI 3.6.21
+Commands: file, otool -L, vtool -show-build, nm -gU, codesign -dv
+No binary was executed.
+
+MAIN EXECUTABLE
+path=ParakeetAI.app/Contents/MacOS/ParakeetAI
+architectures=x86_64,arm64
+linked=@rpath/Electron Framework.framework/Electron Framework
+linked=/usr/lib/libSystem.B.dylib
+global defined symbol exposed by nm -gU=__mh_execute_header only
+
+NATIVE X86_64 NODE MODULE
+path=app.asar.unpacked/dist/main/283c2473f1c04fe665c78f2191192789.node
+sha256=2c60449159d49e26086b7fbaf2a45f6e3270eead63f3cfe9fd59ed0a696564ed
+architecture=x86_64
+minimum_macos=10.12
+sdk=26.5
+linked install name=/Users/runner/_work/parakeetai/parakeetai/packages/native-modules/target/x86_64-apple-darwin/release/deps/libparakeetai_native.dylib
+linked frameworks=AudioUnit,AudioToolbox,CoreAudio,OpenAL,CoreMIDI,CoreFoundation
+linked libraries=/usr/lib/libiconv.2.dylib,/usr/lib/libSystem.B.dylib
+exported dynamic symbol=_napi_register_module_v1 only
+signature=Developer ID Application: Jure Sotosek (836KU58BNR); hardened runtime; timestamp Jul 11 2026 11:22:29 AM
+
+NATIVE ARM64 NODE MODULE
+path=app.asar.unpacked/dist/main/c1bf554b2a57f81079e40ed1eac3f521.node
+sha256=e482f828c2ebd9eef4b46b50fdada4f38a33a1bba8377bc09222229b075d1247
+architecture=arm64
+minimum_macos=11.0
+sdk=26.5
+linked install name=/Users/runner/_work/parakeetai/parakeetai/packages/native-modules/target/aarch64-apple-darwin/release/deps/libparakeetai_native.dylib
+linked frameworks=AudioUnit,AudioToolbox,CoreAudio,OpenAL,CoreMIDI,CoreFoundation
+linked libraries=/usr/lib/libiconv.2.dylib,/usr/lib/libSystem.B.dylib
+exported dynamic symbol=_napi_register_module_v1 only
+signature=Developer ID Application: Jure Sotosek (836KU58BNR); hardened runtime; timestamp Jul 11 2026 11:22:29 AM
+
+The absolute `/Users/runner/_work/...` values are Mach-O install names embedded at build time, not observed runtime paths or additional shipped files. Both modules expose only the N-API registration symbol through the dynamic symbol table; internal Rust symbols are therefore stripped or not exported. The unpacked package separately includes Rust source listed in bundle-static.txt.
+
+HELPERS
+org.parakeetai.ParakeetAI.helper=universal x86_64/arm64
+org.parakeetai.ParakeetAI.helper.GPU=universal x86_64/arm64
+org.parakeetai.ParakeetAI.helper.Plugin=universal x86_64/arm64
+org.parakeetai.ParakeetAI.helper.Renderer=universal x86_64/arm64

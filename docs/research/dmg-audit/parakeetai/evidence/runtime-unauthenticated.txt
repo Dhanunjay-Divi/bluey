@@ -1,0 +1,90 @@
+CONTROLLED UNAUTHENTICATED RUNTIME EVIDENCE — PARAKEETAI 3.6.21
+Captured 2026-07-12. Exact DMG SHA-256 is recorded in ../hashes.txt.
+
+AUTHORIZATION / GUARDRAILS
+- DMG attached with: hdiutil attach -readonly -nobrowse /Users/uno/Downloads/dmg_backtrack_code/ParakeetAI-3.6.21.dmg
+- diskutil confirmed Media Read-Only=Yes and Volume Read-Only=Yes.
+- No account was created; no credential, token, cookie, profile, or user data was supplied.
+- No UI control was clicked. No permission was granted. No audio, screenshot, interview/session, login, purchase, update-install, or bypass action was invoked.
+- HOME, user-data, disk-cache, and temp paths were isolated under /tmp/parakeet-runtime-94e86fe1.
+- An outer macOS sandbox denied external network-outbound operations. Loopback was allowed only for read-only Chrome DevTools Protocol inspection. Closed localhost proxies, host-resolver blackholing, and Chromium background/update flags provided additional defense.
+
+SUCCESSFUL OBSERVATION COMMAND (single shell command)
+env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME=/tmp/parakeet-runtime-94e86fe1/home TMPDIR=/tmp/parakeet-runtime-94e86fe1/tmp USER=uno LOGNAME=uno SHELL=/bin/zsh LANG=en_US.UTF-8 HTTP_PROXY=http://127.0.0.1:9 HTTPS_PROXY=http://127.0.0.1:9 ALL_PROXY=http://127.0.0.1:9 NO_PROXY=127.0.0.1,localhost sandbox-exec -p '(version 1)(allow default)(deny network-outbound)(allow network-outbound (remote ip "localhost:*"))' '/Volumes/ParakeetAI/ParakeetAI.app/Contents/MacOS/ParakeetAI' --no-sandbox --user-data-dir=/tmp/parakeet-runtime-94e86fe1/profile --disk-cache-dir=/tmp/parakeet-runtime-94e86fe1/cache --remote-debugging-address=127.0.0.1 --remote-debugging-port=9333 --disable-background-networking --disable-component-update --disable-sync --no-first-run --disable-default-apps --disable-features=AutofillServerCommunication,OptimizationHints,MediaRouter,Translate,CertificateTransparencyComponentUpdater '--host-resolver-rules=MAP * 0.0.0.0, EXCLUDE localhost'
+
+HARNESS LIMITATION / FAILED SETUP ATTEMPTS
+1. The first attempt omitted --no-sandbox and used the stricter profile `(deny network*)` with loopback IP exceptions. Electron printed `sandbox initialization failed: Operation not permitted` for child processes under the already-active outer sandbox, then exited. This establishes that the unmodified app attempted child sandbox initialization, but not whether it would succeed outside the harness.
+2. A second attempt added harness-only --no-sandbox but retained `(deny network*)`. That also denied Electron's local Unix process-singleton socket, printed `Failed to bind() .../SingletonSocket: Operation not permitted`, and exited.
+3. Both failed attempts wrote only to the isolated temp tree. Their trees were deleted before the successful run. The successful command narrowed the outer denial to network-outbound, allowing local Unix sockets, and retained harness-only --no-sandbox.
+
+Because --no-sandbox was required to nest the successful app under the outer network sandbox, this run MUST NOT be cited as proof that the production Chromium sandbox is disabled. The first attempt shows that the normal app tried to initialize it. The successful renderer command line contained both app-generated `--enable-sandbox` and harness-injected `--no-sandbox`; the latter controlled this test run.
+
+INITIAL PAGE / ROUTE (CDP read-only evaluation; no click)
+page_url=file:///Volumes/ParakeetAI/ParakeetAI.app/Contents/Resources/app.asar/dist/renderer/index.html
+location_hash=<empty>
+document_title=pmodule
+ready_state=complete
+body_text_lines:
+  No Credits
+  ParakeetAI
+  Login to your ParakeetAI account to start your interview.
+  Login
+visible_link=No Credits -> https://www.parakeet-ai.com/dashboard/buyCredits
+visible_link=Login -> https://www.parakeet-ai.com/auth/desktop?protocol=parakeetai
+
+No route transition was made. CDP reported one page target at the local file URL.
+
+RENDERER SECURITY STATE (CDP Runtime.enable / Runtime.evaluate)
+execution_context_1.name=Electron Isolated Context
+execution_context_1.type=isolated
+execution_context_1.origin=file://
+execution_context_2.name=<empty>
+execution_context_2.type=default
+execution_context_2.origin=file://
+main_world typeof require=undefined
+main_world typeof process=undefined
+main_world typeof global=undefined
+main_world typeof window.electron=object
+window.electron keys=ipcRendererProxy,platform,osVersion,enableLoopbackAudio,disableLoopbackAudio,showMeetingStartNotificationOnly
+window.electron.ipcRendererProxy keys=invoke,on
+platform=darwin
+isSecureContext=true
+crossOriginIsolated=false
+CSP meta=<none>
+
+This directly confirms context isolation and absence of Node globals in the renderer main world for this build. It also confirms the broad generic IPC proxy identified statically.
+
+PROCESS MODEL / FLAGS DURING SUCCESSFUL HARNESS RUN
+main=ParakeetAI with harness --no-sandbox and all isolation/network flags above
+gpu=Helper (GPU), --type=gpu-process, --no-sandbox
+network=Helper, --type=utility, --utility-sub-type=network.mojom.NetworkService, --service-sandbox-type=network, --no-sandbox
+renderer=Helper (Renderer), --type=renderer, --enable-experimental-web-platform-features, --enable-sandbox, harness --no-sandbox, --show-meeting-start-toast-only=false
+node_utility=Helper, --type=utility, --utility-sub-type=node.mojom.NodeService, --service-sandbox-type=none, --no-sandbox
+
+NETWORK / UPDATE RESULT
+- App log immediately entered updater state `checking`, then `error` with `net::ERR_CONNECTION_REFUSED`; no update was downloaded or installed.
+- Renderer attempted unauthenticated tRPC fetches for `user.get` and `configuration.getMixpanelToken`, then retried Mixpanel-token configuration.
+- Every PerformanceResourceTiming entry had responseStatus=0, transferSize=0, and encodedBodySize=0.
+- lsof showed only the harness CDP listener and inspector connections on 127.0.0.1:9333. No external socket was present.
+
+ISOLATED TEMP-PROFILE INVENTORY
+total_allocated_kib=1888
+home_log=home/Library/Logs/parakeetai-desktop/main.log
+top_level_profile_entries=.updaterId,Cache,Code Cache,Cookies,Cookies-journal,DIPS,DIPS-wal,DawnGraphiteCache,DawnWebGPUCache,DevToolsActivePort,GPUCache,Local Storage,Network Persistent State,Preferences,Session Storage,Shared Dictionary,SharedStorage,SharedStorage-wal,SingletonCookie,SingletonLock,SingletonSocket,Trust Tokens,Trust Tokens-journal,blob_storage,settings.json
+cookie_database_rows=0
+settings.json:
+  autoDetectMeetings=unset
+  currentScreenIndex=0
+  encryptedBypassToken=<empty>
+  isPrivate=true
+  locationOnScreen=top-center
+  overlayOpacity=45
+  startHiddenAfterUpdate=false
+
+The profile also generated an updater UUID and an anonymous staging user UUID before login. Their ephemeral values are intentionally not retained. The run confirms concrete local Chromium cookie/cache/LevelDB/session-store files and the Electron Settings log/path behavior inside the isolated roots.
+
+TERMINATION / CLEANUP
+- Main PID received SIGTERM and exited before the second 200-ms poll; no SIGKILL was needed.
+- All mounted-app processes and the 127.0.0.1:9333 listener were absent afterward.
+- /tmp/parakeet-runtime-94e86fe1 (equivalent to /private/tmp/parakeet-runtime-94e86fe1 on macOS) was removed.
+- /dev/disk7 was detached and /Volumes/ParakeetAI was absent.

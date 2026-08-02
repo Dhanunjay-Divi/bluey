@@ -26,6 +26,8 @@ import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
+import { jobsApi } from "../api";
+import { validatedBlueyHandoffUrl } from "../lib/bluey-handoff";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -54,6 +56,8 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const [rememberAnswer, setRememberAnswer] = useState(true);
   const [answerScope, setAnswerScope] = useState<"account" | "track" | "company">("account");
   const [prepTarget, setPrepTarget] = useState<{ application: JobApplication; job: JobPosting; resume: ResumeVersion } | null>(null);
+  const [blueyOpening, setBlueyOpening] = useState(false);
+  const [blueyHandoffError, setBlueyHandoffError] = useState("");
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
 
   const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
@@ -98,6 +102,10 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     setAnswerScope(selectedJob?.track_id ? "track" : "account");
   }, [selectedIntervention?.id, selectedIntervention?.kind, selectedJob?.track_id]);
 
+  useEffect(() => {
+    setBlueyHandoffError("");
+  }, [selected?.id]);
+
   const update = async (state: string) => {
     if (!selected) return;
     setBusy(true);
@@ -132,6 +140,22 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
       else window.location.assign(selectedJob.canonical_url);
     } finally {
       setBusy(false);
+    }
+  };
+
+  const openInBluey = async () => {
+    if (!selected || selected.state !== "submitted") return;
+    setBlueyOpening(true);
+    setBlueyHandoffError("");
+    try {
+      const issued = await jobsApi.issueBlueyHandoff(selected.id);
+      window.location.assign(validatedBlueyHandoffUrl(issued));
+    } catch (cause) {
+      setBlueyHandoffError(
+        cause instanceof Error ? cause.message : "Bluey could not open this application.",
+      );
+    } finally {
+      setBlueyOpening(false);
     }
   };
 
@@ -235,7 +259,19 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div>{selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}{selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            {blueyHandoffError && <div className="input-needed"><AlertCircle size={17} /><div><b>Bluey did not open</b><p>{blueyHandoffError}</p></div></div>}
+            <div className="dialog-actions spread">
+              <p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : "Approving counts this tailored application once. Retries do not double-charge."}</p>
+              <div>
+                {selected.state === "needs_input" && !canAnswerIntervention && <a className="button secondary" href={selectedSession?.takeover_url || `bluey-jobs://takeover?application_id=${encodeURIComponent(selected.id)}`}><MonitorUp size={16} />Take over browser</a>}
+                {selected.state === "awaiting_review" && applicationEligibility(selected, selectedJob).can_queue_local && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}
+                {selected.state === "awaiting_review" && !applicationEligibility(selected, selectedJob).can_queue_local && ["handoff", "unknown_review"].includes(applicationEligibility(selected, selectedJob).capability) && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}
+                {selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}
+                {selected.state === "submitted" && <button className="button primary" disabled={blueyOpening} onClick={() => void openInBluey()}><MonitorUp size={16} />{blueyOpening ? "Opening Bluey..." : "Open in Bluey"}</button>}
+                {selected.state === "submitted" && selectedJob && selectedResume && <button className="button secondary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare here</button>}
+                {selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}
+              </div>
+            </div>
           </div>
         )}
       </Dialog>

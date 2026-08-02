@@ -21,10 +21,24 @@ account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
 must opt into another IP with `BLUEY_JOBS_API_HOST` and enforce private ingress.
 
-The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
-API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
-and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
-32-byte secrets and rotate them separately.
+The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. Jobs
+workers sign each API request with `BLUEY_JOBS_WORKER_SIGNING_KEY`; the signed
+credential is bound to the Jobs API audience, worker identity, timestamp,
+nonce, method, path, body hash, and operation scope, and replayed nonces are
+rejected through Valkey/Redis. The
+Temporal worker and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use
+independently generated 32-byte secrets and rotate them separately. During a
+worker-key rotation, the API may temporarily accept
+`BLUEY_JOBS_WORKER_SIGNING_KEY_PREVIOUS`; remove it after all workers use the
+new key and the 180-second replay window has elapsed.
+
+Local Bluey Browser launches consume a single-use root ticket and receive
+separate HMAC capabilities for result delivery and intervention resume. Each
+capability is bound to the Bluey account, application, run, browser profile,
+operation, and ticket expiry. Set `BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY` to an
+independent 32-byte secret. During rotation, temporarily configure
+`BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY_PREVIOUS`, then remove it after all active
+local-run tickets have expired.
 
 ## Required environment
 
@@ -32,7 +46,9 @@ and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
 BLUEY_JOBS_BETA_ENABLED=1
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
 BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
-BLUEY_JOBS_WORKER_TOKEN=<random secret>
+BLUEY_JOBS_WORKER_SIGNING_KEY=<random 32-byte secret>
+BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY=<random 32-byte secret>
+BLUEY_JOBS_WORKER_ID=<stable deployment replica ID>
 BLUEY_JOBS_DISCOVERY_WORKER_ID=<stable deployment replica ID>
 BLUEY_JOBS_DISCOVERY_POLL_MS=5000
 BLUEY_JOBS_RUNNER_ORIGIN=https://jobs-runner.internal
@@ -47,6 +63,12 @@ TEMPORAL_NAMESPACE=<namespace>
 TEMPORAL_API_KEY=<Temporal Cloud API key>
 TEMPORAL_TLS=true
 ```
+
+Production must set `BLUEY_RATE_LIMIT_REDIS_STRICT=1`. The authenticated Jobs
+API uses separate account-plus-trusted-IP buckets for reads, writes, packet
+generation, application identities, browser/run operations, and evidence
+uploads. The signed-worker nonce guard uses the same shared Redis deployment;
+do not run multiple API replicas with local-only replay state.
 
 Run the discovery worker as a separate deployment using the workflows image
 with command `node workflows/dist/discovery-worker.js`. It leases only

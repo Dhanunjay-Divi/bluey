@@ -13,6 +13,74 @@ pub enum AudioSourceKind {
     Microphone,
 }
 
+pub const AUDIO_READINESS_SCHEMA_VERSION: u16 = 1;
+
+/// Result of an explicit, local-only onboarding audio probe.
+///
+/// `Silent` means the source opened successfully but the bounded sample did
+/// not contain an audible signal. It is distinct from an unavailable device
+/// or an OS permission denial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioReadinessState {
+    Ready,
+    PermissionDenied,
+    Unavailable,
+    Silent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioReadinessSourceResult {
+    pub source: AudioSourceKind,
+    pub state: AudioReadinessState,
+    pub captured_bytes: u64,
+    pub sample_count: u64,
+    pub nonzero_samples: u64,
+    /// Linear RMS level in the closed range 0.0..=1.0.
+    pub rms: f32,
+    /// Linear peak level in the closed range 0.0..=1.0.
+    pub peak: f32,
+}
+
+impl AudioReadinessSourceResult {
+    pub fn unavailable(source: AudioSourceKind) -> Self {
+        Self {
+            source,
+            state: AudioReadinessState::Unavailable,
+            captured_bytes: 0,
+            sample_count: 0,
+            nonzero_samples: 0,
+            rms: 0.0,
+            peak: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AudioReadinessProbeResult {
+    pub schema_version: u16,
+    pub checked_at_ms: u64,
+    /// These explicit invariants make the privacy boundary inspectable by the
+    /// UI and regression tests instead of relying on onboarding copy alone.
+    pub retained_audio: bool,
+    pub transcribed: bool,
+    pub uploaded: bool,
+    pub sources: Vec<AudioReadinessSourceResult>,
+}
+
+impl AudioReadinessProbeResult {
+    pub fn local_only(checked_at_ms: u64, sources: Vec<AudioReadinessSourceResult>) -> Self {
+        Self {
+            schema_version: AUDIO_READINESS_SCHEMA_VERSION,
+            checked_at_ms,
+            retained_audio: false,
+            transcribed: false,
+            uploaded: false,
+            sources,
+        }
+    }
+}
+
 impl AudioSourceKind {
     pub fn default_label(self) -> &'static str {
         match self {
@@ -232,6 +300,15 @@ impl AudioStreamFormat {
 
     pub fn stt_mono() -> Self {
         Self::new(DEFAULT_STT_SAMPLE_RATE_HZ, 1, AudioSampleFormat::F32)
+    }
+
+    /// Raw PCM format emitted by Bluey's native audio helpers.
+    ///
+    /// This is intentionally separate from [`Self::stt_mono`]: in-memory STT
+    /// and CPAL paths may still use normalized `f32`, while helper stdout uses
+    /// signed 16-bit little-endian mono samples at 16 kHz.
+    pub fn native_helper_pcm16_mono() -> Self {
+        Self::new(DEFAULT_STT_SAMPLE_RATE_HZ, 1, AudioSampleFormat::I16)
     }
 
     pub fn estimated_frame_count(self, duration_ms: u32) -> u64 {
@@ -1166,6 +1243,18 @@ mod tests {
     }
 
     #[test]
+    fn native_helper_pcm_contract_is_explicit_without_changing_stt_float_format() {
+        assert_eq!(
+            AudioStreamFormat::native_helper_pcm16_mono(),
+            AudioStreamFormat::new(16_000, 1, AudioSampleFormat::I16)
+        );
+        assert_eq!(
+            AudioStreamFormat::stt_mono(),
+            AudioStreamFormat::new(16_000, 1, AudioSampleFormat::F32)
+        );
+    }
+
+    #[test]
     fn selected_device_marks_source_ready_and_updates_format() {
         let config = AudioSourceConfig::microphone_default().with_device_id("mic-1");
         let device = AudioDeviceDescriptor::default_microphone(AudioBackend::CoreAudio)
@@ -1301,5 +1390,29 @@ mod tests {
         // Verify it serializes correctly
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["permission_denied_source"], "microphone");
+    }
+
+    #[test]
+    fn readiness_result_serializes_explicit_local_only_invariants() {
+        let result = AudioReadinessProbeResult::local_only(
+            1_725_000_000_000,
+            vec![AudioReadinessSourceResult {
+                source: AudioSourceKind::Microphone,
+                state: AudioReadinessState::Ready,
+                captured_bytes: 32_000,
+                sample_count: 16_000,
+                nonzero_samples: 12_000,
+                rms: 0.2,
+                peak: 0.8,
+            }],
+        );
+        let json = serde_json::to_value(result).expect("readiness serializes");
+
+        assert_eq!(json["schema_version"], AUDIO_READINESS_SCHEMA_VERSION);
+        assert_eq!(json["sources"][0]["source"], "microphone");
+        assert_eq!(json["sources"][0]["state"], "ready");
+        assert_eq!(json["retained_audio"], false);
+        assert_eq!(json["transcribed"], false);
+        assert_eq!(json["uploaded"], false);
     }
 }

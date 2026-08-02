@@ -2,7 +2,7 @@ use std::env;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 #[cfg(target_os = "macos")]
 use std::time::Instant as StdInstant;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,7 +23,10 @@ use cue_core::{
     MeetingRecap, MeetingRecord, MemoryHit, OverlayPosition, PrivacyFlags, ProviderRoute,
     ProviderSelector, RouteBudget, RouteSelectionPolicy, Speaker, BLUEY_TRACE_ID_ENV,
 };
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
+#[cfg(not(windows))]
 use tokio::net::TcpStream;
 use tokio::time::{sleep, Duration, Instant};
 
@@ -40,6 +43,12 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Show Bluey's machine-readable product policy and provenance notice.
+    Legal {
+        /// Emit the policy as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Start Bluey and open an interactive meeting session.
     #[command(hide = true)]
     Run(RunArgs),
@@ -567,6 +576,22 @@ pub async fn cli_main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Legal { json } => {
+            let policy = cue_core::embedded_product_policy();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&policy)?);
+            } else {
+                println!("Bluey product policy");
+                println!("License: {}", policy.license);
+                println!("Build: {}", policy.build_id);
+                println!("Terms: {}", policy.terms_url);
+                println!("Automated extraction: {}", policy.automated_extraction);
+                println!("Model training: {}", policy.model_training);
+                println!("Redistribution: {}", policy.redistribution);
+                println!("This is a policy notice, not a DRM boundary.");
+            }
+            Ok(())
+        }
         Commands::Run(args) => run(args).await,
         Commands::On(args) => cue_on(args).await,
         Commands::Off => cue_off().await,
@@ -1156,12 +1181,10 @@ enum BlueyOnAuthState {
 }
 
 fn bluey_account_linked(paths: &AppPaths) -> bool {
-    cue_cloud_client::tokens::tokens_available(paths)
-        || (legacy_keyring_fallback_enabled()
-            && keyring_has_tokens_with_timeout(std::time::Duration::from_secs(1))
-                .ok()
-                .flatten()
-                .unwrap_or(false))
+    load_account(paths)
+        .ok()
+        .flatten()
+        .is_some_and(|account| account.provider != "local" && account.linked_owner_id().is_some())
 }
 
 fn bluey_signin_url() -> String {
@@ -1520,7 +1543,7 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         account.provider, account.api_url
     );
     if has_cloud_tokens {
-        println!("Cloud token saved in Bluey's private local account profile.");
+        println!("Cloud token saved in the configured Bluey credential store.");
         println!("Saved sessions sync automatically in the background while Bluey is on.");
     } else {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
@@ -1531,7 +1554,9 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
 async fn print_account() -> Result<()> {
     let paths = AppPaths::discover()?;
     let account = load_account(&paths)?;
-    let has_stored_tokens = cue_cloud_client::tokens::tokens_available(&paths);
+    let has_cloud_link = account
+        .as_ref()
+        .is_some_and(|account| account.provider != "local" && account.linked_owner_id().is_some());
     let cloud = request(DaemonRequest::CloudStatus).await.ok();
 
     match account {
@@ -1542,8 +1567,8 @@ async fn print_account() -> Result<()> {
             println!("User: {}", account.user_id);
             println!("Device: {}", account.device_id);
             println!(
-                "Token: {}",
-                if has_stored_tokens {
+                "Cloud link: {}",
+                if has_cloud_link {
                     "configured"
                 } else {
                     "not configured"
@@ -1770,41 +1795,6 @@ fn login_account_provider(local: bool) -> &'static str {
     }
 }
 
-fn legacy_keyring_fallback_enabled() -> bool {
-    truthy_env("BLUEY_LEGACY_KEYRING_FALLBACK")
-}
-
-fn truthy_env(name: &str) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
-}
-
-fn keyring_has_tokens_with_timeout(timeout: std::time::Duration) -> Result<Option<bool>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<bool> {
-            let client = cue_cloud_client::CloudClient::with_default_keyring()
-                .context("failed to open keyring token store")?;
-            Ok(client.current_tokens().is_some())
-        })();
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(result) => result.map(Some),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(anyhow!("keyring token check task ended without returning"))
-        }
-    }
-}
-
 fn device_login_url(verification_uri: &str, user_code: &str) -> String {
     let base = verification_uri.trim_end_matches('/');
     let separator = if base.contains('?') { '&' } else { '?' };
@@ -1813,7 +1803,7 @@ fn device_login_url(verification_uri: &str, user_code: &str) -> String {
 
 fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
     let paths = AppPaths::discover()?;
-    let owner_account_id = cli_current_owner_account_id(&paths);
+    let owner_account_id = cli_current_owner_account_id(&paths)?;
     let mut meetings: Vec<MeetingRecord> = Vec::new();
 
     let active_path = paths.data_dir.join("active-meeting.json");
@@ -1848,21 +1838,8 @@ fn load_local_meetings() -> Result<Vec<MeetingRecord>> {
     Ok(meetings)
 }
 
-fn cli_current_owner_account_id(paths: &AppPaths) -> Option<String> {
-    let account = load_account(paths).ok().flatten()?;
-    if !account.token_configured() {
-        return None;
-    }
-    account
-        .cloud_account_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .or_else(|| {
-            let user_id = account.user_id.trim();
-            (!user_id.is_empty() && user_id != "local-user").then(|| user_id.to_string())
-        })
+fn cli_current_owner_account_id(paths: &AppPaths) -> Result<Option<String>> {
+    Ok(load_account(paths)?.and_then(|account| account.linked_owner_id().map(ToString::to_string)))
 }
 
 fn meeting_visible_for_cli_owner(meeting: &MeetingRecord, owner_account_id: Option<&str>) -> bool {
@@ -2874,25 +2851,150 @@ fn daemon_executable_candidate_names() -> Vec<String> {
 }
 
 async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
-    let addr = env_value_any("BLUEY_DAEMON_ADDR", "CUE_DAEMON_ADDR")
+    let addr_value = env_value_any("BLUEY_DAEMON_ADDR", "CUE_DAEMON_ADDR")
         .unwrap_or_else(|| DEFAULT_DAEMON_ADDR.to_string());
-    let stream = TcpStream::connect(&addr)
-        .await
-        .with_context(|| format!("failed to connect to Bluey daemon at {addr}"))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-
-    let line = serde_json::to_string(&message.with_trace_id(command_trace_id()))?;
-    writer.write_all(line.as_bytes()).await?;
-    writer.write_all(b"\n").await?;
-    writer.flush().await?;
-
-    let mut response = String::new();
-    let read = reader.read_line(&mut response).await?;
-    if read == 0 {
-        bail!("daemon closed connection without a response");
+    // Validate before loading the capability so bearer bytes can never be
+    // sent to a hostname or non-loopback destination.
+    let addr = cue_core::validated_loopback_ipc_addr(&addr_value)?;
+    let message = message.with_trace_id(command_trace_id());
+    if message.ipc_authorization() == cue_core::IpcAuthorization::Public {
+        return request_wire(cue_core::DaemonWireRequest::Public(message), addr).await;
     }
-    Ok(serde_json::from_str(response.trim_end())?)
+
+    let capability = cli_ipc_capability(false)?;
+    let response = request_wire(
+        cue_core::DaemonWireRequest::Authenticated(cue_core::AuthenticatedDaemonRequest::new(
+            &capability,
+            message.clone(),
+        )),
+        addr,
+    )
+    .await?;
+    if matches!(
+        response,
+        DaemonResponse::IpcAuthError {
+            code: cue_core::IpcAuthErrorCode::StaleBoot
+        }
+    ) {
+        let capability = cli_ipc_capability(true)?;
+        return request_wire(
+            cue_core::DaemonWireRequest::Authenticated(cue_core::AuthenticatedDaemonRequest::new(
+                &capability,
+                message,
+            )),
+            addr,
+        )
+        .await
+        .and_then(reject_cli_ipc_auth_error);
+    }
+    reject_cli_ipc_auth_error(response)
+}
+
+fn cli_ipc_capability(force_reload: bool) -> Result<cue_core::IpcCapabilityRecord> {
+    static CACHE: once_cell::sync::Lazy<Mutex<Option<cue_core::IpcCapabilityRecord>>> =
+        once_cell::sync::Lazy::new(|| Mutex::new(None));
+    let mut cached = CACHE
+        .lock()
+        .map_err(|_| anyhow!("daemon authentication cache unavailable"))?;
+    if force_reload {
+        *cached = None;
+    }
+    if let Some(capability) = cached.as_ref() {
+        return Ok(capability.clone());
+    }
+    let paths = AppPaths::discover().context("daemon authentication path unavailable")?;
+    let capability =
+        cue_core::load_ipc_capability(&paths).context("daemon authentication unavailable")?;
+    *cached = Some(capability.clone());
+    Ok(capability)
+}
+
+fn reject_cli_ipc_auth_error(response: DaemonResponse) -> Result<DaemonResponse> {
+    if let DaemonResponse::IpcAuthError { code } = response {
+        bail!("daemon authentication failed: {code:?}");
+    }
+    Ok(response)
+}
+
+const DAEMON_IPC_OPERATION_TIMEOUT: Duration = Duration::from_secs(6);
+
+async fn request_wire(
+    message: cue_core::DaemonWireRequest,
+    addr: std::net::SocketAddr,
+) -> Result<DaemonResponse> {
+    request_wire_with_timeout(message, addr, DAEMON_IPC_OPERATION_TIMEOUT).await
+}
+
+async fn request_wire_with_timeout(
+    message: cue_core::DaemonWireRequest,
+    addr: std::net::SocketAddr,
+    timeout_limit: Duration,
+) -> Result<DaemonResponse> {
+    #[cfg(windows)]
+    let _ = addr;
+    let operation = async {
+        #[cfg(not(windows))]
+        let stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("failed to connect to Bluey daemon at {addr}"))?;
+        #[cfg(windows)]
+        let stream = connect_windows_daemon_pipe().await?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            cue_core::validate_windows_named_pipe_server(stream.as_raw_handle() as _)
+                .context("refused Windows daemon named-pipe server")?;
+        }
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader =
+            BufReader::new(reader).take((cue_core::ipc_auth::IPC_MAX_RESPONSE_BYTES + 1) as u64);
+
+        let line = serde_json::to_vec(&message)?;
+        if line.len() + 1 > cue_core::ipc_auth::IPC_MAX_REQUEST_BYTES {
+            bail!("daemon request exceeds IPC size limit");
+        }
+        writer.write_all(&line).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+
+        let mut response = Vec::new();
+        let read = reader.read_until(b'\n', &mut response).await?;
+        if read == 0 {
+            bail!("daemon closed connection without a response");
+        }
+        if response.len() > cue_core::ipc_auth::IPC_MAX_RESPONSE_BYTES {
+            bail!("daemon response exceeds IPC size limit");
+        }
+        if response.last() != Some(&b'\n') {
+            bail!("daemon response is missing its delimiter");
+        }
+        Ok(serde_json::from_slice(&response[..response.len() - 1])?)
+    };
+
+    tokio::time::timeout(timeout_limit, operation)
+        .await
+        .map_err(|_| anyhow!("daemon request timed out"))?
+}
+
+#[cfg(windows)]
+async fn connect_windows_daemon_pipe() -> Result<NamedPipeClient> {
+    const RETRY_DELAY: Duration = Duration::from_millis(20);
+
+    let pipe_name = cue_core::windows_named_pipe_name()?;
+    loop {
+        match ClientOptions::new().open(&pipe_name) {
+            Ok(client) => return Ok(client),
+            Err(error)
+                if error.raw_os_error()
+                    == Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32) =>
+            {
+                sleep(RETRY_DELAY).await;
+            }
+            Err(error) => {
+                return Err(error).context("failed to connect to Bluey Windows named pipe")
+            }
+        }
+    }
 }
 
 fn command_trace_id() -> String {
@@ -2979,9 +3081,16 @@ fn print_response(response: DaemonResponse) -> Result<()> {
             print_answer_response(response, false, events.len())
         }
         DaemonResponse::CloudStatus { status } => print_cloud_status(status),
+        DaemonResponse::IpcAuthError { code } => {
+            bail!("daemon authentication failed: {code:?}");
+        }
         DaemonResponse::Error { message } => {
             bail!("daemon error: {message}");
         }
+        other => println!(
+            "{}",
+            serde_json::to_string_pretty(&other).expect("daemon response serializes")
+        ),
     }
     Ok(())
 }
@@ -3507,6 +3616,9 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
                 email: env::var("BLUEY_USER_ID")
                     .or_else(|_| env::var("CUE_USER_ID"))
                     .unwrap_or_else(|_| "env-token".to_string()),
+                account_id: env::var("BLUEY_ACCOUNT_ID")
+                    .or_else(|_| env::var("CUE_ACCOUNT_ID"))
+                    .ok(),
             },
         )?;
         return cue_cloud_client::CloudClient::new(config, Arc::new(store))
@@ -3514,17 +3626,12 @@ fn optional_cloud_client() -> Result<Option<cue_cloud_client::CloudClient>> {
             .map_err(Into::into);
     }
 
-    let store = cue_cloud_client::SecureAccountStore::new(paths.clone());
-    let client = cue_cloud_client::CloudClient::new(config.clone(), Arc::new(store))?;
-    if client.current_tokens().is_some() {
-        return Ok(Some(client));
-    }
-
-    if legacy_keyring_fallback_enabled() {
-        let client = cue_cloud_client::CloudClient::new(
-            config,
-            Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
-        )?;
+    if account
+        .as_ref()
+        .is_some_and(|account| account.provider != "local" && account.linked_owner_id().is_some())
+    {
+        let store = cue_cloud_client::SecureAccountStore::new(paths.clone());
+        let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
         if client.current_tokens().is_some() {
             return Ok(Some(client));
         }
@@ -3581,49 +3688,17 @@ async fn bluey_logout_cmd() -> Result<()> {
     let account_store = cue_cloud_client::SecureAccountStore::new(paths.clone());
     let had_account_tokens = cue_cloud_client::TokenStore::load(&account_store)?.is_some();
     cue_cloud_client::TokenStore::clear(&account_store)?;
+    // Credential clearing and daemon lifecycle clearing are separate. Always
+    // notify the daemon so audio, polling and signed-in overlay state stop even
+    // when the secure store was already empty.
+    let _ = request(DaemonRequest::CloudLogout).await;
 
-    let had_keyring_tokens = if legacy_keyring_fallback_enabled() {
-        match clear_keyring_tokens_with_timeout()? {
-            Some(had_tokens) => had_tokens,
-            None => {
-                eprintln!(
-                    "bluey: legacy keyring cleanup timed out; local account config was still cleared"
-                );
-                false
-            }
-        }
-    } else {
-        false
-    };
-
-    if !had_account_tokens && !had_keyring_tokens {
+    if !had_account_tokens {
         println!("Bluey is already logged out.");
         return Ok(());
     }
-    let _ = request(DaemonRequest::CloudLogout).await;
     println!("Bluey account logged out.");
     Ok(())
-}
-
-fn clear_keyring_tokens_with_timeout() -> Result<Option<bool>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<bool> {
-            let client = cue_cloud_client::CloudClient::with_default_keyring()
-                .context("failed to open keyring token store")?;
-            let had_keyring_tokens = client.current_tokens().is_some();
-            client.clear_tokens()?;
-            Ok(had_keyring_tokens)
-        })();
-        let _ = tx.send(result);
-    });
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(result) => result.map(Some),
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(anyhow!("keyring cleanup task ended without returning"))
-        }
-    }
 }
 
 async fn bluey_portal_cmd() -> Result<()> {
@@ -3674,6 +3749,62 @@ mod tests {
             Duration as StdDuration, SystemTime as StdSystemTime, UNIX_EPOCH as STD_UNIX_EPOCH,
         },
     };
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn daemon_ipc_client_times_out_on_half_open_response() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            tokio::time::sleep(tokio::time::Duration::from_millis(75)).await;
+        });
+
+        let error = super::request_wire_with_timeout(
+            cue_core::DaemonWireRequest::Public(cue_core::DaemonRequest::Ping),
+            addr,
+            tokio::time::Duration::from_millis(15),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        server.await.unwrap();
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn daemon_ipc_client_rejects_oversized_response() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let oversized = vec![b'x'; cue_core::ipc_auth::IPC_MAX_RESPONSE_BYTES + 1];
+            let _ = writer.write_all(&oversized).await;
+        });
+
+        let error = super::request_wire_with_timeout(
+            cue_core::DaemonWireRequest::Public(cue_core::DaemonRequest::Ping),
+            addr,
+            tokio::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("exceeds IPC size limit"));
+        server.await.unwrap();
+    }
 
     #[test]
     fn bluey_on_boot_lines_offer_browser_signin_when_unlinked() {

@@ -1,0 +1,45 @@
+Cluely (New) 2.1.19 — completion verification
+Captured: 2026-07-12
+
+Artifact verification
+---------------------
+DMG SHA-256 and byte size were recorded before attachment.
+The DMG was attached with -readonly -nobrowse and both media/volume read-only flags.
+All hdiutil checksum-verification stages passed.
+The calculated ASAR JSON-header hash matched ElectronAsarIntegrity exactly.
+All 3261 extracted regular ASAR files matched their embedded SHA-256; failures=0.
+The main app and nested code passed codesign --verify --deep --strict.
+Gatekeeper accepted the app as Notarized Developer ID; stapler validation passed.
+
+Documentation QA
+----------------
+Required top-level files present and nonempty: 7/7
+  MANIFEST.md
+  ARCHITECTURE.md
+  FEATURES.md
+  DATA-AND-NETWORK.md
+  SECURITY.md
+  BLUEY-GAP-MAP.md
+  hashes.txt
+Broken relative Markdown links: 0
+Malformed SHA-256 rows in hashes.txt: 0
+Credential/private-key pattern matches in retained audit material: 0
+git diff --check -- docs/research/dmg-audit/cluely: passed
+git diff --check (whole concurrent working tree): passed
+
+Runtime cleanup
+---------------
+Direct app process and descendants after termination: none
+/Applications/Cluely (New).app after probe: absent
+/Users/uno/Applications/Cluely (New).app after probe: absent
+LaunchServices bundle-ID matches after scoped unregister: 0
+Removed only these owned temporary paths:
+  /private/tmp/cluely-2119-asar-extract
+  /private/tmp/cluely-runtime-probe.9zvQDk
+  /private/tmp/cluely-runtime-probe.HKLeS8
+Detached only the audit image device: /dev/disk4
+Detach result: "disk4" ejected
+Remaining matching Cluely audit temp paths: none
+Remaining /dev/disk4 or audit mount in hdiutil info: none
+
+No extracted proprietary source or binary is retained under docs/research/dmg-audit/cluely.

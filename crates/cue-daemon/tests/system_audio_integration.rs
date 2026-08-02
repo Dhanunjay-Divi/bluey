@@ -29,7 +29,7 @@ async fn system_audio_capture_receives_chunks_from_stub() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     let mut received = Vec::new();
@@ -72,7 +72,7 @@ async fn system_audio_capture_stops_cleanly() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     // Receive one chunk then stop
@@ -94,7 +94,7 @@ async fn system_audio_chunks_drive_stt_provider() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     // Create a mock STT provider configured for System audio
@@ -170,7 +170,7 @@ async fn system_audio_handle_retained_for_shutdown() {
 
     std::env::set_var("BLUEY_SYSTEM_AUDIO_BINARY", &stub);
 
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
     let capture = SystemAudioCapture::start(tx).expect("start capture");
 
     // Simulate what the daemon does: store in Option, then take + stop on shutdown
@@ -212,7 +212,7 @@ async fn single_provider_send_and_drain_production_wiring() {
     use tokio::sync::mpsc;
 
     // Set up the same channel the production capture uses.
-    let (sys_tx, mut sys_rx) = mpsc::unbounded_channel::<AudioChunk>();
+    let (sys_tx, mut sys_rx) = mpsc::channel::<AudioChunk>(10);
 
     // Build ONE provider (mirrors production: build_system_audio_stt_provider called once).
     let cfg = SttConfig {
@@ -266,9 +266,9 @@ async fn single_provider_send_and_drain_production_wiring() {
         samples: vec![0i16; 320],
         captured_at_ms: 1000,
     };
-    sys_tx.send(test_chunk.clone()).unwrap();
-    sys_tx.send(test_chunk.clone()).unwrap();
-    sys_tx.send(test_chunk).unwrap();
+    sys_tx.send(test_chunk.clone()).await.unwrap();
+    sys_tx.send(test_chunk.clone()).await.unwrap();
+    sys_tx.send(test_chunk).await.unwrap();
 
     // Give the loop time to process sends.
     tokio::time::sleep(Duration::from_millis(50)).await;

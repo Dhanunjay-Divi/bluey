@@ -1,0 +1,6 @@
+827b46feccd68e18fa41ef840da03102c8c38f381626b1e6bb899d75a5582e62  /Users/uno/Downloads/exe_backtrack_code/Cluely Setup 2.0.193.exe
+607c92940fac960a5cfd6e86ee8e6c50190ff8ef562394475f74016184d0b3e7  payload-x64-exact/resources/app.asar
+607c92940fac960a5cfd6e86ee8e6c50190ff8ef562394475f74016184d0b3e7  payload-arm64-exact/resources/app.asar
+639acae713672d1185d95bc30797c6c799ed4d0a00ea8614fddcd8442ffcd1bf  payload-x64-exact/Cluely.exe
+34f2e3e1d455d6d86edf145edf249fc6faf98e74d15ca4b70ac586c8cc19f5c8  payload-arm64-exact/Cluely.exe
+ce399e29feb92f5899e2acef2d75d8a134c9685f6fd4e173ac994803adc0220c  payload-x64-exact/resources/extra-resources/sox-14.4.1-win32/sox.exe

@@ -1,0 +1,87 @@
+Bluey reference map used for the Cluely comparison
+Captured: 2026-07-12
+Repository: /Users/uno/Downloads/cue-bluey-jobs
+
+The comparison was refreshed against product commit
+eb923a89f24b69664c73479607bf665725789658. Line ranges below were revalidated for that
+tree; later documentation-only commits may change HEAD without changing these files.
+
+Jobs and browser automation
+---------------------------
+jobs/browser/src/profile.ts:4-33
+  Account and application-identity hashing, isolated profile directories/context keys.
+jobs/browser/src/browser-network.ts:18-53
+  HTTP and WebSocket routing guard; HTTPS/WSS-only public target enforcement.
+jobs/automation/src/answer-memory.ts:3-14,35-73,89-102
+  Confirmed answer memory, company > track > account scoping, deterministic ranking.
+jobs/automation/src/challenge-handling.ts:55-89,92-140
+  CAPTCHA, assessment, and 2FA takeover; connected-inbox OTP correlation.
+jobs/automation/src/form-intelligence.ts:78-141,144-152,175-218
+  Sensitive-field gates, memory/profile/document facts, interventions, job documents.
+jobs/automation/src/execute.ts:37-97
+  Provider-first Greenhouse/Lever execution plus standard/fallback adapter path.
+jobs/automation/src/receipts.ts:100-173,176-201
+  Deterministic application receipt/evidence bundle and real confirmation requirement.
+jobs/automation/src/documents.ts:43-84,410-466
+  Deterministic bounded document artifacts, hashes, and PDF output.
+jobs/automation/src/interview-prep.ts:71-80,88-174,247-356
+  Job/application-specific interview preparation.
+jobs/runner/src/profile-store.ts:17-75
+  Identity-scoped profiles, required 32-byte key, encrypted snapshots, plaintext cleanup.
+jobs/runner/src/leased-run.ts:19-90
+  Lease finish/cleanup and side_effect_unknown safety after a final-submit attempt.
+jobs/workflows/src/workflows.ts:10-25,27-90,94-119
+  Retries only reversible work, single-attempt irreversible work, interventions, unknown
+  side-effect handling, and evidence required for submitted state.
+jobs/workflows/src/discovery-runtime.ts:112-320
+  Discovery planning/ranking/runtime execution path.
+server/src/db/jobs.rs:2199-2550,3262-3430,4087-4230
+  Lease completion/failure, eligibility, and application-attempt reservations.
+
+Meeting copilot and user data
+-----------------------------
+crates/cue-daemon/src/audio/system_capture.rs:22-58,163-225
+  Native system-audio helper lifecycle and supervised restart loop.
+crates/cue-daemon/src/audio/vad.rs:16-74,87-177
+  Adaptive RMS plus WebRTC two-stage VAD.
+crates/cue-daemon/src/stt/router.rs:15-97,99-117
+  Ordered STT provider failover; configuration can include local Whisper.
+crates/cue-daemon/src/rag_indexer.rs:114-229
+  Serialized transcript/artifact indexing, reindex, delete, current/global query.
+crates/cue-daemon/src/db/rag.rs:23-95
+  Local transcript/artifact chunking and embedding storage.
+crates/cue-daemon/src/secrets/mod.rs:1-26
+  API-key storage in the operating-system keychain.
+crates/cue-dashboard/src/macos.rs:41-71
+  macOS NSWindowSharingNone capture exclusion.
+crates/cue-daemon/src/app.rs:13909-14093,14164-14220
+  User-approved continuous screen context, accessibility/page-text preference, screenshot
+  fallback, and macOS/Windows capture paths.
+crates/cue-dashboard/ui/src/routes/Search.tsx:47-102
+  Transcript search interface.
+crates/cue-dashboard/ui/src/pages/Settings.tsx:116-124,135-223
+  Account, balance, billing portal, sign-out, and confirmed account deletion UI.
+crates/cue-dashboard/ui/src/pages/Onboarding.tsx:33-183
+  Browser-mediated account sign-in and onboarding flow.
+crates/cue-daemon/src/cloud/sync.rs:182-213,477-620,1128-1190
+  Meeting/context sync, local audit material, and retention behavior.
+crates/cue-daemon/src/llm/answer.rs:6-34
+  Meeting-answer system policy.
+crates/cue-daemon/src/llm/recap.rs:6-77
+  Structured meeting recap generation.
+
+Billing/integrations
+--------------------
+server/src/api/mod.rs:123-126,185-186,258-271
+  Billing webhooks, account billing settings, checkout, portal and saved-card routes.
+server/src/billing/policy.rs:4-46
+  Production/test-account billing restrictions.
+server/src/billing/topup.rs:103-174
+  Risk-aware auto-reload policy and provider selection.
+server/src/db/jobs.rs:7319-7324
+  Google/Outlook calendar provider capability mapping for interview-calendar evidence.
+
+Review note
+-----------
+This map records observed implementation, not comments or roadmap-only claims. Each
+comparison in BLUEY-GAP-MAP.md cites at least one of these implementation locations.

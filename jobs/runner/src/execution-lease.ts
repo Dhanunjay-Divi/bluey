@@ -1,10 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
+import { executionWorkerAuthHeaders } from "./worker-auth.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 const DEFAULT_MAX_RESPONSE_BYTES = 16 * 1024;
 const MAX_OWNER_BYTES = 128;
-const MAX_WORKER_TOKEN_BYTES = 4_096;
 const MAX_LEASE_TOKEN_BYTES = 256;
 const PROCESS_OWNER_ID = `runner-${process.pid}-${randomBytes(8).toString("hex")}`;
 
@@ -33,7 +33,7 @@ export interface ExecutionLeaseClaim {
 
 export interface ExecutionLeaseClientOptions {
   origin: string;
-  workerToken: string;
+  workerSigningKey: string;
   ownerId: string;
   requestTimeoutMs?: number;
   heartbeatIntervalMs?: number;
@@ -163,7 +163,7 @@ export class ActiveExecutionLease {
 
 export class ExecutionLeaseClient {
   readonly #origin: string;
-  readonly #workerToken: string;
+  readonly #workerSigningKey: string;
   readonly #ownerId: string;
   readonly #requestTimeoutMs: number;
   readonly #heartbeatIntervalMs: number;
@@ -172,7 +172,7 @@ export class ExecutionLeaseClient {
 
   constructor(options: ExecutionLeaseClientOptions) {
     this.#origin = normalizedOrigin(options.origin);
-    this.#workerToken = boundedSecret(options.workerToken);
+    this.#workerSigningKey = boundedSecret(options.workerSigningKey);
     this.#ownerId = boundedOwnerId(options.ownerId);
     this.#requestTimeoutMs = boundedInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 100, 60_000);
     this.#heartbeatIntervalMs = boundedInteger(
@@ -249,13 +249,19 @@ export class ExecutionLeaseClient {
     }, this.#requestTimeoutMs);
     timeout.unref?.();
     try {
+      const encodedBody = JSON.stringify(body);
       const response = await this.#fetch(`${this.#origin}${path}`, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${this.#workerToken}`,
+          ...executionWorkerAuthHeaders({
+            signingKey: this.#workerSigningKey,
+            workerId: this.#ownerId,
+            path,
+            body: encodedBody,
+          }),
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(body),
+        body: encodedBody,
         redirect: "error",
         signal: controller.signal,
       });
@@ -295,7 +301,7 @@ export function createExecutionLeaseClientFromEnv(
 ): ExecutionLeaseClient {
   return new ExecutionLeaseClient({
     origin: env.BLUEY_JOBS_API_ORIGIN ?? "",
-    workerToken: env.BLUEY_JOBS_WORKER_TOKEN ?? "",
+    workerSigningKey: env.BLUEY_JOBS_WORKER_SIGNING_KEY ?? "",
     ownerId: runnerOwnerId(env.BLUEY_JOBS_RUNNER_ID),
   });
 }
@@ -326,7 +332,7 @@ function normalizedOrigin(rawOrigin: string): string {
 }
 
 function boundedSecret(value: string): string {
-  if (!value || Buffer.byteLength(value) > MAX_WORKER_TOKEN_BYTES) {
+  if (Buffer.byteLength(value) < 32 || Buffer.byteLength(value) > 4_096) {
     throw new ExecutionLeaseError("configuration", "configuration");
   }
   return value;

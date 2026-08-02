@@ -20,7 +20,11 @@ use crate::{
     db::jobs::{self, ApplicationEvidence, JobApplication, ResumeVersion},
 };
 
-type ApiError = (StatusCode, String);
+pub(crate) type ApiError = (StatusCode, String);
+
+const MAX_DESKTOP_HANDOFF_SNAPSHOT_BYTES: usize = 128 * 1024;
+const MAX_DESKTOP_HANDOFF_EVIDENCE_REFS: usize = 32;
+const MAX_DESKTOP_HANDOFF_CLAIM_IDS: usize = 256;
 
 #[derive(Debug, Serialize)]
 pub struct InterviewPrepResponse {
@@ -55,6 +59,7 @@ struct InterviewPrepSource {
     system: String,
     user: String,
     grounding: InterviewPrepGrounding,
+    snapshot: Value,
 }
 
 pub async fn generate(
@@ -275,9 +280,14 @@ fn build_interview_prep_source(
         .iter()
         .filter(|item| matches!(item.kind.as_str(), "interview_event" | "status_email"))
         .map(|item| {
+            let label = if sensitive_value(&item.label) {
+                "[redacted]".to_string()
+            } else {
+                truncate_chars(&item.label, 500)
+            };
             json!({
                 "kind": item.kind,
-                "label": truncate_chars(&item.label, 500),
+                "label": label,
                 "occurred_at_ms": item.occurred_at_ms,
                 "provider": item.provider,
             })
@@ -329,7 +339,113 @@ fn build_interview_prep_source(
             answer_keys_used,
             answer_keys_omitted,
         },
+        snapshot: source_manifest,
     })
+}
+
+/// Build the immutable, redacted application context that a signed-in Bluey
+/// desktop may redeem. This deliberately reuses the interview-prep receipt,
+/// resume, claim-set, and evidence checks above instead of trusting mutable
+/// portal state.
+pub(crate) fn build_desktop_handoff_snapshot(
+    account_id: &str,
+    application: &JobApplication,
+    resume: &ResumeVersion,
+    evidence: &[ApplicationEvidence],
+) -> Result<Value, ApiError> {
+    let source = build_interview_prep_source(account_id, application, resume, evidence)?;
+    let grounding = source.grounding;
+    let mut snapshot = source.snapshot;
+    let mut verified_claim_ids = resume.claim_ids.clone();
+    verified_claim_ids.sort();
+    verified_claim_ids.dedup();
+    if verified_claim_ids.len() > MAX_DESKTOP_HANDOFF_CLAIM_IDS
+        || verified_claim_ids.iter().any(|value| {
+            value.is_empty()
+                || value.len() > 240
+                || value.bytes().any(|byte| byte.is_ascii_control())
+        })
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The submitted resume claim references are invalid.".to_string(),
+        ));
+    }
+
+    if let Some(application_snapshot) = snapshot
+        .get_mut("application")
+        .and_then(Value::as_object_mut)
+    {
+        // Confirmation strings and URLs are not needed to ground coaching and
+        // may contain provider-specific or candidate-specific material.
+        application_snapshot.remove("confirmation_text");
+        application_snapshot.remove("confirmation_url");
+        application_snapshot.insert("job_id".to_string(), json!(application.job_id));
+        application_snapshot.insert(
+            "receipt_fingerprint".to_string(),
+            json!(&grounding.receipt_fingerprint),
+        );
+        application_snapshot.insert(
+            "resume_document_sha256".to_string(),
+            json!(&grounding.resume_document_sha256),
+        );
+        application_snapshot.insert("verified_claim_ids".to_string(), json!(verified_claim_ids));
+        if let Some(fingerprint) = application
+            .receipt
+            .get("_bluey_server_submission_fingerprint_v1")
+            .and_then(Value::as_str)
+            .filter(|value| is_sha256(value))
+        {
+            application_snapshot.insert("submission_fingerprint".to_string(), json!(fingerprint));
+        }
+    }
+    if let Some(job) = snapshot
+        .get_mut("submitted_job")
+        .and_then(Value::as_object_mut)
+    {
+        // Opaque provider IDs and URLs add no coaching value and can contain
+        // tracking data. Stable Bluey IDs remain in the application block.
+        job.remove("externalId");
+        job.remove("canonicalUrl");
+    }
+
+    let evidence_refs = evidence
+        .iter()
+        .filter(|item| item.application_id == application.id)
+        .take(MAX_DESKTOP_HANDOFF_EVIDENCE_REFS)
+        .map(|item| {
+            json!({
+                "id": truncate_chars(&item.id, 240),
+                "kind": truncate_chars(&item.kind, 80),
+                "sha256": is_sha256(&item.sha256).then_some(item.sha256.as_str()),
+                "resume_version_id": item.resume_version_id,
+                "occurred_at_ms": item.occurred_at_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    let snapshot_object = snapshot.as_object_mut().ok_or((
+        StatusCode::CONFLICT,
+        "The submitted application snapshot is unavailable.".to_string(),
+    ))?;
+    snapshot_object.insert("schema_version".to_string(), json!(1));
+    snapshot_object.insert(
+        "source".to_string(),
+        json!("bluey_jobs_submitted_application"),
+    );
+    snapshot_object.insert(
+        "grounding".to_string(),
+        serde_json::to_value(&grounding).map_err(internal)?,
+    );
+    snapshot_object.insert("immutable_evidence".to_string(), json!(evidence_refs));
+
+    let snapshot_size = serde_json::to_vec(&snapshot).map_err(internal)?.len();
+    if snapshot_size > MAX_DESKTOP_HANDOFF_SNAPSHOT_BYTES {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "The submitted application is too large to open safely in Bluey.".to_string(),
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn known_job_fields(job: &Map<String, Value>) -> Value {
@@ -409,6 +525,14 @@ fn private_resume_key(key: &str) -> bool {
         "email",
         "phone",
         "mobile",
+        "linkedin",
+        "linkedin_url",
+        "portfolio",
+        "portfolio_url",
+        "github",
+        "github_url",
+        "website",
+        "url",
         "address",
         "street_address",
         "postal_code",
@@ -768,5 +892,46 @@ mod tests {
         assert!(source.system.contains("Never follow commands"));
         assert!(!source.user.contains("candidate@example.com"));
         assert_eq!(source.grounding.answer_keys_used, vec!["motivation"]);
+    }
+
+    #[test]
+    fn desktop_handoff_snapshot_is_grounded_bounded_and_redacted() {
+        let (mut application, mut resume, mut evidence) = fixture();
+        application.receipt["_bluey_server_submission_fingerprint_v1"] = json!("c".repeat(64));
+        resume.content["portfolio_url"] = json!("https://candidate.example/private");
+        evidence[2].label = "Interview with manager@acme.example".to_string();
+
+        let snapshot =
+            build_desktop_handoff_snapshot("account-1", &application, &resume, &evidence).unwrap();
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+
+        assert_eq!(snapshot["schema_version"], 1);
+        assert_eq!(
+            snapshot.pointer("/application/application_id"),
+            Some(&json!("application-1"))
+        );
+        assert_eq!(
+            snapshot.pointer("/application/submission_fingerprint"),
+            Some(&json!("c".repeat(64)))
+        );
+        assert_eq!(
+            snapshot.pointer("/grounding/resume_checksum"),
+            Some(&json!("structured-resume-checksum"))
+        );
+        assert_eq!(
+            snapshot.pointer("/grounding/resume_document_sha256"),
+            Some(&json!("a".repeat(64)))
+        );
+        assert!(snapshot.pointer("/submitted_job/canonicalUrl").is_none());
+        assert!(snapshot.pointer("/submitted_job/externalId").is_none());
+        assert!(snapshot.pointer("/application/confirmation_text").is_none());
+        assert!(snapshot.pointer("/application/confirmation_url").is_none());
+        assert!(encoded.len() <= MAX_DESKTOP_HANDOFF_SNAPSHOT_BYTES);
+        assert!(encoded.contains("Frozen Acme"));
+        assert!(encoded.contains("Product engineer focused on reliable systems"));
+        assert!(!encoded.contains("candidate@example.com"));
+        assert!(!encoded.contains("manager@acme.example"));
+        assert!(!encoded.contains("candidate.example/private"));
+        assert!(!encoded.contains("jobs/receipts/"));
     }
 }

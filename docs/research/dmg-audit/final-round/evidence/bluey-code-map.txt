@@ -1,0 +1,44 @@
+BLUEY COMPARISON CODE MAP
+Repository commit: eb923a89f24b69664c73479607bf665725789658
+Repository: /Users/uno/Downloads/cue-bluey-jobs
+
+JOBS PRODUCT
+- Discovery/dedup/freshness/public ATS: jobs/automation/src/public-ats.ts:45-127, 130-240.
+- Match/filter/rank UI and job preparation: jobs/portal/src/views/MatchesView.tsx:35-119; jobs/portal/src/App.tsx:179-253.
+- ATS adapters/fallback/challenges: jobs/automation/src/standard-adapters.ts:52-140, 157-340, 343-355; jobs/automation/src/execute.ts:37-98.
+- Form intelligence/answer memory/sensitive intervention: jobs/automation/src/form-intelligence.ts:78-153; jobs/automation/src/answer-memory.ts:26-103.
+- CAPTCHA/2FA/assessment/email OTP handoff: jobs/automation/src/challenge-handling.ts:55-140.
+- Tailored PDF/cover letter generation and validation: jobs/automation/src/documents.ts:58-125.
+- Resume import/export/diff UI: jobs/portal/src/views/ResumeView.tsx:57-98, 109-142; jobs/portal/src/views/ApplicationsView.tsx:277-340.
+- Local profile isolation/browser takeover: jobs/browser/src/profile.ts:4-34; jobs/browser/src/main.ts:123-170, 405-430, 475-481.
+- Browser network guard: jobs/browser/src/browser-network.ts:18-53.
+- Durable final-submit marker/duplicate protection: jobs/browser/src/irreversible-submit.ts:44-138, 140-175.
+- Explicit final review approval: jobs/browser/src/provider-final-review.ts:29-103; jobs/portal/src/views/BrowserView.tsx:60-66, 106-112.
+- Cloud execution leases/heartbeats/irreversible boundary: jobs/runner/src/execution-lease.ts:66-162, 196-237.
+- Encrypted cloud profiles: jobs/runner/src/profile-store.ts:17-75; jobs/runner/src/crypto-envelope.ts:43-78, 80-167.
+- Receipts/evidence/checksums: jobs/automation/src/receipts.ts:28-173; jobs/automation/src/packet-guards.ts:21-54; jobs/browser/src/main.ts:259-328.
+- Temporal workflow retries/interventions/side-effect unknown: jobs/workflows/src/workflows.ts:12-25, 27-120; jobs/workflows/src/gateway.ts:22-53.
+- Duplicate company/daily policy and eligibility: server/src/db/jobs.rs:3535-3629.
+- Plans/limits/overages/idempotent metering: server/src/db/jobs.rs:930-988, 5375-5584; jobs/portal/src/views/SettingsView.tsx:226-233.
+- Email/calendar state: jobs/automation/src/receipts.ts:74-98, 176-190; jobs/portal/src/views/SettingsView.tsx:213-233, 284-291. UI explicitly says provider authorization is beta/not active for the account at 284-289.
+- Account export/hard delete: server/src/api/account.rs:723-751, 754-890.
+- Interview prep grounded in exact submitted receipt/resume/claims: jobs/automation/src/interview-prep.ts:71-138, 175-197, 247-289.
+
+BLUEY DESKTOP/INTERVIEW
+- Durable meeting record: crates/cue-core/src/meeting.rs:33-52, 150-225, 227-293, 356-453.
+- Local audio VAD: crates/cue-core/src/vad.rs:1-48; crates/cue-daemon/src/audio/vad.rs:87-217.
+- System-audio helper supervision/restart: crates/cue-daemon/src/audio/system_capture.rs:1-59, 163-225, 228-303.
+- Native macOS ScreenCaptureKit audio: native/macos/cue-audio/Sources/cue-audio/main.swift:153-210.
+- STT chain/fallbacks: crates/cue-daemon/src/stt/factory.rs:1-30, 41-135.
+- Streaming STT reconnect: crates/cue-daemon/src/stt/deepgram.rs:479-558.
+- Local Whisper helper: native/macos/cue-whisper/Sources/CueWhisper/main.swift:1-107.
+- Screen/page capture and attachment: crates/cue-daemon/src/app.rs:3151-3187, 13909-14184, 14462-14562.
+- Durable conversation cap and context: crates/cue-core/src/meeting.rs:227-293, 428-453.
+- Overlay capture exclusion: native/macos/cue-overlay/Sources/cue-overlay/main.swift:1793-1805.
+- Overlay authenticated IPC token: crates/cue-daemon/src/app.rs:15416-15532, 15710-15925.
+- Local keychain API-key storage: crates/cue-daemon/src/secrets/mod.rs:1-54.
+- RAG SQLite storage/delete: crates/cue-rag/src/store.rs:25-76, 92-201.
+
+NOTES
+- Line anchors were checked against the commit above after concurrent repository updates.
+- This file is a map, not proof of production deployment. The comparison distinguishes implemented source from runtime/deployment validation.

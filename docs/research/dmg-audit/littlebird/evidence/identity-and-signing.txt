@@ -1,0 +1,95 @@
+Littlebird identity and signing evidence
+========================================
+
+E-LB-ID-001 — DMG identity and integrity
+Source: owner-supplied file at /Users/uno/Downloads/dmg_backtrack_code/Littlebird-Mac-arm64-0.81.11-Installer.dmg
+Commands: stat -f; shasum -a 256; hdiutil imageinfo
+Observed:
+- Size: 336,925,123 bytes.
+- SHA-256: e6e247957338518d9888c8a16147cc66648ae91d4ef347426146233de066234b.
+- Format: UDIF read-only compressed zlib (UDZO), unencrypted, checksummed, no SLA.
+- Image total bytes reported by hdiutil: 1,309,297,664.
+- Partition filesystem: Apple HFS+.
+
+E-LB-ID-002 — Read-only mount
+Command: hdiutil attach -readonly -nobrowse /Users/uno/Downloads/dmg_backtrack_code/Littlebird-Mac-arm64-0.81.11-Installer.dmg
+Observed:
+- Device: /dev/disk4s1.
+- Mount point: /Volumes/Littlebird 0.81.11-arm64.
+- Volume name: Littlebird 0.81.11-arm64.
+- diskutil reported Media Read-Only: Yes and Volume Read-Only: Yes.
+- Volume size: 1,175,040,000 bytes; used: 1,172,221,952 bytes.
+
+E-LB-ID-003 — Volume inventory
+Commands: find (bounded depth); du -sh
+Observed root entries:
+- .DS_Store
+- .VolumeIcon.icns
+- .background.tiff
+- Applications -> /Applications
+- Littlebird.app (approximately 1.1 GiB)
+
+E-LB-ID-004 — App identity
+Source: /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/Info.plist
+Commands: plutil -p; file
+Observed:
+- CFBundleName / display name: Littlebird.
+- CFBundleShortVersionString and CFBundleVersion: 0.81.11.
+- CFBundleIdentifier: com.genos.littlebird.
+- LSMinimumSystemVersion: 13.0.0.
+- Architecture: thin arm64 Mach-O; LSRequiresNativeExecution is true.
+- NSPrincipalClass: AtomApplication (Electron).
+- URL scheme: little-bird.
+
+E-LB-ID-005 — Code signing and notarization
+Commands: codesign -dvvv; codesign --verify --deep --strict; spctl -a -vv; xcrun stapler validate
+Observed:
+- Signing identity: Developer ID Application: Little Bird Software, LLC (ML63743965).
+- Team identifier: ML63743965.
+- Signature timestamp: 2026-07-08 12:36:45.
+- Hardened runtime is enabled.
+- Deep strict verification succeeded.
+- Gatekeeper assessment: accepted; source=Notarized Developer ID.
+- Stapled notarization ticket validation succeeded.
+
+E-LB-ID-006 — Main entitlements and platform permissions
+Commands: codesign -d --entitlements :-; plutil -p Info.plist
+Observed entitlements:
+- com.apple.security.app-sandbox is not present.
+- com.apple.security.cs.allow-jit=true.
+- com.apple.security.cs.allow-unsigned-executable-memory=true.
+- com.apple.security.cs.disable-library-validation=true.
+- com.apple.security.network.client=true.
+- Audio input, camera, microphone, calendars, Apple Events automation, and APS production entitlements are present.
+Observed Info.plist declarations:
+- Usage descriptions for Apple Events/browser tab URL access, other-app audio capture, calendar, contacts, microphone, speech recognition, and reminders.
+- NSAppTransportSecurity allows arbitrary loads and local networking, with insecure HTTP exceptions for localhost and 127.0.0.1.
+
+E-LB-ID-007 — Frameworks and Electron version
+Sources: Littlebird.app/Contents/Frameworks and Electron Framework.framework/Resources/Info.plist
+Commands: find; plutil; file
+Observed:
+- Electron Framework 39.8.7.
+- Mantle 1.0, ReactiveObjC 3.1.0, and Squirrel 1.0 frameworks.
+- Electron Helper, Electron Helper (GPU), Electron Helper (Plugin), and Electron Helper (Renderer) app bundles.
+- Helper bundle identifiers are com.genos.littlebird.helper plus .GPU, .Plugin, and .Renderer variants.
+- Helpers are version 0.81.11 and carry the same broad code-signing entitlement family.
+- No LaunchAgents, LaunchDaemons, system extensions, app extensions, or XPC services were found in the signed app inventory.
+
+E-LB-ID-008 — Native helper inventory
+Commands: plutil; file; codesign; otool -L
+Observed:
+- ContextKitCore.app, bundle id com.genos.contextkit-cli, executable ContextKit-cli, LSUIElement, arm64, same Developer ID signer.
+- LittlebirdAudioTranscription.app, bundle id com.genos.littlebird-audio-transcription, LSUIElement, arm64, same Developer ID signer.
+- ContextKitCore links AppKit, ApplicationServices, ScreenCaptureKit, Contacts, EventKit, JavaScriptCore, CoreData, CryptoKit, SQLite, and AVFoundation among other Apple frameworks.
+- LittlebirdAudioTranscription links AVFoundation, Speech, Network, CoreData, CryptoKit, SQLite, and GRDB-related code.
+
+E-LB-ID-009 — Resource sizes
+Commands: du -h; find
+Observed:
+- Resources/app.asar: approximately 731 MiB.
+- Resources/app.asar.unpacked: approximately 33 MiB.
+- Bundled category SQLite database: approximately 6.5 MiB.
+- ContextKitCore.app: approximately 71 MiB.
+- LittlebirdAudioTranscription.app: approximately 13 MiB.
+- Bundled ripgrep binary: approximately 4.3 MiB.

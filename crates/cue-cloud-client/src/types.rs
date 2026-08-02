@@ -85,6 +85,81 @@ pub struct AccountMe {
     pub billing_restriction_reason: Option<String>,
 }
 
+// ─── Bluey Jobs desktop handoff ────────────────────────────────────────
+
+pub const BLUEY_JOBS_DESKTOP_HANDOFF_AUDIENCE: &str = "bluey-desktop-interview-prep-v1";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RedeemJobsHandoffRequest {
+    pub nonce: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsHandoffGrounding {
+    pub receipt_id: String,
+    pub receipt_fingerprint: String,
+    pub resume_version_id: String,
+    pub resume_checksum: String,
+    pub resume_document_sha256: String,
+    #[serde(default)]
+    pub answer_keys_used: Vec<String>,
+    #[serde(default)]
+    pub answer_keys_omitted: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsHandoffApplicationRef {
+    pub application_id: String,
+    pub job_id: String,
+    pub receipt_id: String,
+    pub receipt_fingerprint: String,
+    pub resume_version_id: String,
+    pub resume_checksum: String,
+    pub resume_document_sha256: String,
+    #[serde(default)]
+    pub verified_claim_ids: Vec<String>,
+    #[serde(default)]
+    pub submission_fingerprint: Option<String>,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsHandoffEvidenceRef {
+    pub id: String,
+    pub kind: String,
+    #[serde(default)]
+    pub sha256: Option<String>,
+    #[serde(default)]
+    pub resume_version_id: Option<String>,
+    pub occurred_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsHandoffSnapshot {
+    pub schema_version: i64,
+    pub source: String,
+    pub source_policy: String,
+    pub application: JobsHandoffApplicationRef,
+    pub submitted_job: serde_json::Value,
+    pub submitted_resume: serde_json::Value,
+    pub submitted_answers: serde_json::Value,
+    #[serde(default)]
+    pub outcome_events: Vec<serde_json::Value>,
+    pub grounding: JobsHandoffGrounding,
+    #[serde(default)]
+    pub immutable_evidence: Vec<JobsHandoffEvidenceRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RedeemJobsHandoffResponse {
+    pub schema_version: i64,
+    pub audience: String,
+    pub account_id: String,
+    pub application_id: String,
+    pub snapshot: JobsHandoffSnapshot,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsageWindow {
     pub period_days: i64,

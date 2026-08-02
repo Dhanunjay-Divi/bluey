@@ -593,6 +593,7 @@ fn current_platform() -> String {
         ("macos", "aarch64") => "darwin-arm64".to_string(),
         ("macos", "x86_64") => "darwin-universal".to_string(),
         ("windows", "x86_64") => "windows-x86_64".to_string(),
+        ("windows", "aarch64") => "windows-arm64".to_string(),
         ("linux", "x86_64") => "linux-x86_64".to_string(),
         (os, arch) => format!("{os}-{arch}"),
     }

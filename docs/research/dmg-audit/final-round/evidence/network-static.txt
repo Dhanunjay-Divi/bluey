@@ -1,0 +1,50 @@
+FINAL ROUND DATA AND NETWORK EVIDENCE — 2026-07-12
+
+OBSERVED — production destinations (public identifiers redacted)
+- Core Node API: https://prod-finalroundai.frai.pro/api
+- Python API: https://prod-finalroundai.frai.pro
+- Socket origin: https://prod-finalroundai.geofrai.pro; namespace `/desktop`; path `/core/socket.io`
+- Authentication: clerk.finalroundai.com
+- Updates: https://releases.finalroundai.com/latest
+- Analytics/telemetry resources: Sentry ingest, PostHog `us.i.posthog.com`, Final Round's Amplitude proxy, and Corgi metrics.
+- Coach/video resources: Daily/Pluot-related hosts in CSP/config.
+- File transfer: server-generated Google Cloud Storage signed URLs.
+- Source: main:3352-3460, 5997-6021, CSP/config inventory. Bundled public client IDs and analytics ingestion values were observed but intentionally not copied into evidence.
+
+OBSERVED — HTTP/API shapes
+- Sessions: create/add, launch, list active, end, last-used configuration, get by ID, ready/archive lists, field update, and transcription metadata.
+- Goals: CRUD.
+- Files: list, signed GCS URL, access URL, and phone-interview audio.
+- Resumes: upload/list/delete against Python API.
+- Reports: list, document, transcript, and regenerate.
+- Preferences/models: get/update interview settings and list models.
+- Screenshots: base64 interview screenshot upload.
+- Payments: plans, checkout/customer session, privilege, subscription, and manage-subscription.
+- Support: `/cio/contact`.
+- Source: first-party service endpoint constants/calls in main:11030-13042 and 14502-17173.
+
+OBSERVED — authentication and transport
+- HTTP requests acquire a valid access token and send it as Authorization bearer. Source: main HTTP client/auth provider around 5315-5560.
+- Socket connects with WebSocket transport only; JWT is sent in socket auth field `session`, with application/device headers. Source: main:5562-5644.
+- Socket reconnect budget is ten attempts in the client config path, with exponential jitter approximately 1-10 seconds; user retry resets the counter. Source: main:5657-5915.
+- Runtime schema validation logs mismatches but invokes handlers anyway. Source: main:5731-5753.
+- HTTP wrapper defaults to zero retries; call timeouts observed range from ten to thirty seconds. Source: HTTP client and service configurations.
+
+OBSERVED — device/fingerprint data
+- Persistent encrypted random device ID plus platform, OS version, app version/build/name/distribution, timezone, screen resolution, and macOS model (`sysctl hw.model`) are added to requests. Source: main:11280-11409.
+- Payment checkout can emit a Corgi browser-fingerprint event for fraud/risk use. Source: main:12683-12699.
+
+OBSERVED — telemetry
+- Sentry initializes with logs enabled, production trace sample rate 0.5, and error sample rate 1.0. Source: main:6409-6456.
+- PostHog and Amplitude initialize in main and identify authenticated users with user ID, email, and name. Source: main:7897 onward, 10489-10501, and 21458-21469.
+- App logger disables its local file transport, sanitizes structured keys, and forwards structured log attributes to Sentry. Source: main:5100-5194.
+- The sensitive-key list covers credential/session/PII key names but does not cover a generic `text` key. Source: main:3765-3805.
+- Live transcript-final logging includes an 80-character `text` prefix, and assistant-final logging passes complete answer text under `text`; both flow through the Sentry-forwarded logger. Source: main:12104-12115 and 12251-12255.
+
+INFERENCE
+- Interview content can enter remote Sentry logging because the static call path forwards those unredacted `text` attributes. The bounded runtime produced a local Sentry queue but outbound traffic was blocked, so actual production delivery was not observed.
+
+UNKNOWN
+- Backend request/response bodies, database schemas, retention, deletion, regional routing, and encryption at rest.
+- Whether Sentry project-side scrubbing removes transcript/answer attributes.
+- Whether signed object URLs are single-use, short-lived, or scoped beyond what is visible in client calls.

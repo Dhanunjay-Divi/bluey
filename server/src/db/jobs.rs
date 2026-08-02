@@ -1014,12 +1014,12 @@ fn private_lookup_hash(scope: &str, value: &str) -> Result<String> {
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
-fn parse_json<T: DeserializeOwned>(raw: String, label: &str) -> Result<T> {
+pub(super) fn parse_json<T: DeserializeOwned>(raw: String, label: &str) -> Result<T> {
     let plain = decrypt_payload(&raw).with_context(|| format!("decrypt {label}"))?;
     serde_json::from_str(&plain).with_context(|| format!("parse {label}"))
 }
 
-fn to_json<T: Serialize>(value: &T, label: &str) -> Result<String> {
+pub(super) fn to_json<T: Serialize>(value: &T, label: &str) -> Result<String> {
     let plain = serde_json::to_string(value).with_context(|| format!("serialize {label}"))?;
     encrypt_payload(&plain).with_context(|| format!("encrypt {label}"))
 }

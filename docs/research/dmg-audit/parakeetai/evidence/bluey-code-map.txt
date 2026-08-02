@@ -1,0 +1,57 @@
+BLUEY COMPARISON BASELINE
+repository=/Users/uno/Downloads/cue-bluey-jobs
+git_commit=eb923a89f24b69664c73479607bf665725789658
+captured=2026-07-12
+
+MEETING / DESKTOP
+crates/cue-dashboard/ui/src/pages/Onboarding.tsx:6-16,55-65,93-135 — browser/deep-link sign-in and onboarding
+crates/cue-dashboard/src/lib.rs:180-230 — transcript catch-up poller
+crates/cue-dashboard/src/lib.rs:233-278 — shortcuts, tray, meeting watch, updates, NSPanel/capture exclusion
+crates/cue-dashboard/src/lib.rs:293-330 — global shortcut registration
+crates/cue-dashboard/src/macos.rs:40-71 — NSWindow sharing type none
+crates/cue-daemon/src/cloud/meeting_detect.rs:1-23,53-97 — macOS frontmost-app heuristic and polling loop
+crates/cue-dashboard/src/commands.rs:716-753 — push-to-talk/microphone commands
+crates/cue-dashboard/src/commands.rs:800-843 — operating-system privacy settings
+crates/cue-dashboard/src/commands.rs:1073-1107 — live transcript query
+crates/cue-dashboard/src/commands.rs:1690-1795 — response generation, routing, and persistence
+crates/cue-dashboard/ui/src/App.tsx:32-55,59-80,88-127 — hotkeys, permissions, routes; screenshot/audio routes are placeholders
+crates/cue-dashboard/ui/src/routes/LiveTranscript.tsx:6-69 — bounded transcript state, session/index de-duplication, catch-up
+crates/cue-dashboard/ui/src/routes/Responses.tsx:26-69,123-218 — streamed response state, copy, rendering
+crates/cue-dashboard/ui/src/pages/Settings.tsx:54-125,135-198,190-256,315-334 — account/billing, deletion, visibility and disguise controls
+crates/cue-daemon/src/audio/system_capture.rs:1-58,163-225,290-303 — 16-kHz system capture and bounded helper respawn
+crates/cue-daemon/src/audio/capture.rs:24-47,79-134 — microphone capture
+crates/cue-core/src/audio.rs:312-330,598-609 — audio-processing flags; echo cancellation defaults false
+crates/cue-daemon/src/stt/factory.rs:57-135 — Deepgram primary, OpenAI fallback, local Whisper option
+crates/cue-daemon/src/stt/router.rs:1-8,20-59,80-118 — provider routing
+crates/cue-daemon/src/stt/deepgram.rs:1-38,64-175 — authenticated stream/reconnect handling
+crates/cue-daemon/src/secrets/mod.rs:1-29 — OS keychain-backed secret storage
+crates/cue-cli/src/app.rs:2104-2124,2145-2165,2212-2220,2275-2334 — screenshot capture with preview/confirmation
+
+JOBS
+jobs/automation/src/form-intelligence.ts:3-55,58-153,175-226 — form model, aliases, sensitive fields, planning, interventions
+jobs/automation/src/answer-memory.ts:1-14,26-103 — normalized, scoped answer memory
+jobs/automation/src/challenge-handling.ts:3-123 — CAPTCHA, OTP/2FA, assessment and takeover behavior
+jobs/automation/src/standard-adapters.ts:24-101,112-140,157-367 — named ATS adapters, generic fallback, validation/submission
+jobs/automation/src/documents.ts:9-13,43-125,280-334 — bounded deterministic PDF materialization
+jobs/automation/src/receipts.ts:4-53,74-98,100-201 — receipt/evidence model, confirmation validation, linked-provider evidence
+jobs/automation/src/interview-prep.ts:20-80,88-197,247-290 — submission-grounded interview packet and claim verification
+jobs/browser/src/profile.ts:4-33 — account/identity-scoped browser profile directories
+jobs/browser/src/browser-network.ts:18-53 — HTTPS/WSS and SSRF boundary
+jobs/browser/src/irreversible-submit.ts:6-17,28-175 — exclusive durable submit marker
+jobs/runner/src/execution-lease.ts:27-42,66-161,196-236 — leases, heartbeat, final-submit authority
+jobs/runner/src/crypto-envelope.ts:7-21,43-168 — AES-256-GCM result envelope and AAD
+jobs/runner/src/result-store.ts:36-153 — committed encrypted result persistence
+jobs/workflows/src/workflows.ts:1-120 — retry and side-effect-unknown policy
+jobs/workflows/src/activities.ts:10-110 — local/cloud execution, resume, result persistence, release
+jobs/workflows/src/gateway.ts:22-74 — unique Temporal workflow ID and conflict handling
+jobs/workflows/src/discovery.ts:20-63,70-188,213-222,320-352 — source policy, replay and de-duplication
+server/src/db/jobs.rs:930-988 — plan limits, local/cloud browser entitlements, overage fields
+server/src/db/jobs.rs:3869-3949 — ranking and structural resume diff
+server/src/db/jobs.rs:4621-4762 — verified identity/facts, tailored resume version, answer memory, queue/review state
+jobs/portal/src/lib/interview-prep.ts:28-70,73-100 — submitted application/resume/receipt consistency and evidence packet
+jobs/portal/src/components/InterviewPrepDialog.tsx:20-112 — receipt-grounded interview-prep UI and privacy exclusions
+jobs/portal/src/views/SettingsView.tsx:213-222,284-293 — inbox/calendar UI; integration beta explicitly not active for the account
+server/src/api/account.rs:769-870 — account deletion orchestration and artifact cleanup
+server/src/db/account_data.rs:86-89,560-590 — hard account deletion paths
+
+All paths and line anchors above were re-read at the stated commit after the concurrent ingress and PostgreSQL integer-flag fixes. They are source observations; deployed behavior was not tested in this audit.

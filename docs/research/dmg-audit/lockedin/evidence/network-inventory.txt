@@ -1,0 +1,64 @@
+LOCKEDIN STATIC NETWORK INVENTORY
+
+Source basis
+  public/electron.js, public/preload.js, build/index.html, build/static/js/main.8ad05cf1.js, app-update.yml
+  Destination and request-shape inventory is static. In the later approved isolated launch, all external traffic was routed to a closed local proxy and DNS was blocked. Firestore and updater/model-config attempts failed before a remote response; a socket snapshot found no live TCP/UDP connection. No packet payload was captured.
+  Query strings, token values, keys, and credential-bearing data are omitted.
+
+First-party origins observed
+  https://prod-us-east-1.lockedinai.com
+  https://app.lockedinai.com
+  https://resume.lockedinai.com
+  https://lockedinai-image-store.s3.us-east-1.amazonaws.com
+  https://d1n3oewcfgleny.cloudfront.net
+  S3 updater bucket desktop-app-updates-lockedin-ai in ap-southeast-2
+
+First-party endpoint paths observed
+  /api/v1/assembly-ai/temporary-token
+  /api/v1/custom-prompt/
+  /api/v1/custom-prompt/optimize
+  /api/v1/duo-invite/notify-helper
+  /api/v1/events/
+  /api/v1/interview-helper/can-join
+  /api/v1/interview-helper/members
+  /api/v1/interview-helper/ice-servers
+  /api/v1/interview-report/
+  /api/v1/interview-report/generate
+  /api/v1/questions
+  /api/v1/users/public-info/
+  /api/v1/word-helper/explain
+  /check_running_session
+  /post_interviews_survey
+  /create_payment
+  /delete_index
+  /end_session
+  /index_material
+  /resume_review
+  /track_user
+  /retention/subscription_info
+
+Observed request-shape examples (field names only)
+  resume_review POST: authorization, user_id, file_id, file_name, job_description, job_title, company, file_link
+  index_material POST: authorization, user, file, documentType
+  delete_index POST: authorization, user, file
+  track_user POST: authorization, last_recorded_url
+  create_payment POST: authorization, user, price, referral, email, coupon
+  subscription_info GET: Authorization Bearer header
+  post_interviews_survey POST: Authorization header plus survey response fields
+  WebSocket/Socket.IO auth: Firebase ID token
+  Duo WebRTC: server-provided ICE configuration and signaling paths
+
+Third-party origins/services observed in first-party static resources
+  Stripe billing and Stripe JavaScript
+  Clerk authentication/telemetry
+  Firebase Auth and Firestore endpoints
+  Google Secure Token, reCAPTCHA, Fonts, and Tag Manager
+  Microsoft Clarity
+  Rewardful
+  LinkedIn Insight
+  Supademo
+  Discord
+  Unsplash
+
+Transport configuration observation
+  Info.plist enables arbitrary loads globally and local networking, plus temporary insecure HTTP exceptions for localhost and 127.0.0.1 with a TLSv1.0 minimum. Whether any production path actually uses insecure transport was not tested.

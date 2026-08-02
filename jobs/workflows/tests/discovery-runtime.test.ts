@@ -124,7 +124,7 @@ describe("discovery worker runtime", () => {
     });
     const client = new DiscoveryApiClient({
       origin: "https://jobs.internal",
-      token: "worker-token",
+      signingKey: "0123456789abcdef0123456789abcdef",
       workerId: "discovery-worker-test",
       fetch: fetcher,
     });
@@ -134,7 +134,9 @@ describe("discovery worker runtime", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0]?.input).toBe("https://jobs.internal/api/jobs/internal/discovery/lease");
-    expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBe("Bearer worker-token");
+    expect(new Headers(requests[0]?.init?.headers).get("authorization")).toBeNull();
+    expect(new Headers(requests[0]?.init?.headers).get("x-bluey-jobs-worker-signature"))
+      .toMatch(/^[a-f0-9]{64}$/);
     expect(new Headers(requests[0]?.init?.headers).get("x-bluey-jobs-worker-id"))
       .toBe("discovery-worker-test");
   });
@@ -143,7 +145,7 @@ describe("discovery worker runtime", () => {
     const workerIds: Array<string | null> = [];
     const client = new DiscoveryApiClient({
       origin: "https://jobs.internal",
-      token: "worker-token",
+      signingKey: "0123456789abcdef0123456789abcdef",
       fetch: async (_input, init) => {
         workerIds.push(new Headers(init?.headers).get("x-bluey-jobs-worker-id"));
         return new Response(null, { status: 204 });
@@ -160,11 +162,11 @@ describe("discovery worker runtime", () => {
   it("allows plaintext API traffic only for loopback development", () => {
     expect(() => new DiscoveryApiClient({
       origin: "http://jobs.internal:8080",
-      token: "worker-token",
+      signingKey: "0123456789abcdef0123456789abcdef",
     })).toThrow("invalid");
     expect(() => new DiscoveryApiClient({
       origin: "http://127.0.0.1:8080",
-      token: "worker-token",
+      signingKey: "0123456789abcdef0123456789abcdef",
     })).not.toThrow();
   });
 
@@ -396,20 +398,20 @@ describe("discovery worker runtime", () => {
   it("retries an idempotent completion with the exact same lease body", async () => {
     const requests: Array<{
       body: string;
-      authorization: string | null;
+      signature: string | null;
       workerId: string | null;
     }> = [];
     const fetcher: DiscoveryApiFetch = vi.fn(async (_input, init) => {
       requests.push({
         body: String(init?.body),
-        authorization: new Headers(init?.headers).get("authorization"),
+        signature: new Headers(init?.headers).get("x-bluey-jobs-worker-signature"),
         workerId: new Headers(init?.headers).get("x-bluey-jobs-worker-id"),
       });
       return new Response(null, { status: requests.length === 1 ? 503 : 204 });
     });
     const client = new DiscoveryApiClient({
       origin: "https://jobs.internal",
-      token: "worker-token",
+      signingKey: "0123456789abcdef0123456789abcdef",
       workerId: "discovery-worker-test",
       fetch: fetcher,
       reportRetryMs: 0,
@@ -432,7 +434,7 @@ describe("discovery worker runtime", () => {
       replay_key: "replay-key-test",
       complete_snapshot: true,
     });
-    expect(requests.every((request) => request.authorization === "Bearer worker-token")).toBe(true);
+    expect(requests.every((request) => /^[a-f0-9]{64}$/.test(request.signature || ""))).toBe(true);
     expect(requests.every((request) => request.workerId === "discovery-worker-test")).toBe(true);
   });
 });

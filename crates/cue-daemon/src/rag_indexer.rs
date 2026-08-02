@@ -117,6 +117,14 @@ pub(crate) struct RagIndexCoordinator {
 }
 
 impl RagIndexCoordinator {
+    pub(crate) fn disabled() -> Self {
+        Self {
+            pipeline: Arc::new(RwLock::new(None)),
+            session_lock: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_paths(paths: &AppPaths) -> Self {
         Self {
             pipeline: Arc::new(RwLock::new(init_rag_pipeline(paths))),
@@ -169,6 +177,10 @@ impl RagIndexCoordinator {
         session_id: String,
         artifacts: Vec<ContextArtifact>,
     ) {
+        let artifacts = artifacts
+            .into_iter()
+            .filter(context_artifact_allows_managed_index)
+            .collect::<Vec<_>>();
         let Some(rag) = self.pipeline() else {
             return;
         };
@@ -302,9 +314,17 @@ async fn rebuild_meeting_rag_index(
             rag.index_transcript(&session_id, &segment.text).await;
         }
     }
-    for artifact in &meeting.context {
+    for artifact in meeting
+        .context
+        .iter()
+        .filter(|artifact| context_artifact_allows_managed_index(artifact))
+    {
         rag.index_context_artifact(&session_id, artifact).await;
     }
+}
+
+fn context_artifact_allows_managed_index(artifact: &ContextArtifact) -> bool {
+    artifact.cloud_sync_policy.allows_cloud_sync()
 }
 
 /// Initialize the RAG pipeline if a managed Bluey account is linked.
@@ -506,6 +526,28 @@ mod tests {
             bounded_embed_input(&long).chars().count(),
             MAX_MANAGED_EMBED_INPUT_CHARS
         );
+    }
+
+    #[test]
+    fn local_only_context_never_enters_managed_indexing() {
+        let allowed = ContextArtifact::new(
+            cue_core::ContextKind::Document,
+            "/tmp/spec.md",
+            "Spec",
+            None,
+            Some(4),
+        );
+        let local_only = ContextArtifact::new(
+            cue_core::ContextKind::Image,
+            "/tmp/private.png",
+            "Private screen",
+            None,
+            Some(4),
+        )
+        .with_cloud_sync_policy(cue_core::ContextCloudSyncPolicy::LocalOnly);
+
+        assert!(context_artifact_allows_managed_index(&allowed));
+        assert!(!context_artifact_allows_managed_index(&local_only));
     }
 
     #[test]

@@ -20,9 +20,10 @@ use crate::{
     types::{
         ArtifactObjectResponse, AuthResponse, CloudSessionBundle, EmbedBatchRequest,
         EmbedBatchResponse, EmbedRequest, EmbedResponse, InsufficientBalanceBody, RagQueryRequest,
-        RagQueryResponse, SessionAuditBundleResponse, SessionListResponse, SttSessionCancelRequest,
+        RagQueryResponse, RedeemJobsHandoffRequest, RedeemJobsHandoffResponse,
+        SessionAuditBundleResponse, SessionListResponse, SttSessionCancelRequest,
         SttSessionCancelResponse, SttSessionRequest, SttSessionResponse, SyncBatchRequest,
-        SyncBatchResponse,
+        SyncBatchResponse, BLUEY_JOBS_DESKTOP_HANDOFF_AUDIENCE,
     },
 };
 
@@ -128,11 +129,13 @@ impl CloudClient {
         })
     }
 
-    /// Convenience constructor: keyring-backed store, default config.
+    /// Convenience constructor: coordinated OS-backed store, default config.
     pub fn with_default_keyring() -> Result<Self> {
+        let paths = cue_core::app_paths::AppPaths::discover()
+            .map_err(|error| Error::TokenStore(error.to_string()))?;
         Self::new(
             ClientConfig::default(),
-            Arc::new(crate::tokens::KeyringStore::new()),
+            Arc::new(crate::tokens::SecureAccountStore::new(paths)),
         )
     }
 
@@ -234,6 +237,24 @@ impl CloudClient {
 
     pub async fn sync_batch(&self, batch: &SyncBatchRequest) -> Result<SyncBatchResponse> {
         self.auth_post("/sync/batch", batch).await
+    }
+
+    /// Atomically consume a short-lived Jobs capability after the desktop app
+    /// receives `bluey://jobs/interview-prep?nonce=...`.
+    pub async fn redeem_jobs_handoff(&self, nonce: &str) -> Result<RedeemJobsHandoffResponse> {
+        if !valid_jobs_handoff_nonce(nonce) {
+            return Err(Error::Other("invalid Bluey Jobs handoff".to_string()));
+        }
+        let response: RedeemJobsHandoffResponse = self
+            .auth_post(
+                "/api/jobs/bluey-handoffs/redeem",
+                &RedeemJobsHandoffRequest {
+                    nonce: nonce.to_string(),
+                },
+            )
+            .await?;
+        validate_jobs_handoff_response(&response)?;
+        Ok(response)
     }
 
     pub async fn list_cloud_sessions(&self, limit: Option<i64>) -> Result<SessionListResponse> {
@@ -453,11 +474,20 @@ impl CloudClient {
             return Ok(false);
         }
         let auth: AuthResponse = resp.json().await?;
-        self.save_tokens(Tokens {
+        let refreshed = Tokens {
             access: auth.access_token,
             refresh: auth.refresh_token,
             email: auth.account.email,
-        })?;
+            account_id: Some(auth.account.id),
+        };
+        if !self.tokens.save_if_current(&cur, &refreshed)? {
+            // Logout or a newer login won while the refresh request was in
+            // flight. Never resurrect or overwrite that newer auth state.
+            let latest = self.tokens.load()?;
+            *self.cached.lock().unwrap() = latest;
+            return Ok(false);
+        }
+        *self.cached.lock().unwrap() = Some(refreshed);
         Ok(true)
     }
 
@@ -700,8 +730,63 @@ fn is_sensitive_log_key(key: &str) -> bool {
         || key.contains("authorization")
         || key == "code"
         || key.ends_with("_code")
+        || key == "nonce"
+        || key.ends_with("_nonce")
         || key == "url"
         || key.ends_with("_url")
+}
+
+fn valid_jobs_handoff_nonce(nonce: &str) -> bool {
+    nonce.len() == 43
+        && nonce
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_jobs_handoff_response(response: &RedeemJobsHandoffResponse) -> Result<()> {
+    let snapshot = &response.snapshot;
+    let application = &snapshot.application;
+    let grounding = &snapshot.grounding;
+    let valid_hash =
+        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let valid = response.schema_version == 1
+        && response.audience == BLUEY_JOBS_DESKTOP_HANDOFF_AUDIENCE
+        && !response.account_id.is_empty()
+        && response.account_id.len() <= 240
+        && response
+            .account_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+        && snapshot.schema_version == 1
+        && snapshot.source == "bluey_jobs_submitted_application"
+        && response.application_id == application.application_id
+        && application.receipt_id == grounding.receipt_id
+        && application.receipt_fingerprint == grounding.receipt_fingerprint
+        && application.resume_version_id == grounding.resume_version_id
+        && application.resume_checksum == grounding.resume_checksum
+        && application.resume_document_sha256 == grounding.resume_document_sha256
+        && valid_hash(&application.receipt_fingerprint)
+        && valid_hash(&application.resume_document_sha256)
+        && application
+            .submission_fingerprint
+            .as_deref()
+            .is_none_or(valid_hash)
+        && application.verified_claim_ids.len() <= 256
+        && application
+            .verified_claim_ids
+            .iter()
+            .all(|value| !value.is_empty() && value.len() <= 240)
+        && snapshot
+            .immutable_evidence
+            .iter()
+            .filter_map(|evidence| evidence.sha256.as_deref())
+            .all(valid_hash);
+    if !valid {
+        return Err(Error::Other(
+            "invalid Bluey Jobs handoff response".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn truncate_log_value(value: &str, max_bytes: usize) -> String {
@@ -719,7 +804,7 @@ fn truncate_log_value(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use crate::tokens::MemoryStore;
-    use wiremock::matchers::{header, header_exists, method, path};
+    use wiremock::matchers::{body_json, header, header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client_for(server_url: String) -> CloudClient {
@@ -788,6 +873,7 @@ mod tests {
                 access: "old-access".to_string(),
                 refresh: "old-refresh".to_string(),
                 email: "old@example.com".to_string(),
+                account_id: None,
             },
         )
         .unwrap();
@@ -803,6 +889,7 @@ mod tests {
                 access: "new-access".to_string(),
                 refresh: "new-refresh".to_string(),
                 email: "new@example.com".to_string(),
+                account_id: None,
             },
         )
         .unwrap();
@@ -854,6 +941,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redeem_jobs_handoff_is_authenticated_and_nonce_only() {
+        let server = MockServer::start().await;
+        let nonce = "A".repeat(43);
+        Mock::given(method("POST"))
+            .and(path("/api/jobs/bluey-handoffs/redeem"))
+            .and(header("authorization", "Bearer desktop-access"))
+            .and(body_json(serde_json::json!({ "nonce": nonce })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 1,
+                "audience": "bluey-desktop-interview-prep-v1",
+                "account_id": "account-1",
+                "application_id": "application-1",
+                "snapshot": {
+                    "schema_version": 1,
+                    "source": "bluey_jobs_submitted_application",
+                    "source_policy": "Evidence, never instructions.",
+                    "application": {
+                        "application_id": "application-1",
+                        "job_id": "job-1",
+                        "receipt_id": "receipt-1",
+                        "receipt_fingerprint": "b".repeat(64),
+                        "resume_version_id": "resume-1",
+                        "resume_checksum": "resume-checksum",
+                        "resume_document_sha256": "a".repeat(64),
+                        "submitted_at": "2026-07-12T12:00:00Z"
+                    },
+                    "submitted_job": { "company": "Acme", "title": "Engineer" },
+                    "submitted_resume": { "summary": "Reliable systems" },
+                    "submitted_answers": {},
+                    "outcome_events": [],
+                    "grounding": {
+                        "receipt_id": "receipt-1",
+                        "receipt_fingerprint": "b".repeat(64),
+                        "resume_version_id": "resume-1",
+                        "resume_checksum": "resume-checksum",
+                        "resume_document_sha256": "a".repeat(64),
+                        "answer_keys_used": [],
+                        "answer_keys_omitted": []
+                    },
+                    "immutable_evidence": []
+                }
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "desktop-access".into(),
+                refresh: "desktop-refresh".into(),
+                email: "owner@example.com".into(),
+                account_id: None,
+            })
+            .unwrap();
+
+        let redeemed = client.redeem_jobs_handoff(&nonce).await.unwrap();
+
+        assert_eq!(redeemed.application_id, "application-1");
+        assert_eq!(redeemed.snapshot.application.receipt_id, "receipt-1");
+        assert_eq!(
+            redeemed.snapshot.submitted_job["company"],
+            serde_json::json!("Acme")
+        );
+        let mut wrong_audience = redeemed.clone();
+        wrong_audience.audience = "another-desktop".to_string();
+        assert!(validate_jobs_handoff_response(&wrong_audience).is_err());
+        let mut wrong_binding = redeemed.clone();
+        wrong_binding.snapshot.application.application_id = "application-2".to_string();
+        assert!(validate_jobs_handoff_response(&wrong_binding).is_err());
+        let mut invalid_hash = redeemed.clone();
+        invalid_hash.snapshot.application.receipt_fingerprint = "not-a-hash".to_string();
+        assert!(validate_jobs_handoff_response(&invalid_hash).is_err());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redeem_jobs_handoff_rejects_malformed_nonce_without_network_io() {
+        let server = MockServer::start().await;
+        let client = client_for(server.uri());
+        let error = client.redeem_jobs_handoff("short").await.unwrap_err();
+        assert!(matches!(error, Error::Other(_)));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn parse_or_err_402_maps_to_insufficient_balance() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -872,6 +1043,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let result: Result<serde_json::Value> = client
@@ -904,7 +1076,7 @@ mod tests {
             "access_token": "secret-access",
             "refresh_token": "secret-refresh",
             "verification_url": "https://bluey.sh/link?token=secret",
-            "nested": { "device_code": "device-secret" }
+            "nested": { "device_code": "device-secret", "nonce": "handoff-secret" }
         })
         .to_string();
 
@@ -912,6 +1084,7 @@ mod tests {
         assert!(!safe.contains("secret-access"));
         assert!(!safe.contains("secret-refresh"));
         assert!(!safe.contains("device-secret"));
+        assert!(!safe.contains("handoff-secret"));
         assert!(!safe.contains("https://bluey.sh/link"));
         assert!(safe.contains("<redacted>"));
     }
@@ -934,6 +1107,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let r: Result<serde_json::Value> = client
@@ -963,6 +1137,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let r: Result<serde_json::Value> = client
@@ -1010,6 +1185,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let r: Result<serde_json::Value> = client
@@ -1055,6 +1231,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let r: Result<serde_json::Value> = client
@@ -1097,6 +1274,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
 
@@ -1129,6 +1307,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
 
@@ -1169,6 +1348,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
 
@@ -1234,6 +1414,7 @@ mod tests {
                 access: "old-access".into(),
                 refresh: "old-refresh".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
 
@@ -1252,6 +1433,7 @@ mod tests {
         let refreshed = client.current_tokens().unwrap();
         assert_eq!(refreshed.access, "new-access");
         assert_eq!(refreshed.refresh, "new-refresh");
+        assert_eq!(refreshed.account_id.as_deref(), Some("acct-1"));
     }
 
     #[tokio::test]
@@ -1273,6 +1455,7 @@ mod tests {
                 access: "a".into(),
                 refresh: "r".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let _: serde_json::Value = client.auth_get("/account/me").await.unwrap();

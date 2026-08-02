@@ -1,0 +1,87 @@
+Cluely (New) 2.1.19 — identity and integrity evidence
+Captured: 2026-07-12
+Source DMG: /Users/uno/Downloads/dmg_backtrack_code/Cluely (New) 2.1.19.dmg
+
+Read-only attachment
+--------------------
+Command:
+  hdiutil attach -readonly -nobrowse -mountpoint /tmp/cluely-2119-audit-mount '/Users/uno/Downloads/dmg_backtrack_code/Cluely (New) 2.1.19.dmg'
+Result:
+  /dev/disk4s1, volume "Cluely (New) 2.1.19-universal", mounted read-only.
+  hdiutil info reported HFS+, media read-only=yes, volume read-only=yes.
+
+DMG
+---
+Size: 230124489 bytes
+SHA-256: 411b2f24a1905fef9c666c67552c73e821f918623847f2c31aca2ffc07e7effc
+Format: UDZO (zlib-compressed), unencrypted, checksummed
+Logical image size: 564366848 bytes
+HFS partition size: 564326400 bytes
+Mounted used bytes: 561246208
+Image CRC32: $111CDB02
+HFS partition CRC32: $14BF9891
+Verification: every hdiutil attach checksum verification step passed.
+
+Application identity
+--------------------
+Path: /tmp/cluely-2119-audit-mount/Cluely (New).app
+Disk use: 542944 KiB
+CFBundleDisplayName / CFBundleName: Cluely (New)
+CFBundleExecutable: Cluely (New)
+CFBundleIdentifier: com.cluely.app.april22
+CFBundleShortVersionString: 2.1.19
+CFBundleVersion: 2.1.19
+LSMinimumSystemVersion: 12.0
+CFBundleURLScheme: cluely-v2
+LSApplicationCategoryType: public.app-category.developer-tools
+DTSDKName: macosx15.5
+Info.plist SHA-256: a97b1017f8962b038f115d16d4aa9c0db17840e51ae99343b61922950b090abc
+Main executable SHA-256: 0d91972b9dc5e92ec5a5934ece5b1c01eb070ac4ec712052a22ef5180fa7dfe5
+
+Code signing and notarization
+-----------------------------
+codesign --verify --deep --strict: success
+spctl --assess --type execute: accepted; source=Notarized Developer ID
+stapler validate: valid stapled ticket
+Signing identity: Developer ID Application: Bounty Studio, Inc. (89PS65RKC6)
+Team identifier: 89PS65RKC6
+Architectures: arm64 and x86_64 (main executable, Electron helpers, bundled macOS helpers)
+Runtime: hardened runtime enabled
+Entitlements on the main app and all four Electron helpers:
+  com.apple.security.cs.allow-jit
+  com.apple.security.cs.allow-unsigned-executable-memory
+  com.apple.security.device.audio-input
+  com.apple.security.device.camera
+
+Bundle inventory
+----------------
+Electron Framework 40.8.0 (Chrome 144.0.7559.236)
+Frameworks: Electron, Mantle, ReactiveObjC, Squirrel
+Helpers: general, GPU, Plugin, Renderer
+Native executables/resources: crashpad_handler, AudioTee, SoX for macOS, SoX for Windows,
+pthread/zlib Windows DLLs, Silero VAD ONNX, ONNX Runtime Web/WASM.
+No .appex, XPC service, launch agent, Contents/Library, or Contents/PlugIns entry was found.
+
+ASAR verification
+-----------------
+Resources/app.asar size: 28435497 bytes
+Whole-file SHA-256: 33565aeb3af69fe35bb081a25a331f638b981dcc2b0a1b2e25851c9cbaf06742
+ElectronAsarIntegrity header hash in Info.plist:
+  b95014ff47d4866a7c44d877180331a0cd146c4eb80c275cce881d250b178797
+Calculated ASAR JSON-header SHA-256:
+  b95014ff47d4866a7c44d877180331a0cd146c4eb80c275cce881d250b178797
+Result: exact match.
+ASAR data-region SHA-256:
+  50a20220dcd79fb4776a8f11ab5147c8da71291bfcaf3456e391463e86f1a774
+Parsed header: pickle=4 bytes, header=855796 bytes, JSON=855788 bytes,
+data begins at byte 855804.
+Safe parser result: 3261 regular files / 27579693 bytes extracted; every regular
+file was re-hashed against its embedded ASAR SHA-256; failures=0; five link or
+unpacked entries were deliberately skipped.
+
+Trust note
+----------
+No bundled script, package hook, or native audio helper was run. After static analysis,
+the main application executable received one eight-second, write-denied/network-denied
+pre-readiness probe; no UI, credentials, permissions, updater, or helper execution was
+allowed. See runtime-assessment.txt. Mounted content itself remained read-only.

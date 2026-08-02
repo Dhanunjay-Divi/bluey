@@ -13,7 +13,8 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 cue-core = { path = "../cue-core" }
-keyring = "2"
+keyring.workspace = true
+libc.workspace = true
 url.workspace = true
 chrono = "0.4"
 

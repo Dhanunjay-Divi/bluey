@@ -7,6 +7,9 @@
 use std::io::Write;
 
 fn main() {
+    eprintln!(
+        r#"{{"event":"ready","source":"system","backend":"test_stub","format":{{"sample_rate_hz":16000,"channel_count":1,"sample_format":"i16"}}}}"#
+    );
     let sample_rate = 16_000u32;
     let frequency = 440.0f64;
     let duration_samples = sample_rate * 2; // 2 seconds
@@ -25,4 +28,5 @@ fn main() {
         }
     }
     let _ = out.flush();
+    eprintln!(r#"{{"event":"stopped","source":"system","reason":"completed"}}"#);
 }

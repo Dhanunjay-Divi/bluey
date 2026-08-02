@@ -41,7 +41,7 @@ cp ops/install/install.ps1 "$STAGE_DIR/install.ps1"
 chmod 0644 "$STAGE_DIR/install.ps1"
 
 artifacts=()
-for platform in darwin-arm64 darwin-universal darwin-x86_64 windows-x86_64 linux-x86_64; do
+for platform in darwin-arm64 darwin-universal darwin-x86_64 windows-x86_64 windows-arm64 linux-x86_64; do
     case "$platform" in
         windows-*) artifact="$DIST_DIR/bluey-${VERSION#v}-$platform.zip" ;;
         *) artifact="$DIST_DIR/bluey-${VERSION#v}-$platform.tar.gz" ;;
@@ -58,123 +58,12 @@ if [ "${#artifacts[@]}" -eq 0 ]; then
     exit 1
 fi
 
-python3 - "$DIST_DIR" "${artifacts[@]}" <<'PY'
-import os
-import sys
-import tarfile
-import zipfile
-from pathlib import Path
-
-static_patterns = [
-    ("dev flag BLUEY_OVERLAY_CAPTURE_VISIBLE", b"BLUEY_OVERLAY_CAPTURE_VISIBLE"),
-    ("dev flag BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE", b"BLUEY_HOST_OVERLAY_CAPTURE_VISIBLE"),
-    ("dev flag BLUEY_LOCAL_VISIBLE_OVERLAY", b"BLUEY_LOCAL_VISIBLE_OVERLAY"),
-    ("dev flag BLUEY_ALLOW_CAPTURE_VISIBLE_LOCAL", b"BLUEY_ALLOW_CAPTURE_VISIBLE_LOCAL"),
-    ("dev flag BLUEY_DEV_OVERLAY", b"BLUEY_DEV_OVERLAY"),
-    ("dev flag bluey-local-visible-overlay", b"bluey-local-visible-overlay"),
-    ("dev flag bluey-overlay-capture-visible", b"bluey-overlay-capture-visible"),
-    ("dev flag bluey-dev-overlay", b"bluey-dev-overlay"),
-]
-
-secret_env_names = [
-    "OPENAI_API_KEYS",
-    "OPENAI_API_KEY",
-    "ANTHROPIC_API_KEYS",
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEYS",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEYS",
-    "GOOGLE_API_KEY",
-    "DEEPSEEK_API_KEYS",
-    "DEEPSEEK_API_KEY",
-    "ZAI_API_KEYS",
-    "ZAI_API_KEY",
-    "ZHIPU_API_KEYS",
-    "ZHIPU_API_KEY",
-    "DEEPGRAM_API_KEYS",
-    "DEEPGRAM_API_KEY",
-    "BLUEY_WEB_SEARCH_API_KEY",
-    "TAVILY_API_KEY",
-    "BRAVE_SEARCH_API_KEY",
-    "BLUEY_OBJECT_SECRET_ACCESS_KEY",
-    "BLUEY_R2_SECRET_ACCESS_KEY",
-    "AWS_SECRET_ACCESS_KEY",
-    "BLUEY_SQUARE_ACCESS_TOKEN",
-    "SQUARE_ACCESS_TOKEN",
-    "STRIPE_SECRET_KEY",
-]
-
-
-def secret_patterns_from_env():
-    patterns = []
-    seen = set()
-    for name in secret_env_names:
-        raw = os.environ.get(name, "")
-        for token in raw.replace("\n", ",").split(","):
-            secret = token.strip()
-            if len(secret) < 16 or secret in seen:
-                continue
-            seen.add(secret)
-            patterns.append((f"secret value from {name}", secret.encode()))
-    return patterns
-
-
-patterns = static_patterns + secret_patterns_from_env()
-
-dist_dir = Path(sys.argv[1])
-failures = []
-checked = 0
-for pair in sys.argv[2:]:
-    _platform, filename = pair.split(":", 1)
-    path = dist_dir / filename
-    if not path.exists():
-        failures.append(f"{filename}: missing artifact")
-        continue
-    if path.suffix == ".zip":
-        with zipfile.ZipFile(path) as zf:
-            for info in zf.infolist():
-                if info.is_dir():
-                    continue
-                data = zf.read(info.filename)
-                checked += 1
-                for label, pattern in patterns:
-                    if pattern in data:
-                        failures.append(f"{filename}:{info.filename}: {label}")
-    elif path.name.endswith(".tar.gz"):
-        with tarfile.open(path, "r:gz") as tf:
-            for member in tf.getmembers():
-                if not member.isfile():
-                    continue
-                extracted = tf.extractfile(member)
-                if extracted is None:
-                    continue
-                data = extracted.read()
-                checked += 1
-                for label, pattern in patterns:
-                    if pattern in data:
-                        failures.append(f"{filename}:{member.name}: {label}")
-    else:
-        data = path.read_bytes()
-        checked += 1
-        for label, pattern in patterns:
-            if pattern in data:
-                failures.append(f"{filename}: {label}")
-
-if failures:
-    print("Refusing to publish release artifacts with forbidden dev flags or secret material:", file=sys.stderr)
-    for failure in failures:
-        print(f"  - {failure}", file=sys.stderr)
-    sys.exit(1)
-
-secret_count = len(patterns) - len(static_patterns)
-if secret_count:
-    print(
-        f"Release artifact dev-flag/secret scan passed "
-        f"({checked} files checked, {secret_count} configured secret value(s) covered)."
-    )
-else:
-    print(f"Release artifact dev-flag/secret scan passed ({checked} files checked, no configured secrets present).")
-PY
+artifact_paths=()
+for pair in "${artifacts[@]}"; do
+    filename="${pair#*:}"
+    artifact_paths+=("$DIST_DIR/$filename")
+done
+python3 scripts/check-release-artifact-contents.py "${artifact_paths[@]}"
 
 (
     cd "$STAGE_DIR/releases/$VERSION_TAG"

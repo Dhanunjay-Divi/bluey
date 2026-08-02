@@ -22,7 +22,16 @@
         "hiddenTitle": false
       }
     ],
-    "macOSPrivateApi": true
+    "macOSPrivateApi": true,
+    "security": {
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$LOCALDATA/bluey/capture-previews/**",
+          "$LOCALDATA/cue/capture-previews/**"
+        ]
+      }
+    }
   },
   "bundle": {
     "active": true,

@@ -1,0 +1,38 @@
+FINAL ROUND SECURITY EVIDENCE — 2026-07-12
+
+OBSERVED — positive controls
+- Valid Developer ID signature, hardened runtime, and stapled notarization.
+- ASAR header integrity metadata verified exactly.
+- OAuth S256 PKCE, random state, expiry, and state verification.
+- contextIsolation enabled; nodeIntegration disabled; navigation and child windows constrained; CSPs avoid unsafe-eval.
+- safeStorage used for refresh token/cached user when available.
+- Screenshot flow content-protects app windows during capture and compresses before upload.
+- Single-instance lock; bounded socket reconnect; typed IPC results/errors.
+
+OBSERVED — high-priority risks
+1. Renderer least privilege is absent. Every renderer preload exposes the same sensitive IPC surface, while sender validation checks only packaged file origin/path and renderer-supplied role identity is not independently bound. A compromised low-trust widget could request access tokens, files, clipboard, screenshots, payment/settings operations, and external navigation. Sources: preload:47-260, 388-392; main:6278-6408 and 7757-7761.
+2. Interview content enters Sentry-forwarded logs. Transcript prefixes and complete assistant answers use a generic `text` key that bypasses the configured key-name redaction patterns. Sources: main:3765-3805, 5100-5194, 12104-12115, 12251-12255.
+3. Inbound socket validation is warn-only. Invalid payloads still reach handlers, increasing crash/state-confusion risk at a remote trust boundary. Source: main:5731-5753.
+
+OBSERVED — medium-priority risks
+- If safeStorage reports unavailable, refresh token/cached user fall back to plaintext electron-store. Source: main:7787-7884.
+- Broad entitlements allow DYLD environment variables, unsigned executable memory, and disabled library validation; no app sandbox entitlement was observed. This expands local compromise surface despite hardened runtime.
+- ATS allows arbitrary loads plus insecure loopback/TLS exceptions. Exact practical exposure depends on call sites.
+- Permission request handler allows media/display-capture/notifications on the shared default session without renderer-specific authorization. Source: main:6742-6765.
+- `openExternal` validates scheme but not host. Source: main:6719-6740.
+- PDF/DOCX validation fails open on local parser errors. Source: main:11485-11561.
+- Packaged remote debugging can be enabled by environment variable. Source: main:20932-20942.
+- Deep-link registration is performed at runtime. The bounded test confirmed it leaves a `frai` preference entry even after scoped bundle unregistration.
+
+OBSERVED — update boundary
+- Current bundle is signed/notarized; updater uses HTTPS generic feed and install-on-quit.
+- macOS `verifyAuthenticodeChain` branch is an explicit non-Windows no-op; this is not proof that electron-updater skips macOS signature checks, only that this application-level verifier adds none. Source: main:6767-6769 and 6882-7124.
+
+INFERENCE
+- Per-window capability allowlists and origin-bound permission decisions would materially reduce renderer compromise blast radius.
+- Plaintext fallback should fail closed for refresh tokens or require an explicit degraded-security user decision.
+- Structured telemetry needs content-classification/redaction at value level, not only key-name patterns.
+
+UNKNOWN
+- Server-side authorization, object-storage policy, telemetry scrubbing, secret rotation, and data deletion.
+- Production renderer sandbox state was not inferred from runtime because the successful test used a harness-only `--no-sandbox` flag under an outer Seatbelt sandbox.

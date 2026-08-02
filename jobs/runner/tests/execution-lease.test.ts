@@ -36,7 +36,13 @@ describe("execution lease client", () => {
     expect(calls).toHaveLength(3);
     expect(calls[0]?.url).toBe("https://jobs-api.example/api/jobs/internal/execution-leases/claim");
     expect(calls[0]?.init).toMatchObject({ method: "POST", redirect: "error" });
-    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBe("Bearer worker-secret-token");
+    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBeNull();
+    expect(new Headers(calls[0]?.init?.headers).get("x-bluey-jobs-worker-scope")).toBe("execution");
+    expect(new Headers(calls[0]?.init?.headers).get("x-bluey-jobs-worker-audience")).toBe("bluey-jobs-api");
+    expect(new Headers(calls[0]?.init?.headers).get("x-bluey-jobs-worker-content-sha256"))
+      .toMatch(/^[a-f0-9]{64}$/);
+    expect(new Headers(calls[0]?.init?.headers).get("x-bluey-jobs-worker-signature"))
+      .toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
       account_id: "account-123",
       application_id: "application-123",
@@ -226,7 +232,7 @@ function createClient(
 ): ExecutionLeaseClient {
   return new ExecutionLeaseClient({
     origin: "https://jobs-api.example",
-    workerToken: "worker-secret-token",
+    workerSigningKey: "0123456789abcdef0123456789abcdef",
     ownerId: "runner-test-1",
     heartbeatIntervalMs: 60_000,
     fetch,

@@ -1067,6 +1067,7 @@ mod tests {
                 access: "access".into(),
                 refresh: "refresh".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let provider = BlueyManagedProvider::new(client, ManagedLane::Instant);
@@ -1129,6 +1130,7 @@ mod tests {
                 access: "access".into(),
                 refresh: "refresh".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let provider = BlueyManagedProvider::new(client, ManagedLane::Instant);
@@ -1191,6 +1193,7 @@ mod tests {
                 access: "access".into(),
                 refresh: "refresh".into(),
                 email: "e@example.com".into(),
+                account_id: None,
             })
             .unwrap();
         let provider = BlueyManagedProvider::new(client, ManagedLane::Instant);

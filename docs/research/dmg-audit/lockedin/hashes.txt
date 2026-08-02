@@ -1,0 +1,15 @@
+# SHA-256 hashes recorded from the read-only LockedIn 1.7.5 image
+a06fab03e233726569e1bc9569cf43f374a9ff7c27bae9ff55dacd89dd1b7501  LockedIn-1.7.5-universal.dmg
+85743ec3aba9777a9f6d4e9ddbf2eac8360ab506040449fd1f58d9acac57f777  LockedIn.app/Contents/Resources/app.asar
+1cd7aec458347b05c21dfffe88765235544cb99e5bef176878e71fa53e8c7dd1  LockedIn.app/Contents/Info.plist
+6ee95b1f229f4df5fef5feeba9f3bd60dc3287e43aee8524b2378c3628239732  LockedIn.app/Contents/MacOS/LockedIn
+f12101c8c9f76ce754365c5a5bad2b6863875bb66084ff0cd66631908e1ddb57  LockedIn.app/Contents/Resources/app-update.yml
+3d7f9550d9b5c430e513664af84a38efd69a4435474d1c0c2c2ee99d3260c4f7  app.asar:package.json
+899bd36d33a592cf578bde636974004ae96e4a4e368f9c598889777302b728af  app.asar:firestore.js
+2d5ecddd8d5a39883273f7adb6da137979da9ae0174c04a181c929cd5a5068e0  app.asar:public/electron.js
+043a7dcf1ff58b9fe3726e7e5f542c911694d52b2646b20ba3c56885eb76ce93  app.asar:public/preload.js
+fbd334bdd6ba2604c68a5b778ecfdc545508a756c4ba7730860e78348b81dfac  app.asar:build/index.html
+e639c1c85646efe8da58a99b3dad0bf72e6cbbcf092a2b79abf3ec6572cdc913  app.asar:build/static/js/main.8ad05cf1.js
+
+# ElectronAsarIntegrity JSON-header SHA-256 from Info.plist
+784fff67eafdc8e56a8f033e16ca46445451adeb6a3861ababeb34cb4e027355  app.asar JSON header

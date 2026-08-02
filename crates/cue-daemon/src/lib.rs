@@ -12,6 +12,7 @@ pub mod secrets;
 pub mod storage;
 pub mod stt;
 pub mod util;
+pub mod workspace_store;
 
 /// Test-only re-exports of internal app helpers needed by integration tests.
 /// Production code does not use this module — it is purely a test seam.

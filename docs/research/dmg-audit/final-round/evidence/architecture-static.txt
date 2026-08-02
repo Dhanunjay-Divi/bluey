@@ -1,0 +1,45 @@
+FINAL ROUND STATIC ARCHITECTURE EVIDENCE — 2026-07-12
+
+OBSERVED — technology and entrypoints
+- Electron 39.2.7; package name `final-round-desktop`, version 2.4.0, main `./out/main/index.mjs`; renderer stack identifies React/TypeScript build output. Source: package.json.
+- Nine renderer entry pages: main-window, audio-indicator-widget, capture-halo-widget, coach-video-widget, interview-assistant-widget, intro-widget, launch-setup-widget, pill-widget, session-config-widget. Source: ASAR file inventory.
+- Nine preload bundles expose the same broad `window.api` surface. Main-window preload query channels occupy lines 47-103, commands 104-199, events 200-260, and contextBridge exposure 388-392. Equivalent content hashes/line maps were observed for the other widget preloads.
+- Main BrowserWindow construction enables `contextIsolation: true` and disables `nodeIntegration`; `sandbox` is not explicitly configured. Do not infer effective production renderer-sandbox state from the harness-only runtime flag. Source: main:6129-6248.
+
+OBSERVED — IPC and renderer trust
+- `IpcGateway` validates that sender URLs are expected `file:` renderer paths before dispatch. Source: main:6278-6408.
+- It does not authorize channels by renderer role/window kind. Every preload exposes access-token retrieval, user/resume/report/settings/payment reads, file upload/delete, clipboard, screenshot capture/upload, external URL opening, stealth/settings changes, and other commands. Source: preload:47-260.
+- Window identity is supplied from renderer to main via `__internal:window:identify` and registered without an independent role binding. Source: main:7757-7761.
+- Renderer CSPs are generated per entry; child-window creation is denied and navigation is constrained to packaged file URLs/dev origin. Source: main:6535-6740 and 7246-7295.
+- `openExternal` checks only allowed schemes (`http`, `https`, system-preference schemes), not destination hosts. Source: main:6719-6740.
+- Default-session permission handling allows media, display-capture, and notifications but does not bind decisions to a particular renderer origin/window. Source: main:6742-6765.
+- No Electron session `partition` was found; all app renderers use the default session. Source: main BrowserWindow/session inventory.
+
+OBSERVED — local process/data flow
+- Main process owns authentication, HTTP/socket clients, session lifecycle, native audio addons, screenshot capture, file upload, telemetry, updater, and electron-store namespaces; renderers invoke those functions over IPC. Source: main service registration and bootstrap:20920-21496.
+- Single-instance lock is enforced. Source: main:20913-20919.
+- Remote debugging is enabled only when `E2E_CDP_PORT` is present and valid, including packaged runs. Source: main:20932-20942.
+- Local namespaces include auth, device, capability-preferences, shortcut-state, audio-capture, speech, stealth, pill-widget, and development network-debug. Source: main storage constructors/config inventory.
+- `EncryptedStorage` encrypts values with Electron safeStorage and hex-encodes ciphertext; if safeStorage is unavailable it explicitly stores plaintext. Decrypt failure deletes the record. Source: main:7787-7884.
+- Access and ID tokens stay in memory; refresh token and cached user use EncryptedStorage. Refresh is single-flight/rotated and terminal 400/401 clears auth. Source: main:10049-10385.
+- OAuth uses random state plus S256 PKCE, a ten-minute pending-flow lifetime, external browser login, and `frai://callback`. Source: main:9990-10001 and 10387-10560.
+
+OBSERVED — audio/interview pipeline
+- Native capture config uses 16 kHz mono PCM for STT and 48 kHz stereo for recording, with bounded ring/latency settings. macOS chooses Core Audio taps on 14.2+, ScreenCaptureKit on 13+, then no backend. Source: main:3516-3649.
+- audio_capture.node links CoreAudio, AudioToolbox, AudioUnit, AVFoundation, CoreMedia, and ScreenCaptureKit; retained symbols/strings identify Core Audio tap, aggregate-device, TCC, ScreenCaptureKit, and WebRTC AEC paths. Source: `otool -L`, `nm`, and `strings` results.
+- audio_detect.node checks microphone-in-use state; keyboard_monitor.node has accessibility/listener/recording probes. Source: linked-library, symbol, and string inventories.
+- Bundled silero_vad.onnx provides local VAD. Main config enables VAD and implements a bounded drop-oldest processing queue. Source: main:6041 onward and VAD service inventory.
+- Socket transport is WebSocket-only, authenticates with a bearer token in socket auth, reconnects with exponential jitter, and reissues ASR start after reconnect. Source: main:5562-5945.
+- Inbound Zod validation is warning-only; handlers still execute malformed payloads. Source: main:5731-5753.
+- Interview state includes streamed transcript/assistant/code/system-design sections, screenshot upload, and ephemeral per-session message maps capped at 100 entries; session teardown clears them. Source: main:12082-12346.
+
+OBSERVED — session lifecycle and recovery
+- Before launch, the app checks privilege, fetches active server sessions, closes the first active session, creates a new one, and starts it. Source: main:15808-16012.
+- Launch tracks side effects and rolls them back on failure; it connects socket/ASR with a 25-second connection gate and loads settings. Source: main:16037-16135.
+- An in-memory XState lifecycle covers idle, launching, active, ending, and failed, with 30-second launch/teardown watchdogs and best-effort rollback/teardown. Source: main:16287-16496.
+- There is no observed local durable session checkpoint, queue, idempotency key, lease, or crash-resume journal. This is an absence from the complete first-party storage/schema/service inventory, not a claim about the opaque backend.
+
+UNKNOWN
+- Server database schema, encryption, retention, queueing, idempotency, billing enforcement, and report persistence are not in the DMG.
+- The exact safeStorage backend/keychain ACL was not inspected and would require permissioned runtime/keychain analysis.
+- First-party bundles are minified and native binaries partly stripped; original source history and server code are unreachable.

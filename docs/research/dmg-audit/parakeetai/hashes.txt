@@ -1,0 +1,18 @@
+# SHA-256 evidence for ParakeetAI 3.6.21
+# Static inspection only; paths after `app.asar::` are virtual ASAR members.
+
+94e86fe16a3b639d97989a88e4436d41a526f6db800d3be7e8c3e3efee386259  226405227  /Users/uno/Downloads/dmg_backtrack_code/ParakeetAI-3.6.21.dmg
+e976a3905580addfee17c17ed7c202ccf7334f2d0cff19ef7188cc73b6a9926a  100668529  ParakeetAI.app/Contents/Resources/app.asar
+27a204c1c4a44cb51f1fc3248de0a09d48ffa076cc8572feb13bf7f97b474a73     490579  app.asar::dist/main/main.js
+1a778173dff9b4446c5468b3574cf399af12ec3cb4f40f94df74511e28752105       1330  app.asar::dist/main/preload.js
+c7f617f626112776482b5fe8bcf8a3ec975bf3f38948cec6a05044c14b6c4f0b      25333  app.asar::dist/main/mic-monitor-worker.js
+9f08de81f14969ef4f814ac4992bba53c12f22b2ef66b886e1ca6862e8f3592b        200  app.asar::dist/renderer/index.html
+0f12b46849684b178e54e87454fca3c3d310a9607b7024576c8d19462a0e4c34    2962413  app.asar::dist/renderer/renderer.js
+2c60449159d49e26086b7fbaf2a45f6e3270eead63f3cfe9fd59ed0a696564ed    1098896  app.asar.unpacked/dist/main/283c2473f1c04fe665c78f2191192789.node (darwin-x64)
+e482f828c2ebd9eef4b46b50fdada4f38a33a1bba8377bc09222229b075d1247     981392  app.asar.unpacked/dist/main/c1bf554b2a57f81079e40ed1eac3f521.node (darwin-arm64)
+f85817c38df8ba4dbf41d6b86ffb298de4bb2303e75b915c9c91784ddfe440b8    1294848  app.asar.unpacked/dist/main/3f29c6df0d761dcd74afd760bd82c0fd.node (win32-x64)
+e24922da62e66c5e1e1a6fddf6de50772f96e25162bc1f6a8b2ea67ca8f6a22e    1038848  app.asar.unpacked/dist/main/8381eec489da0db5f43be6222454ceb8.node (win32-arm64)
+4b016ebbbb4787422b269fdc164715e59a27e947eb5087bf6a727c1e47369742     981392  app.asar.unpacked/node_modules/@parakeetai-desktop/native-modules/prebuilt/parakeetai-native.darwin-arm64.node
+98ebbb5e1e74f2d6bf2c4adfdf2e278c9701ee25eb5302aa165813178bd805ce    1098896  app.asar.unpacked/node_modules/@parakeetai-desktop/native-modules/prebuilt/parakeetai-native.darwin-x64.node
+e24922da62e66c5e1e1a6fddf6de50772f96e25162bc1f6a8b2ea67ca8f6a22e    1038848  app.asar.unpacked/node_modules/@parakeetai-desktop/native-modules/prebuilt/parakeetai-native.win32-arm64-msvc.node
+f85817c38df8ba4dbf41d6b86ffb298de4bb2303e75b915c9c91784ddfe440b8    1294848  app.asar.unpacked/node_modules/@parakeetai-desktop/native-modules/prebuilt/parakeetai-native.win32-x64-msvc.node

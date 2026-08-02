@@ -34,6 +34,9 @@ build-darwin-x86_64:
 
 build-windows-x86_64:
 	cargo build --release --target x86_64-pc-windows-msvc -p cue-daemon -p cue-cli
+	powershell -NoProfile -ExecutionPolicy Bypass -File native/windows/cue-overlay/build.ps1
+	powershell -NoProfile -ExecutionPolicy Bypass -File native/windows/cue-audio/build.ps1
+	powershell -NoProfile -ExecutionPolicy Bypass -File native/windows/cue-capture/build.ps1
 
 build-all: build-darwin-arm64 build-darwin-x86_64
 
@@ -99,7 +102,10 @@ package-windows-x86_64: require-update-pubkey build-windows-x86_64
 	cp staging-win/bin/bluey-daemon.exe staging-win/bin/Terminal.exe
 	cp target/x86_64-pc-windows-msvc/release/bluey.exe staging-win/bin/ 2>/dev/null || \
 		cp target/x86_64-pc-windows-msvc/release/cue.exe staging-win/bin/bluey.exe
-	cp target/x86_64-pc-windows-msvc/release/host-overlay.exe staging-win/bin/ 2>/dev/null || true
-	cp target/x86_64-pc-windows-msvc/release/audio-driver.exe staging-win/bin/ 2>/dev/null || true
+	cp native/windows/cue-overlay/build/bluey-overlay.exe staging-win/bin/host-overlay.exe
+	cp native/windows/cue-audio/build/bluey-audio.exe staging-win/bin/audio-driver.exe
+	cp native/windows/cue-capture/build/bluey-capture.exe staging-win/bin/screen-driver.exe
+	cp BLUEY-NOTICE.txt staging-win/bin/
+	powershell -NoProfile -ExecutionPolicy Bypass -File scripts/write-windows-integrity.ps1 -BinDir staging-win/bin -BuildId $(VERSION)
 	cd staging-win && zip ../dist/bluey-$(VERSION)-windows-x86_64.zip -r *
 	rm -rf staging-win

@@ -10,7 +10,6 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@bluey/jobs-automation": "0.1.0",
     "@tailwindcss/vite": "^4.3.1",
     "docx": "^9.5.1",
     "jspdf": "^4.2.1",

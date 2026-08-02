@@ -38,3 +38,6 @@ ptr_arg = "allow"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.5"
 objc2-foundation = { version = "0.2", features = ["NSString"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation"] }

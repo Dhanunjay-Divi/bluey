@@ -1,0 +1,71 @@
+LOCKEDIN ASAR INVENTORY AND INTEGRITY EVIDENCE
+
+Bundle source
+  LockedIn.app/Contents/Resources/app.asar
+  Size: 474545107 bytes
+  Whole-file SHA-256: 85743ec3aba9777a9f6d4e9ddbf2eac8360ab506040449fd1f58d9acac57f777
+
+Info.plist ElectronAsarIntegrity
+  Header algorithm: SHA256
+  Header hash: 784fff67eafdc8e56a8f033e16ca46445451adeb6a3861ababeb34cb4e027355
+  This is the ASAR JSON-header digest, not a whole-file digest. Both values were independently verified.
+
+Header inventory
+  Files: 49270
+  Packed entries: 49026
+  Unpacked entries: 244
+  Aggregate logical file bytes: 485318437
+  Top-level entries: .env.local, build/, firestore.js, lib/, node_modules/, package.json, public/
+
+Selected entry sizes
+  .env.local: 648 bytes
+  firestore.js: 860 bytes
+  package.json: 2210 bytes
+  build/electron.js: 135568 bytes
+  build/preload.js: 10354 bytes
+  build/static/js/main.8ad05cf1.js: 8343818 bytes
+
+Selected extracted-entry verification
+  package.json
+    SHA-256 3d7f9550d9b5c430e513664af84a38efd69a4435474d1c0c2c2ee99d3260c4f7
+    matched ASAR per-entry integrity
+  public/electron.js
+    SHA-256 2d5ecddd8d5a39883273f7adb6da137979da9ae0174c04a181c929cd5a5068e0
+    matched ASAR per-entry integrity
+  public/preload.js
+    SHA-256 043a7dcf1ff58b9fe3726e7e5f542c911694d52b2646b20ba3c56885eb76ce93
+    matched ASAR per-entry integrity
+  build/index.html
+    SHA-256 fbd334bdd6ba2604c68a5b778ecfdc545508a756c4ba7730860e78348b81dfac
+    matched ASAR per-entry integrity
+  build/static/js/main.8ad05cf1.js
+    SHA-256 e639c1c85646efe8da58a99b3dad0bf72e6cbbcf092a2b79abf3ec6572cdc913
+    matched ASAR per-entry integrity
+  firestore.js
+    SHA-256 899bd36d33a592cf578bde636974004ae96e4a4e368f9c598889777302b728af
+    matched ASAR per-entry integrity
+
+Full-entry audit
+  All 49026 packed entries matched their ASAR per-entry integrity values.
+  All readable non-Mach-O unpacked entries matched.
+  Forty-one unpacked Mach-O files differed from their recorded pre-signing ASAR per-entry hashes. Each was a signed native binary or library; signing mutates Mach-O bytes after packaging. The bundle's deep strict code-signature verification succeeded. This combination is consistent with a post-ASAR code-signing build step and is not, by itself, evidence of tampering.
+  Read errors: 0
+
+Static extraction scope
+  Only package metadata and first-party text assets needed for analysis were extracted to a private temporary directory. `.env.local` values were deliberately excluded. No extracted source is stored in this repository.
+
+Embedded environment-variable names (values omitted)
+  REACT_APP_CLERK_PUBLISHABLE_KEY
+  REACT_APP_CLERK_PUBLISHABLE_KEY_DEV
+  REACT_APP_FIRESTORE_API_KEY
+  REACT_APP_FIRESTORE_AUTH_DOMAIN
+  REACT_APP_FIRESTORE_PROJECT_ID
+  REACT_APP_FIRESTORE_STORAGE_BUCKET
+  REACT_APP_FIRESTORE_MESSAGING_SENDER_ID
+  REACT_APP_FIRESTORE_APP_ID
+  REACT_APP_FIRESTORE_MEASUREMENT_ID
+  REACT_APP_ENDPOINT_SWITCH
+  GENERATE_SOURCEMAP
+
+Source-map observation
+  No first-party source map for build/static/js/main.8ad05cf1.js was present in the ASAR inventory.

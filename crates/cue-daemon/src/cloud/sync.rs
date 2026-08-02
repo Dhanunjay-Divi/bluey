@@ -292,6 +292,7 @@ fn meeting_should_follow_cloud_delete(
 fn remove_bluey_owned_context_files(data_dir: &Path, meeting: &MeetingRecord) {
     for artifact in &meeting.context {
         remove_bluey_owned_prepared_image(data_dir, artifact);
+        remove_bluey_owned_capture(data_dir, artifact);
         remove_bluey_owned_markdown(data_dir, artifact);
     }
 }
@@ -302,13 +303,31 @@ fn remove_bluey_owned_prepared_image(data_dir: &Path, artifact: &ContextArtifact
     if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
         return;
     }
-    remove_file_under_allowed_dir(
-        data_dir,
-        data_dir.join("context-images"),
-        path,
-        artifact.id,
-        "prepared image",
-    );
+    for (subdir, kind) in [
+        ("context-images", "prepared image"),
+        ("context-thumbnails", "retained image thumbnail"),
+    ] {
+        remove_file_under_allowed_dir(data_dir, subdir, &expected_name, &path, artifact.id, kind);
+    }
+}
+
+fn remove_bluey_owned_capture(data_dir: &Path, artifact: &ContextArtifact) {
+    let path = PathBuf::from(&artifact.path);
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return;
+    };
+    let deterministic_name = format!("screenshot-{}.png", artifact.id.simple());
+    let valid_eye_capture = [".jpg", ".png"].iter().any(|suffix| {
+        name.strip_prefix("eye-capture-")
+            .and_then(|value| value.strip_suffix(suffix))
+            .is_some_and(|timestamp| {
+                !timestamp.is_empty() && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    });
+    if name != deterministic_name && !valid_eye_capture {
+        return;
+    }
+    remove_file_under_allowed_dir(data_dir, "captures", name, &path, artifact.id, "capture");
 }
 
 fn remove_bluey_owned_markdown(data_dir: &Path, artifact: &ContextArtifact) {
@@ -326,8 +345,9 @@ fn remove_bluey_owned_markdown(data_dir: &Path, artifact: &ContextArtifact) {
     }
     remove_file_under_allowed_dir(
         data_dir,
-        data_dir.join("context-markdown"),
-        path,
+        "context-markdown",
+        &expected_name,
+        &path,
         artifact.id,
         "converted markdown",
     );
@@ -335,43 +355,86 @@ fn remove_bluey_owned_markdown(data_dir: &Path, artifact: &ContextArtifact) {
 
 fn remove_file_under_allowed_dir(
     data_dir: &Path,
-    allowed_dir: PathBuf,
-    path: PathBuf,
+    subdir: &str,
+    expected_name: &str,
+    path: &Path,
     artifact_id: Uuid,
     kind: &'static str,
 ) {
     let path = if path.is_absolute() {
-        path
+        path.to_path_buf()
     } else {
         data_dir.join(path)
     };
-    let allowed = match allowed_dir.canonicalize() {
-        Ok(dir) => dir,
-        Err(_) => allowed_dir,
+    let allowed_dir = data_dir.join(subdir);
+    if path != allowed_dir.join(expected_name) {
+        return;
+    }
+    let Ok(data_root) = data_dir.canonicalize() else {
+        return;
     };
-    let candidate = match path.canonicalize() {
-        Ok(path) => path,
-        Err(_) => path,
+    let Ok(dir_metadata) = fs::symlink_metadata(&allowed_dir) else {
+        return;
     };
-    if !candidate.starts_with(&allowed) {
+    if !dir_metadata.is_dir() || dir_metadata.file_type().is_symlink() {
+        return;
+    }
+    let Ok(allowed) = allowed_dir.canonicalize() else {
+        return;
+    };
+    if !allowed.starts_with(&data_root) {
         warn!(
             artifact_id = %artifact_id,
-            path = %candidate.display(),
+            path = %path.display(),
             allowed = %allowed.display(),
             "skipping cloud-delete cleanup outside Bluey context directory"
         );
         return;
     }
-    if let Err(error) = fs::remove_file(&candidate) {
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        Err(_) => return,
+    };
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return;
+    }
+    if let Err(error) = remove_cloud_cleanup_child_no_follow(&allowed_dir, expected_name) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!(
                 artifact_id = %artifact_id,
-                path = %candidate.display(),
+                path = %path.display(),
                 kind,
                 "failed to remove Bluey-owned context cache file after cloud delete: {error}"
             );
         }
     }
+}
+
+#[cfg(unix)]
+fn remove_cloud_cleanup_child_no_follow(dir: &Path, name: &str) -> std::io::Result<()> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(dir)?;
+    let name = CString::new(std::ffi::OsStr::new(name).as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid name"))?;
+    let result = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn remove_cloud_cleanup_child_no_follow(dir: &Path, name: &str) -> std::io::Result<()> {
+    fs::remove_file(dir.join(name))
 }
 
 fn load_local_responses(
@@ -412,6 +475,9 @@ async fn upload_context_objects(
     let mut seen = HashSet::new();
     for meeting in meetings {
         for artifact in &meeting.context {
+            if !artifact.cloud_sync_policy.allows_cloud_sync() {
+                continue;
+            }
             if !seen.insert(artifact.id) {
                 continue;
             }
@@ -710,15 +776,20 @@ fn assemble_session_audit_bundle(
     }
 
     for artifact in &meeting.context {
+        if !artifact.cloud_sync_policy.allows_cloud_sync() {
+            continue;
+        }
+        let source = serialized_context_source(artifact);
+        let markdown_source = artifact.markdown_path.as_deref().map(serialized_path_label);
         let payload = json!({
             "artifact_id": artifact.id.to_string(),
             "kind": artifact.kind.to_string(),
             "title": artifact.title,
             "note": artifact.note,
-            "path": artifact.path,
+            "path": source,
             "size_bytes": artifact.size_bytes,
             "text_preview": artifact.text_preview.as_deref().map(|text| truncate_chars(text, MAX_TEXT_PREVIEW_CHARS)),
-            "markdown_path": artifact.markdown_path,
+            "markdown_path": markdown_source,
             "processing_status": artifact.processing_status.to_string(),
             "processing_error": artifact.processing_error,
             "created_at_ms": parse_ms(&artifact.created_at),
@@ -843,6 +914,7 @@ fn assemble_session_audit_bundle(
     }
 
     for turn in &meeting.conversation {
+        let synced_attachment_ids = cloud_syncable_attachment_ids(meeting, turn);
         let key = format!("turn:{}:{}", turn.id, turn.question.trim());
         if !turn.question.trim().is_empty() && seen_questions.insert(key) {
             push_audit_record(
@@ -858,7 +930,7 @@ fn assemble_session_audit_bundle(
                     "text": truncate_chars(&turn.question, MAX_TEXT_PREVIEW_CHARS),
                     "created_at_ms": parse_ms(&turn.created_at),
                     "source": turn.source,
-                    "attachment_ids": turn.attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                    "attachment_ids": synced_attachment_ids,
                 }),
             );
         }
@@ -876,7 +948,7 @@ fn assemble_session_audit_bundle(
                 "created_at_ms": parse_ms(&turn.created_at),
                 "provider": turn.provider,
                 "source": turn.source,
-                "attachment_ids": turn.attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "attachment_ids": synced_attachment_ids,
                 "artifact_type": turn.artifact.as_ref().map(|artifact| cloud_artifact_type_value(artifact.artifact_type)),
             }),
         );
@@ -1254,6 +1326,14 @@ fn current_epoch_ms() -> i64 {
 }
 
 fn artifact_object_path(data_dir: &Path, artifact: &ContextArtifact) -> Option<PathBuf> {
+    if !artifact.cloud_sync_policy.allows_cloud_sync() {
+        return None;
+    }
+    if is_jobs_handoff_context_path(Path::new(&artifact.path)) {
+        // The redacted preview is synced for answer continuity. The full
+        // locally-bound Jobs evidence file is not re-uploaded as an object.
+        return None;
+    }
     let restored_preview_dir = data_dir.join("cloud-restored-context");
     let candidates = std::iter::once(Some(artifact.path.as_str()))
         .chain(std::iter::once(artifact.markdown_path.as_deref()));
@@ -1343,6 +1423,9 @@ fn build_sync_batches(
         }
 
         for artifact in &meeting.context {
+            if !artifact.cloud_sync_policy.allows_cloud_sync() {
+                continue;
+            }
             maybe_flush(&mut batches, &mut batch, &session);
             batch
                 .context_artifacts
@@ -1433,13 +1516,17 @@ fn meeting_has_syncable_content(
     responses: Option<&Vec<crate::llm::CueResponse>>,
 ) -> bool {
     !meeting.transcript.is_empty()
-        || !meeting.context.is_empty()
+        || meeting
+            .context
+            .iter()
+            .any(|artifact| artifact.cloud_sync_policy.allows_cloud_sync())
         || !meeting.conversation.is_empty()
         || responses.is_some_and(|items| !items.is_empty())
         || meeting
             .summary
             .as_deref()
             .is_some_and(|summary| !summary.trim().is_empty())
+        || meeting.assistant_profile != cue_core::AssistantProfile::default()
 }
 
 async fn meeting_from_cloud_bundle(
@@ -1472,8 +1559,22 @@ async fn meeting_from_cloud_bundle(
         }
     }
 
+    let assistant_profile = bundle
+        .session
+        .metadata
+        .get("assistant_profile")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
+
     Ok(MeetingRecord {
         id,
+        workspace_id: bundle
+            .session
+            .metadata
+            .get("workspace_id")
+            .and_then(|value| value.as_str())
+            .and_then(|value| Uuid::parse_str(value).ok()),
         owner_account_id: None,
         title: bundle.session.title,
         started_at: bundle.session.created_at_ms.to_string(),
@@ -1488,6 +1589,9 @@ async fn meeting_from_cloud_bundle(
         context,
         conversation,
         answer_instructions: bundle.session.answer_style,
+        assistant_profile,
+        jobs_handoff_import_id: None,
+        jobs_handoff_context_sha256: None,
         diagnostics: MeetingDiagnostics::default(),
         summary: bundle
             .session
@@ -1535,6 +1639,13 @@ async fn context_artifact_from_cloud(
             .get("processing_error")
             .and_then(|value| value.as_str())
             .map(ToString::to_string),
+        cloud_sync_policy: cue_core::ContextCloudSyncPolicy::Allowed,
+        integrity_sha256: None,
+        vision_send_consumed: record
+            .metadata
+            .get("vision_send_consumed")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false),
         created_at: record.created_at_ms.to_string(),
     })
 }
@@ -1629,7 +1740,7 @@ fn restored_note(
         parts.push(note);
     }
     if let Some(source_uri) = source_uri.filter(|value| !value.trim().is_empty()) {
-        parts.push(format!("Original path on synced device: {source_uri}"));
+        parts.push(format!("Original source on synced device: {source_uri}"));
     }
     if restored_original {
         parts.push("Restored from Bluey Cloud with the original synced file bytes.".to_string());
@@ -1856,7 +1967,9 @@ fn session_record(meeting: &MeetingRecord) -> SyncSessionRecord {
         answer_style: meeting.answer_instructions.clone(),
         metadata: json!({
             "session_code": short_session_code(meeting.id),
+            "workspace_id": meeting.workspace_id.map(|id| id.to_string()),
             "summary": meeting.summary.as_deref(),
+            "assistant_profile": meeting.assistant_profile,
             "action_items": meeting.action_items.len(),
             "decisions": meeting.decisions.len(),
             "diagnostics": {
@@ -1911,7 +2024,7 @@ fn context_record(
         kind: artifact.kind.to_string(),
         title: artifact.title.clone(),
         note: artifact.note.clone(),
-        source_uri: Some(artifact.path.clone()),
+        source_uri: Some(serialized_context_source(artifact)),
         content_hash: uploaded.map(|object| object.sha256.clone()),
         text_preview: artifact
             .text_preview
@@ -1922,6 +2035,7 @@ fn context_record(
             "size_bytes": artifact.size_bytes,
             "processing_status": artifact.processing_status.to_string(),
             "processing_error": artifact.processing_error.as_deref(),
+            "vision_send_consumed": artifact.vision_send_consumed,
             "object_key": uploaded.map(|object| object.object_key.as_str()),
             "object_size_bytes": uploaded.map(|object| object.size_bytes),
             "object_sha256": uploaded.map(|object| object.sha256.as_str()),
@@ -1929,6 +2043,33 @@ fn context_record(
             "object_expires_at_ms": uploaded.map(|object| object.expires_at_ms),
         }),
     }
+}
+
+fn serialized_context_source(artifact: &ContextArtifact) -> String {
+    if is_jobs_handoff_context_path(Path::new(&artifact.path)) {
+        cue_core::BLUEY_JOBS_EVIDENCE_SOURCE.to_string()
+    } else {
+        serialized_path_label(&artifact.path)
+    }
+}
+
+fn serialized_path_label(value: &str) -> String {
+    if Path::new(value).is_absolute() || value.contains('\\') {
+        "local_attachment".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn is_jobs_handoff_context_path(path: &Path) -> bool {
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("submitted-application-") && name.ends_with(".json"));
+    valid_name
+        && path
+            .parent()
+            .is_some_and(|parent| parent.ends_with(Path::new("jobs-handoffs/context")))
 }
 
 fn cue_response_record(response: &crate::llm::CueResponse) -> SyncCueResponseRecord {
@@ -1988,11 +2129,7 @@ fn conversation_response_record(
         artifact_confidence: turn.artifact.as_ref().map(|artifact| artifact.confidence),
         metadata: json!({
             "source": turn.source.as_deref(),
-            "attachment_ids": turn
-                .attachment_ids
-                .iter()
-                .map(|id| id.to_string())
-                .collect::<Vec<_>>(),
+            "attachment_ids": cloud_syncable_attachment_ids(meeting, turn),
         }),
     }
 }
@@ -2031,6 +2168,9 @@ fn context_rag_chunk(
     meeting: &MeetingRecord,
     artifact: &ContextArtifact,
 ) -> Option<SyncRagChunkRecord> {
+    if !artifact.cloud_sync_policy.allows_cloud_sync() {
+        return None;
+    }
     Some(SyncRagChunkRecord {
         chunk_id: format!("{}:context:{}:0", meeting.id, artifact.id),
         session_id: Some(meeting.id.to_string()),
@@ -2102,12 +2242,28 @@ fn updated_at_ms(meeting: &MeetingRecord) -> i64 {
         latest = latest.max(parse_ms(&segment.created_at));
     }
     for artifact in &meeting.context {
-        latest = latest.max(parse_ms(&artifact.created_at));
+        if artifact.cloud_sync_policy.allows_cloud_sync() {
+            latest = latest.max(parse_ms(&artifact.created_at));
+        }
     }
     for turn in &meeting.conversation {
         latest = latest.max(parse_ms(&turn.created_at));
     }
     latest
+}
+
+fn cloud_syncable_attachment_ids(meeting: &MeetingRecord, turn: &ConversationTurn) -> Vec<String> {
+    turn.attachment_ids
+        .iter()
+        .filter(|id| {
+            meeting
+                .context
+                .iter()
+                .find(|artifact| artifact.id == **id)
+                .is_none_or(|artifact| artifact.cloud_sync_policy.allows_cloud_sync())
+        })
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn parse_ms(value: &str) -> i64 {
@@ -2174,6 +2330,138 @@ mod tests {
         assert_eq!(batch.context_artifacts.len(), 1);
         assert_eq!(batch.rag_chunks.len(), 1);
         assert_eq!(batch.rag_chunks[0].source_kind, "context");
+    }
+
+    #[tokio::test]
+    async fn consumed_image_state_survives_cloud_record_round_trip() {
+        let root =
+            std::env::temp_dir().join(format!("bluey-consumed-image-roundtrip-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).expect("root");
+        let meeting = MeetingRecord::new(Some("Consumed image".into()));
+        let mut artifact = ContextArtifact::new(
+            ContextKind::Image,
+            "/tmp/legacy-screen.jpg",
+            "Legacy screen",
+            None,
+            Some(10),
+        )
+        .with_text_preview("Saved text memory");
+        artifact.vision_send_consumed = true;
+
+        let record = context_record(&meeting, &artifact, &HashMap::new());
+        assert_eq!(record.metadata["vision_send_consumed"], true);
+        let restored = context_artifact_from_cloud(&root, None, record)
+            .await
+            .expect("restore context");
+
+        assert!(restored.vision_send_consumed);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_only_context_is_excluded_from_objects_metadata_audit_and_rag() {
+        let data_dir =
+            std::env::temp_dir().join(format!("bluey-local-only-sync-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data_dir).expect("test dir");
+        let local_path = data_dir.join("screen.png");
+        std::fs::write(&local_path, b"local screenshot").expect("local artifact");
+        let local = ContextArtifact::new(
+            ContextKind::Image,
+            local_path.display().to_string(),
+            "Private screen",
+            None,
+            Some(16),
+        )
+        .with_text_preview("private screenshot preview")
+        .with_cloud_sync_policy(cue_core::ContextCloudSyncPolicy::LocalOnly);
+        let local_id = local.id;
+        let allowed =
+            ContextArtifact::new(ContextKind::Document, "/tmp/spec.md", "Spec", None, Some(4))
+                .with_text_preview("allowed spec preview");
+        let allowed_id = allowed.id;
+        let mut meeting = MeetingRecord::new(Some("Mixed context".into()));
+        meeting.context.extend([local.clone(), allowed]);
+        let mut turn = ConversationTurn::new("compare", "done", None, Some("test".into()));
+        turn.attachment_ids = vec![local_id, allowed_id];
+        meeting.conversation.push(turn.clone());
+
+        assert!(artifact_object_path(&data_dir, &local).is_none());
+        assert_eq!(
+            cloud_syncable_attachment_ids(&meeting, &turn),
+            vec![allowed_id.to_string()]
+        );
+        let batches = build_sync_batches(&[meeting.clone()], &HashMap::new(), &HashMap::new());
+        let context_ids = batches
+            .iter()
+            .flat_map(|batch| batch.context_artifacts.iter())
+            .map(|record| record.artifact_id.clone())
+            .collect::<Vec<_>>();
+        assert!(!context_ids.contains(&local_id.to_string()));
+        assert!(context_ids.contains(&allowed_id.to_string()));
+        assert!(!batches
+            .iter()
+            .flat_map(|batch| batch.rag_chunks.iter())
+            .any(|chunk| {
+                chunk.source_kind == "context" && chunk.source_id == local_id.to_string()
+            }));
+
+        let audit = assemble_session_audit_bundle(&data_dir, &meeting, &[], None);
+        assert!(
+            audit.context.is_empty()
+                || audit.context.iter().all(|record| {
+                    !serde_json::to_string(record)
+                        .expect("audit record")
+                        .contains(&local_id.to_string())
+                })
+        );
+        assert!(audit.attachments.iter().all(|record| {
+            !serde_json::to_string(record)
+                .expect("attachment record")
+                .contains(&local_id.to_string())
+        }));
+        assert!(audit.screen.iter().all(|record| {
+            !serde_json::to_string(record)
+                .expect("screen record")
+                .contains(&local_id.to_string())
+        }));
+        let _ = std::fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn jobs_context_syncs_only_redacted_preview_and_never_leaks_local_paths() {
+        let data_dir =
+            std::env::temp_dir().join(format!("bluey-jobs-sync-boundary-test-{}", Uuid::new_v4()));
+        let context_path = data_dir
+            .join("jobs-handoffs/context")
+            .join("submitted-application-0123456789abcdef0123456789abcdef.json");
+        let artifact = ContextArtifact::new(
+            ContextKind::Document,
+            context_path.display().to_string(),
+            "Submitted application",
+            None,
+            Some(128),
+        )
+        .with_text_preview("Role evidence only");
+        let meeting = MeetingRecord::new(Some("Interview prep".into()));
+
+        assert!(artifact_object_path(&data_dir, &artifact).is_none());
+        let record = context_record(&meeting, &artifact, &HashMap::new());
+        assert_eq!(
+            record.source_uri.as_deref(),
+            Some(cue_core::BLUEY_JOBS_EVIDENCE_SOURCE)
+        );
+        assert!(!serde_json::to_string(&record)
+            .expect("serialize context record")
+            .contains(&data_dir.display().to_string()));
+
+        assert_eq!(
+            serialized_path_label("/Users/alice/private/notes.md"),
+            "local_attachment"
+        );
+        assert_eq!(
+            serialized_path_label(r"C:\\Users\\alice\\private\\notes.md"),
+            "local_attachment"
+        );
     }
 
     #[test]

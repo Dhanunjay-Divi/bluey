@@ -1,7 +1,15 @@
 use cue_core::ipc::{DaemonRequest, DaemonResponse, DEFAULT_DAEMON_ADDR};
 use cue_core::session::Session;
+use cue_core::{
+    AssistantProfile, AudioCaptureState, AudioPipelineStatus, AudioReadinessProbeResult,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
 
@@ -61,6 +69,12 @@ pub struct FrontendErrorPayload {
 
 // ===== Daemon IPC helper =====
 
+/// Long enough for MeetingEnd's bounded audio tail drain, while keeping the UI responsive.
+const DAEMON_IPC_OPERATION_TIMEOUT: Duration = Duration::from_secs(6);
+const DAEMON_IPC_TIMEOUT_ERROR: &str = "daemon request timed out";
+static DAEMON_IPC_CAPABILITY_CACHE: OnceLock<Mutex<Option<cue_core::IpcCapabilityRecord>>> =
+    OnceLock::new();
+
 /// Send a request to the running daemon over TCP and return the response.
 pub(crate) async fn daemon_ipc(request: DaemonRequest) -> Result<DaemonResponse, String> {
     let trace_id = dashboard_trace_id();
@@ -79,33 +93,164 @@ async fn daemon_ipc_with_trace_to_addr(
     trace_id: &str,
     addr: &str,
 ) -> Result<DaemonResponse, String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    daemon_ipc_with_trace_to_addr_timeout(request, trace_id, addr, DAEMON_IPC_OPERATION_TIMEOUT)
+        .await
+}
+
+async fn daemon_ipc_with_trace_to_addr_timeout(
+    request: DaemonRequest,
+    trace_id: &str,
+    addr: &str,
+    timeout_limit: Duration,
+) -> Result<DaemonResponse, String> {
+    // Resolve no hostnames and reject non-loopback destinations before a
+    // capability is loaded, so bearer bytes cannot leave the local host.
+    let addr = cue_core::validated_loopback_ipc_addr(addr)
+        .map_err(|error| format!("daemon IPC address refused: {error}"))?;
+    let request = request.with_trace_id(trace_id.to_string());
+    if request.ipc_authorization() == cue_core::IpcAuthorization::Public {
+        return send_daemon_wire_request(
+            cue_core::DaemonWireRequest::Public(request),
+            addr,
+            timeout_limit,
+        )
+        .await
+        .and_then(reject_dashboard_ipc_auth_error);
+    }
+
+    let capability = dashboard_ipc_capability(false)?;
+    let response = send_daemon_wire_request(
+        cue_core::DaemonWireRequest::Authenticated(cue_core::AuthenticatedDaemonRequest::new(
+            &capability,
+            request.clone(),
+        )),
+        addr,
+        timeout_limit,
+    )
+    .await?;
+    if matches!(
+        response,
+        DaemonResponse::IpcAuthError {
+            code: cue_core::IpcAuthErrorCode::StaleBoot
+        }
+    ) {
+        let capability = dashboard_ipc_capability(true)?;
+        return send_daemon_wire_request(
+            cue_core::DaemonWireRequest::Authenticated(cue_core::AuthenticatedDaemonRequest::new(
+                &capability,
+                request,
+            )),
+            addr,
+            timeout_limit,
+        )
+        .await
+        .and_then(reject_dashboard_ipc_auth_error);
+    }
+    reject_dashboard_ipc_auth_error(response)
+}
+
+fn reject_dashboard_ipc_auth_error(response: DaemonResponse) -> Result<DaemonResponse, String> {
+    if let DaemonResponse::IpcAuthError { code } = response {
+        return Err(format!("daemon authentication failed: {code:?}"));
+    }
+    Ok(response)
+}
+
+fn dashboard_ipc_capability(force_reload: bool) -> Result<cue_core::IpcCapabilityRecord, String> {
+    let cache = DAEMON_IPC_CAPABILITY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut cached = cache
+        .lock()
+        .map_err(|_| "daemon authentication cache unavailable".to_string())?;
+    if force_reload {
+        *cached = None;
+    }
+    if let Some(capability) = cached.as_ref() {
+        return Ok(capability.clone());
+    }
+    let paths = cue_core::app_paths::AppPaths::discover()
+        .map_err(|_| "daemon authentication unavailable".to_string())?;
+    let capability = match cue_core::load_ipc_capability(&paths) {
+        Ok(capability) => capability,
+        #[cfg(test)]
+        Err(_) => cue_core::IpcCapabilityRecord::generate()
+            .map_err(|_| "daemon authentication unavailable".to_string())?,
+        #[cfg(not(test))]
+        Err(error) => return Err(format!("daemon authentication unavailable: {error}")),
+    };
+    *cached = Some(capability.clone());
+    Ok(capability)
+}
+
+async fn send_daemon_wire_request(
+    request: cue_core::DaemonWireRequest,
+    addr: std::net::SocketAddr,
+    timeout_limit: Duration,
+) -> Result<DaemonResponse, String> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::TcpStream;
 
-    let stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| format!("failed to connect to daemon: {e}"))?;
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
+    let operation = async {
+        let stream = TcpStream::connect(addr).await.map_err(|error| {
+            tracing::warn!(%error, "dashboard daemon connection failed");
+            "daemon unavailable".to_string()
+        })?;
+        let (reader, mut writer) = stream.into_split();
+        let mut reader =
+            BufReader::new(reader).take((cue_core::ipc_auth::IPC_MAX_RESPONSE_BYTES + 1) as u64);
 
-    let line = serde_json::to_string(&request.with_trace_id(trace_id.to_string()))
-        .map_err(|e| e.to_string())?;
-    writer
-        .write_all(line.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    writer.write_all(b"\n").await.map_err(|e| e.to_string())?;
-    writer.flush().await.map_err(|e| e.to_string())?;
+        let line = serde_json::to_vec(&request).map_err(|error| {
+            tracing::warn!(%error, "dashboard daemon request serialization failed");
+            "daemon request failed".to_string()
+        })?;
+        if line.len() + 1 > cue_core::ipc_auth::IPC_MAX_REQUEST_BYTES {
+            return Err("daemon request exceeds IPC size limit".to_string());
+        }
+        writer.write_all(&line).await.map_err(|error| {
+            tracing::warn!(%error, "dashboard daemon request write failed");
+            "daemon unavailable".to_string()
+        })?;
+        writer.write_all(b"\n").await.map_err(|error| {
+            tracing::warn!(%error, "dashboard daemon request delimiter write failed");
+            "daemon unavailable".to_string()
+        })?;
+        writer.flush().await.map_err(|error| {
+            tracing::warn!(%error, "dashboard daemon request flush failed");
+            "daemon unavailable".to_string()
+        })?;
 
-    let mut response = String::new();
-    let read = reader
-        .read_line(&mut response)
-        .await
-        .map_err(|e| e.to_string())?;
-    if read == 0 {
-        return Err("daemon closed connection without a response".to_string());
+        let mut response = Vec::new();
+        let read = reader
+            .read_until(b'\n', &mut response)
+            .await
+            .map_err(|error| {
+                tracing::warn!(%error, "dashboard daemon response read failed");
+                "daemon unavailable".to_string()
+            })?;
+        if read == 0 {
+            return Err("daemon closed connection".to_string());
+        }
+        if response.len() > cue_core::ipc_auth::IPC_MAX_RESPONSE_BYTES {
+            return Err("daemon response exceeds IPC size limit".to_string());
+        }
+        if response.last() != Some(&b'\n') {
+            return Err("invalid daemon response delimiter".to_string());
+        }
+        serde_json::from_slice(&response[..response.len() - 1]).map_err(|error| {
+            tracing::warn!(%error, "dashboard daemon response parsing failed");
+            "invalid daemon response".to_string()
+        })
+    };
+
+    match tokio::time::timeout(timeout_limit, operation).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!(
+                timeout_ms = timeout_limit.as_millis(),
+                "dashboard daemon operation timed out"
+            );
+            Err(DAEMON_IPC_TIMEOUT_ERROR.to_string())
+        }
     }
-    serde_json::from_str(response.trim_end()).map_err(|e| e.to_string())
 }
 
 fn daemon_addr() -> String {
@@ -134,42 +279,16 @@ fn cloud_client_with_trace(trace_id: &str) -> Result<cue_cloud_client::CloudClie
             config.base_url = account.api_url.clone();
         }
     }
-    let client = cue_cloud_client::CloudClient::new(
-        config.clone(),
-        Arc::new(cue_cloud_client::SecureAccountStore::new(paths)),
-    )
-    .map_err(|e| format!("account store unavailable: {e}"))?;
-    if client.current_tokens().is_some() || !legacy_keyring_fallback_enabled() {
-        return Ok(client);
-    }
-
-    cue_cloud_client::CloudClient::new(
-        config,
-        Arc::new(cue_cloud_client::tokens::KeyringStore::new()),
-    )
-    .map_err(|e| format!("legacy account keyring unavailable: {e}"))
-}
-
-fn legacy_keyring_fallback_enabled() -> bool {
-    std::env::var("BLUEY_LEGACY_KEYRING_FALLBACK")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-}
-
-fn clear_legacy_keyring_tokens_if_enabled() -> Result<(), String> {
-    if !legacy_keyring_fallback_enabled() {
-        return Ok(());
-    }
-    let client = cue_cloud_client::CloudClient::with_default_keyring()
-        .map_err(|e| format!("legacy account keyring unavailable: {e}"))?;
-    client
-        .clear_tokens()
-        .map_err(|e| format!("legacy sign out failed: {e}"))
+    let store: Arc<dyn cue_cloud_client::TokenStore> = if account
+        .as_ref()
+        .is_some_and(|account| account.provider != "local" && account.linked_owner_id().is_some())
+    {
+        Arc::new(cue_cloud_client::SecureAccountStore::new(paths))
+    } else {
+        Arc::new(cue_cloud_client::tokens::MemoryStore::new())
+    };
+    cue_cloud_client::CloudClient::new(config, store)
+        .map_err(|e| format!("account store unavailable: {e}"))
 }
 
 #[tauri::command]
@@ -298,13 +417,20 @@ pub async fn billing_portal_url() -> Result<String, String> {
 }
 
 #[tauri::command]
-pub fn sign_out(db: State<DbState>) -> Result<(), String> {
+pub async fn sign_out(db: State<'_, DbState>) -> Result<(), String> {
     let trace_id = dashboard_trace_id();
     let client = cloud_client_with_trace(&trace_id)?;
     client
         .clear_tokens()
         .map_err(|e| format!("sign out failed: {e}"))?;
-    clear_legacy_keyring_tokens_if_enabled()?;
+    if let Err(error) = daemon_ipc_with_trace(DaemonRequest::CloudLogout, &trace_id).await {
+        // Credential removal is authoritative. A stopped daemon must not turn
+        // a completed local sign-out into a false failure.
+        tracing::warn!(
+            error_length = error.len(),
+            "daemon sign-out notification failed"
+        );
+    }
     mark_onboarding_incomplete(db)
 }
 
@@ -332,7 +458,6 @@ pub async fn delete_account_now(db: State<'_, DbState>) -> Result<(), String> {
         client
             .clear_tokens()
             .map_err(|e| format!("account deleted, but local sign out failed: {e}"))?;
-        clear_legacy_keyring_tokens_if_enabled()?;
         mark_onboarding_incomplete(db)?;
     }
     Ok(())
@@ -686,30 +811,323 @@ pub fn list_speakers(
 
 // ===== Phase 3 Round 6: Hotkey → daemon action commands =====
 
-/// Toggle listening: if a meeting/audio session is active, end it; otherwise start one.
-/// Sends the appropriate IPC request to the running daemon.
-#[tauri::command]
-pub async fn daemon_toggle_listening() -> Result<String, String> {
-    let trace_id = dashboard_trace_id();
-    // Query daemon status to decide start vs stop.
-    let status = daemon_ipc_with_trace(DaemonRequest::Status, &trace_id).await?;
-    let is_active = match &status {
-        DaemonResponse::Status { state } => {
-            matches!(state.meeting, cue_core::MeetingState::InMeeting { .. })
-        }
-        _ => false,
-    };
-    let resp = if is_active {
-        daemon_ipc_with_trace(DaemonRequest::MeetingEnd, &trace_id).await?
+fn audio_pipeline_is_active(status: &AudioPipelineStatus) -> bool {
+    status.capture.is_active()
+        || (status.session_id.is_some()
+            && !matches!(
+                status.capture.state,
+                AudioCaptureState::Stopped | AudioCaptureState::Failed
+            ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicAudioErrorKind {
+    SignIn,
+    Permission,
+    Source,
+    Timeout,
+    Unavailable,
+    Generic,
+}
+
+fn classify_audio_error(message: &str) -> PublicAudioErrorKind {
+    let message = message.to_ascii_lowercase();
+    if ["permission", "screen recording", "tcc", "access denied"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Permission
+    } else if [
+        "sign in",
+        "signin",
+        "not signed",
+        "unauthorized",
+        "authentication",
+        "not authenticated",
+        "auth required",
+        "login required",
+        "account required",
+        "status 401",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::SignIn
+    } else if ["timed out", "timeout", "deadline"]
+        .iter()
+        .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Timeout
+    } else if [
+        "helper",
+        "audio source",
+        "microphone",
+        "system audio",
+        "audio device",
+        "audio backend",
+        "source unavailable",
+        "source failed",
+        "device unavailable",
+        "coreaudio",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Source
+    } else if [
+        "daemon unavailable",
+        "closed connection",
+        "connection",
+        "offline",
+        "refused",
+        "broken pipe",
+        "invalid daemon response",
+        "service unavailable",
+        "not running",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+    {
+        PublicAudioErrorKind::Unavailable
     } else {
-        daemon_ipc_with_trace(DaemonRequest::MeetingStart { title: None }, &trace_id).await?
+        PublicAudioErrorKind::Generic
+    }
+}
+
+fn public_audio_error(message: &str) -> String {
+    match classify_audio_error(message) {
+        PublicAudioErrorKind::SignIn => "Sign in to Bluey to start listening.",
+        PublicAudioErrorKind::Permission => {
+            "Allow microphone and system audio access, then try again."
+        }
+        PublicAudioErrorKind::Source => {
+            "A required audio source is unavailable. Check audio settings and try again."
+        }
+        PublicAudioErrorKind::Timeout => "Bluey took too long to respond. Try again.",
+        PublicAudioErrorKind::Unavailable => {
+            "Bluey's local audio service is unavailable. Try again."
+        }
+        PublicAudioErrorKind::Generic => "Bluey couldn't update the live session. Try again.",
+    }
+    .to_string()
+}
+
+fn public_audio_failure(operation: &str, message: &str) -> String {
+    let kind = classify_audio_error(message);
+    tracing::warn!(
+        operation,
+        ?kind,
+        error_length = message.len(),
+        "audio operation failed"
+    );
+    public_audio_error(message)
+}
+
+fn sanitize_audio_pipeline_status(mut status: AudioPipelineStatus) -> AudioPipelineStatus {
+    let sanitize = |value: &mut Option<String>| {
+        if let Some(message) = value.take() {
+            *value = Some(public_audio_error(&message));
+        }
     };
-    match resp {
-        DaemonResponse::Text { text } => Ok(text),
-        DaemonResponse::Recap { recap } => Ok(format!("Session ended: {}", recap.summary)),
-        DaemonResponse::Ok => Ok("ok".to_string()),
-        DaemonResponse::Error { message } => Err(message),
-        _ => Ok("ok".to_string()),
+
+    sanitize(&mut status.capture.last_error);
+    sanitize(&mut status.capture.system.last_error);
+    sanitize(&mut status.capture.microphone.last_error);
+    if matches!(status.capture.state, AudioCaptureState::Failed) {
+        sanitize(&mut status.note);
+    }
+    status
+}
+
+fn audio_status_from_response(
+    response: DaemonResponse,
+    operation: &str,
+) -> Result<AudioPipelineStatus, String> {
+    match response {
+        DaemonResponse::AudioStatus { status } => Ok(sanitize_audio_pipeline_status(status)),
+        DaemonResponse::Error { message } => Err(public_audio_failure(operation, &message)),
+        _ => Err(public_audio_failure(operation, "unexpected response")),
+    }
+}
+
+async fn daemon_listening_status_with_trace_to_addr(
+    trace_id: &str,
+    addr: &str,
+) -> Result<AudioPipelineStatus, String> {
+    let response = daemon_ipc_with_trace_to_addr(DaemonRequest::AudioStatus, trace_id, addr)
+        .await
+        .map_err(|message| public_audio_failure("query audio status", &message))?;
+    audio_status_from_response(response, "query audio status")
+}
+
+async fn daemon_toggle_listening_with_trace_to_addr(
+    mic_device_id: Option<String>,
+    trace_id: &str,
+    addr: &str,
+) -> Result<AudioPipelineStatus, String> {
+    let status = daemon_listening_status_with_trace_to_addr(trace_id, addr).await?;
+    let was_active = audio_pipeline_is_active(&status);
+    let (request, operation) = if was_active {
+        (DaemonRequest::AudioStop, "stop audio capture")
+    } else {
+        (
+            DaemonRequest::AudioStart {
+                enable_system: true,
+                enable_microphone: true,
+                mic_device_id,
+            },
+            "start audio capture",
+        )
+    };
+    let response = daemon_ipc_with_trace_to_addr(request, trace_id, addr)
+        .await
+        .map_err(|message| public_audio_failure(operation, &message))?;
+    let status = audio_status_from_response(response, operation)?;
+
+    if !was_active
+        && audio_pipeline_is_active(&status)
+        && !(status.config.system.enabled && status.config.microphone.enabled)
+    {
+        if let Err(message) =
+            daemon_ipc_with_trace_to_addr(DaemonRequest::AudioStop, trace_id, addr).await
+        {
+            tracing::warn!(
+                kind = ?classify_audio_error(&message),
+                "failed to clean up partial audio capture"
+            );
+        }
+        return Err(
+            "Bluey couldn't start both audio sources, so listening was stopped. Check audio settings and try again."
+                .to_string(),
+        );
+    }
+
+    Ok(status)
+}
+
+#[derive(Clone, Serialize)]
+pub struct EndSessionPayload {
+    pub audio_status: Option<AudioPipelineStatus>,
+    pub message: String,
+}
+
+async fn daemon_end_session_with_trace_to_addr(
+    trace_id: &str,
+    addr: &str,
+) -> Result<EndSessionPayload, String> {
+    let response = daemon_ipc_with_trace_to_addr(DaemonRequest::MeetingEnd, trace_id, addr)
+        .await
+        .map_err(|message| public_audio_failure("end live session", &message))?;
+    match response {
+        DaemonResponse::Recap { .. } | DaemonResponse::Text { .. } | DaemonResponse::Ok => {}
+        DaemonResponse::Error { message } => {
+            return Err(public_audio_failure("end live session", &message));
+        }
+        _ => {
+            return Err(public_audio_failure(
+                "end live session",
+                "unexpected response",
+            ))
+        }
+    }
+
+    // MeetingEnd is authoritative. A failed follow-up status refresh must not
+    // turn an already-ended session back into a UI failure.
+    let audio_status = match daemon_listening_status_with_trace_to_addr(trace_id, addr).await {
+        Ok(status) => Some(status),
+        Err(message) => {
+            tracing::warn!(
+                kind = ?classify_audio_error(&message),
+                "live session ended but audio status refresh failed"
+            );
+            None
+        }
+    };
+
+    Ok(EndSessionPayload {
+        audio_status,
+        message: "Session ended.".to_string(),
+    })
+}
+
+/// Return the daemon's current audio pipeline status.
+#[tauri::command]
+pub async fn daemon_listening_status() -> Result<AudioPipelineStatus, String> {
+    let trace_id = dashboard_trace_id();
+    daemon_listening_status_with_trace_to_addr(&trace_id, &daemon_addr()).await
+}
+
+/// Run Bluey's fixed-duration, local-only onboarding audio check.
+#[tauri::command]
+pub async fn run_audio_readiness_probe() -> Result<AudioReadinessProbeResult, String> {
+    let response = daemon_ipc(DaemonRequest::AudioReadinessProbe)
+        .await
+        .map_err(|message| public_audio_readiness_failure(&message))?;
+    match response {
+        DaemonResponse::AudioReadiness { result } => Ok(result),
+        DaemonResponse::Error { message } => Err(public_audio_readiness_failure(&message)),
+        _ => Err(public_audio_readiness_failure("unexpected response")),
+    }
+}
+
+fn public_audio_readiness_failure(message: &str) -> String {
+    let lowercase = message.to_ascii_lowercase();
+    if lowercase.contains("already running")
+        || lowercase.contains("audio is active")
+        || lowercase.contains("session is ending")
+    {
+        tracing::warn!(
+            error_length = message.len(),
+            "audio readiness check blocked by active local audio"
+        );
+        "Audio is active. Finish the listening session, then run the check again.".to_string()
+    } else {
+        public_audio_failure("run audio readiness check", message)
+    }
+}
+
+/// Toggle real dual-source audio capture and return the resulting pipeline status.
+#[tauri::command]
+pub async fn daemon_toggle_listening(
+    db: State<'_, DbState>,
+    app: AppHandle,
+) -> Result<AudioPipelineStatus, String> {
+    let trace_id = dashboard_trace_id();
+    let mic_device_id = load_mic_device_from_settings(&db);
+    let result =
+        daemon_toggle_listening_with_trace_to_addr(mic_device_id, &trace_id, &daemon_addr()).await;
+
+    match result {
+        Ok(status) => {
+            let _ = app.emit("audio_pipeline_status", &status);
+            Ok(status)
+        }
+        Err(error) => {
+            let _ = app.emit("audio_pipeline_error", &error);
+            Err(error)
+        }
+    }
+}
+
+/// End the meeting and audio pipeline atomically in the daemon, then refresh status.
+#[tauri::command]
+pub async fn daemon_end_session(app: AppHandle) -> Result<EndSessionPayload, String> {
+    let trace_id = dashboard_trace_id();
+    let result = daemon_end_session_with_trace_to_addr(&trace_id, &daemon_addr()).await;
+
+    match result {
+        Ok(payload) => {
+            if let Some(status) = &payload.audio_status {
+                let _ = app.emit("audio_pipeline_status", status);
+            }
+            let _ = app.emit("live_session_ended", &payload.message);
+            Ok(payload)
+        }
+        Err(error) => {
+            let _ = app.emit("audio_pipeline_error", &error);
+            Err(error)
+        }
     }
 }
 
@@ -722,13 +1140,7 @@ pub async fn daemon_set_push_to_talk(db: State<'_, DbState>) -> Result<String, S
     // Toggle audio: if audio is active, stop it; otherwise start mic-only.
     let status = daemon_ipc_with_trace(DaemonRequest::AudioStatus, &trace_id).await?;
     let is_active = match &status {
-        DaemonResponse::AudioStatus { status } => {
-            status.session_id.is_some()
-                && !matches!(
-                    status.capture.state,
-                    cue_core::AudioCaptureState::Stopped | cue_core::AudioCaptureState::Failed
-                )
-        }
+        DaemonResponse::AudioStatus { status } => audio_pipeline_is_active(status),
         _ => false,
     };
     let resp = if is_active {
@@ -761,6 +1173,665 @@ pub async fn daemon_toggle_overlay() -> Result<String, String> {
         DaemonResponse::Error { message } => Err(message),
         _ => Ok("ok".to_string()),
     }
+}
+
+/// Return the active meeting's assistant profile.
+///
+/// The daemon owns validation and persistence so every dashboard window sees
+/// the same effective mode and grounding fields.
+#[tauri::command]
+pub async fn get_assistant_profile() -> Result<AssistantProfile, String> {
+    match daemon_ipc(DaemonRequest::AssistantProfileGet).await? {
+        DaemonResponse::AssistantProfile { profile } => Ok(profile),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected daemon response".to_string()),
+    }
+}
+
+/// Validate and save the active meeting's assistant profile.
+#[tauri::command]
+pub async fn save_assistant_profile(profile: AssistantProfile) -> Result<AssistantProfile, String> {
+    match daemon_ipc(DaemonRequest::AssistantProfileSet { profile }).await? {
+        DaemonResponse::AssistantProfile { profile } => Ok(profile),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected daemon response".to_string()),
+    }
+}
+
+/// Typed workspace bridge. These commands deliberately preserve the daemon's
+/// tagged response shape so the UI and local IPC share one exact contract.
+#[tauri::command]
+pub async fn workspace_list() -> Result<DaemonResponse, String> {
+    match daemon_ipc(DaemonRequest::WorkspaceList).await? {
+        response @ DaemonResponse::WorkspaceList { .. } => Ok(response),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected workspace_list response".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn workspace_get(workspace_id: Uuid) -> Result<DaemonResponse, String> {
+    match daemon_ipc(DaemonRequest::WorkspaceGet { workspace_id }).await? {
+        response @ DaemonResponse::Workspace { .. } => Ok(response),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected workspace_get response".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn workspace_create(
+    request: cue_core::WorkspaceCreateRequest,
+) -> Result<DaemonResponse, String> {
+    match daemon_ipc(DaemonRequest::WorkspaceCreate { request }).await? {
+        response @ DaemonResponse::Workspace { .. } => Ok(response),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected workspace_create response".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn workspace_update(
+    request: cue_core::WorkspaceUpdateRequest,
+) -> Result<DaemonResponse, String> {
+    match daemon_ipc(DaemonRequest::WorkspaceUpdate { request }).await? {
+        response @ DaemonResponse::Workspace { .. } => Ok(response),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected workspace_update response".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn workspace_activate(workspace_id: Uuid) -> Result<DaemonResponse, String> {
+    match daemon_ipc(DaemonRequest::WorkspaceActivate { workspace_id }).await? {
+        response @ DaemonResponse::Workspace { .. } => Ok(response),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected workspace_activate response".to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn workspace_delete(
+    workspace_id: Uuid,
+    expected_revision: u64,
+) -> Result<DaemonResponse, String> {
+    match daemon_ipc(DaemonRequest::WorkspaceDelete {
+        workspace_id,
+        expected_revision,
+    })
+    .await?
+    {
+        response @ DaemonResponse::WorkspaceDeleted { .. } => Ok(response),
+        DaemonResponse::Error { message } => Err(message),
+        _ => Err("unexpected workspace_delete response".to_string()),
+    }
+}
+
+const MAX_SCREENSHOT_PREVIEW_BYTES: u64 = 25 * 1024 * 1024;
+const MAX_SCREENSHOT_EDGE_PX: u32 = 12_000;
+const MAX_SCREENSHOT_PIXELS: u64 = 80_000_000;
+const MAX_SCREENSHOT_TITLE_CHARS: usize = 160;
+const MAX_SCREENSHOT_BINDING_BYTES: u64 = 16 * 1024;
+const SCREENSHOT_PREVIEW_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAX_SCREENSHOT_CLEANUP_SCAN: usize = 256;
+const MAX_SCREENSHOT_CLEANUP_REMOVALS: usize = 32;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScreenshotConsentBinding {
+    schema_version: u8,
+    operation_id: Uuid,
+    expected_owner_account_id: Option<String>,
+    expected_session_id: Option<Uuid>,
+    created_at: String,
+    preview_path: String,
+    preview_sha256: String,
+    retained_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenshotPreviewPayload {
+    pub operation_id: Uuid,
+    pub path: String,
+    pub file_size_bytes: u64,
+    pub width_px: u32,
+    pub height_px: u32,
+    pub created_at: String,
+    pub capture_kind: String,
+}
+
+/// Capture a private local preview. This command does not attach or upload it.
+#[tauri::command]
+pub async fn capture_screenshot_preview(
+    full_screen: bool,
+) -> Result<ScreenshotPreviewPayload, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|error| error.to_string())?;
+    paths.ensure().map_err(|error| error.to_string())?;
+    let preview_dir = screenshot_preview_dir(&paths);
+    let binding_dir = screenshot_binding_dir(&paths);
+    cue_core::app_paths::create_private_dir(&preview_dir).map_err(|error| error.to_string())?;
+    cue_core::app_paths::create_private_dir(&binding_dir).map_err(|error| error.to_string())?;
+    cleanup_stale_screenshot_previews(&paths);
+
+    let (expected_owner_account_id, expected_session_id) =
+        match daemon_ipc(DaemonRequest::ScreenshotContextDestination).await? {
+            DaemonResponse::ScreenshotContextDestination {
+                owner_account_id,
+                session_id,
+            } => (owner_account_id, session_id),
+            DaemonResponse::Error { message } => return Err(message),
+            _ => return Err("Bluey could not bind the screenshot destination.".to_string()),
+        };
+
+    let created_at = cue_core::clock::now_epoch_ms_string();
+    let operation_id = Uuid::new_v4();
+    let path = preview_dir.join(format!(
+        "preview-{created_at}-{}.png",
+        operation_id.simple()
+    ));
+    let path_for_capture = path.clone();
+    let capture_kind = tokio::task::spawn_blocking(move || {
+        capture_screenshot_platform(&path_for_capture, full_screen)
+    })
+    .await
+    .map_err(|_| "Screenshot capture task stopped unexpectedly.".to_string())??;
+
+    let (bytes, file_size_bytes, width_px, height_px) = match read_validated_png(&path) {
+        Ok(details) => details,
+        Err(error) => {
+            let _ = fs::remove_file(&path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = set_private_capture_permissions(&path) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+
+    let retained_path = paths
+        .data_dir
+        .join("captures")
+        .join(format!("screenshot-{}.png", operation_id.simple()));
+    let binding = ScreenshotConsentBinding {
+        schema_version: 1,
+        operation_id,
+        expected_owner_account_id,
+        expected_session_id,
+        created_at: created_at.clone(),
+        preview_path: path.display().to_string(),
+        preview_sha256: cue_core::jobs_handoff::sha256_hex(&bytes),
+        retained_path: retained_path.display().to_string(),
+    };
+    if let Err(error) = write_screenshot_binding(&paths, &binding) {
+        let _ = fs::remove_file(&path);
+        return Err(error);
+    }
+
+    Ok(ScreenshotPreviewPayload {
+        operation_id,
+        path: path.display().to_string(),
+        file_size_bytes,
+        width_px,
+        height_px,
+        created_at,
+        capture_kind: capture_kind.to_string(),
+    })
+}
+
+/// Copy an approved preview into a deterministic retained path, then ask the
+/// daemon to commit it exactly once to the capture-bound account/session.
+#[tauri::command]
+pub async fn attach_screenshot_preview(
+    operation_id: Uuid,
+    title: String,
+) -> Result<cue_core::ScreenshotContextAttachReceipt, String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|error| error.to_string())?;
+    paths.ensure().map_err(|error| error.to_string())?;
+    let binding = load_screenshot_binding(&paths, operation_id)?;
+    let title = normalize_screenshot_title(&title)?;
+    let (bytes, _, _, _) = read_bound_screenshot_preview(&paths, &binding)?;
+
+    let retained_dir = paths.data_dir.join("captures");
+    cue_core::app_paths::create_private_dir(&retained_dir).map_err(|error| error.to_string())?;
+    let retained_path = validated_bound_retained_path(&paths, &binding)?;
+    ensure_retained_screenshot_copy(&retained_path, &bytes, &binding.preview_sha256)?;
+
+    let request = cue_core::ScreenshotContextAttachRequest {
+        operation_id,
+        expected_owner_account_id: binding.expected_owner_account_id.clone(),
+        expected_session_id: binding.expected_session_id,
+        retained_path: retained_path.display().to_string(),
+        content_sha256: binding.preview_sha256.clone(),
+        title,
+    };
+    let response = daemon_ipc(DaemonRequest::ScreenshotContextAttach { request }).await;
+
+    match response {
+        Ok(DaemonResponse::ScreenshotContextAttached { receipt })
+            if receipt.operation_id == operation_id
+                && receipt.artifact.id == operation_id
+                && receipt.artifact.integrity_sha256.as_deref()
+                    == Some(binding.preview_sha256.as_str()) =>
+        {
+            remove_confirmed_screenshot_preview(&paths, &binding);
+            Ok(receipt)
+        }
+        Ok(DaemonResponse::Error { message }) => Err(message),
+        Ok(_) => Err(
+            "Bluey returned an unreadable screenshot receipt. The retained copy was preserved for safe retry."
+                .to_string(),
+        ),
+        Err(_) => Err(
+            "Bluey could not confirm whether the screenshot was attached. Its private copies were preserved; retry Attach to reconcile safely."
+                .to_string(),
+        ),
+    }
+}
+
+/// Delete an unapproved local preview. Attached context is outside this
+/// command's path boundary and cannot be deleted here.
+#[tauri::command]
+pub fn discard_screenshot_preview(operation_id: Uuid) -> Result<(), String> {
+    let paths = cue_core::app_paths::AppPaths::discover().map_err(|error| error.to_string())?;
+    let binding = load_screenshot_binding(&paths, operation_id)?;
+    discard_bound_screenshot_preview(&paths, &binding)
+}
+
+fn discard_bound_screenshot_preview(
+    paths: &cue_core::app_paths::AppPaths,
+    binding: &ScreenshotConsentBinding,
+) -> Result<(), String> {
+    let preview_path = validated_bound_preview_path(paths, binding)?;
+    fs::remove_file(&preview_path)
+        .map_err(|_| "Bluey could not discard the screenshot preview.".to_string())?;
+    remove_binding_file(paths, binding.operation_id)
+}
+
+fn screenshot_preview_dir(paths: &cue_core::app_paths::AppPaths) -> PathBuf {
+    paths.data_dir.join("capture-previews")
+}
+
+fn screenshot_binding_dir(paths: &cue_core::app_paths::AppPaths) -> PathBuf {
+    paths.data_dir.join("screenshot-consent").join("bindings")
+}
+
+fn screenshot_binding_path(paths: &cue_core::app_paths::AppPaths, operation_id: Uuid) -> PathBuf {
+    screenshot_binding_dir(paths).join(format!("binding-{}.json", operation_id.simple()))
+}
+
+fn write_screenshot_binding(
+    paths: &cue_core::app_paths::AppPaths,
+    binding: &ScreenshotConsentBinding,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(binding)
+        .map_err(|_| "Bluey could not encode the screenshot consent record.".to_string())?;
+    write_private_new_file(
+        &screenshot_binding_path(paths, binding.operation_id),
+        &bytes,
+    )
+}
+
+fn load_screenshot_binding(
+    paths: &cue_core::app_paths::AppPaths,
+    operation_id: Uuid,
+) -> Result<ScreenshotConsentBinding, String> {
+    let path = screenshot_binding_path(paths, operation_id);
+    let bytes = read_regular_file_no_follow(&path, MAX_SCREENSHOT_BINDING_BYTES)
+        .map_err(|_| "Screenshot consent record is no longer available.".to_string())?;
+    let binding: ScreenshotConsentBinding = serde_json::from_slice(&bytes)
+        .map_err(|_| "Screenshot consent record could not be verified.".to_string())?;
+    if binding.schema_version != 1 || binding.operation_id != operation_id {
+        return Err("Screenshot consent record does not match this preview.".to_string());
+    }
+    Ok(binding)
+}
+
+fn validated_bound_preview_path(
+    paths: &cue_core::app_paths::AppPaths,
+    binding: &ScreenshotConsentBinding,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(&binding.preview_path);
+    let expected_name = format!(
+        "preview-{}-{}.png",
+        binding.created_at,
+        binding.operation_id.simple()
+    );
+    validate_exact_regular_child(&path, &screenshot_preview_dir(paths), &expected_name)
+        .map_err(|_| "Screenshot preview is outside Bluey's private preview area.".to_string())?;
+    Ok(path)
+}
+
+fn validated_bound_retained_path(
+    paths: &cue_core::app_paths::AppPaths,
+    binding: &ScreenshotConsentBinding,
+) -> Result<PathBuf, String> {
+    let path = PathBuf::from(&binding.retained_path);
+    let expected_name = format!("screenshot-{}.png", binding.operation_id.simple());
+    validate_exact_child_path(&path, &paths.data_dir.join("captures"), &expected_name).map_err(
+        |_| "Screenshot retained path is outside Bluey's private capture area.".to_string(),
+    )?;
+    Ok(path)
+}
+
+fn normalize_screenshot_title(value: &str) -> Result<String, String> {
+    let value = value
+        .chars()
+        .filter(|character| !character.is_control() || character.is_whitespace())
+        .collect::<String>();
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if value.is_empty() {
+        return Err("Screenshot title is required.".to_string());
+    }
+    if value.chars().count() > MAX_SCREENSHOT_TITLE_CHARS {
+        return Err(format!(
+            "Screenshot title must be {MAX_SCREENSHOT_TITLE_CHARS} characters or fewer."
+        ));
+    }
+    Ok(value)
+}
+
+fn read_bound_screenshot_preview(
+    paths: &cue_core::app_paths::AppPaths,
+    binding: &ScreenshotConsentBinding,
+) -> Result<(Vec<u8>, u64, u32, u32), String> {
+    let path = validated_bound_preview_path(paths, binding)?;
+    let details = read_validated_png(&path)?;
+    if cue_core::jobs_handoff::sha256_hex(&details.0) != binding.preview_sha256 {
+        return Err("Screenshot preview changed after consent review.".to_string());
+    }
+    Ok(details)
+}
+
+fn read_validated_png(path: &Path) -> Result<(Vec<u8>, u64, u32, u32), String> {
+    let bytes = read_regular_file_no_follow(path, MAX_SCREENSHOT_PREVIEW_BYTES)
+        .map_err(|_| "Screenshot preview could not be read safely.".to_string())?;
+    let file_size = bytes.len() as u64;
+    if !(24..=MAX_SCREENSHOT_PREVIEW_BYTES).contains(&file_size) {
+        return Err("Screenshot preview has an unsupported file size.".to_string());
+    }
+    if bytes.get(..8) != Some(b"\x89PNG\r\n\x1a\n") || bytes.get(12..16) != Some(b"IHDR") {
+        return Err("Screenshot preview is not a valid PNG image.".to_string());
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().expect("PNG width bytes"));
+    let height = u32::from_be_bytes(bytes[20..24].try_into().expect("PNG height bytes"));
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0
+        || height == 0
+        || width > MAX_SCREENSHOT_EDGE_PX
+        || height > MAX_SCREENSHOT_EDGE_PX
+        || pixels > MAX_SCREENSHOT_PIXELS
+    {
+        return Err("Screenshot preview dimensions are outside Bluey's safety limits.".to_string());
+    }
+    Ok((bytes, file_size, width, height))
+}
+
+fn ensure_retained_screenshot_copy(
+    path: &Path,
+    bytes: &[u8],
+    expected_sha256: &str,
+) -> Result<(), String> {
+    if path.exists() {
+        let existing = read_regular_file_no_follow(path, MAX_SCREENSHOT_PREVIEW_BYTES)
+            .map_err(|_| "Existing retained screenshot could not be verified.".to_string())?;
+        if cue_core::jobs_handoff::sha256_hex(&existing) != expected_sha256 {
+            return Err(
+                "Existing retained screenshot does not match the reviewed preview.".to_string(),
+            );
+        }
+        return Ok(());
+    }
+    write_private_new_file(path, bytes)?;
+    sync_parent_directory(path)?;
+    Ok(())
+}
+
+fn remove_confirmed_screenshot_preview(
+    paths: &cue_core::app_paths::AppPaths,
+    binding: &ScreenshotConsentBinding,
+) {
+    if let Ok(path) = validated_bound_preview_path(paths, binding) {
+        let _ = fs::remove_file(path);
+    }
+    let _ = remove_binding_file(paths, binding.operation_id);
+}
+
+fn remove_binding_file(
+    paths: &cue_core::app_paths::AppPaths,
+    operation_id: Uuid,
+) -> Result<(), String> {
+    fs::remove_file(screenshot_binding_path(paths, operation_id))
+        .map_err(|_| "Bluey could not remove the screenshot consent record.".to_string())
+}
+
+fn write_private_new_file(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "Bluey could not create a private screenshot record.".to_string())?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| "Bluey could not persist a private screenshot record.".to_string())?;
+    Ok(())
+}
+
+fn read_regular_file_no_follow(path: &Path, max_bytes: u64) -> Result<Vec<u8>, std::io::Error> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let mut file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a bounded regular file",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file exceeded bound while reading",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn validate_exact_regular_child(
+    path: &Path,
+    dir: &Path,
+    expected_name: &str,
+) -> std::io::Result<()> {
+    validate_exact_child_path(path, dir, expected_name)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "not a regular child file",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exact_child_path(path: &Path, dir: &Path, expected_name: &str) -> std::io::Result<()> {
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "unexpected file name",
+        ));
+    }
+    let path_parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "missing parent"))?;
+    if path_parent.canonicalize()? != dir.canonicalize()? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path outside allowed directory",
+        ));
+    }
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| "Screenshot path has no parent.".to_string())?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "Bluey could not durably retain the screenshot.".to_string())?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn cleanup_stale_screenshot_previews(paths: &cue_core::app_paths::AppPaths) {
+    let mut removed = 0usize;
+    let binding_dir = screenshot_binding_dir(paths);
+    if let Ok(entries) = fs::read_dir(&binding_dir) {
+        for entry in entries.flatten().take(MAX_SCREENSHOT_CLEANUP_SCAN) {
+            if removed >= MAX_SCREENSHOT_CLEANUP_REMOVALS || !is_stale_regular_file(&entry.path()) {
+                continue;
+            }
+            let valid_name = entry.file_name().to_str().is_some_and(|name| {
+                name.strip_prefix("binding-")
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .is_some_and(|id| {
+                        id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            });
+            if !valid_name {
+                continue;
+            }
+            if let Ok(bytes) =
+                read_regular_file_no_follow(&entry.path(), MAX_SCREENSHOT_BINDING_BYTES)
+            {
+                if let Ok(binding) = serde_json::from_slice::<ScreenshotConsentBinding>(&bytes) {
+                    if let Ok(preview) = validated_bound_preview_path(paths, &binding) {
+                        let _ = fs::remove_file(preview);
+                    }
+                }
+            }
+            if fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(screenshot_preview_dir(paths)) {
+        for entry in entries.flatten().take(MAX_SCREENSHOT_CLEANUP_SCAN) {
+            if removed >= MAX_SCREENSHOT_CLEANUP_REMOVALS || !is_stale_regular_file(&entry.path()) {
+                continue;
+            }
+            let valid_name = entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("preview-") && name.ends_with(".png") && name.len() <= 128
+            });
+            if valid_name && fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+}
+
+fn is_stale_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|elapsed| elapsed >= SCREENSHOT_PREVIEW_TTL)
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn capture_screenshot_platform(path: &Path, full_screen: bool) -> Result<&'static str, String> {
+    let mut command = Command::new("screencapture");
+    if full_screen {
+        command.arg("-x");
+    } else {
+        command.args(["-i", "-x"]);
+    }
+    let status = command
+        .arg(path)
+        .status()
+        .map_err(|_| "Bluey could not open the macOS screenshot tool.".to_string())?;
+    if !status.success() || !path.is_file() {
+        let _ = fs::remove_file(path);
+        return Err("Screenshot capture was cancelled or permission was denied.".to_string());
+    }
+    Ok(if full_screen {
+        "full_screen"
+    } else {
+        "selection"
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn capture_screenshot_platform(path: &Path, full_screen: bool) -> Result<&'static str, String> {
+    if !full_screen {
+        return Err(
+            "Region or window selection is not available on Windows yet; choose Full screen."
+                .to_string(),
+        );
+    }
+    let escaped = path.display().to_string().replace('\'', "''");
+    let script = format!(
+        "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds; $i=New-Object System.Drawing.Bitmap $b.Width,$b.Height; $g=[System.Drawing.Graphics]::FromImage($i); $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size); $i.Save('{escaped}',[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $i.Dispose()"
+    );
+    let status = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+        ])
+        .arg(script)
+        .status()
+        .map_err(|_| "Bluey could not open Windows screen capture.".to_string())?;
+    if !status.success() || !path.is_file() {
+        let _ = fs::remove_file(path);
+        return Err("Screenshot capture failed or permission was denied.".to_string());
+    }
+    Ok("full_screen")
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn capture_screenshot_platform(_path: &Path, _full_screen: bool) -> Result<&'static str, String> {
+    Err("Screenshot capture is currently available on macOS and Windows.".to_string())
+}
+
+fn set_private_capture_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|_| "Bluey could not protect the screenshot preview.".to_string())?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 /// Trigger an update check from the UI. Emits `update_available` or `update_not_available`.
@@ -825,7 +1896,7 @@ pub fn privacy_settings_command(source: &str) -> Result<(&'static str, Vec<Strin
     {
         let section = match source {
             "microphone" => "privacy-microphone",
-            _ => "privacy-microphone",
+            _ => "sound",
         };
         Ok((
             "cmd",
@@ -927,6 +1998,183 @@ pub fn set_llm_chain(providers: Vec<String>, db: State<DbState>) -> Result<(), S
 mod tests {
     use super::*;
 
+    fn screenshot_test_paths(base: &Path) -> cue_core::app_paths::AppPaths {
+        cue_core::app_paths::AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        }
+    }
+
+    fn write_test_png(path: &Path, width: u32, height: u32) {
+        let mut bytes = Vec::from(&b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"[..]);
+        bytes.extend_from_slice(&width.to_be_bytes());
+        bytes.extend_from_slice(&height.to_be_bytes());
+        fs::write(path, bytes).expect("write test PNG header");
+    }
+
+    #[test]
+    fn screenshot_preview_validation_enforces_owned_path_png_and_dimensions() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-dashboard-screenshot-test-{}",
+            Uuid::new_v4()
+        ));
+        let paths = screenshot_test_paths(&base);
+        paths.ensure().expect("ensure paths");
+        let preview_dir = screenshot_preview_dir(&paths);
+        cue_core::app_paths::create_private_dir(&preview_dir).expect("preview dir");
+        let operation_id = Uuid::new_v4();
+        let created_at = "12345";
+        let preview = preview_dir.join(format!(
+            "preview-{created_at}-{}.png",
+            operation_id.simple()
+        ));
+        write_test_png(&preview, 1920, 1080);
+        let binding = ScreenshotConsentBinding {
+            schema_version: 1,
+            operation_id,
+            expected_owner_account_id: None,
+            expected_session_id: None,
+            created_at: created_at.to_string(),
+            preview_path: preview.display().to_string(),
+            preview_sha256: cue_core::jobs_handoff::sha256_hex(
+                &fs::read(&preview).expect("read PNG"),
+            ),
+            retained_path: paths
+                .data_dir
+                .join("captures")
+                .join(format!("screenshot-{}.png", operation_id.simple()))
+                .display()
+                .to_string(),
+        };
+
+        let validated = validated_bound_preview_path(&paths, &binding).expect("owned preview path");
+        assert_eq!(validated, preview);
+        let (_, size, width, height) = read_validated_png(&preview).expect("valid PNG dimensions");
+        assert_eq!((size, width, height), (24, 1920, 1080));
+
+        let outside = base.join("preview-outside.png");
+        write_test_png(&outside, 100, 100);
+        let mut outside_binding = binding.clone();
+        outside_binding.preview_path = outside.display().to_string();
+        assert!(validated_bound_preview_path(&paths, &outside_binding).is_err());
+
+        write_test_png(&preview, MAX_SCREENSHOT_EDGE_PX + 1, 100);
+        assert!(read_validated_png(&preview).is_err());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn screenshot_title_is_required_bounded_and_single_line() {
+        assert_eq!(
+            normalize_screenshot_title("  Checkout\n failure   state  ").expect("title"),
+            "Checkout failure state"
+        );
+        assert!(normalize_screenshot_title(" \n ").is_err());
+        assert!(normalize_screenshot_title(&"x".repeat(MAX_SCREENSHOT_TITLE_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn discard_removes_only_preview_and_binding_never_retained_copy() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-dashboard-screenshot-discard-test-{}",
+            Uuid::new_v4()
+        ));
+        let paths = screenshot_test_paths(&base);
+        paths.ensure().expect("ensure paths");
+        cue_core::app_paths::create_private_dir(&screenshot_preview_dir(&paths))
+            .expect("preview dir");
+        cue_core::app_paths::create_private_dir(&screenshot_binding_dir(&paths))
+            .expect("binding dir");
+        let capture_dir = paths.data_dir.join("captures");
+        cue_core::app_paths::create_private_dir(&capture_dir).expect("capture dir");
+        let operation_id = Uuid::new_v4();
+        let created_at = "12345";
+        let preview = screenshot_preview_dir(&paths).join(format!(
+            "preview-{created_at}-{}.png",
+            operation_id.simple()
+        ));
+        let retained = capture_dir.join(format!("screenshot-{}.png", operation_id.simple()));
+        write_test_png(&preview, 640, 480);
+        write_test_png(&retained, 640, 480);
+        let preview_bytes = fs::read(&preview).expect("preview bytes");
+        let binding = ScreenshotConsentBinding {
+            schema_version: 1,
+            operation_id,
+            expected_owner_account_id: None,
+            expected_session_id: None,
+            created_at: created_at.to_string(),
+            preview_path: preview.display().to_string(),
+            preview_sha256: cue_core::jobs_handoff::sha256_hex(&preview_bytes),
+            retained_path: retained.display().to_string(),
+        };
+        write_screenshot_binding(&paths, &binding).expect("binding");
+
+        discard_bound_screenshot_preview(&paths, &binding).expect("discard preview");
+
+        assert!(!preview.exists());
+        assert!(!screenshot_binding_path(&paths, operation_id).exists());
+        assert!(
+            retained.exists(),
+            "discard must not touch a possibly committed copy"
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    async fn spawn_fake_daemon(
+        responses: Vec<DaemonResponse>,
+    ) -> (String, tokio::task::JoinHandle<Vec<DaemonRequest>>) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::with_capacity(responses.len());
+            for response in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                requests.push(decode_test_wire_request(&line));
+
+                let response = serde_json::to_string(&response).unwrap();
+                writer.write_all(response.as_bytes()).await.unwrap();
+                writer.write_all(b"\n").await.unwrap();
+            }
+            requests
+        });
+        (addr, server)
+    }
+
+    fn decode_test_wire_request(line: &str) -> DaemonRequest {
+        match serde_json::from_str::<cue_core::DaemonWireRequest>(line.trim()).unwrap() {
+            cue_core::DaemonWireRequest::Authenticated(envelope) => envelope.request,
+            cue_core::DaemonWireRequest::Public(request) => request,
+        }
+    }
+
+    fn traced_inner(request: DaemonRequest, expected_trace_id: &str) -> DaemonRequest {
+        match request {
+            DaemonRequest::WithTrace { trace_id, request } => {
+                assert_eq!(trace_id, expected_trace_id);
+                *request
+            }
+            other => panic!("dashboard request was not trace-wrapped: {other:?}"),
+        }
+    }
+
+    fn active_audio_status() -> AudioPipelineStatus {
+        let mut status = AudioPipelineStatus::idle();
+        status.session_id = Some("session-active".to_string());
+        status.capture.state = AudioCaptureState::Capturing;
+        status
+    }
+
     #[tokio::test]
     async fn daemon_ipc_wraps_dashboard_request_with_trace() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -952,7 +2200,7 @@ mod tests {
         assert!(matches!(response, DaemonResponse::Pong));
 
         let line = server.await.unwrap();
-        let request: DaemonRequest = serde_json::from_str(line.trim()).unwrap();
+        let request = decode_test_wire_request(&line);
         match request {
             DaemonRequest::WithTrace { trace_id, request } => {
                 assert_eq!(trace_id, "dashboard-smoke-trace");
@@ -960,6 +2208,479 @@ mod tests {
             }
             other => panic!("dashboard request was not trace-wrapped: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_reloads_once_only_for_typed_stale_boot() {
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::IpcAuthError {
+                code: cue_core::IpcAuthErrorCode::StaleBoot,
+            },
+            DaemonResponse::Pong,
+        ])
+        .await;
+
+        let response =
+            daemon_ipc_with_trace_to_addr(DaemonRequest::Status, "dashboard-stale-boot", &addr)
+                .await
+                .expect("stale boot retry");
+        assert!(matches!(response, DaemonResponse::Pong));
+        let requests = server.await.expect("fake daemon");
+        assert_eq!(requests.len(), 2);
+        assert!(requests.into_iter().all(|request| matches!(
+            traced_inner(request, "dashboard-stale-boot"),
+            DaemonRequest::Status
+        )));
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_rejects_auth_error_returned_after_stale_boot_retry() {
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::IpcAuthError {
+                code: cue_core::IpcAuthErrorCode::StaleBoot,
+            },
+            DaemonResponse::IpcAuthError {
+                code: cue_core::IpcAuthErrorCode::InvalidCredentials,
+            },
+        ])
+        .await;
+
+        let error =
+            daemon_ipc_with_trace_to_addr(DaemonRequest::Status, "dashboard-auth-error", &addr)
+                .await
+                .unwrap_err();
+        assert!(error.contains("InvalidCredentials"));
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_starts_dual_source_audio_with_saved_mic() {
+        let idle = AudioPipelineStatus::idle();
+        let started = active_audio_status();
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::AudioStatus { status: idle },
+            DaemonResponse::AudioStatus {
+                status: started.clone(),
+            },
+        ])
+        .await;
+
+        let result = daemon_toggle_listening_with_trace_to_addr(
+            Some("saved-mic-id".to_string()),
+            "listen-start-trace",
+            &addr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, started);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "listen-start-trace"),
+            DaemonRequest::AudioStatus
+        ));
+        match traced_inner(requests[1].clone(), "listen-start-trace") {
+            DaemonRequest::AudioStart {
+                enable_system,
+                enable_microphone,
+                mic_device_id,
+            } => {
+                assert!(enable_system);
+                assert!(enable_microphone);
+                assert_eq!(mic_device_id.as_deref(), Some("saved-mic-id"));
+            }
+            other => panic!("expected dual-source audio start, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_stops_active_audio() {
+        let active = active_audio_status();
+        let mut stopped = active.clone();
+        stopped.capture.state = AudioCaptureState::Stopped;
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::AudioStatus { status: active },
+            DaemonResponse::AudioStatus {
+                status: stopped.clone(),
+            },
+        ])
+        .await;
+
+        let result = daemon_toggle_listening_with_trace_to_addr(
+            Some("unused-mic-id".to_string()),
+            "listen-stop-trace",
+            &addr,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, stopped);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "listen-stop-trace"),
+            DaemonRequest::AudioStatus
+        ));
+        assert!(matches!(
+            traced_inner(requests[1].clone(), "listen-stop-trace"),
+            DaemonRequest::AudioStop
+        ));
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_stops_starting_audio_without_session_id() {
+        let mut starting = AudioPipelineStatus::idle();
+        starting.capture.state = AudioCaptureState::Starting;
+        assert!(starting.session_id.is_none());
+        let mut stopped = starting.clone();
+        stopped.capture.state = AudioCaptureState::Stopped;
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::AudioStatus { status: starting },
+            DaemonResponse::AudioStatus {
+                status: stopped.clone(),
+            },
+        ])
+        .await;
+
+        let result =
+            daemon_toggle_listening_with_trace_to_addr(None, "listen-cancel-start-trace", &addr)
+                .await
+                .unwrap();
+        assert_eq!(result, stopped);
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "listen-cancel-start-trace"),
+            DaemonRequest::AudioStatus
+        ));
+        assert!(matches!(
+            traced_inner(requests[1].clone(), "listen-cancel-start-trace"),
+            DaemonRequest::AudioStop
+        ));
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_cleans_up_active_partial_source_start() {
+        let mut partial = active_audio_status();
+        partial.config.system.enabled = false;
+        let mut stopped = partial.clone();
+        stopped.capture.state = AudioCaptureState::Stopped;
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::AudioStatus {
+                status: AudioPipelineStatus::idle(),
+            },
+            DaemonResponse::AudioStatus { status: partial },
+            DaemonResponse::AudioStatus { status: stopped },
+        ])
+        .await;
+
+        let error = daemon_toggle_listening_with_trace_to_addr(
+            Some("saved-mic-id".to_string()),
+            "listen-partial-trace",
+            &addr,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("both audio sources"));
+        assert!(!error.contains("saved-mic-id"));
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "listen-partial-trace"),
+            DaemonRequest::AudioStatus
+        ));
+        assert!(matches!(
+            traced_inner(requests[1].clone(), "listen-partial-trace"),
+            DaemonRequest::AudioStart {
+                enable_system: true,
+                enable_microphone: true,
+                mic_device_id: Some(ref id),
+            } if id == "saved-mic-id"
+        ));
+        assert!(matches!(
+            traced_inner(requests[2].clone(), "listen-partial-trace"),
+            DaemonRequest::AudioStop
+        ));
+    }
+
+    #[tokio::test]
+    async fn listening_status_surfaces_daemon_error() {
+        let (addr, server) = spawn_fake_daemon(vec![DaemonResponse::Error {
+            message: "audio backend unavailable".to_string(),
+        }])
+        .await;
+
+        let error = daemon_listening_status_with_trace_to_addr("listen-error-trace", &addr)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "A required audio source is unavailable. Check audio settings and try again."
+        );
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "listen-error-trace"),
+            DaemonRequest::AudioStatus
+        ));
+    }
+
+    #[tokio::test]
+    async fn listening_toggle_surfaces_unexpected_operation_response() {
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::AudioStatus {
+                status: AudioPipelineStatus::idle(),
+            },
+            DaemonResponse::Ok,
+        ])
+        .await;
+
+        let error =
+            daemon_toggle_listening_with_trace_to_addr(None, "listen-unexpected-trace", &addr)
+                .await
+                .unwrap_err();
+        assert_eq!(error, "Bluey couldn't update the live session. Try again.");
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "listen-unexpected-trace"),
+            DaemonRequest::AudioStatus
+        ));
+        assert!(matches!(
+            traced_inner(requests[1].clone(), "listen-unexpected-trace"),
+            DaemonRequest::AudioStart {
+                enable_system: true,
+                enable_microphone: true,
+                mic_device_id: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_times_out_on_half_open_response() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            line
+        });
+
+        let error = daemon_ipc_with_trace_to_addr_timeout(
+            DaemonRequest::Ping,
+            "timeout-trace",
+            &addr,
+            Duration::from_millis(15),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, DAEMON_IPC_TIMEOUT_ERROR);
+        assert_eq!(
+            public_audio_error(&error),
+            "Bluey took too long to respond. Try again."
+        );
+
+        let line = server.await.unwrap();
+        let request = decode_test_wire_request(&line);
+        assert!(matches!(
+            traced_inner(request, "timeout-trace"),
+            DaemonRequest::Ping
+        ));
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_refuses_non_loopback_destination_before_connecting() {
+        let error = daemon_ipc_with_trace_to_addr(
+            DaemonRequest::Ping,
+            "non-loopback-trace",
+            "192.0.2.10:57321",
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("non-loopback"));
+    }
+
+    #[tokio::test]
+    async fn daemon_ipc_rejects_oversized_response() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let oversized = vec![b'x'; cue_core::ipc_auth::IPC_MAX_RESPONSE_BYTES + 1];
+            let _ = writer.write_all(&oversized).await;
+        });
+
+        let error = daemon_ipc_with_trace_to_addr_timeout(
+            DaemonRequest::Ping,
+            "oversized-response-trace",
+            &addr,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "daemon response exceeds IPC size limit");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn end_session_returns_content_free_payload_and_traced_status() {
+        let stopped = AudioPipelineStatus::idle();
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::Text {
+                text: "private transcript summary".to_string(),
+            },
+            DaemonResponse::AudioStatus {
+                status: stopped.clone(),
+            },
+        ])
+        .await;
+
+        let payload = daemon_end_session_with_trace_to_addr("end-session-trace", &addr)
+            .await
+            .unwrap();
+        assert_eq!(payload.message, "Session ended.");
+        assert_eq!(payload.audio_status, Some(stopped));
+        assert!(!payload.message.contains("private transcript"));
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "end-session-trace"),
+            DaemonRequest::MeetingEnd
+        ));
+        assert!(matches!(
+            traced_inner(requests[1].clone(), "end-session-trace"),
+            DaemonRequest::AudioStatus
+        ));
+    }
+
+    #[tokio::test]
+    async fn end_session_stays_successful_when_status_refresh_fails() {
+        let (addr, server) = spawn_fake_daemon(vec![
+            DaemonResponse::Ok,
+            DaemonResponse::Error {
+                message:
+                    "token TEST_TOKEN_PRIVATE at /Users/example/private https://internal.invalid"
+                        .to_string(),
+            },
+        ])
+        .await;
+
+        let payload = daemon_end_session_with_trace_to_addr("end-refresh-trace", &addr)
+            .await
+            .unwrap();
+        assert_eq!(payload.message, "Session ended.");
+        assert!(payload.audio_status.is_none());
+
+        let requests = server.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(matches!(
+            traced_inner(requests[0].clone(), "end-refresh-trace"),
+            DaemonRequest::MeetingEnd
+        ));
+        assert!(matches!(
+            traced_inner(requests[1].clone(), "end-refresh-trace"),
+            DaemonRequest::AudioStatus
+        ));
+    }
+
+    #[test]
+    fn audio_errors_are_classified_without_exposing_sensitive_details() {
+        assert_eq!(
+            classify_audio_error("microphone permission denied"),
+            PublicAudioErrorKind::Permission
+        );
+        assert_eq!(
+            classify_audio_error("authentication required"),
+            PublicAudioErrorKind::SignIn
+        );
+        assert_eq!(
+            classify_audio_error("system audio helper crashed"),
+            PublicAudioErrorKind::Source
+        );
+        assert_eq!(
+            classify_audio_error("operation timed out"),
+            PublicAudioErrorKind::Timeout
+        );
+        assert_eq!(
+            classify_audio_error("connection refused"),
+            PublicAudioErrorKind::Unavailable
+        );
+        assert_eq!(
+            classify_audio_error("unclassified internal failure"),
+            PublicAudioErrorKind::Generic
+        );
+
+        let raw =
+            "unauthorized bearer TEST_TOKEN_PRIVATE at /Users/example/secret from https://api.invalid";
+        let public = public_audio_error(raw);
+        assert_eq!(public, "Sign in to Bluey to start listening.");
+        for sensitive in ["TEST_TOKEN_PRIVATE", "/Users/example", "https://", "bearer"] {
+            assert!(!public
+                .to_ascii_lowercase()
+                .contains(&sensitive.to_ascii_lowercase()));
+        }
+    }
+
+    #[test]
+    fn failed_audio_status_redacts_all_renderer_error_fields() {
+        let mut status = AudioPipelineStatus::idle();
+        status.capture.state = AudioCaptureState::Failed;
+        status.capture.last_error =
+            Some("permission denied /Users/example/secret https://private.invalid".to_string());
+        status.capture.system.last_error =
+            Some("system audio helper token TEST_TOKEN_SYSTEM at /tmp/helper".to_string());
+        status.capture.microphone.last_error =
+            Some("microphone timeout at https://private.invalid".to_string());
+        status.note = Some("opaque failure TEST_TOKEN_NOTE at /Users/example/note".to_string());
+
+        let sanitized = sanitize_audio_pipeline_status(status);
+        assert!(sanitized.capture.last_error.is_some());
+        assert!(sanitized.capture.system.last_error.is_some());
+        assert!(sanitized.capture.microphone.last_error.is_some());
+        assert!(sanitized.note.is_some());
+        let json = serde_json::to_string(&sanitized).unwrap();
+        for sensitive in [
+            "TEST_TOKEN_SYSTEM",
+            "TEST_TOKEN_NOTE",
+            "/Users/example",
+            "/tmp/",
+            "https://",
+        ] {
+            assert!(!json.contains(sensitive));
+        }
+    }
+
+    #[test]
+    fn listening_shortcut_default_and_label_share_one_accelerator() {
+        let default = default_keybinds()
+            .into_iter()
+            .find(|(action, _)| *action == "toggle_listening")
+            .unwrap()
+            .1;
+        assert_eq!(default, DEFAULT_LISTENING_SHORTCUT);
+        #[cfg(target_os = "macos")]
+        assert_eq!(listening_shortcut_label(default), "⌃⌥L");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(listening_shortcut_label(default), "Ctrl+Alt+L");
     }
 
     #[test]
@@ -1037,7 +2758,7 @@ mod tests {
             #[cfg(target_os = "windows")]
             {
                 assert_eq!(program, "cmd");
-                assert!(args.contains(&"ms-settings:privacy-microphone".to_string()));
+                assert!(args.contains(&"ms-settings:sound".to_string()));
             }
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -1254,6 +2975,10 @@ pub fn get_mouse_passthrough(db: State<DbState>) -> Result<bool, String> {
 
 // ===== Phase 3 Round 9: User-Rebindable Keybinds =====
 
+pub(crate) const DEFAULT_LISTENING_SHORTCUT: &str = "Ctrl+Alt+L";
+
+pub struct ListeningShortcutState(pub String);
+
 /// A keybind entry returned to the frontend.
 #[derive(Clone, Serialize)]
 pub struct KeybindEntry {
@@ -1265,19 +2990,79 @@ pub struct KeybindEntry {
 fn default_keybinds() -> Vec<(&'static str, &'static str)> {
     if cfg!(target_os = "macos") {
         vec![
-            ("toggle_listening", "CmdOrCtrl+Shift+L"),
+            ("toggle_listening", DEFAULT_LISTENING_SHORTCUT),
             ("push_to_talk", "CmdOrCtrl+Shift+P"),
             ("toggle_overlay", "CmdOrCtrl+Shift+H"),
             ("toggle_dashboard", "CmdOrCtrl+Shift+D"),
         ]
     } else {
         vec![
-            ("toggle_listening", "Ctrl+Shift+L"),
+            ("toggle_listening", DEFAULT_LISTENING_SHORTCUT),
             ("push_to_talk", "Ctrl+Shift+P"),
             ("toggle_overlay", "Ctrl+Shift+H"),
             ("toggle_dashboard", "Ctrl+Shift+D"),
         ]
     }
+}
+
+pub(crate) fn listening_shortcut_accelerator(db_state: &DbState) -> String {
+    let candidate = db_state.0.lock().ok().and_then(|db| {
+        if let Err(error) = db.ensure_keybinds_table() {
+            tracing::warn!(%error, "failed to prepare listening shortcut settings");
+            return None;
+        }
+        match db.load_keybind("toggle_listening") {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, "failed to load listening shortcut");
+                None
+            }
+        }
+    });
+
+    candidate
+        .filter(|accelerator| {
+            accelerator
+                .parse::<tauri_plugin_global_shortcut::Shortcut>()
+                .is_ok()
+        })
+        .unwrap_or_else(|| DEFAULT_LISTENING_SHORTCUT.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn listening_shortcut_label(accelerator: &str) -> String {
+    accelerator
+        .split('+')
+        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => "⌃".to_string(),
+            "alt" | "option" => "⌥".to_string(),
+            "shift" => "⇧".to_string(),
+            "cmd" | "command" | "meta" | "super" | "cmdorctrl" => "⌘".to_string(),
+            _ => part.trim().to_ascii_uppercase(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn listening_shortcut_label(accelerator: &str) -> String {
+    accelerator
+        .split('+')
+        .map(|part| {
+            if part.trim().eq_ignore_ascii_case("cmdorctrl") {
+                "Ctrl".to_string()
+            } else {
+                part.trim().to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
+/// Return the startup listening shortcut as a platform-friendly display label.
+#[tauri::command]
+pub fn get_listening_shortcut(shortcut: State<ListeningShortcutState>) -> String {
+    listening_shortcut_label(&shortcut.0)
 }
 
 /// List all keybinds (from DB, falling back to defaults).
@@ -1300,6 +3085,7 @@ pub fn list_keybinds(db: State<DbState>) -> Result<Vec<KeybindEntry>, String> {
 }
 
 /// Set a keybind for an action. Validates the accelerator string.
+/// A changed listening shortcut takes effect after Bluey restarts.
 #[tauri::command]
 pub fn set_keybind(action: String, accelerator: String, db: State<DbState>) -> Result<(), String> {
     // Validate accelerator by attempting to parse
@@ -1707,6 +3493,10 @@ pub async fn request_cue(
         .ok_or_else(|| "no active session".to_string())?;
 
     let session_id = meeting.id.to_string();
+    let session_instructions = cue_daemon::app::merge_answer_instructions(
+        cue_daemon::app::assistant_profile_instructions(&meeting.assistant_profile),
+        meeting.answer_instructions.clone(),
+    );
 
     // Recent transcript text (last ~30s worth, approx last 10 segments).
     let recent: String = meeting
@@ -1758,15 +3548,15 @@ pub async fn request_cue(
             recent.clone()
         };
         let system_prompt = if is_question {
-            answer_mod::SYSTEM_PROMPT
+            answer_mod::system_prompt_with_instructions(session_instructions.as_deref())
         } else {
-            suggest_mod::SYSTEM_PROMPT
+            suggest_mod::system_prompt_with_instructions(session_instructions.as_deref())
         };
         let kind_str = if is_question { "answer" } else { "suggestion" };
         if let Some((text, response_metadata)) = try_speculative_dispatch(
             &user_text,
             &session_id,
-            system_prompt,
+            &system_prompt,
             kind_str,
             &response_id,
             classification,
@@ -1810,66 +3600,78 @@ pub async fn request_cue(
         let app2 = app.clone();
         let rid = response_id.clone();
         AnswerLlm
-            .run_streaming(question, &session_id, llm.as_ref(), |partial, finished| {
-                let meta_for_chunk =
-                    if !emitted_meta_a.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        Some(router_meta_a.clone())
-                    } else {
-                        None
-                    };
-                let _ = app2.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
-                        response_id: rid.clone(),
-                        kind: "answer".to_string(),
-                        partial_text: partial.to_string(),
-                        finished,
-                        cost_cents: None,
-                        balance_cents_after: None,
-                        provider: None,
-                        model: None,
-                        cost_label: None,
-                        artifact_type: None,
-                        artifact_body: None,
-                        artifact_confidence: None,
-                        router_meta: meta_for_chunk,
-                        replace_body: None,
-                    },
-                );
-            })
+            .run_streaming_with_instructions(
+                question,
+                &session_id,
+                llm.as_ref(),
+                session_instructions.as_deref(),
+                |partial, finished| {
+                    let meta_for_chunk =
+                        if !emitted_meta_a.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            Some(router_meta_a.clone())
+                        } else {
+                            None
+                        };
+                    let _ = app2.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
+                            response_id: rid.clone(),
+                            kind: "answer".to_string(),
+                            partial_text: partial.to_string(),
+                            finished,
+                            cost_cents: None,
+                            balance_cents_after: None,
+                            provider: None,
+                            model: None,
+                            cost_label: None,
+                            artifact_type: None,
+                            artifact_body: None,
+                            artifact_confidence: None,
+                            router_meta: meta_for_chunk,
+                            replace_body: None,
+                        },
+                    );
+                },
+            )
             .await
             .map_err(|e| e.to_string())?
     } else {
         let app2 = app.clone();
         let rid = response_id.clone();
         WhatToAnswerLlm
-            .run_streaming(&recent, &session_id, llm.as_ref(), |partial, finished| {
-                let meta_for_chunk =
-                    if !emitted_meta_b.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        Some(router_meta_b.clone())
-                    } else {
-                        None
-                    };
-                let _ = app2.emit(
-                    "cue_response_chunk",
-                    CueResponseChunkPayload {
-                        response_id: rid.clone(),
-                        kind: "suggestion".to_string(),
-                        partial_text: partial.to_string(),
-                        finished,
-                        cost_cents: None,
-                        balance_cents_after: None,
-                        provider: None,
-                        model: None,
-                        cost_label: None,
-                        artifact_type: None,
-                        artifact_body: None,
-                        artifact_confidence: None,
-                        router_meta: meta_for_chunk,
-                        replace_body: None,
-                    },
-                );
-            })
+            .run_streaming_with_instructions(
+                &recent,
+                &session_id,
+                llm.as_ref(),
+                session_instructions.as_deref(),
+                |partial, finished| {
+                    let meta_for_chunk =
+                        if !emitted_meta_b.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            Some(router_meta_b.clone())
+                        } else {
+                            None
+                        };
+                    let _ = app2.emit(
+                        "cue_response_chunk",
+                        CueResponseChunkPayload {
+                            response_id: rid.clone(),
+                            kind: "suggestion".to_string(),
+                            partial_text: partial.to_string(),
+                            finished,
+                            cost_cents: None,
+                            balance_cents_after: None,
+                            provider: None,
+                            model: None,
+                            cost_label: None,
+                            artifact_type: None,
+                            artifact_body: None,
+                            artifact_confidence: None,
+                            router_meta: meta_for_chunk,
+                            replace_body: None,
+                        },
+                    );
+                },
+            )
             .await
             .map_err(|e| e.to_string())?
     };

@@ -1,123 +1,174 @@
-# Bluey Windows Paid Alpha Readiness
+# Bluey Windows paid-alpha readiness
 
-This is the Windows parallel track for Bluey. It does not change the first
-100 paid user architecture: Windows uses the same `bluey.sh` account, billing,
-provider routing, release, support, and storage systems as macOS. There is no
-separate backend for Windows.
+Status: **not yet production-ready for Windows**. The current tree implements
+the core Windows architecture and passes host-side static checks, but a paid
+Windows release remains blocked on Authenticode publisher trust and real
+Windows 10/11 canaries.
 
-Windows is not a blocker for a macOS-only first paid alpha. If we invite any
-paid Windows users, this document becomes a P0 launch gate.
+This is the Windows parallel track for the same Bluey account, billing,
+provider-routing, release, support, and storage systems used on macOS. There is
+no separate Windows backend.
 
-## Product Decision
+## Product boundary
 
-Use a native Windows overlay, following the same shape as Pinky:
+Bluey is a terminal product with a background daemon and small native helpers:
 
-- Win32 HWNDs for native windowing and input.
-- Direct2D/DirectWrite for sharp overlay text and rounded geometry.
-- `SetWindowDisplayAffinity(..., WDA_EXCLUDEFROMCAPTURE)` for normal screen
-  capture exclusion, with the documented Windows limitations.
-- WASAPI for microphone and system-loopback audio capture.
-- No Electron, WebView, WPF, .NET, Wails, or Fyne for the overlay surface.
-
-Reason: the product is an always-on overlay. Native Win32 keeps startup fast,
-keeps capture hiding under our control, avoids a large runtime, and matches the
-platform-specific approach already used by the macOS Swift/AppKit overlay.
-
-## Current State
-
-Existing Windows pieces:
-
-- Native overlay helper exists under `native/windows/cue-overlay`.
-- Native audio helper exists under `native/windows/cue-audio`.
-- Overlay helper uses Win32/Direct2D-style primitives and already has capture
-  exclusion hooks.
-- Audio helper uses WASAPI loopback/microphone capture and emits 16 kHz mono
-  PCM for transcription.
-- CLI/daemon have Windows paths for helper discovery, detached daemon launch,
-  file picker, screen/page capture, and account-file token storage.
-- `scripts/build-windows.ps1` builds Rust plus overlay/audio into a loose
-  `dist/bluey-windows-x64` directory.
-- `infra/scoop/bluey.json` exists as a placeholder.
-
-Known gaps:
-
-- Production `install.ps1` exists under `ops/install/install.ps1` and is
-  published to `https://bluey.sh/install.ps1`.
-- The signed release manifest supports a Windows-specific installer hash via
-  `windows_install` and a `windows-x86_64` artifact entry.
-- Makefile Windows packaging currently does not include all native helpers.
-- Release matrix is not enabled for Windows release artifacts.
-- Web download copy exposes the Windows PowerShell path:
-  `irm https://bluey.sh/install.ps1 | iex`.
-- The Windows whisper helper is a stub; release behavior must either use
-  managed STT only or document a no-local-whisper waiver.
-- Clean Windows 10/11 paid flow has not passed.
-
-## P0 Gate Before Any Paid Windows User
-
-- Build on a clean Windows 10/11 machine with Visual Studio Build Tools:
-
-```powershell
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo build --release
-powershell -ExecutionPolicy Bypass -File native\windows\cue-overlay\build.ps1
-powershell -ExecutionPolicy Bypass -File native\windows\cue-audio\build.ps1
-powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1
+```text
+bluey.exe
+  -> owner-only authenticated named pipe
+  -> bluey-daemon.exe
+       -> integrity-checked WASAPI audio helper
+       -> integrity-checked virtual-desktop capture helper
+       -> existing Bluey cloud, Jobs, workspace, and Coach contracts
 ```
 
-- Produce one canonical `bluey-<version>-windows-x86_64.zip` containing:
-  `bin/bluey.exe`, `bin/bluey-daemon.exe`, `bin/bluey-overlay.exe`, and
-  `bin/bluey-audio.exe`.
-- Either ship a real `cue-whisper.exe` or explicitly waive local whisper for
-  Windows and route captions through managed Bluey STT only.
-- Keep `ops/install/install.ps1` passing on a clean Windows 10/11 account:
-  per-user install under `%LOCALAPPDATA%\Bluey`, checksum verification,
-  PATH setup, reinstall/upgrade behavior, and unsigned-build guidance.
-- Publish SHA256 and signed update manifest entries for the Windows artifact.
-- `bluey on` starts daemon and overlay without dev flags.
-- The first visible state is the compact pill, not a large expanded window.
-- Clicking the pill expands the overlay and all controls are clickable in
-  interactive mode.
-- Sign-in/deep-link account linking works against `bluey.sh`.
-- Listen captures real microphone and system audio and sends it through managed
-  Bluey STT without exposing provider keys.
-- Answer streams through managed Bluey routes, shows cost, and updates balance.
-- Screen analysis works or is clearly disabled in UI until it is supported.
-- Docs attach/indexing works or is clearly disabled in UI until it is supported.
-- Session history loads, renames, and deletes with confirmation.
-- `bluey off` exits daemon and helper processes.
-- Capture exclusion is verified with Snipping Tool plus at least one common
-  meeting/recording path such as Teams, Zoom, or Windows screen recording.
-- Support/log export redacts tokens, provider keys, device codes, and user
-  paths where required.
-- Release artifact hygiene scan shows no provider keys, BYOK/customer-key
-  release paths, mock transcript mode, or dev capture flags.
+Bluey is not distributed as an Electron, WebView, WPF, or other desktop GUI
+application. Therefore, GUI application packaging, GUI installer signing, and
+Apple notarization are not Windows release requirements. Windows executable
+trust is still mandatory: `bluey.exe`, `bluey-daemon.exe`, and every shipped
+native `.exe` helper must be Authenticode-signed by the approved publisher and
+timestamped.
 
-## P1 Before Broader Windows Self-Serve
+This Round 510 slice adds no Keychain or Windows Credential Manager dependency.
+The release gate in this document does not require either facility.
 
-- Code-sign binaries and installer, or keep Windows invite-only with clear
-  unsigned-build guidance.
-- Decide package format: PowerShell installer first; Scoop/MSI/MSIX later.
-- Add Start Menu shortcut and uninstall cleanup.
-- Verify multi-monitor behavior.
-- Verify DPI scaling at 100%, 125%, and 150%.
-- Verify click-through versus interactive mode.
-- Verify drag/move/resize behavior.
-- Verify sleep/wake/reconnect.
-- Verify Defender/SmartScreen behavior.
-- Verify corporate-managed Windows restrictions where possible.
+## Implemented and host-verified
 
-## Operator Inputs Needed
+The following exists in the current tree. “Host-verified” means inspected,
+unit-tested, or cross-compiled on the macOS analysis host; it does not mean the
+Windows-only branch has executed on Windows.
 
-- Access to a clean Windows 10 or Windows 11 test machine.
-- Visual Studio Build Tools installed on that machine.
-- A real Bluey test account with credits.
-- Snipping Tool plus one meeting/recording app for capture-exclusion testing.
-- Confirmation whether Windows is included in the first paid alpha invite list.
+| Area | Current implementation | Verification boundary |
+| --- | --- | --- |
+| Local IPC | Per-user Windows named pipe, current-user-only capability-file DACL, remote-client rejection, peer SID and logon-session validation, per-boot bearer, request IDs, replay bound, 256 KiB framing bounds, deadlines, and connection capacity | Platform-neutral framing/auth tests and Windows-target Rust compilation passed; real Windows ACL and peer-process behavior remain blocked |
+| Screen capture | Native C++ helper captures the bounded full virtual desktop, including negative monitor coordinates, with per-monitor DPI awareness and structured diagnostics | MinGW x64 warnings-as-errors cross-compile passed as a Windows 10-subsystem console PE; real multi-monitor, mixed-DPI, HDR, and secure-desktop behavior remain blocked |
+| Audio | Native event-driven WASAPI microphone/render-loopback helper with structured device-loss errors, a 100 ms jitter buffer, and a 64-tap/256-phase windowed-sinc resampler | Host DSP tests and MinGW x64 cross-compile passed; physical-device latency, endpoint changes, Bluetooth, and suspend/resume remain blocked |
+| Meeting hints | Windows eCapture session enumeration with PID deduplication, read-only process identity, exact Teams/Zoom/Webex/Slack/Discord/browser labels, conservative debounce, and ambiguous-scan fail-safe behavior | Pure classification/debounce tests and Windows-target strict Clippy passed; only the dashboard currently consumes the watcher, so terminal/daemon wiring and real-Windows MMDevice proof remain blocked |
+| Package contents | Windows build collects CLI, daemon, native helpers, policy notice, aliases, and a bounded per-file SHA-256/size integrity manifest | Build script and manifest writer are present; PowerShell parsing and execution still need Windows validation |
+| Install/update safety | Artifact hash check, inner file-manifest verification, required-file enforcement, owner-only bin ACL, staged replacement, startup canary, and previous-version rollback | Implementation is present; clean install/update/failure-injection tests still need Windows validation |
+| Release hygiene | Publication rejects source maps, debug/source files, ASAR, unsafe archive paths, links/special files, case collisions, excessive expansion, configured secret bytes, and production-unsafe flags | Scanner self-tests, scoped hygiene scan, shell syntax checks, and scoped diff checks passed |
 
-## Launch Rule
+Primary implementation evidence:
 
-If the first paid alpha is macOS-only, this file is a parallel readiness track.
-If the first paid alpha includes Windows users, every P0 item above must pass
-before those users are invited.
+- Windows IPC and owner verification:
+  `crates/cue-core/src/ipc_auth.rs`, `crates/cue-daemon/src/app.rs`, and
+  `crates/cue-cli/src/app.rs`.
+- Native capture: `native/windows/cue-capture/main.cpp` and
+  `native/windows/cue-capture/build.ps1`.
+- Native audio and resampling: `native/windows/cue-audio/main.c`,
+  `native/windows/cue-audio/resampler.c`, and
+  `native/windows/cue-audio/resampler.h`.
+- Packaging and install: `scripts/build-windows.ps1`,
+  `scripts/write-windows-integrity.ps1`, and `ops/install/install.ps1`.
+- Release hygiene: `scripts/check-release-artifact-contents.py` and
+  `scripts/publish-bluey-release.sh`.
+
+See [Round 510](../rounds/ROUND-510-BLUEY-WINDOWS-EXE-AUDIT-NATIVE-CAPTURE-IPC-AND-RELEASE-HARDENING.md)
+for exact source locations, observed commands, and the implementation handoff.
+The comparative evidence is in the
+[Windows installer audit](../research/windows-exe-audit/INDEX.md).
+
+## Hard P0 release gates
+
+Every item below must pass before any paid Windows user is invited.
+
+### Publisher and distribution trust
+
+- Produce one canonical, source-free Windows x64 archive through
+  `scripts/build-windows.ps1` and run the release artifact scanner on the final
+  archive.
+- Authenticode-sign `bluey.exe`, `bluey-daemon.exe`, and every shipped native
+  executable/helper with the same approved publisher and a trusted timestamp.
+- Verify the publisher and signed release-manifest digest before install and
+  before launching a privileged helper. The adjacent integrity JSON is useful
+  tamper evidence, but is not a signed root of trust by itself.
+- Validate certificate chain, revocation and offline policy, timestamp behavior,
+  helper replacement rejection, Defender results, and SmartScreen reputation.
+- Publish the artifact SHA-256 and signed update-manifest entry. Update paths
+  must fail closed when signed-manifest handoff is absent or invalid.
+
+### Real Windows 10/11 canaries
+
+Run on clean, standard-user Windows 10 and Windows 11 hosts. Record OS build,
+architecture, artifact hashes, content-free pass/fail codes, and durations.
+
+- **Named pipe and capability ACL:** prove current-user ownership with Windows
+  APIs and `icacls`; reject another user, another logon session, remote clients,
+  stale boot state, forged bearer, replay, oversized input/output, half-open
+  clients, capacity saturation, reparse/replacement attempts, and alternate
+  address transport.
+- **Audio:** exercise real microphones and render-loopback devices, silence,
+  device switching, endpoint loss, exclusive-mode conflicts, Bluetooth, Remote
+  Desktop, sleep/resume, clean teardown, and long-run capture. Record
+  audio-to-answer p50/p95/p99 plus CPU and memory.
+- **Meeting hints:** validate active eCapture enumeration, process identities,
+  debounce, browser churn, ambiguous permission/device failures, and the future
+  terminal/daemon confirmation UX without recording audio, paths, or PIDs.
+- **Capture:** exercise single- and multi-monitor layouts, negative coordinates,
+  mixed DPI at 100/125/150%, HDR/scaling, output bounds, locked/UAC/secure
+  desktop behavior, protected windows, and the consent/integrity path.
+- **Install and rollback:** exercise clean install, in-place update, running
+  daemon replacement, forced failure at every staged transition, byte-for-byte
+  previous-version restoration, PATH behavior, uninstall, non-admin operation,
+  disk-full behavior, and antivirus file locks.
+- **Lifecycle and privacy:** exercise start, status, sign-in, screen capture,
+  audio readiness, listen, answer, stop, update, restart, and uninstall. Verify
+  that logs, crash output, telemetry, temporary directories, and failed-install
+  backups contain no screenshot/audio payloads, tokens, provider keys, device
+  codes, or unnecessary user paths.
+- **Soak and recovery:** run 8-, 24-, and 72-hour sessions; inject helper and
+  daemon failures; verify bounded restart behavior, state recovery, and
+  content-free diagnostics.
+
+### Architecture support
+
+- Windows x64 is the only concrete release target in the current build path.
+- An ARM64 host may use the x64 compatibility build only after that fallback is
+  tested on real ARM64 Windows hardware.
+- Do not publish native Windows ARM64 until Rust binaries, every native helper,
+  dependency/SBOM generation, Authenticode signing, install/update behavior, and
+  the complete canary matrix have ARM64 parity.
+
+## Explicitly not required for this release
+
+- No Electron or other GUI runtime.
+- No GUI-specific installer or application signing track.
+- No Apple notarization; it does not apply to Windows.
+- No new Keychain or Windows Credential Manager integration.
+- No native ARM64 artifact until the parity gate above is complete.
+- No claim that source-map removal or embedded policy text makes binaries
+  impossible to analyze. Server-side authority, minimal shipped secrets,
+  signed artifacts, and operational enforcement remain the effective boundary.
+
+## P1 after the paid-alpha gate
+
+- Wire the implemented Windows meeting-hint watcher into the terminal/daemon
+  runtime with visible confirmation, then validate MMDevice/process behavior on
+  real Windows without weakening its allowlist, debounce, or browser safeguards.
+- Benchmark optional bounded-frame AEC against raw WASAPI capture; preserve a
+  headset/mic-only bypass and ship only if measured quality improves.
+- Add signed native window selection/OCR context with explicit exclusions,
+  capture controls, strict byte/frame/deadline bounds, and derived-reference-only
+  retention by default.
+- Add automatic endpoint-change recovery, silence continuity, and bounded helper
+  crash-budget/state replay after real-device evidence identifies the required
+  behavior.
+
+## Operator inputs
+
+- Clean standard-user Windows 10 and Windows 11 x64 test hosts.
+- A Windows ARM64 host for compatibility-fallback evidence, if ARM64 users are
+  in the alpha cohort.
+- Visual Studio Build Tools and the approved Rust toolchain.
+- An approved Authenticode code-signing certificate and trusted timestamp
+  service.
+- A real Bluey test account with credits plus representative microphone,
+  loopback, Bluetooth, multi-monitor, mixed-DPI, Defender, and SmartScreen test
+  conditions.
+
+## Launch rule
+
+Windows may join the paid alpha only after every P0 gate above has concrete,
+retained evidence. Until then, the Windows architecture is implemented and
+host-checked, but the production release remains blocked. A macOS-only paid
+alpha is unaffected by this Windows parallel track.

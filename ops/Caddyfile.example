@@ -7,11 +7,58 @@
 bluey.sh, www.bluey.sh {
     encode gzip zstd
 
+    @bluey_jobs_internal path /api/jobs/internal/*
+    @bluey_admin path /admin/*
+    @bluey_ai_crawler header_regexp User-Agent (?i)(GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-User|Claude-SearchBot|anthropic-ai|PerplexityBot|Perplexity-User|Google-Extended|CCBot|Bytespider|Applebot-Extended|meta-externalagent|Amazonbot)
+    @bluey_scrape_canary path /.well-known/bluey-integrity-{$BLUEY_SCRAPE_CANARY_TOKEN:disabled}
     @bluey_jobs_api path /api/jobs/*
-    @bluey_api path /health /admin/* /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete
+    @bluey_api path /health /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete
     @bluey_install path /install.sh /install.ps1 /latest.json /latest.json.sig /releases/*
+    @bluey_assets path /assets/* /jobs/assets/*
     @bluey_jobs path /jobs /jobs/*
-    @bluey_html path / /login /download /install /account /reload /link /device /verify-email /password-reset /JobApply* /jobs* /docs/* /llms.txt /robots.txt /sitemap.xml /how-bluey-works* /bluey-faq* /ai-meeting-context-copilot* /engineering-meeting-copilot* /ai-copilot-for-design-reviews* /screen-context-ai-assistant* /meeting-memory-and-project-context* /auto-model-router* /private-desktop-ai-overlay* /bluey-vs-ai-meeting-notetakers* /bluey-vs-coding-agents* /context-coverage*
+    @bluey_html path / /login /download /install /account /reload /link /device /verify-email /password-reset /docs/* /robots.txt /sitemap.xml /how-bluey-works* /bluey-faq* /ai-meeting-context-copilot* /engineering-meeting-copilot* /ai-copilot-for-design-reviews* /screen-context-ai-assistant* /meeting-memory-and-project-context* /auto-model-router* /private-desktop-ai-overlay* /bluey-vs-ai-meeting-notetakers* /bluey-vs-coding-agents* /context-coverage*
+    @bluey_noindex path /jobs /jobs/* /api/* /account /account/* /reload /link /device /verify-email /password-reset /docs/*
+    @bluey_robots path /robots.txt
+
+    # This unadvertised path is harmless. Production sets a random token and
+    # alerts on the X-Bluey-Scrape-Canary marker in access logs.
+    handle @bluey_scrape_canary {
+        header X-Bluey-Scrape-Canary "hit"
+        respond 404
+    }
+
+    # Fallback enforcement for self-identifying AI crawlers. Cloudflare AI
+    # Crawl Control and bot scoring remain the authoritative production layer
+    # because a hostile crawler can spoof its User-Agent.
+    handle @bluey_ai_crawler {
+        respond 403
+    }
+
+    # Worker-only Jobs endpoints use signed service requests and remain private.
+    # Workers on this host call the loopback listener directly; remote workers
+    # require a separate Access/mTLS-protected internal hostname.
+    handle @bluey_jobs_internal {
+        respond 404
+    }
+
+    # The customer hostname never exposes privileged administration routes.
+    # Operators use loopback/SSH until a separate Access-protected admin
+    # hostname with hardware-backed authentication is provisioned.
+    handle @bluey_admin {
+        respond 404
+    }
+
+    handle /llms.txt {
+        respond 410
+    }
+
+    handle /JobApply {
+        redir /jobs 308
+    }
+
+    handle /JobApply/* {
+        redir /jobs 308
+    }
 
     handle @bluey_jobs_api {
         reverse_proxy 127.0.0.1:8081 {
@@ -40,6 +87,13 @@ bluey.sh, www.bluey.sh {
         file_server
     }
 
+    # Static asset requests never fall through to either SPA. Missing assets
+    # and source maps therefore return a real 404 instead of HTML with 200.
+    handle @bluey_assets {
+        root * /var/www/bluey
+        file_server
+    }
+
     handle @bluey_jobs {
         root * /var/www/bluey
         try_files {path} {path}/index.html /jobs/index.html
@@ -54,6 +108,7 @@ bluey.sh, www.bluey.sh {
 
     # Hardening headers.
     header {
+        -Server
         Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
         X-Content-Type-Options "nosniff"
         X-Frame-Options "DENY"
@@ -63,6 +118,8 @@ bluey.sh, www.bluey.sh {
         Content-Security-Policy "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self' https://web.squarecdn.com https://sandbox.web.squarecdn.com https://challenges.cloudflare.com; connect-src 'self' https://connect.squareup.com https://connect.squareupsandbox.com https://web.squarecdn.com https://sandbox.web.squarecdn.com https://challenges.cloudflare.com; frame-src https://web.squarecdn.com https://sandbox.web.squarecdn.com https://challenges.cloudflare.com; frame-ancestors 'none'"
     }
     header @bluey_html Cache-Control "no-cache"
+    header @bluey_robots Content-Type "text/plain; charset=utf-8"
+    header @bluey_noindex X-Robots-Tag "noindex, nofollow, noarchive, nosnippet"
 
     # Standard log to syslog so journalctl shows access patterns.
     log {

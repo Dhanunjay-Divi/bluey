@@ -22,7 +22,10 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
 }
 
 New-Item -ItemType Directory -Force -Path build | Out-Null
-cl.exe /nologo /O2 /D_WIN32_WINNT=0x0601 /Fe:build\bluey-audio.exe main.c ole32.lib uuid.lib
+cl.exe /nologo /O2 /D_WIN32_WINNT=0x0A00 /Fe:build\bluey-audio.exe main.c resampler.c ole32.lib uuid.lib /link /SUBSYSTEM:CONSOLE,10.00
+if ($LASTEXITCODE -ne 0) {
+  throw "bluey-audio compilation failed with exit code $LASTEXITCODE"
+}
 Copy-Item build\bluey-audio.exe build\cue-audio.exe -Force
 Copy-Item build\bluey-audio.exe build\audio-driver.exe -Force
 Write-Output "build\bluey-audio.exe"

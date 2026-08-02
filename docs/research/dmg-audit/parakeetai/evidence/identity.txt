@@ -1,0 +1,99 @@
+STATIC IDENTITY EVIDENCE — PARAKEETAI 3.6.21
+Captured 2026-07-12. These identity commands were read-only and did not launch the app; the later authorized runtime pass is recorded separately in runtime-unauthenticated.txt.
+
+SOURCE
+path=/Users/uno/Downloads/dmg_backtrack_code/ParakeetAI-3.6.21.dmg
+size_bytes=226405227
+mtime=2026-07-12T04:25:50-0400
+sha256=94e86fe16a3b639d97989a88e4436d41a526f6db800d3be7e8c3e3efee386259
+
+IMAGEINFO (hdiutil imageinfo)
+Format=UDZO
+Format Description=UDIF read-only compressed (zlib)
+Total Bytes=594205696
+Compressed Bytes=226363008
+Top-level Checksum Type=CRC32
+Top-level Checksum Value=$6CB64F02
+HFS partition CRC32=$BFF88C4B
+image-encrypted=false
+
+MOUNT (hdiutil info; diskutil info /dev/disk7s1)
+device=/dev/disk7s1
+mount_point=/Volumes/ParakeetAI
+volume_name=ParakeetAI
+filesystem=HFS+
+volume_uuid=1D6B71F1-8865-38E4-B47F-5881235445E5
+disk_partition_uuid=B41762F1-EC6B-4F76-B489-4C6D643D3AEE
+volume_size_bytes=594165760
+volume_used_bytes=591085568
+Media Read-Only=Yes
+Volume Read-Only=Yes (read-only mount flag set)
+
+APP (Info.plist)
+path=/Volumes/ParakeetAI/ParakeetAI.app
+allocated_kib=573276
+regular_file_count=320
+CFBundleExecutable=ParakeetAI
+CFBundleIdentifier=org.parakeetai.ParakeetAI
+CFBundleDisplayName=U+2800 BRAILLE PATTERN BLANK
+CFBundleShortVersionString=3.6.21
+CFBundleVersion=3.6.21
+LSMinimumSystemVersion=12.0
+DTSDKName=macosx14.5
+DTXcode=1540
+url_scheme=parakeetai
+ElectronAsarIntegrity.algorithm=SHA256
+ElectronAsarIntegrity.hash=12c4ae4679aa8d8db485b75fc68e8d28cc4afbe12f3e44e3e6566ab7479f621a
+
+SIGNATURE (codesign -dv --verbose=4; codesign --verify --deep --strict)
+Identifier=org.parakeetai.ParakeetAI
+Format=app bundle with Mach-O universal (x86_64 arm64)
+CodeDirectory.flags=runtime
+CDHash=61cbce835ec4d5186fe397e2e7839405652d7dd1
+Authority=Developer ID Application: Jure Sotosek (836KU58BNR)
+TeamIdentifier=836KU58BNR
+Timestamp=Jul 11, 2026 at 11:22:33 AM
+Runtime Version=26.0.0
+verification=valid on disk; satisfies Designated Requirement
+
+GATEKEEPER / NOTARIZATION
+spctl --assess --type execute --verbose=4: accepted; source=Notarized Developer ID
+xcrun stapler validate: The validate action worked
+
+ENTITLEMENTS (codesign -d --entitlements -)
+com.apple.security.cs.allow-jit=true
+com.apple.security.cs.allow-unsigned-executable-memory=true
+com.apple.security.cs.disable-library-validation=true
+com.apple.security.device.audio-input=true
+com.apple.security.device.microphone=true
+com.apple.security.files.user-selected.read-write=true
+com.apple.security.network.client=true
+
+INFO.PLIST PRIVACY / TRANSPORT DECLARATIONS
+NSMicrophoneUsageDescription=ParakeetAI needs access to your microphone to provide real-time speech transcription.
+NSScreenCaptureDescription=ParakeetAI needs screen recording permission to capture and analyze your screen content.
+NSCameraUsageDescription=ParakeetAI may need camera access for screen recording features.
+NSBluetoothAlwaysUsageDescription=This app needs access to Bluetooth
+NSAppTransportSecurity.NSAllowsArbitraryLoads=true
+NSAppTransportSecurity.NSAllowsLocalNetworking=true
+localhost and 127.0.0.1 allow insecure HTTP and specify temporary minimum TLS 1.0.
+
+FRAMEWORK / HELPER INVENTORY
+Electron Framework.framework version=38.8.6
+Mantle.framework
+ReactiveObjC.framework
+Squirrel.framework
+U+2800 Helper.app
+U+2800 Helper (GPU).app
+U+2800 Helper (Plugin).app
+U+2800 Helper (Renderer).app
+Chrome crashpad handler, libEGL, libGLESv2, ffmpeg, Vulkan SwiftShader resources
+Main executable and Electron Framework are universal x86_64/arm64 Mach-O.
+All four helpers passed nested deep signature verification under the same app signature.
+No .appex, .xpc, embedded LaunchAgents directory, or launch-agent plist was found.
+
+UPDATE CONFIGURATION (Resources/app-update.yml)
+provider=github
+owner=parakeetai
+repo=parakeetai-desktop-releases
+updaterCacheDirName=parakeetai-desktop-updater

@@ -1119,6 +1119,7 @@ dependencies = [
  "sha2",
  "tokio",
  "webbrowser",
+ "windows-sys 0.59.0",
  "zip 2.4.2",
 ]
 
@@ -1130,6 +1131,7 @@ dependencies = [
  "chrono",
  "cue-core",
  "keyring",
+ "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -1147,14 +1149,19 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dirs",
+ "getrandom 0.2.17",
+ "hmac",
+ "libc",
  "serde",
  "serde_json",
  "sha2",
+ "subtle",
  "thiserror 1.0.69",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1176,6 +1183,7 @@ dependencies = [
  "getrandom 0.2.17",
  "hex",
  "keyring",
+ "libc",
  "obfstr",
  "objc2 0.5.2",
  "objc2-app-kit 0.2.2",
@@ -1195,6 +1203,7 @@ dependencies = [
  "url",
  "uuid",
  "webrtc-vad",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -1211,6 +1220,7 @@ dependencies = [
  "cue-stealth",
  "dirs",
  "futures",
+ "libc",
  "objc2 0.5.2",
  "objc2-foundation 0.2.2",
  "serde",
@@ -1229,6 +1239,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2480,6 +2491,12 @@ dependencies = [
  "http-body",
  "pin-project-lite",
 ]
+
+[[package]]
+name = "http-range"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21dec9db110f5f872ed9699c3ecf50cf16f423502706ba5c72462e28d3157573"
 
 [[package]]
 name = "httparse"
@@ -5530,6 +5547,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "http-range",
  "image",
  "jni 0.21.1",
  "libc",

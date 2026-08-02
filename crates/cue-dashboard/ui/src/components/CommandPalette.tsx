@@ -20,7 +20,8 @@ const commands: PaletteCommand[] = [
   { label: "New session", kind: "new-session" },
   { label: "Go to chats", kind: "navigate", to: "/chats" },
   { label: "Go to settings", kind: "navigate", to: "/settings" },
-  { label: "Go to prompts", kind: "navigate", to: "/prompts" },
+  { label: "Set up coach", kind: "navigate", to: "/coach" },
+  { label: "Add screen context", kind: "navigate", to: "/screenshot" },
   { label: "Go to home", kind: "navigate", to: "/" },
 ];
 

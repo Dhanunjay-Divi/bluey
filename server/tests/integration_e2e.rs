@@ -9,8 +9,10 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
+use hmac::{Hmac, Mac};
 use serde_json::json;
 use serial_test::serial;
+use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 use tower::ServiceExt;
 use wiremock::matchers::{header, method, path, path_regex};
@@ -39,6 +41,271 @@ struct Harness {
     pub square: MockServer,
     pub deepgram: MockServer,
     pub mail: MockServer,
+}
+
+type HmacSha256 = Hmac<Sha256>;
+
+struct SignedWorkerRequest<'a> {
+    path: &'a str,
+    scope: &'a str,
+    worker_id: &'a str,
+    timestamp: u64,
+    nonce: &'a str,
+    signed_body: &'a [u8],
+    actual_body: &'a [u8],
+    signing_key: &'a str,
+}
+
+fn signed_worker_request(input: SignedWorkerRequest<'_>) -> Request<Body> {
+    let content_sha256 = hex::encode(Sha256::digest(input.signed_body));
+    let canonical = format!(
+        "bluey-jobs-worker-v1\n{}\n{}\n{}\nbluey-jobs-api\n{}\nPOST\n{}\n{content_sha256}",
+        input.timestamp, input.nonce, input.worker_id, input.scope, input.path,
+    );
+    let mut mac = HmacSha256::new_from_slice(input.signing_key.as_bytes()).unwrap();
+    mac.update(canonical.as_bytes());
+    Request::post(input.path)
+        .header("x-bluey-jobs-worker-id", input.worker_id)
+        .header("x-bluey-jobs-worker-timestamp", input.timestamp.to_string())
+        .header("x-bluey-jobs-worker-nonce", input.nonce)
+        .header("x-bluey-jobs-worker-audience", "bluey-jobs-api")
+        .header("x-bluey-jobs-worker-scope", input.scope)
+        .header("x-bluey-jobs-worker-content-sha256", content_sha256)
+        .header(
+            "x-bluey-jobs-worker-signature",
+            hex::encode(mac.finalize().into_bytes()),
+        )
+        .body(Body::from(input.actual_body.to_vec()))
+        .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_worker_signatures_reject_replay_expiry_and_body_tampering() {
+    const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
+    const PATH: &str = "/api/jobs/internal/discovery/lease";
+    const NONCE: &str = "abcdef0123456789abcdef0123456789";
+    std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", SIGNING_KEY);
+    let harness = boot_harness().await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let accepted = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: PATH,
+            scope: "discovery",
+            worker_id: "integration-signed-worker",
+            timestamp: now,
+            nonce: NONCE,
+            signed_body: b"",
+            actual_body: b"",
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
+
+    let replayed = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: PATH,
+            scope: "discovery",
+            worker_id: "integration-signed-worker",
+            timestamp: now,
+            nonce: NONCE,
+            signed_body: b"",
+            actual_body: b"",
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+
+    let expired = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: PATH,
+            scope: "discovery",
+            worker_id: "integration-signed-worker",
+            timestamp: now - 91,
+            nonce: "abcdef0123456789abcdef0123456790",
+            signed_body: b"",
+            actual_body: b"",
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+
+    let tampered = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: PATH,
+            scope: "discovery",
+            worker_id: "integration-signed-worker",
+            timestamp: now,
+            nonce: "abcdef0123456789abcdef0123456791",
+            signed_body: b"",
+            actual_body: br#"{"forged":true}"#,
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
+    std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_authenticated_reads_return_retry_after_when_the_bucket_is_exhausted() {
+    std::env::set_var("BLUEY_LIMIT_JOBS_READ_PER_MIN", "1");
+    std::env::set_var("BLUEY_LIMIT_JOBS_READ_PER_MIN_BURST", "1");
+    let harness = boot_harness().await;
+    let access = signup_and_login(
+        &harness,
+        "jobs-rate-limit@example.com",
+        "valid-password-123",
+    )
+    .await;
+
+    let first = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/workspace")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+
+    let limited = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/workspace")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers().get("retry-after").is_some());
+    std::env::remove_var("BLUEY_LIMIT_JOBS_READ_PER_MIN");
+    std::env::remove_var("BLUEY_LIMIT_JOBS_READ_PER_MIN_BURST");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_local_run_delivery_is_rate_limited_before_ticket_enumeration() {
+    std::env::set_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN", "1");
+    std::env::set_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN_BURST", "1");
+    let harness = boot_harness().await;
+    let request = || {
+        Request::post("/api/jobs/local-runs/missing-run/claim")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "ticket": "a".repeat(64) })).unwrap(),
+            ))
+            .unwrap()
+    };
+
+    let first = harness
+        .jobs_router
+        .clone()
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::NOT_FOUND);
+
+    let limited = harness
+        .jobs_router
+        .clone()
+        .oneshot(request())
+        .await
+        .unwrap();
+    assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(limited.headers().get("retry-after").is_some());
+    std::env::remove_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN");
+    std::env::remove_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN_BURST");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_cross_account_match_ids_are_indistinguishable_from_missing_ids() {
+    let harness = boot_harness().await;
+    let owner = signup_and_login(&harness, "jobs-owner@example.com", "valid-password-123").await;
+    let other = signup_and_login(&harness, "jobs-other@example.com", "valid-password-123").await;
+    let saved = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/matches")
+                .header("authorization", format!("Bearer {owner}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "canonical_url": "https://boards.greenhouse.io/acme/jobs/tenant-test",
+                        "pasted_description": "Build reliable services.",
+                        "company": "Acme",
+                        "title": "Software Engineer",
+                        "location": "New York, NY",
+                        "workplace": "hybrid"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(saved.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let posting: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let posting_id = posting["id"].as_str().unwrap();
+
+    let cross_tenant = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(format!("/api/jobs/matches/{posting_id}"))
+                .header("authorization", format!("Bearer {other}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let missing = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/matches/job-does-not-exist")
+                .header("authorization", format!("Bearer {other}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_tenant.status(), StatusCode::NOT_FOUND);
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    let cross_body = axum::body::to_bytes(cross_tenant.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let missing_body = axum::body::to_bytes(missing.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(cross_body, missing_body);
 }
 
 #[tokio::test]
@@ -1358,7 +1625,8 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         json!({
             "runId": run_id,
             "accountId": account_id,
-            "applicationId": application_id
+            "applicationId": application_id,
+            "browserProfileId": "profile-local-test"
         }),
         chrono::Utc::now().timestamp_millis() + 60_000,
     )
@@ -1378,6 +1646,38 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         .await
         .unwrap();
     assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed_bytes = axum::body::to_bytes(claimed.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let claim: serde_json::Value = serde_json::from_slice(&claimed_bytes).unwrap();
+    let result_capability = claim["_blueyCapabilities"]["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let resume_capability = claim["_blueyCapabilities"]["resume"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(result_capability, resume_capability);
+
+    let swapped_operation = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &resume_capability,
+                        "receipt": { "status": "failed" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(swapped_operation.status(), StatusCode::NOT_FOUND);
 
     let title = "Review the Greenhouse application";
     let detail = "Review every employer-facing field and document in the preserved form, then approve submission.";
@@ -1400,7 +1700,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "ticket": ticket,
+                        "capability": &result_capability,
                         "receipt": final_review_receipt
                     }))
                     .unwrap(),
@@ -1423,7 +1723,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&json!({ "capability": &resume_capability })).unwrap(),
                 ))
                 .unwrap(),
         )
@@ -1659,7 +1959,8 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         json!({
             "runId": run_id,
             "accountId": account_id,
-            "applicationId": application_id
+            "applicationId": application_id,
+            "browserProfileId": "profile-local-reconcile"
         }),
         chrono::Utc::now().timestamp_millis() + 60_000,
     )

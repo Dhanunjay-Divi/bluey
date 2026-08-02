@@ -1,6 +1,7 @@
 import { NavLink } from "react-router-dom";
 import {
   Home,
+  BrainCircuit,
   MessageSquare,
   Settings,
   MessageCircle,
@@ -11,6 +12,7 @@ import {
 const links = [
   { to: "/", icon: Home, label: "Home" },
   { to: "/chats", icon: MessageSquare, label: "Sessions" },
+  { to: "/coach", icon: BrainCircuit, label: "Coach" },
   { to: "/live", icon: Radio, label: "Live" },
   { to: "/responses", icon: MessageCircle, label: "Answers" },
   { to: "/search", icon: Search, label: "Search" },

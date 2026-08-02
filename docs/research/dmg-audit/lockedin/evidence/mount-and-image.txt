@@ -1,0 +1,48 @@
+LOCKEDIN DMG IMAGE AND MOUNT EVIDENCE
+Captured 2026-07-12 UTC
+
+Source
+  /Users/uno/Downloads/dmg_backtrack_code/LockedIn-1.7.5-universal.dmg
+
+stat -f '%N|%z bytes' <source>
+  /Users/uno/Downloads/dmg_backtrack_code/LockedIn-1.7.5-universal.dmg|302369574 bytes
+
+shasum -a 256 <source>
+  a06fab03e233726569e1bc9569cf43f374a9ff7c27bae9ff55dacd89dd1b7501
+
+Attach command
+  hdiutil attach -readonly -nobrowse <source>
+
+Observed device and mount point
+  /dev/disk6s1
+  /Volumes/LockedIn 1.7.5-universal
+
+mount result
+  /dev/disk6s1 on /Volumes/LockedIn 1.7.5-universal (apfs, local, nodev, nosuid, read-only, journaled, noowners, quarantine, nobrowse, mounted by uno)
+
+diskutil info observations
+  Volume Name: LockedIn 1.7.5-universal
+  File System Personality: APFS
+  Media Read-Only: Yes
+  Volume Read-Only: Yes
+  APFS Encrypted: No
+  Sealed: No
+
+hdiutil imageinfo observations
+  Format: UDZO
+  Format Description: UDIF read-only compressed (zlib)
+  Partitioning: GUID/APFS
+  Total Bytes: 1309914624
+  Checksummed: true
+  Encrypted: false
+
+Detach result
+  Command: hdiutil detach /dev/disk6
+  Result: image ejected successfully; mount point absent and hdiutil no longer listed the LockedIn image.
+
+Approved runtime mount cycle
+  Reattach command: hdiutil attach -readonly -nobrowse <same source>
+  Observed device/mount: /dev/disk6s1 at /Volumes/LockedIn 1.7.5-universal
+  mount flags: apfs, local, nodev, nosuid, read-only, journaled, noowners, quarantine, nobrowse
+  Cleanup: terminated all LockedIn processes, removed the disposable runtime root, then hdiutil detach /dev/disk6
+  Final verification: LockedIn mount point absent and image no longer listed by hdiutil

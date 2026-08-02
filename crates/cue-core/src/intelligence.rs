@@ -148,6 +148,10 @@ pub fn local_answer(question: &str, meeting: &MeetingRecord) -> String {
         answer.push_str("\n\nAnswer instructions:\n");
         answer.push_str(instructions);
     }
+    if let Some(profile) = meeting.assistant_profile.context_summary() {
+        answer.push_str("\n\nAssistant profile:\n");
+        answer.push_str(&profile);
+    }
     format!(
         "Local fallback context for: {question}\n\n{answer}\n\nSet a live provider key to generate a full answer from this context."
     )
@@ -194,6 +198,7 @@ pub fn generate_recap(meeting: &MeetingRecord) -> MeetingRecap {
         transcript_segments: meeting.transcript.len(),
         context: meeting.context.clone(),
         answer_instructions: meeting.answer_instructions.clone(),
+        assistant_profile: meeting.assistant_profile.clone(),
         action_items: meeting.action_items.clone(),
         decisions: meeting.decisions.clone(),
     }

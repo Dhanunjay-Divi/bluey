@@ -1,0 +1,109 @@
+Littlebird static architecture evidence
+=======================================
+
+E-LB-ARCH-001 — Asar layout and extraction method
+Source: Littlebird.app/Contents/Resources/app.asar
+Tool: repository-installed @electron/asar, used only to list the archive and extract selected resources into /tmp/littlebird-static
+Observed:
+- 70,445 archive paths.
+- package.json main: dist-electron/main/index.js.
+- Preload: dist-electron/preload/index.mjs.
+- Renderer assets: dist/, built with Vite/React/TanStack Router.
+- Full app.asar SHA-256 and Electron raw-header integrity are recorded in ../hashes.txt.
+- Selected extracted-file hashes are recorded in ../hashes.txt.
+- No npm/yarn/pnpm install, lifecycle hook, or bundled script was run.
+
+E-LB-ARCH-002 — Major JavaScript dependencies
+Source: app.asar/package.json
+Observed dependency families:
+- Electron, electron-store, electron-updater, Dexie, React 19, TanStack Router/Query, MobX.
+- PostHog, Sentry, Axiom, Singular, and Product Fruits telemetry/onboarding SDKs.
+- MCP client/server packages, WebSocket support, SQLite/GRDB-related native functionality, and image/media utilities.
+Inference boundary: package presence does not alone prove that every dependency is active; active paths below are separately supported by main/preload/source-map control flow.
+
+E-LB-ARCH-003 — Shipped source maps
+Sources in app.asar renderer dist:
+- assets/toaster-CZz_iCCw.js.map (SHA-256 564ec45fd704fae842fb7cf07854d3963d5009dbb88345b072430ffd14d37afc)
+- assets/ExternalLinkHandler-D7Z4nqtc.js.map (SHA-256 5ddf5ab4321671974c0b0449f126650aa4c53605076af2581c7c49e9ed94db8c)
+- assets/login.lazy-BhcLDjbV.js.map
+- assets/onboarding.lazy-BXdpe7Fp.js.map
+- assets/subscription.lazy-zBYfhcPY.js.map
+- assets/index-CvQr8BBx.js.map
+Observed:
+- Maps include original TS/TSX source paths and sourcesContent, including src/screens/LoginScreen.tsx, src/lib/sdk-init.ts, integration code, stores, routes, billing UI, and onboarding steps.
+- These maps substantiate renderer logic but also expose proprietary original source and embedded build-time client configuration.
+
+E-LB-ARCH-004 — Main-to-ContextKit protocol and lifecycle
+Source: extracted dist-electron/main/index.js; corroborating ContextKitCore binary strings/symbols
+Observed:
+- Main launches ContextKit-cli with --daemon.
+- Child stdout messages are framed with <<CONTEXT_KIT_EVENT_START>> / <<CONTEXT_KIT_EVENT_END>> and contain base64-wrapped JSON; Electron-to-child messages use <<ELECTRON_EVENT_START>> / <<ELECTRON_EVENT_END>>.
+- Main maintains an in-memory outbound queue, pending callbacks with a 10-second timeout, and a map of critical state.
+- A PID file is stored under Electron userData as contextkit.pid; stale PID cleanup checks process identity before terminating.
+- Main waits for a ping before marking the helper ready, then restores auth, user/subscription, flags, exclusions, observer, calendar, and iMessage state in a fixed order.
+- Unexpected exits restart up to five times with exponential delay beginning at one second. Duplicate/stale events are guarded.
+- Queue and critical-state maps are in memory; no durable cross-app-restart queue was found.
+
+E-LB-ARCH-005 — Audio-transcription helper lifecycle
+Source: extracted dist-electron/main/index.js
+Observed:
+- The helper starts only when LB_AUDIO_TRANSCRIPTION_PROCESS_ENABLED=true.
+- PID file: audiotranscription.pid under userData.
+- Unexpected exits restart up to five times with exponential delay; a 30-second healthy period resets restart accounting.
+
+E-LB-ARCH-006 — WebSocket service
+Source: extracted dist-electron/main/index.js and renderer src/lib/sdk-init.ts from shipped source map
+Observed:
+- Main uses Node ws against wss://ws.lilbird.co, sends an authentication frame, tracks callbacks, and uses ping/inactivity handling.
+- Renderer references are counted; reconnect uses exponential delay and sleep/resume recovery.
+- Pending callbacks are rejected during reconnect; no durable outbound queue was found.
+- Renderer SDK config uses bearer access tokens, WSS payload validation, a per-window request-source identifier, IndexedDB persistence, and a local search manager.
+
+E-LB-ARCH-007 — BrowserWindow and IPC boundary
+Sources: extracted dist-electron/main/index.js and dist-electron/preload/index.mjs
+Observed:
+- Main, meeting, and notification windows explicitly set contextIsolation=true and nodeIntegration=false.
+- No BrowserWindow explicitly enables Chromium sandboxing; the hummingbird window relies on Electron defaults for isolation-related settings.
+- Main denies window.open and sends allowed HTTP(S) links to the external browser; a srcdoc navigation path is blocked.
+- Remote debugging is gated to development plus an environment switch.
+- No CSP meta tag or main-process CSP response-header hook was found in shipped HTML/main code.
+- Preload exposes generic ipcRenderer on/off/send/invoke methods without a channel allowlist.
+- Main registers sensitive handlers, including auth token get/set/clear, collection controls, relaunch, and filesystem operations. No common sender URL/origin validator was found for these handlers.
+- Filesystem IPC applies realpath allowlists, O_NOFOLLOW, hard-link/TOCTOU checks, and picker-derived path grants for supported reads/deletes.
+
+E-LB-ARCH-008 — Native ContextKit scope
+Sources: ContextKitCore binary linked libraries, Swift symbols/strings, and 46 bundled JavaScript parser resources
+Observed:
+- Symbols identify window observation, API request trace context, redaction summary, EventKit coordination, screenshot/JSON context collection, storage, and meeting capture.
+- Forty-six static parser resources cover browser and native experiences including Gmail, Outlook, Slack, Teams, Messages, WhatsApp, Notion, Calendar, Asana, ClickUp, ChatGPT, Claude, Codex, editors, and terminals.
+- runtime.js is a JavaScriptCore/Node-style shared parser runtime for macOS accessibility trees and provides a generic NOT_HANDLED fallback.
+- The Gmail parser is browser-scoped to mail.google.com and contains accessibility-tree extraction for message threads and compose drafts.
+Inference boundary: static parser code proves intended recognition/extraction behavior, not capture accuracy or permission behavior in production.
+
+E-LB-ARCH-009 — Renderer persistence
+Source: renderer original sources in index-CvQr8BBx.js.map
+Observed:
+- Dexie database name: littlebird; schema version: 15.
+- Tables: threads, messages, journals, meetings, projects, files, arenas, mcpClientGrants, userConfigs, and _meta.
+- BroadcastChannel littlebird-sync coordinates cross-window hydration.
+- Version upgrade code clears local data and forces a full bootstrap.
+- An OpenFailed recovery path deletes a corrupt IndexedDB database and reopens it.
+- No renderer IndexedDB at-rest encryption layer was found.
+
+E-LB-ARCH-010 — Bundled category database
+Source: /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/Resources/category-seed.sqlite
+Command: sqlite3 -readonly
+Observed:
+- Tables: category_metadata, category_domains, sync_state; category index present.
+- Six category metadata rows and 76,161 domain rows; sync id 76161.
+- Categories: Adult Content, Banking & Finance, Entertainment, Health & Medical, Shopping, Social Media.
+- This is a seed/configuration database; no user data was inspected.
+
+E-LB-ARCH-011 — Update architecture
+Sources: dist-electron/main/index.js and Resources/app-update.yml
+Observed:
+- electron-updater/Squirrel with feed base https://downloads.littlebird.ai and architecture-specific paths.
+- Signed config identifies S3 bucket little-bird-releases, region us-east-2, arm64, alpha channel.
+- Feature access selects latest, beta, or alpha; auto-download is enabled; downgrade is allowed; differential download is disabled.
+- Check interval is 15 minutes even though an adjacent log message says one minute.
+- Installation is deferred while a meeting is active; helper cleanup runs before install.

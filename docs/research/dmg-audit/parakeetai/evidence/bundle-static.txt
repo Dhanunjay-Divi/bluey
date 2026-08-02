@@ -1,0 +1,113 @@
+STATIC BUNDLE EVIDENCE — PARAKEETAI 3.6.21
+Archive: /Volumes/ParakeetAI/ParakeetAI.app/Contents/Resources/app.asar
+Archive size: 100668529 bytes
+Archive SHA-256: e976a3905580addfee17c17ed7c202ccf7334f2d0cff19ef7188cc73b6a9926a
+
+ASAR PARSER RESULT
+SUMMARY data_start=3057672 directories=959 files=11726 unpacked_files=32 links=0 integrity_verified=11694 integrity_mismatches=0
+
+The 11694 packed members were copied to a temporary directory only after their ASAR-record SHA-256 values matched. The 32 unpacked records were inspected in place on the read-only mount. No archive content is retained in the repository.
+
+KEY MEMBERS
+package.json                         size=165       name=parakeetai-desktop version=3.6.21 main=./dist/main/main.js
+dist/main/main.js                    size=490579    sha256=27a204c1c4a44cb51f1fc3248de0a09d48ffa076cc8572feb13bf7f97b474a73
+dist/main/preload.js                 size=1330      sha256=1a778173dff9b4446c5468b3574cf399af12ec3cb4f40f94df74511e28752105
+dist/main/mic-monitor-worker.js      size=25333     sha256=c7f617f626112776482b5fe8bcf8a3ec975bf3f38948cec6a05044c14b6c4f0b
+dist/renderer/index.html             size=200       sha256=9f08de81f14969ef4f814ac4992bba53c12f22b2ef66b886e1ca6862e8f3592b
+dist/renderer/renderer.js            size=2962413   sha256=0f12b46849684b178e54e87454fca3c3d310a9607b7024576c8d19462a0e4c34
+
+TECHNOLOGY OBSERVATIONS
+- Info.plist identifies an Electron ASAR and Electron Framework is version 38.8.6.
+- package.json names the main process entry above.
+- The minified renderer contains React, TanStack Query, tRPC, Radix UI, Vercel AI SDK, Speechmatics, and Mixpanel modules. No source map for the app-owned `main.js`, `preload.js`, `mic-monitor-worker.js`, or `renderer.js` bundle was found; packaged dependencies do include their own maps.
+- The unpacked @parakeetai-desktop/native-modules package is NAPI-RS/Rust version 0.1.0. Its macOS source queries CoreAudio for active input processes/devices. Its audio processor wraps the sonora WebRTC-style audio-processing dependency at Git revision dec6a074725e82ef371a024fc45236d60f0acf52.
+- Four platform N-API outputs are present under app.asar.unpacked/dist/main: darwin x86_64, darwin arm64, Windows x86_64, and Windows arm64. Exact hashes are in ../hashes.txt.
+- Mach-O linked-library, build-version, exported-symbol, signature, and helper-architecture results are in native-metadata.txt. Both macOS modules export only the N-API registration symbol.
+
+REPRODUCIBLE STRING/OFFSET INDEX
+Offsets are zero-based positions in the identified minified file.
+
+dist/main/preload.js
+367     ipcRenderer.invoke — generic invoke proxy
+434     ipcRenderer.on — generic event subscription proxy
+817     ipcRendererProxy export
+907     enableLoopbackAudio export
+977     disableLoopbackAudio export
+1087    contextBridge.exposeInMainWorld
+
+dist/main/main.js
+395521  setPermissionRequestHandler
+395889  setWindowOpenHandler
+401612  setAsDefaultProtocolClient
+401900  setLoginItemSettings
+402520  desktopCapturer.getSources
+409435  utilityProcess.fork for microphone monitor worker
+410383  setContentProtection
+413689  checkForUpdates
+418778  capture-screenshot IPC name
+419584  desktopCapturer.getSources in screenshot handler
+423468  open-log-file IPC name
+432732  safeStorage
+433851  __Secure-next-auth.session-token
+433929  secure:true cookie attribute
+433939  httpOnly:false cookie attribute
+433951  sameSite:no_restriction cookie attribute
+434118  second session cookie secure:true
+434128  second session cookie httpOnly:false
+434140  second session cookie sameSite:no_restriction
+
+dist/renderer/renderer.js
+149538   wss://eu2.rt.speechmatics.com/v2
+982007   callSession.takeOver
+1011939  google.com/generate_204 connectivity probe
+1043275  scrapeJobPost.scrape
+1151457  api-eu.mixpanel.com
+1214837  /api/chat
+1218835  generateSpeechmaticsApiKey
+1224969  getDisplayMedia
+1233944  /api/trpc
+
+STATICALLY CONSTRUCTED SERVICE ROOTS
+production=https://www.parakeet-ai.com
+staging=https://staging.parakeet-ai.com
+development=http://localhost:3000
+trpc=<service-root>/api/trpc
+chat=<service-root>/api/chat
+login=<service-root>/auth/desktop?protocol=parakeetai
+speech_to_text=wss://eu2.rt.speechmatics.com/v2?jwt=<ephemeral-token>
+telemetry=https://api-eu.mixpanel.com
+connectivity=https://www.google.com/generate_204 and a Cloudflare probe
+
+TRPC PROCEDURE NAMES OBSERVED IN STATIC CALL SITES
+callDocument.getMany
+callSession.aiMessages.get
+callSession.create
+callSession.generateSpeechmaticsApiKey
+callSession.get
+callSession.getMany
+callSession.metadata.update
+callSession.ping
+callSession.reportLiveCallSessionError
+callSession.scrapeJobPost.scrape
+callSession.status.activate
+callSession.status.end
+callSession.status.extendLimitedSession
+callSession.status.restartPlanSession
+callSession.takeOver
+callSession.transcription.createMany
+callSession.transcription.get
+callSession.updateLive
+configuration.getLanguages
+configuration.getMixpanelToken
+configuration.getVercelRegion
+feedback.answerPostCall
+feedback.rateResponse
+feedback.recordCopied
+resume.getMany
+subscription.getState
+user.get
+user.getCountryCode
+user.getSessionForcedLogout
+user.update
+
+The names above are evidence of client call shapes, not proof of server implementation details or authorization behavior.

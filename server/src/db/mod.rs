@@ -25,6 +25,7 @@ pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod jobs;
+pub mod jobs_handoffs;
 pub mod link_codes;
 pub mod metrics;
 pub mod ops_audit;
@@ -1157,6 +1158,29 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX IF NOT EXISTS idx_jobs_local_resume_actions_application
         ON jobs_local_run_resume_actions(account_id, application_id, created_at_ms DESC);
     "#,
+    // 0026 - short-lived, single-use Jobs -> Bluey desktop handoffs.
+    //
+    // Only a SHA-256 digest of the random nonce is retained. The redacted
+    // submitted-application snapshot is encrypted with the existing Jobs data
+    // envelope, and every redemption is account- and audience-scoped.
+    r#"
+    CREATE TABLE IF NOT EXISTS jobs_bluey_handoffs (
+        nonce_hash          TEXT PRIMARY KEY,
+        account_id          TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        application_id      TEXT NOT NULL REFERENCES jobs_applications(id) ON DELETE CASCADE,
+        audience            TEXT NOT NULL,
+        snapshot_json       TEXT NOT NULL,
+        created_at_ms       INTEGER NOT NULL,
+        expires_at_ms       INTEGER NOT NULL,
+        consumed_at_ms      INTEGER,
+        CHECK(length(audience) BETWEEN 1 AND 64),
+        CHECK(expires_at_ms > created_at_ms)
+    );
+    CREATE INDEX IF NOT EXISTS idx_jobs_bluey_handoffs_account
+        ON jobs_bluey_handoffs(account_id, application_id, created_at_ms DESC);
+    CREATE INDEX IF NOT EXISTS idx_jobs_bluey_handoffs_expiry
+        ON jobs_bluey_handoffs(expires_at_ms, consumed_at_ms);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1270,6 +1294,8 @@ const POSTGRES_RUNTIME_SCHEMA: &str =
     include_str!("../../../infra/postgres/server-runtime/001_server_runtime_compat.sql");
 const POSTGRES_JOBS_SCHEMA: &str =
     include_str!("../../../infra/postgres/server-runtime/002_jobs.sql");
+const POSTGRES_JOBS_HANDOFF_SCHEMA: &str =
+    include_str!("../../migrations/postgres/003_jobs_bluey_handoffs.sql");
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
     run_blocking_db(|| run_postgres_migrations_inner(pool))
@@ -1317,6 +1343,15 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
         &[&"002_jobs.sql"],
     )
     .context("record postgres Jobs migration")?;
+
+    conn.batch_execute(POSTGRES_JOBS_HANDOFF_SCHEMA)
+        .context("apply Postgres Jobs desktop handoff schema")?;
+    conn.execute(
+        "INSERT INTO bluey_schema_migrations(version) VALUES ($1)
+         ON CONFLICT (version) DO NOTHING",
+        &[&"003_jobs_bluey_handoffs.sql"],
+    )
+    .context("record Postgres Jobs desktop handoff migration")?;
 
     let vector_ready = conn
         .query_opt("SELECT 1 FROM pg_extension WHERE extname = 'vector'", &[])

@@ -1,0 +1,29 @@
+# SHA-256 provenance for Littlebird 0.81.11 arm64 static audit
+# Generated with shasum -a 256. Paths under /tmp are selected read-only extracts and are not committed.
+
+e6e247957338518d9888c8a16147cc66648ae91d4ef347426146233de066234b  /Users/uno/Downloads/dmg_backtrack_code/Littlebird-Mac-arm64-0.81.11-Installer.dmg
+e1471a8362349c7f143bcf3a87e98af889ba961e74baabd66a3835bca04aef6f  /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/Info.plist
+f13053f4f951f1c74ea0e37968cd4831129345037e16ed72b12b07a8abedfc4d  /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/MacOS/Littlebird
+6f8d78b53c5b343236a3ae9718d8d98207575446cc17adaa540f94c05795605c  /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/Resources/app.asar
+6b3bc98cf1f980d0b297845067b317e153761c4f8ce9c5897c5d60d19f32627b  /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/Resources/app-update.yml
+9426709d639f8983af93de1ac0f2d8e8c4896ee38d07cd076670e97709fc8f13  /Volumes/Littlebird 0.81.11-arm64/Littlebird.app/Contents/Resources/category-seed.sqlite
+4f24248a6553db3dda78034f5d5eb80f63ec309756dffff347f8bdf04061ea0e  Electron Framework binary
+f1aa40016a12d2aa9fd55a715495aa02951731970801ccabc537320e650df0ff  ContextKitCore.app/Contents/MacOS/ContextKit-cli
+06de7a99d1b9eec41dd3f0b8ad08887c6be8f0b7448406c7ece35e5eefeefb9b  LittlebirdAudioTranscription.app executable
+4aab86c92bddd48d72bd6b147af417d2a70d70ab8102b2b1ba03b8e29c6b8faf  app.asar.unpacked window-event native module
+4946d2584afcc50bb722fc0536af803f1d9d5981ed9b119a3ddfeb533ae00f91  app.asar.unpacked permissions native module
+16d9eb1b4c2433ede65bd4511466c65845c6c8f382c3e37e50596a6a7da42dbd  app.asar.unpacked sharp native module
+9dec925772fc4280d83615634582bec94da77fcf3664fc427bc486623d01e33e  app.asar.unpacked libvips dylib
+a393f34d9aec708d73360ec624c72d20edbf47d00c3e868c51158d4de97a04a3  bundled sentry-cli
+7474514721f3f253a32f08dc0ebeff42a1ee87c27d265ab1fafa30d6b0cf42fa  bundled rg
+
+# Selected app.asar extracts
+66d047bd86058b660e4e6e5f07c284428cccfe192c13d5937af94f3d4a5b012d  app.asar/package.json
+50d9c6080d3919770edcb155a86300ab7b1fbcef867431fc1cdaa25a9602cdbd  app.asar/dist-electron/main/index.js
+2306db4ee755735646a0d3c04139c66cee0308791e2640d86dfcccbef955982a  app.asar/dist-electron/preload/index.mjs
+d685e461b50b532fbb901c6ac16b4d8f629679f335a4f1fee59d68b5a3b6cb92  derived beautified preload (analysis aid)
+564ec45fd704fae842fb7cf07854d3963d5009dbb88345b072430ffd14d37afc  app.asar renderer assets/toaster-CZz_iCCw.js.map
+5ddf5ab4321671974c0b0449f126650aa4c53605076af2581c7c49e9ed94db8c  app.asar renderer assets/ExternalLinkHandler-D7Z4nqtc.js.map
+
+# ElectronAsarIntegrity raw-header hash from Info.plist; independently recomputed and matched
+7ec60b0c34bf06ecc6a8d89031bdb8e88bc5b5a26798c955829c2900d98e236c  app.asar raw header string

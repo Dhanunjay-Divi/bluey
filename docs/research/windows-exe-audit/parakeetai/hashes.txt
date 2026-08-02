@@ -1,0 +1,7 @@
+63b29b103609417d5b93370b415a1abcfe2c611439b60e659b37bab44a273977  /Users/uno/Downloads/exe_backtrack_code/ParakeetAI-Setup-3.7.0.exe
+c46e9111af31b3d0a63813d8082f56fd7113499b371e9125ad5821293b40d26c  payload-x64-exact/resources/app.asar
+c46e9111af31b3d0a63813d8082f56fd7113499b371e9125ad5821293b40d26c  payload-arm64-exact/resources/app.asar
+d91d871df5ac01331d590b9d17c45d36d56788d8b175681a1a713a7b393ef473  payload-x64-exact/⠀.exe
+16077ef4b241814f32bbb63af9554808dd276f0bc2174f6d569d70ed18ca4fd9  payload-arm64-exact/⠀.exe
+d8858720429f67378fbed058d4cdea5306b2765355d7eb1029b63c98fa8d8109  payload-x64-exact/resources/app.asar.unpacked/dist/main/4534341dcc507be8dc8c0a40fcca90d5.node
+7865f35c15a9cc68a20935679ca8dd7b974c5ed8e850206659f84a8bd023a8d3  payload-arm64-exact/resources/app.asar.unpacked/dist/main/df93be55d0c90cc0807e8df6d30f13ff.node

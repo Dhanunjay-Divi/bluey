@@ -1,0 +1,65 @@
+Cluely (New) 2.1.19 — runtime assessment
+Captured: 2026-07-12
+
+Runtime status: ONE BOUNDED PRE-READINESS PROBE COMPLETED; NO UI OR AUTHENTICATED RUNTIME.
+
+Static blocker
+--------------
+The production main process calls app.moveToApplicationsFolder() at
+dist-electron/main.js:16938 before normal application readiness. Immediately after
+readiness, the updater is configured to query/download releases and later invoke
+quitAndInstall; login-item registration is also initialized by the application.
+
+A direct launch from the read-only DMG therefore creates an unnecessary risk of:
+  * copying the application into /Applications or ~/Applications;
+  * starting an updater request/download;
+  * changing login-item state;
+  * creating normal userData/log/cookie/profile state; and
+  * prompting for microphone, screen-recording, accessibility, camera, or Bluetooth.
+
+The assigned runtime boundary requires all writes and application-move attempts to
+be denied outside an isolated root, outbound network to be blocked, permissions and
+credentials not to be supplied, and the probe to remain short and unauthenticated.
+Containment validation
+----------------------
+A fresh `/private/tmp/cluely-runtime-probe.*` root was created. An inherited macOS
+`sandbox-exec` profile allowed default reads/execution but denied every file write
+outside that exact root, denied all network operations, and denied Apple-event sends.
+Before the app probe, four harmless assertions were executed under the identical
+profile:
+  isolated-root write: ALLOWED
+  /Users/uno/Applications write: DENIED (Operation not permitted)
+  /Applications write: DENIED (Operation not permitted)
+  outbound DNS/HTTPS: DENIED
+
+Probe
+-----
+The mounted app executable was invoked directly, not through `open`, so the sandbox
+was inherited by the process and descendants. HOME, TMPDIR, XDG cache/config/data,
+and Chromium user-data were set beneath the isolated root. No `--no-sandbox` flag was
+used. No credentials, clicks, permissions, or network were supplied.
+
+Duration: 8.007 seconds
+Exit: process group received SIGTERM at the timeout; exit code -15
+stdout: empty
+stderr: empty
+Application-created files inside isolated root: none
+Application at /Applications before/after: absent/absent
+Application at /Users/uno/Applications before/after: absent/absent
+Matching app descendants after termination: none
+
+LaunchServices had zero matching bundle-ID entries before the direct launch and
+three matching entries after it. `lsregister -u` was run only for the mounted
+`Cluely (New).app`; a second dump verified zero matching entries. No broader registry
+reset was performed.
+
+Interpretation
+--------------
+The no-output/no-profile stall is consistent with a pre-readiness native move/dialog
+boundary, and the LaunchServices change confirms startup advanced far enough to
+register the bundle. It does not prove a completed move attempt, updater behavior,
+login-item mutation, or any renderer/UI feature. The static `app.moveToApplicationsFolder()`
+call at line 16938 remains the direct evidence for the boundary.
+
+Static conclusions do not rely on this probe. Items requiring authenticated or visual
+runtime remain labeled unknown in the audit documents.

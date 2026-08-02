@@ -1,0 +1,72 @@
+Littlebird static feature evidence
+==================================
+
+E-LB-FEAT-001 — Onboarding and authentication
+Sources: onboarding.lazy-BXdpe7Fp.js.map and login.lazy-BhcLDjbV.js.map original sources
+Observed:
+- Onboarding sequence includes User Details, Accessibility, Meeting Notes, Integrations, Hummingbird, Data Sharing, Referral Code, and Done.
+- Permission request paths exist for Accessibility and microphone-related capabilities.
+- Authentication providers are Google, Apple, and passwordless email OTP through Auth0.
+- Desktop login opens the public website, then receives access and refresh tokens through the little-bird://auth-callback custom URL.
+
+E-LB-FEAT-002 — General assistant and context
+Sources: renderer route tree/stores in index-CvQr8BBx.js.map, main IPC, and ContextKit evidence E-LB-ARCH-008
+Observed product areas:
+- Chats with multiple modes, projects, journal, routines/reports, meetings, world model/knowledge graph, arenas, sprites/sandbox, MCP grants, notifications, and hummingbird multi-window UI.
+- Native context observation uses app/domain/category exclusions, accessibility-tree parsers, screenshot/JSON context paths, and a generic fallback.
+- The evidence supports a general contextual AI assistant; it does not show a job-application-specific workflow.
+
+E-LB-FEAT-003 — Meetings and transcription
+Sources: main process helper lifecycle, meeting renderer assets/source maps, native helper imports/symbols
+Observed:
+- Meeting detection/status UI, audio capture/transcription helper, transcript/import API routes, meeting panel, and calendar-aware behavior are present.
+- Update installation is blocked during an active meeting.
+Unknown: transcription accuracy, server retention, and permission-prompt behavior require runtime/authenticated validation.
+
+E-LB-FEAT-004 — Integrations and multi-account
+Sources: renderer integration stores/source map and API route strings
+Observed:
+- OAuth integration models support multiple accounts.
+- Google Calendar and Gmail connection paths appear in onboarding.
+- Email draft fetch/update/send operations and calendar integration paths are present.
+- ContextKit resources also include Outlook, Slack, Teams, iMessage/Contacts, and multiple productivity app parsers.
+Boundary: a parser is not equivalent to an authenticated provider integration; the two are distinguished in the audit.
+
+E-LB-FEAT-005 — Billing and limits
+Sources: subscription.lazy-zBYfhcPY.js.map and API route strings
+Observed:
+- Basic, Plus, Power, and Pro plan UI; monthly/annual selection and trial paths.
+- Per-feature limits for meetings, chats, research, image generation, journals, and routines.
+- Purchased credits, team pool, auto-refill, monthly cap, invoices, Stripe checkout/portal, cancellation, and retention-offer flows.
+Unknown: server-side enforcement and current prices were not validated.
+
+E-LB-FEAT-006 — Privacy, deletion, and export
+Sources: renderer settings/delete routes, main-to-helper messages, and API route strings
+Observed:
+- Context deletion scopes include last hour, last day, custom range, and all; deletion is sent to backend and native helper paths.
+- Account deletion and deletion-feedback endpoints/UI are present.
+- Data export is represented as a request workflow rather than an immediately generated local archive.
+- Exclusions support applications, domains, and content categories.
+Unknown: remote deletion completeness and retention windows require server/runtime evidence.
+
+E-LB-FEAT-007 — Static job-workflow search
+Sources searched: asar path list, package metadata, extracted main/preload bundles, renderer route tree and shipped sourcesContent
+Observed:
+- No dedicated job discovery/ranking model, resume import/tailoring/diff/export workflow, ATS adapter registry, application answer memory, application queue, duplicate-application guard, job-submission receipt, or application-outcome tracker was found.
+- Generic assistant context and email/calendar functionality could support user-authored job work, but no evidence ties those capabilities into a job application state machine.
+Boundary: this is a static negative finding. Authenticated server-delivered capabilities or future feature flags remain unknown.
+
+E-LB-FEAT-008 — Automation and recovery
+Sources: E-LB-ARCH-004 through E-LB-ARCH-006 and Axon tool paths in main bundle
+Observed:
+- Native helper and audio helper supervise/restart locally with capped exponential backoff.
+- WebSocket reconnect handles sleep/resume and rejects pending callbacks on reconnect.
+- An Axon local-tool path validates inputs, evaluates allow/ask/deny policy, supports time-bounded consent with read/update/destroy risk classes, and posts tool results to the backend.
+- No durable worker lease, idempotency key, or disk-backed retry queue comparable to Bluey's application runner was found.
+
+E-LB-FEAT-009 — CAPTCHA, 2FA, assessments, and takeover
+Sources searched as in E-LB-FEAT-007
+Observed:
+- Auth0 email OTP is an account-login method.
+- No job-application CAPTCHA/2FA/assessment intervention model or job-scoped browser-takeover state machine was found.
+- Axon consent prompts are local-tool authorization, not evidence of an ATS challenge handoff.

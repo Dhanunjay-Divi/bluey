@@ -31,6 +31,7 @@ import {
   safeLocalFailure,
   type LocalFailureClassification,
 } from "./local-failure.js";
+import { localRunCapabilities, localRunRequestPayload } from "./local-capability.js";
 import { identityContextKey, identityProfileDirectory } from "./profile.js";
 import {
   isApprovedLocalResumeAction,
@@ -55,7 +56,9 @@ interface StartRunRequest {
 
 interface LocalRunDelivery {
   apiOrigin: string;
-  ticket: string;
+  protocolTicket: string;
+  resultCapability: string;
+  resumeCapability: string;
 }
 
 interface ActiveLocalRun {
@@ -192,11 +195,11 @@ async function executeLocalRequest(
       if (approved) active.approvedSubmitActionConsumed = true;
       if (!approved) {
         const pending = pendingProviderReviewReceipt();
-        pending.intervention!.takeoverUrl = localResumeUrl(request.runId, delivery.ticket);
+        pending.intervention!.takeoverUrl = localResumeUrl(request.runId, delivery.protocolTicket);
         await showControllerPage(interventionPage(
           pending.intervention!.title,
           pending.intervention!.detail,
-          localResumeUrl(request.runId, delivery.ticket),
+          localResumeUrl(request.runId, delivery.protocolTicket),
         ));
         return {
           status: pending.status,
@@ -254,7 +257,7 @@ async function executeLocalRequest(
     throw new LocalBrowserError("submit_outcome_unknown");
   }
   if (execution.receipt.status === "needs_input" && execution.receipt.intervention) {
-    execution.receipt.intervention.takeoverUrl = localResumeUrl(request.runId, delivery.ticket);
+    execution.receipt.intervention.takeoverUrl = localResumeUrl(request.runId, delivery.protocolTicket);
   }
   const job = request.job ?? await resolveJob(execution.adapter, browserPage);
   const screenshotPath = join(runDirectory, "final.png");
@@ -320,7 +323,7 @@ async function executeLocalRequest(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      ticket: delivery.ticket,
+      capability: delivery.resultCapability,
       receipt: execution.receipt,
       receiptBundle: bundle,
       evidenceObjects,
@@ -331,7 +334,7 @@ async function executeLocalRequest(
     await showControllerPage(interventionPage(
       execution.receipt.intervention?.title || "Application needs your input",
       execution.receipt.intervention?.detail || "Complete this step in the application browser.",
-      localResumeUrl(request.runId, delivery.ticket),
+      localResumeUrl(request.runId, delivery.protocolTicket),
     ));
   } else {
     activeLocalRuns.delete(request.runId);
@@ -513,20 +516,27 @@ async function openProtocolUrl(rawUrl: string): Promise<void> {
         body: JSON.stringify({ ticket }),
       });
       if (!response.ok) throw new LocalBrowserError("launch_expired");
-      const request = await response.json() as StartRunRequest;
+      const claim = await response.json() as unknown;
+      const capabilities = localRunCapabilities(claim, runId);
+      const request = localRunRequestPayload(claim) as unknown as StartRunRequest;
       if (request.runId !== runId) throw new LocalBrowserError("launch_mismatch");
-      const delivery = { apiOrigin, ticket };
+      const delivery: LocalRunDelivery = {
+        apiOrigin,
+        protocolTicket: ticket,
+        resultCapability: capabilities.result,
+        resumeCapability: capabilities.resume,
+      };
       try {
         await executeLocalRequest(request, delivery);
       } catch (error) {
         const failure = await reportLocalFailure(request, delivery, error);
-        await showLocalFailurePage(request.runId, delivery.ticket, failure);
+        await showLocalFailurePage(request.runId, delivery.protocolTicket, failure);
       }
       return;
     }
     if (command.action === "resume") {
       const active = activeLocalRuns.get(runId);
-      if (!active || active.delivery.ticket !== ticket) {
+      if (!active || active.delivery.protocolTicket !== ticket) {
         throw new LocalBrowserError("run_not_active");
       }
       await showControllerPage(loadingPage("Checking the application"));
@@ -561,7 +571,7 @@ async function reportLocalFailure(
         kind: "browser_takeover",
         title: "Confirm the application result",
         detail: failure.message,
-        takeoverUrl: localResumeUrl(request.runId, delivery.ticket),
+        takeoverUrl: localResumeUrl(request.runId, delivery.protocolTicket),
         resolution: { kind: "browser_takeover", resumeAfter: true },
       }
     : undefined;
@@ -569,7 +579,7 @@ async function reportLocalFailure(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      ticket: delivery.ticket,
+      capability: delivery.resultCapability,
       receipt: {
         status: failure.status,
         errorCode: failure.code,
@@ -591,7 +601,7 @@ async function consumeApprovedLocalSubmitAction(
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ticket: delivery.ticket }),
+        body: JSON.stringify({ capability: delivery.resumeCapability }),
       },
     );
     if (!response.ok) return false;

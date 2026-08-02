@@ -1,6 +1,6 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
-#define _WIN32_WINNT 0x0601
+#define _WIN32_WINNT 0x0A00
 
 #include <initguid.h>
 #include <audioclient.h>
@@ -15,7 +15,7 @@
 #include <windows.h>
 #include <io.h>
 
-#define BLUEY_TARGET_SAMPLE_RATE 16000.0
+#include "resampler.h"
 
 static const GUID BLUEY_SUBTYPE_PCM = {
     0x00000001,
@@ -46,32 +46,34 @@ typedef struct Args {
     CaptureSource source;
     DWORD duration_ms;
     int continuous;
+    int valid;
 } Args;
-
-typedef struct Resampler {
-    double ratio;
-    double carry;
-    double window_sum;
-    unsigned int window_count;
-} Resampler;
 
 static Args parse_args(int argc, char **argv) {
     Args args;
     args.source = CAPTURE_SOURCE_SYSTEM;
     args.duration_ms = 3000;
     args.continuous = 0;
+    args.valid = 1;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--source") == 0 && i + 1 < argc) {
             i++;
             if (strcmp(argv[i], "microphone") == 0) {
                 args.source = CAPTURE_SOURCE_MICROPHONE;
-            } else {
+            } else if (strcmp(argv[i], "system") == 0) {
                 args.source = CAPTURE_SOURCE_SYSTEM;
+            } else {
+                args.valid = 0;
             }
         } else if (strcmp(argv[i], "--duration-ms") == 0 && i + 1 < argc) {
             i++;
-            long value = strtol(argv[i], NULL, 10);
+            char *end = NULL;
+            long value = strtol(argv[i], &end, 10);
+            if (end == argv[i] || *end != '\0') {
+                args.valid = 0;
+                continue;
+            }
             if (value < 250) {
                 value = 250;
             }
@@ -81,6 +83,8 @@ static Args parse_args(int argc, char **argv) {
             args.duration_ms = (DWORD)value;
         } else if (strcmp(argv[i], "--continuous") == 0) {
             args.continuous = 1;
+        } else {
+            args.valid = 0;
         }
     }
 
@@ -162,30 +166,13 @@ static float read_channel_sample(const BYTE *sample, const WAVEFORMATEX *format,
     }
 }
 
-static void write_resampled_i16(Resampler *resampler, float sample) {
-    resampler->window_sum += (double)sample;
-    resampler->window_count += 1;
-    resampler->carry += 1.0;
-    const double samples_per_output = resampler->ratio > 0.0 ? (1.0 / resampler->ratio) : 1.0;
-    while (resampler->carry >= samples_per_output) {
-        double averaged = resampler->window_count > 0
-            ? resampler->window_sum / (double)resampler->window_count
-            : (double)sample;
-        if (averaged > 1.0) {
-            averaged = 1.0;
-        } else if (averaged < -1.0) {
-            averaged = -1.0;
-        }
-        int16_t out = (int16_t)(averaged * 32767.0);
-        fwrite(&out, sizeof(int16_t), 1, stdout);
-        resampler->carry -= samples_per_output;
-        resampler->window_sum = 0.0;
-        resampler->window_count = 0;
-    }
+static int write_stdout_sample(int16_t sample, void *context) {
+    (void)context;
+    return fwrite(&sample, sizeof(sample), 1, stdout) == 1;
 }
 
-static void write_frames_as_16k_mono_i16(
-    Resampler *resampler,
+static int write_frames_as_16k_mono_i16(
+    BlueyResampler *resampler,
     const BYTE *data,
     UINT32 frame_count,
     DWORD flags,
@@ -202,22 +189,77 @@ static void write_frames_as_16k_mono_i16(
                 mono += read_channel_sample(frame_data, format, channel) / (float)channel_count;
             }
         }
-        write_resampled_i16(resampler, mono);
+        if (!bluey_resampler_push(resampler, mono, write_stdout_sample, NULL)) {
+            return 0;
+        }
     }
+    return 1;
 }
 
-static int fail_hr(const char *label, HRESULT hr) {
-    fprintf(stderr, "bluey windows audio helper failed: %s (0x%08lx)\n", label, (unsigned long)hr);
+static const char *source_name(CaptureSource source) {
+    return source == CAPTURE_SOURCE_MICROPHONE ? "microphone" : "system";
+}
+
+static void emit_ready(CaptureSource source) {
+    fprintf(
+        stderr,
+        "{\"event\":\"ready\",\"source\":\"%s\",\"backend\":\"wasapi\",\"format\":{\"sample_rate_hz\":16000,\"channel_count\":1,\"sample_format\":\"i16\"}}\n",
+        source_name(source)
+    );
+    fflush(stderr);
+}
+
+static void emit_stopped(CaptureSource source, const char *reason) {
+    fprintf(
+        stderr,
+        "{\"event\":\"stopped\",\"source\":\"%s\",\"reason\":\"%s\"}\n",
+        source_name(source),
+        reason
+    );
+    fflush(stderr);
+}
+
+static int fail_hr(CaptureSource source, const char *label, HRESULT hr) {
+    if (hr == E_ACCESSDENIED) {
+        fprintf(
+            stderr,
+            "{\"event\":\"permission_denied\",\"source\":\"%s\",\"permission\":\"%s\",\"message\":\"audio capture access denied\"}\n",
+            source_name(source),
+            source == CAPTURE_SOURCE_MICROPHONE ? "microphone" : "system_audio"
+        );
+        fflush(stderr);
+        return 3;
+    }
+    const int recoverable = hr == AUDCLNT_E_DEVICE_INVALIDATED
+        || hr == AUDCLNT_E_SERVICE_NOT_RUNNING
+        || hr == AUDCLNT_E_RESOURCES_INVALIDATED;
+    fprintf(
+        stderr,
+        "{\"event\":\"error\",\"source\":\"%s\",\"code\":\"hresult_%08lx\",\"message\":\"%s\",\"recoverable\":%s}\n",
+        source_name(source),
+        (unsigned long)hr,
+        label,
+        recoverable ? "true" : "false"
+    );
+    fflush(stderr);
     return 1;
 }
 
 int main(int argc, char **argv) {
     Args args = parse_args(argc, argv);
+    if (!args.valid) {
+        fprintf(
+            stderr,
+            "{\"event\":\"error\",\"code\":\"invalid_arguments\",\"message\":\"expected --source system|microphone, --duration-ms 250..30000, or --continuous\",\"recoverable\":false}\n"
+        );
+        fflush(stderr);
+        return 2;
+    }
     _setmode(_fileno(stdout), _O_BINARY);
 
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
     if (FAILED(hr)) {
-        return fail_hr("CoInitializeEx", hr);
+        return fail_hr(args.source, "CoInitializeEx", hr);
     }
 
     IMMDeviceEnumerator *enumerator = NULL;
@@ -225,6 +267,7 @@ int main(int argc, char **argv) {
     IAudioClient *audio_client = NULL;
     IAudioCaptureClient *capture_client = NULL;
     WAVEFORMATEX *mix_format = NULL;
+    HANDLE capture_event = NULL;
     int exit_code = 1;
 
     hr = CoCreateInstance(
@@ -235,31 +278,48 @@ int main(int argc, char **argv) {
         (void **)&enumerator
     );
     if (FAILED(hr)) {
-        exit_code = fail_hr("CoCreateInstance IMMDeviceEnumerator", hr);
+        exit_code = fail_hr(args.source, "CoCreateInstance IMMDeviceEnumerator", hr);
         goto cleanup;
     }
 
     EDataFlow flow = args.source == CAPTURE_SOURCE_SYSTEM ? eRender : eCapture;
     hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, flow, eConsole, &device);
     if (FAILED(hr)) {
-        exit_code = fail_hr("GetDefaultAudioEndpoint", hr);
+        exit_code = fail_hr(args.source, "GetDefaultAudioEndpoint", hr);
         goto cleanup;
     }
 
     hr = IMMDevice_Activate(device, &IID_IAudioClient, CLSCTX_ALL, NULL, (void **)&audio_client);
     if (FAILED(hr)) {
-        exit_code = fail_hr("Activate IAudioClient", hr);
+        exit_code = fail_hr(args.source, "Activate IAudioClient", hr);
         goto cleanup;
     }
 
     hr = IAudioClient_GetMixFormat(audio_client, &mix_format);
     if (FAILED(hr)) {
-        exit_code = fail_hr("GetMixFormat", hr);
+        exit_code = fail_hr(args.source, "GetMixFormat", hr);
+        goto cleanup;
+    }
+    if (mix_format->nSamplesPerSec < 8000 || mix_format->nSamplesPerSec > 384000
+        || mix_format->nChannels == 0
+        || mix_format->nBlockAlign == 0
+        || (!format_is_float(mix_format) && !format_is_pcm(mix_format))) {
+        fprintf(
+            stderr,
+            "{\"event\":\"error\",\"source\":\"%s\",\"code\":\"unsupported_mix_format\",\"message\":\"WASAPI returned an unsupported mix format\",\"recoverable\":false}\n",
+            source_name(args.source)
+        );
+        fflush(stderr);
+        exit_code = 1;
         goto cleanup;
     }
 
-    DWORD stream_flags = args.source == CAPTURE_SOURCE_SYSTEM ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
-    REFERENCE_TIME buffer_duration = 10000000;
+    DWORD stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    if (args.source == CAPTURE_SOURCE_SYSTEM) {
+        stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+    }
+    /* 100 ms protects against scheduler jitter while event wakeups preserve low latency. */
+    REFERENCE_TIME buffer_duration = 1000000;
     hr = IAudioClient_Initialize(
         audio_client,
         AUDCLNT_SHAREMODE_SHARED,
@@ -270,40 +330,77 @@ int main(int argc, char **argv) {
         NULL
     );
     if (FAILED(hr)) {
-        exit_code = fail_hr("IAudioClient Initialize", hr);
+        exit_code = fail_hr(args.source, "IAudioClient Initialize", hr);
+        goto cleanup;
+    }
+
+    capture_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (capture_event == NULL) {
+        fprintf(
+            stderr,
+            "{\"event\":\"error\",\"source\":\"%s\",\"code\":\"event_create_failed\",\"message\":\"could not create WASAPI event\",\"recoverable\":false}\n",
+            source_name(args.source)
+        );
+        fflush(stderr);
+        exit_code = 1;
+        goto cleanup;
+    }
+    hr = IAudioClient_SetEventHandle(audio_client, capture_event);
+    if (FAILED(hr)) {
+        exit_code = fail_hr(args.source, "SetEventHandle", hr);
         goto cleanup;
     }
 
     hr = IAudioClient_GetService(audio_client, &IID_IAudioCaptureClient, (void **)&capture_client);
     if (FAILED(hr)) {
-        exit_code = fail_hr("GetService IAudioCaptureClient", hr);
+        exit_code = fail_hr(args.source, "GetService IAudioCaptureClient", hr);
         goto cleanup;
     }
 
-    Resampler resampler;
-    resampler.ratio = BLUEY_TARGET_SAMPLE_RATE / (double)mix_format->nSamplesPerSec;
-    resampler.carry = 0.0;
-    resampler.window_sum = 0.0;
-    resampler.window_count = 0;
+    BlueyResampler resampler;
+    if (!bluey_resampler_init(&resampler, (double)mix_format->nSamplesPerSec)) {
+        exit_code = 1;
+        goto cleanup;
+    }
 
     hr = IAudioClient_Start(audio_client);
     if (FAILED(hr)) {
-        exit_code = fail_hr("IAudioClient Start", hr);
+        exit_code = fail_hr(args.source, "IAudioClient Start", hr);
         goto cleanup;
     }
+    emit_ready(args.source);
 
     ULONGLONG end_tick = args.continuous ? ULLONG_MAX : (GetTickCount64() + args.duration_ms);
     while (GetTickCount64() < end_tick) {
-        UINT32 packet_frames = 0;
-        hr = IAudioCaptureClient_GetNextPacketSize(capture_client, &packet_frames);
-        if (FAILED(hr)) {
-            exit_code = fail_hr("GetNextPacketSize", hr);
+        DWORD wait_ms = 1000;
+        if (!args.continuous) {
+            ULONGLONG now = GetTickCount64();
+            if (now >= end_tick) {
+                break;
+            }
+            ULONGLONG remaining = end_tick - now;
+            wait_ms = (DWORD)(remaining < wait_ms ? remaining : wait_ms);
+        }
+        DWORD wait_result = WaitForSingleObject(capture_event, wait_ms);
+        if (wait_result == WAIT_TIMEOUT) {
+            continue;
+        }
+        if (wait_result != WAIT_OBJECT_0) {
+            fprintf(
+                stderr,
+                "{\"event\":\"error\",\"source\":\"%s\",\"code\":\"event_wait_failed\",\"message\":\"WASAPI event wait failed\",\"recoverable\":true}\n",
+                source_name(args.source)
+            );
+            fflush(stderr);
+            exit_code = 1;
             goto stop;
         }
 
-        if (packet_frames == 0) {
-            Sleep(5);
-            continue;
+        UINT32 packet_frames = 0;
+        hr = IAudioCaptureClient_GetNextPacketSize(capture_client, &packet_frames);
+        if (FAILED(hr)) {
+            exit_code = fail_hr(args.source, "GetNextPacketSize", hr);
+            goto stop;
         }
 
         while (packet_frames > 0) {
@@ -312,17 +409,32 @@ int main(int argc, char **argv) {
             DWORD flags = 0;
             hr = IAudioCaptureClient_GetBuffer(capture_client, &data, &frame_count, &flags, NULL, NULL);
             if (FAILED(hr)) {
-                exit_code = fail_hr("GetBuffer", hr);
+                exit_code = fail_hr(args.source, "GetBuffer", hr);
                 goto stop;
             }
 
-            write_frames_as_16k_mono_i16(&resampler, data, frame_count, flags, mix_format);
-            fflush(stdout);
-            IAudioCaptureClient_ReleaseBuffer(capture_client, frame_count);
+            if (!write_frames_as_16k_mono_i16(
+                    &resampler, data, frame_count, flags, mix_format
+                ) || fflush(stdout) != 0 || ferror(stdout)) {
+                IAudioCaptureClient_ReleaseBuffer(capture_client, frame_count);
+                fprintf(
+                    stderr,
+                    "{\"event\":\"error\",\"source\":\"%s\",\"code\":\"stdout_closed\",\"message\":\"audio consumer closed the stream\",\"recoverable\":false}\n",
+                    source_name(args.source)
+                );
+                fflush(stderr);
+                exit_code = 0;
+                goto stop;
+            }
+            hr = IAudioCaptureClient_ReleaseBuffer(capture_client, frame_count);
+            if (FAILED(hr)) {
+                exit_code = fail_hr(args.source, "ReleaseBuffer", hr);
+                goto stop;
+            }
 
             hr = IAudioCaptureClient_GetNextPacketSize(capture_client, &packet_frames);
             if (FAILED(hr)) {
-                exit_code = fail_hr("GetNextPacketSize after buffer", hr);
+                exit_code = fail_hr(args.source, "GetNextPacketSize after buffer", hr);
                 goto stop;
             }
         }
@@ -330,11 +442,15 @@ int main(int argc, char **argv) {
 
     fflush(stdout);
     exit_code = 0;
+    emit_stopped(args.source, "duration_complete");
 
 stop:
     IAudioClient_Stop(audio_client);
 
 cleanup:
+    if (capture_event != NULL) {
+        CloseHandle(capture_event);
+    }
     if (mix_format != NULL) {
         CoTaskMemFree(mix_format);
     }

@@ -691,6 +691,10 @@ pub struct AnswerContext {
     pub content: String,
     pub title: Option<String>,
     pub source: Option<String>,
+    /// Optional digest of the exact file bytes the user approved. Consumers
+    /// must verify this immediately before reading an image for a provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_sha256: Option<String>,
     #[serde(default)]
     pub sensitivity: DataSensitivity,
 }
@@ -702,6 +706,7 @@ impl AnswerContext {
             content: content.into(),
             title: None,
             source: None,
+            integrity_sha256: None,
             sensitivity: DataSensitivity::default(),
         }
     }
@@ -717,6 +722,11 @@ impl AnswerContext {
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_integrity_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.integrity_sha256 = Some(sha256.into());
         self
     }
 

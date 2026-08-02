@@ -1,0 +1,14 @@
+Bluey product policy notice
+
+License identifier: LicenseRef-Bluey-Proprietary
+Terms: https://bluey.sh/terms
+
+Automated extraction, redistribution, and use of Bluey binaries or bundled
+materials for model training are prohibited except where the terms or a
+separate written agreement explicitly permit them.
+
+Machine-readable policy:
+{"schema_version":1,"product":"Bluey","license":"LicenseRef-Bluey-Proprietary","automated_extraction":"prohibited","model_training":"prohibited","redistribution":"prohibited","terms_url":"https://bluey.sh/terms","notice_only":true}
+
+This notice communicates policy and provenance. It is not a DRM or security
+boundary and does not claim that client-side code is impossible to inspect.

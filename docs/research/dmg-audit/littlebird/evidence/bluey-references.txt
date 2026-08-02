@@ -1,0 +1,70 @@
+Bluey code references used for Littlebird comparison
+====================================================
+
+E-LB-BLUEY-001 — Local Electron/browser boundary
+- jobs/browser/src/main.ts:94-116: contextIsolation=true, nodeIntegration=false, sandbox=true, protocol navigation/window-open denial.
+- jobs/browser/src/main.ts:123-170: request identity validation, public URL policy, durable final-submit marker, materialized documents, identity busy guard, isolated context selection.
+- jobs/browser/src/profile.ts:4-33: hashed account and application-identity profile directories/context keys.
+
+E-LB-BLUEY-002 — Encrypted cloud browser profiles
+- jobs/runner/src/profile-store.ts:17-32: account+application-identity profile scope and 32-byte external key requirement.
+- jobs/runner/src/profile-store.ts:35-70: restore/seal lifecycle and encrypted snapshot cleanup.
+- jobs/runner/src/crypto-envelope.ts:7-21: versioned envelope and authenticated context types.
+- jobs/runner/src/crypto-envelope.ts:43-78: AES-256-GCM, HKDF-derived key, AAD, unique IV, durable replacement.
+- jobs/runner/src/crypto-envelope.ts:80-130: authenticated decryption and version/error handling.
+
+E-LB-BLUEY-003 — ATS adapters and generic fallback
+- jobs/automation/src/execute.ts:19-53: provider-first Greenhouse/Lever registry plus standard/semantic fallbacks.
+- jobs/automation/src/execute.ts:56-97: prepare/fill/validate/submit state sequence and intervention on blocking issues.
+- jobs/automation/src/providers/lever.ts:14-34,93-99,166-209: provider identity, strict submit selectors, and challenge behavior.
+
+E-LB-BLUEY-004 — Challenge handoff
+- jobs/automation/src/challenge-handling.ts:6-21: CAPTCHA, email/SMS OTP, authenticator, push, and assessment challenge model.
+- jobs/automation/src/challenge-handling.ts:23-89: intervention mapping and explicit browser takeover.
+- jobs/automation/src/challenge-handling.ts:92-141: ephemeral email-code handling and expiration constraints.
+- server/src/db/jobs.rs:5657-5740: persisted interventions reject authentication codes/credentials.
+
+E-LB-BLUEY-005 — Answer memory and document tailoring
+- jobs/automation/src/answer-memory.ts:1-103: normalized scoped answer memory and safe reuse behavior.
+- server/src/db/jobs.rs:4771-4813: confirmed answer selection by company, track, and account priority.
+- server/src/db/jobs.rs:5791-5952: normalized, confirmed, bounded answer-memory storage and private lookup hash.
+- jobs/automation/src/documents.ts:58-82: materialized tailored resume and cover-letter PDFs with hashes.
+- jobs/automation/src/form-intelligence.ts:90-109: upload planning for tailored application documents.
+
+E-LB-BLUEY-006 — Receipts and evidence
+- jobs/automation/src/receipts.ts:100-128: confirmation and exact-resume evidence construction.
+- jobs/automation/src/receipts.ts:131-168: receipt finalization and fingerprinting.
+- jobs/automation/src/receipts.ts:198-204: screenshot evidence attachment.
+- server/src/db/jobs.rs:5103-5135: submission state transition requires exact resume and confirmation evidence.
+
+E-LB-BLUEY-007 — Discovery, queueing, and idempotency
+- jobs/workflows/src/discovery.ts:7-18: discovery candidates and source provenance model.
+- jobs/workflows/src/discovery.ts:20-78: source configuration and validation.
+- jobs/workflows/src/discovery.ts:87-125: candidate normalization/ranking inputs.
+- jobs/workflows/src/discovery.ts:136-203: persisted discovery flow, duplicate handling, and retry-aware orchestration.
+- jobs/workflows/src/discovery.ts:213-222: retry policy.
+- jobs/workflows/src/activities.ts:10-50: account/application-identity scoped profile and durable activity input.
+- jobs/workflows/src/activities.ts:53-98: execution/receipt activity boundary.
+
+E-LB-BLUEY-008 — Server APIs and account controls
+- server/src/api/jobs.rs:50-134: profile, applications, evidence, interventions, answers, and identities routes.
+- server/src/api/jobs.rs:185-194: internal receipt endpoint.
+- server/src/api/mod.rs:165-189: protected API routing.
+- server/src/api/mod.rs:257-277: billing, export, and account deletion routes.
+- server/src/api/account.rs:769-888: hard-delete workflow.
+
+E-LB-BLUEY-009 — Application preparation
+- server/src/db/jobs.rs:4593-4768: tailored resume selection, answer-memory injection, review/auto-submit eligibility, identity snapshot, candidate-truth fingerprint, and metering receipt.
+
+E-LB-BLUEY-010 — Bluey desktop meeting, context, answer, and memory product
+- crates/cue-daemon/src/cloud/meeting_detect.rs:3-23,53-97: macOS frontmost-app meeting detection for Zoom, Teams, Slack, Webex, Chrome/Meet, and Arc.
+- crates/cue-daemon/src/app.rs:3459-3603: session-scoped native audio runtime for enabled system and microphone sources.
+- crates/cue-daemon/src/app.rs:3606-3646 and crates/cue-daemon/src/stt/factory.rs:1-135: system/microphone STT and Deepgram → OpenAI Realtime → local Whisper fallback chain.
+- crates/cue-daemon/src/app.rs:7608-7718: partial/final transcript streaming to overlay/dashboard, near-duplicate suppression, persistence, action/decision extraction, cloud sync, and RAG indexing.
+- crates/cue-daemon/src/app.rs:3151-3184: explicit user-approved periodic screenshot context.
+- crates/cue-daemon/src/app.rs:14049-14151: active-page-first screen analysis with screenshot fallback and context attachment.
+- crates/cue-daemon/src/app.rs:14234-14379: macOS active Chrome/Edge/Brave/Arc/Chromium/Safari page text capture; Windows UI Automation implementation continues at 14382-14452.
+- crates/cue-core/src/overlay.rs:26-128: context/session items, transcript/card commands, and ask events for the native overlay.
+- crates/cue-daemon/src/app.rs:7947-8265: context-aware answer routing and streamed overlay answer lifecycle.
+- crates/cue-daemon/src/rag_indexer.rs:148-228,259-307: transcript/context indexing, current/global retrieval, session deletion/rebuild, and indexing of summaries, prior answers, final transcripts, and artifacts.
+- crates/cue-daemon/src/db/rag.rs:35-93: indexing user-approved documents, page captures, screenshot notes, and source previews.

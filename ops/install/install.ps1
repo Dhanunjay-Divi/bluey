@@ -7,8 +7,10 @@
 #   %LOCALAPPDATA%\Bluey\bin
 #
 # The update path runs this script only after the CLI verifies latest.json.sig.
-# Direct installs still verify the downloaded Windows artifact SHA256 from
-# latest.json or the release SHA256SUMS.txt.
+# Direct installs use the HTTPS-delivered bootstrap script as their trust root
+# and verify the artifact SHA256 supplied by that same origin. Updates are
+# stronger: the installed CLI verifies latest.json.sig before handing the
+# manifest-pinned artifact SHA256 to this script.
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
@@ -29,7 +31,16 @@ $InstallRoot = if (![string]::IsNullOrWhiteSpace($env:BLUEY_INSTALL_ROOT)) {
     Join-Path $env:LOCALAPPDATA "Bluey"
 }
 $BinDir = Join-Path $InstallRoot "bin"
-$Platform = "windows-x86_64"
+$Platform = if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64" -or $env:PROCESSOR_ARCHITEW6432 -eq "ARM64") {
+    "windows-arm64"
+} else {
+    "windows-x86_64"
+}
+$InstallContext = if ([string]::IsNullOrWhiteSpace($env:BLUEY_INSTALL_CONTEXT)) {
+    "direct"
+} else {
+    $env:BLUEY_INSTALL_CONTEXT
+}
 
 function Write-Step {
     param([string]$Message)
@@ -49,7 +60,15 @@ function Write-Warn {
 function Fail {
     param([string]$Message)
     Write-Host "ERROR  $Message" -ForegroundColor Red
-    exit 1
+    throw $Message
+}
+
+$DownloadUri = [Uri]$DownloadHost
+if ($DownloadUri.Scheme -ne "https" -and $env:BLUEY_INSTALL_ALLOW_INSECURE_HOST -ne "1") {
+    Fail "Bluey installation requires HTTPS. Set BLUEY_INSTALL_ALLOW_INSECURE_HOST=1 only for an isolated development host."
+}
+if ($InstallContext -eq "update" -and [string]::IsNullOrWhiteSpace($env:BLUEY_ARTIFACT_SHA256)) {
+    Fail "Signed update handoff did not provide the manifest-pinned artifact SHA256"
 }
 
 function Resolve-BlueyUrl {
@@ -84,6 +103,103 @@ function Assert-FileSha256 {
     $actual = Get-FileSha256 -Path $Path
     if ($actual -ne $expectedTrimmed) {
         Fail "Checksum mismatch for $(Split-Path -Leaf $Path). Expected $expectedTrimmed, got $actual"
+    }
+}
+
+function Assert-BlueyBinIntegrity {
+    param([string]$Dir)
+
+    $manifestPath = Join-Path $Dir "bluey-integrity.json"
+    if (!(Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        Fail "Bluey archive did not contain bin\bluey-integrity.json"
+    }
+    if ((Get-Item -LiteralPath $manifestPath).Length -gt 262144) {
+        Fail "Bluey integrity manifest is oversized"
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    } catch {
+        Fail "Bluey integrity manifest is invalid JSON"
+    }
+    if ($manifest.schema_version -ne 1 -or $manifest.product -ne "Bluey") {
+        Fail "Bluey integrity manifest has an unsupported schema or product"
+    }
+    $entries = @($manifest.files)
+    if ($entries.Count -lt 3 -or $entries.Count -gt 64) {
+        Fail "Bluey integrity manifest has an invalid file count"
+    }
+    $seen = @{}
+    foreach ($entry in $entries) {
+        $name = [string]$entry.path
+        if ([string]::IsNullOrWhiteSpace($name) -or
+            $name -ne [System.IO.Path]::GetFileName($name) -or
+            $name.Contains("/") -or $name.Contains("\")) {
+            Fail "Bluey integrity manifest contains an unsafe path"
+        }
+        $key = $name.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            Fail "Bluey integrity manifest contains a duplicate path"
+        }
+        $seen[$key] = $true
+        $expected = ([string]$entry.sha256).ToLowerInvariant()
+        if ($expected -notmatch '^[0-9a-f]{64}$') {
+            Fail "Bluey integrity manifest contains an invalid SHA256"
+        }
+        $path = Join-Path $Dir $name
+        if (!(Test-Path -LiteralPath $path -PathType Leaf)) {
+            Fail "Bluey package file is missing: $name"
+        }
+        $item = Get-Item -LiteralPath $path
+        if ([uint64]$item.Length -ne [uint64]$entry.size_bytes) {
+            Fail "Bluey package file size mismatch: $name"
+        }
+        Assert-FileSha256 -Path $path -Expected $expected
+    }
+    foreach ($required in @("bluey.exe", "bluey-daemon.exe", "host-overlay.exe", "audio-driver.exe", "screen-driver.exe", "BLUEY-NOTICE.txt")) {
+        if (!$seen.ContainsKey($required.ToLowerInvariant())) {
+            Fail "Bluey integrity manifest is missing required file: $required"
+        }
+    }
+    if (!$seen.ContainsKey("terminal.exe")) {
+        Fail "Bluey integrity manifest is missing required process alias: Terminal.exe"
+    }
+    Get-ChildItem -LiteralPath $Dir -File |
+        Where-Object { $_.Name -ne "bluey-integrity.json" } |
+        ForEach-Object {
+            if (!$seen.ContainsKey($_.Name.ToLowerInvariant())) {
+                Fail "Bluey package contains an unmanifested file: $($_.Name)"
+            }
+        }
+    if (Get-ChildItem -LiteralPath $Dir -Directory | Select-Object -First 1) {
+        Fail "Bluey Windows bin package must not contain unmanifested directories"
+    }
+}
+
+function Protect-BlueyBinAcl {
+    param([string]$Dir)
+
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if ([string]::IsNullOrWhiteSpace($sid)) {
+        Fail "Could not determine the current Windows user SID"
+    }
+    & icacls.exe $Dir /inheritance:r /grant:r "*$sid`:(OI)(CI)F" /T /C /Q | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Fail "Could not apply owner-only permissions to the Bluey bin directory"
+    }
+}
+
+function Invoke-BlueyInstallCanary {
+    param([string]$Dir)
+
+    $bluey = Join-Path $Dir "bluey.exe"
+    $daemon = Join-Path $Dir "bluey-daemon.exe"
+    $legal = & $bluey legal --json 2>&1
+    if ($LASTEXITCODE -ne 0 -or ($legal -join "`n") -notmatch 'LicenseRef-Bluey-Proprietary') {
+        throw "bluey.exe legal canary failed"
+    }
+    & $daemon --help *> $null
+    if ($LASTEXITCODE -ne 0) {
+        throw "bluey-daemon.exe startup canary failed"
     }
 }
 
@@ -132,33 +248,6 @@ function Stop-BlueyForInstall {
             }
         } |
         Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
-function Copy-FirstBinaryAlias {
-    param(
-        [string]$Dir,
-        [string]$AliasName,
-        [string[]]$Candidates
-    )
-    $aliasPath = Join-Path $Dir $AliasName
-    if (Test-Path $aliasPath) {
-        return
-    }
-    foreach ($candidate in $Candidates) {
-        $candidatePath = Join-Path $Dir $candidate
-        if (Test-Path $candidatePath) {
-            Copy-Item -Force $candidatePath $aliasPath
-            return
-        }
-    }
-}
-
-function Ensure-ProcessIdentityAliases {
-    param([string]$Dir)
-
-    Copy-FirstBinaryAlias -Dir $Dir -AliasName "Terminal.exe" -Candidates @("bluey-daemon.exe", "cue-daemon.exe")
-    Copy-FirstBinaryAlias -Dir $Dir -AliasName "host-overlay.exe" -Candidates @("bluey-overlay.exe", "cue-overlay.exe")
-    Copy-FirstBinaryAlias -Dir $Dir -AliasName "audio-driver.exe" -Candidates @("bluey-audio.exe", "cue-audio.exe")
 }
 
 function Install-BlueyLocalDocTools {
@@ -239,7 +328,15 @@ if ($Version -eq "latest" -or [string]::IsNullOrWhiteSpace($env:BLUEY_ARTIFACT_U
             Fail "latest.json did not include a version"
         }
         $Version = $Latest.version
+    } elseif ($Latest.version.TrimStart("v") -ne $Version.TrimStart("v")) {
+        # Never use mutable latest metadata for a caller-pinned older release.
+        $Latest = $null
     }
+}
+if ($Platform -eq "windows-arm64" -and
+    (!$Latest -or !$Latest.platforms -or !$Latest.platforms.PSObject.Properties["windows-arm64"])) {
+    Write-Warn "Native Windows ARM64 is not published for this release; using the x64 compatibility build"
+    $Platform = "windows-x86_64"
 }
 
 $VersionNumber = $Version.TrimStart("v")
@@ -264,6 +361,9 @@ if ([string]::IsNullOrWhiteSpace($ArtifactUrl)) {
 }
 
 $ArtifactUri = [Uri]$ArtifactUrl
+if ($ArtifactUri.Scheme -ne "https" -and $env:BLUEY_INSTALL_ALLOW_INSECURE_HOST -ne "1") {
+    Fail "Bluey artifact downloads require HTTPS"
+}
 $ArchiveName = Split-Path -Leaf $ArtifactUri.AbsolutePath
 if ([string]::IsNullOrWhiteSpace($ArchiveName)) {
     $ArchiveName = "bluey-$VersionNumber-$Platform.zip"
@@ -289,8 +389,15 @@ try {
             }
         }
         Assert-FileSha256 -Path $ZipPath -Expected $ArtifactSha256
-        Write-Ok "Checksum verified"
+        if ($InstallContext -eq "update") {
+            Write-Ok "Signed-manifest artifact checksum verified"
+        } else {
+            Write-Ok "HTTPS-bootstrap artifact checksum verified"
+        }
     } else {
+        if ($InstallContext -eq "update" -or $env:BLUEY_INSTALL_ALLOW_INSECURE_HOST -ne "1") {
+            Fail "BLUEY_SKIP_CHECKSUM is restricted to isolated development installs"
+        }
         Write-Warn "Skipping checksum because BLUEY_SKIP_CHECKSUM=1"
     }
 
@@ -303,14 +410,40 @@ try {
     if (!(Test-Path (Join-Path $ExtractedBin "bluey-daemon.exe"))) {
         Fail "Archive did not contain bin\bluey-daemon.exe"
     }
+    Assert-BlueyBinIntegrity -Dir $ExtractedBin
 
     Stop-BlueyForInstall
     New-Item -ItemType Directory -Force -Path $InstallRoot | Out-Null
-    Remove-Item -LiteralPath $BinDir -Recurse -Force -ErrorAction SilentlyContinue
-    Copy-Item -Path $ExtractedBin -Destination $BinDir -Recurse -Force
-    Ensure-ProcessIdentityAliases -Dir $BinDir
-    Get-ChildItem -Path $BinDir -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
+    $StagedBin = Join-Path $InstallRoot ("bin.stage." + [guid]::NewGuid().ToString("N"))
+    $PreviousBin = Join-Path $InstallRoot "bin.previous"
+    Copy-Item -Path $ExtractedBin -Destination $StagedBin -Recurse -Force
+    Assert-BlueyBinIntegrity -Dir $StagedBin
+    Protect-BlueyBinAcl -Dir $StagedBin
+    Get-ChildItem -Path $StagedBin -Filter "*.exe" -Recurse -ErrorAction SilentlyContinue |
         ForEach-Object { Unblock-File -Path $_.FullName -ErrorAction SilentlyContinue }
+    $MovedPrevious = $false
+    try {
+        Remove-Item -LiteralPath $PreviousBin -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $BinDir) {
+            Move-Item -LiteralPath $BinDir -Destination $PreviousBin
+            $MovedPrevious = $true
+        }
+        Move-Item -LiteralPath $StagedBin -Destination $BinDir
+        Assert-BlueyBinIntegrity -Dir $BinDir
+        Invoke-BlueyInstallCanary -Dir $BinDir
+        if (Test-Path -LiteralPath $PreviousBin) {
+            Remove-Item -LiteralPath $PreviousBin -Recurse -Force -ErrorAction Stop
+        }
+    } catch {
+        $installError = $_
+        Remove-Item -LiteralPath $BinDir -Recurse -Force -ErrorAction SilentlyContinue
+        if ($MovedPrevious -and (Test-Path -LiteralPath $PreviousBin)) {
+            Move-Item -LiteralPath $PreviousBin -Destination $BinDir
+        }
+        throw "Bluey install canary failed; previous version restored. $($installError.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $StagedBin -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Install-BlueyLocalDocTools -Root $InstallRoot
 
     Ensure-UserPathEntry -Dir $BinDir

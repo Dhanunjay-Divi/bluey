@@ -1,0 +1,35 @@
+FINAL ROUND BOUNDED UNAUTHENTICATED RUNTIME — 2026-07-12
+
+AUTHORIZATION AND SCOPE
+- Coordinator explicitly approved one <=20-second network-denied attempt, then explicitly approved one <=15-second harness retry after the first test failed before UI.
+- Direct execution from the read-only mounted bundle; fresh disposable HOME, user-data, cache, and TMP roots.
+- No account, credential, click, permission grant/request, external message, billing action, update, or application submission.
+- HTTP(S)/ALL proxy pointed to closed loopback port; Chromium background networking/component updates/sync/domain reliability disabled; resolver mapped hosts to 0.0.0.0; outer macOS Seatbelt denied network-outbound.
+
+ATTEMPT 1 — OBSERVED
+- Outer Seatbelt denied all networking while normal Chromium sandboxing remained enabled.
+- App exited before UI: `Failed to bind ... SingletonSocket: Operation not permitted` and `sandbox initialization failed`.
+- At checkpoint: no assigned process, no network descriptor, no runtime state beyond empty stdout and a 376-byte stderr.
+- Scoped bundle unregister ran; no `frai` handler was present.
+
+ATTEMPT 2 — OBSERVED
+- Explicitly approved harness-only `--no-sandbox` was added to avoid the nested sandbox/socket conflict. This flag says nothing about production sandbox state.
+- Within seven seconds the process tree reached main, crashpad, GPU helper, network-service utility, and one renderer.
+- No stdout/stderr output appeared.
+- Disposable user-data contained Chromium Cookies/DIPS/Local Storage/Session Storage/cache/GPU cache/Crashpad files, `audio-capture.json`, and local Sentry session/scope/queue files. Raw payloads were not opened, copied, or retained.
+- The app registered `frai` to `com.finalround.desktop` in LaunchServices.
+- The planned checkpoint formatter had a zsh newline bug, so the seven-second process/lsof output is incomplete. Do not claim a clean socket enumeration. Network outbound was denied by Seatbelt, and a post-termination exact-PID check found no remaining process/socket.
+- Termination targeted only the recorded Final Round main/crashpad/helper/renderer PIDs. All were gone after TERM/KILL fallback.
+- Scoped `lsregister -u` ran. A stale `frai -> com.finalround.desktop` preference entry remained; the audit did not reset or rewrite LaunchServices.
+
+CLEANUP — OBSERVED
+- Both disposable runtime roots, extracted ASAR tree, and other audit temp files were deleted.
+- Only the Final Round image device `/dev/disk5` was detached successfully (`"disk5" ejected`).
+- Separate Littlebird/Cluely mounts were not touched.
+- No Final Round process or audit mount remained after cleanup.
+
+RUNTIME CONCLUSIONS
+- Confirmed: a normal unauthenticated bootstrap creates one renderer and local Chromium/Sentry/audio-capture state immediately.
+- Confirmed: startup registers the custom URL scheme.
+- Unknown: exact rendered sign-in/onboarding visuals; the test intentionally avoided accessibility/screen-recording permissions and the formatter bug prevented a reliable window capture.
+- Unknown: production network behavior; outbound was deliberately blocked and no credentials were supplied.

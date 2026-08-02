@@ -5,7 +5,7 @@ import { DiscoveryWorkerRuntime } from "./discovery-runtime.js";
 
 export function discoveryWorkerFromEnvironment(): DiscoveryWorkerRuntime {
   const origin = process.env.BLUEY_JOBS_API_ORIGIN || "http://127.0.0.1:8080";
-  const token = process.env.BLUEY_JOBS_WORKER_TOKEN || "";
+  const signingKey = process.env.BLUEY_JOBS_WORKER_SIGNING_KEY || "";
   const workerId = process.env.BLUEY_JOBS_DISCOVERY_WORKER_ID
     || `discovery-${hostname()}-${process.pid}`;
   const pollIntervalMs = environmentInteger(
@@ -15,7 +15,7 @@ export function discoveryWorkerFromEnvironment(): DiscoveryWorkerRuntime {
   );
 
   return new DiscoveryWorkerRuntime({
-    api: new DiscoveryApiClient({ origin, token, workerId }),
+    api: new DiscoveryApiClient({ origin, signingKey, workerId }),
     pollIntervalMs,
   });
 }

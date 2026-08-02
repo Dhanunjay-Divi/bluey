@@ -15,6 +15,7 @@ import type {
   UserJobInput,
   JobPreferences,
   JobsIntegration,
+  JobsBlueyHandoffIssueResponse,
   JobsWorkspace,
   MailboxConnection,
   PacketCommitResult,
@@ -152,6 +153,10 @@ export const jobsApi = {
     request<InterviewPrepCompletionResponse>(`/api/jobs/applications/${encodeURIComponent(applicationId)}/interview-prep`, {
       method: "POST",
       body: "{}",
+    }),
+  issueBlueyHandoff: (applicationId: string) =>
+    request<JobsBlueyHandoffIssueResponse>(`/api/jobs/applications/${encodeURIComponent(applicationId)}/bluey-handoff`, {
+      method: "POST",
     }),
   saveProfile: (profile: CareerProfile) =>
     request<CareerProfile>("/api/jobs/profile", { method: "PUT", body: JSON.stringify(profile) }),

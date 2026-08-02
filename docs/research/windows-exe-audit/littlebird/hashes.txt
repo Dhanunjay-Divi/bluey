@@ -1,0 +1,5 @@
+2e202cde30b2d8cedf4295bf4d6160a044797086f2083f7afb07d01a9fcf525f  /Users/uno/Downloads/exe_backtrack_code/Littlebird-Win-x64-0.81.10-Setup.exe
+dc51fb4f9d91239f157d9815bd0bc0d59545ae17bc9ec4614d3eff874df5e1a0  payload-x64-exact/resources/app.asar
+0874590bfe690ab4d826a9928e5e79a8f2d7031dd737941071cb5865ccdb20e6  payload-x64-exact/Littlebird.exe
+98d6988361858c1529b1961095e05d3be91a05e710ee10f974e57b60efb2c57e  payload-x64-exact/resources/bin/littlebird-capture.exe
+5ed73af5dfa53c0e4b338b9051c912a9a7d9445354eb169d9fe181f7468b24b9  payload-x64-exact/resources/bin/rg.exe

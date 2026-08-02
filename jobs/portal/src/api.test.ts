@@ -77,4 +77,31 @@ describe("Jobs API authentication", () => {
       "/account/me:Bearer dummy-fresh-access-token",
     ]));
   });
+
+  it("issues an authenticated handoff without putting application data in the request body", async () => {
+    localStorage.setItem("bluey_access_token", "portal-access-token");
+    let receivedPath = "";
+    let receivedInit: RequestInit | undefined;
+    const nonce = "A".repeat(43);
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      receivedPath = String(input);
+      receivedInit = init;
+      return Response.json({
+        schema_version: 1,
+        audience: "bluey-desktop-interview-prep-v1",
+        nonce,
+        deep_link_url: `bluey://jobs/interview-prep?nonce=${nonce}`,
+        expires_at_ms: Date.now() + 90_000,
+        expires_in_seconds: 90,
+      });
+    }));
+
+    const issued = await jobsApi.issueBlueyHandoff("application/1");
+
+    expect(receivedPath).toBe("/api/jobs/applications/application%2F1/bluey-handoff");
+    expect(receivedInit?.method).toBe("POST");
+    expect(receivedInit?.body).toBeUndefined();
+    expect(new Headers(receivedInit?.headers).get("Authorization")).toBe("Bearer portal-access-token");
+    expect(issued.deep_link_url).toBe(`bluey://jobs/interview-prep?nonce=${nonce}`);
+  });
 });

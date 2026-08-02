@@ -202,11 +202,18 @@ DAEMON_BIN="$WORKSPACE/target/release/bluey-daemon"
 if [ ! -x "$DAEMON_BIN" ]; then
     DAEMON_BIN="$WORKSPACE/target/debug/bluey-daemon"
 fi
+CLI_BIN="$WORKSPACE/target/release/bluey"
+if [ ! -x "$CLI_BIN" ]; then
+    CLI_BIN="$WORKSPACE/target/debug/bluey"
+fi
 
 if [ ! -x "$DAEMON_BIN" ]; then
     warn "bluey-daemon binary not found; skipping Phase 5 daemon assertion"
     warn "build with: cargo build -p cue-daemon --bin bluey-daemon"
 else
+    if [ ! -x "$CLI_BIN" ]; then
+        fail "bluey CLI binary not found; cannot verify authenticated Phase 5 IPC"
+    fi
     DAEMON_LOG_DIR="$WORK/daemon-logs"
     mkdir -p "$DAEMON_LOG_DIR"
     KNOWN_TRACE="phase5-acceptance-trace-$$"
@@ -223,19 +230,22 @@ else
     sleep 2
 
     if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-        warn "daemon failed to start; skipping Phase 5 daemon assertion"
+        fail "daemon failed to start; authenticated Phase 5 IPC was not verified"
     else
-        # Send a status request via the daemon's IPC port.
-        if printf '%s\n' '{"type":"status"}' | nc -w 2 127.0.0.1 57321 >/dev/null 2>&1; then
+        # Use the native CLI so the per-boot capability never enters shell
+        # output, renderer state, environment variables, or smoke logs.
+        if BLUEY_TRACE_ID="$KNOWN_TRACE" "$CLI_BIN" status >/dev/null 2>&1; then
             sleep 1
             # Send shutdown to flush logs cleanly.
-            printf '%s\n' '{"type":"shutdown"}' | nc -w 2 127.0.0.1 57321 >/dev/null 2>&1 || true
+            if ! BLUEY_TRACE_ID="$KNOWN_TRACE" "$CLI_BIN" stop >/dev/null 2>&1; then
+                fail "authenticated daemon shutdown failed in Phase 5"
+            fi
             sleep 2
 
             # Grep the daemon log for the env-supplied trace.
             DAEMON_LOG_FILE="$(ls "$DAEMON_LOG_DIR"/daemon-log.*.log 2>/dev/null | head -1)"
             if [ -z "$DAEMON_LOG_FILE" ] || [ ! -f "$DAEMON_LOG_FILE" ]; then
-                warn "daemon log file not produced; Phase 5 assertion skipped"
+                fail "daemon log file not produced; Phase 5 assertion could not run"
             elif ! grep -q "\"trace_id\":\"$KNOWN_TRACE\"" "$DAEMON_LOG_FILE"; then
                 echo "--- daemon log tail ---"
                 tail -20 "$DAEMON_LOG_FILE"
@@ -244,7 +254,7 @@ else
                 ok "daemon JSON log contains trace_id=$KNOWN_TRACE on IPC dispatch"
             fi
         else
-            warn "could not send IPC to daemon (nc failure); Phase 5 assertion skipped"
+            fail "could not send authenticated IPC to daemon in Phase 5"
         fi
 
         kill -TERM "$DAEMON_PID" 2>/dev/null || true

@@ -1,0 +1,22 @@
+LOCKEDIN NATIVE COMPONENT EVIDENCE
+
+Custom audio capture
+  app.asar.unpacked/lib/arm64/audio_capture_mac.node: arm64
+  app.asar.unpacked/lib/arm64/libAudioCapture.dylib: arm64
+  app.asar.unpacked/lib/x86_64/audio_capture_mac.node: x86_64
+  app.asar.unpacked/lib/x86_64/libAudioCapture.dylib: x86_64
+  Signer: same Cyber Gravity LLC Developer ID team as the app
+  Linked frameworks observed: AudioToolbox, CoreAudio, AVFoundation, ScreenCaptureKit, Swift runtime libraries
+  Export/symbol indicators: audio capture create, start, stop, and callback functions
+
+Input automation and global keys
+  @jitsi/robotjs native addon: universal arm64/x86_64 Mach-O variants observed
+  node-global-key-listener/bin/MacKeyServer: x86_64-only Mach-O
+  fsevents native addon: universal arm64/x86_64
+
+PDF rendering dependencies
+  pdfjs-dist/canvas-related native dependencies inspected in the unpacked tree were arm64-only. Runtime reachability on an x86_64 Mac is unknown; if those paths are loaded under Rosetta/native x86_64, the packaging asymmetry is a compatibility and maintenance risk.
+
+Execution policy
+  Static phase: none of these components was executed; purpose came from linked frameworks, exported symbols, package metadata, and public/electron.js calls.
+  Approved isolated runtime: the main process detected arm64 and loaded/found the arm64 audio addon, but no audio capture or permission was started. Robotjs, MacKeyServer, PDF native paths, and remote input were not invoked.

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::cards::CueCardArtifact;
 use crate::clock;
+use crate::{assistant::AssistantProfile, cards::CueCardArtifact};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -117,6 +117,23 @@ pub enum ContextProcessingStatus {
     Failed,
 }
 
+/// Whether an attached artifact may leave this device through background
+/// session sync or managed indexing. Existing records predate this field, so
+/// the backward-compatible default remains `Allowed`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextCloudSyncPolicy {
+    #[default]
+    Allowed,
+    LocalOnly,
+}
+
+impl ContextCloudSyncPolicy {
+    pub fn allows_cloud_sync(self) -> bool {
+        matches!(self, Self::Allowed)
+    }
+}
+
 impl Default for ContextProcessingStatus {
     fn default() -> Self {
         Self::Pending
@@ -163,6 +180,15 @@ pub struct ContextArtifact {
     pub processing_status: ContextProcessingStatus,
     #[serde(default)]
     pub processing_error: Option<String>,
+    #[serde(default)]
+    pub cloud_sync_policy: ContextCloudSyncPolicy,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrity_sha256: Option<String>,
+    /// True after an image has been sent for the user's explicit Answer once.
+    /// Consumed images remain local display/memory artifacts and must not be
+    /// selected for a later provider upload without a fresh attachment.
+    #[serde(default)]
+    pub vision_send_consumed: bool,
     pub created_at: String,
 }
 
@@ -185,8 +211,26 @@ impl ContextArtifact {
             markdown_path: None,
             processing_status: ContextProcessingStatus::Pending,
             processing_error: None,
+            cloud_sync_policy: ContextCloudSyncPolicy::Allowed,
+            integrity_sha256: None,
+            vision_send_consumed: false,
             created_at: clock::now_epoch_ms_string(),
         }
+    }
+
+    pub fn with_id(mut self, id: Uuid) -> Self {
+        self.id = id;
+        self
+    }
+
+    pub fn with_cloud_sync_policy(mut self, policy: ContextCloudSyncPolicy) -> Self {
+        self.cloud_sync_policy = policy;
+        self
+    }
+
+    pub fn with_integrity_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.integrity_sha256 = Some(sha256.into());
+        self
     }
 
     pub fn with_text_preview(mut self, preview: impl Into<String>) -> Self {
@@ -274,6 +318,8 @@ impl ConversationTurn {
 pub struct MeetingRecord {
     pub id: Uuid,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_account_id: Option<String>,
     pub title: String,
     pub started_at: String,
@@ -287,6 +333,14 @@ pub struct MeetingRecord {
     pub conversation: Vec<ConversationTurn>,
     #[serde(default)]
     pub answer_instructions: Option<String>,
+    #[serde(default)]
+    pub assistant_profile: AssistantProfile,
+    /// Opaque idempotency key for a capability-authenticated Jobs import.
+    /// This is session metadata and is never included in provider context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobs_handoff_import_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobs_handoff_context_sha256: Option<String>,
     #[serde(default)]
     pub diagnostics: MeetingDiagnostics,
     pub summary: Option<String>,
@@ -357,6 +411,7 @@ impl MeetingRecord {
     pub fn new(title: Option<String>) -> Self {
         Self {
             id: Uuid::new_v4(),
+            workspace_id: None,
             owner_account_id: None,
             title: title
                 .filter(|value| !value.trim().is_empty())
@@ -369,6 +424,9 @@ impl MeetingRecord {
             context: Vec::new(),
             conversation: Vec::new(),
             answer_instructions: None,
+            assistant_profile: AssistantProfile::default(),
+            jobs_handoff_import_id: None,
+            jobs_handoff_context_sha256: None,
             diagnostics: MeetingDiagnostics::default(),
             summary: None,
         }
@@ -494,6 +552,8 @@ pub struct MeetingRecap {
     pub transcript_segments: usize,
     pub context: Vec<ContextArtifact>,
     pub answer_instructions: Option<String>,
+    #[serde(default)]
+    pub assistant_profile: AssistantProfile,
     pub action_items: Vec<ActionItem>,
     pub decisions: Vec<Decision>,
 }
@@ -563,5 +623,27 @@ mod tests {
         assert!(text.chars().count() <= 80);
         assert!(text.starts_with("system: ..."));
         assert!(text.contains("important ending"));
+    }
+
+    #[test]
+    fn legacy_context_defaults_to_cloud_allowed_and_unconsumed() {
+        let artifact = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/legacy.txt",
+            "Legacy",
+            None,
+            Some(1),
+        );
+        let mut value = serde_json::to_value(&artifact).expect("serialize artifact");
+        let object = value.as_object_mut().expect("artifact object");
+        object.remove("cloud_sync_policy");
+        object.remove("integrity_sha256");
+        object.remove("vision_send_consumed");
+
+        let restored: ContextArtifact = serde_json::from_value(value).expect("legacy artifact");
+
+        assert_eq!(restored.cloud_sync_policy, ContextCloudSyncPolicy::Allowed);
+        assert!(restored.integrity_sha256.is_none());
+        assert!(!restored.vision_send_consumed);
     }
 }

@@ -1,0 +1,102 @@
+Cluely (New) 2.1.19 — static bundle evidence map
+Captured: 2026-07-12
+
+This is a provenance index, not a source-code redistribution. Minified proprietary
+source was inspected in a temporary directory and is identified by hash plus stable
+line/byte locations. No extracted source is retained in the repository.
+
+Primary artifacts
+-----------------
+dist-electron/main.js
+  size=544886 bytes, lines=16945
+  sha256=f086147527720bbb74e0223d828f0149e32cef390794e8c722fd6119249d5ccc
+  Relevant lines:
+    15374,15475,15591,15660 — content-protection transitions
+    15766-15794 — auth window and token retrieval
+    15796-15813 — navigation/window-open policy
+    15814-15844 — HTTPS protocol handler and forced Origin header
+    15845-15847 — initial screen-content protection
+    15886-15905 — login-item initialization
+    16025-16122 — microphone/System Audio capture and renderer broadcasts
+    16124-16157 — main-process session inactivity timer
+    16370-16449 — legacy v1 settings migration
+    16451-16589 — shared-state schema, JSON persistence, atomic rename
+    16628-16665 — deep-link auth handling and in-memory token handoff
+    16668-16688 — renderer-sender origin validation wrapper
+    16743-16778 — full-display screenshot capture and retry
+    16780-16846 — registered IPC surface
+    16938 — app.moveToApplicationsFolder()
+    16939-16940 — userData and log paths
+
+dist-electron/preload.mjs
+  size=314 bytes, one minified logical line
+  sha256=3e4d4b7ec738e48dda15970e0a9d920d0de16489654e2f7cf1a60071915de174
+  Exposes platform plus generic ipcRenderer on/send/invoke methods to the renderer.
+
+package.json
+  size=1386 bytes, lines=48
+  sha256=55f5b302262cb2829e789d8095dfa2524f186f25e988f31b3751050d253c5d82
+  name=cluely-v2, version=2.1.19, main=dist-electron/main.js, type=module.
+  Direct runtime dependencies include electron-updater 6.8.3, electron-log 5.4.3,
+  electron-app-universal-protocol-client 2.1.1, node-record-lpcm16, and fs-extra.
+  No package scripts are present.
+
+Selected renderer chunks (all in dist/assets)
+------------------------------------------------
+chat-BH3ET_qx.js sha256=fbcc2bb7c7b2a70c0923c67e841844e74153693a00b27395d46d6ac52b1da524
+  Session transcript, chat-agent connection, session history, meetings/calendar, people,
+  screenshot/audio upload, heartbeat and transcript persistence.
+chat-De5Wloo-.js sha256=20c7b9c68d5ef69cb0de01a68f0bdf6c9050d38417b055d691ea6817441ace44
+  Chat window control and session UI.
+chat-P1okxrDA.js sha256=fcf7bda4cb4e599812f693fc020788e98691fa94ba26068144d07364207ab80c
+  Chat presentation components.
+settings-BuvgGbrV.js sha256=69d15bacb042de25806037447f64555177fb148884e43e54b4c245229ff66083
+  Settings, custom modes, file upload, calendar, billing, account controls.
+mode-tANOI-sD.js sha256=1bee0934c28fba4d68e0a63d68b15b9550c8f1b1902bae86206dc872902f21b4
+  Mode model and presentation.
+transcription-C5LDIt8L.js sha256=65b469463bf978860a6eb7f4c8486c084a97eb41df361dcb3853ed1a603e7fe5
+  Local VAD, WAV construction, bounded transcription concurrency, RPC upload.
+orpc-CSebChCN.js sha256=5c97ef20524deefcdab5e4cd99afde68e16bcb620a8b751a95889613bce7f767
+  ORPC client at byte ~49300: https://api.v2.cluely.com/rpc, dynamic Clerk
+  Bearer token, credentials included.
+posthog-VTzWjthB.js sha256=f9fbac868311451da8ab21faa8b887d787eb18d93b6e86705ff339bd4016dcdc
+  PostHog setup, exception/console capture integration.
+route-BzU-sEaW.js sha256=d2b9530316a120dfa151ea309b24547ca28f997b6d5782d8167fdf6b63b89357
+  Application route and launch telemetry; relevant minified byte offset ~602409.
+route-BzHuaDna.js sha256=737366efeb956607e1106b6479aca8a9e1ca3b389daebf80f12a89cc61a2b991
+  Onboarding/application routing.
+permissions-DaGfjhrd.js sha256=d4855ee406792168c5ac20daa0b1acf0054e927c3fc08839d1d1b37a3f53b1f7
+  Microphone, screen-recording, and accessibility permission explanations.
+sign-in-B0nA9S4C.js sha256=eebb079dff1aaa92d82d1530317e09b1a82d09bbf2af42ed5d05fd4ccecac5ef
+  Desktop sign-in presentation.
+pricing-DouDVWHe.js sha256=29aa0d0244b4908cbb0ab2116d6585c83e0fedc32b1aecb0324cb431ed3cad69
+  Pricing/paywall presentation.
+subscription-plan-selection-Ztn3FoAd.js sha256=d29e5d8085f0caddcbc34901f4594b1926eeb3327e9f066cf0953648bb75fbae
+  Plan selection and entitlements.
+use-create-session-QredbwKK.js sha256=3e8f145955a9908854b34e93aa3c6c11c6b0728047a0c9de8f7ebb917a5a053c
+  Server session creation and free-session limit handling.
+use-end-session-CYpYiVXS.js sha256=d90f9f07bf5cb4e7a46b6055466bc226affb6558b10d0efc911b33d768fa90c6
+  Session completion mutation.
+control-CwKQK60o.js sha256=573bdcbe110aef648402f22fb5e66ba910815db77167b26674cb720f81653179
+desktop-ui-DEYGam0u.js sha256=1a273cb3a847f856b43b2944269761facfba3264933302fab722b069d4e43900
+notification-CdyM-8oU.js sha256=ca585a2f52135231fc6582056bc545110d54bf271ae6121503b2d6edeedf487b
+env-C6vhDF_e.js sha256=757316eb35368e5dcf061ffcbce3123f3a047214cb82dad91a4509b5f8dadb92
+
+Stable byte-offset observations in minified chunks
+---------------------------------------------------
+chat-BH3ET_qx.js:
+  ~260700-271200 — Cloudflare Agents/PartySocket construction and room URL
+  ~668727-690506 — session dashboard, search, calendar polling, people/meeting flows
+  ~694827 — widget-dashboard:brief-collapsed localStorage key
+  ~745240-746800 — transcript persistence, heartbeat, screenshot/partial-audio upload
+settings-BuvgGbrV.js:
+  ~152004-165514 — custom modes, templates, file limits/upload/sync
+  ~173781 — file-upload limits and state
+  ~178121 — cluely.modes.sidebarOrder.v2 localStorage key
+transcription-C5LDIt8L.js:
+  ~421943-422942 — Silero/ONNX VAD, role suppression, four-request transcription cap
+
+Embedded public configuration values were observed but are intentionally not copied
+here. This includes the Clerk publishable key, PostHog client ID, and similar public
+client identifiers. No credentials, auth tokens, cookies, or user data were present
+or collected.

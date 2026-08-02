@@ -1,0 +1,51 @@
+FINAL ROUND IDENTITY AND INTEGRITY — 2026-07-12
+
+OBSERVED — image
+- Input: /Users/uno/Downloads/dmg_backtrack_code/final-round-desktop-2.4.0-arm64-mac.dmg
+- Size: 180,434,644 bytes.
+- SHA-256: fbeeb1fc108ef4808d0e3a7af72dfa1f5700645bfbb6809126e1183bb381cabc.
+- hdiutil imageinfo: UDZO, compressed zlib, read-only, unencrypted, checksummed; 606,956,032 virtual bytes.
+- hdiutil attach used `-readonly -nobrowse`; the APFS payload mounted read-only. The image's filesystem volume name was `Untitled`; the audit used a disposable custom mountpoint.
+- Mounted application footprint: 470,496 KiB by `du -sk`.
+
+OBSERVED — application identity
+- Bundle: Final Round.app.
+- CFBundleName / product name: Final Round.
+- Version and build: 2.4.0 / 2.4.0.
+- Bundle ID: com.finalround.desktop.
+- URL scheme: frai.
+- Minimum macOS: 12.0.
+- Build SDK: macOS 15.5; Xcode 16.4.
+- Architecture: thin arm64 for main executable and bundled helpers/native addons inspected.
+- Electron Framework: 39.2.7.
+- Sources: Info.plist; package.json; `file`/`lipo -info`; Electron Framework Resources/Info.plist.
+
+OBSERVED — signature and notarization
+- `codesign --verify --deep --strict --verbose=4`: valid on disk and satisfies designated requirement.
+- `spctl -a -vvv -t exec`: accepted; source `Notarized Developer ID`.
+- `xcrun stapler validate`: valid stapled ticket.
+- Signing identity: Developer ID Application: Final Round AI Inc (JP52NT2HD8); Team ID JP52NT2HD8.
+- Signature timestamp: 2026-07-09 07:29:02 local command output.
+- Hardened runtime flag present.
+- Electron helpers and native addons inspected were signed by the same identity.
+
+OBSERVED — entitlements and platform boundary
+- Main and helper entitlements broadly include JIT, unsigned executable memory, DYLD environment variables, disabled library validation, audio input, and camera.
+- No `com.apple.security.app-sandbox` entitlement was observed.
+- Info.plist permits arbitrary ATS loads and local networking, with localhost/127.0.0.1 insecure-HTTP and TLS 1.0 exceptions.
+- Permission descriptions cover audio, camera, microphone, screen capture, Documents, Downloads, and Bluetooth.
+- Sources: `codesign -d --entitlements :-`; Info.plist.
+
+OBSERVED — components
+- Helpers: general, GPU, Renderer, Plugin.
+- Frameworks: Electron, Squirrel, ReactiveObjC, Mantle.
+- Update/crash helpers: Squirrel ShipIt and Electron crashpad.
+- No launch agent, launch daemon, login item, app extension, or XPC service was present in the bundle inventory.
+- Resources include app.asar, silero_vad.onnx, audio_capture.node, audio_detect.node, keyboard_monitor.node, and app-update.yml.
+- Update metadata: generic provider, https://releases.finalroundai.com/latest, `latest` channel, updater cache `final-round-desktop-updater`.
+
+OBSERVED — ASAR integrity
+- app.asar raw SHA-256: d453f6ee6479e973dcf6c333be8f199f006e3d63a5ed9762dc4e6884ea90b615.
+- Info.plist ElectronAsarIntegrity value: c553ca898295a163f5c641797ca72ed49982c65e684e653ef89256a5a157b565.
+- Trusted local `@electron/asar getRawHeader` returned a 1,764,500-byte `headerString`; its SHA-256 exactly matched ElectronAsarIntegrity.
+- Extraction inventory: 6,719 files, 220,440 KiB. No sourcemaps, TypeScript, or TSX were present in first-party output.

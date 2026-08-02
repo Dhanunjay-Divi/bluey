@@ -1,0 +1,70 @@
+Littlebird bounded runtime evidence
+===================================
+
+E-LB-RUN-001 — Authorization and preflight
+Scope: unauthenticated initial-window/process/temp-state observation only, explicitly authorized after the static pass.
+Preflight command: pgrep/ps for Littlebird, ContextKit-cli, LittlebirdAudioTranscription, Cluely, LockedIn, and Parakeet.
+Observed:
+- No competitor application process was active. The separately mounted Cluely image was not touched.
+- Littlebird remained on the read-only DMG; it was not copied to /Applications or installed.
+- No account, credential, permission, update, external URL, or UI control was used.
+
+E-LB-RUN-002 — Isolation controls
+Launch controls:
+- Dedicated mode-0700 HOME, profile, and temp roots under /private/tmp/littlebird-runtime-20260712-*.
+- --user-data-dir pointed at the dedicated profile.
+- LB_AUDIO_TRANSCRIPTION_PROCESS_ENABLED=false and DISABLE_APP_UPDATES=true.
+- Chromium --disable-background-networking, loopback discard proxy, and --disable-crash-reporter switches.
+- sandbox-exec denied outbound networking and denied writes outside the dedicated temp root plus the macOS per-user temporary directory.
+Observed limitation:
+- Littlebird main unconditionally resets Electron userData to appData/Littlebird, so the --user-data-dir switch alone did not redirect early electron-store/Crashpad state. This matches extracted main-process code.
+- The first attempt created a fresh ~/Library/Application Support/Littlebird and ~/Library/Logs/Littlebird at the exact launch timestamp. All entries had the same birth time and contained only first-run defaults. They were moved under the isolated root; temporary symlinks redirected those exact app paths to the isolated profile for the final attempt. Both symlinks and all created state were removed during cleanup.
+
+E-LB-RUN-003 — First and second launch constraints
+Attempt 1:
+- A broad sandbox network denial also denied Chromium's local process-singleton socket bind.
+- Main logged "Another instance is already running" and exited without a window.
+Attempt 2:
+- Local socket binding was allowed, outbound networking remained denied, and writes outside the isolated root were denied.
+- Main reached early initialization, then failed when electron-store attempted to write hummingbird-v4.json under the hard-coded/default appData path.
+- The process and its crashpad child were terminated before retry.
+Conclusion: these attempts exposed the userData override but produced no UI evidence.
+
+E-LB-RUN-004 — Final bounded launch
+Observed main-process initialization before termination:
+- Main registered IPC/event logging and the little-bird protocol path.
+- Hummingbird store migrated from 0.0.0 to 0.0.1; Hummingbird was disabled by default.
+- ExclusionManager selected app-exclusions.json and seeded a runtime category database with six categories.
+- Crash-detection and WebSocket IPC handlers registered.
+- MeetingNotesManager initialized, found no access token for calendar polling, and queued calendar messages because ContextKit was not running.
+- No initial deep link was present and no audio-transcription helper started.
+- An Axiom telemetry request was attempted during unauthenticated startup but failed under the no-network sandbox with ENOTFOUND. No endpoint response or token validation occurred.
+
+E-LB-RUN-005 — No usable UI/runtime feature validation
+Observed:
+- Chromium GPU, Network Service, and renderer subprocesses repeatedly failed with exit code 6 because Electron's child sandbox could not initialize inside the outer sandbox-exec policy.
+- The main process eventually exited fatally after repeated GPU failures. No usable initial window was rendered, so onboarding layout and interaction were not runtime-validated.
+- ContextKitCore and LittlebirdAudioTranscription did not run. No macOS privacy permission was requested or granted.
+Conclusion: runtime evidence is limited to unauthenticated main-process initialization and file/process behavior. Static feature conclusions were not upgraded to runtime-confirmed UI behavior.
+
+E-LB-RUN-006 — Isolated state inventory
+Total final isolated state before deletion: approximately 21 MiB.
+Created file families, recorded by path/name and size only (contents not copied):
+- First-run JSON: app settings, notifications, meetings, iMessage permission state, menubar calendar, window settings, crash detection, hummingbird, and app exclusions.
+- remote_categories.sqlite plus WAL/SHM; the main log reported six seeded categories.
+- Chromium Local Storage and code/GPU/WebGPU caches.
+- Crashpad settings and crash dumps caused by the constrained launch.
+- Sentry offline queue/session/scope files caused by subprocess crashes.
+Not observed:
+- No auth-store file, cookie database, IndexedDB application database, ContextKit PID, audio-transcription PID, user document, credential, or account data.
+- Crash/Sentry payload contents were not opened and were deleted with the profile.
+
+E-LB-RUN-007 — Termination and cleanup
+Observed:
+- Littlebird main and crashpad child were terminated; no Littlebird, ContextKit-cli, or LittlebirdAudioTranscription process remained.
+- LaunchServices app registration for the mounted Littlebird bundle was unregistered. A targeted removal of the launch-created `LSHandlers` entry initially succeeded while preserving all other entries, but the per-user LaunchServices daemon reconstructed the stale bundle-id preference from its database. Final state therefore has no registered Littlebird bundle/binding and only an `unknown` scheme record pointing at the now-unavailable bundle id. A system-wide LaunchServices database reset was deliberately avoided because it would mutate unrelated user registrations.
+- The temporary Application Support and Logs symlinks were removed.
+- /private/tmp/littlebird-runtime-20260712-1, -2, and -3 were recursively deleted after inventory.
+- `hdiutil detach /dev/disk4` reported `disk4 ejected`; subsequent `mount` and `hdiutil info` checks found no Littlebird volume/device.
+
+Runtime boundary: no credentials, cookies, extracted code, crash payloads, or profile data were retained or uploaded.

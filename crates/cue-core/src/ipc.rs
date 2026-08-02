@@ -2,11 +2,33 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     sanitize_observability_id, ActionItem, AiRuntimeStatus, AnswerRequest, AnswerResponse,
-    AnswerStreamEvent, AudioPipelineStatus, CloudSyncStatus, ContextArtifact, CueCard, DaemonState,
-    MeetingRecap, MemoryHit, OverlayPosition, Speaker,
+    AnswerStreamEvent, AssistantProfile, AudioPipelineStatus, AudioReadinessProbeResult,
+    CloudSyncStatus, ContextArtifact, CueCard, DaemonState, MeetingRecap, MemoryHit,
+    OverlayPosition, Speaker, WorkspaceCreateRequest, WorkspaceRecord, WorkspaceUpdateRequest,
 };
 
 pub const DEFAULT_DAEMON_ADDR: &str = "127.0.0.1:57321";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotContextAttachRequest {
+    pub operation_id: uuid::Uuid,
+    #[serde(default)]
+    pub expected_owner_account_id: Option<String>,
+    #[serde(default)]
+    pub expected_session_id: Option<uuid::Uuid>,
+    pub retained_path: String,
+    pub content_sha256: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreenshotContextAttachReceipt {
+    pub operation_id: uuid::Uuid,
+    pub session_id: uuid::Uuid,
+    pub artifact: ContextArtifact,
+    pub already_attached: bool,
+    pub active: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -60,6 +82,10 @@ pub enum DaemonRequest {
         title: Option<String>,
         note: Option<String>,
     },
+    ScreenshotContextDestination,
+    ScreenshotContextAttach {
+        request: ScreenshotContextAttachRequest,
+    },
     ContextList,
     ActivePageCapture,
     ScreenCaptureStart {
@@ -71,11 +97,40 @@ pub enum DaemonRequest {
     },
     InstructionsGet,
     InstructionsClear,
+    AssistantProfileGet,
+    AssistantProfileSet {
+        profile: AssistantProfile,
+    },
+    WorkspaceList,
+    WorkspaceGet {
+        workspace_id: uuid::Uuid,
+    },
+    WorkspaceCreate {
+        request: WorkspaceCreateRequest,
+    },
+    WorkspaceUpdate {
+        request: WorkspaceUpdateRequest,
+    },
+    WorkspaceActivate {
+        workspace_id: uuid::Uuid,
+    },
+    WorkspaceDelete {
+        workspace_id: uuid::Uuid,
+        expected_revision: u64,
+    },
+    /// Capability-authenticated, account-bound Jobs handoff. The daemon
+    /// validates and applies context plus profile as one session transaction.
+    JobsHandoffImport {
+        authorization: crate::JobsHandoffImportAuthorization,
+    },
     MemorySearch {
         query: String,
         limit: usize,
     },
     AudioStatus,
+    /// Explicit local-only readiness probe. The daemon uses a fixed bounded
+    /// duration and never invokes STT, cloud sync, or meeting persistence.
+    AudioReadinessProbe,
     AudioStart {
         enable_system: bool,
         enable_microphone: bool,
@@ -147,11 +202,40 @@ pub enum DaemonResponse {
     ContextItems {
         items: Vec<ContextArtifact>,
     },
+    ScreenshotContextDestination {
+        owner_account_id: Option<String>,
+        session_id: Option<uuid::Uuid>,
+    },
+    ScreenshotContextAttached {
+        receipt: ScreenshotContextAttachReceipt,
+    },
+    AssistantProfile {
+        profile: AssistantProfile,
+    },
+    WorkspaceList {
+        workspaces: Vec<WorkspaceRecord>,
+        active_workspace_id: Option<uuid::Uuid>,
+    },
+    Workspace {
+        workspace: WorkspaceRecord,
+        active_workspace_id: Option<uuid::Uuid>,
+    },
+    WorkspaceDeleted {
+        workspace_id: uuid::Uuid,
+        deleted: bool,
+        active_workspace_id: Option<uuid::Uuid>,
+    },
+    JobsHandoffImported {
+        receipt: crate::JobsHandoffImportReceipt,
+    },
     MemoryHits {
         hits: Vec<MemoryHit>,
     },
     AudioStatus {
         status: AudioPipelineStatus,
+    },
+    AudioReadiness {
+        result: AudioReadinessProbeResult,
     },
     AiStatus {
         status: AiRuntimeStatus,
@@ -162,6 +246,9 @@ pub enum DaemonResponse {
     },
     CloudStatus {
         status: CloudSyncStatus,
+    },
+    IpcAuthError {
+        code: crate::ipc_auth::IpcAuthErrorCode,
     },
     Error {
         message: String,
@@ -199,5 +286,61 @@ mod tests {
     #[test]
     fn shutdown_is_detected_inside_trace_envelope() {
         assert!(DaemonRequest::Shutdown.with_trace_id("trace").is_shutdown());
+    }
+
+    #[test]
+    fn audio_readiness_request_round_trips_without_user_controlled_duration() {
+        let value = serde_json::to_value(DaemonRequest::AudioReadinessProbe)
+            .expect("serialize readiness request");
+        assert_eq!(value["type"], "audio_readiness_probe");
+        assert_eq!(value.as_object().map(serde_json::Map::len), Some(1));
+        let decoded: DaemonRequest = serde_json::from_value(value).expect("decode readiness");
+        assert!(matches!(decoded, DaemonRequest::AudioReadinessProbe));
+    }
+
+    #[test]
+    fn workspace_update_contract_round_trips_with_explicit_instruction_action() {
+        let workspace_id = uuid::Uuid::new_v4();
+        let request = DaemonRequest::WorkspaceUpdate {
+            request: WorkspaceUpdateRequest {
+                workspace_id,
+                expected_revision: 7,
+                title: Some("Interview prep".to_string()),
+                profile: None,
+                instructions: crate::WorkspaceInstructionsPatch::Set {
+                    text: "Use STAR examples.".to_string(),
+                },
+            },
+        };
+
+        let json = serde_json::to_value(&request).expect("serialize workspace update");
+        assert_eq!(json["type"], "workspace_update");
+        assert_eq!(json["request"]["workspace_id"], workspace_id.to_string());
+        assert_eq!(json["request"]["expected_revision"], 7);
+        assert_eq!(json["request"]["instructions"]["action"], "set");
+        assert_eq!(
+            json["request"]["instructions"]["text"],
+            "Use STAR examples."
+        );
+        let decoded: DaemonRequest = serde_json::from_value(json).expect("decode workspace update");
+        assert!(matches!(decoded, DaemonRequest::WorkspaceUpdate { .. }));
+    }
+
+    #[test]
+    fn workspace_delete_contract_requires_expected_revision() {
+        let workspace_id = uuid::Uuid::new_v4();
+        let request = DaemonRequest::WorkspaceDelete {
+            workspace_id,
+            expected_revision: 9,
+        };
+        let json = serde_json::to_value(request).expect("serialize workspace delete");
+        assert_eq!(json["type"], "workspace_delete");
+        assert_eq!(json["workspace_id"], workspace_id.to_string());
+        assert_eq!(json["expected_revision"], 9);
+        assert!(serde_json::from_value::<DaemonRequest>(serde_json::json!({
+            "type": "workspace_delete",
+            "workspace_id": workspace_id,
+        }))
+        .is_err());
     }
 }

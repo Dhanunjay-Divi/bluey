@@ -1,0 +1,44 @@
+FINAL ROUND FEATURE EVIDENCE — 2026-07-12
+
+OBSERVED — first-party route inventory
+- Main renderer routes: authentication, onboarding mission/payment, copilot, career coaches, goal, preparation, reports/report detail, settings general/permission/keyboard/account, and subscriptions. Source: renderer:37428-37516.
+- Account settings show profile, subscription, and sign-out. No self-service account deletion route/control was present in the first-party route/account panel. Source: renderer:35070-35119 and route inventory.
+
+OBSERVED — supported product workflows
+- Onboarding/authentication: external-browser OAuth with PKCE/state, permission onboarding, and payment mission.
+- Interview Copilot: microphone and system-audio capture on the current computer, phone/external-audio mode, multilingual ASR, local VAD, live transcript/answers, force-generate/pause, answer length/tone/model/programming-language settings, and keyboard shortcuts.
+- Visual assistance: capture selected display, temporarily content-protect app windows, compress JPEG to <=1920px at quality 85, then upload base64 to the interview screenshot endpoint. Source: main:16503-16576 and 12120-12129.
+- Coding/system design: streamed pattern, idea, code, walkthrough, tests, and system-design sections in the renderer/service contract.
+- Goals: company/job-description goal CRUD.
+- Resumes: native picker, PDF/DOCX local validation, list/upload/delete, and resume context for interviews. Source: main:11456-11764 and 14569-14643.
+- Career coach: Daily/Pluot video-coach and mock-interview UI/service resources.
+- Reports: list, document/transcript retrieval, and regenerate. Source: main:14502-14568.
+- Payments: plans, checkout, customer portal, privilege/trial lookup, and subscription management. Source: main:12611-13042.
+- Privacy/stealth: content protection is enabled by default and reapplied to every window every 500 ms; UI describes hiding from screenshots/screen recordings. Source: main:5968-5989, 20180-20354; renderer:35893-35942.
+- Meeting-app monitoring: `ps -eo comm` every two seconds with a three-second debounce and automatic session close when tracked native meeting apps exit; browser-hosted meetings are explicitly unsupported. Source: main:3807-3838 and 15535-15719.
+- Updates: initial check after one minute, then every four hours; download is not automatic and install-on-quit is enabled. Source: main:5997-6021 and 6882-7124.
+
+OBSERVED ABSENCE — job-application product functions
+The complete first-party route, preload capability, API endpoint, service-constructor, and storage-namespace inventory contains no implementation for:
+- job discovery, ranking, freshness, deduplication, or career-track agents;
+- local/cloud application browser runners or multi-account browser profiles;
+- job-specific resume tailoring, visible resume diff, or PDF/DOCX export;
+- reusable application-answer memory;
+- ATS adapters or generic application-form fallback;
+- CAPTCHA, 2FA, assessment, or application-browser takeover;
+- application queues, leases, idempotency, crash recovery, duplicate-submit prevention, or submission receipts;
+- application confirmation screenshots/evidence trails;
+- Gmail/Outlook/calendar outcome tracking.
+
+These are evidence-backed absences from this desktop artifact, not statements about other Final Round web products.
+
+OBSERVED — partial/limited behaviors
+- Resume validation checks PDF/DOCX content locally, but parse/read failures fail open (`valid: true`) before upload. Source: main:11485-11561.
+- Answer history is ephemeral in the live interview session; server reports may persist output, but no durable local answer-memory model exists. Source: main:12082-12346.
+- Support contact submits through `/cio/contact`; it is not an email/calendar integration. Source: main:11030-11133.
+- Plans/trials/subscriptions are implemented; no explicit overage UI was observed in the desktop bundle.
+
+UNKNOWN
+- Whether authenticated server APIs provide additional web-only functionality.
+- Whether any upload parsing, malware scanning, retention, or deletion enforcement occurs server-side.
+- Runtime rendering beyond the unauthenticated bootstrap was intentionally not exercised because it required credentials and permissions.

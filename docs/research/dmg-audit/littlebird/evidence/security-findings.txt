@@ -1,0 +1,83 @@
+Littlebird security evidence
+============================
+
+E-LB-SEC-001 — Successful OTP telemetry path (high)
+Source: shipped source map login.lazy-BhcLDjbV.js.map, original src/screens/LoginScreen.tsx, handleCodeSubmit
+Observed control flow:
+1. The handler accepts code and email.
+2. It calls the Auth0 OTP verification helper.
+3. On success, it calls trackEvent for AUTH0_CODE_VALID with both email and the raw code in the event properties.
+4. The analytics utility routes trackEvent properties to PostHog.
+Conclusion: the signed client contains a path that can transmit a successful authentication factor and account identifier to analytics. No actual credential was used or observed.
+Required response: remove code/email from the event, inspect production telemetry ingestion/redaction and historical data, purge affected events if present, and rotate or revoke credentials where exposure is confirmed.
+
+E-LB-SEC-002 — Session-recording masking can be relaxed (high in combination)
+Source: renderer analytics source in shipped index-CvQr8BBx.js.map
+Observed:
+- When data_sharing_enabled is true, PostHog session recording sets maskAllInputs=false and uses an empty maskTextSelector; password fields retain separate masking.
+- When the setting is false, all inputs are masked with additional selectors.
+- Onboarding includes a Data Sharing step.
+Conclusion: this broadens the data captured from non-password fields. Whether an OTP input is recorded in a given production session was not runtime-tested; that part remains unknown.
+
+E-LB-SEC-003 — Auth token storage boundary (high)
+Sources: main auth manager in extracted dist-electron/main/index.js; preload auth API; LoginScreen source
+Observed:
+- Desktop auth is persisted with electron-store under little-bird-prod-auth using a constant encryption key embedded in signed JavaScript.
+- Access and refresh tokens arrive as query parameters in a custom-protocol deep link.
+- Access token is synchronized to renderer localStorage; preload exposes access-token and refresh-token getters.
+- No Keychain/Security.framework-backed token store was found.
+Conclusion: the embedded key is obfuscation, not a device-bound secret. A renderer compromise has a path to tokens through generic IPC/localStorage.
+
+E-LB-SEC-004 — Generic renderer IPC (high)
+Sources: extracted preload and main bundles
+Observed:
+- Preload exposes generic ipcRenderer on/off/send/invoke without a fixed channel allowlist.
+- Sensitive auth, collection, relaunch, and filesystem handlers are registered in main.
+- No common validation of senderFrame URL/origin was found.
+- Context isolation is enabled and Node integration disabled, but no explicit BrowserWindow sandbox flag or CSP was found.
+Conclusion: an injected renderer payload would have a wider main-process attack surface than necessary. Filesystem handlers themselves include meaningful path-hardening controls.
+
+E-LB-SEC-005 — Embedded telemetry/client configuration (medium; scope unknown)
+Sources: extracted main bundle and renderer Vite environment in signed assets
+Observed:
+- A client-side Axiom ingestion token is embedded and passed to native helpers.
+- Client configuration also includes identifiers/keys for Auth0, PostHog, Singular, Sentry, and product-onboarding tooling.
+- Values are intentionally omitted from this evidence and were not tested over the network.
+Conclusion: some SDK identifiers are designed for client distribution; privilege and scope cannot be inferred from presence alone. The Axiom token should be least-privileged, abuse-limited, and rotated if its actual scope is broader than client ingestion requires.
+
+E-LB-SEC-006 — Device and user telemetry (medium)
+Sources: main logging and renderer analytics paths
+Observed:
+- Device identity combines hostname with a hash of a machine identifier.
+- User id/email are attached to telemetry/logging paths.
+- Active telemetry/onboarding families include Axiom, PostHog, Sentry, Singular, and Product Fruits.
+Unknown: server-side retention, data residency, and processor configuration were not statically reachable.
+
+E-LB-SEC-007 — Native capture and entitlement breadth (medium/high impact)
+Sources: E-LB-ID-006, E-LB-ID-008, E-LB-ARCH-008
+Observed:
+- The app requests Accessibility, microphone/audio, calendar/contact/automation-related capabilities and implements broad cross-application context parsing.
+- JIT, unsigned executable memory, and disabled library validation are enabled.
+- Main app sandbox entitlement is absent.
+Conclusion: intended functionality requires powerful access, increasing the consequence of renderer/main/native compromise. This is not evidence of malicious behavior.
+
+E-LB-SEC-008 — Source-map exposure and provenance (medium)
+Source: E-LB-ARCH-003
+Observed:
+- Signed production assets contain original TS/TSX sourcesContent and internal route/store/integration architecture.
+Conclusion: this increases reverse-engineering and secret-discovery exposure. The code remains proprietary; presence in a source map does not grant Bluey reuse rights.
+
+E-LB-SEC-009 — Positive controls
+Sources: E-LB-ID-005, E-LB-ARCH-007, updater path
+Observed:
+- Developer ID signature, hardened runtime, deep verification, Gatekeeper acceptance, and stapled notarization succeed.
+- External navigation is denied/redirected; remote debugging is dev-gated.
+- File IPC uses path allowlists, realpath checks, O_NOFOLLOW, and link/TOCTOU defenses.
+- Local tool execution has schema validation and allow/ask/deny consent policy.
+- Updater uses the signed Electron update mechanism and defers installation during active meetings.
+
+E-LB-SEC-010 — No bypass activity
+Observed:
+- No encryption, authentication, licensing, DRM, or platform control was bypassed.
+- No embedded token was validated or used.
+- No credentials, cookies, profiles, user data, or proprietary extracted source were added to the repository or uploaded.

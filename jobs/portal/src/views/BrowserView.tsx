@@ -19,6 +19,7 @@ import {
 import type { Intervention, JobApplication, JobsWorkspace } from "../types";
 import { isFinalSubmissionReview, runnerEligibleApplications } from "../lib/application-flow";
 import { relativeTime, titleCase } from "../lib/format";
+import { cloudRunnerAccessCopy, localRunnerAccessCopy } from "../lib/runner-access";
 import { Dialog } from "../components/Dialog";
 
 export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSession, onResolveIntervention }: { workspace: JobsWorkspace; onQueueLocal(application: JobApplication): Promise<void>; onQueueCloud(application: JobApplication): Promise<void>; onUpdateSession(session: JobsWorkspace["browser_sessions"][number], status: string): Promise<void>; onResolveIntervention(intervention: Intervention, action: string): Promise<void> }) {
@@ -36,6 +37,8 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   const finalSubmissionReview = isFinalSubmissionReview(intervention);
   const takeoverUrl = active?.takeover_url || (active ? `bluey-jobs://takeover?session_id=${encodeURIComponent(active.id)}` : "#");
   const queuedApplications = runnerEligibleApplications(workspace.applications);
+  const localCopy = localRunnerAccessCopy(workspace.entitlement.local_browser);
+  const cloudCopy = cloudRunnerAccessCopy(workspace.entitlement.cloud_browser);
 
   return (
     <div className="view-shell browser-view">
@@ -72,13 +75,13 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       <section className="runner-grid">
         <article className={`runner-option ${workspace.entitlement.local_browser ? "enabled" : "locked"}`}>
           <div className="runner-icon"><Laptop /></div>
-          <div className="runner-copy"><p>LOCAL</p><h2>Bluey Browser</h2><span>Applications run on your computer in a separate Jobs browser. Take over at any moment.</span><ul><li><Check size={14} />Keeps your job-site sign-ins ready</li><li><Check size={14} />Uses the same application flow as cloud</li><li><Check size={14} />Stops when your computer is off</li></ul></div>
-          <div className="runner-action"><b>{workspace.entitlement.local_browser ? "Included" : "Pro"}</b>{workspace.entitlement.local_browser ? <><button className="button primary" onClick={() => setLocalOpen(true)}>Run locally<ArrowRight size={16} /></button><button className="button secondary compact" onClick={() => setInstallOpen(true)}>Set up browser</button></> : <a className="button secondary" href="/jobs/settings#plans">See Pro<ArrowRight size={16} /></a>}</div>
+          <div className="runner-copy"><p>LOCAL</p><h2>Bluey Browser</h2><span>{localCopy.description}</span><ul>{localCopy.points.map((point) => <li key={point}><Check size={14} />{point}</li>)}</ul></div>
+          <div className="runner-action"><b>{localCopy.badge}</b>{workspace.entitlement.local_browser ? <><button className="button primary" onClick={() => setLocalOpen(true)}>{localCopy.action}<ArrowRight size={16} /></button><button className="button secondary compact" onClick={() => setInstallOpen(true)}>Set up browser</button></> : <a className="button secondary" href="/jobs/settings#plans">{localCopy.action}<ArrowRight size={16} /></a>}</div>
         </article>
         <article className={`runner-option ${workspace.entitlement.cloud_browser ? "enabled" : "locked"}`}>
           <div className="runner-icon cloud"><Cloud /></div>
-          <div className="runner-copy"><p>CLOUD</p><h2>Background runner</h2><span>Bluey continues from an encrypted, isolated browser profile while your computer is off.</span><ul><li><Check size={14} />Offers one-click email-code approval</li><li><Check size={14} />Pauses for security checks and user handoff</li><li><Check size={14} />Stores an evidence-backed submission receipt</li></ul></div>
-          <div className="runner-action"><b>{workspace.entitlement.cloud_browser ? "Included" : "Cloud"}</b>{workspace.entitlement.cloud_browser ? <button className="button primary" onClick={() => setCloudOpen(true)}>Queue a run<ArrowRight size={16} /></button> : <a className="button secondary" href="/jobs/settings#plans">See Cloud<ArrowRight size={16} /></a>}</div>
+          <div className="runner-copy"><p>CLOUD</p><h2>Background runner</h2><span>{cloudCopy.description}</span><ul>{cloudCopy.points.map((point) => <li key={point}><Check size={14} />{point}</li>)}</ul></div>
+          <div className="runner-action"><b>{cloudCopy.badge}</b>{workspace.entitlement.cloud_browser ? <button className="button primary" onClick={() => setCloudOpen(true)}>{cloudCopy.action}<ArrowRight size={16} /></button> : <a className="button secondary" href="/jobs/settings#plans">{cloudCopy.action}<ArrowRight size={16} /></a>}</div>
         </article>
       </section>
 
@@ -89,7 +92,7 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       </section>
 
       <Dialog open={installOpen} title="Open Bluey Browser" description="A separate application profile keeps job-site sessions away from your everyday browser." onClose={() => setInstallOpen(false)}>
-        <div className="launch-steps"><div><span>1</span><p><b>Install Bluey Browser</b><small>Available for macOS and Windows during Jobs beta.</small></p><a className="button secondary compact" href="/download">Download<ExternalLink size={14} /></a></div><div><span>2</span><p><b>Sign in with Bluey</b><small>The browser links to this Jobs workspace and stores its profile locally.</small></p></div><div><span>3</span><p><b>Start from Applications</b><small>Review an application, then choose the local runner.</small></p></div></div>
+        <div className="launch-steps"><div><span>1</span><p><b>Install Bluey Browser</b><small>Available after local runner beta access is enabled for your account.</small></p><a className="button secondary compact" href="/download">Download<ExternalLink size={14} /></a></div><div><span>2</span><p><b>Sign in with Bluey</b><small>The browser links to this Jobs workspace and stores its profile locally.</small></p></div><div><span>3</span><p><b>Start from Applications</b><small>Review an application, then choose the local runner.</small></p></div></div>
         <div className="dialog-actions"><button className="button secondary" onClick={() => setInstallOpen(false)}>Close</button><a className="button primary" href="bluey-jobs://open"><Chrome size={16} />Open Bluey Browser</a></div>
       </Dialog>
 

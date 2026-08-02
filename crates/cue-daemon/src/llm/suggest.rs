@@ -5,6 +5,16 @@ use super::CueResponse;
 
 pub const SYSTEM_PROMPT: &str = "Given the recent conversation, suggest a concise next thing the user could say. Output 1-2 short bullet points.";
 
+pub fn system_prompt_with_instructions(instructions: Option<&str>) -> String {
+    let Some(instructions) = instructions.filter(|value| !value.trim().is_empty()) else {
+        return SYSTEM_PROMPT.to_string();
+    };
+    format!(
+        "{SYSTEM_PROMPT}\n\nUse these session-specific coaching preferences when choosing the suggestion, without inventing facts:\n{}",
+        instructions.trim()
+    )
+}
+
 pub struct WhatToAnswerLlm;
 
 impl WhatToAnswerLlm {
@@ -29,8 +39,20 @@ impl WhatToAnswerLlm {
         llm: &dyn LlmProvider,
         on_chunk: impl Fn(&str, bool),
     ) -> Result<CueResponse, cue_llm::LlmError> {
+        self.run_streaming_with_instructions(transcript, session_id, llm, None, on_chunk)
+            .await
+    }
+
+    pub async fn run_streaming_with_instructions(
+        &self,
+        transcript: &str,
+        session_id: &str,
+        llm: &dyn LlmProvider,
+        instructions: Option<&str>,
+        on_chunk: impl Fn(&str, bool),
+    ) -> Result<CueResponse, cue_llm::LlmError> {
         let req = LlmRequest {
-            system: SYSTEM_PROMPT.to_string(),
+            system: system_prompt_with_instructions(instructions),
             user: transcript.to_string(),
             session_id: Some(session_id.to_string()),
             max_tokens: Some(200),
@@ -87,6 +109,16 @@ mod tests {
     use cue_llm::{LlmError, LlmResponse};
 
     struct FakeLlm;
+
+    #[test]
+    fn session_instructions_are_added_to_suggestion_prompt() {
+        let prompt = system_prompt_with_instructions(Some(
+            "Coaching mode: Meeting\nPrioritize the budget question.",
+        ));
+        assert!(prompt.starts_with(SYSTEM_PROMPT));
+        assert!(prompt.contains("Coaching mode: Meeting"));
+        assert!(prompt.contains("without inventing facts"));
+    }
 
     #[async_trait]
     impl LlmProvider for FakeLlm {

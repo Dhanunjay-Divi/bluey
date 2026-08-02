@@ -38,6 +38,7 @@ obfstr.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 getrandom.workspace = true
+libc.workspace = true
 rusqlite.workspace = true
 hex = "0.4"
 sha2 = "0.10"
@@ -80,3 +81,11 @@ path = "src/bin/whisper_stub.rs"
 objc2 = "0.5"
 objc2-app-kit = { version = "0.2", features = ["NSWorkspace", "NSRunningApplication"] }
 objc2-foundation = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Threading",
+] }

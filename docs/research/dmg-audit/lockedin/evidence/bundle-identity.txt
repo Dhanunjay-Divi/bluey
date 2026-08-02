@@ -1,0 +1,81 @@
+LOCKEDIN BUNDLE IDENTITY, SIGNING, AND CONTENT EVIDENCE
+
+Observed app
+  /Volumes/LockedIn 1.7.5-universal/LockedIn.app
+  du -sk: 913976 KiB (approximately 892.6 MiB)
+
+Info.plist observations
+  CFBundleName: LockedIn
+  CFBundleDisplayName: LockedIn
+  CFBundleShortVersionString: 1.7.5
+  CFBundleVersion: 1.7.5
+  CFBundleIdentifier: com.lockedindesktopapp
+  LSMinimumSystemVersion: 11.0
+  LSUIElement: true
+  LSApplicationCategoryType: public.app-category.developer-tools
+  CFBundleURLSchemes: locked-in
+  DTSDKName: macosx14.5
+  DTXcode: 1540
+  NSHumanReadableCopyright: Copyright © 2026 LockedIn AI. All rights reserved.
+  NSAppTransportSecurity.NSAllowsArbitraryLoads: true
+  NSAppTransportSecurity.NSAllowsLocalNetworking: true
+  Temporary insecure HTTP exceptions: localhost and 127.0.0.1
+  Minimum TLS in those exceptions: TLSv1.0
+  Usage descriptions present: microphone, audio capture, camera, Bluetooth, accessibility, screen capture
+  ElectronAsarIntegrity algorithm: SHA256
+  ElectronAsarIntegrity hash: 784fff67eafdc8e56a8f033e16ca46445451adeb6a3861ababeb34cb4e027355
+
+Main executable
+  file/lipo: Mach-O universal binary with x86_64 and arm64 slices
+  otool: links Electron Framework and libSystem
+
+Electron runtime
+  Electron Framework bundle version: 33.4.11
+  Embedded Chromium version string: 130.0.6723.191
+
+Signature and Gatekeeper observations
+  Authority: Developer ID Application: Cyber Gravity LLC (F5JH5QMHRD)
+  TeamIdentifier: F5JH5QMHRD
+  Timestamp: Jul 9, 2026 at 7:24:35 PM
+  Runtime version flag: hardened runtime enabled
+  codesign --verify --deep --strict: valid on disk
+  designated requirement: satisfied
+  spctl --assess --type execute: accepted
+  spctl source: Notarized Developer ID
+  xcrun stapler validate: stapled ticket validated
+
+Observed app entitlements
+  com.apple.security.automation.apple-events
+  com.apple.security.cs.allow-dyld-environment-variables
+  com.apple.security.cs.allow-jit
+  com.apple.security.cs.allow-unsigned-executable-memory
+  com.apple.security.cs.disable-library-validation
+  com.apple.security.device.audio-input
+  com.apple.security.device.camera
+  com.apple.security.device.microphone
+  com.apple.security.inherit
+  com.apple.security.screen-recording
+
+No com.apple.security.app-sandbox entitlement was observed.
+
+Bundled frameworks and helpers
+  Electron Framework.framework
+  Squirrel.framework
+  ReactiveObjC.framework
+  Mantle.framework
+  LockedIn Helper.app
+  LockedIn Helper (Renderer).app
+  LockedIn Helper (GPU).app
+  LockedIn Helper (Plugin).app
+  chrome_crashpad_handler
+  Squirrel ShipIt
+
+No LaunchAgent, XPC service, app extension, or system extension was found under the mounted bundle.
+
+Update configuration: Contents/Resources/app-update.yml
+  provider: s3
+  bucket: desktop-app-updates-lockedin-ai
+  region: ap-southeast-2
+  path: updates/
+  channel: latest
+  updater cache directory name: lockedin_desktop_app-updater
