@@ -21,6 +21,9 @@ under `docs/release/`.
 
 ### Changed
 
+- Promoted the reviewed Round 586 Jobs authority and ATS form read-back build
+  through a backed-up, exact-artifact manual deployment, while keeping model
+  generation, Browser distribution, and mailbox synchronization disabled.
 - Made global discovery refreshes semantic and candidate writes
   content-addressed, so unchanged manifests preserve their completed schedule
   and unchanged encrypted job payloads no longer rewrite canonical rows.
