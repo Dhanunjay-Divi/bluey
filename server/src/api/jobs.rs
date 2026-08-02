@@ -100,7 +100,7 @@ pub fn router() -> Router<AppState> {
         )
         .route(
             "/api/jobs/applications/:application_id/evidence",
-            get(application_evidence).post(save_application_evidence),
+            get(application_evidence),
         )
         .route(
             "/api/jobs/applications/:application_id/interview-prep",
@@ -1441,10 +1441,13 @@ pub async fn update_application(
     Path(application_id): Path<String>,
     Json(req): Json<UpdateApplicationRequest>,
 ) -> Result<Json<JobApplication>, ApiError> {
-    if req.state == "queued" {
+    if matches!(
+        req.state.as_str(),
+        "queued" | "running" | "needs_input" | "side_effect_unknown" | "submitted"
+    ) {
         return Err((
             StatusCode::CONFLICT,
-            "Approve the application packet before queueing it.".to_string(),
+            "This application state is controlled by the verified runner workflow.".to_string(),
         ));
     }
     jobs::update_application(
@@ -1573,22 +1576,6 @@ pub async fn application_evidence(
     jobs::list_application_evidence(&state.pool, &account.id, Some(&application_id))
         .map(Json)
         .map_err(internal)
-}
-
-pub async fn save_application_evidence(
-    State(state): State<AppState>,
-    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
-    Path(application_id): Path<String>,
-    Json(mut evidence): Json<ApplicationEvidence>,
-) -> Result<Json<ApplicationEvidence>, ApiError> {
-    evidence.id.clear();
-    evidence.application_id = application_id;
-    evidence.kind = evidence.kind.trim().to_ascii_lowercase();
-    evidence.provider = evidence.provider.trim().to_ascii_lowercase();
-    evidence.created_at_ms = 0;
-    jobs::save_application_evidence(&state.pool, &account.id, &evidence)
-        .map(Json)
-        .map_err(domain_error)
 }
 
 pub async fn commit_application_packet(

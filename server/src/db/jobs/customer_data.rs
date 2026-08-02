@@ -779,24 +779,6 @@ fn validate_document_evidence(evidence: &ApplicationEvidence) -> Result<()> {
     Ok(())
 }
 
-fn application_submission_evidence_complete(
-    pool: &DbPool,
-    account_id: &str,
-    application: &JobApplication,
-) -> Result<bool> {
-    let Some(resume_version_id) = application.resume_version_id.as_deref() else {
-        return Ok(false);
-    };
-    let evidence = list_application_evidence(pool, account_id, Some(&application.id))?;
-    let matching_resume = evidence.iter().any(|item| {
-        item.kind == "resume" && item.resume_version_id.as_deref() == Some(resume_version_id)
-    });
-    let confirmation = evidence
-        .iter()
-        .any(|item| item.kind == "submission_confirmation");
-    Ok(matching_resume && confirmation)
-}
-
 struct PreparedSubmissionEvidence {
     value: ApplicationEvidence,
     provider_event_hash: String,

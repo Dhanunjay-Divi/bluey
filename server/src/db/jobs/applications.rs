@@ -1455,6 +1455,11 @@ pub fn update_application(
     let Some(mut application) = get_application(pool, account_id, application_id)? else {
         return Ok(None);
     };
+    if state == "submitted" {
+        anyhow::bail!(
+            "only a verified runner receipt can finalize a submitted application"
+        )
+    }
     validate_application_transition(&application.state, state)?;
     if matches!(state, "queued" | "running") {
         let posting = get_posting(pool, account_id, &application.job_id)?
@@ -1471,11 +1476,6 @@ pub fn update_application(
             );
         }
     }
-    if state == "submitted"
-        && !application_submission_evidence_complete(pool, account_id, &application)?
-    {
-        anyhow::bail!("attach the exact resume used and submission confirmation before marking this application submitted")
-    }
     application.state = state.to_string();
     if let Some(mode) = submission_mode {
         if !matches!(mode, "review_first" | "auto_submit") {
@@ -1484,9 +1484,6 @@ pub fn update_application(
         application.submission_mode = mode.to_string();
     }
     application.updated_at_ms = now_ms();
-    if state == "submitted" {
-        application.submitted_at_ms = Some(application.updated_at_ms);
-    }
     save_application(pool, account_id, &application).map(Some)
 }
 
@@ -1755,24 +1752,32 @@ pub fn commit_packet(
                     monthly_packet_limit: limit,
                 });
             }
-            let (used, limit): (i64, i64) = tx.query_row(
-                "SELECT used_packets, monthly_packet_limit FROM jobs_entitlements WHERE account_id = ?1",
+            let (used, limit, period_start): (i64, i64, i64) = tx.query_row(
+                "SELECT used_packets, monthly_packet_limit, period_start_ms
+                   FROM jobs_entitlements WHERE account_id = ?1",
                 params![account_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-            let allowance: Option<String> = tx
+            let allowance: Option<(String, i64)> = tx
                 .query_row(
-                    "SELECT status
+                    "SELECT status, period_start_ms
                        FROM jobs_generation_allowance_reservations
                       WHERE account_id = ?1 AND job_id = ?2",
                     params![account_id, application.job_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if allowance.as_deref() == Some("committed") {
+            if allowance
+                .as_ref()
+                .is_some_and(|(status, _)| status == "committed")
+            {
                 anyhow::bail!("committed Jobs allowance has no packet metering row")
             }
-            let pre_reserved = allowance.as_deref() == Some("reserved");
+            let pre_reserved = allowance
+                .as_ref()
+                .is_some_and(|(status, held_period)| {
+                    status == "reserved" && *held_period == period_start
+                });
             let included = pre_reserved || used < limit;
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };
             if amount_cents > 0 {
@@ -1828,7 +1833,10 @@ pub fn commit_packet(
                     updated_at_ms = ?2 WHERE account_id = ?1 AND ?3 = 0",
                 params![account_id, now, i64::from(pre_reserved)],
             )?;
-            if allowance.as_deref() == Some("reserved") {
+            if allowance
+                .as_ref()
+                .is_some_and(|(status, _)| status == "reserved")
+            {
                 tx.execute(
                     "UPDATE jobs_generation_allowance_reservations
                         SET status = 'committed', application_id = ?3, updated_at_ms = ?4
@@ -1856,7 +1864,8 @@ pub fn commit_packet(
                 )],
             )?;
             let entitlement = tx.query_one(
-                "SELECT used_packets, monthly_packet_limit FROM jobs_entitlements
+                "SELECT used_packets, monthly_packet_limit, period_start_ms
+                   FROM jobs_entitlements
                   WHERE account_id = $1 FOR UPDATE",
                 &[&account_id],
             )?;
@@ -1875,8 +1884,9 @@ pub fn commit_packet(
             }
             let used: i64 = entitlement.get(0);
             let limit: i64 = entitlement.get(1);
+            let period_start: i64 = entitlement.get(2);
             let allowance = tx.query_opt(
-                "SELECT status
+                "SELECT status, period_start_ms
                    FROM jobs_generation_allowance_reservations
                   WHERE account_id = $1 AND job_id = $2 FOR UPDATE",
                 &[&account_id, &application.job_id],
@@ -1889,7 +1899,10 @@ pub fn commit_packet(
             }
             let pre_reserved = allowance
                 .as_ref()
-                .is_some_and(|row| row.get::<_, String>(0) == "reserved");
+                .is_some_and(|row| {
+                    row.get::<_, String>(0) == "reserved"
+                        && row.get::<_, i64>(1) == period_start
+                });
             let included = pre_reserved || used < limit;
             let included_db = i32::from(included);
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };

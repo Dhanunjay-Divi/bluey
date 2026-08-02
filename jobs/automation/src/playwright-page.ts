@@ -1,3 +1,4 @@
+import { basename } from "node:path";
 import type { Locator, Page } from "playwright";
 import type { BrowserLocator, BrowserPage, FormControl, FormControlKind } from "./contracts.js";
 
@@ -13,7 +14,7 @@ export class PlaywrightBrowserPage implements BrowserPage {
   }
 
   locator(selector: string): BrowserLocator {
-    return new PlaywrightBrowserLocator(this.page.locator(selector).first());
+    return new PlaywrightBrowserLocator(this.page.locator(selector));
   }
 
   async controls(): Promise<FormControl[]> {
@@ -84,8 +85,11 @@ class PlaywrightBrowserLocator implements BrowserLocator {
     return this.locator.count();
   }
 
-  fill(value: string): Promise<void> {
-    return this.locator.fill(value);
+  async fill(value: string): Promise<void> {
+    await this.locator.fill(value);
+    if (await this.locator.inputValue() !== value) {
+      throw new Error("Browser did not retain the requested field value.");
+    }
   }
 
   click(): Promise<void> {
@@ -105,15 +109,35 @@ class PlaywrightBrowserLocator implements BrowserLocator {
   }
 
   async selectOption(value: string): Promise<void> {
-    await this.locator.selectOption(value);
+    const selected = await this.locator.selectOption(value);
+    if (selected.length !== 1 || selected[0] !== value) {
+      throw new Error("Browser did not retain the requested select option.");
+    }
   }
 
   async setChecked(checked: boolean): Promise<void> {
     await this.locator.setChecked(checked);
+    if (await this.locator.isChecked() !== checked) {
+      throw new Error("Browser did not retain the requested checked state.");
+    }
   }
 
   async setInputFiles(paths: string[]): Promise<void> {
     await this.locator.setInputFiles(paths);
+    const actualNames = await this.locator.evaluateAll((elements) => (
+      elements.flatMap((element) => (
+        element instanceof HTMLInputElement && element.type === "file"
+          ? Array.from(element.files || []).map((file) => file.name)
+          : []
+      ))
+    ));
+    const expectedNames = paths.map((path) => basename(path));
+    if (
+      actualNames.length !== expectedNames.length
+      || actualNames.some((name, index) => name !== expectedNames[index])
+    ) {
+      throw new Error("Browser did not retain the requested application document.");
+    }
   }
 }
 
