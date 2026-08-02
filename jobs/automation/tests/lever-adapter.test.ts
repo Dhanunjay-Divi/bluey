@@ -216,6 +216,33 @@ describe("LeverApplicationStateMachine", () => {
     expect(submitHooks).toEqual([]);
   });
 
+  it("blocks submission when Lever discards a prepared field value", async () => {
+    const fixture = asDirectApplication(loadFixture("us-current.json"));
+    const page = new LeverFixturePage(
+      fixture,
+      { ignoredWrites: ["[data-bluey-field-id='name']"] },
+    );
+    const adapter = new LeverApplicationStateMachine();
+    const submitHooks: string[] = [];
+    const context = makeContext(page, fixture.answers, { events: submitHooks });
+
+    await adapter.prepare(context);
+    await adapter.fill(context);
+    const issues = await adapter.validate(context);
+
+    expect(issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        field: "Full name",
+        message: expect.stringContaining("did not register"),
+        severity: "blocking",
+      }),
+    ]));
+    const receipt = await adapter.submit(context, { finalReviewApproved: true });
+    expect(receipt.status).toBe("needs_input");
+    expect(page.submitClicks).toBe(0);
+    expect(submitHooks).toEqual([]);
+  });
+
   it("blocks ambiguous Lever form recognition before any field action", async () => {
     const fixture = asDirectApplication(loadFixture("us-current.json"));
     const page = new LeverFixturePage(fixture, { formCount: 2 });
@@ -404,6 +431,7 @@ interface FixturePageOptions {
   formCount?: number;
   submitCount?: number;
   throwAfterSubmit?: boolean;
+  ignoredWrites?: string[];
 }
 
 class LeverFixturePage implements BrowserPage {
@@ -479,7 +507,7 @@ class LeverFixturePage implements BrowserPage {
     return {
       count: async () => count(),
       fill: async (value) => {
-        if (control) control.value = value;
+        if (control && !this.options.ignoredWrites?.includes(selector)) control.value = value;
       },
       click: async () => {
         if (selector === this.fixture.applySelector && !this.onApplication) {
@@ -498,13 +526,13 @@ class LeverFixturePage implements BrowserPage {
       getAttribute: async () => null,
       isVisible: async () => count() > 0,
       selectOption: async (value) => {
-        if (control) control.value = value;
+        if (control && !this.options.ignoredWrites?.includes(selector)) control.value = value;
       },
       setChecked: async (checked) => {
-        if (control) control.checked = checked;
+        if (control && !this.options.ignoredWrites?.includes(selector)) control.checked = checked;
       },
       setInputFiles: async (paths) => {
-        if (!control) return;
+        if (!control || this.options.ignoredWrites?.includes(selector)) return;
         const path = paths[0] ?? "";
         control.value = path.split("/").at(-1) ?? "";
         this.uploads.push([selector, path]);

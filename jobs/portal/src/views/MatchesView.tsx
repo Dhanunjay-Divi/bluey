@@ -23,6 +23,7 @@ import {
   TriangleAlert,
 } from "lucide-react";
 import type {
+  AutoSubmitAuthorization,
   CandidateEventInput,
   DiscoverySource,
   DiscoverySourceCatalogEntry,
@@ -237,7 +238,12 @@ export function MatchesView({
       await onPrepare(
         job,
         mode,
-        effectiveSubmissionMode(job, submissionMode, workspace.runner_availability),
+        effectiveSubmissionMode(
+          job,
+          submissionMode,
+          workspace.runner_availability,
+          hasActiveAutoSubmitAuthorization(job, workspace.auto_submit_authorizations),
+        ),
       );
       setSelected(null);
     } catch (cause) {
@@ -275,6 +281,14 @@ export function MatchesView({
       setFeedbackBusy(false);
     }
   };
+
+  const selectedCanAutoSubmit = selected
+    ? canAutoSubmit(
+        selected,
+        workspace.runner_availability,
+        workspace.auto_submit_authorizations,
+      )
+    : false;
 
   return (
     <div className="view-shell matches-view">
@@ -389,8 +403,8 @@ export function MatchesView({
                 <div className="segmented"><button className={mode === "factual" ? "active" : ""} onClick={() => setMode("factual")}>Factual</button><button className={mode === "enhance" ? "active" : ""} onClick={() => setMode("enhance")}>Enhance</button></div>
                 <p className="selection-help">{mode === "enhance" ? "Enhance strengthens wording and emphasizes JD-relevant skills already supported by your profile. It never invents employers, dates, credentials, or experience." : "Factual keeps your verified wording and moves the strongest relevant evidence first."}</p>
                 <label>After preparation</label>
-                <div className="segmented"><button className={submissionMode === "review_first" || !canAutoSubmit(selected, workspace.runner_availability) ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!canAutoSubmit(selected, workspace.runner_availability)} title={autoSubmitUnavailableReason(selected, workspace.runner_availability)} className={submissionMode === "auto_submit" && canAutoSubmit(selected, workspace.runner_availability) ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div>
-                {!canAutoSubmit(selected, workspace.runner_availability) && <p className="selection-help warning-copy">{autoSubmitUnavailableReason(selected, workspace.runner_availability)}</p>}
+                <div className="segmented"><button className={submissionMode === "review_first" || !selectedCanAutoSubmit ? "active" : ""} onClick={() => setSubmissionMode("review_first")}>Review first</button><button disabled={!selectedCanAutoSubmit} title={autoSubmitUnavailableReason(selected, workspace.runner_availability, workspace.auto_submit_authorizations)} className={submissionMode === "auto_submit" && selectedCanAutoSubmit ? "active" : ""} onClick={() => setSubmissionMode("auto_submit")}>Auto-submit</button></div>
+                {!selectedCanAutoSubmit && <p className="selection-help warning-copy">{autoSubmitUnavailableReason(selected, workspace.runner_availability, workspace.auto_submit_authorizations)}</p>}
               </section>
             </div>
             {actionError && <div className="inline-error" role="alert">{actionError}</div>}
@@ -575,13 +589,31 @@ function capabilityDescription(capability: ReturnType<typeof jobEligibility>["ca
   return "Bluey can prepare a kit, but this application system is not certified for runner submission.";
 }
 
-export function canAutoSubmit(job: JobPosting, runners: RunnerAvailability): boolean {
-  return jobEligibility(job).can_auto_submit && runners.auto_submit_available;
+export function hasActiveAutoSubmitAuthorization(
+  job: Pick<JobPosting, "track_id">,
+  authorizations: AutoSubmitAuthorization[],
+): boolean {
+  return authorizations.some(
+    (authorization) =>
+      authorization.career_track_id === job.track_id
+      && authorization.status === "active",
+  );
+}
+
+export function canAutoSubmit(
+  job: JobPosting,
+  runners: RunnerAvailability,
+  authorizations: AutoSubmitAuthorization[],
+): boolean {
+  return jobEligibility(job).can_auto_submit
+    && runners.auto_submit_available
+    && hasActiveAutoSubmitAuthorization(job, authorizations);
 }
 
 export function autoSubmitUnavailableReason(
   job: JobPosting,
   runners?: RunnerAvailability,
+  authorizations: AutoSubmitAuthorization[] = [],
 ): string | undefined {
   const eligibility = jobEligibility(job);
   if (eligibility.hard_failures.length > 0) return "Resolve the Career Track rules above before Auto-submit can be considered.";
@@ -590,6 +622,15 @@ export function autoSubmitUnavailableReason(
   if (eligibility.capability === "unknown_review") return "Review first is required because this application system is not certified.";
   if (eligibility.capability === "blocked") return "This listing cannot use a Bluey runner.";
   if (!eligibility.can_auto_submit) return "Auto-submit is available only after every server rule and application-system check passes.";
+  const authorization = authorizations.find(
+    (item) => item.career_track_id === job.track_id,
+  );
+  if (authorization?.status === "needs_review") {
+    return "This Career Track changed. Review and enable Auto-submit again in Settings.";
+  }
+  if (!authorization || authorization.status !== "active") {
+    return "Enable Auto-submit for this Career Track in Settings first.";
+  }
   if (runners && !runners.auto_submit_available) return runners.auto_submit_reason;
   if (eligibility.can_auto_submit) return undefined;
   return "Auto-submit is available only after every server rule and application-system check passes.";

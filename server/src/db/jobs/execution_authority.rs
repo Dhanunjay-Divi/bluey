@@ -77,6 +77,32 @@ fn current_execution_authorized_sqlite(
     let facts = fact_stmt
         .query_map(params![account_id], fact_from_sqlite_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let auto_submit_authorization = if application.submission_mode == "auto_submit" {
+        tx.query_row(
+            "SELECT id, career_track_id, application_identity_id,
+                    source_resume_asset_id, authority_fingerprint, revision_no,
+                    authorized_at_ms, revoked_at_ms
+               FROM jobs_auto_submit_authorizations
+              WHERE account_id = ?1 AND career_track_id = ?2
+                AND revoked_at_ms IS NULL",
+            params![account_id, track.id],
+            |row| {
+                Ok(StoredAutoSubmitAuthorization {
+                    id: row.get(0)?,
+                    career_track_id: row.get(1)?,
+                    application_identity_id: row.get(2)?,
+                    source_resume_asset_id: row.get(3)?,
+                    authority_fingerprint: row.get(4)?,
+                    revision_no: row.get(5)?,
+                    authorized_at_ms: row.get(6)?,
+                    revoked_at_ms: row.get(7)?,
+                })
+            },
+        )
+        .optional()?
+    } else {
+        None
+    };
     let preferences = tx
         .query_row(
             "SELECT preferences_json FROM jobs_preferences WHERE account_id = ?1",
@@ -136,6 +162,7 @@ fn current_execution_authorized_sqlite(
         &track,
         &identity,
         &facts,
+        auto_submit_authorization.as_ref(),
         &preferences,
         &reservations,
         &authorities,
@@ -198,6 +225,29 @@ fn current_execution_authorized_postgres(
         .into_iter()
         .map(fact_from_pg_row)
         .collect::<Result<Vec<_>>>()?;
+    let auto_submit_authorization = if application.submission_mode == "auto_submit" {
+        tx.query_opt(
+            "SELECT id, career_track_id, application_identity_id,
+                    source_resume_asset_id, authority_fingerprint, revision_no,
+                    authorized_at_ms, revoked_at_ms
+               FROM jobs_auto_submit_authorizations
+              WHERE account_id = $1 AND career_track_id = $2
+                AND revoked_at_ms IS NULL",
+            &[&account_id, &track.id],
+        )?
+        .map(|row| StoredAutoSubmitAuthorization {
+            id: row.get(0),
+            career_track_id: row.get(1),
+            application_identity_id: row.get(2),
+            source_resume_asset_id: row.get(3),
+            authority_fingerprint: row.get(4),
+            revision_no: row.get(5),
+            authorized_at_ms: row.get(6),
+            revoked_at_ms: row.get(7),
+        })
+    } else {
+        None
+    };
     let preferences = tx
         .query_opt(
             "SELECT preferences_json FROM jobs_preferences WHERE account_id = $1",
@@ -255,6 +305,7 @@ fn current_execution_authorized_postgres(
         &track,
         &identity,
         &facts,
+        auto_submit_authorization.as_ref(),
         &preferences,
         &reservations,
         &authorities,
@@ -272,6 +323,7 @@ fn current_execution_authority_matches(
     track: &CareerTrack,
     identity: &ApplicationIdentity,
     facts: &[CareerFact],
+    auto_submit_authorization: Option<&StoredAutoSubmitAuthorization>,
     preferences: &JobPreferences,
     reservations: &[AttemptReservation],
     authorities: &[JobDiscoveryAuthority],
@@ -314,6 +366,37 @@ fn current_execution_authority_matches(
         || (application.submission_mode == "auto_submit" && !decision.can_auto_submit)
     {
         return Ok(false);
+    }
+    if application.submission_mode == "auto_submit" {
+        let Some(authorization) = auto_submit_authorization else {
+            return Ok(false);
+        };
+        if !auto_submit_authorization_matches_inputs(
+            authorization,
+            profile,
+            facts,
+            track,
+            identity,
+        )? {
+            return Ok(false);
+        }
+        let admission = application.receipt.pointer("/approved_execution/admission");
+        let admission_matches = admission.is_some_and(|value| {
+            value.get("kind").and_then(Value::as_str) == Some("track_auto_submit")
+                && value.get("authorization_id").and_then(Value::as_str)
+                    == Some(authorization.id.as_str())
+                && value.get("career_track_id").and_then(Value::as_str)
+                    == Some(track.id.as_str())
+                && value.get("revision_no").and_then(Value::as_i64)
+                    == Some(authorization.revision_no)
+                && value
+                    .get("authority_fingerprint")
+                    .and_then(Value::as_str)
+                    == Some(authorization.authority_fingerprint.as_str())
+        });
+        if !admission_matches {
+            return Ok(false);
+        }
     }
 
     let experience = role_experience_evidence(profile, Some(track), posting);

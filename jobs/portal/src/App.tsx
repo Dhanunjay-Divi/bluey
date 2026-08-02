@@ -7,6 +7,7 @@ import type {
   AccountSummary,
   AnswerMemory,
   ApplicationIdentity,
+  AutoSubmitAuthorization,
   BrowserSession,
   CandidateEvent,
   CandidateEventInput,
@@ -213,10 +214,61 @@ export default function App() {
       : await jobsApi.saveTrack(track);
     setWorkspace((current) =>
       current
-        ? { ...current, tracks: [saved, ...current.tracks.filter((item) => item.id !== saved.id)] }
+        ? {
+            ...current,
+            tracks: [saved, ...current.tracks.filter((item) => item.id !== saved.id)],
+            auto_submit_authorizations: current.auto_submit_authorizations.map((authorization) =>
+              authorization.career_track_id === saved.id
+                ? { ...authorization, status: "needs_review" }
+                : authorization,
+            ),
+          }
         : current,
     );
     setToast(track.id ? "Career Track updated." : "Career Track started.");
+  }, []);
+
+  const authorizeTrackAutoSubmit = useCallback(async (track: CareerTrack) => {
+    const saved: AutoSubmitAuthorization = isPreview
+      ? {
+          id: `auto-submit-${track.id}-${Date.now()}`,
+          career_track_id: track.id,
+          application_identity_id: track.application_identity_id || "",
+          source_resume_asset_id: workspace?.profile.source_resume_asset_id || "",
+          revision_no: 1,
+          authorized_at_ms: Date.now(),
+          status: "active",
+        }
+      : await jobsApi.authorizeTrackAutoSubmit(track.id);
+    setWorkspace((current) =>
+      current
+        ? {
+            ...current,
+            auto_submit_authorizations: [
+              saved,
+              ...current.auto_submit_authorizations.filter(
+                (authorization) => authorization.career_track_id !== track.id,
+              ),
+            ],
+          }
+        : current,
+    );
+    setToast(`Auto-submit enabled for ${track.name}.`);
+  }, [workspace?.profile.source_resume_asset_id]);
+
+  const revokeTrackAutoSubmit = useCallback(async (track: CareerTrack) => {
+    if (!isPreview) await jobsApi.revokeTrackAutoSubmit(track.id);
+    setWorkspace((current) =>
+      current
+        ? {
+            ...current,
+            auto_submit_authorizations: current.auto_submit_authorizations.filter(
+              (authorization) => authorization.career_track_id !== track.id,
+            ),
+          }
+        : current,
+    );
+    setToast(`Auto-submit turned off for ${track.name}.`);
   }, []);
 
   const deleteTrack = useCallback(async (track: CareerTrack) => {
@@ -226,6 +278,9 @@ export default function App() {
         ? {
             ...current,
             tracks: current.tracks.filter((item) => item.id !== track.id),
+            auto_submit_authorizations: current.auto_submit_authorizations.filter(
+              (authorization) => authorization.career_track_id !== track.id,
+            ),
             matches: current.matches.map((job) =>
               job.track_id === track.id ? { ...job, track_id: "" } : job,
             ),
@@ -808,6 +863,8 @@ export default function App() {
               onSavePreferences={savePreferences}
               onSaveTrack={saveTrack}
               onDeleteTrack={deleteTrack}
+              onAuthorizeTrackAutoSubmit={authorizeTrackAutoSubmit}
+              onRevokeTrackAutoSubmit={revokeTrackAutoSubmit}
               onCreateIdentity={createApplicationIdentity}
               onUpdateIdentity={updateApplicationIdentity}
               onVerifyIdentity={verifyApplicationIdentity}

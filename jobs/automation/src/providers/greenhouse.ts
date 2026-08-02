@@ -10,6 +10,13 @@ import type {
   SubmissionReceipt,
   ValidationIssue,
 } from "../contracts.js";
+import {
+  checkedExpectation,
+  fileExpectation,
+  type FormFillExpectation,
+  valueExpectation,
+  verifyFillExpectations,
+} from "../form-readback.js";
 
 export const GREENHOUSE_ADAPTER_PROFILE = Object.freeze({
   kind: "greenhouse",
@@ -239,6 +246,7 @@ export class GreenhouseApplicationStateMachine {
   private reviewApproved: boolean;
   private pausedForFinalReview = false;
   private submitStarted = false;
+  private fillExpectations: FormFillExpectation[] = [];
 
   constructor(
     private readonly context: AdapterContext,
@@ -339,6 +347,7 @@ export class GreenhouseApplicationStateMachine {
 
     const controls = await this.readControls();
     if (!controls) return;
+    this.fillExpectations = [];
     let filledFieldCount = 0;
     for (const control of controls) {
       if (control.kind === "hidden" || control.kind === "other" || hasControlValue(control)) continue;
@@ -348,6 +357,7 @@ export class GreenhouseApplicationStateMachine {
         const path = documentPath(control, this.context.packet);
         if (path) {
           await this.context.page.locator(control.selector).setInputFiles([path]);
+          this.fillExpectations.push(fileExpectation(control, displayField(control), path));
           filledFieldCount += 1;
         }
         continue;
@@ -360,18 +370,23 @@ export class GreenhouseApplicationStateMachine {
         const option = bestOption(control, answer);
         if (option !== undefined) {
           await locator.selectOption(option);
+          this.fillExpectations.push(valueExpectation(control, displayField(control), option));
           filledFieldCount += 1;
         }
       } else if (control.kind === "radio") {
         if (radioMatches(control, answer)) {
           await locator.setChecked(true);
+          this.fillExpectations.push(checkedExpectation(control, displayField(control), true));
           filledFieldCount += 1;
         }
       } else if (control.kind === "checkbox") {
-        await locator.setChecked(booleanAnswer(answer));
+        const checked = booleanAnswer(answer);
+        await locator.setChecked(checked);
+        this.fillExpectations.push(checkedExpectation(control, displayField(control), checked));
         filledFieldCount += 1;
       } else {
         await locator.fill(answer);
+        this.fillExpectations.push(valueExpectation(control, displayField(control), answer));
         filledFieldCount += 1;
       }
     }
@@ -404,7 +419,11 @@ export class GreenhouseApplicationStateMachine {
 
     const controls = await this.readControls();
     if (!controls) return this.getReceipt()?.issues ?? [];
-    const records = validationRecords(controls, this.context.packet);
+    const records = combinedValidationRecords(
+      this.fillExpectations,
+      controls,
+      this.context.packet,
+    );
     if (records.length > 0) {
       await this.finish(validationReceipt(records));
       return records.map((record) => record.issue);
@@ -462,7 +481,11 @@ export class GreenhouseApplicationStateMachine {
 
     const controls = await this.readControls();
     if (!controls) return this.requireReceipt();
-    const records = validationRecords(controls, this.context.packet);
+    const records = combinedValidationRecords(
+      this.fillExpectations,
+      controls,
+      this.context.packet,
+    );
     if (records.length > 0) return this.finish(validationReceipt(records));
 
     const submit = await locateUniqueVisible(this.context.page, SUBMIT_SELECTORS);
@@ -863,6 +886,31 @@ function validationRecords(controls: FormControl[], packet: ApplicationPacket): 
     });
   }
   return records;
+}
+
+function combinedValidationRecords(
+  expectations: readonly FormFillExpectation[],
+  controls: FormControl[],
+  packet: ApplicationPacket,
+): ValidationRecord[] {
+  const readback = readbackValidationRecords(expectations, controls);
+  const readbackFields = new Set(readback.map((record) => record.issue.field));
+  return [
+    ...readback,
+    ...validationRecords(controls, packet)
+      .filter((record) => !readbackFields.has(record.issue.field)),
+  ];
+}
+
+function readbackValidationRecords(
+  expectations: readonly FormFillExpectation[],
+  controls: FormControl[],
+): ValidationRecord[] {
+  return verifyFillExpectations(expectations, controls, "Greenhouse")
+    .map((issue) => ({
+      issue,
+      interventionKind: "missing_fact",
+    }));
 }
 
 function choicesFor(control: FormControl, controls: FormControl[]): string[] | undefined {

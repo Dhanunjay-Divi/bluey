@@ -161,6 +161,90 @@ mod tests {
     }
 
     #[test]
+    fn replacing_source_resume_requires_auto_submit_review_again() {
+        let pool = test_pool();
+        let now = now_ms();
+        let first_asset = ResumeSourceAsset {
+            id: "resume-source-one".to_string(),
+            file_name: "software-engineer-resume.docx".to_string(),
+            media_type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                .to_string(),
+            file_type: "docx".to_string(),
+            storage_key: "jobs/acct-jobs/resume-source-one".to_string(),
+            sha256: "resume-source-one-sha256".to_string(),
+            size_bytes: 1_024,
+            page_count: Some(2),
+            template_status: "exact_docx".to_string(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let mut profile = default_profile("jobs@example.com");
+        profile.onboarding_complete = true;
+        profile.source_resume_name = first_asset.file_name.clone();
+        profile.source_resume_asset_id = first_asset.id.clone();
+        profile.source_resume_sha256 = first_asset.sha256.clone();
+        profile.source_resume_media_type = first_asset.media_type.clone();
+        profile.source_resume_template_status = first_asset.template_status.clone();
+        let (_, profile) =
+            save_resume_source_asset(&pool, "acct-jobs", &first_asset, &profile).unwrap();
+
+        let authorization = authorize_auto_submit(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+            "track-default",
+        )
+        .unwrap();
+        assert_eq!(authorization.status, "active");
+        assert_eq!(authorization.source_resume_asset_id, first_asset.id);
+
+        let replacement_asset = ResumeSourceAsset {
+            id: "resume-source-two".to_string(),
+            file_name: "software-engineer-resume-v2.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            file_type: "pdf".to_string(),
+            storage_key: "jobs/acct-jobs/resume-source-two".to_string(),
+            sha256: "resume-source-two-sha256".to_string(),
+            size_bytes: 2_048,
+            page_count: Some(2),
+            template_status: "converted_layout".to_string(),
+            created_at_ms: now + 1,
+            updated_at_ms: now + 1,
+        };
+        let mut replacement_profile = profile;
+        replacement_profile.source_resume_name = replacement_asset.file_name.clone();
+        replacement_profile.source_resume_asset_id = replacement_asset.id.clone();
+        replacement_profile.source_resume_sha256 = replacement_asset.sha256.clone();
+        replacement_profile.source_resume_media_type = replacement_asset.media_type.clone();
+        replacement_profile.source_resume_template_status =
+            replacement_asset.template_status.clone();
+        save_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &replacement_asset,
+            &replacement_profile,
+        )
+        .unwrap();
+
+        let authorizations =
+            list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(authorizations.len(), 1);
+        assert_eq!(authorizations[0].status, "needs_review");
+        assert!(require_valid_auto_submit_authorization(
+            &pool,
+            "acct-jobs",
+            "jobs@example.com",
+            "track-default",
+        )
+        .is_err());
+
+        assert!(revoke_auto_submit(&pool, "acct-jobs", "track-default").unwrap());
+        assert!(list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn experience_fit_is_derived_from_profile_dates_and_posting_requirements() {
         let mut profile = default_profile("jobs@example.com");
         profile.employment = vec![EmploymentEntry {

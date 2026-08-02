@@ -4,6 +4,7 @@ export * from "./answer-memory.js";
 export * from "./challenge-handling.js";
 export * from "./contracts.js";
 export * from "./curated-feeds.js";
+export * from "./form-readback.js";
 export * from "./form-intelligence.js";
 export * from "./interview-prep.js";
 export * from "./job-source-intelligence.js";

@@ -39,6 +39,11 @@ pub fn workspace(pool: &DbPool, account_id: &str, email: &str) -> Result<JobsWor
         candidate_events: list_candidate_events(pool, account_id)?,
         integrations: list_integrations(pool, account_id)?,
         application_identities: list_application_identities(pool, account_id)?,
+        auto_submit_authorizations: list_auto_submit_authorizations(
+            pool,
+            account_id,
+            email,
+        )?,
         mailbox_connections: list_mailbox_connections(pool, account_id)?,
         discovery_sources: list_discovery_sources(pool, account_id)?
             .iter()
