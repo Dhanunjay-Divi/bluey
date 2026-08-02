@@ -26941,19 +26941,25 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
         }
 
         let mut rag_deleted = false;
+        let mut last_rag_error = None;
         for _ in 0..50 {
-            let rag = cue_rag::VectorStore::open(&rag_path, 3).unwrap();
-            if rag
-                .query(&rag_scope, &[1.0, 0.0, 0.0], 10, Some(&session_id_string))
-                .unwrap()
-                .is_empty()
-            {
-                rag_deleted = true;
-                break;
+            match cue_rag::VectorStore::open(&rag_path, 3).and_then(|rag| {
+                rag.query(&rag_scope, &[1.0, 0.0, 0.0], 10, Some(&session_id_string))
+            }) {
+                Ok(hits) if hits.is_empty() => {
+                    rag_deleted = true;
+                    break;
+                }
+                Ok(_) => last_rag_error = None,
+                Err(error) => last_rag_error = Some(format!("{error:#}")),
             }
             sleep(Duration::from_millis(20)).await;
         }
-        assert!(rag_deleted, "deleted session remained in the RAG index");
+        assert!(
+            rag_deleted,
+            "deleted session remained in the RAG index; last read error: {}",
+            last_rag_error.as_deref().unwrap_or("none")
+        );
 
         let _ = std::fs::remove_dir_all(base);
     }
