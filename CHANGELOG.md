@@ -5,10 +5,18 @@ under `docs/release/`.
 
 ## [Unreleased]
 
+### Added
+
+- Linked the Bluey landing, account, download, and policy headers to Bluey Jobs
+  with a compact, accessible new-tab action across desktop and mobile layouts.
+
 ### Changed
 
 - Required the local `$bluey-ops` operating-memory preflight across Bluey agent
   entry points, work templates, and runbooks, with CI coverage for future docs.
+- Replaced the landing-page overlay mockup with a faithful, responsive preview
+  of the shipped Bluey host toolbar, answer workspace, caption rail, and
+  composer.
 
 ### Fixed
 

@@ -8580,250 +8580,304 @@
       margin-top: .65rem;
     }
 
-    #productSite .overlay-preview {
-      width: min(100%, 540px);
-      padding: 8px;
-      border: 1px solid rgba(116, 218, 246, .18);
-      border-radius: 8px;
-      background: #071014;
-      box-shadow: 0 28px 80px rgba(0, 0, 0, .46);
-    }
-
-    #productSite .overlay-demo {
-      min-height: 418px;
-      overflow: hidden;
-      border: 1px solid rgba(141, 225, 248, .16);
-      border-radius: 6px;
-      background: #080d11;
-      color: #edf7fa;
-    }
-
-    #productSite .overlay-demo-header {
-      display: grid;
-      grid-template-columns: 1fr auto auto;
-      align-items: center;
-      gap: .75rem;
-      min-height: 48px;
-      padding: 0 14px;
-      border-bottom: 1px solid rgba(255, 255, 255, .08);
-      background: #0d151a;
-    }
-
-    #productSite .overlay-demo-brand,
-    #productSite .overlay-demo-state {
-      display: inline-flex;
-      align-items: center;
-      gap: .5rem;
-    }
-
-    #productSite .overlay-demo-brand {
-      font-size: .82rem;
-      font-weight: 750;
-    }
-
-    #productSite .overlay-demo-brand img {
-      width: 20px;
-      height: 20px;
-      border-radius: 5px;
-    }
-
-    #productSite .overlay-demo-state,
-    #productSite .overlay-demo-session {
-      color: #a8bac2;
-      font-size: .69rem;
-      font-weight: 650;
-    }
-
-    #productSite .overlay-demo-state > span,
-    #productSite .overlay-listening-state > span {
-      width: 7px;
-      height: 7px;
-      flex: 0 0 auto;
-      border-radius: 50%;
-      background: #65dfa1;
-      box-shadow: 0 0 10px rgba(101, 223, 161, .46);
-    }
-
-    #productSite .overlay-context-ledger {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      min-height: 42px;
-      padding: 7px 14px;
-      overflow: hidden;
-      border-bottom: 1px solid rgba(255, 255, 255, .06);
-      background: #0a1115;
-      white-space: nowrap;
-    }
-
-    #productSite .overlay-context-ledger strong {
-      margin-right: 2px;
-      color: #dbe8ec;
-      font-size: .68rem;
-    }
-
-    #productSite .overlay-context-ledger span {
-      padding: 4px 7px;
-      border: 1px solid rgba(124, 205, 229, .18);
-      border-radius: 999px;
-      color: #9dc8d6;
-      background: rgba(84, 164, 190, .08);
-      font-size: .63rem;
-      font-weight: 650;
-    }
-
-    #productSite .overlay-demo-feed {
-      display: grid;
-      gap: 10px;
-      min-height: 236px;
-      padding: 13px 14px;
-      background: #080d11;
-    }
-
-    #productSite .overlay-demo-turn {
-      padding: 10px 12px;
-      border: 1px solid rgba(255, 255, 255, .08);
-      border-radius: 6px;
-      background: #0c1419;
-    }
-
-    #productSite .overlay-demo-question {
-      width: 82%;
-      justify-self: end;
-      border-color: rgba(101, 187, 216, .22);
-      background: #102029;
-    }
-
-    #productSite .overlay-demo-answer {
-      width: 94%;
-      border-left: 2px solid #68cce8;
-    }
-
-    #productSite .overlay-demo-turn-label,
-    #productSite .overlay-demo-turn-head > span {
-      color: #71cfe9;
-      font-size: .64rem;
-      font-weight: 750;
-      text-transform: uppercase;
-    }
-
-    #productSite .overlay-demo-turn-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-    }
-
-    #productSite .overlay-demo-turn-head > span {
-      color: #83d5aa;
-    }
-
-    #productSite .overlay-demo-turn p {
-      max-width: none;
-      margin: 5px 0 0;
-      color: #d9e6ea;
-      font-size: .74rem;
-      line-height: 1.48;
-    }
-
-    #productSite .overlay-answer-points {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 7px;
-      margin-top: 9px;
-    }
-
-    #productSite .overlay-answer-points span {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      color: #b5c6cc;
-      font-size: .65rem;
-    }
-
-    #productSite .overlay-answer-points strong {
-      display: grid;
-      width: 18px;
-      height: 18px;
-      flex: 0 0 auto;
-      place-items: center;
-      border: 1px solid rgba(246, 186, 99, .28);
-      border-radius: 50%;
-      color: #f6ba63;
-      font-size: .59rem;
-    }
-
-    #productSite .overlay-answer-sources {
-      margin-top: 9px;
-      color: #79919b;
-      font-size: .62rem;
-    }
-
-    #productSite .overlay-listening-state {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      min-height: 28px;
-      padding: 0 14px;
-      border-top: 1px solid rgba(255, 255, 255, .06);
-      color: #8da0a8;
-      background: #0a1115;
-      font-size: .64rem;
-    }
-
-    #productSite .overlay-listening-state > span {
-      background: #75838a;
+    #productSite .host-overlay-preview {
+      width: min(100%, 620px);
+      padding: 0;
+      border: 0;
+      background: transparent;
       box-shadow: none;
     }
 
-    #productSite .overlay-demo-composer {
+    #productSite .host-overlay-window {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: center;
-      gap: 10px;
-      min-height: 62px;
-      padding: 8px 10px 8px 14px;
-      border-top: 1px solid rgba(255, 255, 255, .08);
-      background: #0f181d;
+      grid-template-rows: 46px minmax(0, 1fr) 26px 76px;
+      gap: 6px;
+      width: 100%;
+      aspect-ratio: 1.48;
+      min-height: 0;
+      padding: 8px;
+      overflow: hidden;
+      border: 1px solid rgba(103, 214, 246, .36);
+      border-radius: 24px;
+      background: #020609;
+      color: #edf7fa;
+      box-shadow: 0 30px 78px rgba(0, 0, 0, .5);
     }
 
-    #productSite .overlay-composer-placeholder {
+    #productSite .host-overlay-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+      padding: 0 10px;
+      border: 1px solid rgba(103, 214, 246, .24);
+      border-radius: 999px;
+      background: #05090c;
+    }
+
+    #productSite .host-overlay-toolbar-left,
+    #productSite .host-overlay-toolbar-right,
+    #productSite .host-overlay-input-actions,
+    #productSite .host-overlay-tools {
+      display: flex;
+      align-items: center;
+    }
+
+    #productSite .host-overlay-toolbar-left,
+    #productSite .host-overlay-toolbar-right {
+      gap: 6px;
+      min-width: 0;
+    }
+
+    #productSite .host-overlay-toolbar-right {
+      justify-content: flex-end;
+    }
+
+    #productSite .host-overlay-icon {
+      display: inline-grid;
+      width: 25px;
+      height: 25px;
+      flex: 0 0 25px;
+      place-items: center;
+      border: 0;
+      border-radius: 6px;
+      color: #b4c5cc;
+      background: transparent;
+    }
+
+    #productSite .host-overlay-icon svg,
+    #productSite .host-overlay-control svg {
+      width: 15px;
+      height: 15px;
+      fill: none;
+      stroke: currentColor;
+      stroke-width: 1.9;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    #productSite .host-overlay-logo {
+      display: grid;
+      width: 29px;
+      height: 29px;
+      flex: 0 0 29px;
+      place-items: center;
+      margin-left: 2px;
+      border: 1px solid rgba(103, 214, 246, .22);
+      border-radius: 8px;
+      background: #07141b;
+    }
+
+    #productSite .host-overlay-logo img {
+      width: 23px;
+      height: 23px;
+    }
+
+    #productSite .host-overlay-wordmark {
+      margin-right: 8px;
+      color: #dff8ff;
+      font-size: 1rem;
+      font-weight: 780;
+      letter-spacing: 0;
+    }
+
+    #productSite .host-overlay-ready,
+    #productSite .host-overlay-caption-state {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      color: #62ef90;
+      font-size: .67rem;
+      font-weight: 760;
+      white-space: nowrap;
+    }
+
+    #productSite .host-overlay-ready i,
+    #productSite .host-overlay-caption-state i {
+      width: 7px;
+      height: 7px;
+      flex: 0 0 7px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 8px rgba(98, 239, 144, .42);
+    }
+
+    #productSite .host-overlay-balance {
+      min-width: 48px;
+      color: #f7bc5e;
+      font-size: .7rem;
+      text-align: center;
+      white-space: nowrap;
+    }
+
+    #productSite .host-overlay-workspace {
+      min-height: 0;
       overflow: hidden;
-      color: #73858d;
-      font-size: .71rem;
+      border: 1px solid rgba(255, 255, 255, .1);
+      border-radius: 16px;
+      background: #04080b;
+    }
+
+    #productSite .host-overlay-answer {
+      max-width: none;
+      padding: 17px 18px;
+      color: #dce8ec;
+      font-size: .78rem;
+      line-height: 1.52;
+    }
+
+    #productSite .host-overlay-answer p {
+      max-width: none;
+      margin: 0;
+      color: inherit;
+      font: inherit;
+    }
+
+    #productSite .host-overlay-answer p + p {
+      margin-top: .7rem;
+    }
+
+    #productSite .host-overlay-captions {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+      padding: 0 10px;
+      border: 1px solid rgba(255, 255, 255, .09);
+      border-radius: 999px;
+      color: #c4d3d9;
+      background: #070c0f;
+      font-size: .62rem;
+    }
+
+    #productSite .host-overlay-caption-state {
+      color: #8f9da3;
+      font-size: .55rem;
+      text-transform: uppercase;
+    }
+
+    #productSite .host-overlay-caption-state i {
+      width: 6px;
+      height: 6px;
+      flex-basis: 6px;
+      box-shadow: none;
+    }
+
+    #productSite .host-overlay-composer {
+      display: grid;
+      grid-template-rows: 40px 30px;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    #productSite .host-overlay-input {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      padding: 0 6px 0 12px;
+      border: 1px solid rgba(255, 255, 255, .1);
+      border-radius: 999px;
+      background: #060b0e;
+    }
+
+    #productSite .host-overlay-placeholder {
+      min-width: 0;
+      flex: 1 1 auto;
+      overflow: hidden;
+      color: #778a92;
+      font-size: .68rem;
+      font-weight: 620;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
 
-    #productSite .overlay-composer-actions {
-      display: flex;
+    #productSite .host-overlay-input-actions {
+      gap: 5px;
+      flex: 0 0 auto;
+    }
+
+    #productSite .host-overlay-control,
+    #productSite .host-overlay-select {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      min-height: 25px;
+      padding: 0 7px;
+      border: 1px solid rgba(255, 255, 255, .1);
+      border-radius: 999px;
+      color: #d4e0e4;
+      background: #0c1317;
+      font-size: .58rem;
+      font-weight: 720;
+      white-space: nowrap;
+    }
+
+    #productSite .host-overlay-answer-button {
+      border-color: rgba(103, 214, 246, .42);
+      color: #dff9ff;
+      background: #0b1c24;
+    }
+
+    #productSite .host-overlay-tools {
+      gap: 5px;
+      min-width: 0;
+      padding: 0 4px;
+    }
+
+    #productSite .host-overlay-tools .host-overlay-icon {
+      width: 24px;
+      height: 24px;
+      flex-basis: 24px;
+      color: #67d6f6;
+    }
+
+    #productSite .host-overlay-opacity {
+      display: inline-flex;
       align-items: center;
       gap: 5px;
-    }
-
-    #productSite .overlay-composer-actions span,
-    #productSite .overlay-composer-actions strong {
-      padding: 5px 7px;
-      border: 1px solid rgba(255, 255, 255, .09);
-      border-radius: 5px;
-      color: #a8bac2;
-      background: #111d23;
-      font-size: .59rem;
+      color: #8fa0a7;
+      font-size: .55rem;
       font-weight: 650;
+      white-space: nowrap;
     }
 
-    #productSite .overlay-composer-actions strong {
-      border-color: rgba(104, 204, 232, .38);
-      color: #071115;
-      background: #68cce8;
+    #productSite .host-overlay-opacity > i {
+      position: relative;
+      width: 46px;
+      height: 4px;
+      overflow: visible;
+      border-radius: 999px;
+      background: #193848;
     }
 
-    #productSite .overlay-preview-note {
-      max-width: none;
-      margin: 8px 2px 1px;
-      color: #73858d;
-      font-size: .67rem;
-      line-height: 1.4;
+    #productSite .host-overlay-opacity > i > b {
+      position: absolute;
+      top: 50%;
+      left: 80%;
+      width: 10px;
+      height: 10px;
+      border: 1px solid #b6eefd;
+      border-radius: 50%;
+      background: #ecfbff;
+      transform: translate(-50%, -50%);
+    }
+
+    #productSite .host-overlay-select {
+      min-width: 75px;
+      justify-content: space-between;
+    }
+
+    #productSite .host-overlay-select b {
+      color: #8da1a9;
+      font-size: .7rem;
+    }
+
+    #productSite .host-overlay-tool-spacer {
+      flex: 1 1 auto;
+      min-width: 4px;
     }
 
     #downloadApp .release-badge {
@@ -8885,14 +8939,9 @@
       grid-template-columns: 1fr;
     }
 
-    html[data-bluey-theme="light"] #productSite .overlay-preview {
-      border-color: #c5dce7;
-      background: #eaf3f7;
-      box-shadow: 0 24px 70px rgba(31, 70, 91, .18);
-    }
-
-    html[data-bluey-theme="light"] #productSite .overlay-preview-note {
-      color: #627986;
+    html[data-bluey-theme="light"] #productSite .host-overlay-window {
+      border-color: rgba(31, 142, 180, .46);
+      box-shadow: 0 24px 70px rgba(31, 70, 91, .2);
     }
 
     html[data-bluey-theme="light"] #productSite .hero-connect,
@@ -8921,11 +8970,11 @@
         padding: 1.5rem 0 2rem;
       }
 
-      #productSite .product-preview.overlay-preview {
+      #productSite .product-preview.host-overlay-preview {
         display: block;
       }
 
-      #productSite .overlay-preview {
+      #productSite .host-overlay-preview {
         width: 100%;
       }
 
@@ -8948,32 +8997,134 @@
         font-size: .91rem !important;
       }
 
-      #productSite .overlay-demo-header {
-        grid-template-columns: 1fr auto;
+      #productSite .host-overlay-window {
+        grid-template-rows: 44px minmax(132px, 1fr) 24px 76px;
+        aspect-ratio: auto;
+        min-height: 326px;
+        border-radius: 19px;
       }
 
-      #productSite .overlay-demo-session {
+      #productSite .host-overlay-toolbar {
+        padding: 0 7px;
+      }
+
+      #productSite .host-overlay-toolbar-left,
+      #productSite .host-overlay-toolbar-right {
+        gap: 3px;
+      }
+
+      #productSite .host-overlay-toolbar-left > .host-overlay-icon:first-child,
+      #productSite .host-overlay-toolbar-left > .host-overlay-icon:nth-child(2),
+      #productSite .host-overlay-toolbar-right > .host-overlay-icon:first-child,
+      #productSite .host-overlay-secondary {
         display: none;
       }
 
-      #productSite .overlay-context-ledger span:last-child {
+      #productSite .host-overlay-wordmark {
+        margin-right: 3px;
+      }
+
+      #productSite .host-overlay-answer {
+        padding: 14px;
+        font-size: .71rem;
+      }
+
+      #productSite .host-overlay-opacity,
+      #productSite .host-overlay-tools > .host-overlay-control,
+      #productSite .host-overlay-tools > .host-overlay-icon {
         display: none;
       }
 
-      #productSite .overlay-demo-question,
-      #productSite .overlay-demo-answer {
-        width: 100%;
+      #productSite .host-overlay-tools {
+        padding: 0 2px;
+      }
+    }
+
+    /* Shared navigation bridge between the Bluey site and Bluey Jobs. */
+    #productSite .nav-links a.nav-jobs-link,
+    #accountApp .account-top a.nav-jobs-link,
+    #downloadApp .navlinks a.nav-jobs-link,
+    #policyApp .navlinks a.nav-jobs-link {
+      display: inline-flex;
+      align-items: center;
+      gap: .28rem;
+      color: var(--bluey-accent);
+      white-space: nowrap;
+    }
+
+    #productSite .nav-links a.nav-jobs-link:hover,
+    #accountApp .account-top a.nav-jobs-link:hover,
+    #downloadApp .navlinks a.nav-jobs-link:hover,
+    #policyApp .navlinks a.nav-jobs-link:hover {
+      color: #a5efff;
+    }
+
+    .nav-jobs-link svg {
+      width: 14px;
+      height: 14px;
+      flex: 0 0 14px;
+      stroke: currentColor;
+      stroke-width: 2;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+
+    .nav-jobs-label-short {
+      display: none;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-links a.nav-jobs-link,
+    html[data-bluey-theme="light"] #accountApp .account-top a.nav-jobs-link,
+    html[data-bluey-theme="light"] #downloadApp .navlinks a.nav-jobs-link,
+    html[data-bluey-theme="light"] #policyApp .navlinks a.nav-jobs-link {
+      color: #087ca6;
+    }
+
+    html[data-bluey-theme="light"] #productSite .nav-links a.nav-jobs-link:hover,
+    html[data-bluey-theme="light"] #accountApp .account-top a.nav-jobs-link:hover,
+    html[data-bluey-theme="light"] #downloadApp .navlinks a.nav-jobs-link:hover,
+    html[data-bluey-theme="light"] #policyApp .navlinks a.nav-jobs-link:hover {
+      color: #055f80;
+    }
+
+    @media (max-width: 600px) {
+      .nav-jobs-label-long {
+        display: none;
       }
 
-      #productSite .overlay-answer-points {
-        grid-template-columns: 1fr;
+      .nav-jobs-label-short {
+        display: inline;
+      }
+    }
+
+    @media (max-width: 520px) {
+      #productSite .nav {
+        padding: .85rem .75rem;
+        column-gap: .5rem;
       }
 
-      #productSite .overlay-demo-composer {
-        grid-template-columns: 1fr;
+      #productSite .brand-wordmark {
+        width: 56px;
       }
 
-      #productSite .overlay-composer-actions {
-        justify-content: space-between;
+      #productSite .nav-links {
+        gap: .45rem;
+      }
+
+      #productSite .nav-links a,
+      #productSite .nav-links .nav-signout {
+        font-size: .78rem;
+      }
+
+      #productSite .nav-links .btn-nav {
+        min-height: 30px;
+        padding: .42rem .6rem;
+        white-space: nowrap;
+      }
+    }
+
+    @media (max-width: 360px) {
+      #productSite .nav-links > a[href="/download"] {
+        display: none;
       }
     }
