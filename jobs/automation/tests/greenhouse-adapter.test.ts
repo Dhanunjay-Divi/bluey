@@ -154,6 +154,33 @@ describe("Greenhouse provider state machine", () => {
     expect(page.controlByLabel("How did you hear").value).toBe("");
   });
 
+  it("blocks submission when Greenhouse discards a prepared field value", async () => {
+    const page = new GreenhouseFixturePage(
+      PUBLIC_MODERN,
+      { ignoredWrites: ["[data-bluey-field-id='first-name']"] },
+    );
+    const submitHooks: string[] = [];
+    const machine = new GreenhouseApplicationStateMachine(
+      context(page, {}, { events: submitHooks }),
+    );
+    await machine.detect();
+    await machine.prepare();
+    await machine.fill();
+
+    const issues = await machine.validate();
+
+    expect(issues).toEqual([
+      expect.objectContaining({
+        field: "First name",
+        message: expect.stringContaining("did not register"),
+        severity: "blocking",
+      }),
+    ]);
+    expect(machine.getReceipt()?.intervention?.kind).toBe("missing_fact");
+    expect(page.submitClicks).toBe(0);
+    expect(submitHooks).toEqual([]);
+  });
+
   it("pauses immediately when Greenhouse presents a challenge", async () => {
     const page = new GreenhouseFixturePage({
       ...PUBLIC_MODERN,
@@ -291,7 +318,11 @@ class GreenhouseFixturePage implements BrowserPage {
 
   constructor(
     private readonly definition: FixtureDefinition,
-    private readonly behavior: { removeControlsAfterSubmit?: boolean; postSubmitUrl?: string } = {},
+    private readonly behavior: {
+      removeControlsAfterSubmit?: boolean;
+      postSubmitUrl?: string;
+      ignoredWrites?: string[];
+    } = {},
   ) {
     this.currentUrl = definition.url;
     this.controlsState = definition.controls.map((control) => ({
@@ -338,7 +369,9 @@ class GreenhouseFixturePage implements BrowserPage {
     const submit = selector === "#submit_app";
     return {
       count: async () => control || marker ? 1 : 0,
-      fill: async (value) => { if (control) control.value = value; },
+      fill: async (value) => {
+        if (control && !this.behavior.ignoredWrites?.includes(selector)) control.value = value;
+      },
       click: async () => {
         if (submit) {
           this.submitClicks += 1;
@@ -349,9 +382,17 @@ class GreenhouseFixturePage implements BrowserPage {
       textContent: async () => "",
       getAttribute: async () => null,
       isVisible: async () => Boolean(control || marker),
-      selectOption: async (value) => { if (control) control.value = value; },
-      setChecked: async (checked) => { if (control) control.checked = checked; },
-      setInputFiles: async (paths) => { if (control) control.value = paths[0]?.split("/").at(-1) || ""; },
+      selectOption: async (value) => {
+        if (control && !this.behavior.ignoredWrites?.includes(selector)) control.value = value;
+      },
+      setChecked: async (checked) => {
+        if (control && !this.behavior.ignoredWrites?.includes(selector)) control.checked = checked;
+      },
+      setInputFiles: async (paths) => {
+        if (control && !this.behavior.ignoredWrites?.includes(selector)) {
+          control.value = paths[0]?.split("/").at(-1) || "";
+        }
+      },
     };
   }
 }

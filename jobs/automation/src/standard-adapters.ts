@@ -11,6 +11,13 @@ import type {
   SubmissionReceipt,
   ValidationIssue,
 } from "./contracts.js";
+import {
+  checkedExpectation,
+  fileExpectation,
+  type FormFillExpectation,
+  valueExpectation,
+  verifyFillExpectations,
+} from "./form-readback.js";
 
 interface AdapterDefinition {
   kind: AtsKind;
@@ -157,6 +164,7 @@ const ANSWER_ALIASES: Record<string, string[]> = {
 export class StandardAtsAdapter implements ApplicationAdapter {
   readonly kind: AtsKind;
   readonly version: string;
+  private readonly fillExpectations = new WeakMap<AdapterContext, FormFillExpectation[]>();
 
   constructor(private readonly definition: AdapterDefinition) {
     this.kind = definition.kind;
@@ -196,6 +204,7 @@ export class StandardAtsAdapter implements ApplicationAdapter {
 
   async fill(context: AdapterContext): Promise<void> {
     const controls = await context.page.controls();
+    const expectations: FormFillExpectation[] = [];
     let filled = 0;
     for (const control of controls) {
       if (control.kind === "hidden" || control.kind === "other") continue;
@@ -204,6 +213,7 @@ export class StandardAtsAdapter implements ApplicationAdapter {
         const file = /cover/i.test(field) ? context.packet.coverLetterPath : context.packet.resumePath;
         if (file) {
           await context.page.locator(control.selector).setInputFiles([file]);
+          expectations.push(fileExpectation(control, displayField(control), file));
           filled += 1;
         }
         continue;
@@ -215,28 +225,38 @@ export class StandardAtsAdapter implements ApplicationAdapter {
         const option = bestOption(control, answer);
         if (option) {
           await locator.selectOption(option);
+          expectations.push(valueExpectation(control, displayField(control), option));
           filled += 1;
         }
       } else if (control.kind === "radio") {
         if (radioMatches(control, answer)) {
           await locator.setChecked(true);
+          expectations.push(checkedExpectation(control, displayField(control), true));
           filled += 1;
         }
       } else if (control.kind === "checkbox") {
         const checked = /^(1|true|yes|y|on)$/i.test(answer.trim());
         await locator.setChecked(checked);
+        expectations.push(checkedExpectation(control, displayField(control), checked));
         filled += 1;
       } else {
         await locator.fill(answer);
+        expectations.push(valueExpectation(control, displayField(control), answer));
         filled += 1;
       }
     }
+    this.fillExpectations.set(context, expectations);
     await context.log("application_fields_filled", { adapter: this.kind, count: filled });
   }
 
   async validate(context: AdapterContext): Promise<ValidationIssue[]> {
-    const issues: ValidationIssue[] = [];
     const controls = await context.page.controls();
+    const issues = verifyFillExpectations(
+      this.fillExpectations.get(context) ?? [],
+      controls,
+      providerLabel(this.kind),
+    );
+    const readbackFields = new Set(issues.map((issue) => issue.field));
     for (const control of controls) {
       if (!control.required || hasValue(control)) continue;
       if (control.kind === "radio" && controls.some((candidate) => (
@@ -245,6 +265,7 @@ export class StandardAtsAdapter implements ApplicationAdapter {
         && candidate.checked
       ))) continue;
       const field = searchableField(control) || "required field";
+      if (readbackFields.has(field)) continue;
       issues.push({
         field,
         message: answerFor(control, context.packet) === undefined
@@ -375,6 +396,13 @@ function searchableField(control: FormControl): string {
   return [control.label, control.name, control.placeholder].filter(Boolean).join(" ").trim();
 }
 
+function displayField(control: FormControl): string {
+  return control.label.trim()
+    || control.placeholder.trim()
+    || control.name.trim()
+    || "application field";
+}
+
 function normalize(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
@@ -441,4 +469,9 @@ function hasValue(control: FormControl): boolean {
 function confirmationExcerpt(body: string): string {
   const normalized = body.replace(/\s+/g, " ").trim();
   return normalized.slice(0, 500);
+}
+
+function providerLabel(kind: AtsKind): string {
+  if (kind === "semantic") return "Employer form";
+  return `${kind[0]?.toUpperCase() ?? ""}${kind.slice(1)}`;
 }

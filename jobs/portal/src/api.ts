@@ -3,6 +3,7 @@ import type {
   ApproveApplicationResponse,
   ApplicationEvidence,
   ApplicationIdentity,
+  AutoSubmitAuthorization,
   BrowserSession,
   CareerFact,
   CareerProfile,
@@ -301,6 +302,16 @@ export const jobsApi = {
     }),
   deleteTrack: (id: string) =>
     request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  authorizeTrackAutoSubmit: (id: string) =>
+    request<AutoSubmitAuthorization>(
+      `/api/jobs/tracks/${encodeURIComponent(id)}/auto-submit`,
+      { method: "POST" },
+    ),
+  revokeTrackAutoSubmit: (id: string) =>
+    request<void>(
+      `/api/jobs/tracks/${encodeURIComponent(id)}/auto-submit`,
+      { method: "DELETE" },
+    ),
   saveMatch: (job: UserJobInput) =>
     request<JobPosting>("/api/jobs/matches", { method: "POST", body: JSON.stringify(job) }),
   searchDiscoveryCatalog: (query: string, trackId: string, provider = "all") =>

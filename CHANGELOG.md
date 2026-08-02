@@ -12,6 +12,12 @@ under `docs/release/`.
 - Added an opt-in, verified R2 cold-storage lifecycle for expired, unreferenced
   global job candidates. PostgreSQL drops the heavy candidate body only after
   object-store read-back matches the exact bytes and SHA-256 written.
+- Added revisioned, Track-scoped Auto-submit authorization bound to one
+  verified application identity, current source resume, Career Track policy,
+  and confirmed candidate facts.
+- Added post-fill and immediate pre-submit ATS form read-back so silently
+  discarded answers or documents pause the application instead of producing an
+  incomplete submission.
 
 ### Changed
 
@@ -70,6 +76,13 @@ under `docs/release/`.
   monitored for both process availability and overdue source snapshots.
 - Made the Jobs portal derive source health from the last successful sync so a
   historically healthy source cannot appear current after updates stop.
+- Refreshed Jobs runtime dependencies for current archive, sanitizer, URI, CSS,
+  and client-router security fixes; the portal remains a client-only Vite SPA
+  with no React Server Components or server actions.
+- Prevented Review-first packet approval from becoming reusable Auto-submit
+  authority, and made legacy Auto-submit packets fail closed.
+- Prevented an ATS-controlled field that only appears filled from passing
+  validation when the employer form did not register the value.
 
 ## [0.1.104] - 2026-07-19
 

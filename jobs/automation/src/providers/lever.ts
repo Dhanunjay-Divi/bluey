@@ -10,6 +10,13 @@ import type {
   SubmissionReceipt,
   ValidationIssue,
 } from "../contracts.js";
+import {
+  checkedExpectation,
+  fileExpectation,
+  type FormFillExpectation,
+  valueExpectation,
+  verifyFillExpectations,
+} from "../form-readback.js";
 
 export const LEVER_ADAPTER_VERSION = "2026.07.0-beta.1";
 
@@ -71,6 +78,7 @@ interface LeverSession {
   submitClicked: boolean;
   operationalIssues: ValidationIssue[];
   validationIssues: ValidationIssue[];
+  fillExpectations: FormFillExpectation[];
   challenge?: InterventionRequest;
   current?: LeverStateSnapshot;
   history: LeverStateSnapshot[];
@@ -386,6 +394,7 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
     }
 
     const controls = await leverControls(context.page);
+    session.fillExpectations = [];
     let filled = 0;
     for (const control of controls) {
       if (control.kind === "hidden" || control.kind === "other" || isGuardedField(control)) continue;
@@ -396,6 +405,7 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
           const path = attachmentPath(control, context.packet);
           if (!path) continue;
           await locator.setInputFiles([path]);
+          session.fillExpectations.push(fileExpectation(control, displayField(control), path));
           filled += 1;
           continue;
         }
@@ -407,16 +417,21 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
           const option = exactOption(control, answer);
           if (!option) continue;
           await locator.selectOption(option);
+          session.fillExpectations.push(valueExpectation(control, displayField(control), option));
           filled += 1;
         } else if (control.kind === "radio") {
           if (!radioMatches(control, answer)) continue;
           await locator.setChecked(true);
+          session.fillExpectations.push(checkedExpectation(control, displayField(control), true));
           filled += 1;
         } else if (control.kind === "checkbox") {
-          await locator.setChecked(isAffirmative(answer));
+          const checked = isAffirmative(answer);
+          await locator.setChecked(checked);
+          session.fillExpectations.push(checkedExpectation(control, displayField(control), checked));
           filled += 1;
         } else {
           await locator.fill(answer);
+          session.fillExpectations.push(valueExpectation(control, displayField(control), answer));
           filled += 1;
         }
       } catch {
@@ -584,6 +599,7 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       submitClicked: previous?.submitClicked ?? false,
       operationalIssues: [],
       validationIssues: [],
+      fillExpectations: [],
       history: previous?.history ?? [],
     };
     this.sessions.set(context, session);
@@ -636,6 +652,13 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
     }
 
     const controls = await leverControls(context.page);
+    const readbackIssues = verifyFillExpectations(
+      session.fillExpectations,
+      controls,
+      "Lever",
+    );
+    for (const issue of readbackIssues) addIssue(issues, issue);
+    const readbackFields = new Set(readbackIssues.map((issue) => issue.field));
     const handledGroups = new Set<string>();
     for (const control of controls) {
       if (control.kind === "hidden") continue;
@@ -644,6 +667,7 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       handledGroups.add(groupKey);
 
       const field = displayField(control);
+      if (readbackFields.has(field)) continue;
       if (isGuardedField(control)) {
         addIssue(issues, {
           field,
