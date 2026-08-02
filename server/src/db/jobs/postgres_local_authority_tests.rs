@@ -58,7 +58,7 @@ fn postgres_pool() -> Option<DbPool> {
 }
 
 fn greenhouse_posting(url: &str) -> JobPosting {
-    JobPosting {
+    let mut posting = JobPosting {
         id: String::new(),
         canonical_key: String::new(),
         source: "greenhouse".to_string(),
@@ -81,8 +81,18 @@ fn greenhouse_posting(url: &str) -> JobPosting {
         status: "matched".to_string(),
         created_at_ms: 0,
         updated_at_ms: 0,
+        discovery_evidence: JobDiscoveryEvidence::default(),
         eligibility: None,
-    }
+    };
+    posting.canonical_key = canonical_job_key(&posting);
+    posting.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+        posting.canonical_key.clone(),
+        "greenhouse:acme".to_string(),
+        Some("boards.greenhouse.io".to_string()),
+        now_ms(),
+        "a".repeat(64),
+    );
+    posting
 }
 
 fn local_authority_fixture(pool: &DbPool, label: &str) -> LocalAuthorityFixture {

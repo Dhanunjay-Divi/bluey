@@ -635,6 +635,7 @@ mod evidence_tests {
             status: "matched".into(),
             created_at_ms: 1,
             updated_at_ms: 1,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         };
         let baseline = json!({

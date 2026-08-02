@@ -3,10 +3,11 @@
 //! Only exact, allowlisted ATS hosts are resolved. User-controlled hosts are
 //! never fetched by the API; unsupported links remain manual Review-only jobs.
 
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use reqwest::{redirect::Policy, StatusCode, Url};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 
 const MAX_JOB_RESPONSE_BYTES: u64 = 1_048_576;
@@ -25,6 +26,8 @@ pub(super) struct ImportedJob {
     pub compensation: String,
     pub employment_type: String,
     pub posted_at_ms: Option<i64>,
+    pub verified_at_ms: i64,
+    pub evidence_hash: String,
 }
 
 #[derive(Debug)]
@@ -75,14 +78,40 @@ pub(super) async fn import_supported_job(
             .0;
     let url = Url::parse(&canonical_url)
         .map_err(|_| JobImportError::Invalid("Use a complete https job link.".to_string()))?;
-    match provider {
+    let mut imported = match provider {
         "lever" => import_lever(&url).await.map(Some),
         "greenhouse" => import_greenhouse(&url).await.map(Some),
         "ashby" => import_ashby(&url).await.map(Some),
         "smartrecruiters" => import_smartrecruiters(&url).await.map(Some),
         "workday" => import_workday(&url).await.map(Some),
         _ => unreachable!(),
+    }?;
+    if let Some(imported) = imported.as_mut() {
+        imported.verified_at_ms = Utc::now().timestamp_millis();
+        imported.evidence_hash = imported_job_evidence_hash(imported);
     }
+    Ok(imported)
+}
+
+fn imported_job_evidence_hash(imported: &ImportedJob) -> String {
+    let mut hasher = Sha256::new();
+    for field in [
+        imported.source.as_str(),
+        imported.external_id.as_str(),
+        imported.company.as_str(),
+        imported.title.as_str(),
+        imported.location.as_str(),
+        imported.workplace.as_str(),
+        imported.canonical_url.as_str(),
+        imported.description.as_str(),
+        imported.compensation.as_str(),
+        imported.employment_type.as_str(),
+    ] {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+    }
+    hasher.update(imported.posted_at_ms.unwrap_or_default().to_le_bytes());
+    hex::encode(hasher.finalize())
 }
 
 async fn import_lever(url: &Url) -> Result<ImportedJob, JobImportError> {
@@ -171,6 +200,8 @@ fn lever_job_from_payload(
                 .unwrap_or_default(),
         ),
         posted_at_ms: payload.get("createdAt").and_then(Value::as_i64),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -238,6 +269,8 @@ async fn import_greenhouse(url: &Url) -> Result<ImportedJob, JobImportError> {
         compensation: String::new(),
         employment_type: String::new(),
         posted_at_ms,
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -337,6 +370,8 @@ fn ashby_job_from_payload(
             .get("publishedAt")
             .and_then(Value::as_str)
             .and_then(parse_timestamp_ms),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -438,6 +473,8 @@ fn smartrecruiters_job_from_payload(
             .get("releasedDate")
             .and_then(Value::as_str)
             .and_then(parse_timestamp_ms),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 
@@ -548,6 +585,8 @@ fn workday_job_from_payload(
             .get("startDate")
             .and_then(Value::as_str)
             .and_then(parse_timestamp_ms),
+        verified_at_ms: 0,
+        evidence_hash: String::new(),
     })
 }
 

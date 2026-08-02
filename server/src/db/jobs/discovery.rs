@@ -2324,6 +2324,7 @@ pub fn complete_discovery_run(
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         };
         if source.provider == CURATED_DISCOVERY_PROVIDER {
@@ -2340,6 +2341,20 @@ pub fn complete_discovery_run(
             anyhow::bail!("discovery source Career Track was not found")
         }
         posting.canonical_key = canonical_job_key(&posting);
+        posting.discovery_evidence = if source.provider == CURATED_DISCOVERY_PROVIDER {
+            JobDiscoveryEvidence::external_feed_lead(posting.canonical_key.clone())
+        } else {
+            let application_domain = reqwest::Url::parse(&posting.canonical_url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_string));
+            JobDiscoveryEvidence::provider_verified_original_source(
+                posting.canonical_key.clone(),
+                source.source_key.clone(),
+                application_domain,
+                fetched_at_ms,
+                content_hash.clone(),
+            )
+        };
         let external_id = posting.external_id.clone();
         match normalized.get(&external_id) {
             Some((existing, existing_hash))

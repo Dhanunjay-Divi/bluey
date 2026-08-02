@@ -506,6 +506,7 @@ mod candidate_policy_tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         }
     }

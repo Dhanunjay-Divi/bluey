@@ -46,7 +46,8 @@ mod tests {
     }
 
     fn test_posting(url: &str, posted_at_ms: i64, last_verified_at_ms: i64) -> JobPosting {
-        JobPosting {
+        verified_test_posting(
+            JobPosting {
             id: String::new(),
             canonical_key: String::new(),
             source: "greenhouse".to_string(),
@@ -69,8 +70,58 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
-            eligibility: None,
-        }
+                discovery_evidence: JobDiscoveryEvidence::default(),
+                eligibility: None,
+            },
+            last_verified_at_ms,
+        )
+    }
+
+    fn verified_test_posting(mut posting: JobPosting, checked_at_ms: i64) -> JobPosting {
+        posting.canonical_key = canonical_job_key(&posting);
+        let application_domain = reqwest::Url::parse(&posting.canonical_url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_string));
+        posting.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+            posting.canonical_key.clone(),
+            format!("{}:test", posting.source),
+            application_domain,
+            checked_at_ms,
+            "a".repeat(64),
+        );
+        posting
+    }
+
+    fn discovery_decision(
+        posting: &JobPosting,
+        require_live_verification: bool,
+    ) -> JobEligibilityDecision {
+        let profile = default_profile("jobs@example.com");
+        let track = CareerTrack {
+            id: "track-default".to_string(),
+            name: "Software engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some("identity-primary".to_string()),
+            policy: CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                ..CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        build_job_eligibility(
+            posting,
+            &profile,
+            &JobPreferences::default(),
+            &[],
+            require_live_verification,
+            None,
+            Some(&track),
+        )
     }
 
     #[test]
@@ -2878,6 +2929,7 @@ mod tests {
             now_ms(),
         );
         manual.title = "Platform Engineer".to_string();
+        let manual = verified_test_posting(manual, now_ms());
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let discovery_pool = pool.clone();
         let discovery_barrier = barrier.clone();
@@ -3665,8 +3717,40 @@ mod tests {
                 .unwrap();
             assert_eq!(membership_status, "active", "{provider}");
             let refreshed = list_postings(&pool, "acct-jobs").unwrap().remove(0);
+            assert_eq!(
+                refreshed.discovery_evidence.provenance,
+                "original_source",
+                "{provider}"
+            );
+            assert_eq!(
+                refreshed.discovery_evidence.employer_verification_status,
+                "ats_tenant_verified",
+                "{provider}"
+            );
+            assert_eq!(
+                refreshed.discovery_evidence.scam_risk_status,
+                "source_screened",
+                "{provider}"
+            );
             let active_eligibility =
                 evaluate_job_eligibility(&pool, "acct-jobs", &refreshed, true, None).unwrap();
+            assert!(active_eligibility.can_prepare, "{provider}");
+            assert!(!active_eligibility.can_queue_local, "{provider}");
+            assert!(!active_eligibility.can_queue_cloud, "{provider}");
+            assert!(
+                active_eligibility
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == "employer_identity_review_required"),
+                "{provider}"
+            );
+            assert!(
+                active_eligibility
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == "job_risk_review_required"),
+                "{provider}"
+            );
             assert!(
                 active_eligibility
                     .passed_checks
@@ -4037,6 +4121,7 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         };
         let mut b = a.clone();
@@ -4044,6 +4129,173 @@ mod tests {
         b.canonical_url =
             "https://boards.example/jobs/1?ref=feed&utm_source=newsletter".to_string();
         assert_eq!(canonical_job_key(&a), canonical_job_key(&b));
+    }
+
+    #[test]
+    fn discovery_evidence_fails_closed_until_original_source_is_verified() {
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/unverified",
+            now_ms(),
+            now_ms(),
+        );
+        posting.discovery_evidence = JobDiscoveryEvidence::default();
+        let unverified = discovery_decision(&posting, true);
+        assert!(!unverified.can_prepare);
+        assert!(!unverified.can_queue_local);
+        assert!(!unverified.can_queue_cloud);
+        assert!(unverified
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "original_source_unverified"));
+
+        posting.discovery_evidence = JobDiscoveryEvidence::external_feed_lead(
+            posting.canonical_key.clone(),
+        );
+        let feed_lead = discovery_decision(&posting, true);
+        assert!(!feed_lead.can_prepare);
+        assert!(feed_lead
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "external_feed_requires_revalidation"));
+    }
+
+    #[test]
+    fn current_original_source_evidence_allows_preparation_and_queueing() {
+        let posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/current-evidence",
+            now_ms(),
+            now_ms(),
+        );
+        let decision = discovery_decision(&posting, true);
+        assert!(decision.can_prepare, "{decision:?}");
+        assert!(decision.can_queue_local, "{decision:?}");
+        assert!(decision.can_queue_cloud, "{decision:?}");
+    }
+
+    #[test]
+    fn hosted_ats_snapshot_is_reviewable_but_cannot_queue_unattended() {
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/provider-evidence",
+            now_ms(),
+            now_ms(),
+        );
+        posting.discovery_evidence = JobDiscoveryEvidence::provider_verified_original_source(
+            posting.canonical_key.clone(),
+            "greenhouse:acme".to_string(),
+            Some("boards.greenhouse.io".to_string()),
+            now_ms(),
+            "a".repeat(64),
+        );
+
+        let decision = discovery_decision(&posting, true);
+        assert!(decision.can_prepare, "{decision:?}");
+        assert!(!decision.can_queue_local, "{decision:?}");
+        assert!(!decision.can_queue_cloud, "{decision:?}");
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "employer_identity_review_required"));
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "job_risk_review_required"));
+    }
+
+    #[test]
+    fn stale_original_source_evidence_requires_refresh_before_queueing() {
+        let posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/stale-evidence",
+            now_ms(),
+            now_ms() - 2 * DAY_MS,
+        );
+        let decision = discovery_decision(&posting, false);
+        assert!(decision.can_prepare, "{decision:?}");
+        assert!(!decision.can_queue_local);
+        assert!(!decision.can_queue_cloud);
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "original_source_refresh_required"));
+    }
+
+    #[test]
+    fn discovery_evidence_is_bound_to_exact_job_and_application_domain() {
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/bound-evidence",
+            now_ms(),
+            now_ms(),
+        );
+        posting.discovery_evidence.canonical_job_id = Some("different-job".to_string());
+        let canonical_mismatch = discovery_decision(&posting, true);
+        assert!(!canonical_mismatch.can_prepare);
+        assert!(canonical_mismatch
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "canonical_evidence_mismatch"));
+
+        posting.discovery_evidence.canonical_job_id = Some(posting.canonical_key.clone());
+        posting.discovery_evidence.application_domain = Some("attacker.example".to_string());
+        let domain_mismatch = discovery_decision(&posting, true);
+        assert!(!domain_mismatch.can_prepare);
+        assert!(domain_mismatch
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "application_domain_mismatch"));
+    }
+
+    #[test]
+    fn scam_and_employer_mismatch_evidence_are_hard_blocks() {
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/risk-evidence",
+            now_ms(),
+            now_ms(),
+        );
+        posting.discovery_evidence.scam_risk_status = "blocked".to_string();
+        posting.discovery_evidence.scam_signals = vec![DiscoveryScamSignal {
+            code: "impersonated_domain".to_string(),
+            source: "domain_verifier".to_string(),
+        }];
+        let scam_block = discovery_decision(&posting, true);
+        assert!(!scam_block.can_prepare);
+        assert!(scam_block
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "scam_risk_blocked"));
+
+        posting.discovery_evidence.scam_risk_status = "clear".to_string();
+        posting.discovery_evidence.scam_signals.clear();
+        posting.discovery_evidence.employer_verification_status = "mismatch".to_string();
+        let employer_block = discovery_decision(&posting, true);
+        assert!(!employer_block.can_prepare);
+        assert!(employer_block
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "employer_identity_mismatch"));
+    }
+
+    #[test]
+    fn upsert_never_synthesizes_discovery_verification_from_active_status() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let mut posting = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/no-synthetic-evidence",
+            now_ms(),
+            now_ms(),
+        );
+        posting.discovery_evidence = JobDiscoveryEvidence::default();
+        posting.last_verified_at_ms = None;
+        let saved = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &posting,
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        assert!(saved.last_verified_at_ms.is_none());
+        assert_eq!(saved.discovery_evidence.original_source_status, "unknown");
+        assert!(!saved.eligibility.unwrap().can_prepare);
     }
 
     #[test]
@@ -4095,6 +4347,7 @@ mod tests {
         assert!(stale_verification.to_string().contains("still open"));
 
         posting.last_verified_at_ms = Some(now_ms());
+        posting = verified_test_posting(posting, now_ms());
         upsert_posting(
             &pool,
             "acct-jobs",
@@ -4236,7 +4489,8 @@ mod tests {
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &JobPosting {
+            &verified_test_posting(
+                JobPosting {
                 id: String::new(),
                 canonical_key: String::new(),
                 source: "pasted_link".to_string(),
@@ -4259,8 +4513,11 @@ mod tests {
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
-            },
+                },
+                now_ms(),
+            ),
             &profile,
             &JobPreferences::default(),
         )
@@ -4308,6 +4565,7 @@ mod tests {
         cloud_job.company = "Cloudco".to_string();
         cloud_job.title = "Cloud Engineer".to_string();
         cloud_job.description = "Build AWS services backed by PostgreSQL.".to_string();
+        let cloud_job = verified_test_posting(cloud_job, now_ms());
         let cloud_job = upsert_posting(
             &pool,
             "acct-jobs",
@@ -4325,6 +4583,7 @@ mod tests {
         frontend_job.company = "Webco".to_string();
         frontend_job.title = "Frontend Engineer".to_string();
         frontend_job.description = "Build customer interfaces with React.".to_string();
+        let frontend_job = verified_test_posting(frontend_job, now_ms());
         let frontend_job = upsert_posting(
             &pool,
             "acct-jobs",
@@ -4491,6 +4750,7 @@ mod tests {
         sde_job.company = "Acme, Inc.".to_string();
         sde_job.title = "Software Development Engineer".to_string();
         sde_job.track_id = sde_track.id;
+        let sde_job = verified_test_posting(sde_job, now_ms());
         let sde_job =
             upsert_posting(&pool, "acct-jobs", &sde_job, &profile, &saved_preferences).unwrap();
         let (sde_application, _) =
@@ -4508,6 +4768,7 @@ mod tests {
         data_job.company = "The Acme LLC".to_string();
         data_job.title = "Data Engineer".to_string();
         data_job.track_id = data_track.id;
+        let data_job = verified_test_posting(data_job, now_ms());
         let data_job =
             upsert_posting(&pool, "acct-jobs", &data_job, &profile, &saved_preferences).unwrap();
 
@@ -4608,7 +4869,8 @@ mod tests {
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &JobPosting {
+            &verified_test_posting(
+                JobPosting {
                 id: String::new(),
                 canonical_key: String::new(),
                 source: "pasted_link".to_string(),
@@ -4631,8 +4893,11 @@ mod tests {
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
-            },
+                },
+                now_ms(),
+            ),
             &profile,
             &JobPreferences::default(),
         )
@@ -4808,7 +5073,7 @@ mod tests {
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &JobPosting {
+            &verified_test_posting(JobPosting {
                 id: String::new(),
                 canonical_key: String::new(),
                 source: "linkedin_handoff".to_string(),
@@ -4820,7 +5085,7 @@ mod tests {
                 canonical_url: "https://linkedin.com/jobs/view/123".to_string(),
                 description: "Distributed systems".to_string(),
                 compensation: String::new(),
-                employment_type: String::new(),
+                employment_type: "full_time".to_string(),
                 track_id: "track-default".to_string(),
                 match_score: 96,
                 matched_reasons: Vec::new(),
@@ -4831,8 +5096,9 @@ mod tests {
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
-            },
+            }, now_ms()),
             &profile,
             &JobPreferences::default(),
         )
@@ -5865,6 +6131,7 @@ mod tests {
             now_ms(),
         );
         second.title = "Backend Engineer".to_string();
+        let second = verified_test_posting(second, now_ms());
         let second = upsert_posting(&pool, "acct-jobs", &second, &profile, &preferences).unwrap();
         assert!(
             prepare_application(&pool, "acct-jobs", &second.id, "factual", "review_first")
@@ -5881,6 +6148,7 @@ mod tests {
             );
             posting.company = format!("Company {index}");
             posting.title = format!("Platform Engineer {index}");
+            let posting = verified_test_posting(posting, now_ms());
             let posting =
                 upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
             let (application, _) =
@@ -5896,21 +6164,20 @@ mod tests {
         );
         final_posting.company = "Globex".to_string();
         final_posting.title = "Platform Engineer".to_string();
+        let final_posting = verified_test_posting(final_posting, now_ms());
         let final_posting =
             upsert_posting(&pool, "acct-jobs", &final_posting, &profile, &preferences).unwrap();
-        let (final_application, _) = prepare_application(
-            &pool,
-            "acct-jobs",
-            &final_posting.id,
-            "factual",
-            "review_first",
-        )
-        .unwrap();
         assert!(
-            reserve_application_attempt(&pool, "acct-jobs", &final_application.id, "local")
+            prepare_application(
+                &pool,
+                "acct-jobs",
+                &final_posting.id,
+                "factual",
+                "review_first",
+            )
                 .unwrap_err()
                 .to_string()
-                .contains("attempt limit")
+                .contains("Today's application limit")
         );
 
         let reservations = list_attempt_reservations(&pool, "acct-jobs").unwrap();
@@ -5952,7 +6219,8 @@ mod tests {
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &JobPosting {
+            &verified_test_posting(
+                JobPosting {
                 id: String::new(),
                 canonical_key: String::new(),
                 source: "greenhouse".to_string(),
@@ -5975,8 +6243,11 @@ mod tests {
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
-            },
+                },
+                now_ms(),
+            ),
             &profile,
             &JobPreferences::default(),
         )
@@ -7111,7 +7382,8 @@ mod tests {
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &JobPosting {
+            &verified_test_posting(
+                JobPosting {
                 id: String::new(),
                 canonical_key: String::new(),
                 source: "greenhouse".to_string(),
@@ -7134,8 +7406,11 @@ mod tests {
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
-            },
+                },
+                now_ms(),
+            ),
             &profile,
             &JobPreferences::default(),
         )

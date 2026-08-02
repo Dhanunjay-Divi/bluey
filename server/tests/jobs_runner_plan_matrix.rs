@@ -13,7 +13,7 @@ use bluey_server::{
     config::{Config, ServerDbBackend, TrialAbuseConfig, UpstreamKeys},
     db::{
         accounts::Account,
-        jobs::{self, JobApplication, JobPosting, JobPreferences},
+        jobs::{self, JobApplication, JobDiscoveryEvidence, JobPosting, JobPreferences},
         open_pool, run_migrations, DbPool,
     },
 };
@@ -138,10 +138,7 @@ impl TestContext {
         .expect("save matrix career track");
         let now = chrono::Utc::now().timestamp_millis();
         let slug = format!("{label}-{}", uuid::Uuid::new_v4().simple());
-        let posting = jobs::upsert_posting(
-            &self.pool,
-            &account.id,
-            &JobPosting {
+        let mut posting_input = JobPosting {
                 id: String::new(),
                 canonical_key: String::new(),
                 source: "greenhouse".to_string(),
@@ -164,8 +161,21 @@ impl TestContext {
                 status: "matched".to_string(),
                 created_at_ms: 0,
                 updated_at_ms: 0,
+                discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
-            },
+            };
+        posting_input.canonical_key = jobs::canonical_job_key(&posting_input);
+        posting_input.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+            posting_input.canonical_key.clone(),
+            format!("matrix-employer:{slug}"),
+            Some("boards.greenhouse.io".to_string()),
+            now,
+            "a".repeat(64),
+        );
+        let posting = jobs::upsert_posting(
+            &self.pool,
+            &account.id,
+            &posting_input,
             &profile,
             &JobPreferences::default(),
         )

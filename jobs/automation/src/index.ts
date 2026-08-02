@@ -20,6 +20,7 @@ export * from "./standard-adapters.js";
 export * from "./execute.js";
 export * from "./playwright-page.js";
 export * from "./documents.js";
+export * from "./discovery-quality.js";
 export * from "./network.js";
 export * from "./recovery.js";
 export * from "./source-catalog.js";

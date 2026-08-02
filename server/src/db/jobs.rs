@@ -407,6 +407,125 @@ pub struct AutoSubmitAuthorization {
     pub authority_fingerprint: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryScamSignal {
+    pub code: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobDiscoveryEvidence {
+    pub provenance: String,
+    pub canonical_status: String,
+    #[serde(default)]
+    pub canonical_job_id: Option<String>,
+    pub employer_verification_status: String,
+    #[serde(default)]
+    pub employer_id: Option<String>,
+    #[serde(default)]
+    pub canonical_employer_domain: Option<String>,
+    #[serde(default)]
+    pub application_domain: Option<String>,
+    pub scam_risk_status: String,
+    #[serde(default)]
+    pub scam_signals: Vec<DiscoveryScamSignal>,
+    pub original_source_status: String,
+    #[serde(default)]
+    pub original_source_checked_at_ms: Option<i64>,
+    #[serde(default)]
+    pub original_source_snapshot_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub original_source_evidence_hash: Option<String>,
+    #[serde(default)]
+    pub original_source_mismatched_fields: Vec<String>,
+    #[serde(default = "default_true")]
+    pub requires_original_revalidation: bool,
+}
+
+impl Default for JobDiscoveryEvidence {
+    fn default() -> Self {
+        Self {
+            provenance: "unknown".to_string(),
+            canonical_status: "unknown".to_string(),
+            canonical_job_id: None,
+            employer_verification_status: "unknown".to_string(),
+            employer_id: None,
+            canonical_employer_domain: None,
+            application_domain: None,
+            scam_risk_status: "unknown".to_string(),
+            scam_signals: Vec::new(),
+            original_source_status: "unknown".to_string(),
+            original_source_checked_at_ms: None,
+            original_source_snapshot_expires_at_ms: None,
+            original_source_evidence_hash: None,
+            original_source_mismatched_fields: Vec::new(),
+            requires_original_revalidation: true,
+        }
+    }
+}
+
+impl JobDiscoveryEvidence {
+    pub fn external_feed_lead(canonical_job_id: String) -> Self {
+        Self {
+            provenance: "external_feed".to_string(),
+            canonical_status: "canonical".to_string(),
+            canonical_job_id: Some(canonical_job_id),
+            ..Self::default()
+        }
+    }
+
+    pub fn verified_original_source(
+        canonical_job_id: String,
+        employer_id: String,
+        application_domain: Option<String>,
+        checked_at_ms: i64,
+        evidence_hash: String,
+    ) -> Self {
+        let mut evidence = Self::provider_verified_original_source(
+            canonical_job_id,
+            employer_id,
+            application_domain,
+            checked_at_ms,
+            evidence_hash,
+        );
+        evidence.employer_verification_status = "verified".to_string();
+        evidence.scam_risk_status = "clear".to_string();
+        evidence
+    }
+
+    /// Record a fresh snapshot from an allowlisted hosted ATS without
+    /// overstating independent employer or scam verification. This evidence
+    /// is sufficient for a review-first packet, but unattended queueing still
+    /// requires `verified_original_source` evidence from the risk pipeline.
+    pub fn provider_verified_original_source(
+        canonical_job_id: String,
+        employer_id: String,
+        application_domain: Option<String>,
+        checked_at_ms: i64,
+        evidence_hash: String,
+    ) -> Self {
+        Self {
+            provenance: "original_source".to_string(),
+            canonical_status: "canonical".to_string(),
+            canonical_job_id: Some(canonical_job_id),
+            employer_verification_status: "ats_tenant_verified".to_string(),
+            employer_id: Some(employer_id),
+            canonical_employer_domain: None,
+            application_domain,
+            scam_risk_status: "source_screened".to_string(),
+            scam_signals: Vec::new(),
+            original_source_status: "verified_open".to_string(),
+            original_source_checked_at_ms: Some(checked_at_ms),
+            original_source_snapshot_expires_at_ms: Some(
+                checked_at_ms.saturating_add(24 * 60 * 60 * 1_000),
+            ),
+            original_source_evidence_hash: Some(evidence_hash),
+            original_source_mismatched_fields: Vec::new(),
+            requires_original_revalidation: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPosting {
     #[serde(default)]
@@ -451,6 +570,8 @@ pub struct JobPosting {
     pub created_at_ms: i64,
     #[serde(default)]
     pub updated_at_ms: i64,
+    #[serde(default)]
+    pub discovery_evidence: JobDiscoveryEvidence,
     #[serde(default)]
     pub eligibility: Option<JobEligibilityDecision>,
 }

@@ -2,6 +2,226 @@
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const LIVE_VERIFICATION_MAX_AGE_MS: i64 = DAY_MS;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiscoveryExecutionGate {
+    can_prepare: bool,
+    can_queue: bool,
+}
+
+fn apply_posting_discovery_evidence(
+    posting: &JobPosting,
+    at_ms: i64,
+    hard_failures: &mut Vec<EligibilityReason>,
+    review_reasons: &mut Vec<EligibilityReason>,
+    passed_checks: &mut Vec<String>,
+) -> DiscoveryExecutionGate {
+    let evidence = &posting.discovery_evidence;
+    let canonical_status = evidence.canonical_status.trim().to_ascii_lowercase();
+    let employer_status = evidence
+        .employer_verification_status
+        .trim()
+        .to_ascii_lowercase();
+    let scam_status = evidence.scam_risk_status.trim().to_ascii_lowercase();
+    let original_status = evidence
+        .original_source_status
+        .trim()
+        .to_ascii_lowercase();
+
+    if matches!(
+        canonical_status.as_str(),
+        "duplicate" | "repost" | "invalid" | "malformed"
+    ) {
+        push_reason(
+            hard_failures,
+            "canonical_job_rejected",
+            "Bluey rejected this duplicate, reposted, or malformed job record.",
+        );
+    }
+    if matches!(employer_status.as_str(), "mismatch" | "impersonated") {
+        push_reason(
+            hard_failures,
+            "employer_identity_mismatch",
+            "The application destination does not match the verified employer.",
+        );
+    }
+    if scam_status == "blocked" {
+        push_reason(
+            hard_failures,
+            "scam_risk_blocked",
+            "Bluey blocked this posting after an employer or job-risk check.",
+        );
+    }
+    if matches!(original_status.as_str(), "closed" | "mismatch")
+        || !evidence.original_source_mismatched_fields.is_empty()
+    {
+        push_reason(
+            hard_failures,
+            "original_source_rejected",
+            "The original employer posting is closed or no longer matches this job record.",
+        );
+    }
+
+    let expected_canonical_job_id = posting.canonical_key.trim();
+    let evidence_canonical_job_id = evidence
+        .canonical_job_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let canonical_verified = canonical_status == "canonical"
+        && !expected_canonical_job_id.is_empty()
+        && evidence_canonical_job_id == Some(expected_canonical_job_id);
+    if canonical_verified {
+        passed_checks.push("canonical_job_verified".to_string());
+    } else if canonical_status == "canonical" {
+        push_reason(
+            hard_failures,
+            "canonical_evidence_mismatch",
+            "The discovery evidence belongs to a different canonical job record.",
+        );
+    } else if !matches!(
+        canonical_status.as_str(),
+        "duplicate" | "repost" | "invalid" | "malformed"
+    ) {
+        push_reason(
+            review_reasons,
+            "canonical_job_unverified",
+            "Bluey must canonicalize and deduplicate this job before preparing an application.",
+        );
+    }
+
+    let canonical_url_host = reqwest::Url::parse(&posting.canonical_url)
+        .ok()
+        .and_then(|url| url.host_str().map(normalize_discovery_domain));
+    let evidence_application_domain = evidence
+        .application_domain
+        .as_deref()
+        .map(normalize_discovery_domain)
+        .filter(|domain| !domain.is_empty());
+    let application_domain_matches = canonical_url_host.is_some()
+        && evidence_application_domain.as_ref() == canonical_url_host.as_ref();
+    let employer_source_bound = matches!(
+        employer_status.as_str(),
+        "verified" | "ats_tenant_verified"
+    );
+    if employer_source_bound && !application_domain_matches {
+        push_reason(
+            hard_failures,
+            "application_domain_mismatch",
+            "The verified application destination does not match this job URL.",
+        );
+    }
+
+    let employer_bound = employer_source_bound
+        && evidence
+            .employer_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && application_domain_matches;
+    let employer_verified = employer_status == "verified" && employer_bound;
+    if employer_verified {
+        passed_checks.push("employer_identity_verified".to_string());
+    } else if employer_bound {
+        passed_checks.push("ats_tenant_bound".to_string());
+        push_reason(
+            review_reasons,
+            "employer_identity_review_required",
+            "Bluey must independently verify the employer before Auto-submit.",
+        );
+    } else if !matches!(employer_status.as_str(), "mismatch" | "impersonated") {
+        push_reason(
+            review_reasons,
+            "employer_identity_unverified",
+            "Bluey must verify the employer and application destination before preparing this job.",
+        );
+    }
+
+    let scam_screened = matches!(scam_status.as_str(), "clear" | "source_screened")
+        && evidence.scam_signals.is_empty();
+    let scam_clear = scam_status == "clear" && scam_screened;
+    if scam_clear {
+        passed_checks.push("job_risk_clear".to_string());
+    } else if scam_screened {
+        passed_checks.push("source_risk_screened".to_string());
+        push_reason(
+            review_reasons,
+            "job_risk_review_required",
+            "Bluey must finish the employer-risk review before Auto-submit.",
+        );
+    } else if scam_status != "blocked" {
+        push_reason(
+            review_reasons,
+            "job_risk_review_required",
+            "Bluey must finish the job-risk review before preparing an application.",
+        );
+    }
+
+    let original_evidence_present = original_status == "verified_open"
+        && evidence.original_source_checked_at_ms.is_some()
+        && evidence
+            .original_source_evidence_hash
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty());
+    let original_evidence_current = original_evidence_present
+        && evidence
+            .original_source_snapshot_expires_at_ms
+            .is_some_and(|expires_at| expires_at >= at_ms);
+    if original_evidence_current {
+        passed_checks.push("original_source_current".to_string());
+    } else if original_evidence_present {
+        push_reason(
+            review_reasons,
+            "original_source_refresh_required",
+            "Bluey must refresh the original employer posting before a runner starts.",
+        );
+    } else if !matches!(original_status.as_str(), "closed" | "mismatch") {
+        push_reason(
+            review_reasons,
+            "original_source_unverified",
+            "Bluey must verify this job on the original employer site before preparing it.",
+        );
+    }
+
+    let original_source_provenance = evidence.provenance == "original_source";
+    if evidence.provenance == "external_feed" {
+        push_reason(
+            review_reasons,
+            "external_feed_requires_revalidation",
+            "This feed entry is a lead until Bluey verifies it on the original employer site.",
+        );
+    }
+    if evidence.requires_original_revalidation {
+        push_reason(
+            review_reasons,
+            "original_source_revalidation_required",
+            "Bluey must revalidate this job on its original source before preparing it.",
+        );
+    }
+
+    let hard_blocked = !hard_failures.is_empty();
+    let reviewable_original = original_source_provenance
+        && canonical_verified
+        && employer_bound
+        && scam_screened
+        && original_evidence_present
+        && !evidence.requires_original_revalidation;
+    let unattended_original = reviewable_original && employer_verified && scam_clear;
+    DiscoveryExecutionGate {
+        can_prepare: !hard_blocked && reviewable_original,
+        can_queue: !hard_blocked && unattended_original && original_evidence_current,
+    }
+}
+
+fn normalize_discovery_domain(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    normalized
+        .strip_prefix("www.")
+        .unwrap_or(&normalized)
+        .to_string()
+}
+
 pub fn get_job_discovery_authority(
     pool: &DbPool,
     account_id: &str,
@@ -534,14 +754,26 @@ fn build_job_eligibility(
         ),
     }
 
+    let discovery_gate = apply_posting_discovery_evidence(
+        posting,
+        now,
+        &mut hard_failures,
+        &mut review_reasons,
+        &mut passed_checks,
+    );
+
     let can_prepare = capability != "blocked"
+        && discovery_gate.can_prepare
         && hard_failures
             .iter()
             .all(|reason| reason.code == "daily_limit_reached")
         && (!require_live_verification || !live_verification_missing);
     let queue_capable = matches!(capability.as_str(), "certified" | "beta_review");
-    let can_queue =
-        can_prepare && hard_failures.is_empty() && queue_capable && !live_verification_missing;
+    let can_queue = can_prepare
+        && discovery_gate.can_queue
+        && hard_failures.is_empty()
+        && queue_capable
+        && !live_verification_missing;
     let can_auto_submit = can_queue
         && capability == "certified"
         && review_reasons.is_empty()

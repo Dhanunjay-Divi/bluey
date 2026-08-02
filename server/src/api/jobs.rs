@@ -1217,7 +1217,23 @@ fn posting_from_user_input(
     imported: Option<jobs_import::ImportedJob>,
 ) -> JobPosting {
     if let Some(imported) = imported {
-        return JobPosting {
+        let provider = discovery_provider_label(&imported.source);
+        let employer_id = format!(
+            "{provider}:{}",
+            imported
+                .company
+                .trim()
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join("-")
+        );
+        let application_domain = reqwest::Url::parse(&imported.canonical_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string));
+        let verified_at_ms = imported.verified_at_ms;
+        let evidence_hash = imported.evidence_hash.clone();
+        let mut posting = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
             source: imported.source,
@@ -1235,13 +1251,23 @@ fn posting_from_user_input(
             matched_reasons: Vec::new(),
             missing_requirements: Vec::new(),
             posted_at_ms: imported.posted_at_ms,
-            last_verified_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            last_verified_at_ms: Some(verified_at_ms),
             availability_status: "active".to_string(),
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: jobs::JobDiscoveryEvidence::default(),
             eligibility: None,
         };
+        posting.canonical_key = jobs::canonical_job_key(&posting);
+        posting.discovery_evidence = jobs::JobDiscoveryEvidence::provider_verified_original_source(
+            posting.canonical_key.clone(),
+            employer_id,
+            application_domain,
+            verified_at_ms,
+            evidence_hash,
+        );
+        return posting;
     }
     JobPosting {
         id: String::new(),
@@ -1266,6 +1292,7 @@ fn posting_from_user_input(
         status: "matched".to_string(),
         created_at_ms: 0,
         updated_at_ms: 0,
+        discovery_evidence: jobs::JobDiscoveryEvidence::default(),
         eligibility: None,
     }
 }
@@ -5532,7 +5559,7 @@ mod tests {
     }
 
     fn imported_discovery_posting(source: &str, canonical_url: &str, track_id: &str) -> JobPosting {
-        JobPosting {
+        let mut posting = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
             source: source.to_string(),
@@ -5555,8 +5582,21 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: jobs::JobDiscoveryEvidence::default(),
             eligibility: None,
-        }
+        };
+        posting.canonical_key = jobs::canonical_job_key(&posting);
+        let application_domain = reqwest::Url::parse(canonical_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string));
+        posting.discovery_evidence = jobs::JobDiscoveryEvidence::verified_original_source(
+            posting.canonical_key.clone(),
+            format!("{source}:acme"),
+            application_domain,
+            jobs::now_ms(),
+            "a".repeat(64),
+        );
+        posting
     }
 
     fn store_discovery_posting(
@@ -5953,6 +5993,13 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: jobs::JobDiscoveryEvidence::verified_original_source(
+                "job-key".to_string(),
+                "greenhouse:acme".to_string(),
+                Some("boards.greenhouse.io".to_string()),
+                jobs::now_ms(),
+                "a".repeat(64),
+            ),
             eligibility: None,
         };
         let resume = ResumeVersion {
@@ -6227,6 +6274,8 @@ mod tests {
                 compensation: "USD 150000-220000 year".to_string(),
                 employment_type: "full_time".to_string(),
                 posted_at_ms: Some(1_744_222_396_719),
+                verified_at_ms: 1_744_222_396_719,
+                evidence_hash: "a".repeat(64),
             }),
         );
 
@@ -6238,6 +6287,22 @@ mod tests {
         assert_eq!(posting.match_score, 0);
         assert_eq!(posting.availability_status, "active");
         assert!(posting.last_verified_at_ms.is_some());
+        assert_eq!(
+            posting.discovery_evidence.canonical_job_id.as_deref(),
+            Some(posting.canonical_key.as_str())
+        );
+        assert_eq!(
+            posting.discovery_evidence.original_source_status,
+            "verified_open"
+        );
+        assert_eq!(
+            posting.discovery_evidence.employer_verification_status,
+            "ats_tenant_verified"
+        );
+        assert_eq!(
+            posting.discovery_evidence.scam_risk_status,
+            "source_screened"
+        );
     }
 
     #[test]

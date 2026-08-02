@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+use super::jobs::JobDiscoveryEvidence;
 use super::jobs::{CareerProfile, EmploymentEntry, JobPosting, ProjectEntry};
 
 const MAX_RESUME_SKILLS: usize = 16;
@@ -552,6 +554,7 @@ mod tests {
             status: "matched".to_string(),
             created_at_ms: 0,
             updated_at_ms: 0,
+            discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         }
     }

@@ -7,6 +7,10 @@ under `docs/release/`.
 
 ### Added
 
+- Added server-authoritative discovery evidence for canonical job identity,
+  employer and application-domain binding, scam screening, original-source
+  freshness, and immutable evidence hashes before Bluey Jobs can prepare or
+  queue an application.
 - Added fail-closed, application-identity-scoped Bluey Browser profiles with
   opaque server-compatible profile IDs, collision detection, path confinement,
   and upgrade-compatible profile directories.

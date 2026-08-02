@@ -848,9 +848,6 @@ pub fn upsert_posting(
     if value.created_at_ms == 0 {
         value.created_at_ms = now;
     }
-    if value.availability_status == "active" && value.last_verified_at_ms.is_none() {
-        value.last_verified_at_ms = Some(now);
-    }
     value.updated_at_ms = now;
     let applications = list_applications(pool, account_id)?;
     let reservations = list_attempt_reservations(pool, account_id)?;
@@ -1096,9 +1093,6 @@ fn prepare_snapshot_posting(
     value.missing_requirements = missing;
     if value.created_at_ms == 0 {
         value.created_at_ms = context.observed_at_ms;
-    }
-    if value.availability_status == "active" && value.last_verified_at_ms.is_none() {
-        value.last_verified_at_ms = Some(context.observed_at_ms);
     }
     value.updated_at_ms = context.observed_at_ms;
     let existing_application_id = context

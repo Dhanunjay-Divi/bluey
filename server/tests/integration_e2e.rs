@@ -24,7 +24,8 @@ use bluey_server::config::{
 };
 use bluey_server::db::accounts::Account;
 use bluey_server::db::jobs::{
-    self, BrowserSession, DiscoverySourceInput, Intervention, JobPosting, JobPreferences,
+    self, BrowserSession, DiscoverySourceInput, Intervention, JobDiscoveryEvidence, JobPosting,
+    JobPreferences,
 };
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
@@ -753,34 +754,44 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
     )
     .unwrap();
     let now = chrono::Utc::now().timestamp_millis();
+    let mut posting_input = JobPosting {
+        id: String::new(),
+        canonical_key: String::new(),
+        source: "greenhouse".to_string(),
+        external_id: "lease-integration".to_string(),
+        company: "Acme".to_string(),
+        title: "Platform Engineer".to_string(),
+        location: "New York, NY".to_string(),
+        workplace: "hybrid".to_string(),
+        canonical_url: "https://boards.greenhouse.io/acme/jobs/lease-integration".to_string(),
+        description: "Build reliable systems.".to_string(),
+        compensation: "$170k-$200k".to_string(),
+        employment_type: "full_time".to_string(),
+        track_id: track.id,
+        match_score: 92,
+        matched_reasons: Vec::new(),
+        missing_requirements: Vec::new(),
+        posted_at_ms: Some(now),
+        last_verified_at_ms: Some(now),
+        availability_status: "active".to_string(),
+        status: "matched".to_string(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        discovery_evidence: JobDiscoveryEvidence::default(),
+        eligibility: None,
+    };
+    posting_input.canonical_key = jobs::canonical_job_key(&posting_input);
+    posting_input.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+        posting_input.canonical_key.clone(),
+        "greenhouse:acme".to_string(),
+        Some("boards.greenhouse.io".to_string()),
+        now,
+        "a".repeat(64),
+    );
     let posting = jobs::upsert_posting(
         &harness.pool,
         &account.id,
-        &JobPosting {
-            id: String::new(),
-            canonical_key: String::new(),
-            source: "greenhouse".to_string(),
-            external_id: "lease-integration".to_string(),
-            company: "Acme".to_string(),
-            title: "Platform Engineer".to_string(),
-            location: "New York, NY".to_string(),
-            workplace: "hybrid".to_string(),
-            canonical_url: "https://boards.greenhouse.io/acme/jobs/lease-integration".to_string(),
-            description: "Build reliable systems.".to_string(),
-            compensation: "$170k-$200k".to_string(),
-            employment_type: "full_time".to_string(),
-            track_id: track.id,
-            match_score: 92,
-            matched_reasons: Vec::new(),
-            missing_requirements: Vec::new(),
-            posted_at_ms: Some(now),
-            last_verified_at_ms: Some(now),
-            availability_status: "active".to_string(),
-            status: "matched".to_string(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            eligibility: None,
-        },
+        &posting_input,
         &profile,
         &JobPreferences::default(),
     )
