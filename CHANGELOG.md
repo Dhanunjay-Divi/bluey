@@ -21,6 +21,9 @@ under `docs/release/`.
 
 ### Changed
 
+- Preserved three remaining Codex-owned local branch tips on named remote archive
+  branches and documented why their older discovery, spend-accounting, and
+  optional-provider patches must not be bulk-merged over current main.
 - Preserved the complete historical Bluey Jobs experimental worktree on a
   dedicated remote snapshot branch and reconciled every remaining Codex-owned
   branch against current main without merging obsolete runtime, generated
