@@ -1140,6 +1140,51 @@ pub struct JobsProviderMessage {
     pub updated_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationAction {
+    #[serde(default)]
+    pub id: String,
+    pub application_id: String,
+    pub connection_id: String,
+    #[serde(default)]
+    pub source_message_id: Option<String>,
+    pub kind: String,
+    pub provider: String,
+    pub idempotency_key: String,
+    #[serde(default)]
+    pub payload: Value,
+    #[serde(default)]
+    pub payload_sha256: String,
+    #[serde(default = "default_pending_status")]
+    pub status: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub lease_owner: Option<String>,
+    #[serde(default)]
+    pub lease_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub next_attempt_at_ms: i64,
+    #[serde(default)]
+    pub attempt_count: i64,
+    #[serde(default)]
+    pub approved_at_ms: Option<i64>,
+    #[serde(default)]
+    pub dispatched_at_ms: Option<i64>,
+    #[serde(default)]
+    pub created_at_ms: i64,
+    #[serde(default)]
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationActionLease {
+    pub account_id: String,
+    pub action: JobsCommunicationAction,
+    pub lease_token: String,
+    pub fence: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobsEntitlement {
     pub plan: String,
@@ -1622,6 +1667,7 @@ include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");
 include!("jobs/mailbox_sync.rs");
+include!("jobs/communication_actions.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");

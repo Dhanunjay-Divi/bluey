@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 export const JOBS_PARITY_TABLES = [
+  "jobs_communication_actions",
   "jobs_discovery_memberships",
   "jobs_discovery_runs",
   "jobs_discovery_sources",
@@ -11,6 +12,13 @@ export const JOBS_PARITY_TABLES = [
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
+  [
+    "jobs_communication_actions",
+    [
+      "idx_jobs_communication_actions_account on jobs_communication_actions (account_id, application_id, created_at_ms desc)",
+      "idx_jobs_communication_actions_due on jobs_communication_actions (status, next_attempt_at_ms, lease_expires_at_ms)",
+    ].sort(),
+  ],
   [
     "jobs_discovery_memberships",
     ["idx_jobs_discovery_memberships_job on jobs_discovery_memberships (account_id, job_id)"],
@@ -130,6 +138,7 @@ function parityTableNames(sql) {
     .map((match) => match[1].toLowerCase())
     .filter(
       (tableName) =>
+        tableName === "jobs_communication_actions" ||
         tableName.startsWith("jobs_discovery_") ||
         tableName === "jobs_execution_leases" ||
         tableName === "jobs_local_run_resume_actions",
@@ -198,14 +207,34 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
 function main() {
   const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
   const sqlitePath = path.join(repoRoot, "server/src/db/mod.rs");
+  const sqliteCommunicationPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/041_jobs_communication_actions.sql",
+  );
   const postgresPath = path.join(repoRoot, "infra/postgres/server-runtime/002_jobs.sql");
-  const sqliteSource = fs.readFileSync(sqlitePath, "utf8");
-  const postgresSource = fs.readFileSync(postgresPath, "utf8");
+  const postgresCommunicationPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/019_jobs_communication_actions.sql",
+  );
+  const sqliteSource = [sqlitePath, sqliteCommunicationPath]
+    .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
+    .join("\n");
+  const postgresSource = [postgresPath, postgresCommunicationPath]
+    .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
+    .join("\n");
   const issues = compareJobsSchemas(sqliteSource, postgresSource);
 
   const includePath = 'include_str!("../../../infra/postgres/server-runtime/002_jobs.sql")';
   if (!sqliteSource.includes(includePath)) issues.push(`server migration runner does not include 002_jobs.sql via ${includePath}`);
   if (!sqliteSource.includes('&[&"002_jobs.sql"]')) issues.push("server migration runner does not record 002_jobs.sql");
+  const communicationInclude =
+    'include_str!("../../../infra/postgres/server-runtime/019_jobs_communication_actions.sql")';
+  if (!sqliteSource.includes(communicationInclude)) {
+    issues.push(`server migration runner does not include 019_jobs_communication_actions.sql via ${communicationInclude}`);
+  }
+  if (!sqliteSource.includes('"019_jobs_communication_actions.sql"')) {
+    issues.push("server migration runner does not record 019_jobs_communication_actions.sql");
+  }
 
   if (issues.length > 0) {
     console.error("Jobs SQLite/Postgres schema parity failed:");

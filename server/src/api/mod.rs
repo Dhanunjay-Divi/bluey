@@ -18,6 +18,7 @@ pub mod admin;
 pub mod auth_routes;
 pub mod billing;
 pub mod jobs;
+mod jobs_communication_actions;
 mod jobs_import;
 pub mod jobs_interview_prep;
 pub mod jobs_local_capability;

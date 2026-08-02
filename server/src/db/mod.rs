@@ -277,6 +277,8 @@ const SQLITE_JOBS_GLOBAL_INGESTION_QUARANTINE: &str =
     include_str!("../../../infra/sqlite/server-runtime/039_jobs_global_ingestion_quarantine.sql");
 const SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/sqlite/server-runtime/040_jobs_auto_submit_authorizations.sql");
+const SQLITE_JOBS_COMMUNICATION_ACTIONS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/041_jobs_communication_actions.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1589,6 +1591,8 @@ const MIGRATIONS: &[&str] = &[
     // 0040 - Track-scoped, revisioned user authority for unattended
     // application submission.
     SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+    // 0041 - approval-gated, replay-safe email and calendar actions.
+    SQLITE_JOBS_COMMUNICATION_ACTIONS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2024,6 +2028,8 @@ const POSTGRES_JOBS_GLOBAL_CANDIDATE_ARCHIVE: &str =
     include_str!("../../../infra/postgres/server-runtime/017_jobs_global_candidate_archive.sql");
 const POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/018_jobs_auto_submit_authorizations.sql");
+const POSTGRES_JOBS_COMMUNICATION_ACTIONS: &str =
+    include_str!("../../../infra/postgres/server-runtime/019_jobs_communication_actions.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2084,6 +2090,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "018_jobs_auto_submit_authorizations.sql",
         POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+    ),
+    (
+        "019_jobs_communication_actions.sql",
+        POSTGRES_JOBS_COMMUNICATION_ACTIONS,
     ),
 ];
 

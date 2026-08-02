@@ -6518,6 +6518,411 @@ mod tests {
         assert!(!raw.contains("recruiter@example.org"));
     }
 
+    fn communication_test_application(pool: &DbPool) -> JobApplication {
+        let profile = default_profile("jobs@example.com");
+        save_profile(pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/communication-action",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        application
+    }
+
+    fn communication_test_application_mailbox_and_message(
+        pool: &DbPool,
+    ) -> (JobApplication, MailboxConnection, JobsProviderMessage) {
+        let application = communication_test_application(pool);
+        let mailbox = save_mailbox_connection(
+            pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: vec!["reply".to_string(), "calendar".to_string()],
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-communication-action",
+        )
+        .unwrap();
+        let message = communication_test_source_message(
+            pool,
+            &application,
+            &mailbox,
+            "gmail-message-communication-action",
+        );
+        (application, mailbox, message)
+    }
+
+    fn communication_test_source_message(
+        pool: &DbPool,
+        application: &JobApplication,
+        mailbox: &MailboxConnection,
+        external_id: &str,
+    ) -> JobsProviderMessage {
+        save_provider_message(
+            pool,
+            "acct-jobs",
+            &JobsProviderMessage {
+                id: String::new(),
+                connection_id: mailbox.id.clone(),
+                provider: mailbox.provider.clone(),
+                external_id: external_id.to_string(),
+                sender: "recruiter@example.org".to_string(),
+                recipients: vec![mailbox.account_label.clone()],
+                subject: "Interview availability".to_string(),
+                body_text: "Please share a few interview times.".to_string(),
+                received_at_ms: now_ms(),
+                application_id: Some(application.id.clone()),
+                processing_status: "needs_input".to_string(),
+                classification: "interview".to_string(),
+                confidence: 0.98,
+                metadata: json!({"thread_id": format!("thread-{external_id}")}),
+                processed_at_ms: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap()
+        .0
+    }
+
+    fn communication_test_action(
+        application: &JobApplication,
+        mailbox: &MailboxConnection,
+        source_message: &JobsProviderMessage,
+        idempotency_key: &str,
+    ) -> JobsCommunicationAction {
+        JobsCommunicationAction {
+            id: String::new(),
+            application_id: application.id.clone(),
+            connection_id: mailbox.id.clone(),
+            source_message_id: Some(source_message.id.clone()),
+            kind: "reply".to_string(),
+            provider: "gmail".to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            payload: json!({
+                "to": "recruiter@example.org",
+                "subject": "Interview availability",
+                "body_text": "Tuesday afternoon works for me."
+            }),
+            payload_sha256: String::new(),
+            status: String::new(),
+            provider_object_id: String::new(),
+            lease_owner: None,
+            lease_expires_at_ms: None,
+            next_attempt_at_ms: 0,
+            attempt_count: 0,
+            approved_at_ms: None,
+            dispatched_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn communication_actions_are_idempotent_encrypted_and_tenant_scoped() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action =
+            communication_test_action(&application, &mailbox, &message, "reply-interview-1");
+
+        let (stored, inserted) =
+            create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        assert!(inserted);
+        assert_eq!(stored.status, "awaiting_approval");
+        let (replayed, inserted_again) =
+            create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        assert!(!inserted_again);
+        assert_eq!(stored.id, replayed.id);
+        assert!(communication_action(&pool, "acct-other", &stored.id)
+            .unwrap()
+            .is_none());
+        assert!(list_communication_actions(&pool, "acct-other", None, 20)
+            .unwrap()
+            .is_empty());
+
+        let raw: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT action_json FROM jobs_communication_actions WHERE id = ?1",
+                params![stored.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!raw.contains("Tuesday afternoon works for me"));
+        assert!(!raw.contains("recruiter@example.org"));
+
+        let mut conflicting = action;
+        conflicting.payload["body_text"] = json!("Wednesday morning instead.");
+        assert!(create_communication_action(&pool, "acct-jobs", &conflicting).is_err());
+    }
+
+    #[test]
+    fn communication_replies_require_a_bound_source_message() {
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let mut action =
+            communication_test_action(&application, &mailbox, &message, "reply-without-source");
+        action.source_message_id = None;
+
+        let error = create_communication_action(&pool, "acct-jobs", &action)
+            .expect_err("a reply without an inbound provider message must fail");
+        assert!(error
+            .to_string()
+            .contains("communication replies require a source mailbox message"));
+    }
+
+    #[test]
+    fn approved_communication_actions_wait_for_mailbox_reauthorization() {
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "reply-after-reauthorization",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+
+        assert!(mark_mailbox_reauthorization_required(&pool, "acct-jobs", &mailbox.id).unwrap());
+        assert!(claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .is_none());
+
+        let reconnected = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                status: "connected".to_string(),
+                ..mailbox.clone()
+            },
+            "google-subject-communication-action",
+        )
+        .unwrap();
+        assert_eq!(reconnected.id, mailbox.id);
+
+        let lease = claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .expect("the approved reply may dispatch after reconnection");
+        assert_eq!(lease.action.id, stored.id);
+    }
+
+    #[test]
+    fn outlook_email_and_calendar_actions_use_the_outlook_mailbox_connection() {
+        let pool = test_pool();
+        let application = communication_test_application(&pool);
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "outlook".to_string(),
+                status: "connected".to_string(),
+                account_label: "candidate@outlook.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: vec!["reply".to_string(), "calendar".to_string()],
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "microsoft-subject-communication-action",
+        )
+        .unwrap();
+        let message = communication_test_source_message(
+            &pool,
+            &application,
+            &mailbox,
+            "outlook-message-communication-action",
+        );
+
+        let mut reply =
+            communication_test_action(&application, &mailbox, &message, "outlook-reply-1");
+        reply.provider = "outlook_email".to_string();
+        let (stored_reply, inserted_reply) =
+            create_communication_action(&pool, "acct-jobs", &reply).unwrap();
+        assert!(inserted_reply);
+        assert_eq!(stored_reply.provider, "outlook_email");
+
+        let mut calendar =
+            communication_test_action(&application, &mailbox, &message, "outlook-event-1");
+        calendar.kind = "calendar".to_string();
+        calendar.provider = "outlook_calendar".to_string();
+        calendar.source_message_id = None;
+        calendar.payload = json!({
+            "title": "Interview with Acme",
+            "starts_at_ms": 2_000_000_000_000_i64,
+            "ends_at_ms": 2_000_003_600_000_i64,
+            "attendees": ["candidate@outlook.com", "recruiter@example.org"]
+        });
+        let (stored_calendar, inserted_calendar) =
+            create_communication_action(&pool, "acct-jobs", &calendar).unwrap();
+        assert!(inserted_calendar);
+        assert_eq!(stored_calendar.provider, "outlook_calendar");
+    }
+
+    #[test]
+    fn communication_actions_require_approval_and_fenced_provider_evidence() {
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action =
+            communication_test_action(&application, &mailbox, &message, "reply-interview-2");
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+
+        assert!(claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .is_none());
+        let approved = approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.status, "approved");
+        assert!(approved.approved_at_ms.is_some());
+
+        let lease = claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.action.id, stored.id);
+        assert_eq!(lease.action.status, "dispatching");
+        assert_eq!(lease.action.attempt_count, 1);
+        assert!(finish_communication_action(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            "mail-worker",
+            "wrong-token",
+            lease.fence,
+            "sent",
+            Some("gmail-message-1"),
+        )
+        .is_err());
+        assert!(finish_communication_action(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            "mail-worker",
+            &lease.lease_token,
+            lease.fence,
+            "sent",
+            None,
+        )
+        .is_err());
+
+        let completed = finish_communication_action(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            "mail-worker",
+            &lease.lease_token,
+            lease.fence,
+            "sent",
+            Some("gmail-message-1"),
+        )
+        .unwrap();
+        assert_eq!(completed.status, "sent");
+        assert_eq!(completed.provider_object_id, "gmail-message-1");
+        assert!(completed.lease_owner.is_none());
+        assert!(completed.lease_expires_at_ms.is_none());
+        let lease_secret: Option<String> = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT lease_token_sha256 FROM jobs_communication_actions WHERE id = ?1",
+                params![stored.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(lease_secret.is_none());
+    }
+
+    #[test]
+    fn expired_communication_dispatch_requires_reconciliation_before_retry() {
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action =
+            communication_test_action(&application, &mailbox, &message, "reply-interview-3");
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions SET lease_expires_at_ms = ?2 WHERE id = ?1",
+                params![stored.id, now_ms() - 1],
+            )
+            .unwrap();
+
+        assert!(claim_communication_action(&pool, "replacement-worker")
+            .unwrap()
+            .is_none());
+        let unknown = communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unknown.status, "side_effect_unknown");
+        assert!(finish_communication_action(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            "mail-worker",
+            &lease.lease_token,
+            lease.fence,
+            "sent",
+            Some("gmail-message-late"),
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn cancelled_communication_actions_never_dispatch() {
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action =
+            communication_test_action(&application, &mailbox, &message, "reply-interview-4");
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        let cancelled = cancel_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .is_none());
+        assert!(approve_communication_action(&pool, "acct-jobs", &stored.id).is_err());
+    }
+
     #[test]
     fn mailbox_sync_can_be_scheduled_immediately_without_stealing_a_lease() {
         let pool = test_pool();

@@ -190,6 +190,23 @@ pub fn router() -> Router<AppState> {
             "/api/jobs/mailbox-messages",
             get(super::jobs_mailbox::mailbox_messages),
         )
+        .route(
+            "/api/jobs/communication-actions",
+            get(super::jobs_communication_actions::communication_actions)
+                .post(super::jobs_communication_actions::create_communication_action),
+        )
+        .route(
+            "/api/jobs/communication-actions/:action_id",
+            get(super::jobs_communication_actions::communication_action),
+        )
+        .route(
+            "/api/jobs/communication-actions/:action_id/approve",
+            post(super::jobs_communication_actions::approve_communication_action),
+        )
+        .route(
+            "/api/jobs/communication-actions/:action_id/cancel",
+            post(super::jobs_communication_actions::cancel_communication_action),
+        )
         .route("/api/jobs/entitlements", get(entitlements))
         .route("/api/jobs/runs/:run_id/events", get(run_events))
         .route_layer(axum::middleware::from_fn(require_jobs_beta))
@@ -5253,6 +5270,8 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("daily application limit")
         || message.contains("active application attempt")
         || message.contains("application attempt")
+        || message.contains("communication action cannot")
+        || message.contains("communication action idempotency key was reused")
     {
         StatusCode::CONFLICT
     } else if message.contains("monthly packet limit")
@@ -5284,6 +5303,8 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("application issue")
         || message.contains("application outcome")
         || message.contains("does not belong to this job")
+        || message.contains("communication action")
+        || message.contains("calendar action")
     {
         StatusCode::BAD_REQUEST
     } else {

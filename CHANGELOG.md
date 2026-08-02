@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added encrypted, account-scoped communication drafts for reviewed recruiter
+  replies and interview calendar actions, with explicit approval, idempotency,
+  mailbox binding, fenced worker leases, and non-retryable ambiguous outcomes.
 - Added evidence-grounded, job-specific cover letters to managed Bluey Jobs
   application kits, with cited Career Profile facts, server-owned target-role
   framing, transactional persistence, and exact packet-review rendering.
