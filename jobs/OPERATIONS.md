@@ -68,6 +68,13 @@ BLUEY_JOBS_GLOBAL_DISCOVERY_MANIFEST_REFRESH_MS=900000
 BLUEY_JOBS_GLOBAL_DISCOVERY_ARTIFACT_TIMEOUT_MS=1800000
 BLUEY_JOBS_GLOBAL_DISCOVERY_MAX_ARTIFACT_BYTES=4294967296
 BLUEY_JOBS_GLOBAL_DISCOVERY_STAGING_DIR=/var/lib/bluey-jobs-global-discovery
+# Leave cold archival disabled until the R2 write/read-back preflight below
+# succeeds against the production bucket.
+BLUEY_JOBS_GLOBAL_ARCHIVE_ENABLED=0
+BLUEY_JOBS_GLOBAL_ARCHIVE_RETENTION_DAYS=30
+BLUEY_JOBS_GLOBAL_ARCHIVE_POLL_SECONDS=3600
+BLUEY_JOBS_GLOBAL_ARCHIVE_BATCH_SIZE=25
+BLUEY_JOBS_GLOBAL_ARCHIVE_LEASE_SECONDS=300
 BLUEY_JOBS_RUNNER_ORIGIN=https://jobs-runner.internal
 BLUEY_JOBS_RUNNER_TOKEN=<random secret>
 BLUEY_JOBS_RUNNER_ID=<stable browser-pool replica ID>
@@ -303,6 +310,125 @@ and otherwise ambiguous checkpoints remain `side_effect_unknown` and are never
 automatically replayed. Configure a stable `BLUEY_JOBS_RUNNER_ID` so a restarted
 replica can rotate its still-prepared server lease immediately; without one,
 recovery waits for the old prepared lease to expire.
+
+## Global candidate cold storage
+
+Run the `bluey-ops` preflight before changing any archive setting. PostgreSQL
+remains the authoritative live search and relationship index. R2 stores only an
+encrypted, immutable copy of the heavy normalized candidate body for rows that
+are all of the following:
+
+- expired and older than `BLUEY_JOBS_GLOBAL_ARCHIVE_RETENTION_DAYS`;
+- absent from every non-expired source membership;
+- not materialized into any account match or application;
+- not already archived or leased by another archive worker.
+
+The worker is fail-closed and off by default. It writes the archive object,
+reads the exact object back, checks both byte equality and SHA-256, and only
+then replaces the heavy PostgreSQL candidate body with a small encrypted
+tombstone. An upload, read-back, checksum, lease, or transaction failure leaves
+the complete PostgreSQL payload intact and schedules a bounded retry.
+Rediscovery with the same or changed content restores the complete hot payload
+and clears the archive metadata.
+
+This lifecycle is not a database backup. Keep the normal PostgreSQL backup and
+restore proof, R2 replication, lifecycle, deletion, and object-inventory
+procedures independently operational. Do not delete archived objects during
+the first rollout. A verified content-addressed object may remain unreferenced
+if the candidate changes after read-back but before the guarded PostgreSQL
+completion. Do not delete that object in the worker: a newer lease may be using
+the same deterministic key. Reconcile unreferenced objects through the bounded
+object-inventory process after confirming no database row references them.
+
+Before enabling production archival:
+
+1. Verify the Jobs API is running the migration that adds the archive columns.
+2. Verify the configured R2 credentials can PUT, GET, and byte-compare a test
+   object under the configured private prefix.
+3. Confirm the preflight query below returns only expired candidates without
+   active memberships or account materializations.
+4. Enable the worker with a small batch size and monitor one complete pass.
+5. Verify object hashes and sizes against `archive_sha256` and
+   `archive_size_bytes`.
+6. Confirm Jobs API latency, source freshness, PostgreSQL CPU, dead tuples, and
+   archive retry counts remain healthy before increasing throughput.
+
+```sql
+SELECT c.id, c.canonical_key, c.updated_at_ms
+FROM jobs_global_candidates c
+WHERE c.availability_status = 'expired'
+  AND c.archive_state = 'hot'
+  AND c.updated_at_ms < (
+      EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') * 1000
+  )::BIGINT
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jobs_global_candidate_memberships m
+      WHERE m.candidate_id = c.id
+        AND m.expired_at_ms IS NULL
+  )
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jobs_global_candidate_materializations m
+      WHERE m.candidate_id = c.id
+  )
+ORDER BY c.updated_at_ms
+LIMIT 100;
+```
+
+Monitor archive state and retries:
+
+```sql
+SELECT archive_state, COUNT(*) AS candidates,
+       SUM(archive_attempt_count) AS attempts
+FROM jobs_global_candidates
+GROUP BY archive_state
+ORDER BY archive_state;
+
+SELECT id, archive_attempt_count, archive_next_attempt_at_ms
+FROM jobs_global_candidates
+WHERE archive_state = 'hot'
+  AND archive_attempt_count > 0
+ORDER BY archive_next_attempt_at_ms
+LIMIT 100;
+```
+
+To stop archival, set `BLUEY_JOBS_GLOBAL_ARCHIVE_ENABLED=0` and restart only the
+Jobs API candidate that has passed the normal release gates. Already archived
+rows remain valid searchable tombstones. Do not restore an old binary against
+the migrated authority schema; fix forward. If a hot body is required again,
+normal source rediscovery rehydrates it.
+
+## Jobs artifact storage boundary
+
+Keep queryable authority in PostgreSQL:
+
+- account and tenant ownership;
+- job/application state and canonical IDs;
+- Career Track and identity binding;
+- claim provenance and verification state;
+- searchable timestamps, hashes, receipt references, and metering authority;
+- compact structured resume/application metadata needed for authorization.
+
+Keep immutable or large artifacts in private R2 and reference them by key,
+SHA-256, media type, and size:
+
+- original imported resumes;
+- rendered job-specific PDF/DOCX documents and cover letters;
+- frozen job descriptions and answer bundles;
+- screenshots, confirmation evidence, and final receipt documents;
+- encrypted cold global-candidate bodies.
+
+Do not move live application rows wholesale to R2 without a tested hydration,
+authorization, export, deletion, and interview-prep retrieval path. A future
+terminal-application archive may use the same verified read-back pattern after
+those paths exist.
+
+Historical customer artifacts may be used for private, same-account retrieval,
+evaluation, resume improvement, and interview preparation. Do not pool customer
+artifacts for cross-account model training without explicit opt-in,
+de-identification, versioned dataset manifests, deletion propagation, and
+reviewed Terms and Privacy disclosures.
 
 Bluey Browser uses the same conservative phase policy for local runs. Its
 operation-scoped result/resume capabilities and frozen request are held only in

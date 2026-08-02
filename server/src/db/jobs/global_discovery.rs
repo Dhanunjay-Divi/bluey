@@ -55,6 +55,17 @@ pub fn sync_global_discovery_sources(
             for (id, input, config) in &normalized {
                 let provider = input.provider.trim().to_ascii_lowercase();
                 let source_key = input.source_key.trim().to_ascii_lowercase();
+                let stored_config = tx
+                    .query_row(
+                        "SELECT source_json FROM jobs_global_discovery_sources
+                          WHERE provider = ?1 AND source_key = ?2",
+                        params![&provider, &source_key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let config_change = global_source_config_change(stored_config, config)?;
+                let payload_changed = config_change.payload_changed as i64;
+                let revision_changed = config_change.revision_changed as i64;
                 let payload = to_json(config, "global discovery source")?;
                 let run_interval_ms = input
                     .run_interval_ms
@@ -68,16 +79,32 @@ pub fn sync_global_discovery_sources(
                         source_json = CASE
                             WHEN jobs_global_discovery_sources.lease_expires_at_ms IS NULL
                               OR jobs_global_discovery_sources.lease_expires_at_ms <= ?6
-                            THEN excluded.source_json ELSE jobs_global_discovery_sources.source_json END,
+                            THEN CASE WHEN ?7 = 1
+                                THEN excluded.source_json
+                                ELSE jobs_global_discovery_sources.source_json END
+                            ELSE jobs_global_discovery_sources.source_json END,
                         status = 'active',
                         run_interval_ms = excluded.run_interval_ms,
                         next_run_at_ms = CASE
                             WHEN (jobs_global_discovery_sources.lease_expires_at_ms IS NULL
                                OR jobs_global_discovery_sources.lease_expires_at_ms <= ?6)
-                              AND jobs_global_discovery_sources.source_json <> excluded.source_json
+                              AND (?8 = 1 OR jobs_global_discovery_sources.status <> 'active')
                             THEN ?6 ELSE jobs_global_discovery_sources.next_run_at_ms END,
-                        updated_at_ms = ?6",
-                    params![id, provider, source_key, payload, run_interval_ms, now],
+                        updated_at_ms = CASE
+                            WHEN ?7 = 1
+                              OR jobs_global_discovery_sources.status <> 'active'
+                              OR jobs_global_discovery_sources.run_interval_ms <> excluded.run_interval_ms
+                            THEN ?6 ELSE jobs_global_discovery_sources.updated_at_ms END",
+                    params![
+                        id,
+                        provider,
+                        source_key,
+                        payload,
+                        run_interval_ms,
+                        now,
+                        payload_changed,
+                        revision_changed
+                    ],
                 )?;
             }
             let retained = normalized
@@ -112,6 +139,14 @@ pub fn sync_global_discovery_sources(
             for (id, input, config) in &normalized {
                 let provider = input.provider.trim().to_ascii_lowercase();
                 let source_key = input.source_key.trim().to_ascii_lowercase();
+                let stored_config = tx
+                    .query_opt(
+                        "SELECT source_json FROM jobs_global_discovery_sources
+                          WHERE provider = $1 AND source_key = $2 FOR UPDATE",
+                        &[&provider, &source_key],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                let config_change = global_source_config_change(stored_config, config)?;
                 let payload = to_json(config, "global discovery source")?;
                 let run_interval_ms = input
                     .run_interval_ms
@@ -125,16 +160,32 @@ pub fn sync_global_discovery_sources(
                         source_json = CASE
                             WHEN jobs_global_discovery_sources.lease_expires_at_ms IS NULL
                               OR jobs_global_discovery_sources.lease_expires_at_ms <= $6
-                            THEN excluded.source_json ELSE jobs_global_discovery_sources.source_json END,
+                            THEN CASE WHEN $7
+                                THEN excluded.source_json
+                                ELSE jobs_global_discovery_sources.source_json END
+                            ELSE jobs_global_discovery_sources.source_json END,
                         status = 'active',
                         run_interval_ms = excluded.run_interval_ms,
                         next_run_at_ms = CASE
                             WHEN (jobs_global_discovery_sources.lease_expires_at_ms IS NULL
                                OR jobs_global_discovery_sources.lease_expires_at_ms <= $6)
-                              AND jobs_global_discovery_sources.source_json <> excluded.source_json
+                              AND ($8 OR jobs_global_discovery_sources.status <> 'active')
                             THEN $6 ELSE jobs_global_discovery_sources.next_run_at_ms END,
-                        updated_at_ms = $6",
-                    &[&id, &provider, &source_key, &payload, &run_interval_ms, &now],
+                        updated_at_ms = CASE
+                            WHEN $7
+                              OR jobs_global_discovery_sources.status <> 'active'
+                              OR jobs_global_discovery_sources.run_interval_ms <> excluded.run_interval_ms
+                            THEN $6 ELSE jobs_global_discovery_sources.updated_at_ms END",
+                    &[
+                        &id,
+                        &provider,
+                        &source_key,
+                        &payload,
+                        &run_interval_ms,
+                        &now,
+                        &config_change.payload_changed,
+                        &config_change.revision_changed,
+                    ],
                 )?;
             }
             let retained = normalized
@@ -161,6 +212,37 @@ pub fn sync_global_discovery_sources(
             list_global_discovery_sources(pool)
         }
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GlobalSourceConfigChange {
+    payload_changed: bool,
+    revision_changed: bool,
+}
+
+fn global_source_config_change(
+    stored: Option<String>,
+    incoming: &Value,
+) -> Result<GlobalSourceConfigChange> {
+    let Some(stored) = stored else {
+        return Ok(GlobalSourceConfigChange {
+            payload_changed: true,
+            revision_changed: true,
+        });
+    };
+    let existing: Value = parse_json(stored, "global discovery source")?;
+    Ok(GlobalSourceConfigChange {
+        payload_changed: existing != *incoming,
+        revision_changed: global_source_revision(&existing) != global_source_revision(incoming),
+    })
+}
+
+fn global_source_revision(config: &Value) -> (&Value, &Value, &Value) {
+    (
+        &config["sourceFamily"],
+        &config["artifactSha256"],
+        &config["expectedRows"],
+    )
 }
 
 pub fn list_global_discovery_sources(pool: &DbPool) -> Result<Vec<GlobalDiscoverySource>> {
@@ -839,8 +921,11 @@ fn normalize_global_candidate(
     };
     let canonical_key = canonical_job_key(&posting);
     let candidate_id = format!("global-candidate-{}", &canonical_key[..32]);
-    let candidate_json = to_json(&normalized, "global job candidate")?;
-    let content_hash = hex::encode(Sha256::digest(candidate_json.as_bytes()));
+    let candidate_plaintext =
+        serde_json::to_string(&normalized).context("serialize global job candidate")?;
+    let content_hash = hex::encode(Sha256::digest(candidate_plaintext.as_bytes()));
+    let candidate_json =
+        encrypt_payload(&candidate_plaintext).context("encrypt global job candidate")?;
     let role_family = infer_role_family(&title);
     Ok(NormalizedGlobalCandidate {
         external_id,
@@ -923,20 +1008,30 @@ fn upsert_global_candidate_sqlite(
 ) -> Result<()> {
     tx.execute(
         "INSERT INTO jobs_global_candidates (
-            id, canonical_key, candidate_json, company, title, location, workplace,
+            id, canonical_key, candidate_json, content_hash, company, title, location, workplace,
             canonical_url, role_family, posted_at_ms, availability_status,
             first_seen_at_ms, last_seen_at_ms, updated_at_ms
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'unknown', ?11, ?11, ?11)
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'unknown',
+                   ?12, ?12, ?12)
          ON CONFLICT(canonical_key) DO UPDATE SET
-            candidate_json = excluded.candidate_json, company = excluded.company,
+            candidate_json = excluded.candidate_json, content_hash = excluded.content_hash,
+            company = excluded.company,
             title = excluded.title, location = excluded.location, workplace = excluded.workplace,
             canonical_url = excluded.canonical_url, role_family = excluded.role_family,
             posted_at_ms = excluded.posted_at_ms, availability_status = 'unknown',
-            last_seen_at_ms = excluded.last_seen_at_ms, updated_at_ms = excluded.updated_at_ms",
+            last_seen_at_ms = excluded.last_seen_at_ms, updated_at_ms = excluded.updated_at_ms,
+            archive_state = 'hot', archive_storage_key = NULL, archive_sha256 = NULL,
+            archive_size_bytes = NULL, archived_at_ms = NULL, archive_attempt_count = 0,
+            archive_next_attempt_at_ms = 0, archive_lease_owner = NULL,
+            archive_lease_expires_at_ms = NULL
+         WHERE jobs_global_candidates.content_hash <> excluded.content_hash
+            OR jobs_global_candidates.availability_status = 'expired'
+            OR jobs_global_candidates.archive_state <> 'hot'",
         params![
             candidate.candidate_id,
             candidate.canonical_key,
             candidate.candidate_json,
+            candidate.content_hash,
             candidate.company,
             candidate.title,
             candidate.location,
@@ -974,22 +1069,40 @@ fn upsert_global_candidate_postgres(
     now: i64,
 ) -> Result<()> {
     let row = tx.query_one(
-        "INSERT INTO jobs_global_candidates (
-            id, canonical_key, candidate_json, company, title, location, workplace,
-            canonical_url, role_family, posted_at_ms, availability_status,
-            first_seen_at_ms, last_seen_at_ms, updated_at_ms
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'unknown', $11, $11, $11)
-         ON CONFLICT(canonical_key) DO UPDATE SET
-            candidate_json = excluded.candidate_json, company = excluded.company,
-            title = excluded.title, location = excluded.location, workplace = excluded.workplace,
-            canonical_url = excluded.canonical_url, role_family = excluded.role_family,
-            posted_at_ms = excluded.posted_at_ms, availability_status = 'unknown',
-            last_seen_at_ms = excluded.last_seen_at_ms, updated_at_ms = excluded.updated_at_ms
-         RETURNING id",
+        "WITH upserted AS (
+            INSERT INTO jobs_global_candidates (
+                id, canonical_key, candidate_json, content_hash, company, title, location,
+                workplace, canonical_url, role_family, posted_at_ms, availability_status,
+                first_seen_at_ms, last_seen_at_ms, updated_at_ms
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'unknown',
+                       $12, $12, $12)
+             ON CONFLICT(canonical_key) DO UPDATE SET
+                candidate_json = excluded.candidate_json,
+                content_hash = excluded.content_hash,
+                company = excluded.company, title = excluded.title,
+                location = excluded.location, workplace = excluded.workplace,
+                canonical_url = excluded.canonical_url, role_family = excluded.role_family,
+                posted_at_ms = excluded.posted_at_ms, availability_status = 'unknown',
+                last_seen_at_ms = excluded.last_seen_at_ms,
+                updated_at_ms = excluded.updated_at_ms,
+                archive_state = 'hot', archive_storage_key = NULL, archive_sha256 = NULL,
+                archive_size_bytes = NULL, archived_at_ms = NULL, archive_attempt_count = 0,
+                archive_next_attempt_at_ms = 0, archive_lease_owner = NULL,
+                archive_lease_expires_at_ms = NULL
+             WHERE jobs_global_candidates.content_hash IS DISTINCT FROM excluded.content_hash
+                OR jobs_global_candidates.availability_status = 'expired'
+                OR jobs_global_candidates.archive_state <> 'hot'
+             RETURNING id
+         )
+         SELECT id FROM upserted
+         UNION ALL
+         SELECT id FROM jobs_global_candidates WHERE canonical_key = $2
+         LIMIT 1",
         &[
             &candidate.candidate_id,
             &candidate.canonical_key,
             &candidate.candidate_json,
+            &candidate.content_hash,
             &candidate.company,
             &candidate.title,
             &candidate.location,

@@ -9,9 +9,15 @@ under `docs/release/`.
 
 - Linked the Bluey landing, account, download, and policy headers to Bluey Jobs
   with a compact, accessible new-tab action across desktop and mobile layouts.
+- Added an opt-in, verified R2 cold-storage lifecycle for expired, unreferenced
+  global job candidates. PostgreSQL drops the heavy candidate body only after
+  object-store read-back matches the exact bytes and SHA-256 written.
 
 ### Changed
 
+- Made global discovery refreshes semantic and candidate writes
+  content-addressed, so unchanged manifests preserve their completed schedule
+  and unchanged encrypted job payloads no longer rewrite canonical rows.
 - Required the local `$bluey-ops` operating-memory preflight across Bluey agent
   entry points, work templates, and runbooks, with CI coverage for future docs.
 - Replaced the landing-page overlay mockup with a faithful, responsive preview

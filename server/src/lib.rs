@@ -22,6 +22,7 @@ pub mod auth;
 pub mod billing;
 pub mod config;
 pub mod db;
+pub mod jobs_global_archive;
 pub mod jobs_mailbox_sync;
 pub mod jobs_resume_template;
 pub mod mail;

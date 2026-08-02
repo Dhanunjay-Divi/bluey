@@ -1599,6 +1599,65 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    // Keep historical SQLite migrations immutable. Additive columns used by
+    // the global-candidate cold-storage lifecycle are applied after replay.
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "content_hash",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_state",
+        "TEXT NOT NULL DEFAULT 'hot'",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_storage_key",
+        "TEXT",
+    )?;
+    ensure_column(&conn, "jobs_global_candidates", "archive_sha256", "TEXT")?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_size_bytes",
+        "INTEGER",
+    )?;
+    ensure_column(&conn, "jobs_global_candidates", "archived_at_ms", "INTEGER")?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_attempt_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_next_attempt_at_ms",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_lease_owner",
+        "TEXT",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_global_candidates",
+        "archive_lease_expires_at_ms",
+        "INTEGER",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_global_candidates_archive_due
+             ON jobs_global_candidates(
+                 archive_state, availability_status, updated_at_ms,
+                 archive_next_attempt_at_ms
+             );",
+    )?;
     ensure_column(
         &conn,
         "jobs_global_ingestion_runs",
@@ -1956,6 +2015,8 @@ const POSTGRES_JOBS_MAILBOX_SYNC: &str =
     include_str!("../../../infra/postgres/server-runtime/015_jobs_mailbox_sync.sql");
 const POSTGRES_JOBS_GLOBAL_INGESTION_QUARANTINE: &str =
     include_str!("../../../infra/postgres/server-runtime/016_jobs_global_ingestion_quarantine.sql");
+const POSTGRES_JOBS_GLOBAL_CANDIDATE_ARCHIVE: &str =
+    include_str!("../../../infra/postgres/server-runtime/017_jobs_global_candidate_archive.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2008,6 +2069,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "016_jobs_global_ingestion_quarantine.sql",
         POSTGRES_JOBS_GLOBAL_INGESTION_QUARANTINE,
+    ),
+    (
+        "017_jobs_global_candidate_archive.sql",
+        POSTGRES_JOBS_GLOBAL_CANDIDATE_ARCHIVE,
     ),
 ];
 
