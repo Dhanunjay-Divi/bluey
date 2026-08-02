@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added fail-closed, application-identity-scoped Bluey Browser profiles with
+  opaque server-compatible profile IDs, collision detection, path confinement,
+  and upgrade-compatible profile directories.
 - Added encrypted, account-scoped communication drafts for reviewed recruiter
   replies and interview calendar actions, with explicit approval, idempotency,
   mailbox binding, fenced worker leases, and non-retryable ambiguous outcomes.
