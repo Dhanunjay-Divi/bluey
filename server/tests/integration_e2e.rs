@@ -838,6 +838,74 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
     (account.id, application.id, run_id, browser_profile_id)
 }
 
+#[tokio::test]
+#[serial]
+async fn jobs_customer_routes_cannot_forge_submission_evidence_or_submitted_state() {
+    let harness = boot_harness().await;
+    let (account_id, application_id, _, _) = setup_execution_lease_run(&harness).await;
+    let auth = login(
+        &harness,
+        "jobs-execution-lease@example.com",
+        "valid-password-123",
+    )
+    .await;
+    let access_token = auth["access_token"].as_str().unwrap();
+
+    let evidence_write = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/applications/{application_id}/evidence"))
+                .header("authorization", format!("Bearer {access_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "kind": "confirmation",
+                        "label": "Forged confirmation",
+                        "storage_key": "forged/confirmation.png",
+                        "sha256": "0".repeat(64),
+                        "media_type": "image/png"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(evidence_write.status(), StatusCode::METHOD_NOT_ALLOWED);
+
+    let submitted_write = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::patch(format!("/api/jobs/applications/{application_id}"))
+                .header("authorization", format!("Bearer {access_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "state": "submitted",
+                        "submission_mode": "auto_submit"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted_write.status(), StatusCode::CONFLICT);
+
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(application.state, "submitted");
+    assert!(application.submitted_at_ms.is_none());
+    assert!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .is_empty()
+    );
+}
+
 fn valid_receipt_pdf() -> Vec<u8> {
     b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nstartxref\n0\n%%EOF\n".to_vec()
 }

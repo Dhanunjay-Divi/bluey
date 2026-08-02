@@ -392,7 +392,6 @@ export default function App() {
           } : current);
         }
       } else {
-        if (state === "submitted") await commitApplication(application);
         updated = await jobsApi.updateApplication(application.id, state, application.submission_mode);
       }
     }
@@ -402,7 +401,7 @@ export default function App() {
         : current,
     );
     setToast(state === "queued" ? "Application queued." : "Application updated.");
-  }, [commitApplication]);
+  }, []);
 
   const loadResumeVersion = useCallback(
     async (id: string) => {

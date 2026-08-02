@@ -3441,7 +3441,7 @@ mod tests {
     }
 
     #[test]
-    fn submitted_applications_require_exact_resume_and_confirmation_evidence() {
+    fn submitted_applications_require_verified_runner_finalization() {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
         save_profile(&pool, "acct-jobs", &profile).unwrap();
@@ -3462,10 +3462,6 @@ mod tests {
                 .unwrap();
         update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap();
         update_application(&pool, "acct-jobs", &application.id, "running", None).unwrap();
-
-        let missing =
-            update_application(&pool, "acct-jobs", &application.id, "submitted", None).unwrap_err();
-        assert!(missing.to_string().contains("exact resume"));
 
         let resume_evidence = ApplicationEvidence {
             id: "resume-evidence".to_string(),
@@ -3492,10 +3488,6 @@ mod tests {
                 .count(),
             1
         );
-        assert!(
-            update_application(&pool, "acct-jobs", &application.id, "submitted", None,).is_err()
-        );
-
         save_application_evidence(
             &pool,
             "acct-jobs",
@@ -3519,10 +3511,18 @@ mod tests {
             },
         )
         .unwrap();
-        let submitted = update_application(&pool, "acct-jobs", &application.id, "submitted", None)
+        let error =
+            update_application(&pool, "acct-jobs", &application.id, "submitted", None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("only a verified runner receipt can finalize")
+        );
+        let unchanged = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
-        assert_eq!(submitted.state, "submitted");
+        assert_eq!(unchanged.state, "running");
+        assert!(unchanged.submitted_at_ms.is_none());
     }
 
     #[test]
@@ -3945,6 +3945,158 @@ mod tests {
         assert!(first.newly_metered);
         assert!(!second.newly_metered);
         assert_eq!(first.used_packets, second.used_packets);
+    }
+
+    #[test]
+    fn packet_commit_reuses_the_same_period_generation_allowance() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/same-period",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let generation_key = "generation-same-period";
+        let crate::db::jobs_generation::ResumeGenerationReservation::Start(generation) =
+            crate::db::jobs_generation::reserve(
+                &pool,
+                "acct-jobs",
+                &posting.id,
+                generation_key,
+            )
+            .unwrap()
+        else {
+            panic!("generation reservation must start")
+        };
+        assert_eq!(
+            crate::db::jobs_generation_allowance::reserve(
+                &pool,
+                "acct-jobs",
+                &posting.id,
+                generation_key,
+                &generation.reservation_token,
+            )
+            .unwrap(),
+            crate::db::jobs_generation_allowance::AllowanceReservation::Reserved
+        );
+
+        let committed = commit_packet(&pool, "acct-jobs", &application.id).unwrap();
+        assert!(committed.newly_metered);
+        assert!(committed.included);
+        assert_eq!(committed.amount_cents, 0);
+        assert_eq!(committed.used_packets, 1);
+
+        let (used_packets, allowance_status): (i64, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT e.used_packets, r.status
+                   FROM jobs_entitlements e
+                   JOIN jobs_generation_allowance_reservations r
+                     ON r.account_id = e.account_id
+                  WHERE e.account_id = ?1 AND r.job_id = ?2",
+                params!["acct-jobs", posting.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(used_packets, 1);
+        assert_eq!(allowance_status, "committed");
+    }
+
+    #[test]
+    fn packet_commit_after_period_rollover_counts_the_new_period_once() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/period-rollover",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &JobPreferences::default(),
+        )
+        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
+        let generation_key = "generation-before-rollover";
+        let crate::db::jobs_generation::ResumeGenerationReservation::Start(generation) =
+            crate::db::jobs_generation::reserve(
+                &pool,
+                "acct-jobs",
+                &posting.id,
+                generation_key,
+            )
+            .unwrap()
+        else {
+            panic!("generation reservation must start")
+        };
+        assert_eq!(
+            crate::db::jobs_generation_allowance::reserve(
+                &pool,
+                "acct-jobs",
+                &posting.id,
+                generation_key,
+                &generation.reservation_token,
+            )
+            .unwrap(),
+            crate::db::jobs_generation_allowance::AllowanceReservation::Reserved
+        );
+
+        let old_period: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT period_start_ms FROM jobs_entitlements WHERE account_id = ?1",
+                ["acct-jobs"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_entitlements
+                    SET used_packets = 0, period_start_ms = ?2, period_end_ms = ?3
+                  WHERE account_id = ?1",
+                params!["acct-jobs", old_period + 1, now_ms() + 60_000],
+            )
+            .unwrap();
+
+        let committed = commit_packet(&pool, "acct-jobs", &application.id).unwrap();
+        assert!(committed.newly_metered);
+        assert!(committed.included);
+        assert_eq!(committed.amount_cents, 0);
+        assert_eq!(committed.used_packets, 1);
+        let (used_packets, allowance_status): (i64, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT e.used_packets, r.status
+                   FROM jobs_entitlements e
+                   JOIN jobs_generation_allowance_reservations r
+                     ON r.account_id = e.account_id
+                  WHERE e.account_id = ?1 AND r.job_id = ?2",
+                params!["acct-jobs", posting.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(used_packets, 1);
+        assert_eq!(allowance_status, "committed");
     }
 
     #[test]

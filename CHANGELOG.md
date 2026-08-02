@@ -12,6 +12,10 @@ under `docs/release/`.
 
 ### Fixed
 
+- Made Bluey Jobs submission state and evidence runner-owned: customers can no
+  longer forge evidence or mark an application submitted, final receipts commit
+  atomically with the bound run and resume, browser writes are read back before
+  submission, and packet allowances no longer leak or cross billing periods.
 - Restored Rust 1.97 warning-as-error compatibility across Linux, macOS, and
   Windows builds by aligning platform-specific imports and helper functions
   with their actual compile targets.

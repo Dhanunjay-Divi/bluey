@@ -790,6 +790,63 @@ mod tests {
     }
 
     #[test]
+    fn failure_before_provider_exposure_releases_the_jobs_packet_slot() {
+        let (pool, account_id, job_id) = generation_pool_with_job();
+        let ResumeGenerationReservation::Start(generation) =
+            jobs_generation::reserve(&pool, &account_id, &job_id, "unspent-generation").unwrap()
+        else {
+            panic!("generation reservation must start")
+        };
+        assert_eq!(
+            jobs_generation_allowance::reserve(
+                &pool,
+                &account_id,
+                &job_id,
+                "unspent-generation",
+                &generation.reservation_token,
+            )
+            .unwrap(),
+            AllowanceReservation::Reserved
+        );
+
+        jobs_generation::fail(
+            &pool,
+            &account_id,
+            "unspent-generation",
+            &generation.reservation_token,
+            "validation_failed",
+        )
+        .unwrap();
+        assert!(
+            jobs_generation_allowance::release(
+                &pool,
+                &account_id,
+                &job_id,
+                "unspent-generation",
+                &generation.reservation_token,
+            )
+            .unwrap(),
+            "a generation that never reached a provider must release its packet slot"
+        );
+
+        let (used_packets, allowance_status): (i64, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT e.used_packets, r.status
+                   FROM jobs_entitlements e
+                   JOIN jobs_generation_allowance_reservations r
+                     ON r.account_id = e.account_id
+                  WHERE e.account_id = ?1 AND r.job_id = ?2",
+                rusqlite::params![account_id, job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(used_packets, 0);
+        assert_eq!(allowance_status, "released");
+    }
+
+    #[test]
     fn crossing_the_lease_ttl_cannot_commit_late_model_output() {
         let (pool, account_id, job_id) = generation_pool_with_job();
         let ResumeGenerationReservation::Start(first) =
