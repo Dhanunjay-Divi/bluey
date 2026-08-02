@@ -400,6 +400,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .kit-detail-section dl > div { padding-top: 7px; display: grid; gap: 2px; border-top: 1px solid var(--border); }
 .kit-detail-section dt { color: var(--text-soft); font-size: 10px; font-weight: 750; }
 .kit-detail-section dd { margin: 0; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.cover-letter-preview > p { margin-top: 9px; padding-top: 9px; border-top: 1px solid var(--border); white-space: pre-wrap; color: var(--text-soft); }
 .pause-section ul { margin: 9px 0 0; padding-left: 16px; display: grid; gap: 5px; color: var(--text-soft); font-size: 10px; line-height: 1.4; }
 .claim-note, .input-needed { padding: 11px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid color-mix(in srgb, var(--green) 35%, var(--border)); border-radius: 7px; background: var(--green-soft); color: var(--green); }
 .claim-note span, .input-needed div { display: grid; gap: 3px; }

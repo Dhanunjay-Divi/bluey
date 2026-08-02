@@ -1392,14 +1392,16 @@ pub async fn prepare_application(
     let jobs_resume_generation::GeneratedResume {
         content,
         diff,
+        cover_letter,
         public_provenance,
     } = generated;
-    let (mut application, resume_version) = jobs::finalize_prepared_application(
+    let (mut application, resume_version) = jobs::finalize_prepared_application_kit(
         &state.pool,
         &account.id,
         &prepared,
         content,
         diff,
+        cover_letter,
         public_provenance,
     )
     .map_err(internal)?;

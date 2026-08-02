@@ -4882,12 +4882,15 @@ mod tests {
             "claims_added": 0,
         });
         let generation = content["provenance"]["resume_generation"].clone();
-        let (application, resume) = finalize_prepared_application(
+        let cover_letter =
+            "Dear Hiring Team,\n\nI built reliable systems.\n\nSincerely,\nCandidate".to_string();
+        let (application, resume) = finalize_prepared_application_kit(
             &pool,
             "acct-jobs",
             &prepared,
             content.clone(),
             baseline.diff.clone(),
+            cover_letter.clone(),
             generation,
         )
         .unwrap();
@@ -4898,6 +4901,11 @@ mod tests {
         );
         assert_eq!(resume.version_no, 1);
         assert_eq!(resume.content, content);
+        assert_eq!(application.cover_letter, cover_letter);
+        assert_eq!(
+            application.receipt.pointer("/cover_letter_status"),
+            Some(&json!("included"))
+        );
         assert_eq!(
             application.receipt.pointer("/resume_generation/kind"),
             Some(&json!("model"))

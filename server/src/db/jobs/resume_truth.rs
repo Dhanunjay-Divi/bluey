@@ -4,26 +4,7 @@ pub(crate) fn validate_resume_rewrite_claims(
     source: &str,
     rewritten: &str,
 ) -> Result<()> {
-    let source_anchors = protected_resume_claim_anchors(profile, source);
-    let rewrite_anchors = protected_resume_claim_anchors(profile, rewritten);
-    let unsupported = rewrite_anchors
-        .difference(&source_anchors)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unsupported.is_empty() {
-        anyhow::bail!(
-            "employment rewrite introduced unsupported protected claims: {}",
-            unsupported.join(", ")
-        )
-    }
-
-    for family in resume_claim_verb_families() {
-        if resume_contains_any_word(rewritten, family)
-            && !resume_contains_any_word(source, family)
-        {
-            anyhow::bail!("employment rewrite strengthened a claim beyond its source evidence")
-        }
-    }
+    validate_grounded_application_text(profile, &[source], rewritten)?;
 
     let rewritten_search = normalize_resume_search_text(rewritten);
     let source_search = normalize_resume_search_text(source);
@@ -45,13 +26,60 @@ pub(crate) fn validate_resume_rewrite_claims(
             }
         }
     }
+    Ok(())
+}
 
-    let source_words = meaningful_resume_words(source);
-    let rewrite_words = meaningful_resume_words(rewritten);
-    if rewrite_words.len() >= 4 {
-        let overlap = rewrite_words.intersection(&source_words).count();
-        if overlap * 100 < rewrite_words.len() * 20 {
-            anyhow::bail!("employment rewrite is not sufficiently grounded in its source bullets")
+pub(crate) fn validate_grounded_application_text(
+    profile: &CareerProfile,
+    sources: &[&str],
+    generated: &str,
+) -> Result<()> {
+    let source = sources.join(" ");
+    let source_anchors = protected_resume_claim_anchors(profile, &source);
+    let generated_anchors = protected_resume_claim_anchors(profile, generated);
+    let unsupported = generated_anchors
+        .difference(&source_anchors)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unsupported.is_empty() {
+        anyhow::bail!(
+            "generated application text introduced unsupported protected claims: {}",
+            unsupported.join(", ")
+        )
+    }
+
+    for family in resume_claim_verb_families() {
+        if resume_contains_any_word(generated, family)
+            && !resume_contains_any_word(&source, family)
+        {
+            anyhow::bail!("generated application text strengthened a claim beyond its evidence")
+        }
+    }
+
+    let generated_search = normalize_resume_search_text(generated);
+    let source_search = normalize_resume_search_text(&source);
+    for employment in &profile.employment {
+        for protected in [
+            &employment.company,
+            &employment.title,
+            &employment.location,
+        ] {
+            let phrase = normalize_resume_search_text(protected);
+            if phrase.len() >= 3
+                && resume_contains_normalized_phrase(&generated_search, &phrase)
+                && !resume_contains_normalized_phrase(&source_search, &phrase)
+            {
+                anyhow::bail!("generated application text introduced uncited employment evidence")
+            }
+        }
+    }
+
+    let source_words = meaningful_resume_words(&source);
+    let generated_words = meaningful_resume_words(generated);
+    if generated_words.len() >= 4 {
+        let overlap = generated_words.intersection(&source_words).count();
+        if overlap * 100 < generated_words.len() * 20 {
+            anyhow::bail!("generated application text is not sufficiently grounded in evidence")
         }
     }
     Ok(())

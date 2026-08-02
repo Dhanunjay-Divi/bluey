@@ -1,3 +1,4 @@
+const MAX_APPLICATION_COVER_LETTER_CHARS: usize = 4_000;
 
 pub fn list_applications(pool: &DbPool, account_id: &str) -> Result<Vec<JobApplication>> {
     crate::db::run_blocking_db(|| match pool {
@@ -400,7 +401,35 @@ pub fn finalize_prepared_application(
     diff: Value,
     generation: Value,
 ) -> Result<(JobApplication, ResumeVersion)> {
+    finalize_prepared_application_kit(
+        pool,
+        account_id,
+        prepared,
+        content,
+        diff,
+        String::new(),
+        generation,
+    )
+}
+
+pub fn finalize_prepared_application_kit(
+    pool: &DbPool,
+    account_id: &str,
+    prepared: &PreparedApplicationDraft,
+    content: Value,
+    diff: Value,
+    cover_letter: String,
+    generation: Value,
+) -> Result<(JobApplication, ResumeVersion)> {
+    let cover_letter = cover_letter.trim().to_string();
+    if cover_letter.chars().count() > MAX_APPLICATION_COVER_LETTER_CHARS {
+        anyhow::bail!("generated cover letter is too long")
+    }
+    if cover_letter.contains('\0') {
+        anyhow::bail!("generated cover letter contains invalid content")
+    }
     let mut application = prepared.application.clone();
+    application.cover_letter = cover_letter;
     let baseline = &prepared.baseline_resume;
     if application.state != "preparing" {
         anyhow::bail!("application is not waiting for resume generation")
@@ -558,6 +587,14 @@ pub fn finalize_prepared_application(
         serde_json::to_value(eligibility)?,
     );
     receipt.insert("resume_generation".to_string(), generation);
+    receipt.insert(
+        "cover_letter_status".to_string(),
+        json!(if application.cover_letter.is_empty() {
+            "not_included"
+        } else {
+            "included"
+        }),
+    );
     receipt.insert(
         "prepared_at_ms".to_string(),
         json!(application.updated_at_ms),

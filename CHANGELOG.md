@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added evidence-grounded, job-specific cover letters to managed Bluey Jobs
+  application kits, with cited Career Profile facts, server-owned target-role
+  framing, transactional persistence, and exact packet-review rendering.
 - Linked the Bluey landing, account, download, and policy headers to Bluey Jobs
   with a compact, accessible new-tab action across desktop and mobile layouts.
 - Added an opt-in, verified R2 cold-storage lifecycle for expired, unreferenced

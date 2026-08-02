@@ -317,6 +317,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="review-title"><div><p>PACKET REVIEW</p><h3>Application kit</h3></div><FileDiff size={20} /></div>
                 <ApplicationKitSummary application={selected} job={selectedJob} resume={selectedResume} />
                 <DiffList resume={selectedResume} />
+                <CoverLetterPreview coverLetter={selected.cover_letter} />
                 <FinalAnswers answers={selected.answers} />
                 <PauseReasons application={selected} job={selectedJob} intervention={selectedIntervention} />
                 <div className="claim-note"><CheckCircle2 size={17} /><span><b>No unsupported claims</b><small>{selectedResume?.claim_ids.length || 0} profile facts carry provenance into this version.</small></span></div>
@@ -421,6 +422,24 @@ function FinalAnswers({ answers }: { answers: Array<Record<string, unknown>> }) 
         const scope = answer.scope ? ` · ${titleCase(String(answer.scope))}` : "";
         return <div key={`${question}-${index}`}><dt>{question}</dt><dd>{value || "Awaiting your answer"}{scope}</dd></div>;
       })}</dl>
+    </section>
+  );
+}
+
+function CoverLetterPreview({ coverLetter }: { coverLetter: string }) {
+  const content = coverLetter.trim();
+  if (!content) {
+    return (
+      <div className="kit-section-empty">
+        <b>Cover letter</b>
+        <span>This application does not include a cover letter.</span>
+      </div>
+    );
+  }
+  return (
+    <section className="kit-detail-section cover-letter-preview">
+      <div><p>COVER LETTER</p><h4>What Bluey will submit</h4></div>
+      <p>{content}</p>
     </section>
   );
 }

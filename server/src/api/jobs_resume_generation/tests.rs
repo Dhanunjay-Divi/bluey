@@ -43,6 +43,7 @@ mod tests {
             }],
             employment_highlight_rewrites: Vec::new(),
             project_order: vec![0],
+            cover_letter: None,
         }
     }
 
@@ -157,7 +158,7 @@ mod tests {
             checksum: "checksum".into(),
             created_at_ms: 1,
         };
-        let generated = materialize(&profile, &baseline, &plan, "model").unwrap();
+        let generated = materialize(&profile, &posting(), &baseline, &plan, "model").unwrap();
         assert_eq!(
             generated.content["summary"],
             "Increased revenue for the platform. • Reduced latency by 30 percent."
@@ -249,7 +250,8 @@ mod tests {
             checksum: "checksum".into(),
             created_at_ms: 1,
         };
-        let generated = materialize(&profile, &baseline, &valid_plan(), "model").unwrap();
+        let generated =
+            materialize(&profile, &posting(), &baseline, &valid_plan(), "model").unwrap();
         assert_eq!(
             generated.content["employment"][0]["highlights"][0],
             "Reduced deployment time by 30 percent."
@@ -259,6 +261,99 @@ mod tests {
             "model"
         );
         assert_eq!(generated.diff["claims_added"], json!([]));
+        assert!(generated.cover_letter.is_empty());
+        assert_eq!(
+            generated.public_provenance["cover_letter_included"],
+            json!(false)
+        );
+    }
+
+    #[test]
+    fn materializes_only_evidence_grounded_cover_letter_paragraphs() {
+        let mut profile = profile();
+        profile.full_name = "Candidate Name".into();
+        let baseline = ResumeVersion {
+            id: "resume-1".into(),
+            job_id: "job-1".into(),
+            version_no: 1,
+            mode: "factual".into(),
+            content: json!({"provenance": {}}),
+            diff: json!({}),
+            claim_ids: Vec::new(),
+            checksum: "checksum".into(),
+            created_at_ms: 1,
+        };
+        let mut plan = valid_plan();
+        plan.cover_letter = Some(CoverLetterPlan {
+            paragraphs: vec![CoverLetterParagraph {
+                source_evidence_ids: vec!["profile:summary".into()],
+                text: "I built reliable distributed systems for healthcare teams.".into(),
+            }],
+        });
+
+        let generated = materialize(&profile, &posting(), &baseline, &plan, "model").unwrap();
+
+        assert!(generated
+            .cover_letter
+            .contains("I am applying for the Engineer role at Example."));
+        assert!(generated
+            .cover_letter
+            .contains("I built reliable distributed systems for healthcare teams."));
+        assert!(generated.cover_letter.ends_with("Sincerely,\nCandidate Name"));
+        assert_eq!(
+            generated.public_provenance["cover_letter_included"],
+            json!(true)
+        );
+        assert_eq!(
+            generated.public_provenance["cover_letter_sources"]["0"],
+            json!(["profile:summary"])
+        );
+    }
+
+    #[test]
+    fn rejects_cover_letter_with_unknown_or_inflated_evidence() {
+        let profile = profile();
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let mut unknown = valid_plan();
+        unknown.cover_letter = Some(CoverLetterPlan {
+            paragraphs: vec![CoverLetterParagraph {
+                source_evidence_ids: vec!["profile:missing".into()],
+                text: "I built reliable distributed systems for healthcare teams.".into(),
+            }],
+        });
+        assert!(validate_plan(&profile, &catalog, unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown cover letter evidence"));
+
+        let mut unsupported_metric = valid_plan();
+        unsupported_metric.cover_letter = Some(CoverLetterPlan {
+            paragraphs: vec![CoverLetterParagraph {
+                source_evidence_ids: vec!["profile:summary".into()],
+                text:
+                    "I built reliable distributed systems for healthcare teams with 99 percent uptime."
+                        .into(),
+            }],
+        });
+        assert!(validate_plan(&profile, &catalog, unsupported_metric)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported protected claims"));
+
+        let mut profile = profile;
+        profile.summary = "Supported reliable distributed systems for healthcare teams.".into();
+        let catalog = EvidenceCatalog::from_profile(&profile);
+        let mut stronger_claim = valid_plan();
+        stronger_claim.cover_letter = Some(CoverLetterPlan {
+            paragraphs: vec![CoverLetterParagraph {
+                source_evidence_ids: vec!["profile:summary".into()],
+                text: "I led reliable distributed systems for healthcare teams.".into(),
+            }],
+        });
+        assert!(validate_plan(&profile, &catalog, stronger_claim)
+            .unwrap_err()
+            .to_string()
+            .contains("strengthened"));
     }
 
     #[test]
@@ -292,7 +387,7 @@ mod tests {
             text: "Engineered reliable distributed systems.".into(),
         }];
 
-        let generated = materialize(&profile, &baseline, &plan, "model").unwrap();
+        let generated = materialize(&profile, &posting(), &baseline, &plan, "model").unwrap();
         assert_eq!(
             generated.content["employment"][0]["company"],
             "Example Health"
@@ -478,6 +573,7 @@ mod tests {
                 text: "Engineered reliable distributed systems.".into(),
             }],
             project_order: vec![1, 0],
+            cover_letter: None,
         };
         let locked =
             lock_plan_to_source_layout(&profile, normalize_plan(&profile, &catalog, requested));
@@ -550,9 +646,11 @@ mod tests {
                 text: "Engineered reliable distributed systems.".into(),
             }],
             project_order: vec![1, 0],
+            cover_letter: None,
         };
 
-        let generated = materialize(&profile, &baseline, &requested, "model").unwrap();
+        let generated =
+            materialize(&profile, &posting(), &baseline, &requested, "model").unwrap();
 
         assert_eq!(generated.content["headline"], "Original Word headline");
         assert_eq!(generated.content["summary"], "Original Word summary");
