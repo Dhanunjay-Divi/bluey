@@ -12,11 +12,15 @@
 
 use crate::StealthError;
 
+static AUMID_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Set the App User Model ID for the current process.
 pub(crate) fn set_app_user_model_id(aumid: &str) -> Result<(), StealthError> {
     use windows::core::HSTRING;
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 
+    // The AppUserModelID is process-wide and the Shell setter is not safe to race.
+    let _guard = AUMID_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     let wide = HSTRING::from(aumid);
     unsafe {
         SetCurrentProcessExplicitAppUserModelID(&wide).map_err(|e| {
@@ -75,6 +79,24 @@ mod tests {
     fn set_aumid_valid() {
         let result = set_app_user_model_id("com.bluey.cue.terminal");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn concurrent_aumid_updates_are_serialized() {
+        let workers = (0..8)
+            .map(|index| {
+                std::thread::spawn(move || {
+                    let aumid = format!("com.bluey.cue.test{index}");
+                    for _ in 0..8 {
+                        set_app_user_model_id(&aumid).expect("AppUserModelID update failed");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker.join().expect("AppUserModelID worker panicked");
+        }
     }
 
     #[test]
