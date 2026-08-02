@@ -20,6 +20,8 @@ under `docs/release/`.
 
 ### Fixed
 
+- Serialized Windows AppUserModelID updates so concurrent disguise reassertion
+  cannot corrupt the `cue-stealth` process heap during normal use or tests.
 - Made Bluey Jobs submission state and evidence runner-owned: customers can no
   longer forge evidence or mark an application submitted, final receipts commit
   atomically with the bound run and resume, browser writes are read back before
