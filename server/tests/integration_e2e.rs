@@ -1500,6 +1500,165 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
 
 #[tokio::test]
 #[serial]
+async fn jobs_checkpoint_reconciliation_route_is_authenticated_and_token_fenced() {
+    const WORKER_TOKEN: &str = "jobs-checkpoint-reconciliation-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness).await;
+    let owner_id = "checkpoint-integration-worker";
+    let claim = jobs::claim_execution_lease(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        owner_id,
+    )
+    .unwrap();
+    let path = format!("/api/jobs/internal/execution-leases/{run_id}/reconcile-checkpoint");
+    let body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "owner_id": owner_id,
+        "lease_token": claim.lease_token,
+        "fence": claim.fence,
+        "checkpoint_version": 2,
+        "checkpoint_phase": "prepared"
+    });
+
+    let unauthorized = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(&path)
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let mut missing_token = body.clone();
+    missing_token.as_object_mut().unwrap().remove("lease_token");
+    let missing_token_response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(&path)
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&missing_token).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_token_response.status(), StatusCode::BAD_REQUEST);
+
+    let mut forged = body.clone();
+    forged["lease_token"] = json!("forged-checkpoint-token");
+    let forged_response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(&path)
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&forged).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(forged_response.status(), StatusCode::CONFLICT);
+
+    for _ in 0..2 {
+        let released = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(&path)
+                    .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = released.status();
+        let bytes = axum::body::to_bytes(released.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "checkpoint reconciliation failed: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["phase"], "released");
+    }
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.state, "failed");
+    assert!(application.submitted_at_ms.is_none());
+
+    let unsafe_harness = boot_harness().await;
+    let (unsafe_account_id, unsafe_application_id, unsafe_run_id, unsafe_browser_profile_id) =
+        setup_execution_lease_run(&unsafe_harness).await;
+    let unsafe_claim = jobs::claim_execution_lease(
+        &unsafe_harness.pool,
+        &unsafe_account_id,
+        &unsafe_application_id,
+        &unsafe_run_id,
+        &unsafe_browser_profile_id,
+        owner_id,
+    )
+    .unwrap();
+    let unsafe_path =
+        format!("/api/jobs/internal/execution-leases/{unsafe_run_id}/reconcile-checkpoint");
+    let unsafe_body = json!({
+        "account_id": unsafe_account_id,
+        "application_id": unsafe_application_id,
+        "owner_id": owner_id,
+        "lease_token": unsafe_claim.lease_token,
+        "fence": unsafe_claim.fence,
+        "checkpoint_version": 2,
+        "checkpoint_phase": "final_submit_started"
+    });
+    let uncertain = unsafe_harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(&unsafe_path)
+                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&unsafe_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(uncertain.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(uncertain.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["phase"], "side_effect_unknown");
+    let application = jobs::get_application(
+        &unsafe_harness.pool,
+        &unsafe_account_id,
+        &unsafe_application_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(application.state, "side_effect_unknown");
+    assert!(application.submitted_at_ms.is_none());
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+#[tokio::test]
+#[serial]
 async fn jobs_cloud_receipt_requires_an_exact_terminal_submitted_lease_binding() {
     const WORKER_TOKEN: &str = "jobs-receipt-lease-test-token";
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);

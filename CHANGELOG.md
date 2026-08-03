@@ -59,6 +59,11 @@ under `docs/release/`.
 
 ### Fixed
 
+- Made cloud-runner restart recovery durable and fail closed: checkpoint files
+  now bind to the exact account, application, run, browser profile, lease owner,
+  fence, and v2 lease token; safe pre-submit work releases authority atomically,
+  while any possibly activated Submit remains `side_effect_unknown` unless the
+  server already holds a complete trusted receipt and evidence bundle.
 - Verified generated DOCX application kits before release: Bluey now preserves
   source package order, compression, permissions, timestamps, relationships,
   styles, numbering, headers, footers, and media; rejects duplicate or invalid

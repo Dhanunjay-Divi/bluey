@@ -235,6 +235,10 @@ pub fn worker_router() -> Router<AppState> {
             post(worker_finish_execution_lease),
         )
         .route(
+            "/api/jobs/internal/execution-leases/:run_id/reconcile-checkpoint",
+            post(worker_reconcile_execution_checkpoint),
+        )
+        .route(
             "/api/jobs/internal/discovery/lease",
             post(worker_discovery_lease),
         )
@@ -3731,6 +3735,18 @@ struct WorkerFinishExecutionRequest {
     outcome: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkerCheckpointReconciliationRequest {
+    account_id: String,
+    application_id: String,
+    owner_id: String,
+    #[serde(default)]
+    lease_token: Option<String>,
+    fence: i64,
+    checkpoint_version: i64,
+    checkpoint_phase: String,
+}
+
 async fn worker_claim_execution_lease(
     State(state): State<AppState>,
     Json(req): Json<WorkerExecutionLeaseClaimRequest>,
@@ -3802,6 +3818,26 @@ async fn worker_finish_execution_lease(
         &req.outcome,
     )
     .map(|()| StatusCode::NO_CONTENT)
+    .map_err(execution_lease_error)
+}
+
+async fn worker_reconcile_execution_checkpoint(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerCheckpointReconciliationRequest>,
+) -> Result<Json<jobs::ExecutionLeaseRecord>, ApiError> {
+    jobs::reconcile_execution_lease_checkpoint(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.owner_id,
+        req.lease_token.as_deref(),
+        req.fence,
+        req.checkpoint_version,
+        &req.checkpoint_phase,
+    )
+    .map(Json)
     .map_err(execution_lease_error)
 }
 

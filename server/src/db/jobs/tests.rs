@@ -451,6 +451,23 @@ mod tests {
         let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
             .unwrap()
             .unwrap();
+        let now = now_ms();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+                    id, account_id, application_id, company_key, period_key,
+                    runner, status, reserved_at_ms, updated_at_ms
+                 ) VALUES (?1, 'acct-jobs', ?2, ?3, 'test-period',
+                           'unassigned', 'reserved', ?4, ?4)",
+                params![
+                    format!("attempt-{}", application.id),
+                    application.id,
+                    format!("test-company-{suffix}"),
+                    now,
+                ],
+            )
+            .unwrap();
         let identity_id = application
             .receipt
             .pointer("/application_identity/id")
@@ -3867,6 +3884,17 @@ mod tests {
             "owner-one",
         )
         .unwrap();
+        let attempt_runner: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT runner FROM jobs_attempt_reservations
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![application.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(attempt_runner, "cloud");
         let stored_hash: String = pool
             .get()
             .unwrap()
@@ -3988,6 +4016,271 @@ mod tests {
             ),
             Err(ExecutionLeaseError::Conflict)
         ));
+    }
+
+    #[test]
+    fn execution_lease_requires_an_active_cloud_compatible_attempt() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "missing-attempt");
+        pool.get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_attempt_reservations
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![application.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            claim_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                "missing-attempt-worker",
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "local-attempt");
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_attempt_reservations SET runner = 'local'
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![application.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            claim_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                "local-attempt-worker",
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn safe_worker_checkpoint_releases_all_execution_authority_atomically() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "safe-checkpoint");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "cloud").unwrap();
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "safe-owner",
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let reconciled = reconcile_execution_lease_checkpoint(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                "safe-owner",
+                Some(&lease.lease_token),
+                lease.fence,
+                2,
+                "prepared",
+            )
+            .unwrap();
+            assert_eq!(reconciled.phase, "released");
+        }
+        assert!(matches!(
+            reconcile_execution_lease_checkpoint(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                "safe-owner",
+                Some(&lease.lease_token),
+                lease.fence,
+                2,
+                "needs_input",
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "failed");
+        assert_eq!(
+            stored.receipt.pointer("/cloud_recovery/status"),
+            Some(&json!("released"))
+        );
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == run_id)
+            .unwrap();
+        assert_eq!(session.status, "failed");
+        assert_eq!(session.current_step, "Browser run stopped before submission");
+        let attempt = list_attempt_reservations(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|attempt| attempt.application_id == application.id)
+            .unwrap();
+        assert_eq!(attempt.status, "released");
+    }
+
+    #[test]
+    fn unsafe_worker_checkpoint_never_invents_a_submitted_application() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "unsafe-checkpoint");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "cloud").unwrap();
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "unsafe-owner",
+        )
+        .unwrap();
+
+        for _ in 0..2 {
+            let reconciled = reconcile_execution_lease_checkpoint(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                "unsafe-owner",
+                Some(&lease.lease_token),
+                lease.fence,
+                2,
+                "final_submit_started",
+            )
+            .unwrap();
+            assert_eq!(reconciled.phase, "side_effect_unknown");
+        }
+
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "side_effect_unknown");
+        assert_eq!(stored.submitted_at_ms, None);
+        assert_eq!(
+            stored.receipt.pointer("/cloud_recovery/checkpoint_phase"),
+            Some(&json!("final_submit_started"))
+        );
+        assert!(list_application_evidence(&pool, "acct-jobs", Some(&application.id))
+            .unwrap()
+            .is_empty());
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == run_id)
+            .unwrap();
+        assert_eq!(session.status, "needs_input");
+        assert_eq!(session.takeover_url, None);
+        let attempt = list_attempt_reservations(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|attempt| attempt.application_id == application.id)
+            .unwrap();
+        assert_eq!(attempt.status, "side_effect_unknown");
+    }
+
+    #[test]
+    fn submitted_worker_lease_without_receipt_still_requires_reconciliation() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "submitted-no-receipt");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "cloud").unwrap();
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "submitted-owner",
+        )
+        .unwrap();
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+        )
+        .unwrap();
+        finish_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            "submitted",
+        )
+        .unwrap();
+
+        let reconciled = reconcile_execution_lease_checkpoint(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            "submitted-owner",
+            Some(&lease.lease_token),
+            lease.fence,
+            2,
+            "final_submit_activated",
+        )
+        .unwrap();
+        assert_eq!(reconciled.phase, "side_effect_unknown");
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "side_effect_unknown");
+        assert_eq!(stored.submitted_at_ms, None);
+    }
+
+    #[test]
+    fn checkpoint_reconciliation_rejects_wrong_token_and_v2_without_token() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "checkpoint-token");
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "token-owner",
+        )
+        .unwrap();
+
+        for token in [Some("wrong-token"), None] {
+            assert!(matches!(
+                reconcile_execution_lease_checkpoint(
+                    &pool,
+                    "acct-jobs",
+                    &application.id,
+                    &run_id,
+                    "token-owner",
+                    token,
+                    lease.fence,
+                    2,
+                    "prepared",
+                ),
+                Err(ExecutionLeaseError::InvalidRequest | ExecutionLeaseError::Conflict)
+            ));
+        }
     }
 
     #[test]

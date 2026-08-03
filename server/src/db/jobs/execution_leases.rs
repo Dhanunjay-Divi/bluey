@@ -325,6 +325,46 @@ fn postgres_next_execution_fence(
     current.checked_add(1).ok_or(ExecutionLeaseError::Conflict)
 }
 
+fn sqlite_bind_cloud_attempt(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    let updated = tx.execute(
+        "UPDATE jobs_attempt_reservations
+            SET runner = 'cloud', updated_at_ms = ?3
+          WHERE account_id = ?1 AND application_id = ?2
+            AND status IN ('reserved', 'running')
+            AND runner IN ('unassigned', 'cloud')",
+        params![account_id, application_id, now],
+    )?;
+    if updated != 1 {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
+fn postgres_bind_cloud_attempt(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    let updated = tx.execute(
+        "UPDATE jobs_attempt_reservations
+            SET runner = 'cloud', updated_at_ms = $3
+          WHERE account_id = $1 AND application_id = $2
+            AND status IN ('reserved', 'running')
+            AND runner IN ('unassigned', 'cloud')",
+        &[&account_id, &application_id, &now],
+    )?;
+    if updated != 1 {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
 pub fn claim_execution_lease(
     pool: &DbPool,
     account_id: &str,
@@ -355,6 +395,7 @@ pub fn claim_execution_lease(
             if browser_profile_id != supplied_browser_profile_id {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            sqlite_bind_cloud_attempt(&tx, account_id, application_id, now)?;
             let existing = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -457,6 +498,7 @@ pub fn claim_execution_lease(
             if browser_profile_id != supplied_browser_profile_id {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            postgres_bind_cloud_attempt(&mut tx, account_id, application_id, now)?;
             let existing = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -793,6 +835,369 @@ fn execution_finish_allowed(phase: &str, outcome: &str) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointRecoveryOutcome {
+    Released,
+    SideEffectUnknown,
+}
+
+impl CheckpointRecoveryOutcome {
+    fn lease_phase(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::SideEffectUnknown => "side_effect_unknown",
+        }
+    }
+
+    fn application_state(self) -> &'static str {
+        match self {
+            Self::Released => "failed",
+            Self::SideEffectUnknown => "side_effect_unknown",
+        }
+    }
+
+    fn browser_status(self) -> &'static str {
+        match self {
+            Self::Released => "failed",
+            Self::SideEffectUnknown => "needs_input",
+        }
+    }
+
+    fn browser_step(self) -> &'static str {
+        match self {
+            Self::Released => "Browser run stopped before submission",
+            Self::SideEffectUnknown => "Submission outcome needs reconciliation",
+        }
+    }
+
+    fn attempt_status(self) -> &'static str {
+        match self {
+            Self::Released => "released",
+            Self::SideEffectUnknown => "side_effect_unknown",
+        }
+    }
+}
+
+struct CheckpointReconciliationPlan {
+    outcome: CheckpointRecoveryOutcome,
+    application: JobApplication,
+    browser_session: BrowserSession,
+}
+
+struct CheckpointReconciliationRequest<'a> {
+    account_id: &'a str,
+    application_id: &'a str,
+    run_id: &'a str,
+    owner_id: &'a str,
+    lease_token: Option<&'a str>,
+    fence: i64,
+    checkpoint_version: i64,
+    checkpoint_phase: &'a str,
+}
+
+fn validate_checkpoint_reconciliation_request(
+    request: &CheckpointReconciliationRequest<'_>,
+) -> ExecutionLeaseResult<()> {
+    if !validate_execution_binding(request.account_id, 240)
+        || !validate_execution_binding(request.application_id, 240)
+        || !validate_execution_binding(request.run_id, 240)
+        || !validate_execution_binding(request.owner_id, 240)
+        || request.fence <= 0
+        || !matches!(request.checkpoint_version, 1 | 2)
+        || !matches!(
+            request.checkpoint_phase,
+            "prepared"
+                | "needs_input"
+                | "provider_review"
+                | "final_submit_started"
+                | "final_submit_activated"
+                | "side_effect_unknown"
+        )
+        || request
+            .lease_token
+            .is_some_and(|token| token.is_empty() || token.len() > 256)
+        || (request.checkpoint_version == 2 && request.lease_token.is_none())
+    {
+        return Err(ExecutionLeaseError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn checkpoint_recovery_outcome(
+    checkpoint_phase: &str,
+    lease_phase: &str,
+) -> ExecutionLeaseResult<CheckpointRecoveryOutcome> {
+    if matches!(
+        checkpoint_phase,
+        "final_submit_started" | "final_submit_activated" | "side_effect_unknown"
+    ) || matches!(
+        lease_phase,
+        "click_started" | "submitted" | "side_effect_unknown"
+    ) {
+        return Ok(CheckpointRecoveryOutcome::SideEffectUnknown);
+    }
+    if matches!(checkpoint_phase, "prepared" | "needs_input" | "provider_review")
+        && matches!(lease_phase, "prepared" | "failed" | "released")
+    {
+        return Ok(CheckpointRecoveryOutcome::Released);
+    }
+    Err(ExecutionLeaseError::Conflict)
+}
+
+fn trusted_submitted_application(application: &JobApplication, evidence_count: i64) -> bool {
+    application.state == "submitted"
+        && application.submitted_at_ms.is_some_and(|value| value > 0)
+        && application
+            .receipt
+            .get("_bluey_server_submission_fingerprint_v1")
+            .and_then(Value::as_str)
+            .is_some_and(|fingerprint| {
+                fingerprint.len() == 64
+                    && fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && evidence_count > 0
+}
+
+fn validate_checkpoint_lease_access(
+    lease: &StoredExecutionLease,
+    owner_id: &str,
+    lease_token: Option<&str>,
+    fence: i64,
+    checkpoint_version: i64,
+) -> ExecutionLeaseResult<()> {
+    let token_matches = match (checkpoint_version, lease_token) {
+        (1, None) => true,
+        (_, Some(token)) => execution_lease_token_matches(&lease.lease_token_sha256, token),
+        _ => false,
+    };
+    if lease.owner_id != owner_id || lease.fence != fence || !token_matches {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_checkpoint_recovery_replay(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    lease: &StoredExecutionLease,
+    checkpoint_version: i64,
+    checkpoint_phase: &str,
+    application_job_id: &str,
+    application_raw: &str,
+    application_state: &str,
+    session_raw: &str,
+    session_runner: &str,
+    session_status: &str,
+    attempt: Option<&AttemptReservation>,
+) -> ExecutionLeaseResult<Option<CheckpointRecoveryOutcome>> {
+    let application = parse_application_json(
+        application_raw.to_string(),
+        application_id,
+        application_job_id,
+        "job application",
+    )?;
+    let Some(recovery) = application.receipt.get("cloud_recovery") else {
+        return Ok(None);
+    };
+    let outcome = match recovery.get("status").and_then(Value::as_str) {
+        Some("released") => CheckpointRecoveryOutcome::Released,
+        Some("side_effect_unknown") => CheckpointRecoveryOutcome::SideEffectUnknown,
+        _ => return Err(ExecutionLeaseError::Conflict),
+    };
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .filter(|value| validate_execution_binding(value, 240))
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    let browser_session: BrowserSession =
+        parse_json(session_raw.to_string(), "browser session")?;
+    if recovery.get("schema_version").and_then(Value::as_i64) != Some(1)
+        || recovery.get("run_id").and_then(Value::as_str) != Some(run_id)
+        || recovery.get("checkpoint_version").and_then(Value::as_i64)
+            != Some(checkpoint_version)
+        || recovery.get("checkpoint_phase").and_then(Value::as_str) != Some(checkpoint_phase)
+        || application.id != application_id
+        || application.state != application_state
+        || application.state != outcome.application_state()
+        || application.run_id.as_deref() != Some(run_id)
+        || application.submitted_at_ms.is_some()
+        || lease.account_id != account_id
+        || lease.application_id != application_id
+        || lease.phase != outcome.lease_phase()
+        || lease.browser_profile_id != execution_browser_profile_id(account_id, identity_id)
+        || browser_session.id != run_id
+        || browser_session.application_id.as_deref() != Some(application_id)
+        || browser_session.runner != session_runner
+        || session_runner != "cloud"
+        || browser_session.status != session_status
+        || session_status != outcome.browser_status()
+        || browser_session.current_step != outcome.browser_step()
+        || browser_session.takeover_url.is_some()
+        || attempt.is_some_and(|attempt| {
+            attempt.application_id != application_id
+                || attempt.runner != "cloud"
+                || attempt.status != outcome.attempt_status()
+        })
+    {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(Some(outcome))
+}
+
+fn validate_trusted_submitted_checkpoint(
+    request: &CheckpointReconciliationRequest<'_>,
+    lease: &StoredExecutionLease,
+    application_job_id: &str,
+    application_raw: String,
+    application_state: &str,
+    evidence_count: i64,
+) -> ExecutionLeaseResult<bool> {
+    if application_state != "submitted" {
+        return Ok(false);
+    }
+    let application = parse_application_json(
+        application_raw,
+        request.application_id,
+        application_job_id,
+        "job application",
+    )?;
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .filter(|value| validate_execution_binding(value, 240))
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    if application.run_id.as_deref() != Some(request.run_id)
+        || lease.browser_profile_id
+            != execution_browser_profile_id(request.account_id, identity_id)
+        || !trusted_submitted_application(&application, evidence_count)
+    {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn checkpoint_reconciliation_plan(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    lease: &StoredExecutionLease,
+    checkpoint_version: i64,
+    checkpoint_phase: &str,
+    application_job_id: &str,
+    application_raw: String,
+    application_state: &str,
+    session_raw: String,
+    session_runner: &str,
+    session_status: &str,
+    attempt: Option<&AttemptReservation>,
+    now: i64,
+) -> ExecutionLeaseResult<CheckpointReconciliationPlan> {
+    if lease.account_id != account_id || lease.application_id != application_id {
+        return Err(ExecutionLeaseError::NotFound);
+    }
+    let mut application = parse_application_json(
+        application_raw,
+        application_id,
+        application_job_id,
+        "job application",
+    )?;
+    if application.id != application_id
+        || application.state != application_state
+        || application.run_id.as_deref() != Some(run_id)
+    {
+        return Err(ExecutionLeaseError::NotFound);
+    }
+    if !matches!(
+        application_state,
+        "queued" | "running" | "needs_input" | "failed" | "side_effect_unknown"
+    ) {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .filter(|value| validate_execution_binding(value, 240))
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    if lease.browser_profile_id != execution_browser_profile_id(account_id, identity_id) {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+
+    let mut browser_session: BrowserSession = parse_json(session_raw, "browser session")?;
+    if browser_session.id != run_id
+        || browser_session.application_id.as_deref() != Some(application_id)
+        || browser_session.runner != session_runner
+        || session_runner != "cloud"
+        || browser_session.status != session_status
+        || !matches!(
+            session_status,
+            "queued" | "running" | "needs_input" | "failed" | "complete"
+        )
+    {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    if let Some(attempt) = attempt {
+        if attempt.application_id != application_id
+            || attempt.runner != "cloud"
+            || !matches!(
+                attempt.status.as_str(),
+                "reserved" | "running" | "released" | "side_effect_unknown" | "submitted"
+            )
+        {
+            return Err(ExecutionLeaseError::Conflict);
+        }
+    }
+
+    let outcome = checkpoint_recovery_outcome(checkpoint_phase, &lease.phase)?;
+    if !application.receipt.is_object() {
+        application.receipt = json!({});
+    }
+    let recovery = application
+        .receipt
+        .get("cloud_recovery")
+        .filter(|value| {
+            value.get("run_id").and_then(Value::as_str) == Some(run_id)
+                && value.get("status").and_then(Value::as_str) == Some(outcome.lease_phase())
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "schema_version": 1,
+                "status": outcome.lease_phase(),
+                "checkpoint_version": checkpoint_version,
+                "checkpoint_phase": checkpoint_phase,
+                "lease_phase": lease.phase,
+                "recorded_at_ms": now,
+                "run_id": run_id,
+            })
+        });
+    application
+        .receipt
+        .as_object_mut()
+        .expect("receipt normalized above")
+        .insert("cloud_recovery".to_string(), recovery);
+    application.state = outcome.application_state().to_string();
+    application.updated_at_ms = now;
+    application.submitted_at_ms = None;
+
+    browser_session.status = outcome.browser_status().to_string();
+    browser_session.current_step = outcome.browser_step().to_string();
+    browser_session.takeover_url = None;
+    browser_session.updated_at_ms = now;
+
+    Ok(CheckpointReconciliationPlan {
+        outcome,
+        application,
+        browser_session,
+    })
+}
+
 pub fn execution_lease_phase_for_application(
     pool: &DbPool,
     account_id: &str,
@@ -934,6 +1339,438 @@ pub fn finish_execution_lease(
             }
             tx.commit()?;
             Ok(())
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn reconcile_execution_lease_checkpoint(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    owner_id: &str,
+    lease_token: Option<&str>,
+    fence: i64,
+    checkpoint_version: i64,
+    checkpoint_phase: &str,
+) -> ExecutionLeaseResult<ExecutionLeaseRecord> {
+    let request = CheckpointReconciliationRequest {
+        account_id,
+        application_id,
+        run_id,
+        owner_id,
+        lease_token,
+        fence,
+        checkpoint_version,
+        checkpoint_phase,
+    };
+    validate_checkpoint_reconciliation_request(&request)?;
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let lease = tx
+                .query_row(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
+                       FROM jobs_execution_leases
+                      WHERE run_id = ?1 AND account_id = ?2 AND application_id = ?3",
+                    params![run_id, account_id, application_id],
+                    execution_lease_from_sqlite_row,
+                )
+                .optional()?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            validate_checkpoint_lease_access(
+                &lease,
+                owner_id,
+                lease_token,
+                fence,
+                checkpoint_version,
+            )?;
+            let (application_job_id, application_raw, application_state): (
+                String,
+                String,
+                String,
+            ) = tx
+                .query_row(
+                    "SELECT job_id, application_json, state FROM jobs_applications
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, application_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let evidence_count: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_application_evidence
+                  WHERE account_id = ?1 AND application_id = ?2",
+                params![account_id, application_id],
+                |row| row.get(0),
+            )?;
+            if validate_trusted_submitted_checkpoint(
+                &request,
+                &lease,
+                &application_job_id,
+                application_raw.clone(),
+                &application_state,
+                evidence_count,
+            )? {
+                tx.commit()?;
+                return Ok(ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: "submitted".to_string(),
+                });
+            }
+            let (session_raw, session_runner, session_status): (String, String, String) = tx
+                .query_row(
+                    "SELECT session_json, runner, status FROM jobs_browser_sessions
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let attempt = tx
+                .query_row(
+                    "SELECT id, application_id, company_key, period_key, runner, status,
+                            reserved_at_ms, updated_at_ms
+                       FROM jobs_attempt_reservations
+                      WHERE account_id = ?1 AND application_id = ?2",
+                    params![account_id, application_id],
+                    |row| {
+                        Ok(AttemptReservation {
+                            id: row.get(0)?,
+                            application_id: row.get(1)?,
+                            company_key: row.get(2)?,
+                            period_key: row.get(3)?,
+                            runner: row.get(4)?,
+                            status: row.get(5)?,
+                            reserved_at_ms: row.get(6)?,
+                            updated_at_ms: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(outcome) = exact_checkpoint_recovery_replay(
+                account_id,
+                application_id,
+                run_id,
+                &lease,
+                checkpoint_version,
+                checkpoint_phase,
+                &application_job_id,
+                &application_raw,
+                &application_state,
+                &session_raw,
+                &session_runner,
+                &session_status,
+                attempt.as_ref(),
+            )? {
+                tx.commit()?;
+                return Ok(ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: outcome.lease_phase().to_string(),
+                });
+            }
+            let plan = checkpoint_reconciliation_plan(
+                account_id,
+                application_id,
+                run_id,
+                &lease,
+                checkpoint_version,
+                checkpoint_phase,
+                &application_job_id,
+                application_raw,
+                &application_state,
+                session_raw,
+                &session_runner,
+                &session_status,
+                attempt.as_ref(),
+                now,
+            )?;
+            let application_payload = to_json(&plan.application, "Jobs application")?;
+            let session_payload = to_json(&plan.browser_session, "browser session")?;
+            if tx.execute(
+                "UPDATE jobs_applications SET state = ?3, application_json = ?4,
+                        updated_at_ms = ?5, submitted_at_ms = NULL
+                  WHERE account_id = ?1 AND id = ?2 AND state = ?6",
+                params![
+                    account_id,
+                    application_id,
+                    plan.outcome.application_state(),
+                    application_payload,
+                    now,
+                    application_state,
+                ],
+            )? != 1
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if tx.execute(
+                "UPDATE jobs_browser_sessions SET status = ?3, session_json = ?4,
+                        updated_at_ms = ?5
+                  WHERE account_id = ?1 AND id = ?2 AND status = ?6",
+                params![
+                    account_id,
+                    run_id,
+                    plan.outcome.browser_status(),
+                    session_payload,
+                    now,
+                    session_status,
+                ],
+            )? != 1
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if let Some(attempt) = &attempt {
+                if tx.execute(
+                    "UPDATE jobs_attempt_reservations SET status = ?4, updated_at_ms = ?5
+                      WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
+                        AND status = ?6",
+                    params![
+                        attempt.id,
+                        account_id,
+                        application_id,
+                        plan.outcome.attempt_status(),
+                        now,
+                        attempt.status,
+                    ],
+                )? != 1
+                {
+                    return Err(ExecutionLeaseError::Conflict);
+                }
+            }
+            if tx.execute(
+                "UPDATE jobs_execution_leases SET phase = ?6, updated_at_ms = ?7,
+                        finished_at_ms = ?7
+                  WHERE run_id = ?1 AND account_id = ?2 AND application_id = ?3
+                    AND owner_id = ?4 AND fence = ?5 AND phase = ?8",
+                params![
+                    run_id,
+                    account_id,
+                    application_id,
+                    owner_id,
+                    fence,
+                    plan.outcome.lease_phase(),
+                    now,
+                    lease.phase,
+                ],
+            )? != 1
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            tx.commit()?;
+            Ok(ExecutionLeaseRecord {
+                run_id: run_id.to_string(),
+                fence,
+                lease_expires_at_ms: lease.lease_expires_at_ms,
+                phase: plan.outcome.lease_phase().to_string(),
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let lease = tx
+                .query_opt(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
+                       FROM jobs_execution_leases
+                      WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                      FOR UPDATE",
+                    &[&run_id, &account_id, &application_id],
+                )?
+                .map(execution_lease_from_pg_row)
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            validate_checkpoint_lease_access(
+                &lease,
+                owner_id,
+                lease_token,
+                fence,
+                checkpoint_version,
+            )?;
+            let application_row = tx
+                .query_opt(
+                    "SELECT job_id, application_json, state FROM jobs_applications
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &application_id],
+                )?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let application_job_id: String = application_row.get(0);
+            let application_raw: String = application_row.get(1);
+            let application_state: String = application_row.get(2);
+            let evidence_count: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM jobs_application_evidence
+                      WHERE account_id = $1 AND application_id = $2",
+                    &[&account_id, &application_id],
+                )?
+                .get(0);
+            if validate_trusted_submitted_checkpoint(
+                &request,
+                &lease,
+                &application_job_id,
+                application_raw.clone(),
+                &application_state,
+                evidence_count,
+            )? {
+                tx.commit()?;
+                return Ok(ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: "submitted".to_string(),
+                });
+            }
+            let session_row = tx
+                .query_opt(
+                    "SELECT session_json, runner, status FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &run_id],
+                )?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let session_raw: String = session_row.get(0);
+            let session_runner: String = session_row.get(1);
+            let session_status: String = session_row.get(2);
+            let attempt = tx
+                .query_opt(
+                    "SELECT id, application_id, company_key, period_key, runner, status,
+                            reserved_at_ms, updated_at_ms
+                       FROM jobs_attempt_reservations
+                      WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+                    &[&account_id, &application_id],
+                )?
+                .map(|row| AttemptReservation {
+                    id: row.get(0),
+                    application_id: row.get(1),
+                    company_key: row.get(2),
+                    period_key: row.get(3),
+                    runner: row.get(4),
+                    status: row.get(5),
+                    reserved_at_ms: row.get(6),
+                    updated_at_ms: row.get(7),
+                });
+            if let Some(outcome) = exact_checkpoint_recovery_replay(
+                account_id,
+                application_id,
+                run_id,
+                &lease,
+                checkpoint_version,
+                checkpoint_phase,
+                &application_job_id,
+                &application_raw,
+                &application_state,
+                &session_raw,
+                &session_runner,
+                &session_status,
+                attempt.as_ref(),
+            )? {
+                tx.commit()?;
+                return Ok(ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: outcome.lease_phase().to_string(),
+                });
+            }
+            let plan = checkpoint_reconciliation_plan(
+                account_id,
+                application_id,
+                run_id,
+                &lease,
+                checkpoint_version,
+                checkpoint_phase,
+                &application_job_id,
+                application_raw,
+                &application_state,
+                session_raw,
+                &session_runner,
+                &session_status,
+                attempt.as_ref(),
+                now,
+            )?;
+            let application_payload = to_json(&plan.application, "Jobs application")?;
+            let session_payload = to_json(&plan.browser_session, "browser session")?;
+            if tx.execute(
+                "UPDATE jobs_applications SET state = $3, application_json = $4,
+                        updated_at_ms = $5, submitted_at_ms = NULL
+                  WHERE account_id = $1 AND id = $2 AND state = $6",
+                &[
+                    &account_id,
+                    &application_id,
+                    &plan.outcome.application_state(),
+                    &application_payload,
+                    &now,
+                    &application_state,
+                ],
+            )? != 1
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if tx.execute(
+                "UPDATE jobs_browser_sessions SET status = $3, session_json = $4,
+                        updated_at_ms = $5
+                  WHERE account_id = $1 AND id = $2 AND status = $6",
+                &[
+                    &account_id,
+                    &run_id,
+                    &plan.outcome.browser_status(),
+                    &session_payload,
+                    &now,
+                    &session_status,
+                ],
+            )? != 1
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if let Some(attempt) = &attempt {
+                if tx.execute(
+                    "UPDATE jobs_attempt_reservations SET status = $4, updated_at_ms = $5
+                      WHERE id = $1 AND account_id = $2 AND application_id = $3
+                        AND status = $6",
+                    &[
+                        &attempt.id,
+                        &account_id,
+                        &application_id,
+                        &plan.outcome.attempt_status(),
+                        &now,
+                        &attempt.status,
+                    ],
+                )? != 1
+                {
+                    return Err(ExecutionLeaseError::Conflict);
+                }
+            }
+            if tx.execute(
+                "UPDATE jobs_execution_leases SET phase = $6, updated_at_ms = $7,
+                        finished_at_ms = $7
+                  WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                    AND owner_id = $4 AND fence = $5 AND phase = $8",
+                &[
+                    &run_id,
+                    &account_id,
+                    &application_id,
+                    &owner_id,
+                    &fence,
+                    &plan.outcome.lease_phase(),
+                    &now,
+                    &lease.phase,
+                ],
+            )? != 1
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            tx.commit()?;
+            Ok(ExecutionLeaseRecord {
+                run_id: run_id.to_string(),
+                fence,
+                lease_expires_at_ms: lease.lease_expires_at_ms,
+                phase: plan.outcome.lease_phase().to_string(),
+            })
         }
     })
 }

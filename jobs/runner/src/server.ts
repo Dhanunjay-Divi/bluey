@@ -25,6 +25,8 @@ import {
   createExecutionLeaseClientFromEnv,
   ExecutionLeaseError,
   type ActiveExecutionLease,
+  type ExecutionLeaseCheckpointMetadata,
+  type ReconciledCheckpointPhase,
 } from "./execution-lease.js";
 import {
   abortLeasedRun,
@@ -42,6 +44,7 @@ import {
   sealProfile,
 } from "./profile-store.js";
 import {
+  CURRENT_CHECKPOINT_VERSION,
   listRunCheckpoints,
   reconcileOrphanActiveProfiles,
   removeRunCheckpoint,
@@ -344,19 +347,8 @@ async function restoreCloudRunCheckpoints(): Promise<void> {
   const checkpoints = await listRunCheckpoints<CloudRunRequest, RunEvent>(root, profileKey!);
   for (const { checkpoint } of checkpoints) {
     const disposition = restartDisposition(checkpoint.phase, checkpoint.expiresAtMs);
-    if (disposition === "expired") {
-      await removeRunCheckpoint(root, checkpoint.profileScope, checkpoint.browserSessionId);
-    } else if (disposition === "restore") {
-      await restoreCheckpoint(checkpoint).catch(() => undefined);
-    } else if (checkpoint.phase !== "side_effect_unknown"
-      || checkpoint.workflow.status !== "side_effect_unknown") {
-      await writeRunCheckpoint(root, {
-        ...checkpoint,
-        phase: "side_effect_unknown",
-        updatedAtMs: Date.now(),
-        workflow: { ...checkpoint.workflow, status: "side_effect_unknown" },
-      }, profileKey!);
-    }
+    if (disposition === "restore") await restoreCheckpoint(checkpoint);
+    else await reconcileStoredCheckpoint(checkpoint);
   }
 }
 
@@ -367,8 +359,12 @@ async function restoreCloudRunCheckpoint(
   if (existing) return existing;
   const checkpoints = await listRunCheckpoints<CloudRunRequest, RunEvent>(root, profileKey!);
   const found = checkpoints.find(({ checkpoint }) => checkpoint.browserSessionId === browserSessionId)?.checkpoint;
-  if (!found || restartDisposition(found.phase, found.expiresAtMs) !== "restore") return undefined;
-  await restoreCheckpoint(found).catch(() => undefined);
+  if (!found) return undefined;
+  if (restartDisposition(found.phase, found.expiresAtMs) !== "restore") {
+    await reconcileStoredCheckpoint(found);
+    return undefined;
+  }
+  await restoreCheckpoint(found);
   return activeRuns.get(browserSessionId);
 }
 
@@ -442,14 +438,52 @@ async function restoreCheckpoint(
       activeScopes.delete(paths.scope);
     }
     if (lease) {
-      // Keep the safe encrypted checkpoint and leave the server-side lease in
-      // prepared state. The same stable runner owner can rotate it immediately;
-      // another owner can retry after expiry. A terminal finish would make the
-      // otherwise-safe checkpoint permanently unrecoverable.
-      await lease.stopHeartbeat().catch(() => undefined);
+      await lease.stopHeartbeat();
+      await reconcileCheckpointMetadata(
+        approvedRequest,
+        lease.checkpointMetadata(),
+        CURRENT_CHECKPOINT_VERSION,
+        "prepared",
+      );
+      await removeRunCheckpoint(root, checkpoint.profileScope, checkpoint.browserSessionId);
     }
     throw error;
   }
+}
+
+async function reconcileStoredCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): Promise<void> {
+  await reconcileCheckpointMetadata(
+    checkpoint.request,
+    {
+      fence: checkpoint.lease.fence,
+      expiresAtMs: checkpoint.lease.expiresAtMs,
+      ownerId: checkpoint.lease.ownerId,
+      leaseToken: checkpoint.lease.leaseToken ?? "",
+    },
+    checkpoint.version,
+    checkpoint.phase,
+  );
+  await removeRunCheckpoint(root, checkpoint.profileScope, checkpoint.browserSessionId);
+}
+
+async function reconcileCheckpointMetadata(
+  request: CloudRunRequest,
+  lease: ExecutionLeaseCheckpointMetadata,
+  checkpointVersion: 1 | 2,
+  checkpointPhase: ReconciledCheckpointPhase,
+): Promise<void> {
+  await leaseClient.reconcileCheckpoint({
+    accountId: request.accountId,
+    applicationId: request.applicationId,
+    runId: request.runId,
+    ownerId: lease.ownerId,
+    fence: lease.fence,
+    ...(checkpointVersion === 2 ? { leaseToken: lease.leaseToken } : {}),
+    checkpointVersion,
+    checkpointPhase,
+  });
 }
 
 async function writeCloudCheckpoint(input: {
@@ -466,7 +500,7 @@ async function writeCloudCheckpoint(input: {
 }): Promise<void> {
   const now = Date.now();
   await writeRunCheckpoint<CloudRunRequest, RunEvent>(root, {
-    version: 1,
+    version: CURRENT_CHECKPOINT_VERSION,
     phase: input.phase,
     createdAtMs: input.checkpointCreatedAtMs,
     updatedAtMs: now,
@@ -481,11 +515,7 @@ async function writeCloudCheckpoint(input: {
       ...(input.providerReview ? { providerReview: input.providerReview } : {}),
     },
     events: input.events,
-    lease: {
-      fence: input.lease.fence,
-      expiresAtMs: input.lease.expiresAtMs,
-      ownerId: input.lease.ownerId,
-    },
+    lease: input.lease.checkpointMetadata(),
   }, profileKey!);
 }
 

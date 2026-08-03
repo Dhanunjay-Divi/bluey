@@ -36,6 +36,12 @@ describe("execution lease client", () => {
     expect(lease.fence).toBe(7);
     expect(lease.expiresAtMs).toBeGreaterThan(Date.now());
     expect(lease.ownerId).toBe("runner-test-1");
+    expect(lease.checkpointMetadata()).toEqual({
+      leaseToken: "lease-secret-value",
+      fence: 7,
+      expiresAtMs: lease.expiresAtMs,
+      ownerId: "runner-test-1",
+    });
     await lease.beforeFinalSubmit();
     await lease.afterFinalSubmit("activated");
     await lease.finish("submitted");
@@ -65,6 +71,68 @@ describe("execution lease client", () => {
     expect(new Set(calls.map((call) => new Headers(call.init?.headers)
       .get("x-bluey-jobs-worker-nonce"))).size).toBe(calls.length);
     expect(JSON.stringify(lease)).not.toContain("lease-secret-value");
+  });
+
+  it("reconciles an encrypted restart checkpoint with a signed bounded request", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return recordResponse("side_effect_unknown");
+    }) as typeof globalThis.fetch;
+    const client = createClient(fetch);
+
+    await client.reconcileCheckpoint({
+      accountId: "account-123",
+      applicationId: "application-123",
+      runId: "run-123",
+      ownerId: "runner-test-1",
+      fence: 7,
+      leaseToken: "lease-secret-value",
+      checkpointVersion: 2,
+      checkpointPhase: "final_submit_started",
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(
+      "https://jobs-api.example/api/jobs/internal/execution-leases/run-123/reconcile-checkpoint",
+    );
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      account_id: "account-123",
+      application_id: "application-123",
+      owner_id: "runner-test-1",
+      fence: 7,
+      lease_token: "lease-secret-value",
+      checkpoint_version: 2,
+      checkpoint_phase: "final_submit_started",
+    });
+    expectSignedWorkerRequest(calls[0]!, "runner-test-1");
+  });
+
+  it("omits the lease token only for a legacy v1 restart checkpoint", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return recordResponse("released");
+    }) as typeof globalThis.fetch;
+
+    await createClient(fetch).reconcileCheckpoint({
+      accountId: "account-123",
+      applicationId: "application-123",
+      runId: "run-123",
+      ownerId: "runner-test-1",
+      fence: 7,
+      checkpointVersion: 1,
+      checkpointPhase: "prepared",
+    });
+
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      account_id: "account-123",
+      application_id: "application-123",
+      owner_id: "runner-test-1",
+      fence: 7,
+      checkpoint_version: 1,
+      checkpoint_phase: "prepared",
+    });
   });
 
   it("makes the irreversible fence single-shot when its success response is lost", async () => {
@@ -302,7 +370,9 @@ function grantResponse(): Response {
   });
 }
 
-function recordResponse(phase: "prepared" | "click_started"): Response {
+function recordResponse(
+  phase: "prepared" | "click_started" | "released" | "side_effect_unknown" | "submitted",
+): Response {
   return new Response(JSON.stringify({ run_id: "run-123", fence: 7, phase }), {
     status: 200,
     headers: { "Content-Type": "application/json" },

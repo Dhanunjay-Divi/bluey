@@ -32,6 +32,32 @@ export interface ExecutionLeaseClaim {
   browserProfileId: string;
 }
 
+export type ReconciledCheckpointPhase =
+  | "prepared"
+  | "needs_input"
+  | "provider_review"
+  | "final_submit_started"
+  | "final_submit_activated"
+  | "side_effect_unknown";
+
+export interface ExecutionLeaseCheckpointReconciliation {
+  accountId: string;
+  applicationId: string;
+  runId: string;
+  ownerId: string;
+  fence: number;
+  leaseToken?: string;
+  checkpointVersion: 1 | 2;
+  checkpointPhase: ReconciledCheckpointPhase;
+}
+
+export interface ExecutionLeaseCheckpointMetadata {
+  leaseToken: string;
+  fence: number;
+  expiresAtMs: number;
+  ownerId: string;
+}
+
 export interface ExecutionLeaseClientOptions {
   origin: string;
   workerSigningKey: string;
@@ -44,7 +70,7 @@ export interface ExecutionLeaseClientOptions {
 
 export class ExecutionLeaseError extends Error {
   constructor(
-    readonly operation: "claim" | "heartbeat" | "irreversible" | "finish" | "configuration",
+    readonly operation: "claim" | "heartbeat" | "irreversible" | "finish" | "recovery" | "configuration",
     readonly code: ExecutionLeaseErrorCode,
     readonly status?: number,
   ) {
@@ -68,6 +94,7 @@ interface LeaseOperations {
 export class ActiveExecutionLease {
   readonly #operations: LeaseOperations;
   readonly #heartbeatIntervalMs: number;
+  readonly #leaseToken: string;
   #heartbeatTimer?: ReturnType<typeof setTimeout>;
   #heartbeatInFlight?: Promise<void>;
   #heartbeatStopped = false;
@@ -84,9 +111,11 @@ export class ActiveExecutionLease {
     readonly fence: number = 1,
     readonly expiresAtMs: number = Date.now() + heartbeatIntervalMs,
     readonly ownerId: string = "runner-unknown",
+    leaseToken: string = "",
   ) {
     this.#operations = operations;
     this.#heartbeatIntervalMs = heartbeatIntervalMs;
+    this.#leaseToken = leaseToken;
     this.scheduleHeartbeat();
   }
 
@@ -108,6 +137,15 @@ export class ActiveExecutionLease {
 
   get heartbeatActive(): boolean {
     return !this.#heartbeatStopped;
+  }
+
+  checkpointMetadata(): ExecutionLeaseCheckpointMetadata {
+    return {
+      leaseToken: this.#leaseToken,
+      fence: this.fence,
+      expiresAtMs: this.expiresAtMs,
+      ownerId: this.ownerId,
+    };
   }
 
   async beforeFinalSubmit(): Promise<void> {
@@ -247,11 +285,36 @@ export class ExecutionLeaseClient {
       grant.fence,
       grant.expiresAtMs,
       this.#ownerId,
+      grant.leaseToken,
+    );
+  }
+
+  async reconcileCheckpoint(input: ExecutionLeaseCheckpointReconciliation): Promise<void> {
+    const runPath = encodeURIComponent(input.runId);
+    const response = await this.request(
+      "recovery",
+      `/api/jobs/internal/execution-leases/${runPath}/reconcile-checkpoint`,
+      {
+        account_id: input.accountId,
+        application_id: input.applicationId,
+        owner_id: input.ownerId,
+        fence: input.fence,
+        lease_token: input.leaseToken,
+        checkpoint_version: input.checkpointVersion,
+        checkpoint_phase: input.checkpointPhase,
+      },
+    );
+    parseLeaseRecord(
+      "recovery",
+      response,
+      input.runId,
+      input.fence,
+      ["released", "side_effect_unknown", "submitted"],
     );
   }
 
   private async request(
-    operation: "claim" | "heartbeat" | "irreversible" | "finish",
+    operation: "claim" | "heartbeat" | "irreversible" | "finish" | "recovery",
     path: string,
     body: Record<string, unknown>,
   ): Promise<unknown> {
@@ -397,7 +460,7 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
 }
 
 function parseLeaseRecord(
-  operation: "heartbeat" | "irreversible",
+  operation: "heartbeat" | "irreversible" | "recovery",
   value: unknown,
   expectedRunId: string,
   expectedFence: number,
@@ -418,7 +481,7 @@ function parseLeaseRecord(
 async function discardBounded(
   response: Response,
   maximumBytes: number,
-  operation: "claim" | "heartbeat" | "irreversible" | "finish",
+  operation: "claim" | "heartbeat" | "irreversible" | "finish" | "recovery",
 ): Promise<void> {
   await readBounded(response, maximumBytes, operation);
 }
@@ -426,7 +489,7 @@ async function discardBounded(
 async function readBounded(
   response: Response,
   maximumBytes: number,
-  operation: "claim" | "heartbeat" | "irreversible" | "finish",
+  operation: "claim" | "heartbeat" | "irreversible" | "finish" | "recovery",
 ): Promise<string> {
   const declaredLength = Number(response.headers.get("content-length"));
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {

@@ -20,6 +20,7 @@ import {
 } from "@bluey/jobs-automation";
 import { profilePaths, restoreProfile } from "../src/profile-store.js";
 import {
+  CURRENT_CHECKPOINT_VERSION,
   cloudCheckpointScope,
   listRunCheckpoints,
   readRunCheckpoint,
@@ -51,6 +52,7 @@ describe("encrypted cloud run checkpoints", () => {
     expect(encrypted.subarray(0, 8).toString("ascii")).toBe("BLUEYJP2");
     expect(encrypted.includes(Buffer.from("person@example.test"))).toBe(false);
     expect(encrypted.includes(Buffer.from("private answer"))).toBe(false);
+    expect(encrypted.includes(Buffer.from("lease-secret-value"))).toBe(false);
     if (process.platform !== "win32") {
       expect((await stat(path)).mode & 0o777).toBe(0o600);
       expect((await stat(dirname(path))).mode & 0o777).toBe(0o700);
@@ -131,6 +133,29 @@ describe("encrypted cloud run checkpoints", () => {
     await expect(writeRunCheckpoint(root, checkpoint, key))
       .rejects.toThrow("changed after review");
   });
+
+  it("keeps legacy v1 checkpoints readable without a persisted lease token", async () => {
+    const root = await temporaryDirectory();
+    const key = randomBytes(32);
+    const checkpoint = fixture({ version: 1 });
+    const scope = cloudCheckpointScope(checkpoint.profileScope, checkpoint.browserSessionId);
+
+    await writeRunCheckpoint(root, checkpoint, key);
+
+    await expect(readRunCheckpoint(root, checkpoint.profileScope, scope, key))
+      .resolves.toEqual(checkpoint);
+    expect(checkpoint.lease.leaseToken).toBeUndefined();
+  });
+
+  it("rejects a v2 checkpoint that cannot prove its original lease capability", async () => {
+    const root = await temporaryDirectory();
+    const key = randomBytes(32);
+    const checkpoint = fixture();
+    delete checkpoint.lease.leaseToken;
+
+    await expect(writeRunCheckpoint(root, checkpoint, key))
+      .rejects.toThrow("Invalid cloud run checkpoint lease metadata");
+  });
 });
 
 describe("cloud runner crash-start profile reconciliation", () => {
@@ -167,6 +192,7 @@ interface FixtureRequest {
 function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint<FixtureRequest> {
   const profileScope = "a".repeat(40);
   const browserSessionId = String(overrides.browserSessionId || "cloud-application-123");
+  const version = overrides.version === 1 ? 1 : CURRENT_CHECKPOINT_VERSION;
   const job: NormalizedJob = {
     externalId: "job-123",
     canonicalUrl: "https://jobs.example.test/apply",
@@ -188,7 +214,7 @@ function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint<Fi
   };
   packet.approvedPacketChecksum = approvedExecutionChecksum(packet, job);
   return {
-    version: 1,
+    version,
     phase: "needs_input",
     createdAtMs: Date.parse("2026-07-16T12:00:00.000Z"),
     updatedAtMs: Date.parse("2026-07-16T12:01:00.000Z"),
@@ -216,6 +242,9 @@ function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint<Fi
       fence: 7,
       expiresAtMs: Date.parse("2026-07-16T12:05:00.000Z"),
       ownerId: "runner-test-1",
+      ...(version === CURRENT_CHECKPOINT_VERSION
+        ? { leaseToken: "lease-secret-value" }
+        : {}),
     },
   };
 }

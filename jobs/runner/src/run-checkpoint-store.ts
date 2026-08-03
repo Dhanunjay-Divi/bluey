@@ -21,14 +21,15 @@ import {
 import { decryptBytes, encryptBytes, replaceFileDurably } from "./crypto-envelope.js";
 import { profilePathsFromScope, sealProfile } from "./profile-store.js";
 
-const CHECKPOINT_VERSION = 1;
+export const CURRENT_CHECKPOINT_VERSION = 2 as const;
+export type RunCheckpointVersion = 1 | typeof CURRENT_CHECKPOINT_VERSION;
 const MAX_CHECKPOINT_BYTES = 5 * 1024 * 1024;
 const MAX_CHECKPOINTS = 512;
 const PROFILE_SCOPE = /^[a-f0-9]{40}$/;
 const CHECKPOINT_SCOPE = /^[a-f0-9]{64}$/;
 
 export interface CloudRunCheckpoint<Request extends object = Record<string, unknown>, Event = unknown> {
-  version: typeof CHECKPOINT_VERSION;
+  version: RunCheckpointVersion;
   phase: DurableRunPhase;
   createdAtMs: number;
   updatedAtMs: number;
@@ -47,6 +48,7 @@ export interface CloudRunCheckpoint<Request extends object = Record<string, unkn
     fence: number;
     expiresAtMs: number;
     ownerId: string;
+    leaseToken?: string;
   };
 }
 
@@ -246,7 +248,7 @@ function encryptionContext(profileScope: string, checkpointScope: string) {
 
 function validateCheckpoint(value: unknown): asserts value is CloudRunCheckpoint {
   const checkpoint = requireRecord(value, "cloud run checkpoint");
-  if (checkpoint.version !== CHECKPOINT_VERSION
+  if (![1, CURRENT_CHECKPOINT_VERSION].includes(Number(checkpoint.version))
     || !["prepared", "needs_input", "provider_review", "final_submit_started",
       "final_submit_activated", "side_effect_unknown"].includes(String(checkpoint.phase))
     || !isTimestamp(checkpoint.createdAtMs)
@@ -312,7 +314,15 @@ function validateCheckpoint(value: unknown): asserts value is CloudRunCheckpoint
   if (!Number.isSafeInteger(lease.fence) || Number(lease.fence) <= 0
     || !isTimestamp(lease.expiresAtMs)
     || typeof lease.ownerId !== "string"
-    || !/^[A-Za-z0-9._:-]{1,128}$/.test(lease.ownerId)) {
+    || !/^[A-Za-z0-9._:-]{1,128}$/.test(lease.ownerId)
+    || (checkpoint.version === CURRENT_CHECKPOINT_VERSION
+      && (typeof lease.leaseToken !== "string"
+        || lease.leaseToken.length === 0
+        || Buffer.byteLength(lease.leaseToken, "utf8") > 256))
+    || (lease.leaseToken !== undefined
+      && (typeof lease.leaseToken !== "string"
+        || lease.leaseToken.length === 0
+        || Buffer.byteLength(lease.leaseToken, "utf8") > 256))) {
     throw new Error("Invalid cloud run checkpoint lease metadata");
   }
 }
