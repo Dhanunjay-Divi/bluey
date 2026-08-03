@@ -408,6 +408,11 @@ mod tests {
     fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
         let profile = default_profile("jobs@example.com");
         save_profile(pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(pool, "acct-jobs", &preferences).unwrap();
         let posting = upsert_posting(
             pool,
             "acct-jobs",
@@ -417,7 +422,7 @@ mod tests {
                 now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, _) =
@@ -483,17 +488,22 @@ mod tests {
     ) -> (JobApplication, String, String, String) {
         let profile = default_profile("jobs@example.com");
         save_profile(pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(pool, "acct-jobs", &preferences).unwrap();
         set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
         let posting = upsert_posting(
             pool,
             "acct-jobs",
             &test_posting(
-                &format!("https://jobs.ashbyhq.com/acme/{suffix}"),
+                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
                 now_ms(),
                 now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, _) =
@@ -6054,6 +6064,45 @@ mod tests {
             application.receipt.pointer("/eligibility/capability"),
             Some(&json!("beta_review"))
         );
+    }
+
+    #[test]
+    fn submission_capability_requires_exact_provider_hosts() {
+        let now = now_ms();
+        for url in [
+            "https://boards.greenhouse.io/acme/jobs/1",
+            "https://job-boards.greenhouse.io/acme/jobs/1",
+            "https://jobs.lever.co/acme/1",
+            "https://jobs.eu.lever.co/acme/1",
+        ] {
+            assert_eq!(submission_capability(&test_posting(url, now, now)), "beta_review");
+        }
+
+        for url in [
+            "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/1",
+            "https://jobs.ashbyhq.com/acme/1",
+            "https://jobs.smartrecruiters.com/Acme/1",
+            "https://jobs.acme.example/1",
+            "https://boards.greenhouse.io.attacker.example/jobs/1",
+            "https://evil.example/jobs?next=https://jobs.lever.co/acme/1",
+            "https://notindeed.com/viewjob/1",
+        ] {
+            assert_eq!(
+                submission_capability(&test_posting(url, now, now)),
+                "unknown_review"
+            );
+        }
+
+        for url in [
+            "https://www.linkedin.com/jobs/view/1",
+            "https://subdomain.indeed.com/viewjob/1",
+        ] {
+            assert_eq!(submission_capability(&test_posting(url, now, now)), "handoff");
+        }
+
+        for url in ["file:///etc/passwd", "not a URL"] {
+            assert_eq!(submission_capability(&test_posting(url, now, now)), "blocked");
+        }
     }
 
     #[test]

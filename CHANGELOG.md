@@ -62,6 +62,10 @@ under `docs/release/`.
 
 ### Fixed
 
+- Restricted employer-facing final submission to exact-version provider state
+  machines. Generic ATS and semantic adapters now stop at review or takeover,
+  spoofed provider hosts fail closed, and adapter output alone cannot forge a
+  Submitted result.
 - Made cloud-runner restart recovery durable and fail closed: checkpoint files
   now bind to the exact account, application, run, browser profile, lease owner,
   fence, and v2 lease token; safe pre-submit work releases authority atomically,

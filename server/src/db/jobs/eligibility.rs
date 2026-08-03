@@ -811,33 +811,39 @@ fn push_reason(reasons: &mut Vec<EligibilityReason>, code: &str, message: &str) 
 }
 
 fn submission_capability(posting: &JobPosting) -> String {
-    let url = posting.canonical_url.trim().to_ascii_lowercase();
-    if !url.starts_with("https://") && !url.starts_with("http://") {
+    let Ok(url) = reqwest::Url::parse(posting.canonical_url.trim()) else {
+        return "blocked".to_string();
+    };
+    if !matches!(url.scheme(), "http" | "https") {
         return "blocked".to_string();
     }
-    if url.contains("linkedin.com") || url.contains("indeed.com") {
+    let Some(host) = url
+        .host_str()
+        .map(|value| value.trim_end_matches('.').to_ascii_lowercase())
+    else {
+        return "blocked".to_string();
+    };
+
+    if host_matches_domain(&host, "linkedin.com") || host_matches_domain(&host, "indeed.com") {
         return "handoff".to_string();
     }
-    if known_review_only_ats(&url) {
+    if matches!(
+        host.as_str(),
+        "boards.greenhouse.io"
+            | "job-boards.greenhouse.io"
+            | "jobs.lever.co"
+            | "jobs.eu.lever.co"
+    ) {
         return "beta_review".to_string();
     }
     "unknown_review".to_string()
 }
 
-fn known_review_only_ats(url: &str) -> bool {
-    [
-        "greenhouse.io",
-        "boards.greenhouse.io",
-        "lever.co",
-        "jobs.lever.co",
-        "ashbyhq.com",
-        "jobs.ashbyhq.com",
-        "smartrecruiters.com",
-        "workday.com",
-        "myworkdayjobs.com",
-    ]
-    .iter()
-    .any(|host| url.contains(host))
+fn host_matches_domain(host: &str, domain: &str) -> bool {
+    host == domain
+        || host
+            .strip_suffix(domain)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 fn location_failure(

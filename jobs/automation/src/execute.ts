@@ -1,8 +1,22 @@
 import { AdapterRegistry } from "./adapters.js";
-import type { AdapterContext, ApplicationAdapter, SubmissionReceipt } from "./contracts.js";
+import {
+  adapterCanFinalize,
+  atsCapabilityProfile,
+} from "./adapter-capabilities.js";
+import type {
+  AdapterContext,
+  ApplicationAdapter,
+  SubmissionReceipt,
+} from "./contracts.js";
 import { assertRunnablePacket } from "./packet-guards.js";
-import { createGreenhouseAdapter, type GreenhouseAdapterOptions } from "./providers/greenhouse.js";
-import { createLeverAdapter, type LeverAdapterOptions } from "./providers/lever.js";
+import {
+  createGreenhouseAdapter,
+  type GreenhouseAdapterOptions,
+} from "./providers/greenhouse.js";
+import {
+  createLeverAdapter,
+  type LeverAdapterOptions,
+} from "./providers/lever.js";
 import { createStandardAdapters } from "./standard-adapters.js";
 
 export interface ExecutionResult {
@@ -17,7 +31,9 @@ export interface ProviderAdapterRegistryOptions {
 }
 
 class ProviderFirstAdapterRegistry extends AdapterRegistry {
-  constructor(private readonly providerAdapters: readonly ApplicationAdapter[]) {
+  constructor(
+    private readonly providerAdapters: readonly ApplicationAdapter[],
+  ) {
     super();
   }
 
@@ -28,7 +44,9 @@ class ProviderFirstAdapterRegistry extends AdapterRegistry {
     } catch {
       return super.resolve(rawUrl);
     }
-    const provider = this.providerAdapters.find((adapter) => adapter.detect(url));
+    const provider = this.providerAdapters.find((adapter) =>
+      adapter.detect(url),
+    );
     if (provider) return provider;
     return super.resolve(rawUrl);
   }
@@ -59,7 +77,13 @@ export async function executeApplication(
 ): Promise<ExecutionResult> {
   assertRunnablePacket(context.packet);
   const adapter = registry.resolve(context.page.url());
-  await context.log("adapter_selected", { kind: adapter.kind, version: adapter.version });
+  const capability = atsCapabilityProfile(adapter.kind);
+  await context.log("adapter_selected", {
+    kind: adapter.kind,
+    version: adapter.version,
+    capability: capability.capability,
+    final_submission: adapterCanFinalize(adapter.kind, adapter.version),
+  });
   await adapter.prepare(context);
   await adapter.fill(context);
   const issues = await adapter.validate(context);
@@ -71,12 +95,14 @@ export async function executeApplication(
       issues,
       intervention: {
         kind,
-        title: kind === "sensitive_question"
-          ? "Your choice is needed"
-          : kind === "unknown_question"
-            ? "A new question needs your answer"
-            : "One detail is missing",
-        detail: issues[0]?.message || "Complete the required application field.",
+        title:
+          kind === "sensitive_question"
+            ? "Your choice is needed"
+            : kind === "unknown_question"
+              ? "A new question needs your answer"
+              : "One detail is missing",
+        detail:
+          issues[0]?.message || "Complete the required application field.",
         field,
         resolution: { kind: "answer", resumeAfter: true },
       },
@@ -88,7 +114,34 @@ export async function executeApplication(
     });
     return { adapter: adapter.kind, adapterVersion: adapter.version, receipt };
   }
-  const receipt = await adapter.submit(context);
+  let receipt = await adapter.submit(context);
+  if (
+    receipt.status === "submitted" &&
+    !adapterCanFinalize(adapter.kind, adapter.version)
+  ) {
+    await context.log("adapter_submission_authority_violation", {
+      kind: adapter.kind,
+      version: adapter.version,
+    });
+    receipt = {
+      status: "needs_input",
+      issues: [
+        {
+          field: "submission",
+          message:
+            "Bluey cannot verify this application as submitted with this adapter.",
+          severity: "blocking",
+        },
+      ],
+      intervention: {
+        kind: "browser_takeover",
+        title: "Review the application result",
+        detail:
+          "This application system is not certified for unattended final submission. Review the preserved browser before continuing.",
+        resolution: { kind: "browser_takeover", resumeAfter: false },
+      },
+    };
+  }
   await context.log("application_execution_finished", {
     adapter: adapter.kind,
     status: receipt.status,
@@ -97,11 +150,19 @@ export async function executeApplication(
   return { adapter: adapter.kind, adapterVersion: adapter.version, receipt };
 }
 
-function issueKind(field: string): "missing_fact" | "unknown_question" | "sensitive_question" {
-  if (/gender|race|ethnic|disab|veteran|sexual orientation|religion/i.test(field)) {
+function issueKind(
+  field: string,
+): "missing_fact" | "unknown_question" | "sensitive_question" {
+  if (
+    /gender|race|ethnic|disab|veteran|sexual orientation|religion/i.test(field)
+  ) {
     return "sensitive_question";
   }
-  if (/name|email|phone|mobile|location|city|address|linkedin|portfolio|website|salary|compensation|sponsorship|visa|authoriz/i.test(field)) {
+  if (
+    /name|email|phone|mobile|location|city|address|linkedin|portfolio|website|salary|compensation|sponsorship|visa|authoriz/i.test(
+      field,
+    )
+  ) {
     return "missing_fact";
   }
   return "unknown_question";

@@ -8,14 +8,22 @@ import {
 
 describe("job source catalog", () => {
   it("deduplicates the supplied staffing catalog by stable source ID", () => {
-    expect(new Set(JOB_SOURCE_CATALOG.map((entry) => entry.id)).size).toBe(JOB_SOURCE_CATALOG.length);
-    expect(JOB_SOURCE_CATALOG.filter((entry) => entry.name === "Business Plan Solutions")).toHaveLength(1);
+    expect(new Set(JOB_SOURCE_CATALOG.map((entry) => entry.id)).size).toBe(
+      JOB_SOURCE_CATALOG.length,
+    );
+    expect(
+      JOB_SOURCE_CATALOG.filter(
+        (entry) => entry.name === "Business Plan Solutions",
+      ),
+    ).toHaveLength(1);
   });
 
   it("normalizes staffing aliases and domains", () => {
     expect(findJobSourceByName("Apex System")?.name).toBe("Apex Systems");
     expect(findJobSourceByName("Tek Systems")?.name).toBe("TEKsystems");
-    expect(findJobSourceByUrl("https://careers.randstadusa.com/job/1")?.id).toBe("staffing-randstad");
+    expect(
+      findJobSourceByUrl("https://careers.randstadusa.com/job/1")?.id,
+    ).toBe("staffing-randstad");
   });
 
   it("covers every owner-supplied staffing and recruiting source name", () => {
@@ -106,51 +114,71 @@ describe("job source catalog", () => {
       "modis.com",
     ];
 
-    const missing = suppliedDomains.filter((domain) => (
-      !findJobSourceByUrl(`https://careers.${domain}/jobs/1`)
-    ));
+    const missing = suppliedDomains.filter(
+      (domain) => !findJobSourceByUrl(`https://careers.${domain}/jobs/1`),
+    );
     expect(missing).toEqual([]);
   });
 
   it("keeps portals and curated repositories as leads or handoffs", () => {
-    expect(findJobSourceByUrl("https://www.linkedin.com/jobs/view/1")?.submissionCapability).toBe("handoff");
+    expect(
+      findJobSourceByUrl("https://www.linkedin.com/jobs/view/1")
+        ?.submissionCapability,
+    ).toBe("handoff");
     const feed = findJobSourceByName("SimplifyJobs/New-Grad-Positions");
     expect(feed?.discoveryCapability).toBe("candidate_lead");
     expect(feed && requiresCanonicalEmployerRevalidation(feed)).toBe(true);
-    expect(findJobSourceByUrl("https://github.com/PrepAIJobs/Summer2026-Internships/tree/main")?.id)
-      .toBe("feed-prepai-internships");
-    expect(findJobSourceByUrl("https://github.com/zapplyjobs/New-Grad-Jobs-2027")?.id)
-      .toBe("feed-zapply-new-grad");
-    expect(findJobSourceByUrl("https://github.com/unlisted/repository")).toBeUndefined();
-    expect(findJobSourceByUrl("https://storage.stapply.ai/jobhive/v1/manifest.json")).toMatchObject({
+    expect(
+      findJobSourceByUrl(
+        "https://github.com/PrepAIJobs/Summer2026-Internships/tree/main",
+      )?.id,
+    ).toBe("feed-prepai-internships");
+    expect(
+      findJobSourceByUrl("https://github.com/zapplyjobs/New-Grad-Jobs-2027")
+        ?.id,
+    ).toBe("feed-zapply-new-grad");
+    expect(
+      findJobSourceByUrl("https://github.com/unlisted/repository"),
+    ).toBeUndefined();
+    expect(
+      findJobSourceByUrl("https://storage.stapply.ai/jobhive/v1/manifest.json"),
+    ).toMatchObject({
       id: "feed-jobhive-index",
       discoveryCapability: "shared_ingestion",
       submissionCapability: "unknown_review",
       requiresCanonicalRevalidation: true,
     });
-    expect(findJobSourceByUrl("https://remoteok.com/remote-jobs/1")).toMatchObject({
+    expect(
+      findJobSourceByUrl("https://remoteok.com/remote-jobs/1"),
+    ).toMatchObject({
       id: "feed-remoteok",
       discoveryCapability: "planned_shared_ingestion",
     });
   });
 
   it("does not label connector metadata as a live shared reader", () => {
-    const liveShared = JOB_SOURCE_CATALOG
-      .filter((entry) => entry.discoveryCapability === "shared_ingestion")
-      .map((entry) => entry.id);
+    const liveShared = JOB_SOURCE_CATALOG.filter(
+      (entry) => entry.discoveryCapability === "shared_ingestion",
+    ).map((entry) => entry.id);
     expect(liveShared).toEqual(["feed-jobhive-index"]);
-    expect(findJobSourceByName("Remote OK")?.discoveryCapability)
-      .toBe("planned_shared_ingestion");
-    expect(findJobSourceByName("We Work Remotely")?.discoveryCapability)
-      .toBe("planned_shared_ingestion");
-    expect(findJobSourceByName("Y Combinator jobs")?.discoveryCapability)
-      .toBe("planned_shared_ingestion");
-    expect(findJobSourceByName("Built In")?.discoveryCapability)
-      .toBe("planned_shared_ingestion");
+    expect(findJobSourceByName("Remote OK")?.discoveryCapability).toBe(
+      "planned_shared_ingestion",
+    );
+    expect(findJobSourceByName("We Work Remotely")?.discoveryCapability).toBe(
+      "planned_shared_ingestion",
+    );
+    expect(findJobSourceByName("Y Combinator jobs")?.discoveryCapability).toBe(
+      "planned_shared_ingestion",
+    );
+    expect(findJobSourceByName("Built In")?.discoveryCapability).toBe(
+      "planned_shared_ingestion",
+    );
   });
 
   it("allows scheduled ingestion only for typed public ATS families", () => {
-    const scheduled = JOB_SOURCE_CATALOG.filter((entry) => entry.discoveryCapability === "scheduled_public_feed");
+    const scheduled = JOB_SOURCE_CATALOG.filter(
+      (entry) => entry.discoveryCapability === "scheduled_public_feed",
+    );
     expect(scheduled.map((entry) => entry.name)).toEqual([
       "Greenhouse",
       "Lever",
@@ -158,6 +186,18 @@ describe("job source catalog", () => {
       "SmartRecruiters",
       "Workday",
     ]);
-    expect(scheduled.every((entry) => !entry.requiresCanonicalRevalidation)).toBe(true);
+    expect(
+      scheduled.every((entry) => !entry.requiresCanonicalRevalidation),
+    ).toBe(true);
+    expect(
+      scheduled
+        .filter((entry) => entry.submissionCapability === "beta_review")
+        .map((entry) => entry.name),
+    ).toEqual(["Greenhouse", "Lever"]);
+    expect(
+      scheduled
+        .filter((entry) => entry.submissionCapability === "unknown_review")
+        .map((entry) => entry.name),
+    ).toEqual(["Ashby", "SmartRecruiters", "Workday"]);
   });
 });
