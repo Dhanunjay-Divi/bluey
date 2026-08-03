@@ -2410,6 +2410,144 @@ async fn resolve_intervention_request(
 
 #[tokio::test]
 #[serial]
+async fn jobs_intervention_answer_revises_packet_without_resuming_runner() {
+    const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
+    let harness = boot_harness().await;
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
+    jobs::update_application(&harness.pool, &account_id, &application_id, "running", None).unwrap();
+    jobs::update_application(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        "needs_input",
+        None,
+    )
+    .unwrap();
+    let mut session = jobs::list_browser_sessions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == run_id)
+        .unwrap();
+    session.status = "needs_input".to_string();
+    session.current_step = "Waiting for a required answer".to_string();
+    jobs::upsert_browser_session(&harness.pool, &account_id, &session).unwrap();
+
+    let intervention = jobs::save_intervention(
+        &harness.pool,
+        &account_id,
+        &Intervention {
+            id: String::new(),
+            application_id: Some(application_id.clone()),
+            kind: "unknown_question".to_string(),
+            status: "open".to_string(),
+            title: "Years of production Rust experience?".to_string(),
+            detail: "This answer will be included in the application packet.".to_string(),
+            choices: Vec::new(),
+            resolution_kind: "answer".to_string(),
+            resume_after_resolution: true,
+            provider: String::new(),
+            provider_message_id: String::new(),
+            expires_at_ms: None,
+            metadata: json!({
+                "receipt": {
+                    "intervention": {
+                        "field": "years_of_rust",
+                        "question": "Years of production Rust experience?"
+                    }
+                }
+            }),
+            created_at_ms: 0,
+            resolved_at_ms: None,
+        },
+    )
+    .unwrap();
+    let access_token =
+        auth::jwt::issue(JWT_SECRET, &account_id, auth::jwt::TokenKind::Access).unwrap();
+
+    let response = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &intervention.id,
+        json!({
+            "status": "resolved",
+            "action": "answer",
+            "answer": "Three years",
+            "remember": true,
+            "scope": "account"
+        }),
+    )
+    .await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "answer resolution failed: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["intervention"]["status"], "resolved");
+    assert_eq!(value["application"]["state"], "awaiting_review");
+    assert!(value["application"]["run_id"].is_null());
+    assert_eq!(value["application"]["answers"][0]["key"], "years of rust");
+    assert_eq!(
+        value["application"]["answers"][0]["question"],
+        "Years of production Rust experience?"
+    );
+    assert_eq!(value["application"]["answers"][0]["value"], "Three years");
+    assert_eq!(
+        value["application"]["receipt"]["final_answers"][0]["value"],
+        "Three years"
+    );
+    assert!(value["local_resume"].is_null());
+    assert_eq!(value["answer_memory"]["value"], "Three years");
+
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert!(application.receipt.get("approved_execution").is_none());
+    assert_eq!(
+        application.receipt["final_answers"][0]["key"],
+        "years of rust"
+    );
+    assert_eq!(
+        application.receipt["final_answers"][0]["value"],
+        "Three years"
+    );
+    assert_eq!(
+        application.receipt["packet_revision"]["reason"],
+        "intervention_answer"
+    );
+    assert_eq!(
+        application.receipt["packet_revision"]["reapproval_required"],
+        true
+    );
+    let session = jobs::list_browser_sessions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.id == run_id)
+        .unwrap();
+    assert_eq!(session.status, "paused");
+    assert_eq!(
+        session.current_step,
+        "Application kit changed; review required"
+    );
+    assert!(!harness
+        .openai
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(
+            |request| request.url.path().contains("/workflows/applications/")
+                && request.url.path().ends_with("/resume")
+        ));
+}
+
+#[tokio::test]
+#[serial]
 async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review() {
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
     const WORKFLOW_TOKEN: &str = "jobs-workflow-test-token";

@@ -29,6 +29,7 @@ import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
+import { applicationAfterInterventionResolution } from "../lib/application-flow";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -217,7 +218,9 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
         scope: answerScope,
         scope_id: scopeId,
       });
-      setSelected((current) => current ? { ...current, state: "queued", updated_at_ms: Date.now() } : current);
+      setSelected((current) => current
+        ? applicationAfterInterventionResolution(current, undefined, "answer", Date.now())
+        : current);
     } catch (cause) {
       setLocalError(errorMessage(cause));
     } finally {
@@ -346,7 +349,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
                         <label><input type="checkbox" checked={rememberAnswer} onChange={(event) => setRememberAnswer(event.target.checked)} /><span><b>Remember this answer</b><small>Reuse it when the same question appears.</small></span></label>
                         {rememberAnswer && <label className="answer-scope"><span>Use for</span><select value={answerScope} onChange={(event) => setAnswerScope(event.target.value as typeof answerScope)}><option value="account">All applications</option>{selectedJob?.track_id && <option value="track">This Career Track</option>}<option value="company">{selectedJob?.company || "This company"} only</option></select></label>}
                       </div>
-                      <button className="button primary compact" disabled={busy || !answer.trim()} onClick={() => void submitInterventionAnswer()}>{busy ? "Saving..." : "Use answer & resume"}<ArrowRight size={15} /></button>
+                      <button className="button primary compact" disabled={busy || !answer.trim()} onClick={() => void submitInterventionAnswer()}>{answerInterventionActionLabel(busy)}<ArrowRight size={15} /></button>
                     </div>
                   : selected.state === "needs_input" && <div className="input-needed"><AlertCircle size={17} /><div><b>Bluey needs you</b><p>{selectedIntervention?.detail || "Open the browser takeover to continue."}</p></div></div>}
                 {selected.state === "awaiting_review" && !selectedRunnerAvailable && (
@@ -640,6 +643,10 @@ export function applicationNeedsReview(application: JobApplication): boolean {
   return ["awaiting_review", "needs_confirmation", "needs_input", "side_effect_unknown"].includes(
     application.state,
   );
+}
+
+export function answerInterventionActionLabel(busy: boolean): string {
+  return busy ? "Saving..." : "Save answer for review";
 }
 
 export function applicationCountFor(filter: string, applications: JobApplication[]): number {

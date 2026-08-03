@@ -1,4 +1,5 @@
 import type {
+  BrowserSession,
   Intervention,
   JobApplication,
   JobPosting,
@@ -8,6 +9,59 @@ import type {
 
 export function runnerEligibleApplications(applications: JobApplication[]): JobApplication[] {
   return applications.filter((application) => application.state === "queued");
+}
+
+export function interventionActionResumesApplication(action: string): boolean {
+  return action === "approve_email_otp" || action === "approve_submission";
+}
+
+export function applicationAfterInterventionResolution(
+  application: JobApplication,
+  returnedApplication: JobApplication | undefined,
+  action: string,
+  updatedAtMs: number,
+): JobApplication {
+  if (action === "answer") {
+    return {
+      ...(returnedApplication || application),
+      state: "awaiting_review",
+      updated_at_ms: returnedApplication?.updated_at_ms || updatedAtMs,
+    };
+  }
+  if (returnedApplication) return returnedApplication;
+  if (!interventionActionResumesApplication(action)) return application;
+  return { ...application, state: "queued", updated_at_ms: updatedAtMs };
+}
+
+export function browserSessionAfterInterventionResolution(
+  session: BrowserSession,
+  action: string,
+  updatedAtMs: number,
+): BrowserSession {
+  if (action === "answer") {
+    return {
+      ...session,
+      status: "paused",
+      current_step: "Application kit changed; review required",
+      updated_at_ms: updatedAtMs,
+    };
+  }
+  if (!interventionActionResumesApplication(action)) return session;
+  return {
+    ...session,
+    status: "queued",
+    current_step: "Resuming application",
+    updated_at_ms: updatedAtMs,
+  };
+}
+
+export function interventionResolutionToast(action: string): string {
+  if (action === "approve_submission") {
+    return "Submission approved. Bluey is completing the application.";
+  }
+  if (action === "approve_email_otp") return "Email code approved. Bluey is resuming.";
+  if (action === "answer") return "Answer saved. The updated application kit requires review.";
+  return "Intervention resolved.";
 }
 
 export function effectiveSubmissionMode(

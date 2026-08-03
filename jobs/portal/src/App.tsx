@@ -34,6 +34,12 @@ import { Onboarding } from "./components/Onboarding";
 import { LoadError, LoadingScreen } from "./components/PageState";
 import { previewPosting, previewResume } from "./lib/preview-application";
 import { runnerAvailabilityOrLocked } from "./lib/runner-access";
+import {
+  applicationAfterInterventionResolution,
+  browserSessionAfterInterventionResolution,
+  interventionActionResumesApplication,
+  interventionResolutionToast,
+} from "./lib/application-flow";
 
 const MatchesView = lazy(() => import("./views/MatchesView").then((module) => ({ default: module.MatchesView })));
 const ApplicationsView = lazy(() => import("./views/ApplicationsView").then((module) => ({ default: module.ApplicationsView })));
@@ -760,7 +766,7 @@ export default function App() {
     resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string },
   ) => {
     const now = Date.now();
-    const approved = action === "approve_email_otp" || action === "approve_submission";
+    const approved = interventionActionResumesApplication(action);
     const result = isPreview
       ? {
           intervention: {
@@ -789,20 +795,21 @@ export default function App() {
         }
       : await jobsApi.resolveIntervention(intervention.id, "resolved", action, resolution);
     const saved = result.intervention;
+    const updatedAtMs = Date.now();
     setWorkspace((current) => current ? {
       ...current,
       interventions: current.interventions.map((item) => item.id === saved.id ? saved : item),
       applications: current.applications.map((application) => application.id === saved.application_id
-        ? result.application || { ...application, state: "queued", updated_at_ms: Date.now() }
+        ? applicationAfterInterventionResolution(application, result.application, action, updatedAtMs)
         : application),
       answer_memory: result.answer_memory
         ? [result.answer_memory, ...current.answer_memory.filter((item) => item.id !== result.answer_memory?.id && !(item.key === result.answer_memory?.key && item.scope === result.answer_memory?.scope && (item.scope_id || "") === (result.answer_memory?.scope_id || "")))]
         : current.answer_memory,
       browser_sessions: current.browser_sessions.map((session) => session.application_id === saved.application_id
-        ? { ...session, status: "queued", current_step: "Resuming application", updated_at_ms: Date.now() }
+        ? browserSessionAfterInterventionResolution(session, action, updatedAtMs)
         : session),
     } : current);
-    setToast(action === "approve_submission" ? "Submission approved. Bluey is completing the application." : action === "approve_email_otp" ? "Email code approved. Bluey is resuming." : resolution?.remember ? "Answer saved. Bluey is resuming." : "Answer sent. Bluey is resuming.");
+    setToast(interventionResolutionToast(action));
   }, []);
 
   if (!isPreview && !accessToken()) return <AuthGate />;

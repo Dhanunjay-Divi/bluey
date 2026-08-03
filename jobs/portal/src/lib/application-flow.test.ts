@@ -1,6 +1,20 @@
 import { describe, expect, it } from "vitest";
-import type { Intervention, JobApplication, JobPosting, RunnerAvailability } from "../types";
-import { effectiveSubmissionMode, isFinalSubmissionReview, runnerEligibleApplications } from "./application-flow";
+import type {
+  BrowserSession,
+  Intervention,
+  JobApplication,
+  JobPosting,
+  RunnerAvailability,
+} from "../types";
+import {
+  applicationAfterInterventionResolution,
+  browserSessionAfterInterventionResolution,
+  effectiveSubmissionMode,
+  interventionActionResumesApplication,
+  interventionResolutionToast,
+  isFinalSubmissionReview,
+  runnerEligibleApplications,
+} from "./application-flow";
 
 const runners = (available: boolean): RunnerAvailability => ({
   local: {
@@ -35,6 +49,17 @@ const application = (state: JobApplication["state"]): JobApplication => ({
   created_at_ms: 1,
   updated_at_ms: 1,
 });
+
+const browserSession: BrowserSession = {
+  id: "browser-1",
+  runner: "cloud",
+  status: "paused",
+  current_company: "Acme",
+  current_step: "Waiting for an answer",
+  application_id: "queued",
+  created_at_ms: 1,
+  updated_at_ms: 1,
+};
 
 const job = (canAutoSubmit: boolean): JobPosting => ({
   id: "job-1",
@@ -84,6 +109,38 @@ describe("application workflow boundaries", () => {
     expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), false)).toBe("review_first");
     expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), true)).toBe("auto_submit");
   });
+
+  it("returns answer-bearing applications to review without resuming the browser", () => {
+    const returned = { ...application("queued"), answers: [{ question: "Why?", value: "Because." }] };
+
+    expect(applicationAfterInterventionResolution(application("needs_input"), returned, "answer", 2))
+      .toMatchObject({ state: "awaiting_review", answers: returned.answers });
+    expect(applicationAfterInterventionResolution(application("needs_input"), undefined, "answer", 2))
+      .toMatchObject({ state: "awaiting_review", updated_at_ms: 2 });
+    expect(browserSessionAfterInterventionResolution(browserSession, "answer", 2)).toMatchObject({
+      status: "paused",
+      current_step: "Application kit changed; review required",
+      updated_at_ms: 2,
+    });
+    expect(interventionActionResumesApplication("answer")).toBe(false);
+    expect(interventionResolutionToast("answer")).toBe(
+      "Answer saved. The updated application kit requires review.",
+    );
+  });
+
+  it.each(["approve_email_otp", "approve_submission"])(
+    "retains resume behavior for %s",
+    (action) => {
+      expect(interventionActionResumesApplication(action)).toBe(true);
+      expect(applicationAfterInterventionResolution(application("needs_input"), undefined, action, 2))
+        .toMatchObject({ state: "queued", updated_at_ms: 2 });
+      expect(browserSessionAfterInterventionResolution(browserSession, action, 2)).toMatchObject({
+        status: "queued",
+        current_step: "Resuming application",
+        updated_at_ms: 2,
+      });
+    },
+  );
 
   it("recognizes only the structured, open final-review intervention", () => {
     const intervention = finalReviewIntervention();

@@ -203,6 +203,467 @@ pub fn save_intervention(
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct InterventionAnswerRevisionResult {
+    pub intervention: Intervention,
+    pub application: JobApplication,
+    pub question: String,
+}
+
+fn prepare_intervention_answer_revision(
+    mut intervention: Intervention,
+    mut application: JobApplication,
+    answer: &str,
+    now: i64,
+) -> Result<(InterventionAnswerRevisionResult, Option<String>)> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        anyhow::bail!("enter the answer Bluey should use")
+    }
+    if answer.len() > 10_000 {
+        anyhow::bail!("application answer is too long")
+    }
+    if intervention.status != "open" {
+        anyhow::bail!("this intervention has already been resolved")
+    }
+    if intervention.resolution_kind != "answer"
+        || !matches!(
+            intervention.kind.as_str(),
+            "unknown_question" | "missing_fact" | "sensitive_question"
+        )
+    {
+        anyhow::bail!("this intervention is not waiting for an application answer")
+    }
+    if application.state != "needs_input" {
+        anyhow::bail!("this application is no longer waiting for an answer")
+    }
+    validate_application_transition(&application.state, "awaiting_review")?;
+
+    let field = intervention
+        .metadata
+        .pointer("/receipt/intervention/field")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::trim);
+    let question = intervention
+        .metadata
+        .pointer("/receipt/intervention/question")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&intervention.title)
+        .trim()
+        .to_string();
+    let answer_key = normalize_answer_memory_key(field.unwrap_or(&question));
+    if answer_key.is_empty() {
+        anyhow::bail!("application question is missing")
+    }
+    let answer_value = json!({
+        "key": answer_key,
+        "question": question,
+        "value": answer,
+        "source": "intervention",
+        "confirmed": true,
+        "intervention_id": intervention.id,
+        "updated_at_ms": now,
+    });
+    let matching_answer = application.answers.iter_mut().find(|candidate| {
+        let existing = candidate
+            .get("key")
+            .or_else(|| candidate.get("question"))
+            .or_else(|| candidate.get("field"))
+            .or_else(|| candidate.get("name"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        normalize_answer_memory_key(existing) == answer_key
+    });
+    if let Some(existing) = matching_answer {
+        *existing = answer_value;
+    } else {
+        application.answers.push(answer_value);
+    }
+
+    let answers = Value::Array(application.answers.clone());
+    let receipt = application.receipt.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("application receipt is unavailable; prepare the packet again")
+    })?;
+    receipt.insert("final_answers".to_string(), answers);
+    let invalidated_checksum = receipt
+        .remove("approved_execution")
+        .and_then(|value| value.get("checksum").cloned())
+        .unwrap_or(Value::Null);
+    let revision = json!({
+        "reason": "intervention_answer",
+        "intervention_id": intervention.id,
+        "revised_at_ms": now,
+        "reapproval_required": true,
+        "invalidated_packet_checksum": invalidated_checksum,
+    });
+    let revisions = receipt
+        .entry("packet_revisions".to_string())
+        .or_insert_with(|| json!([]));
+    let revisions = revisions.as_array_mut().ok_or_else(|| {
+        anyhow::anyhow!("application packet revision history is invalid")
+    })?;
+    revisions.push(revision.clone());
+    receipt.insert("packet_revision".to_string(), revision);
+
+    let metadata = intervention.metadata.as_object_mut().ok_or_else(|| {
+        anyhow::anyhow!("this intervention cannot be answered")
+    })?;
+    metadata.insert("resolved_answer".to_string(), json!(answer));
+    metadata.insert("answered_at_ms".to_string(), json!(now));
+    metadata.insert("reapproval_required".to_string(), json!(true));
+    intervention.status = "resolved".to_string();
+    intervention.resolved_at_ms = Some(now);
+
+    let previous_run_id = application.run_id.take();
+    application.state = "awaiting_review".to_string();
+    application.updated_at_ms = now;
+    Ok((
+        InterventionAnswerRevisionResult {
+            intervention,
+            application,
+            question,
+        },
+        previous_run_id,
+    ))
+}
+
+fn reject_irreversible_answer_revision(
+    lease_phase: Option<&str>,
+    local_ticket_status: Option<&str>,
+) -> Result<()> {
+    if matches!(
+        lease_phase,
+        Some("click_started" | "submitted" | "side_effect_unknown")
+    ) || matches!(
+        local_ticket_status,
+        Some("complete" | "side_effect_unknown")
+    ) {
+        anyhow::bail!(
+            "application submission is awaiting reconciliation; answers cannot change yet"
+        )
+    }
+    Ok(())
+}
+
+pub fn resolve_intervention_answer_for_review(
+    pool: &DbPool,
+    account_id: &str,
+    intervention_id: &str,
+    answer: &str,
+) -> Result<InterventionAnswerRevisionResult> {
+    let account_id = account_id.trim();
+    let intervention_id = intervention_id.trim();
+    if account_id.is_empty() || intervention_id.is_empty() {
+        anyhow::bail!("intervention not found")
+    }
+    let now = now_ms();
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row: Option<(Option<String>, String)> = tx
+                .query_row(
+                    "SELECT application_id, intervention_json FROM jobs_interventions
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, intervention_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((application_id, raw)) = row else {
+                anyhow::bail!("intervention not found")
+            };
+            let application_id = application_id
+                .ok_or_else(|| anyhow::anyhow!("intervention is not attached to an application"))?;
+            let mut intervention: Intervention = parse_json(raw, "intervention")?;
+            intervention.id = intervention_id.to_string();
+            intervention.application_id = Some(application_id.clone());
+            let row: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT job_id, application_json FROM jobs_applications
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, application_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((job_id, raw)) = row else {
+                anyhow::bail!("application not found")
+            };
+            let application = parse_application_json(
+                raw,
+                &application_id,
+                &job_id,
+                "job application",
+            )?;
+            let (revision, previous_run_id) =
+                prepare_intervention_answer_revision(intervention, application, answer, now)?;
+
+            let mut browser_session: Option<BrowserSession> = None;
+            let mut lease_phase: Option<String> = None;
+            let mut local_ticket_status: Option<String> = None;
+            if let Some(run_id) = previous_run_id.as_deref() {
+                lease_phase = tx
+                    .query_row(
+                        "SELECT phase FROM jobs_execution_leases
+                          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                        params![account_id, application_id, run_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                local_ticket_status = tx
+                    .query_row(
+                        "SELECT status FROM jobs_local_run_tickets
+                          WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
+                        params![account_id, application_id, run_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                browser_session = tx
+                    .query_row(
+                        "SELECT session_json FROM jobs_browser_sessions
+                          WHERE account_id = ?1 AND id = ?2",
+                        params![account_id, run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .map(|raw| parse_json(raw, "browser session"))
+                    .transpose()?;
+            }
+            reject_irreversible_answer_revision(
+                lease_phase.as_deref(),
+                local_ticket_status.as_deref(),
+            )?;
+
+            if let Some(run_id) = previous_run_id.as_deref() {
+                if lease_phase.as_deref() == Some("prepared")
+                    && tx.execute(
+                        "UPDATE jobs_execution_leases
+                            SET phase = 'released', updated_at_ms = ?4, finished_at_ms = ?4
+                          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+                            AND phase = 'prepared'",
+                        params![account_id, application_id, run_id, now],
+                    )? != 1
+                {
+                    anyhow::bail!("cloud execution authority changed")
+                }
+                if matches!(
+                    local_ticket_status.as_deref(),
+                    Some("queued" | "claimed" | "needs_input")
+                ) && tx.execute(
+                    "UPDATE jobs_local_run_tickets SET status = 'failed', updated_at_ms = ?4
+                      WHERE account_id = ?1 AND application_id = ?2 AND id = ?3
+                        AND status IN ('queued', 'claimed', 'needs_input')",
+                    params![account_id, application_id, run_id, now],
+                )? != 1
+                {
+                    anyhow::bail!("local execution authority changed")
+                }
+                tx.execute(
+                    "DELETE FROM jobs_local_run_resume_actions
+                      WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+                        AND status = 'approved'",
+                    params![account_id, application_id, run_id],
+                )?;
+                tx.execute(
+                    "UPDATE jobs_attempt_reservations
+                        SET status = 'released', updated_at_ms = ?3
+                      WHERE account_id = ?1 AND application_id = ?2
+                        AND status IN ('reserved', 'running')",
+                    params![account_id, application_id, now],
+                )?;
+                if let Some(mut session) = browser_session {
+                    session.status = "paused".to_string();
+                    session.current_step =
+                        "Application kit changed; review required".to_string();
+                    session.updated_at_ms = now;
+                    let payload = to_json(&session, "browser session")?;
+                    if tx.execute(
+                        "UPDATE jobs_browser_sessions SET status = 'paused',
+                            session_json = ?3, updated_at_ms = ?4
+                          WHERE account_id = ?1 AND id = ?2",
+                        params![account_id, run_id, payload, now],
+                    )? != 1
+                    {
+                        anyhow::bail!("browser session changed")
+                    }
+                }
+            }
+
+            let application_payload = to_json(&revision.application, "job application")?;
+            if tx.execute(
+                "UPDATE jobs_applications SET state = 'awaiting_review',
+                    application_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2 AND state = 'needs_input'",
+                params![account_id, application_id, application_payload, now],
+            )? != 1
+            {
+                anyhow::bail!("application no longer waiting for an answer")
+            }
+            let intervention_payload = to_json(&revision.intervention, "intervention")?;
+            if tx.execute(
+                "UPDATE jobs_interventions SET status = 'resolved',
+                    intervention_json = ?3, resolved_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2 AND status = 'open'",
+                params![account_id, intervention_id, intervention_payload, now],
+            )? != 1
+            {
+                anyhow::bail!("intervention has already been resolved")
+            }
+            tx.commit()?;
+            Ok(revision)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let row = tx.query_opt(
+                "SELECT application_id, intervention_json FROM jobs_interventions
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &intervention_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("intervention not found")
+            };
+            let application_id: Option<String> = row.get(0);
+            let application_id = application_id
+                .ok_or_else(|| anyhow::anyhow!("intervention is not attached to an application"))?;
+            let mut intervention: Intervention = parse_json(row.get(1), "intervention")?;
+            intervention.id = intervention_id.to_string();
+            intervention.application_id = Some(application_id.clone());
+            let row = tx.query_opt(
+                "SELECT job_id, application_json FROM jobs_applications
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &application_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("application not found")
+            };
+            let job_id: String = row.get(0);
+            let application = parse_application_json(
+                row.get(1),
+                &application_id,
+                &job_id,
+                "job application",
+            )?;
+            let (revision, previous_run_id) =
+                prepare_intervention_answer_revision(intervention, application, answer, now)?;
+
+            let mut browser_session: Option<BrowserSession> = None;
+            let mut lease_phase: Option<String> = None;
+            let mut local_ticket_status: Option<String> = None;
+            if let Some(run_id) = previous_run_id.as_deref() {
+                lease_phase = tx
+                    .query_opt(
+                        "SELECT phase FROM jobs_execution_leases
+                          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                          FOR UPDATE",
+                        &[&account_id, &application_id, &run_id],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                local_ticket_status = tx
+                    .query_opt(
+                        "SELECT status FROM jobs_local_run_tickets
+                          WHERE account_id = $1 AND application_id = $2 AND id = $3
+                          FOR UPDATE",
+                        &[&account_id, &application_id, &run_id],
+                    )?
+                    .map(|row| row.get::<_, String>(0));
+                browser_session = tx
+                    .query_opt(
+                        "SELECT session_json FROM jobs_browser_sessions
+                          WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                        &[&account_id, &run_id],
+                    )?
+                    .map(|row| parse_json(row.get(0), "browser session"))
+                    .transpose()?;
+            }
+            reject_irreversible_answer_revision(
+                lease_phase.as_deref(),
+                local_ticket_status.as_deref(),
+            )?;
+
+            if let Some(run_id) = previous_run_id.as_deref() {
+                if lease_phase.as_deref() == Some("prepared")
+                    && tx.execute(
+                        "UPDATE jobs_execution_leases
+                            SET phase = 'released', updated_at_ms = $4, finished_at_ms = $4
+                          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                            AND phase = 'prepared'",
+                        &[&account_id, &application_id, &run_id, &now],
+                    )? != 1
+                {
+                    anyhow::bail!("cloud execution authority changed")
+                }
+                if matches!(
+                    local_ticket_status.as_deref(),
+                    Some("queued" | "claimed" | "needs_input")
+                ) && tx.execute(
+                    "UPDATE jobs_local_run_tickets SET status = 'failed', updated_at_ms = $4
+                      WHERE account_id = $1 AND application_id = $2 AND id = $3
+                        AND status IN ('queued', 'claimed', 'needs_input')",
+                    &[&account_id, &application_id, &run_id, &now],
+                )? != 1
+                {
+                    anyhow::bail!("local execution authority changed")
+                }
+                tx.execute(
+                    "DELETE FROM jobs_local_run_resume_actions
+                      WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                        AND status = 'approved'",
+                    &[&account_id, &application_id, &run_id],
+                )?;
+                tx.execute(
+                    "UPDATE jobs_attempt_reservations
+                        SET status = 'released', updated_at_ms = $3
+                      WHERE account_id = $1 AND application_id = $2
+                        AND status IN ('reserved', 'running')",
+                    &[&account_id, &application_id, &now],
+                )?;
+                if let Some(mut session) = browser_session {
+                    session.status = "paused".to_string();
+                    session.current_step =
+                        "Application kit changed; review required".to_string();
+                    session.updated_at_ms = now;
+                    let payload = to_json(&session, "browser session")?;
+                    if tx.execute(
+                        "UPDATE jobs_browser_sessions SET status = 'paused',
+                            session_json = $3, updated_at_ms = $4
+                          WHERE account_id = $1 AND id = $2",
+                        &[&account_id, &run_id, &payload, &now],
+                    )? != 1
+                    {
+                        anyhow::bail!("browser session changed")
+                    }
+                }
+            }
+
+            let application_payload = to_json(&revision.application, "job application")?;
+            if tx.execute(
+                "UPDATE jobs_applications SET state = 'awaiting_review',
+                    application_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2 AND state = 'needs_input'",
+                &[&account_id, &application_id, &application_payload, &now],
+            )? != 1
+            {
+                anyhow::bail!("application no longer waiting for an answer")
+            }
+            let intervention_payload = to_json(&revision.intervention, "intervention")?;
+            if tx.execute(
+                "UPDATE jobs_interventions SET status = 'resolved',
+                    intervention_json = $3, resolved_at_ms = $4
+                  WHERE account_id = $1 AND id = $2 AND status = 'open'",
+                &[&account_id, &intervention_id, &intervention_payload, &now],
+            )? != 1
+            {
+                anyhow::bail!("intervention has already been resolved")
+            }
+            tx.commit()?;
+            Ok(revision)
+        }
+    })
+}
+
 pub fn normalize_answer_memory_key(value: &str) -> String {
     let mut normalized = String::with_capacity(value.len());
     let mut pending_space = false;

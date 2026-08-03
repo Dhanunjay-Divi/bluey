@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { JobApplication, JobEligibilityDecision, RunnerAvailability } from "../types";
 import {
+  answerInterventionActionLabel,
   applicationCountFor,
   applicationNeedsReview,
   hasAvailableRunner,
@@ -91,5 +92,12 @@ describe("uncertain submission review", () => {
 
     expect(applicationNeedsReview(uncertain)).toBe(true);
     expect(applicationCountFor("review", [uncertain, application("submitted")])).toBe(1);
+  });
+});
+
+describe("answer intervention review", () => {
+  it("labels the answer action as a save-for-review step", () => {
+    expect(answerInterventionActionLabel(false)).toBe("Save answer for review");
+    expect(answerInterventionActionLabel(true)).toBe("Saving...");
   });
 });

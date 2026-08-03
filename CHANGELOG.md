@@ -62,6 +62,10 @@ under `docs/release/`.
 
 ### Fixed
 
+- Prevented intervention answers from resuming an application under an obsolete
+  approved packet. Answer changes now revise the stored packet and receipt,
+  invalidate prior execution approval, fence cloud and local runner authority,
+  release the active attempt, and return the application to explicit review.
 - Restricted employer-facing final submission to exact-version provider state
   machines. Generic ATS and semantic adapters now stop at review or takeover,
   spoofed provider hosts fail closed, and adapter output alone cannot forge a

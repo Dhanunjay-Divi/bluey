@@ -1594,7 +1594,7 @@ fn validate_application_transition(current: &str, next: &str) -> Result<()> {
         ),
         "needs_input" => matches!(
             next,
-            "queued" | "running" | "side_effect_unknown" | "failed"
+            "awaiting_review" | "queued" | "running" | "side_effect_unknown" | "failed"
         ),
         "side_effect_unknown" => matches!(next, "needs_input" | "submitted" | "failed"),
         "failed" => matches!(next, "queued" | "awaiting_review"),

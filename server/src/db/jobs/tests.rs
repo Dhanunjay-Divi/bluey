@@ -568,6 +568,41 @@ mod tests {
         (application, run_id, ticket_hash, identity_id)
     }
 
+    fn answer_intervention_fixture(
+        pool: &DbPool,
+        application_id: &str,
+        suffix: &str,
+    ) -> Intervention {
+        save_intervention(
+            pool,
+            "acct-jobs",
+            &Intervention {
+                id: format!("answer-intervention-{suffix}"),
+                application_id: Some(application_id.to_string()),
+                kind: "unknown_question".to_string(),
+                status: "open".to_string(),
+                title: "Are you willing to travel?".to_string(),
+                detail: "The employer requires an answer before continuing.".to_string(),
+                choices: vec!["Yes".to_string(), "No".to_string()],
+                resolution_kind: "answer".to_string(),
+                resume_after_resolution: true,
+                provider: "greenhouse".to_string(),
+                provider_message_id: format!("provider-message-{suffix}"),
+                expires_at_ms: None,
+                metadata: json!({
+                    "receipt": {
+                        "intervention": {
+                            "field": "Are you willing to travel?"
+                        }
+                    }
+                }),
+                created_at_ms: 0,
+                resolved_at_ms: None,
+            },
+        )
+        .unwrap()
+    }
+
     fn discovered_job(external_id: &str, title: &str) -> DiscoveredJobInput {
         DiscoveredJobInput {
             external_id: external_id.to_string(),
@@ -8577,5 +8612,356 @@ mod tests {
         .unwrap();
         assert_eq!(stored.writer_run_id, run_id);
         assert_eq!(stored.writer_fence, replacement.fence);
+    }
+
+    #[test]
+    fn intervention_answer_revises_cloud_packet_and_requires_review() {
+        let pool = test_pool();
+        let (mut application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "answer-cloud");
+        application
+            .receipt
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "approved_execution".to_string(),
+                json!({"schema_version": 2, "checksum": "approved-cloud-checksum"}),
+            );
+        application = replace_application_receipt(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt,
+        )
+        .unwrap()
+        .unwrap();
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "answer-worker",
+        )
+        .unwrap();
+        assert_eq!(lease.phase, "prepared");
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running")
+            .unwrap();
+        application = update_application(&pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        application = update_application(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "needs_input",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        upsert_browser_session(
+            &pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "cloud".to_string(),
+                status: "needs_input".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Waiting for an application answer".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: Some("https://takeover.example.test/session".to_string()),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let intervention =
+            answer_intervention_fixture(&pool, &application.id, "answer-cloud");
+
+        let revision = resolve_intervention_answer_for_review(
+            &pool,
+            "acct-jobs",
+            &intervention.id,
+            "Yes, up to 25%.",
+        )
+        .unwrap();
+
+        assert_eq!(revision.application.state, "awaiting_review");
+        assert_eq!(revision.application.run_id, None);
+        assert_eq!(revision.question, "Are you willing to travel?");
+        assert!(revision.application.receipt.get("approved_execution").is_none());
+        assert_eq!(
+            revision
+                .application
+                .receipt
+                .pointer("/packet_revision/invalidated_packet_checksum")
+                .and_then(Value::as_str),
+            Some("approved-cloud-checksum")
+        );
+        assert_eq!(
+            revision
+                .application
+                .receipt
+                .pointer("/packet_revision/reapproval_required")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            revision
+                .application
+                .receipt
+                .pointer("/final_answers/0/value")
+                .and_then(Value::as_str),
+            Some("Yes, up to 25%.")
+        );
+        assert_eq!(
+            revision
+                .application
+                .receipt
+                .pointer("/packet_revisions/0/intervention_id")
+                .and_then(Value::as_str),
+            Some(intervention.id.as_str())
+        );
+
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "awaiting_review");
+        assert_eq!(stored.run_id, None);
+        let interventions = list_interventions(&pool, "acct-jobs").unwrap();
+        let stored_intervention = interventions
+            .iter()
+            .find(|item| item.id == intervention.id)
+            .unwrap();
+        assert_eq!(stored_intervention.status, "resolved");
+        assert_eq!(
+            stored_intervention
+                .metadata
+                .get("resolved_answer")
+                .and_then(Value::as_str),
+            Some("Yes, up to 25%.")
+        );
+        let lease_phase: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT phase FROM jobs_execution_leases WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_phase, "released");
+        assert_eq!(
+            list_attempt_reservations(&pool, "acct-jobs").unwrap()[0].status,
+            "released"
+        );
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == run_id)
+            .unwrap();
+        assert_eq!(session.status, "paused");
+        assert_eq!(
+            session.current_step,
+            "Application kit changed; review required"
+        );
+    }
+
+    #[test]
+    fn intervention_answer_revises_local_packet_and_invalidates_ticket() {
+        let pool = test_pool();
+        let (mut application, run_id, ticket_hash, _) =
+            local_run_authority_fixture(&pool, "answer-local");
+        application
+            .receipt
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "approved_execution".to_string(),
+                json!({"schema_version": 2, "checksum": "approved-local-checksum"}),
+            );
+        application = replace_application_receipt(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(update_local_run_ticket_status(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "needs_input"
+        )
+        .unwrap());
+        application = update_application(&pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        application = update_application(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "needs_input",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        upsert_browser_session(
+            &pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "local".to_string(),
+                status: "needs_input".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Waiting for an application answer".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let intervention =
+            answer_intervention_fixture(&pool, &application.id, "answer-local");
+
+        let revision = resolve_intervention_answer_for_review(
+            &pool,
+            "acct-jobs",
+            &intervention.id,
+            "No",
+        )
+        .unwrap();
+
+        assert_eq!(revision.application.state, "awaiting_review");
+        assert_eq!(revision.application.run_id, None);
+        assert!(revision.application.receipt.get("approved_execution").is_none());
+        let ticket_status: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "failed");
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == run_id)
+            .unwrap();
+        assert_eq!(session.status, "paused");
+    }
+
+    #[test]
+    fn intervention_answer_is_rejected_after_submission_click_started() {
+        let pool = test_pool();
+        let (mut application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "answer-after-click");
+        application
+            .receipt
+            .as_object_mut()
+            .unwrap()
+            .insert(
+                "approved_execution".to_string(),
+                json!({"schema_version": 2, "checksum": "approved-click-checksum"}),
+            );
+        application = replace_application_receipt(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt,
+        )
+        .unwrap()
+        .unwrap();
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "click-worker",
+        )
+        .unwrap();
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running")
+            .unwrap();
+        application = update_application(&pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+        )
+        .unwrap();
+        application = update_application(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "needs_input",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        upsert_browser_session(
+            &pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "cloud".to_string(),
+                status: "needs_input".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Submission outcome needs reconciliation".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let intervention =
+            answer_intervention_fixture(&pool, &application.id, "answer-after-click");
+
+        let error = resolve_intervention_answer_for_review(
+            &pool,
+            "acct-jobs",
+            &intervention.id,
+            "Yes",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("awaiting reconciliation"));
+
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "needs_input");
+        assert_eq!(stored.run_id.as_deref(), Some(run_id.as_str()));
+        assert!(stored.receipt.get("approved_execution").is_some());
+        assert!(stored.receipt.get("packet_revision").is_none());
+        let stored_intervention = list_interventions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == intervention.id)
+            .unwrap();
+        assert_eq!(stored_intervention.status, "open");
+        let lease_phase: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT phase FROM jobs_execution_leases WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_phase, "click_started");
+        assert_eq!(
+            list_attempt_reservations(&pool, "acct-jobs").unwrap()[0].status,
+            "running"
+        );
     }
 }

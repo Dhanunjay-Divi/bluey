@@ -2487,7 +2487,7 @@ pub async fn update_intervention(
         .ok_or((StatusCode::NOT_FOUND, "Intervention not found.".to_string()))?;
     let mut updated = intervention;
     let action = req.action.trim().to_ascii_lowercase();
-    let mut remembered_answer = None;
+    let remembered_answer = None;
     let original_status = updated.status.clone();
     updated.status = req.status.trim().to_ascii_lowercase();
     if action == "approve_email_otp" {
@@ -2570,35 +2570,49 @@ pub async fn update_intervention(
         if answer.len() > 10_000 {
             return bad_request("That answer is too long.");
         }
-        let answered_at_ms = jobs::now_ms();
-        let metadata = updated.metadata.as_object_mut().ok_or((
-            StatusCode::BAD_REQUEST,
-            "This intervention cannot be answered.".to_string(),
-        ))?;
-        metadata.insert("resolved_answer".to_string(), serde_json::json!(answer));
-        metadata.insert(
-            "answered_at_ms".to_string(),
-            serde_json::json!(answered_at_ms),
-        );
-        updated.status = "resolved".to_string();
+        let scope = if req.scope.trim().is_empty() {
+            "account".to_string()
+        } else {
+            req.scope.trim().to_ascii_lowercase()
+        };
+        let scope_id = req
+            .scope_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         if req.remember {
-            let question = updated
-                .metadata
-                .pointer("/receipt/intervention/field")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .unwrap_or(&updated.title);
+            if !matches!(scope.as_str(), "account" | "track" | "company") {
+                return bad_request("Choose where this answer should be reused.");
+            }
+            if scope != "account" && scope_id.is_none() {
+                return bad_request("Choose where this answer should be reused.");
+            }
+            if scope == "track"
+                && !jobs::list_tracks(&state.pool, &account.id)
+                    .map_err(internal)?
+                    .iter()
+                    .any(|track| Some(track.id.as_str()) == scope_id.as_deref())
+            {
+                return bad_request("Career track not found.");
+            }
+        }
+
+        let revision = jobs::resolve_intervention_answer_for_review(
+            &state.pool,
+            &account.id,
+            &intervention_id,
+            answer,
+        )
+        .map_err(domain_error)?;
+        let remembered_answer = if req.remember {
             let memory = AnswerMemory {
                 id: String::new(),
                 key: String::new(),
-                question: question.to_string(),
+                question: revision.question.clone(),
                 value: answer.to_string(),
-                scope: if req.scope.trim().is_empty() {
-                    "account".to_string()
-                } else {
-                    req.scope.clone()
-                },
-                scope_id: req.scope_id.clone(),
+                scope,
+                scope_id,
                 confirmed: true,
                 source: "intervention".to_string(),
                 created_at_ms: 0,
@@ -2606,30 +2620,47 @@ pub async fn update_intervention(
                 last_used_at_ms: None,
                 use_count: 0,
             };
-            remembered_answer = Some(
-                jobs::save_answer_memory(&state.pool, &account.id, &memory)
-                    .map_err(domain_error)?,
-            );
-        }
+            match jobs::save_answer_memory(&state.pool, &account.id, &memory) {
+                Ok(memory) => Some(memory),
+                Err(error) => {
+                    tracing::error!(
+                        application_id = %revision.application.id,
+                        intervention_id = %revision.intervention.id,
+                        error = %error,
+                        "Bluey Jobs saved an intervention answer but could not update answer memory"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        return Ok(Json(InterventionResolutionResult {
+            intervention: revision.intervention,
+            answer_memory: remembered_answer,
+            application: Some(revision.application),
+            local_resume: None,
+        }));
     }
     let mut saved = if action == "approve_submission" {
         Some(jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?)
     } else {
         None
     };
-    let resumed_application = if !action.is_empty()
-        && updated.resume_after_resolution
-        && matches!(updated.status.as_str(), "approved" | "resolved")
-    {
-        if let Some(application_id) = updated.application_id.as_deref() {
-            jobs::update_application(&state.pool, &account.id, application_id, "queued", None)
-                .map_err(domain_error)?
+    let resumed_application =
+        if matches!(action.as_str(), "approve_email_otp" | "approve_submission")
+            && updated.resume_after_resolution
+            && matches!(updated.status.as_str(), "approved" | "resolved")
+        {
+            if let Some(application_id) = updated.application_id.as_deref() {
+                jobs::update_application(&state.pool, &account.id, application_id, "queued", None)
+                    .map_err(domain_error)?
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
     let mut saved = match saved.take() {
         Some(saved) => saved,
         None => jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?,
@@ -2676,13 +2707,8 @@ pub async fn update_intervention(
                 };
                 local_resume = Some(approved);
             } else {
-                let answer = if action == "approve_submission" {
-                    ""
-                } else {
-                    req.answer.trim()
-                };
                 if let Err(error) =
-                    signal_workflow_resume(&account.id, run_id, &action, field, answer).await
+                    signal_workflow_resume(&account.id, run_id, &action, field, "").await
                 {
                     tracing::error!(error = %error.1, "Bluey Jobs workflow resume failed");
                     saved.status = "open".to_string();
@@ -5712,6 +5738,11 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("daily application limit")
         || message.contains("active application attempt")
         || message.contains("application attempt")
+        || message.contains("already been resolved")
+        || message.contains("no longer waiting for an answer")
+        || message.contains("awaiting reconciliation")
+        || message.contains("execution authority changed")
+        || message.contains("application packet revision history is invalid")
         || message.contains("communication action cannot")
         || message.contains("communication action idempotency key was reused")
     {
