@@ -59,6 +59,11 @@ under `docs/release/`.
 
 ### Fixed
 
+- Verified generated DOCX application kits before release: Bluey now preserves
+  source package order, compression, permissions, timestamps, relationships,
+  styles, numbering, headers, footers, and media; rejects duplicate or invalid
+  package parts and normalized no-op rewrites; and reopens every tailored file
+  to prove that only the intended document text changed.
 - Prevented cloud and local browser retries from converting an uncertain
   employer-facing submission into a duplicate application or false Submitted
   state; the application now remains blocked until either trusted receipt

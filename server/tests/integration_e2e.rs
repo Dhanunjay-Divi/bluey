@@ -1040,13 +1040,8 @@ fn prepare_cloud_submission(
     jobs::update_application(&harness.pool, account_id, application_id, "running", None)
         .unwrap()
         .unwrap();
-    jobs::update_attempt_reservation_status(
-        &harness.pool,
-        account_id,
-        application_id,
-        "running",
-    )
-    .unwrap();
+    jobs::update_attempt_reservation_status(&harness.pool, account_id, application_id, "running")
+        .unwrap();
     let lease = jobs::claim_execution_lease(
         &harness.pool,
         account_id,
@@ -1085,15 +1080,9 @@ fn prepare_cloud_side_effect_unknown(
     browser_profile_id: &str,
 ) {
     jobs::reserve_application_attempt(&harness.pool, account_id, application_id, "cloud").unwrap();
-    jobs::update_application(
-        &harness.pool,
-        account_id,
-        application_id,
-        "running",
-        None,
-    )
-    .unwrap()
-    .unwrap();
+    jobs::update_application(&harness.pool, account_id, application_id, "running", None)
+        .unwrap()
+        .unwrap();
     let lease = jobs::claim_execution_lease(
         &harness.pool,
         account_id,
@@ -1636,8 +1625,7 @@ async fn jobs_cloud_side_effect_unknown_can_be_reconciled_not_submitted() {
     assert_eq!(session.current_step, "Confirmed not submitted");
 
     let receipt = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
-    let late_receipt =
-        post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &receipt).await;
+    let late_receipt = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &receipt).await;
     assert_eq!(late_receipt.status(), StatusCode::CONFLICT);
     std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
 }

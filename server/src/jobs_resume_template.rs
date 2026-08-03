@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, bail, Context, Result};
 use quick_xml::{events::Event, Reader, Writer};
 use serde_json::Value;
-use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
+use zip::{write::SimpleFileOptions, CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
 const DOCUMENT_XML: &str = "word/document.xml";
 const MAX_REWRITES: usize = 64;
@@ -30,12 +30,13 @@ enum XmlChunk {
     Paragraph(Vec<Event<'static>>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ZipEntry {
     name: String,
     bytes: Vec<u8>,
     compression: CompressionMethod,
     unix_mode: Option<u32>,
+    last_modified: Option<DateTime>,
     is_dir: bool,
 }
 
@@ -47,13 +48,23 @@ pub fn patch_docx(source: &[u8], diff: &Value) -> Result<Vec<u8>> {
         return Ok(source.to_vec());
     }
 
-    let mut archive = ZipArchive::new(Cursor::new(source)).context("open source DOCX")?;
-    if archive.by_name("[Content_Types].xml").is_err() {
-        bail!("source file is not a valid DOCX package");
-    }
+    let source_entries = read_docx_entries(source)?;
+    validate_source_package(&source_entries)?;
+    let mut tailored_entries = source_entries.clone();
+    let document = tailored_entries
+        .iter_mut()
+        .find(|entry| entry.name == DOCUMENT_XML)
+        .ok_or_else(|| anyhow!("source DOCX does not contain word/document.xml"))?;
+    document.bytes = patch_document_xml(&document.bytes, &replacements)?;
 
+    let output = write_docx_entries(&tailored_entries)?;
+    verify_tailored_package(&source_entries, &output, &replacements)?;
+    Ok(output)
+}
+
+fn read_docx_entries(source: &[u8]) -> Result<Vec<ZipEntry>> {
+    let mut archive = ZipArchive::new(Cursor::new(source)).context("open DOCX package")?;
     let mut entries = Vec::with_capacity(archive.len());
-    let mut found_document = false;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index).context("read DOCX entry")?;
         let name = entry.name().to_string();
@@ -61,27 +72,43 @@ pub fn patch_docx(source: &[u8], diff: &Value) -> Result<Vec<u8>> {
         entry
             .read_to_end(&mut bytes)
             .with_context(|| format!("read DOCX entry {name}"))?;
-        if name == DOCUMENT_XML {
-            bytes = patch_document_xml(&bytes, &replacements)?;
-            found_document = true;
-        }
         entries.push(ZipEntry {
             name,
             bytes,
             compression: entry.compression(),
             unix_mode: entry.unix_mode(),
+            last_modified: entry.last_modified(),
             is_dir: entry.is_dir(),
         });
     }
-    if !found_document {
+    Ok(entries)
+}
+
+fn validate_source_package(entries: &[ZipEntry]) -> Result<()> {
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        if !names.insert(entry.name.as_str()) {
+            bail!("source DOCX contains a duplicate package entry");
+        }
+    }
+    if !names.contains("[Content_Types].xml") {
+        bail!("source file is not a valid DOCX package");
+    }
+    if !names.contains(DOCUMENT_XML) {
         bail!("source DOCX does not contain word/document.xml");
     }
+    Ok(())
+}
 
+fn write_docx_entries(entries: &[ZipEntry]) -> Result<Vec<u8>> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     for entry in entries {
         let mut options = SimpleFileOptions::default().compression_method(entry.compression);
         if let Some(mode) = entry.unix_mode {
             options = options.unix_permissions(mode);
+        }
+        if let Some(last_modified) = entry.last_modified {
+            options = options.last_modified_time(last_modified);
         }
         if entry.is_dir {
             writer
@@ -100,6 +127,120 @@ pub fn patch_docx(source: &[u8], diff: &Value) -> Result<Vec<u8>> {
         .finish()
         .context("finish tailored DOCX")?
         .into_inner())
+}
+
+fn verify_tailored_package(
+    source_entries: &[ZipEntry],
+    output: &[u8],
+    replacements: &[Replacement],
+) -> Result<()> {
+    let output_entries = read_docx_entries(output).context("reopen tailored DOCX")?;
+    validate_source_package(&output_entries).context("validate tailored DOCX package")?;
+    if output_entries.len() != source_entries.len() {
+        bail!("tailored DOCX changed the package entry count");
+    }
+
+    for (source, tailored) in source_entries.iter().zip(&output_entries) {
+        if source.name != tailored.name {
+            bail!("tailored DOCX changed package entry order or names");
+        }
+        if source.compression != tailored.compression || source.is_dir != tailored.is_dir {
+            bail!("tailored DOCX changed package entry metadata");
+        }
+        if let Some(source_mode) = source.unix_mode {
+            let tailored_mode = tailored
+                .unix_mode
+                .ok_or_else(|| anyhow!("tailored DOCX removed package entry permissions"))?;
+            if source_mode & 0o777 != tailored_mode & 0o777 {
+                bail!("tailored DOCX changed package entry permissions");
+            }
+        }
+        if source.last_modified.is_some() && source.last_modified != tailored.last_modified {
+            bail!("tailored DOCX changed package entry timestamps");
+        }
+        if source.name != DOCUMENT_XML && source.bytes != tailored.bytes {
+            bail!("tailored DOCX changed a non-document package part");
+        }
+    }
+
+    let source_document = source_entries
+        .iter()
+        .find(|entry| entry.name == DOCUMENT_XML)
+        .ok_or_else(|| anyhow!("source DOCX does not contain word/document.xml"))?;
+    let tailored_document = output_entries
+        .iter()
+        .find(|entry| entry.name == DOCUMENT_XML)
+        .ok_or_else(|| anyhow!("tailored DOCX does not contain word/document.xml"))?;
+    verify_document_rewrites(
+        &source_document.bytes,
+        &tailored_document.bytes,
+        replacements,
+    )
+}
+
+fn verify_document_rewrites(
+    source: &[u8],
+    tailored: &[u8],
+    replacements: &[Replacement],
+) -> Result<()> {
+    let source_paragraphs = paragraph_values(source)?;
+    let tailored_paragraphs = paragraph_values(tailored)?;
+    if source_paragraphs.len() != tailored_paragraphs.len() {
+        bail!("tailored DOCX changed the document paragraph count");
+    }
+
+    let expected_rewrites = replacements
+        .iter()
+        .map(|replacement| {
+            (
+                normalize_text(&replacement.before),
+                normalize_text(&replacement.after),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for (source_value, tailored_value) in source_paragraphs.iter().zip(&tailored_paragraphs) {
+        if let Some(expected) = expected_rewrites.get(source_value) {
+            if tailored_value != expected {
+                bail!("tailored DOCX did not apply the expected paragraph rewrite");
+            }
+        } else if tailored_value != source_value {
+            bail!("tailored DOCX changed an unrelated paragraph");
+        }
+    }
+
+    for replacement in replacements {
+        let before = normalize_text(&replacement.before);
+        let after = normalize_text(&replacement.after);
+        if tailored_paragraphs
+            .iter()
+            .filter(|value| value.as_str() == before.as_str())
+            .count()
+            != 0
+        {
+            bail!("tailored DOCX retained a source bullet selected for replacement");
+        }
+        if tailored_paragraphs
+            .iter()
+            .filter(|value| value.as_str() == after.as_str())
+            .count()
+            != 1
+        {
+            bail!("tailored DOCX did not materialize one exact replacement bullet");
+        }
+    }
+    Ok(())
+}
+
+fn paragraph_values(source: &[u8]) -> Result<Vec<String>> {
+    parse_document_chunks(source)?
+        .into_iter()
+        .filter_map(|chunk| match chunk {
+            XmlChunk::Paragraph(events) => {
+                Some(paragraph_text(&events).map(|value| normalize_text(&value)))
+            }
+            XmlChunk::Raw(_) => None,
+        })
+        .collect()
 }
 
 fn replacements_from_diff(diff: &Value) -> Result<Vec<Replacement>> {
@@ -134,7 +275,8 @@ fn replacements_from_diff(diff: &Value) -> Result<Vec<Replacement>> {
         {
             bail!("resume rewrite contains an empty evidence ID");
         }
-        if before.is_empty() || after.is_empty() || before == after {
+        if before.is_empty() || after.is_empty() || normalize_text(before) == normalize_text(after)
+        {
             bail!("resume rewrite must contain distinct source and replacement text");
         }
         if before.len() > MAX_BULLET_BYTES || after.len() > MAX_BULLET_BYTES {
@@ -297,6 +439,89 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn write_entry(
+        writer: &mut ZipWriter<Cursor<Vec<u8>>>,
+        name: &str,
+        bytes: &[u8],
+        options: SimpleFileOptions,
+    ) {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+
+    fn package_docx(document: &str, include_full_package: bool) -> Vec<u8> {
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        let last_modified = DateTime::from_date_and_time(2026, 7, 21, 14, 32, 10).unwrap();
+        let deflated = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Deflated)
+            .unix_permissions(0o644)
+            .last_modified_time(last_modified);
+        let stored = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .unix_permissions(0o644)
+            .last_modified_time(last_modified);
+
+        write_entry(
+            &mut writer,
+            "[Content_Types].xml",
+            b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>",
+            deflated,
+        );
+        if include_full_package {
+            write_entry(
+                &mut writer,
+                "_rels/.rels",
+                b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "docProps/core.xml",
+                b"<cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\"/>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "word/_rels/document.xml.rels",
+                b"<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"/>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "word/styles.xml",
+                b"<w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:style w:styleId=\"ResumeBody\"/></w:styles>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "word/numbering.xml",
+                b"<w:numbering xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"/>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "word/header1.xml",
+                b"<w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:p><w:r><w:t>Candidate</w:t></w:r></w:p></w:hdr>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "word/footer1.xml",
+                b"<w:ftr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:p><w:r><w:t>Page 1</w:t></w:r></w:p></w:ftr>",
+                deflated,
+            );
+            write_entry(
+                &mut writer,
+                "word/media/image1.png",
+                b"\x89PNG\r\n\x1a\nbluey-resume-fixture",
+                stored,
+            );
+        }
+        write_entry(&mut writer, DOCUMENT_XML, document.as_bytes(), deflated);
+        writer.finish().unwrap().into_inner()
+    }
+
     fn source_docx(paragraphs: &[&str]) -> Vec<u8> {
         let body = paragraphs
             .iter()
@@ -305,18 +530,23 @@ mod tests {
         let document = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body>{body}</w:body></w:document>"#
         );
-        let cursor = Cursor::new(Vec::new());
-        let mut writer = ZipWriter::new(cursor);
-        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-        writer.start_file("[Content_Types].xml", options).unwrap();
-        writer
-            .write_all(
-                b"<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"/>",
-            )
-            .unwrap();
-        writer.start_file(DOCUMENT_XML, options).unwrap();
-        writer.write_all(document.as_bytes()).unwrap();
-        writer.finish().unwrap().into_inner()
+        package_docx(&document, false)
+    }
+
+    fn rich_source_docx() -> Vec<u8> {
+        let document = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Experience</w:t></w:r></w:p>
+    <w:p>
+      <w:pPr><w:pStyle w:val="ListBullet"/><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr>
+      <w:r><w:rPr><w:b/></w:rPr><w:t xml:space="preserve">Built reliable </w:t></w:r>
+      <w:r><w:rPr><w:i/></w:rPr><w:t>APIs</w:t></w:r>
+    </w:p>
+    <w:p><w:r><w:t>January 2021 - Present</w:t></w:r></w:p>
+  </w:body>
+</w:document>"#;
+        package_docx(document, true)
     }
 
     fn diff(before: &str, after: &str) -> Value {
@@ -390,5 +620,80 @@ mod tests {
             }]
         });
         assert!(patch_docx(&source, &diff).is_err());
+    }
+
+    #[test]
+    fn preserves_full_package_and_split_run_formatting() {
+        let source = rich_source_docx();
+        let source_entries = read_docx_entries(&source).unwrap();
+        let output = patch_docx(
+            &source,
+            &diff(
+                "Built reliable APIs",
+                "Built reliable APIs & event pipelines for payment workloads",
+            ),
+        )
+        .unwrap();
+        let output_entries = read_docx_entries(&output).unwrap();
+
+        assert_eq!(source_entries.len(), output_entries.len());
+        for (before, after) in source_entries.iter().zip(&output_entries) {
+            assert_eq!(before.name, after.name);
+            assert_eq!(before.compression, after.compression);
+            assert_eq!(before.is_dir, after.is_dir);
+            assert_eq!(before.last_modified, after.last_modified);
+            assert_eq!(
+                before.unix_mode.map(|mode| mode & 0o777),
+                after.unix_mode.map(|mode| mode & 0o777)
+            );
+            if before.name != DOCUMENT_XML {
+                assert_eq!(before.bytes, after.bytes, "changed {}", before.name);
+            }
+        }
+
+        let xml = document_xml(&output);
+        assert!(xml.contains("w:val=\"ListBullet\""));
+        assert!(xml.contains("<w:b"));
+        assert!(xml.contains("<w:i"));
+        assert!(xml.contains("payment workloads"));
+        assert!(xml.contains("&amp;"));
+        assert_eq!(
+            paragraph_values(xml.as_bytes()).unwrap(),
+            vec![
+                "Experience",
+                "Built reliable APIs & event pipelines for payment workloads",
+                "January 2021 - Present"
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_normalized_no_op_rewrite() {
+        let source = source_docx(&["Built reliable APIs"]);
+        assert!(patch_docx(
+            &source,
+            &diff("Built reliable APIs", "  Built   reliable APIs  "),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn verifier_rejects_unrelated_paragraph_changes() {
+        let source = source_docx(&["Capital One", "Software Engineer", "Built reliable APIs"]);
+        let source_xml = document_xml(&source);
+        let tailored_xml = source_xml
+            .replace(">Software Engineer<", ">Data Engineer<")
+            .replace(">Built reliable APIs<", ">Built reliable payment APIs<");
+        let replacements =
+            replacements_from_diff(&diff("Built reliable APIs", "Built reliable payment APIs"))
+                .unwrap();
+
+        let error = verify_document_rewrites(
+            source_xml.as_bytes(),
+            tailored_xml.as_bytes(),
+            &replacements,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unrelated paragraph"));
     }
 }
