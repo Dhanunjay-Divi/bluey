@@ -22,6 +22,10 @@ import {
 } from "@bluey/jobs-automation";
 import { installBrowserNetworkGuard } from "./browser-network-guard.js";
 import {
+  createBrowserProfileSnapshotClientFromEnv,
+  type BrowserProfileSnapshotLeaseContext,
+} from "./profile-snapshot-client.js";
+import {
   createExecutionLeaseClientFromEnv,
   ExecutionLeaseError,
   type ActiveExecutionLease,
@@ -37,11 +41,14 @@ import {
 } from "./leased-run.js";
 import { RunnerEncryptionError } from "./crypto-envelope.js";
 import {
+  installEncryptedProfileSnapshot,
   parseProfileKey,
   profilePaths,
   profilePathsFromScope,
+  readEncryptedProfileSnapshot,
   restoreProfile,
   sealProfile,
+  writeProfileSnapshotGeneration,
 } from "./profile-store.js";
 import {
   CURRENT_CHECKPOINT_VERSION,
@@ -95,6 +102,7 @@ const profileKey = process.env.BLUEY_JOBS_PROFILE_ENCRYPTION_KEY
   ? parseProfileKey(process.env.BLUEY_JOBS_PROFILE_ENCRYPTION_KEY)
   : undefined;
 const leaseClient = createExecutionLeaseClientFromEnv();
+const profileSnapshotClient = createBrowserProfileSnapshotClientFromEnv();
 const locks = new Map<string, Promise<void>>();
 const activeRuns = new Map<string, {
   context: BrowserContext;
@@ -162,7 +170,7 @@ const runnerServer = createServer(async (request, response) => {
             await writeResult(root, resultContext, execution.result, profileKey);
           } catch {
             return abortLeasedRun(lease, async () => {
-              await closeBrowserExecution(execution.context, paths);
+              await closeBrowserExecution(execution.context, paths, input, lease);
               await removeRunCheckpoint(root, paths.scope, input.browserSessionId);
             });
           }
@@ -190,12 +198,15 @@ const runnerServer = createServer(async (request, response) => {
             checkpointCreatedAtMs,
             input.url,
           ).catch(() => undefined);
-          return abortLeasedRun(lease, () => closeBrowserExecution(execution.context, paths));
+          return abortLeasedRun(
+            lease,
+            () => closeBrowserExecution(execution.context, paths, input, lease),
+          );
         }
         return finalizeLeasedRun({
           lease,
           intendedOutcome: outcome,
-          cleanup: () => closeBrowserExecution(execution.context, paths),
+          cleanup: () => closeBrowserExecution(execution.context, paths, input, lease),
           async stage() {
             await stageResult(root, resultContext, execution.result, profileKey);
           },
@@ -391,7 +402,7 @@ async function restoreCheckpoint(
       runId: approvedRequest.runId,
       browserProfileId: approvedRequest.browserProfileId,
     });
-    await restoreProfile(paths, profileKey!);
+    await restoreDurableBrowserProfile(approvedRequest, paths, lease);
     context = await chromium.launchPersistentContext(paths.directory, {
       headless: true,
       acceptDownloads: true,
@@ -431,7 +442,9 @@ async function restoreCheckpoint(
       providerReview: checkpoint.workflow.providerReview,
     });
   } catch (error) {
-    if (context) await closeBrowserExecution(context, paths).catch(() => undefined);
+    if (context && lease) {
+      await closeBrowserExecution(context, paths, approvedRequest, lease).catch(() => undefined);
+    }
     await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
     if (activeRuns.get(checkpoint.browserSessionId)?.lease === lease) {
       activeRuns.delete(checkpoint.browserSessionId);
@@ -580,7 +593,7 @@ async function run(
       status: "prepared",
       browserUrl: input.url,
     });
-    await restoreProfile(paths, profileKey!);
+    await restoreDurableBrowserProfile(input, paths, lease);
     profileRestored = true;
     context = await chromium.launchPersistentContext(paths.directory, {
       headless: true,
@@ -608,7 +621,7 @@ async function run(
     };
   } catch {
     if (context) {
-      await closeBrowserExecution(context, paths).catch(() => undefined);
+      await closeBrowserExecution(context, paths, input, lease).catch(() => undefined);
     } else if (profileRestored) {
       await sealProfile(paths, profileKey!).catch(() => undefined);
     }
@@ -802,6 +815,8 @@ async function validate(input: CloudRunRequest): Promise<CloudRunRequest> {
 async function closeBrowserExecution(
   context: BrowserContext | undefined,
   paths: ReturnType<typeof profilePaths>,
+  input: CloudRunRequest,
+  lease: ActiveExecutionLease,
 ): Promise<void> {
   if (!context) return;
   let failed = false;
@@ -812,6 +827,13 @@ async function closeBrowserExecution(
   }
   try {
     await sealProfile(paths, profileKey!);
+    const snapshot = await readEncryptedProfileSnapshot(paths);
+    if (!snapshot) throw new Error("Encrypted browser profile snapshot was not created");
+    const stored = await profileSnapshotClient.store(
+      profileSnapshotLeaseContext(input, lease),
+      snapshot,
+    );
+    await writeProfileSnapshotGeneration(paths, stored.generation);
   } catch {
     failed = true;
     await rm(paths.directory, { recursive: true, force: true }).catch(() => undefined);
@@ -824,11 +846,38 @@ async function closeActiveRun(
   active: NonNullable<ReturnType<typeof activeRuns.get>>,
 ): Promise<void> {
   try {
-    await closeBrowserExecution(active.context, active.paths);
+    await closeBrowserExecution(active.context, active.paths, active.input, active.lease);
   } finally {
     if (activeRuns.get(browserSessionId) === active) activeRuns.delete(browserSessionId);
     activeScopes.delete(active.paths.scope);
   }
+}
+
+async function restoreDurableBrowserProfile(
+  input: CloudRunRequest,
+  paths: ReturnType<typeof profilePaths>,
+  lease: ActiveExecutionLease,
+): Promise<void> {
+  const remoteSnapshot = await profileSnapshotClient.restore(
+    profileSnapshotLeaseContext(input, lease),
+  );
+  if (remoteSnapshot) await installEncryptedProfileSnapshot(paths, remoteSnapshot);
+  await restoreProfile(paths, profileKey!);
+}
+
+function profileSnapshotLeaseContext(
+  input: CloudRunRequest,
+  lease: ActiveExecutionLease,
+): BrowserProfileSnapshotLeaseContext {
+  const metadata = lease.checkpointMetadata();
+  return {
+    accountId: input.accountId,
+    applicationId: input.applicationId,
+    runId: input.runId,
+    browserProfileId: input.browserProfileId,
+    leaseToken: metadata.leaseToken,
+    fence: metadata.fence,
+  };
 }
 
 function publicRunnerFailure(error: unknown): { status: number; code: string; message: string } {

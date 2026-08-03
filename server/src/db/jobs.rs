@@ -1428,6 +1428,20 @@ pub struct ExecutionLeaseRecord {
     pub phase: String,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct BrowserProfileSnapshotRecord {
+    pub browser_profile_id: String,
+    pub generation: i64,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub envelope_version: i64,
+    pub writer_run_id: String,
+    pub writer_fence: i64,
+    pub updated_at_ms: i64,
+    #[serde(skip_serializing)]
+    pub object_key: String,
+}
+
 #[derive(Debug, Error)]
 pub enum ExecutionLeaseError {
     #[error("Invalid execution lease request.")]
@@ -1794,6 +1808,7 @@ include!("jobs/communication_actions.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");
+include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
 
 #[cfg(test)]

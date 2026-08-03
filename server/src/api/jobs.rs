@@ -38,6 +38,7 @@ pub(super) type ApiError = (StatusCode, String);
 // the server can verify and persist evidence before accepting "submitted".
 const RECEIPT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const DISCOVERY_SNAPSHOT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
+const BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const TRUSTED_WORKER_RECEIPT_KEY: &str = "_bluey_worker_receipt_v1";
 const SUBMISSION_FINGERPRINT_KEY: &str = "_bluey_server_submission_fingerprint_v1";
 const MAX_RECEIPT_DOCUMENTS: usize = 8;
@@ -237,6 +238,16 @@ pub fn worker_router() -> Router<AppState> {
         .route(
             "/api/jobs/internal/execution-leases/:run_id/reconcile-checkpoint",
             post(worker_reconcile_execution_checkpoint),
+        )
+        .route(
+            "/api/jobs/internal/execution-leases/:run_id/profile/restore",
+            post(worker_restore_browser_profile_snapshot),
+        )
+        .route(
+            "/api/jobs/internal/execution-leases/:run_id/profile/store",
+            post(worker_store_browser_profile_snapshot).route_layer(DefaultBodyLimit::max(
+                BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/api/jobs/internal/discovery/lease",
@@ -3747,6 +3758,48 @@ struct WorkerCheckpointReconciliationRequest {
     checkpoint_phase: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct WorkerBrowserProfileSnapshotAccessRequest {
+    account_id: String,
+    application_id: String,
+    browser_profile_id: String,
+    lease_token: String,
+    fence: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerBrowserProfileSnapshotStoreRequest {
+    account_id: String,
+    application_id: String,
+    browser_profile_id: String,
+    lease_token: String,
+    fence: i64,
+    expected_generation: i64,
+    envelope_version: i64,
+    sha256: String,
+    size_bytes: i64,
+    encrypted_snapshot_base64: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerBrowserProfileSnapshotStoreResponse {
+    browser_profile_id: String,
+    generation: i64,
+    sha256: String,
+    size_bytes: i64,
+    envelope_version: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkerBrowserProfileSnapshotRestoreResponse {
+    browser_profile_id: String,
+    generation: i64,
+    sha256: String,
+    size_bytes: i64,
+    envelope_version: i64,
+    encrypted_snapshot_base64: String,
+}
+
 async fn worker_claim_execution_lease(
     State(state): State<AppState>,
     Json(req): Json<WorkerExecutionLeaseClaimRequest>,
@@ -3839,6 +3892,241 @@ async fn worker_reconcile_execution_checkpoint(
     )
     .map(Json)
     .map_err(execution_lease_error)
+}
+
+async fn worker_restore_browser_profile_snapshot(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerBrowserProfileSnapshotAccessRequest>,
+) -> Result<Response, ApiError> {
+    let snapshot = jobs::get_browser_profile_snapshot_for_lease(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.browser_profile_id,
+        &req.lease_token,
+        req.fence,
+    )
+    .map_err(execution_lease_error)?;
+    let Some(snapshot) = snapshot else {
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    };
+    let storage = browser_profile_object_storage(&state)?;
+    if !storage.key_belongs_to_account(&snapshot.object_key, &req.account_id) {
+        return Err((
+            StatusCode::CONFLICT,
+            "The saved browser profile is unavailable.".to_string(),
+        ));
+    }
+    let stored = storage
+        .get(&snapshot.object_key)
+        .await
+        .map_err(browser_profile_storage_error)?;
+    if let Err(error) = verify_browser_profile_snapshot_bytes(
+        &stored.bytes,
+        &snapshot.sha256,
+        snapshot.size_bytes,
+        storage.max_object_bytes(),
+    ) {
+        tracing::error!(
+            account_id = %req.account_id,
+            browser_profile_id = %req.browser_profile_id,
+            generation = snapshot.generation,
+            error = %error.1,
+            "Bluey Jobs stored browser profile snapshot failed integrity verification"
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The saved browser profile is unavailable.".to_string(),
+        ));
+    }
+    Ok(Json(WorkerBrowserProfileSnapshotRestoreResponse {
+        browser_profile_id: snapshot.browser_profile_id,
+        generation: snapshot.generation,
+        sha256: snapshot.sha256,
+        size_bytes: snapshot.size_bytes,
+        envelope_version: snapshot.envelope_version,
+        encrypted_snapshot_base64: base64::engine::general_purpose::STANDARD.encode(stored.bytes),
+    })
+    .into_response())
+}
+
+async fn worker_store_browser_profile_snapshot(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerBrowserProfileSnapshotStoreRequest>,
+) -> Result<Json<WorkerBrowserProfileSnapshotStoreResponse>, ApiError> {
+    let storage = browser_profile_object_storage(&state)?;
+    if req.envelope_version <= 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Invalid browser profile envelope version.".to_string(),
+        ));
+    }
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(req.encrypted_snapshot_base64.as_bytes())
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Invalid encrypted browser profile snapshot.".to_string(),
+            )
+        })?;
+    verify_browser_profile_snapshot_bytes(
+        &encrypted,
+        &req.sha256,
+        req.size_bytes,
+        storage.max_object_bytes(),
+    )?;
+    let current = jobs::get_browser_profile_snapshot_for_lease(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.browser_profile_id,
+        &req.lease_token,
+        req.fence,
+    )
+    .map_err(execution_lease_error)?;
+    let next_generation = req.expected_generation.checked_add(1).ok_or((
+        StatusCode::BAD_REQUEST,
+        "Invalid browser profile generation.".to_string(),
+    ))?;
+    let object_key = storage.browser_profile_snapshot_key(
+        &req.account_id,
+        &req.browser_profile_id,
+        next_generation,
+        &req.sha256,
+    );
+    if let Some(current) = current.as_ref() {
+        if current.generation == next_generation
+            && current.object_key == object_key
+            && current.sha256 == req.sha256
+            && current.size_bytes == req.size_bytes
+            && current.envelope_version == req.envelope_version
+            && current.writer_run_id == run_id
+            && current.writer_fence == req.fence
+        {
+            return Ok(Json(browser_profile_snapshot_store_response(current)));
+        }
+    }
+    if current.as_ref().map_or(0, |snapshot| snapshot.generation) != req.expected_generation {
+        return Err((
+            StatusCode::CONFLICT,
+            "A newer browser profile snapshot is already available.".to_string(),
+        ));
+    }
+    storage
+        .put(
+            &object_key,
+            encrypted.into(),
+            "application/vnd.bluey.browser-profile+encrypted",
+        )
+        .await
+        .map_err(browser_profile_storage_error)?;
+    let read_back = storage
+        .get(&object_key)
+        .await
+        .map_err(browser_profile_storage_error)?;
+    if let Err(error) = verify_browser_profile_snapshot_bytes(
+        &read_back.bytes,
+        &req.sha256,
+        req.size_bytes,
+        storage.max_object_bytes(),
+    ) {
+        let _ = storage.delete(&object_key).await;
+        return Err(error);
+    }
+    let committed = jobs::commit_browser_profile_snapshot_for_lease(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.browser_profile_id,
+        &req.lease_token,
+        req.fence,
+        req.expected_generation,
+        &object_key,
+        &req.sha256,
+        req.size_bytes,
+        req.envelope_version,
+    );
+    let committed = committed.map_err(|error| {
+        // The object key is immutable and content-addressed. Leave a losing
+        // writer's upload for lifecycle cleanup because deleting it here could
+        // race a successful writer that adopted the same object.
+        tracing::warn!(
+            account_id = %req.account_id,
+            browser_profile_id = %req.browser_profile_id,
+            generation = next_generation,
+            object_key = %object_key,
+            "Bluey Jobs browser profile metadata commit lost its lease or generation race"
+        );
+        execution_lease_error(error)
+    })?;
+    Ok(Json(browser_profile_snapshot_store_response(&committed)))
+}
+
+fn browser_profile_snapshot_store_response(
+    snapshot: &jobs::BrowserProfileSnapshotRecord,
+) -> WorkerBrowserProfileSnapshotStoreResponse {
+    WorkerBrowserProfileSnapshotStoreResponse {
+        browser_profile_id: snapshot.browser_profile_id.clone(),
+        generation: snapshot.generation,
+        sha256: snapshot.sha256.clone(),
+        size_bytes: snapshot.size_bytes,
+        envelope_version: snapshot.envelope_version,
+    }
+}
+
+fn browser_profile_object_storage(state: &AppState) -> Result<ObjectStorage, ApiError> {
+    state
+        .config
+        .object_storage
+        .clone()
+        .map(ObjectStorage::new)
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Browser profile recovery storage is unavailable.".to_string(),
+        ))
+}
+
+fn verify_browser_profile_snapshot_bytes(
+    bytes: &[u8],
+    expected_sha256: &str,
+    expected_size_bytes: i64,
+    maximum_bytes: usize,
+) -> Result<(), ApiError> {
+    let actual_size = i64::try_from(bytes.len()).map_err(|_| {
+        (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Encrypted browser profile snapshot is too large.".to_string(),
+        )
+    })?;
+    if bytes.is_empty()
+        || bytes.len() > maximum_bytes
+        || expected_size_bytes <= 0
+        || actual_size != expected_size_bytes
+        || expected_sha256.len() != 64
+        || !expected_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        || sha256_hex(bytes) != expected_sha256
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Encrypted browser profile snapshot did not pass integrity checks.".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn browser_profile_storage_error(error: anyhow::Error) -> ApiError {
+    tracing::error!(error = %error, "Bluey Jobs browser profile storage failed");
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Browser profile recovery storage is unavailable.".to_string(),
+    )
 }
 
 #[derive(Debug, Deserialize)]

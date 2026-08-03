@@ -80,6 +80,33 @@ fn signed_worker_request(input: SignedWorkerRequest<'_>) -> Request<Body> {
         .unwrap()
 }
 
+fn signed_worker_json_request(
+    path: &str,
+    scope: &str,
+    worker_id: &str,
+    timestamp: u64,
+    nonce: &str,
+    body: &serde_json::Value,
+    signing_key: &str,
+) -> Request<Body> {
+    let bytes = serde_json::to_vec(body).unwrap();
+    let mut request = signed_worker_request(SignedWorkerRequest {
+        path,
+        scope,
+        worker_id,
+        timestamp,
+        nonce,
+        signed_body: &bytes,
+        actual_body: &bytes,
+        signing_key,
+    });
+    request.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    request
+}
+
 fn pcm16_mono_wav(seconds: u32) -> Vec<u8> {
     const SAMPLE_RATE: u32 = 16_000;
     const CHANNELS: u16 = 1;
@@ -847,6 +874,225 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         .unwrap();
     let browser_profile_id = jobs::execution_browser_profile_id(&account.id, identity_id);
     (account.id, application.id, run_id, browser_profile_id)
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_worker_round_trips_a_fenced_encrypted_browser_profile_snapshot() {
+    const SIGNING_KEY: &str = "jobs-profile-snapshot-signing-key-at-least-32-bytes";
+    const WORKER_ID: &str = "browser-profile-integration-worker";
+    std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", SIGNING_KEY);
+
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 25 * 1024 * 1024,
+        });
+    })
+    .await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness).await;
+    let lease = jobs::claim_execution_lease(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        WORKER_ID,
+    )
+    .unwrap();
+    let restore_path = format!("/api/jobs/internal/execution-leases/{run_id}/profile/restore");
+    let store_path = format!("/api/jobs/internal/execution-leases/{run_id}/profile/store");
+    let access_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "browser_profile_id": browser_profile_id,
+        "lease_token": lease.lease_token,
+        "fence": lease.fence
+    });
+    let timestamp = u64::try_from(chrono::Utc::now().timestamp()).unwrap();
+
+    let empty_restore = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &restore_path,
+            "execution",
+            WORKER_ID,
+            timestamp,
+            "profile-empty-restore-nonce-0001",
+            &access_body,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(empty_restore.status(), StatusCode::NO_CONTENT);
+
+    let encrypted = b"BLUEYJP2encrypted-integration-browser-profile";
+    let sha256 = hex::encode(Sha256::digest(encrypted));
+    let size_bytes = i64::try_from(encrypted.len()).unwrap();
+    let profile_scope = hex::encode(Sha256::digest(browser_profile_id.as_bytes()));
+    let object_key = format!(
+        "bluey-cloud/accounts/{account_id}/jobs/browser-profiles/\
+         {profile_scope}/generation/1/sha256/{sha256}.enc"
+    );
+    Mock::given(method("PUT"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(encrypted.as_slice()))
+        .expect(2)
+        .mount(&object_store)
+        .await;
+
+    let store_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "browser_profile_id": browser_profile_id,
+        "lease_token": lease.lease_token,
+        "fence": lease.fence,
+        "expected_generation": 0,
+        "envelope_version": 2,
+        "sha256": sha256,
+        "size_bytes": size_bytes,
+        "encrypted_snapshot_base64": base64::engine::general_purpose::STANDARD.encode(encrypted)
+    });
+    let stored = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &store_path,
+            "execution",
+            WORKER_ID,
+            timestamp,
+            "profile-store-nonce-0000000002",
+            &store_body,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    let stored_status = stored.status();
+    let stored_body = axum::body::to_bytes(stored.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_status,
+        StatusCode::OK,
+        "browser profile store failed: {}",
+        String::from_utf8_lossy(&stored_body)
+    );
+    let stored_json: serde_json::Value = serde_json::from_slice(&stored_body).unwrap();
+    assert_eq!(stored_json["browser_profile_id"], browser_profile_id);
+    assert_eq!(stored_json["generation"], 1);
+    assert_eq!(stored_json["sha256"], sha256);
+    assert_eq!(stored_json["size_bytes"], size_bytes);
+    assert_eq!(stored_json["envelope_version"], 2);
+
+    let replay = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &store_path,
+            "execution",
+            WORKER_ID,
+            timestamp,
+            "profile-store-replay-nonce-00003",
+            &store_body,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+
+    let restored = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &restore_path,
+            "execution",
+            WORKER_ID,
+            timestamp,
+            "profile-restore-nonce-00000004",
+            &access_body,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(restored.status(), StatusCode::OK);
+    let restored_body = axum::body::to_bytes(restored.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let restored_json: serde_json::Value = serde_json::from_slice(&restored_body).unwrap();
+    assert_eq!(restored_json["browser_profile_id"], browser_profile_id);
+    assert_eq!(restored_json["generation"], 1);
+    assert_eq!(restored_json["sha256"], sha256);
+    assert_eq!(restored_json["size_bytes"], size_bytes);
+    assert_eq!(restored_json["envelope_version"], 2);
+    assert_eq!(
+        restored_json["encrypted_snapshot_base64"],
+        base64::engine::general_purpose::STANDARD.encode(encrypted)
+    );
+
+    let forged_access = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "browser_profile_id": browser_profile_id,
+        "lease_token": "forged-browser-profile-token",
+        "fence": lease.fence
+    });
+    let forged = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &restore_path,
+            "execution",
+            WORKER_ID,
+            timestamp,
+            "profile-forged-lease-nonce-0005",
+            &forged_access,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(forged.status(), StatusCode::CONFLICT);
+
+    let wrong_profile_access = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "browser_profile_id": "browser-profile-from-another-identity",
+        "lease_token": lease.lease_token,
+        "fence": lease.fence
+    });
+    let wrong_profile = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &restore_path,
+            "execution",
+            WORKER_ID,
+            timestamp,
+            "profile-cross-scope-nonce-000006",
+            &wrong_profile_access,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_profile.status(), StatusCode::CONFLICT);
+
+    object_store.verify().await;
+    std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
 }
 
 #[tokio::test]

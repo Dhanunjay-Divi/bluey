@@ -97,6 +97,22 @@ impl ObjectStorage {
         )
     }
 
+    pub fn browser_profile_snapshot_key(
+        &self,
+        account_id: &str,
+        browser_profile_id: &str,
+        generation: i64,
+        sha256: &str,
+    ) -> String {
+        let profile_scope = hex::encode(Sha256::digest(browser_profile_id.as_bytes()));
+        self.account_key(
+            &format!(
+                "jobs/browser-profiles/{profile_scope}/generation/{generation}/sha256/{sha256}.enc"
+            ),
+            account_id,
+        )
+    }
+
     pub fn global_candidate_archive_key(&self, candidate_id: &str, content_hash: &str) -> String {
         let prefix = self.config.key_prefix.trim_matches('/');
         let suffix = format!("global/jobs/candidates/{candidate_id}/sha256/{content_hash}.json");

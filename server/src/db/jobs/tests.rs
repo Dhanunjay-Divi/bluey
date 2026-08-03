@@ -8371,4 +8371,162 @@ mod tests {
             reference.object_key == "accounts/acct-jobs/jobs/export/confirmation.png"
         }));
     }
+
+    #[test]
+    fn browser_profile_snapshot_is_fenced_versioned_and_idempotent() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "profile-snapshot");
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "profile-worker",
+        )
+        .unwrap();
+        assert!(get_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+        )
+        .unwrap()
+        .is_none());
+
+        let object_key = format!(
+            "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/1.enc"
+        );
+        let first = commit_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            0,
+            &object_key,
+            &"a".repeat(64),
+            128,
+            1,
+        )
+        .unwrap();
+        assert_eq!(first.generation, 1);
+        let replay = commit_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            0,
+            &object_key,
+            &"a".repeat(64),
+            128,
+            1,
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert!(matches!(
+            commit_browser_profile_snapshot_for_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                &lease.lease_token,
+                lease.fence,
+                0,
+                &format!("{object_key}.different"),
+                &"b".repeat(64),
+                129,
+                1,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn browser_profile_snapshot_rejects_stale_and_cross_profile_workers() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "profile-stale");
+        let stale = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "stale-worker",
+        )
+        .unwrap();
+        assert!(matches!(
+            get_browser_profile_snapshot_for_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                "another-profile",
+                &stale.lease_token,
+                stale.fence,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_execution_leases SET lease_expires_at_ms = ?2 WHERE run_id = ?1",
+                params![run_id, now_ms() - 1],
+            )
+            .unwrap();
+        let replacement = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "replacement-worker",
+        )
+        .unwrap();
+        assert!(matches!(
+            commit_browser_profile_snapshot_for_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                &stale.lease_token,
+                stale.fence,
+                0,
+                "accounts/acct-jobs/jobs/browser-profiles/stale.enc",
+                &"c".repeat(64),
+                64,
+                1,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        let stored = commit_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &replacement.lease_token,
+            replacement.fence,
+            0,
+            "accounts/acct-jobs/jobs/browser-profiles/replacement.enc",
+            &"d".repeat(64),
+            96,
+            1,
+        )
+        .unwrap();
+        assert_eq!(stored.writer_run_id, run_id);
+        assert_eq!(stored.writer_fence, replacement.fence);
+    }
 }

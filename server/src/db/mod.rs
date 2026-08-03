@@ -279,6 +279,8 @@ const SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/sqlite/server-runtime/040_jobs_auto_submit_authorizations.sql");
 const SQLITE_JOBS_COMMUNICATION_ACTIONS: &str =
     include_str!("../../../infra/sqlite/server-runtime/041_jobs_communication_actions.sql");
+const SQLITE_JOBS_BROWSER_PROFILE_SNAPSHOTS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/042_jobs_browser_profile_snapshots.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1593,6 +1595,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
     // 0041 - approval-gated, replay-safe email and calendar actions.
     SQLITE_JOBS_COMMUNICATION_ACTIONS,
+    // 0042 - durable encrypted Browser profile snapshot generations.
+    SQLITE_JOBS_BROWSER_PROFILE_SNAPSHOTS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2030,6 +2034,8 @@ const POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/018_jobs_auto_submit_authorizations.sql");
 const POSTGRES_JOBS_COMMUNICATION_ACTIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/019_jobs_communication_actions.sql");
+const POSTGRES_JOBS_BROWSER_PROFILE_SNAPSHOTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/020_jobs_browser_profile_snapshots.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2094,6 +2100,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "019_jobs_communication_actions.sql",
         POSTGRES_JOBS_COMMUNICATION_ACTIONS,
+    ),
+    (
+        "020_jobs_browser_profile_snapshots.sql",
+        POSTGRES_JOBS_BROWSER_PROFILE_SNAPSHOTS,
     ),
 ];
 

@@ -1,10 +1,10 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
-import { chmod, mkdir, rm, stat } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
-import { decryptFile, encryptFile } from "./crypto-envelope.js";
+import { decryptFile, encryptFile, replaceFileDurably } from "./crypto-envelope.js";
 
 export { decryptFile, encryptFile } from "./crypto-envelope.js";
 
@@ -12,6 +12,13 @@ export interface ProfilePaths {
   scope: string;
   directory: string;
   encryptedSnapshot: string;
+  snapshotGeneration: string;
+}
+
+export interface EncryptedProfileSnapshot {
+  bytes: Buffer;
+  generation: number;
+  envelopeVersion: 2;
 }
 
 export function profilePaths(root: string, accountId: string, applicationIdentityId: string): ProfilePaths {
@@ -28,6 +35,7 @@ export function profilePathsFromScope(root: string, scope: string): ProfilePaths
     scope,
     directory: join(root, "active", scope),
     encryptedSnapshot: join(root, "snapshots", `${scope}.tar.gz.enc`),
+    snapshotGeneration: join(root, "snapshots", `${scope}.generation`),
   };
 }
 
@@ -75,6 +83,103 @@ export async function sealProfile(paths: ProfilePaths, key: Buffer): Promise<voi
     await rm(archive, { force: true });
   }
   await rm(paths.directory, { recursive: true, force: true });
+}
+
+export async function readEncryptedProfileSnapshot(
+  paths: ProfilePaths,
+): Promise<EncryptedProfileSnapshot | undefined> {
+  let bytes: Buffer;
+  try {
+    bytes = await readFile(paths.encryptedSnapshot);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+  if (bytes.length < 8 || bytes.subarray(0, 8).toString("ascii") !== "BLUEYJP2") {
+    throw new Error("Invalid encrypted browser profile snapshot");
+  }
+  return {
+    bytes,
+    generation: await readProfileSnapshotGeneration(paths),
+    envelopeVersion: 2,
+  };
+}
+
+export async function installEncryptedProfileSnapshot(
+  paths: ProfilePaths,
+  snapshot: EncryptedProfileSnapshot,
+): Promise<void> {
+  if (!Number.isSafeInteger(snapshot.generation) || snapshot.generation <= 0) {
+    throw new Error("Invalid browser profile snapshot generation");
+  }
+  if (snapshot.envelopeVersion !== 2
+    || snapshot.bytes.length < 8
+    || snapshot.bytes.subarray(0, 8).toString("ascii") !== "BLUEYJP2") {
+    throw new Error("Invalid encrypted browser profile snapshot");
+  }
+  const existing = await readEncryptedProfileSnapshot(paths);
+  if (existing && existing.generation > snapshot.generation) {
+    throw new Error("Refusing to replace a newer browser profile snapshot");
+  }
+  if (existing && existing.generation === snapshot.generation) {
+    if (!existing.bytes.equals(snapshot.bytes)) {
+      throw new Error("Browser profile snapshot generation conflict");
+    }
+    return;
+  }
+
+  const snapshotsDirectory = dirname(paths.encryptedSnapshot);
+  await mkdir(snapshotsDirectory, { recursive: true, mode: 0o700 });
+  await chmod(snapshotsDirectory, 0o700);
+  const suffix = `${process.pid}-${randomBytes(8).toString("hex")}`;
+  const snapshotStaging = `${paths.encryptedSnapshot}.${suffix}.incoming`;
+  const generationStaging = `${paths.snapshotGeneration}.${suffix}.incoming`;
+  try {
+    await writeFile(snapshotStaging, snapshot.bytes, { flag: "wx", mode: 0o600 });
+    await writeFile(generationStaging, `${snapshot.generation}\n`, { flag: "wx", mode: 0o600 });
+    await replaceFileDurably(snapshotStaging, paths.encryptedSnapshot);
+    await replaceFileDurably(generationStaging, paths.snapshotGeneration);
+  } finally {
+    await rm(snapshotStaging, { force: true });
+    await rm(generationStaging, { force: true });
+  }
+}
+
+export async function writeProfileSnapshotGeneration(
+  paths: ProfilePaths,
+  generation: number,
+): Promise<void> {
+  if (!Number.isSafeInteger(generation) || generation <= 0) {
+    throw new Error("Invalid browser profile snapshot generation");
+  }
+  const snapshotsDirectory = dirname(paths.snapshotGeneration);
+  await mkdir(snapshotsDirectory, { recursive: true, mode: 0o700 });
+  await chmod(snapshotsDirectory, 0o700);
+  const staging = `${paths.snapshotGeneration}.${process.pid}-${randomBytes(8).toString("hex")}.incoming`;
+  try {
+    await writeFile(staging, `${generation}\n`, { flag: "wx", mode: 0o600 });
+    await replaceFileDurably(staging, paths.snapshotGeneration);
+  } finally {
+    await rm(staging, { force: true });
+  }
+}
+
+async function readProfileSnapshotGeneration(paths: ProfilePaths): Promise<number> {
+  let value: string;
+  try {
+    value = (await readFile(paths.snapshotGeneration, "utf8")).trim();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+  if (!/^[0-9]{1,16}$/.test(value)) {
+    throw new Error("Invalid browser profile snapshot generation");
+  }
+  const generation = Number(value);
+  if (!Number.isSafeInteger(generation) || generation <= 0) {
+    throw new Error("Invalid browser profile snapshot generation");
+  }
+  return generation;
 }
 
 function profileEncryptionContext(paths: ProfilePaths) {

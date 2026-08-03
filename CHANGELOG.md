@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added durable, encrypted Bluey Browser profile recovery for cloud runners,
+  with account-scoped object storage, lease-fenced generation updates,
+  integrity-checked replacement-runner restore, and replay-safe metadata.
 - Added an owner-confirmed reconciliation path for employer submissions whose
   result became unknown after the final click, with durable audit evidence,
   idempotent release of application attempts, and a bounded late-receipt path

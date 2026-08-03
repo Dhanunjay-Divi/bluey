@@ -21,6 +21,7 @@ const SIGNATURE_AUDIENCE: &str = "bluey-jobs-api";
 const SIGNATURE_WINDOW_SECS: u64 = 90;
 const DEFAULT_SIGNED_BODY_BYTES: usize = 4 * 1024 * 1024;
 const DISCOVERY_SIGNED_BODY_BYTES: usize = 32 * 1024 * 1024;
+const BROWSER_PROFILE_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 const RECEIPT_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -216,6 +217,8 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
 fn signed_body_limit(path: &str) -> usize {
     if path.ends_with("/receipt") {
         RECEIPT_SIGNED_BODY_BYTES
+    } else if path.contains("/execution-leases/") && path.ends_with("/profile/store") {
+        BROWSER_PROFILE_SIGNED_BODY_BYTES
     } else if (path.contains("/discovery/") || path.contains("/global-discovery/"))
         && (path.ends_with("/complete") || path.ends_with("/batches"))
     {
@@ -321,6 +324,10 @@ mod tests {
         assert_eq!(
             signed_body_limit("/api/jobs/internal/applications/app/receipt"),
             RECEIPT_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit("/api/jobs/internal/execution-leases/run/profile/store"),
+            BROWSER_PROFILE_SIGNED_BODY_BYTES
         );
         assert_eq!(
             signed_body_limit("/api/jobs/internal/discovery/source/complete"),
