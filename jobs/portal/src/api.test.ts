@@ -77,4 +77,23 @@ describe("Jobs API authentication", () => {
       "/account/me:Bearer dummy-fresh-access-token",
     ]));
   });
+
+  it("sends the narrow owner confirmation for an uncertain submission", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const fetchMock = vi.fn(async () => Response.json({
+      id: "application-one",
+      job_id: "job-one",
+      state: "failed",
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await jobsApi.reconcileSubmissionNotSubmitted("application-one");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(path).toBe("/api/jobs/applications/application-one/reconcile-submission");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ outcome: "not_submitted", confirmed: true });
+    expect(new Headers(init.headers).get("Authorization")).toBe("Bearer dummy-access-token");
+  });
 });

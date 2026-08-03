@@ -950,21 +950,40 @@ pub fn finalize_submission(
                         |row| row.get(0),
                     )
                     .optional()?;
-                if phase.as_deref() != Some("submitted") {
-                    anyhow::bail!("matching cloud execution lease is not terminal submitted")
+                match phase.as_deref() {
+                    Some("submitted") => {}
+                    Some("side_effect_unknown") => {
+                        if tx.execute(
+                            "UPDATE jobs_execution_leases
+                                SET phase = 'submitted', updated_at_ms = ?4,
+                                    finished_at_ms = ?4
+                              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+                                AND phase = 'side_effect_unknown'",
+                            params![account_id, application_id, run_id, now],
+                        )? != 1
+                        {
+                            anyhow::bail!("matching cloud execution lease changed")
+                        }
+                    }
+                    _ => anyhow::bail!("matching cloud execution lease cannot accept receipt"),
                 }
             } else if tx.execute(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'complete', updated_at_ms = ?5
                   WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
-                    AND ticket_hash = ?4 AND expires_at_ms > ?5
-                    AND status IN ('claimed', 'needs_input')",
+                    AND ticket_hash = ?4
+                    AND (
+                        (expires_at_ms > ?5 AND status IN ('claimed', 'needs_input'))
+                        OR (status = 'side_effect_unknown'
+                            AND expires_at_ms + ?6 > ?5)
+                    )",
                 params![
                     run_id,
                     account_id,
                     application_id,
                     local_ticket_hash.expect("local ticket checked above"),
-                    now
+                    now,
+                    SUBMISSION_RECONCILIATION_GRACE_MS,
                 ],
             )? != 1
             {
@@ -990,7 +1009,8 @@ pub fn finalize_submission(
             }
             if tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = 'submitted', updated_at_ms = ?3
-                  WHERE account_id = ?1 AND application_id = ?2",
+                  WHERE account_id = ?1 AND application_id = ?2
+                    AND status IN ('running', 'side_effect_unknown')",
                 params![account_id, application_id, now],
             )? != 1
             {
@@ -1076,21 +1096,40 @@ pub fn finalize_submission(
                         &[&account_id, &application_id, &run_id],
                     )?
                     .map(|row| row.get::<_, String>(0));
-                if phase.as_deref() != Some("submitted") {
-                    anyhow::bail!("matching cloud execution lease is not terminal submitted")
+                match phase.as_deref() {
+                    Some("submitted") => {}
+                    Some("side_effect_unknown") => {
+                        if tx.execute(
+                            "UPDATE jobs_execution_leases
+                                SET phase = 'submitted', updated_at_ms = $4,
+                                    finished_at_ms = $4
+                              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                                AND phase = 'side_effect_unknown'",
+                            &[&account_id, &application_id, &run_id, &now],
+                        )? != 1
+                        {
+                            anyhow::bail!("matching cloud execution lease changed")
+                        }
+                    }
+                    _ => anyhow::bail!("matching cloud execution lease cannot accept receipt"),
                 }
             } else if tx.execute(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'complete', updated_at_ms = $5
                   WHERE id = $1 AND account_id = $2 AND application_id = $3
-                    AND ticket_hash = $4 AND expires_at_ms > $5
-                    AND status IN ('claimed', 'needs_input')",
+                    AND ticket_hash = $4
+                    AND (
+                        (expires_at_ms > $5 AND status IN ('claimed', 'needs_input'))
+                        OR (status = 'side_effect_unknown'
+                            AND expires_at_ms + $6 > $5)
+                    )",
                 &[
                     &run_id,
                     &account_id,
                     &application_id,
                     &local_ticket_hash.expect("local ticket checked above"),
                     &now,
+                    &SUBMISSION_RECONCILIATION_GRACE_MS,
                 ],
             )? != 1
             {
@@ -1116,7 +1155,8 @@ pub fn finalize_submission(
             }
             if tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = 'submitted', updated_at_ms = $3
-                  WHERE account_id = $1 AND application_id = $2",
+                  WHERE account_id = $1 AND application_id = $2
+                    AND status IN ('running', 'side_effect_unknown')",
                 &[&account_id, &application_id, &now],
             )? != 1
             {

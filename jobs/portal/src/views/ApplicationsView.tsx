@@ -24,7 +24,7 @@ import {
 } from "lucide-react";
 import type { ApplicationEvidence, CandidateEventInput, Intervention, JobApplication, JobEligibilityDecision, JobPosting, JobsWorkspace, ResumeVersion, RunnerAvailability } from "../types";
 import { relativeTime, titleCase } from "../lib/format";
-import { Dialog } from "../components/Dialog";
+import { ConfirmDialog, Dialog } from "../components/Dialog";
 import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
@@ -34,6 +34,7 @@ interface Props {
   workspace: JobsWorkspace;
   resumeVersions: Record<string, ResumeVersion>;
   onUpdate(application: JobApplication, state: string): Promise<void>;
+  onReconcileSubmission(application: JobApplication): Promise<void>;
   onCommit(application: JobApplication): Promise<void>;
   onLoadResume(id: string): Promise<ResumeVersion | undefined>;
   onResolveIntervention(intervention: Intervention, action: string, resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string }): Promise<void>;
@@ -47,7 +48,7 @@ const stateGroups = [
   ["all", "All"],
 ] as const;
 
-export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit, onLoadResume, onResolveIntervention, onSaveCandidateEvent }: Props) {
+export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconcileSubmission, onCommit, onLoadResume, onResolveIntervention, onSaveCandidateEvent }: Props) {
   const [filter, setFilter] = useState<(typeof stateGroups)[number][0]>("active");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<JobApplication | null>(null);
@@ -63,6 +64,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
   const [feedbackMode, setFeedbackMode] = useState<"outcome" | "issue" | null>(null);
   const [feedbackAction, setFeedbackAction] = useState("");
   const [feedbackNote, setFeedbackNote] = useState("");
+  const [reconciliationTarget, setReconciliationTarget] = useState<JobApplication | null>(null);
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
 
   const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
@@ -95,7 +97,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     const textMatch = !query || `${job?.company || ""} ${job?.title || ""}`.toLowerCase().includes(query.toLowerCase());
     if (!textMatch) return false;
     if (filter === "submitted") return application.state === "submitted";
-    if (filter === "review") return ["awaiting_review", "needs_confirmation", "needs_input"].includes(application.state);
+    if (filter === "review") return applicationNeedsReview(application);
     if (filter === "active") return !["submitted", "failed"].includes(application.state);
     return true;
   });
@@ -144,6 +146,21 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
     try {
       await onUpdate(selected, state);
       setSelected((current) => current ? { ...current, state: state as JobApplication["state"] } : current);
+    } catch (cause) {
+      setLocalError(errorMessage(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const reconcileNotSubmitted = async () => {
+    if (!reconciliationTarget || busy) return;
+    setBusy(true);
+    setLocalError("");
+    try {
+      await onReconcileSubmission(reconciliationTarget);
+      setReconciliationTarget(null);
+      setSelected(null);
     } catch (cause) {
       setLocalError(errorMessage(cause));
     } finally {
@@ -263,7 +280,7 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
       )}
 
       <section className="application-toolbar">
-        <div className="tab-control">{stateGroups.map(([value, label]) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{label}<span>{countFor(value, workspace.applications)}</span></button>)}</div>
+        <div className="tab-control">{stateGroups.map(([value, label]) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{label}<span>{applicationCountFor(value, workspace.applications)}</span></button>)}</div>
         <label className="search-field small"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search applications" /></label>
       </section>
 
@@ -344,10 +361,19 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onCommit
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : selected.state === "side_effect_unknown" ? "Automatic retry is disabled until the employer-facing outcome is reconciled." : selected.state === "awaiting_review" && !selectedRunnerAvailable ? "Your tailored kit is ready. Download it or continue on the original job site." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div><button className="button secondary" onClick={() => openFeedback(selected, "issue")}><TriangleAlert size={16} />Report problem</button>{selected.state === "submitted" && <button className="button secondary" onClick={() => openFeedback(selected, "outcome")}><CalendarDays size={16} />Update outcome</button>}{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && selectedRunnerAvailable && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !selectedRunnerAvailable && selectedCanHandoff && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : selected.state === "side_effect_unknown" ? "Automatic retry is disabled until the employer-facing outcome is reconciled." : selected.state === "awaiting_review" && !selectedRunnerAvailable ? "Your tailored kit is ready. Download it or continue on the original job site." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div><button className="button secondary" onClick={() => openFeedback(selected, "issue")}><TriangleAlert size={16} />Report problem</button>{selected.state === "side_effect_unknown" && <button className="button danger subtle" disabled={busy} onClick={() => setReconciliationTarget(selected)}><AlertCircle size={16} />I checked: not submitted</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => openFeedback(selected, "outcome")}><CalendarDays size={16} />Update outcome</button>}{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && selectedRunnerAvailable && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !selectedRunnerAvailable && selectedCanHandoff && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
           </div>
         )}
       </Dialog>
+      <ConfirmDialog
+        open={Boolean(reconciliationTarget)}
+        title="Confirm application was not submitted"
+        description="Check the employer confirmation page and your application email first. Bluey will close this uncertain run and allow a new reviewed attempt."
+        confirmLabel={busy ? "Closing run..." : "Confirm not submitted"}
+        tone="danger"
+        onConfirm={() => void reconcileNotSubmitted()}
+        onClose={() => !busy && setReconciliationTarget(null)}
+      />
       <Dialog open={receiptOpen} title="Submission receipt" description={selected ? `${jobs.get(selected.job_id)?.company || "Application"} · ${jobs.get(selected.job_id)?.title || ""}` : ""} onClose={() => setReceiptOpen(false)}>
         {selected && <ReceiptView application={selected} resume={selectedResume} evidence={selectedEvidence} />}
       </Dialog>
@@ -610,16 +636,24 @@ function ResumePreview({ resume }: { resume: ResumeVersion }) {
   return <div className="resume-paper"><header><h2>{content.contact?.name || "Candidate"}</h2><p>{[content.contact?.email, content.contact?.phone, content.contact?.location].filter(Boolean).join(" · ")}</p></header><h3>{content.headline || "Professional Summary"}</h3><p>{content.summary}</p><h4>SKILLS</h4><p className="skill-line">{content.skills?.join(" · ")}</p><h4>EXPERIENCE</h4>{content.employment?.map((role) => <div className="resume-role" key={role.id}><div><b>{role.title}</b><span>{role.company}</span></div><small>{role.start_date} - {role.current ? "Present" : role.end_date}</small>{role.highlights.map((highlight) => <p key={highlight}>• {highlight}</p>)}</div>)}</div>;
 }
 
-function countFor(filter: string, applications: JobApplication[]): number {
+export function applicationNeedsReview(application: JobApplication): boolean {
+  return ["awaiting_review", "needs_confirmation", "needs_input", "side_effect_unknown"].includes(
+    application.state,
+  );
+}
+
+export function applicationCountFor(filter: string, applications: JobApplication[]): number {
   if (filter === "submitted") return applications.filter((item) => item.state === "submitted").length;
-  if (filter === "review") return applications.filter((item) => ["awaiting_review", "needs_confirmation", "needs_input"].includes(item.state)).length;
+  if (filter === "review") return applications.filter(applicationNeedsReview).length;
   if (filter === "active") return applications.filter((item) => !["submitted", "failed"].includes(item.state)).length;
   return applications.length;
 }
 
 function stateIcon(state: string) {
   if (state === "submitted") return <CheckCircle2 className="success" size={18} />;
-  if (state === "needs_input" || state === "needs_confirmation") return <AlertCircle className="warning" size={18} />;
+  if (["needs_input", "needs_confirmation", "side_effect_unknown"].includes(state)) {
+    return <AlertCircle className="warning" size={18} />;
+  }
   if (state === "running") return <CircleDot className="accent" size={18} />;
   return <Clock3 size={18} />;
 }

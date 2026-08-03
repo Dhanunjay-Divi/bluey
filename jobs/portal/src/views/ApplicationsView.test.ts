@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
-import type { JobEligibilityDecision, RunnerAvailability } from "../types";
-import { hasAvailableRunner, runnerUnavailableReason } from "./ApplicationsView";
+import type { JobApplication, JobEligibilityDecision, RunnerAvailability } from "../types";
+import {
+  applicationCountFor,
+  applicationNeedsReview,
+  hasAvailableRunner,
+  runnerUnavailableReason,
+} from "./ApplicationsView";
 
 const eligibility = (
   capability: JobEligibilityDecision["capability"],
@@ -62,5 +67,29 @@ describe("reviewed application runner availability", () => {
     expect(runnerUnavailableReason(blocked, runners(false))).toBe(
       "This job is outside your selected locations.",
     );
+  });
+});
+
+describe("uncertain submission review", () => {
+  const application = (state: JobApplication["state"]): JobApplication => ({
+    id: `application-${state}`,
+    job_id: "job-one",
+    state,
+    submission_mode: "review_first",
+    match_score: 91,
+    resume_version_id: "resume-one",
+    cover_letter: "",
+    answers: [],
+    receipt: {},
+    run_id: "run-one",
+    created_at_ms: 1,
+    updated_at_ms: 1,
+  });
+
+  it("keeps a side-effect-unknown application in Needs review", () => {
+    const uncertain = application("side_effect_unknown");
+
+    expect(applicationNeedsReview(uncertain)).toBe(true);
+    expect(applicationCountFor("review", [uncertain, application("submitted")])).toBe(1);
   });
 });

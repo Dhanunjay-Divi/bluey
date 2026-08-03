@@ -99,6 +99,10 @@ pub fn router() -> Router<AppState> {
             post(approve_application_packet),
         )
         .route(
+            "/api/jobs/applications/:application_id/reconcile-submission",
+            post(reconcile_submission),
+        )
+        .route(
             "/api/jobs/applications/:application_id/runs",
             post(queue_application_run),
         )
@@ -1542,6 +1546,31 @@ pub async fn update_application(
     .map_err(|error| validation_or_internal(error, "Choose a valid application state."))?
     .map(Json)
     .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReconcileSubmissionRequest {
+    pub outcome: String,
+    #[serde(default)]
+    pub confirmed: bool,
+}
+
+pub async fn reconcile_submission(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    Path(application_id): Path<String>,
+    Json(req): Json<ReconcileSubmissionRequest>,
+) -> Result<Json<JobApplication>, ApiError> {
+    if !req.confirmed || req.outcome != "not_submitted" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Confirm that the employer did not receive this application.".to_string(),
+        ));
+    }
+    jobs::reconcile_submission_not_submitted(&state.pool, &account.id, &application_id)
+        .map_err(submission_domain_error)?
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
 }
 
 #[derive(Debug, Serialize)]
@@ -3269,8 +3298,14 @@ async fn authorize_local_run_submit(
             "Bluey Browser local runs are currently paused.".to_string(),
         ));
     }
-    let ticket =
-        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "submit")?;
+    let ticket = authorize_local_run_operation(
+        &state,
+        &run_id,
+        &req.capability,
+        &req.ticket,
+        "submit",
+        false,
+    )?;
     if !jobs::local_run_submit_authorized(&state.pool, &run_id, &ticket.ticket_hash)
         .map_err(internal)?
     {
@@ -3309,8 +3344,14 @@ async fn consume_local_run_resume(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunAccessRequest>,
 ) -> Result<Json<jobs::LocalRunResumeAction>, ApiError> {
-    let ticket =
-        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "resume")?;
+    let ticket = authorize_local_run_operation(
+        &state,
+        &run_id,
+        &req.capability,
+        &req.ticket,
+        "resume",
+        false,
+    )?;
     let action = jobs::consume_local_run_resume_action(&state.pool, &run_id, &ticket.ticket_hash)
         .map_err(internal)?
         .ok_or((
@@ -3354,20 +3395,33 @@ async fn save_local_run_result(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunResultRequest>,
 ) -> Result<Json<JobApplication>, ApiError> {
-    let ticket =
-        authorize_local_run_operation(&state, &run_id, &req.capability, &req.ticket, "result")?;
-    if ticket.expires_at_ms <= jobs::now_ms() {
-        return Err((
-            StatusCode::GONE,
-            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-        ));
-    }
     let status = req
         .receipt
         .get("status")
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let ticket = authorize_local_run_operation(
+        &state,
+        &run_id,
+        &req.capability,
+        &req.ticket,
+        "result",
+        status == "submitted",
+    )?;
+    if ticket.expires_at_ms <= jobs::now_ms()
+        && !(status == "submitted"
+            && ticket.status == "side_effect_unknown"
+            && ticket
+                .expires_at_ms
+                .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
+                > jobs::now_ms())
+    {
+        return Err((
+            StatusCode::GONE,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
     let (bound_application, bound_session) = local_result_binding(&state, &ticket, &run_id)?;
     match ticket.status.as_str() {
         "failed" if status == "failed" && bound_application.state == "failed" => {
@@ -3385,6 +3439,7 @@ async fn save_local_run_result(
                 "This local run already has a different terminal result.".to_string(),
             ));
         }
+        "side_effect_unknown" if status == "submitted" => {}
         "failed" | "side_effect_unknown" => {
             return Err((
                 StatusCode::CONFLICT,
@@ -3561,26 +3616,45 @@ fn authorize_local_run_operation(
     capability: &str,
     _legacy_ticket: &str,
     operation: &str,
+    allow_late_reconciliation: bool,
 ) -> Result<jobs::LocalRunTicket, ApiError> {
+    let now = jobs::now_ms();
     #[cfg(debug_assertions)]
     if capability.is_empty() && !_legacy_ticket.is_empty() {
         let hash = local_run_ticket_hash(_legacy_ticket)?;
-        return jobs::get_local_run_ticket_by_hash(&state.pool, run_id, &hash)
+        let ticket = jobs::get_local_run_ticket_by_hash(&state.pool, run_id, &hash)
             .map_err(internal)?
             .ok_or((
                 StatusCode::NOT_FOUND,
                 "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+            ))?;
+        if ticket.expires_at_ms <= now
+            && !(allow_late_reconciliation
+                && ticket.status == "side_effect_unknown"
+                && ticket
+                    .expires_at_ms
+                    .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
+                    > now)
+        {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
             ));
+        }
+        return Ok(ticket);
     }
 
-    let claims =
-        super::jobs_local_capability::verify(capability, run_id, operation, jobs::now_ms())
-            .map_err(|_| {
-                (
-                    StatusCode::NOT_FOUND,
-                    "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-                )
-            })?;
+    let claims = if allow_late_reconciliation {
+        super::jobs_local_capability::verify_for_reconciliation(capability, run_id, operation, now)
+    } else {
+        super::jobs_local_capability::verify(capability, run_id, operation, now)
+    }
+    .map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        )
+    })?;
     let ticket = jobs::get_local_run_ticket(&state.pool, &claims.account_id, run_id)
         .map_err(internal)?
         .filter(|ticket| {
@@ -3596,6 +3670,19 @@ fn authorize_local_run_operation(
             StatusCode::NOT_FOUND,
             "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
         ))?;
+    if ticket.expires_at_ms <= now
+        && !(allow_late_reconciliation
+            && ticket.status == "side_effect_unknown"
+            && ticket
+                .expires_at_ms
+                .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
+                > now)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
     Ok(ticket)
 }
 
@@ -4185,11 +4272,11 @@ async fn persist_submission_receipt(
         .map_err(internal)?
         .as_deref()
         {
-            Some("submitted") => {}
+            Some("submitted" | "side_effect_unknown") => {}
             Some(_) | None => {
                 return Err((
                     StatusCode::CONFLICT,
-                    "A matching cloud execution lease is not terminal submitted.".to_string(),
+                    "A matching cloud execution lease cannot accept this receipt.".to_string(),
                 ));
             }
         }
@@ -4966,6 +5053,7 @@ fn update_worker_browser_session(
     let session_status = match status {
         "submitted" => "complete",
         "needs_input" => "needs_input",
+        "side_effect_unknown" => "needs_input",
         "failed" => "failed",
         "running" => "running",
         other => other,
@@ -4978,6 +5066,9 @@ fn update_worker_browser_session(
         session.status = session_status.to_string();
         session.current_step = match session_status {
             "complete" => "Application submitted",
+            "needs_input" if status == "side_effect_unknown" => {
+                "Submission outcome needs reconciliation"
+            }
             "needs_input" => "Waiting for your input",
             "failed" => "Run stopped",
             "running" => "Filling application",
@@ -5344,8 +5435,17 @@ fn submission_domain_error(error: anyhow::Error) -> ApiError {
     let message = error.to_string();
     if message.contains("different final receipt")
         || message.contains("execution lease is not terminal submitted")
+        || message.contains("execution lease cannot accept this receipt")
+        || message.contains("execution lease cannot accept receipt")
+        || message.contains("execution lease changed")
         || message.contains("invalid application state transition")
         || message.contains("local run ticket is not active")
+        || message.contains("awaiting reconciliation")
+        || message.contains("execution authority changed")
+        || message.contains("attempt reservation changed")
+        || message.contains("browser session changed")
+        || message.contains("submission outcome changed")
+        || message.contains("does not match this application")
     {
         (StatusCode::CONFLICT, message)
     } else if message.contains("application not found") {

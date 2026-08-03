@@ -341,6 +341,14 @@ export const jobsApi = {
     request<ApproveApplicationResponse>(`/api/jobs/applications/${encodeURIComponent(id)}/approve`, {
       method: "POST",
     }),
+  reconcileSubmissionNotSubmitted: (id: string) =>
+    request<JobApplication>(
+      `/api/jobs/applications/${encodeURIComponent(id)}/reconcile-submission`,
+      {
+        method: "POST",
+        body: JSON.stringify({ outcome: "not_submitted", confirmed: true }),
+      },
+    ),
   queueApplicationRun: (id: string, runner: "local" | "cloud" = "cloud") =>
     request<QueueApplicationRunResponse>(`/api/jobs/applications/${encodeURIComponent(id)}/runs`, {
       method: "POST",

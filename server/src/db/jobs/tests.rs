@@ -807,6 +807,8 @@ mod tests {
             .unwrap()
             .unwrap();
         reserve_application_attempt(&pool, "acct-jobs", &application.id, "cloud").unwrap();
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running")
+            .unwrap();
         let lease = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -898,7 +900,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.to_string().contains("browser session not found"));
+        assert!(
+            error.to_string().contains("browser session not found"),
+            "unexpected finalization error: {error:#}"
+        );
         assert!(
             list_application_evidence(&pool, "acct-jobs", Some(&application.id))
                 .unwrap()
@@ -917,7 +922,7 @@ mod tests {
             .into_iter()
             .find(|reservation| reservation.application_id == application.id)
             .unwrap();
-        assert_eq!(reservation.status, "reserved");
+        assert_eq!(reservation.status, "running");
         assert!(list_browser_sessions(&pool, "acct-jobs")
             .unwrap()
             .into_iter()

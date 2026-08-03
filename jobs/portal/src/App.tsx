@@ -77,7 +77,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [isPreview]);
 
   useEffect(() => {
     if (!isPreview && accessToken()) void refresh();
@@ -162,7 +162,7 @@ export default function App() {
     const saved = isPreview ? profile : await jobsApi.saveProfile(profile);
     setWorkspace((current) => (current ? { ...current, profile: saved } : current));
     setToast("Career Profile saved.");
-  }, []);
+  }, [isPreview]);
 
   const importResumeSource = useCallback(
     async (file: File, profile: CareerProfile, pageCount?: number): Promise<CareerProfile> => {
@@ -206,7 +206,7 @@ export default function App() {
     const saved = isPreview ? localized : await jobsApi.savePreferences(localized);
     setWorkspace((current) => (current ? { ...current, preferences: saved } : current));
     setToast("Job preferences saved.");
-  }, []);
+  }, [isPreview]);
 
   const saveTrack = useCallback(async (track: CareerTrack) => {
     const saved = isPreview
@@ -457,6 +457,38 @@ export default function App() {
     );
     setToast(state === "queued" ? "Application queued." : "Application updated.");
   }, []);
+
+  const reconcileSubmissionNotSubmitted = useCallback(async (application: JobApplication) => {
+    const updated = isPreview
+      ? {
+          ...application,
+          state: "failed" as const,
+          updated_at_ms: Date.now(),
+          submitted_at_ms: undefined,
+          receipt: {
+            ...application.receipt,
+            submission_reconciliation: {
+              schema_version: 1,
+              outcome: "not_submitted",
+              resolved_by: "account_owner",
+              resolved_at_ms: Date.now(),
+              run_id: application.run_id,
+            },
+          },
+        }
+      : await jobsApi.reconcileSubmissionNotSubmitted(application.id);
+    setWorkspace((current) =>
+      current
+        ? {
+            ...current,
+            applications: current.applications.map((item) =>
+              item.id === updated.id ? updated : item,
+            ),
+          }
+        : current,
+    );
+    setToast("Uncertain run closed as not submitted.");
+  }, [isPreview]);
 
   const loadResumeVersion = useCallback(
     async (id: string) => {
@@ -822,6 +854,7 @@ export default function App() {
               workspace={workspace}
               resumeVersions={resumeVersions}
               onUpdate={updateApplication}
+              onReconcileSubmission={reconcileSubmissionNotSubmitted}
               onCommit={commitApplication}
               onLoadResume={loadResumeVersion}
               onResolveIntervention={resolveIntervention}

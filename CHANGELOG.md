@@ -7,6 +7,10 @@ under `docs/release/`.
 
 ### Added
 
+- Added an owner-confirmed reconciliation path for employer submissions whose
+  result became unknown after the final click, with durable audit evidence,
+  idempotent release of application attempts, and a bounded late-receipt path
+  for trusted runners that subsequently prove the application was submitted.
 - Added server-authoritative discovery evidence for canonical job identity,
   employer and application-domain binding, scam screening, original-source
   freshness, and immutable evidence hashes before Bluey Jobs can prepare or
@@ -55,6 +59,10 @@ under `docs/release/`.
 
 ### Fixed
 
+- Prevented cloud and local browser retries from converting an uncertain
+  employer-facing submission into a duplicate application or false Submitted
+  state; the application now remains blocked until either trusted receipt
+  evidence arrives or the owner explicitly confirms it was not submitted.
 - Serialized Windows AppUserModelID updates so concurrent disguise reassertion
   cannot corrupt the `cue-stealth` process heap during normal use or tests.
 - Made Bluey Jobs submission state and evidence runner-owned: customers can no

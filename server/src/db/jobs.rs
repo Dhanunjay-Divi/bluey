@@ -48,6 +48,7 @@ const GLOBAL_DISCOVERY_MAX_BATCH_ROWS: usize = 1_000;
 const GLOBAL_DISCOVERY_MAX_MATERIALIZED_PER_ACCOUNT: usize = 500;
 const EXECUTION_LEASE_TTL_MS: i64 = 60 * 1_000;
 const LOCAL_RESUME_ACTION_TTL_MS: i64 = 15 * 60 * 1_000;
+pub const SUBMISSION_RECONCILIATION_GRACE_MS: i64 = 24 * 60 * 60 * 1_000;
 type HmacSha256 = Hmac<Sha256>;
 
 fn default_discovery_interval_ms() -> i64 {
@@ -1787,6 +1788,7 @@ include!("jobs/auto_submit.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");
+include!("jobs/submission_reconciliation.rs");
 include!("jobs/mailbox_sync.rs");
 include!("jobs/communication_actions.rs");
 include!("jobs/execution_authority.rs");

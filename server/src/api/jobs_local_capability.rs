@@ -10,6 +10,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const TOKEN_VERSION: u8 = 1;
 const TOKEN_AUDIENCE: &str = "bluey-jobs-local-run";
+pub const RECONCILIATION_GRACE_MS: i64 = crate::db::jobs::SUBMISSION_RECONCILIATION_GRACE_MS;
 
 pub fn validate_runtime_config() -> anyhow::Result<()> {
     let local_distribution_enabled = cfg!(debug_assertions)
@@ -77,6 +78,31 @@ pub fn verify(
     expected_operation: &str,
     now_ms: i64,
 ) -> anyhow::Result<LocalRunCapabilityClaims> {
+    verify_with_late_grace(token, expected_run_id, expected_operation, now_ms, 0)
+}
+
+pub fn verify_for_reconciliation(
+    token: &str,
+    expected_run_id: &str,
+    expected_operation: &str,
+    now_ms: i64,
+) -> anyhow::Result<LocalRunCapabilityClaims> {
+    verify_with_late_grace(
+        token,
+        expected_run_id,
+        expected_operation,
+        now_ms,
+        RECONCILIATION_GRACE_MS,
+    )
+}
+
+fn verify_with_late_grace(
+    token: &str,
+    expected_run_id: &str,
+    expected_operation: &str,
+    now_ms: i64,
+    late_grace_ms: i64,
+) -> anyhow::Result<LocalRunCapabilityClaims> {
     validate_operation(expected_operation)?;
     if token.len() > 4_096 {
         anyhow::bail!("invalid local run capability");
@@ -104,7 +130,7 @@ pub fn verify(
         || claims.audience != TOKEN_AUDIENCE
         || claims.run_id != expected_run_id
         || claims.operation != expected_operation
-        || claims.expires_at_ms <= now_ms
+        || claims.expires_at_ms.saturating_add(late_grace_ms) <= now_ms
         || claims.nonce.len() < 24
     {
         anyhow::bail!("invalid local run capability");
@@ -180,6 +206,14 @@ mod tests {
         );
         assert!(verify(&submit, "run", "result", 1_000).is_err());
         assert!(verify(&token, "run", "result", 2_000).is_err());
+        assert!(verify_for_reconciliation(&token, "run", "result", 2_000).is_ok());
+        assert!(verify_for_reconciliation(
+            &token,
+            "run",
+            "result",
+            2_000 + RECONCILIATION_GRACE_MS
+        )
+        .is_err());
 
         let mut tampered = token.into_bytes();
         tampered[5] ^= 1;
