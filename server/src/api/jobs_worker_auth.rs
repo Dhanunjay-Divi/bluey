@@ -197,7 +197,9 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
     if !method.eq_ignore_ascii_case("POST") || !path.starts_with("/api/jobs/internal/") {
         return None;
     }
-    if path.contains("/execution-leases/") {
+    if path.contains("/runner-volumes/") {
+        Some("runner-volume")
+    } else if path.contains("/execution-leases/") {
         Some("execution")
     } else if path.contains("/discovery/") || path.contains("/global-discovery/") {
         Some("discovery")
@@ -316,6 +318,10 @@ mod tests {
         assert_eq!(
             worker_scope("POST", "/api/jobs/internal/execution-leases/run/heartbeat"),
             Some("execution")
+        );
+        assert_eq!(
+            worker_scope("POST", "/api/jobs/internal/runner-volumes/volume/poll"),
+            Some("runner-volume")
         );
         assert_eq!(
             worker_scope("GET", "/api/jobs/internal/discovery/lease"),

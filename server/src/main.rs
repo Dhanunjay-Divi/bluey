@@ -26,6 +26,8 @@ async fn main() -> anyhow::Result<()> {
     let config = Config::from_env().context("load config")?;
     api::jobs_local_capability::validate_runtime_config()
         .context("validate Bluey Browser capability configuration")?;
+    api::jobs_runner_volumes::validate_runtime_config()
+        .context("validate managed runner-volume purge signing configuration")?;
     tracing::info!(
         port = config.port,
         db_backend = ?config.db_backend,

@@ -344,6 +344,8 @@ const SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS: &str = include_str!(
 const SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
     "../../../infra/sqlite/server-runtime/045_jobs_account_object_upload_backfill.sql"
 );
+const SQLITE_JOBS_RUNNER_VOLUME_PURGE: &str =
+    include_str!("../../../infra/sqlite/server-runtime/046_jobs_runner_volume_purge.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1667,6 +1669,9 @@ const MIGRATIONS: &[&str] = &[
     // 0045 - adopt existing source resumes and Browser profiles into the
     // account-scoped object lifecycle.
     SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+    // 0046 - signed managed-runner volume identity, purge fan-out, and
+    // pseudonymous restore tombstones.
+    SQLITE_JOBS_RUNNER_VOLUME_PURGE,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2119,6 +2124,9 @@ pub const JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID: &str =
 const POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
     "../../../infra/postgres/server-runtime/023_jobs_account_object_upload_backfill.sql"
 );
+pub const JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID: &str = "024_jobs_runner_volume_purge.sql";
+const POSTGRES_JOBS_RUNNER_VOLUME_PURGE: &str =
+    include_str!("../../../infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2199,6 +2207,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
         POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+    ),
+    (
+        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
+        POSTGRES_JOBS_RUNNER_VOLUME_PURGE,
     ),
 ];
 
@@ -3117,13 +3129,15 @@ mod sqlite_migration_replay_tests {
 mod postgres_migration_tests {
     use super::{
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
-        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, POSTGRES_ACCOUNT_DELETION_INTENTS,
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
-        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_SCHEMA,
+        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
+        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_MIGRATIONS,
         POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
         SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
-        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
     };
 
     #[test]
@@ -3466,5 +3480,133 @@ mod postgres_migration_tests {
             maximum_browser_profile_logical_id_bytes <= 384,
             "the maximum accepted browser-profile candidate identity must fit the ledger"
         );
+    }
+
+    #[test]
+    fn runner_volume_purge_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID)
+            .expect("runner-volume purge schema must exist before a runner can enroll");
+
+        assert_eq!(*version, "024_jobs_runner_volume_purge.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_fleet_state",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_legacy_inventory_authorities",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_admission_grants",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volumes",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_keys",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_authority_uses",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_storage_attestations",
+            "CREATE TABLE IF NOT EXISTS jobs_execution_lease_volume_bindings",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_account_subjects",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_residencies",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_requests",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_targets",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_tombstones",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_purge_enforcements",
+            "CREATE TABLE IF NOT EXISTS jobs_runner_volume_destructions",
+            "idx_jobs_runner_volume_grants_expiry",
+            "idx_jobs_runner_volumes_worker_status",
+            "idx_jobs_runner_volume_authority_uses_consumed",
+            "idx_jobs_runner_volume_storage_attestations_latest",
+            "idx_jobs_execution_lease_volume_bindings_volume",
+            "idx_jobs_runner_residencies_subject_state",
+            "idx_jobs_runner_residencies_volume_state",
+            "idx_jobs_runner_purge_requests_account_state",
+            "idx_jobs_runner_purge_requests_deletion_attempt",
+            "idx_jobs_runner_purge_targets_volume_state",
+            "idx_jobs_runner_purge_targets_request_state",
+            "idx_jobs_runner_purge_tombstones_request",
+            "idx_jobs_runner_purge_enforcements_volume_state",
+            "idx_jobs_runner_volume_destructions_volume",
+            "REFERENCES accounts(id) ON DELETE SET NULL",
+            "public_key_base64url",
+            "enrollment_epoch",
+            "issued_fleet_generation",
+            "required_tombstone_generation",
+            "reconciled_tombstone_generation",
+            "destruction_generation",
+            "legacy_reconciliation_generation",
+            "storage_attestation_generation",
+            "storage_attestation_count",
+            "storage_attestation_set_sha256",
+            "legacy_inventory_state",
+            "legacy_inventory_generation",
+            "legacy_inventory_reconciliation_id",
+            "legacy_inventory_authority_id",
+            "legacy_inventory_authority_sha256",
+            "legacy_inventory_root_count",
+            "legacy_inventory_root_set_sha256",
+            "cutover_enrollment_generation",
+            "cutover_purge_generation",
+            "cutover_tombstone_generation",
+            "cutover_destruction_generation",
+            "cutover_legacy_reconciliation_generation",
+            "cutover_storage_attestation_generation",
+            "cutover_storage_attestation_count",
+            "cutover_storage_attestation_set_sha256",
+            "cutover_legacy_inventory_generation",
+            "cutover_legacy_inventory_reconciliation_id",
+            "cutover_legacy_inventory_authority_id",
+            "cutover_legacy_inventory_authority_sha256",
+            "cutover_non_destroyed_volume_count",
+            "cutover_destruction_count",
+            "cutover_unresolved_legacy_volume_count",
+            "purge_subject_sha256",
+            "volume_key_fingerprint",
+            "command_sha256",
+            "ack_signature",
+            "legacy_unresolved_count",
+            "resolved_target_count",
+            "target_set_sha256",
+            "snapshot_inventory_sha256",
+            "runner legacy inventory authority is append-only",
+            "runner volume storage attestation is append-only",
+            "indefinite_managed_restore_safety",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL runner purge migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_RUNNER_VOLUME_PURGE.contains(required),
+                "SQLite runner purge migration missing {required}"
+            );
+        }
+        let postgres_compact = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sqlite_compact = SQLITE_JOBS_RUNNER_VOLUME_PURGE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(postgres_compact
+            .contains("purge_generation BIGINT NOT NULL DEFAULT 0 CHECK(purge_generation >= 0)"));
+        assert!(sqlite_compact
+            .contains("purge_generation INTEGER NOT NULL DEFAULT 0 CHECK(purge_generation >= 0)"));
+        assert!(postgres_compact.contains(
+            "destruction_generation BIGINT NOT NULL DEFAULT 0 CHECK(destruction_generation >= 0)"
+        ));
+        assert!(sqlite_compact.contains(
+            "destruction_generation INTEGER NOT NULL DEFAULT 0 CHECK(destruction_generation >= 0)"
+        ));
+        assert!(postgres_compact.contains(
+            "legacy_reconciliation_generation BIGINT NOT NULL DEFAULT 0 CHECK(legacy_reconciliation_generation >= 0)"
+        ));
+        assert!(sqlite_compact.contains(
+            "legacy_reconciliation_generation INTEGER NOT NULL DEFAULT 0 CHECK(legacy_reconciliation_generation >= 0)"
+        ));
+        assert!(postgres_compact.contains(
+            "legacy_unresolved SMALLINT NOT NULL DEFAULT 0 CHECK(legacy_unresolved IN (0, 1))"
+        ));
+        assert!(postgres_compact.contains(
+            "tombstone_generation BIGINT NOT NULL UNIQUE CHECK(tombstone_generation >= 1)"
+        ));
+        assert!(sqlite_compact.contains(
+            "tombstone_generation INTEGER NOT NULL UNIQUE CHECK(tombstone_generation >= 1)"
+        ));
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_RUNNER_VOLUME_PURGE);
     }
 }

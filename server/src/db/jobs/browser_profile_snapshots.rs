@@ -161,6 +161,12 @@ pub fn authorize_browser_profile_snapshot_store(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
             let lease = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -188,9 +194,10 @@ pub fn authorize_browser_profile_snapshot_store(
                     browser_profile_snapshot_from_sqlite_row,
                 )
                 .optional()?;
-            if current.as_ref().is_some_and(|current| {
-                browser_profile_snapshot_is_exact(current, &exact_snapshot)
-            }) {
+            if current
+                .as_ref()
+                .is_some_and(|current| browser_profile_snapshot_is_exact(current, &exact_snapshot))
+            {
                 tx.commit()?;
                 return Ok(current);
             }
@@ -201,9 +208,7 @@ pub fn authorize_browser_profile_snapshot_store(
                 fence,
                 now,
             )?;
-            if current.as_ref().map_or(0, |snapshot| snapshot.generation)
-                != expected_generation
-            {
+            if current.as_ref().map_or(0, |snapshot| snapshot.generation) != expected_generation {
                 return Err(ExecutionLeaseError::Conflict);
             }
             if tx.execute(
@@ -232,6 +237,12 @@ pub fn authorize_browser_profile_snapshot_store(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
             let lock_scope = format!("{account_id}\0{browser_profile_id}");
             tx.query_one(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -264,9 +275,10 @@ pub fn authorize_browser_profile_snapshot_store(
                     &[&account_id, &browser_profile_id],
                 )?
                 .map(browser_profile_snapshot_from_pg_row);
-            if current.as_ref().is_some_and(|current| {
-                browser_profile_snapshot_is_exact(current, &exact_snapshot)
-            }) {
+            if current
+                .as_ref()
+                .is_some_and(|current| browser_profile_snapshot_is_exact(current, &exact_snapshot))
+            {
                 tx.commit()?;
                 return Ok(current);
             }
@@ -277,9 +289,7 @@ pub fn authorize_browser_profile_snapshot_store(
                 fence,
                 now,
             )?;
-            if current.as_ref().map_or(0, |snapshot| snapshot.generation)
-                != expected_generation
-            {
+            if current.as_ref().map_or(0, |snapshot| snapshot.generation) != expected_generation {
                 return Err(ExecutionLeaseError::Conflict);
             }
             if tx.execute(
@@ -318,19 +328,19 @@ pub fn get_browser_profile_snapshot_for_lease(
     fence: i64,
 ) -> ExecutionLeaseResult<Option<BrowserProfileSnapshotRecord>> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
-    validate_browser_profile_snapshot_request(
-        browser_profile_id,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )?;
+    validate_browser_profile_snapshot_request(browser_profile_id, None, None, None, None, None)?;
     let now = now_ms();
     match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let lease = conn
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let lease = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
                             owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
@@ -348,20 +358,29 @@ pub fn get_browser_profile_snapshot_for_lease(
                 fence,
                 now,
             )?;
-            conn.query_row(
-                "SELECT browser_profile_id, generation, object_key, sha256, size_bytes,
+            let snapshot = tx
+                .query_row(
+                    "SELECT browser_profile_id, generation, object_key, sha256, size_bytes,
                         envelope_version, writer_run_id, writer_fence, updated_at_ms
                    FROM jobs_browser_profile_snapshots
                   WHERE account_id = ?1 AND browser_profile_id = ?2",
-                params![account_id, browser_profile_id],
-                browser_profile_snapshot_from_sqlite_row,
-            )
-            .optional()
-            .map_err(ExecutionLeaseError::from)
+                    params![account_id, browser_profile_id],
+                    browser_profile_snapshot_from_sqlite_row,
+                )
+                .optional()?;
+            tx.commit()?;
+            Ok(snapshot)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            let lease = conn
+            let mut tx = conn.transaction()?;
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let lease = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
                             owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
@@ -378,7 +397,7 @@ pub fn get_browser_profile_snapshot_for_lease(
                 fence,
                 now,
             )?;
-            Ok(conn
+            let snapshot = tx
                 .query_opt(
                     "SELECT browser_profile_id, generation, object_key, sha256, size_bytes,
                             envelope_version, writer_run_id, writer_fence, updated_at_ms
@@ -386,7 +405,9 @@ pub fn get_browser_profile_snapshot_for_lease(
                       WHERE account_id = $1 AND browser_profile_id = $2",
                     &[&account_id, &browser_profile_id],
                 )?
-                .map(browser_profile_snapshot_from_pg_row))
+                .map(browser_profile_snapshot_from_pg_row);
+            tx.commit()?;
+            Ok(snapshot)
         }
     }
 }
@@ -498,13 +519,12 @@ fn commit_browser_profile_snapshot_internal(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
             let published_upload = if let Some(upload_id) = upload_id {
                 Some(crate::db::object_uploads::publish_account_object_sqlite_tx(
-                    &tx,
-                    upload_id,
-                    account_id,
-                    object_key,
-                    now,
+                    &tx, upload_id, account_id, object_key, now,
                 )?)
             } else {
                 crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
@@ -554,9 +574,10 @@ fn commit_browser_profile_snapshot_internal(
                     browser_profile_snapshot_from_sqlite_row,
                 )
                 .optional()?;
-            if let Some(current) = current.as_ref().filter(|current| {
-                browser_profile_snapshot_is_exact(current, &exact_snapshot)
-            }) {
+            if let Some(current) = current
+                .as_ref()
+                .filter(|current| browser_profile_snapshot_is_exact(current, &exact_snapshot))
+            {
                 tx.commit()?;
                 return Ok(current.clone());
             }
@@ -575,9 +596,7 @@ fn commit_browser_profile_snapshot_internal(
                     now,
                 )?;
             }
-            if current.as_ref().map_or(0, |snapshot| snapshot.generation)
-                != expected_generation
-            {
+            if current.as_ref().map_or(0, |snapshot| snapshot.generation) != expected_generation {
                 return Err(ExecutionLeaseError::Conflict);
             }
             tx.execute(
@@ -619,9 +638,7 @@ fn commit_browser_profile_snapshot_internal(
                 )?;
                 if cleanup.is_none() {
                     let adopted = legacy_browser_profile_snapshot_upload(account_id, previous, now);
-                    crate::db::object_uploads::adopt_ready_account_object_sqlite_tx(
-                        &tx, &adopted,
-                    )?;
+                    crate::db::object_uploads::adopt_ready_account_object_sqlite_tx(&tx, &adopted)?;
                     if crate::db::object_uploads::schedule_account_object_cleanup_sqlite_tx(
                         &tx,
                         account_id,
@@ -651,18 +668,18 @@ fn commit_browser_profile_snapshot_internal(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
             let published_upload = if let Some(upload_id) = upload_id {
-                Some(crate::db::object_uploads::publish_account_object_postgres_tx(
-                    &mut tx,
-                    upload_id,
-                    account_id,
-                    object_key,
-                    now,
-                )?)
+                Some(
+                    crate::db::object_uploads::publish_account_object_postgres_tx(
+                        &mut tx, upload_id, account_id, object_key, now,
+                    )?,
+                )
             } else {
                 crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                    &mut tx,
-                    account_id,
+                    &mut tx, account_id,
                 )?;
                 None
             };
@@ -713,9 +730,10 @@ fn commit_browser_profile_snapshot_internal(
                     &[&account_id, &browser_profile_id],
                 )?
                 .map(browser_profile_snapshot_from_pg_row);
-            if let Some(current) = current.as_ref().filter(|current| {
-                browser_profile_snapshot_is_exact(current, &exact_snapshot)
-            }) {
+            if let Some(current) = current
+                .as_ref()
+                .filter(|current| browser_profile_snapshot_is_exact(current, &exact_snapshot))
+            {
                 tx.commit()?;
                 return Ok(current.clone());
             }
@@ -734,9 +752,7 @@ fn commit_browser_profile_snapshot_internal(
                     now,
                 )?;
             }
-            if current.as_ref().map_or(0, |snapshot| snapshot.generation)
-                != expected_generation
-            {
+            if current.as_ref().map_or(0, |snapshot| snapshot.generation) != expected_generation {
                 return Err(ExecutionLeaseError::Conflict);
             }
             tx.execute(
@@ -770,12 +786,13 @@ fn commit_browser_profile_snapshot_internal(
                 .as_ref()
                 .filter(|previous| previous.object_key != object_key)
             {
-                let cleanup = crate::db::object_uploads::schedule_account_object_cleanup_postgres_tx(
-                    &mut tx,
-                    account_id,
-                    &previous.object_key,
-                    now,
-                )?;
+                let cleanup =
+                    crate::db::object_uploads::schedule_account_object_cleanup_postgres_tx(
+                        &mut tx,
+                        account_id,
+                        &previous.object_key,
+                        now,
+                    )?;
                 if cleanup.is_none() {
                     let adopted = legacy_browser_profile_snapshot_upload(account_id, previous, now);
                     crate::db::object_uploads::adopt_ready_account_object_postgres_tx(

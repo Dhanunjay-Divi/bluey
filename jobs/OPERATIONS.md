@@ -79,7 +79,18 @@ BLUEY_JOBS_RUNNER_ORIGIN=https://jobs-runner.internal
 BLUEY_JOBS_RUNNER_TOKEN=<random secret>
 BLUEY_JOBS_RUNNER_ID=<stable browser-pool replica ID>
 BLUEY_JOBS_PROFILE_ENCRYPTION_KEY=<base64 32-byte key>
-BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs
+BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner
+BLUEY_JOBS_RUNNER_BUILD_ID=runner-602.1
+BLUEY_JOBS_RUNNER_ADMISSION_GRANT_ID=<one-time per-volume grant ID>
+BLUEY_JOBS_RUNNER_ADMISSION_GRANT_TOKEN=<one-time per-volume grant token>
+BLUEY_JOBS_RUNNER_PROVIDER=<provider ID>
+BLUEY_JOBS_RUNNER_PROVIDER_RESOURCE_ID=<managed volume resource ID>
+BLUEY_JOBS_RUNNER_RESOURCE_FINGERPRINT=<64 lowercase hex characters>
+BLUEY_JOBS_RUNNER_SERVER_COMMAND_KEYS=<JSON key-ID to public-key map>
+BLUEY_JOBS_RUNNER_PURGE_SIGNING_KEY_ID=<current server key ID>
+BLUEY_JOBS_RUNNER_PURGE_SIGNING_KEY=<base64url 32-byte server seed>
+BLUEY_JOBS_RUNNER_MINIMUM_BUILD_ID=runner-602.1
+BLUEY_JOBS_RUNNER_PURGE_VERIFYING_KEYS_JSON=<JSON public-key history>
 BLUEY_JOBS_TAKEOVER_ORIGIN=https://jobs-browser.bluey.sh
 BLUEY_JOBS_API_ORIGIN=https://bluey.sh
 TEMPORAL_ADDRESS=<namespace endpoint>
@@ -87,6 +98,24 @@ TEMPORAL_NAMESPACE=<namespace>
 TEMPORAL_API_KEY=<Temporal Cloud API key>
 TEMPORAL_TLS=true
 ```
+
+The four purge-policy variables are server-owned and must be valid before the
+API starts because account deletion now depends on signed immutable fan-out.
+The private signing seed never enters a runner. Each runner instead receives
+the public `BLUEY_JOBS_RUNNER_SERVER_COMMAND_KEYS` map plus its own provider-
+bound admission grant. Create that grant through
+`POST /admin/jobs/runner-volumes/admission-grants` only after resolving the
+exact worker ID, provider resource ID, and resource fingerprint; mount the
+returned ID and token into one runner and start it before the ten-minute expiry.
+The grant is single-use. Use `ops/bluey-jobs-runner.env.example` as the
+per-volume template, not the shared API environment.
+
+Do not enable either Browser distribution flag merely because enrollment
+succeeds. The fleet status, zero legacy inventory authority, current signed
+storage attestations, exact cutover record, container smoke, and separate
+authorized device/provider canaries must all pass. Lost or offline volumes stay
+in the deletion target set until they acknowledge or an administrator records
+provider-bound destruction evidence.
 
 Run the discovery worker as a separate deployment using the workflows image
 with command `node workflows/dist/discovery-worker.js`, or install

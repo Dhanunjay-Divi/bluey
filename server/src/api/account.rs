@@ -3,27 +3,67 @@
 use axum::{
     body::Body,
     extract::{Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue, Method, Request, StatusCode},
+    middleware::Next,
     response::{IntoResponse, Response},
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Write};
 
-use super::AppState;
+use super::{jobs_runner_volumes, AppState};
 use crate::auth::AuthedAccount;
 use crate::billing::policy::{
     is_internal_or_test_billing_account, INTERNAL_TEST_BILLING_BLOCK_MESSAGE,
 };
 use crate::config::{BillingProvider, ObjectStorageConfig};
 use crate::db::devices::{DeviceRecord, DeviceRegistration};
-use crate::db::{account_data, diagnostic_logs};
+use crate::db::{account_data, diagnostic_logs, jobs};
 use crate::object_storage::ObjectStorage;
 
 const MIN_AUTO_RELOAD_CENTS: i64 = 1500;
 const MAX_AUTO_RELOAD_CENTS: i64 = 50_000;
 const MIN_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 100;
 const MAX_AUTO_RELOAD_THRESHOLD_CENTS: i64 = 5_000;
+
+pub async fn reject_mutation_after_deletion_fence(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let read_only = request.method() == Method::GET
+        || request.method() == Method::HEAD
+        || request.method() == Method::OPTIONS;
+    let path = request.uri().path();
+    if read_only || path == "/account/delete" || path == "/auth/logout" {
+        return Ok(next.run(request).await);
+    }
+    let deletion_pending = account_data::account_deletion_intent(&state.pool, &account.id)
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to check account-deletion fence before mutation"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .is_some();
+    if deletion_pending {
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(ApiError {
+                error: concat!(
+                    "Account deletion is pending. Bluey has fenced new writes and launches; ",
+                    "retry account deletion to check cleanup."
+                )
+                .to_string(),
+            }),
+        )
+            .into_response());
+    }
+    Ok(next.run(request).await)
+}
 
 #[derive(Serialize)]
 pub struct AccountMe {
@@ -784,12 +824,26 @@ pub async fn export_data(
     Ok(Json(bundle).into_response())
 }
 
+const ACCOUNT_DELETE_RETRY_AFTER_MS: u64 = 5_000;
+
 #[derive(serde::Serialize)]
-pub struct DeleteAck {
+pub struct DeleteAccountResponse {
     pub deleted: bool,
-    pub deleted_at: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required_target_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_target_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_unresolved_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
     pub object_count_deleted: usize,
-    pub note: &'static str,
+    pub note: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -809,24 +863,12 @@ pub async fn delete_account(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<DeleteAccountRequest>,
-) -> Result<Json<DeleteAck>, axum::http::StatusCode> {
+) -> Result<Response, axum::http::StatusCode> {
     if req.confirm_text.trim() != "DELETE" || !req.accept_data_loss || !req.accept_credit_loss {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let _object_deletion_guard =
-        account_data::acquire_account_object_deletion(&state.pool, &account.id)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    error = %error,
-                    "failed to serialize account deletion with object writers"
-                );
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-
-    match account_data::begin_account_deletion(
+    let initial_deletion = account_data::begin_account_deletion(
         &state.pool,
         &account.id,
         chrono::Utc::now().timestamp_millis(),
@@ -838,16 +880,10 @@ pub async fn delete_account(
             "failed to establish account-deletion write fence"
         );
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
-    })? {
-        Some(account_data::BeginAccountDeletionResult::Ready(_)) => {}
-        Some(account_data::BeginAccountDeletionResult::WaitingForUploads(intent)) => {
-            tracing::info!(
-                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                fresh_in_flight_puts = intent.fresh_in_flight_puts,
-                "account deletion is fenced and waiting for active object uploads"
-            );
-            return Err(axum::http::StatusCode::CONFLICT);
-        }
+    })?;
+    let (intent, uploads_pending) = match initial_deletion {
+        Some(account_data::BeginAccountDeletionResult::Ready(intent)) => (intent, false),
+        Some(account_data::BeginAccountDeletionResult::WaitingForUploads(intent)) => (intent, true),
         Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
             active_submissions,
         }) => {
@@ -858,17 +894,240 @@ pub async fn delete_account(
             );
             return Err(axum::http::StatusCode::CONFLICT);
         }
-        Some(account_data::BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
-            cloud_runner_records,
-        }) => {
+        None => return Err(axum::http::StatusCode::NOT_FOUND),
+    };
+
+    let purge_request_id = account_deletion_purge_request_id(&account.id, intent.requested_at_ms);
+    let fleet = jobs::runner_volume_fleet_status(&state.pool).map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed to load legacy runner inventory authority after deletion fence"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if fleet.legacy_inventory_state != "ready" {
+        return Ok(pending_account_delete_without_purge_response(
+            "pending_runner_legacy_inventory",
+            &purge_request_id,
+            concat!(
+                "Account deletion is securely fenced and pending authorized legacy runner ",
+                "inventory reconciliation. Your credentials are retained so you can check ",
+                "deletion status."
+            ),
+        ));
+    }
+    let (
+        Some(legacy_inventory_reconciliation_id),
+        Some(legacy_inventory_authority_id),
+        Some(legacy_inventory_authority_sha256),
+    ) = (
+        fleet.legacy_inventory_reconciliation_id.clone(),
+        fleet.legacy_inventory_authority_id.clone(),
+        fleet.legacy_inventory_authority_sha256.clone(),
+    )
+    else {
+        tracing::error!("ready runner legacy inventory is missing its exact authority binding");
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+    let policy = jobs_runner_volumes::runner_volume_purge_policy()?;
+    let prepare_input = jobs::PrepareRunnerVolumePurgeRequest {
+        request_id: purge_request_id.clone(),
+        account_id: account.id.clone(),
+        minimum_runner_build_id: policy.minimum_runner_build_id,
+        expected_legacy_inventory_generation: fleet.legacy_inventory_generation,
+        expected_legacy_inventory_reconciliation_id: legacy_inventory_reconciliation_id,
+        expected_legacy_inventory_authority_id: legacy_inventory_authority_id,
+        expected_legacy_inventory_authority_sha256: legacy_inventory_authority_sha256,
+        now_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    let prepared = match jobs::prepare_runner_volume_purge(
+        &state.pool,
+        &policy.signer,
+        &policy.key_ring,
+        &prepare_input,
+    ) {
+        Ok(prepared) => prepared,
+        Err(
+            error @ (jobs::RunnerVolumePurgeError::NotReady
+            | jobs::RunnerVolumePurgeError::Conflict),
+        ) => {
+            let refreshed =
+                jobs::runner_volume_fleet_status(&state.pool).map_err(|refresh_error| {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        error = %refresh_error,
+                        "failed to refresh runner legacy inventory after prepare race"
+                    );
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
+            let authority_drifted = refreshed.legacy_inventory_state != "ready"
+                || refreshed.legacy_inventory_generation
+                    != prepare_input.expected_legacy_inventory_generation
+                || refreshed.legacy_inventory_reconciliation_id.as_deref()
+                    != Some(
+                        prepare_input
+                            .expected_legacy_inventory_reconciliation_id
+                            .as_str(),
+                    )
+                || refreshed.legacy_inventory_authority_id.as_deref()
+                    != Some(
+                        prepare_input
+                            .expected_legacy_inventory_authority_id
+                            .as_str(),
+                    )
+                || refreshed.legacy_inventory_authority_sha256.as_deref()
+                    != Some(
+                        prepare_input
+                            .expected_legacy_inventory_authority_sha256
+                            .as_str(),
+                    );
+            if authority_drifted {
+                return Ok(pending_account_delete_without_purge_response(
+                    "pending_runner_legacy_inventory",
+                    &purge_request_id,
+                    "Account deletion is securely fenced and pending a stable authorized legacy runner inventory.",
+                ));
+            }
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                purge_request_id = %purge_request_id,
+                error = %error,
+                "runner-volume purge preparation failed without legacy inventory drift"
+            );
+            return Err(runner_purge_account_delete_error_status(&error));
+        }
+        Err(error) => {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                purge_request_id = %purge_request_id,
+                error = %error,
+                "failed to prepare durable runner-volume purge"
+            );
+            return Err(runner_purge_account_delete_error_status(&error));
+        }
+    };
+    if prepared.status.account_id.as_deref() != Some(account.id.as_str()) {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            purge_request_id = %purge_request_id,
+            "runner-volume purge replay did not match the fenced account"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let active_purge_request_id = prepared.status.request_id.clone();
+    let purge_status = complete_runner_purge_if_ready(
+        &state,
+        prepared.status,
+        chrono::Utc::now().timestamp_millis(),
+    )?;
+
+    if purge_status.state != "complete" {
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            purge_request_id = %purge_status.request_id,
+            required_target_count = purge_status.required_target_count,
+            resolved_target_count = purge_status.resolved_target_count,
+            legacy_unresolved_count = purge_status.legacy_unresolved_count,
+            "account deletion is fenced and waiting for runner-volume purge"
+        );
+        return Ok(pending_account_delete_response(
+            "pending_runner_volume_purge",
+            &purge_request_id,
+            &purge_status,
+            concat!(
+                "Account deletion is securely pending managed runner-volume purge ",
+                "attestation. Your credentials are retained so you can check deletion status."
+            ),
+        ));
+    }
+    if uploads_pending {
+        tracing::info!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            fresh_in_flight_puts = intent.fresh_in_flight_puts,
+            "account deletion is fenced and waiting for active object uploads"
+        );
+        return Ok(pending_account_delete_response(
+            "pending_upload_drain",
+            &purge_request_id,
+            &purge_status,
+            "Account deletion is securely pending active object-upload drain.",
+        ));
+    }
+
+    let _object_deletion_guard =
+        account_data::acquire_account_object_deletion(&state.pool, &account.id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    error = %error,
+                    "failed to serialize final account deletion with object writers"
+                );
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    let final_deletion = account_data::begin_account_deletion(
+        &state.pool,
+        &account.id,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed to revalidate account-deletion fence before object sweep"
+        );
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    match final_deletion {
+        Some(account_data::BeginAccountDeletionResult::Ready(_)) => {}
+        Some(account_data::BeginAccountDeletionResult::WaitingForUploads(intent)) => {
             tracing::info!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                cloud_runner_records,
-                "account deletion is waiting for acknowledged cloud-runner cleanup"
+                fresh_in_flight_puts = intent.fresh_in_flight_puts,
+                "account deletion found an active upload during final revalidation"
+            );
+            return Ok(pending_account_delete_response(
+                "pending_upload_drain",
+                &purge_request_id,
+                &purge_status,
+                "Account deletion is securely pending active object-upload drain.",
+            ));
+        }
+        Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+            active_submissions,
+        }) => {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                active_submissions,
+                "irreversible submission appeared after account deletion was fenced"
             );
             return Err(axum::http::StatusCode::CONFLICT);
         }
         None => return Err(axum::http::StatusCode::NOT_FOUND),
+    }
+    let final_purge_status =
+        jobs::runner_volume_purge_status(&state.pool, &active_purge_request_id).map_err(
+            |error| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    purge_request_id = %active_purge_request_id,
+                    error = %error,
+                    "failed to revalidate runner-volume purge before object sweep"
+                );
+                runner_purge_account_delete_error_status(&error)
+            },
+        )?;
+    if final_purge_status.state != "complete"
+        || final_purge_status.account_id.as_deref() != Some(account.id.as_str())
+    {
+        return Ok(pending_account_delete_response(
+            "pending_runner_volume_purge",
+            &purge_request_id,
+            &final_purge_status,
+            "Account deletion is securely pending managed runner-volume purge attestation.",
+        ));
     }
 
     let artifact_storage_config = state.config.object_storage.clone().ok_or_else(|| {
@@ -987,8 +1246,56 @@ pub async fn delete_account(
     // credit_batches, refresh_tokens, usage_events,
     // email_verification_tokens, password_reset_tokens, request_idempotency)
     // takes care of dependent rows.
-    let deleted = account_data::hard_delete_account(&state.pool, &account.id)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+    let deleted = match account_data::hard_delete_account_after_runner_purge(
+        &state.pool,
+        &account.id,
+        &active_purge_request_id,
+    ) {
+        Ok(deleted) => deleted,
+        Err(error) => {
+            let refreshed_fleet = jobs::runner_volume_fleet_status(&state.pool)
+                .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+            let legacy_inventory_drifted = refreshed_fleet.legacy_inventory_state != "ready"
+                || refreshed_fleet.legacy_inventory_generation
+                    != final_purge_status.legacy_inventory_generation
+                || refreshed_fleet
+                    .legacy_inventory_reconciliation_id
+                    .as_deref()
+                    != Some(
+                        final_purge_status
+                            .legacy_inventory_reconciliation_id
+                            .as_str(),
+                    )
+                || refreshed_fleet.legacy_inventory_authority_id.as_deref()
+                    != Some(final_purge_status.legacy_inventory_authority_id.as_str())
+                || refreshed_fleet.legacy_inventory_authority_sha256.as_deref()
+                    != Some(
+                        final_purge_status
+                            .legacy_inventory_authority_sha256
+                            .as_str(),
+                    );
+            if legacy_inventory_drifted {
+                tracing::info!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    purge_request_id = %active_purge_request_id,
+                    "account deletion remains fenced after legacy inventory changed before hard delete"
+                );
+                return Ok(pending_account_delete_response(
+                    "pending_runner_legacy_inventory",
+                    &purge_request_id,
+                    &final_purge_status,
+                    "Account deletion is securely pending renewed legacy runner inventory authority.",
+                ));
+            }
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                purge_request_id = %active_purge_request_id,
+                error = %error,
+                "final account hard delete failed its durable runner-purge gate"
+            );
+            return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        }
+    };
     if !deleted {
         return Err(axum::http::StatusCode::NOT_FOUND);
     }
@@ -1007,12 +1314,134 @@ pub async fn delete_account(
             "data_loss_accepted": true
         }),
     );
-    Ok(Json(DeleteAck {
+    Ok(Json(DeleteAccountResponse {
         deleted: true,
-        deleted_at: chrono::Utc::now().to_rfc3339(),
+        state: "deleted".to_string(),
+        request_id: Some(purge_request_id),
+        required_target_count: Some(final_purge_status.required_target_count),
+        resolved_target_count: Some(final_purge_status.resolved_target_count),
+        legacy_unresolved_count: Some(final_purge_status.legacy_unresolved_count),
+        retry_after_ms: None,
+        deleted_at: Some(chrono::Utc::now().to_rfc3339()),
         object_count_deleted,
-        note: "All account data has been removed. Re-signup is allowed with the same email.",
-    }))
+        note: "All account data has been removed. Re-signup is allowed with the same email."
+            .to_string(),
+    })
+    .into_response())
+}
+
+fn account_deletion_purge_request_id(account_id: &str, requested_at_ms: i64) -> String {
+    let material =
+        format!("bluey-jobs-runner\0account-deletion-request-v1\0{account_id}\0{requested_at_ms}");
+    format!("delete-{}", sha256_text(&material))
+}
+
+fn runner_purge_account_delete_error_status(error: &jobs::RunnerVolumePurgeError) -> StatusCode {
+    match error {
+        jobs::RunnerVolumePurgeError::NotFound => StatusCode::NOT_FOUND,
+        jobs::RunnerVolumePurgeError::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        jobs::RunnerVolumePurgeError::InvalidRequest
+        | jobs::RunnerVolumePurgeError::Conflict
+        | jobs::RunnerVolumePurgeError::Unauthorized
+        | jobs::RunnerVolumePurgeError::NotReady => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+fn complete_runner_purge_if_ready(
+    state: &AppState,
+    status: jobs::RunnerPurgeRequestStatus,
+    now_ms: i64,
+) -> Result<jobs::RunnerPurgeRequestStatus, StatusCode> {
+    if !matches!(status.state.as_str(), "pending" | "complete") {
+        tracing::error!(
+            purge_request_id = %status.request_id,
+            state = %status.state,
+            "runner-volume purge has an unsupported deletion state"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    if status.state == "pending"
+        && (status.legacy_unresolved_count != 0
+            || status.resolved_target_count != status.required_target_count)
+    {
+        return Ok(status);
+    }
+    match jobs::complete_runner_volume_purge(&state.pool, &status.request_id, now_ms) {
+        Ok(completion) => Ok(completion.status),
+        Err(jobs::RunnerVolumePurgeError::NotReady) => {
+            jobs::runner_volume_purge_status(&state.pool, &status.request_id).map_err(|error| {
+                tracing::warn!(
+                    purge_request_id = %status.request_id,
+                    error = %error,
+                    "failed to refresh runner-volume purge after completion race"
+                );
+                runner_purge_account_delete_error_status(&error)
+            })
+        }
+        Err(error) => {
+            tracing::warn!(
+                purge_request_id = %status.request_id,
+                error = %error,
+                "failed to finalize ready runner-volume purge tombstone"
+            );
+            Err(runner_purge_account_delete_error_status(&error))
+        }
+    }
+}
+
+fn pending_account_delete_response(
+    state: &str,
+    deletion_request_id: &str,
+    purge: &jobs::RunnerPurgeRequestStatus,
+    note: &str,
+) -> Response {
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(DeleteAccountResponse {
+            deleted: false,
+            state: state.to_string(),
+            request_id: Some(deletion_request_id.to_string()),
+            required_target_count: Some(purge.required_target_count),
+            resolved_target_count: Some(purge.resolved_target_count),
+            legacy_unresolved_count: Some(purge.legacy_unresolved_count),
+            retry_after_ms: Some(ACCOUNT_DELETE_RETRY_AFTER_MS),
+            deleted_at: None,
+            object_count_deleted: 0,
+            note: note.to_string(),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+fn pending_account_delete_without_purge_response(
+    state: &str,
+    request_id: &str,
+    note: &str,
+) -> Response {
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(DeleteAccountResponse {
+            deleted: false,
+            state: state.to_string(),
+            request_id: Some(request_id.to_string()),
+            required_target_count: None,
+            resolved_target_count: None,
+            legacy_unresolved_count: None,
+            retry_after_ms: Some(ACCOUNT_DELETE_RETRY_AFTER_MS),
+            deleted_at: None,
+            object_count_deleted: 0,
+            note: note.to_string(),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
 }
 
 async fn export_zip(

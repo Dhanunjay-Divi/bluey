@@ -9,10 +9,12 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
+use ed25519_dalek::SigningKey as Ed25519SigningKey;
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::io::{Cursor, Read};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -111,6 +113,606 @@ fn signed_worker_json_request(
         axum::http::HeaderValue::from_static("application/json"),
     );
     request
+}
+
+fn runner_volume_http_payload_sha256(
+    path: &str,
+    worker_id: &str,
+    payload_fields: &[(&str, &str)],
+) -> String {
+    let mut canonical = format!(
+        "bluey-jobs-runner-volume-http-payload-v1\nmethod=POST\npath={path}\nworker_id={worker_id}\n"
+    );
+    for (name, value) in payload_fields {
+        canonical.push_str(name);
+        canonical.push('=');
+        canonical.push_str(value);
+        canonical.push('\n');
+    }
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+
+struct SignedRunnerVolumeFixture {
+    signing_key: Ed25519SigningKey,
+    worker_id: String,
+    volume_id: String,
+    enrollment_epoch: i64,
+    process_instance_id: String,
+    key_fingerprint: String,
+    resource_fingerprint: String,
+}
+
+fn enroll_unattested_offline_runner_volume(
+    pool: &DbPool,
+    seed_byte: u8,
+    label: &str,
+) -> SignedRunnerVolumeFixture {
+    let signing_key = Ed25519SigningKey::from_bytes(&[seed_byte; 32]);
+    let public_key_base64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(signing_key.verifying_key().to_bytes());
+    let volume_id = jobs::runner_volume_id_from_public_key(&public_key_base64url).unwrap();
+    let key_fingerprint = jobs::runner_volume_key_fingerprint(&public_key_base64url).unwrap();
+    let process_instance_id =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([seed_byte.wrapping_add(1); 32]);
+    let grant_token =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([seed_byte.wrapping_add(2); 32]);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let worker_id = format!("offline-worker-{label}");
+    let provider_resource_id = format!("offline-resource-{label}");
+    let resource_fingerprint = hex::encode(Sha256::digest(provider_resource_id.as_bytes()));
+    let grant_id = format!("offline-grant-{label}");
+    jobs::create_runner_volume_admission_grant(
+        pool,
+        &jobs::NewRunnerVolumeAdmissionGrant {
+            grant_id: grant_id.clone(),
+            token: grant_token.clone(),
+            expected_worker_id: worker_id.clone(),
+            provider: "integration".to_string(),
+            provider_resource_id: provider_resource_id.clone(),
+            resource_fingerprint: resource_fingerprint.clone(),
+            authorization_ref: format!("offline-authorization-{label}"),
+            created_by: "phase-602-integration-admin".to_string(),
+            expires_at_ms: now_ms + 600_000,
+            created_at_ms: now_ms,
+        },
+    )
+    .unwrap();
+    let proof = jobs::sign_runner_volume_enrollment_proof(
+        &signing_key,
+        jobs::NewRunnerVolumeEnrollmentProof {
+            admission_grant_id: grant_id,
+            volume_id: volume_id.clone(),
+            worker_id: worker_id.clone(),
+            provider: "integration".to_string(),
+            provider_resource_id,
+            resource_fingerprint: resource_fingerprint.clone(),
+            enrollment_epoch: 1,
+            public_key_base64url,
+            key_fingerprint: key_fingerprint.clone(),
+            legacy_artifact_count: 0,
+            requested_at_ms: now_ms,
+        },
+    )
+    .unwrap();
+    let enrolled = jobs::enroll_runner_volume(
+        pool,
+        &jobs::EnrollRunnerVolumeRequest {
+            grant_token,
+            proof,
+            enrolled_at_ms: now_ms,
+        },
+    )
+    .unwrap();
+    assert_eq!(enrolled.status, "reconciling");
+    assert!(enrolled.active_instance_id.is_none());
+    let attestation_count: i64 = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_runner_volume_storage_attestations \
+              WHERE volume_id = ?1",
+            rusqlite::params![volume_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attestation_count, 0);
+    SignedRunnerVolumeFixture {
+        signing_key,
+        worker_id,
+        volume_id,
+        enrollment_epoch: 1,
+        process_instance_id,
+        key_fingerprint,
+        resource_fingerprint,
+    }
+}
+
+fn authorize_empty_legacy_runner_inventory(
+    pool: &DbPool,
+    reconciliation_id: &str,
+) -> jobs::RunnerVolumeFleetStatus {
+    let fleet = jobs::runner_volume_fleet_status(pool).unwrap();
+    if fleet.legacy_inventory_state == "ready" {
+        return fleet;
+    }
+    assert!(matches!(
+        fleet.legacy_inventory_state.as_str(),
+        "unknown" | "reconciling"
+    ));
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let reconciling = jobs::record_runner_legacy_inventory_authority(
+        pool,
+        &jobs::RecordRunnerLegacyInventoryAuthorityRequest {
+            reconciliation_id: reconciliation_id.to_string(),
+            authority_state: "reconciling".to_string(),
+            expected_predecessor_generation: fleet.legacy_inventory_generation,
+            expected_predecessor_authority_id: fleet.legacy_inventory_authority_id,
+            expected_predecessor_authority_sha256: fleet.legacy_inventory_authority_sha256,
+            root_count: 0,
+            root_set_sha256: jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+            scope_ref: "phase-602-integration-empty-legacy-roots".to_string(),
+            evidence_ref: "phase-602-integration-inventory-reconciling".to_string(),
+            evidence_sha256: hex::encode(Sha256::digest(
+                b"phase-602-integration-inventory-reconciling",
+            )),
+            authorized_by: "phase-602-integration-admin".to_string(),
+            recorded_at_ms: now_ms,
+        },
+    )
+    .unwrap()
+    .authority;
+    jobs::record_runner_legacy_inventory_authority(
+        pool,
+        &jobs::RecordRunnerLegacyInventoryAuthorityRequest {
+            reconciliation_id: reconciliation_id.to_string(),
+            authority_state: "ready".to_string(),
+            expected_predecessor_generation: reconciling.authority_generation,
+            expected_predecessor_authority_id: Some(reconciling.authority_id),
+            expected_predecessor_authority_sha256: Some(reconciling.authority_sha256),
+            root_count: 0,
+            root_set_sha256: jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+            scope_ref: reconciling.scope_ref,
+            evidence_ref: "phase-602-integration-inventory-ready".to_string(),
+            evidence_sha256: hex::encode(Sha256::digest(b"phase-602-integration-inventory-ready")),
+            authorized_by: "phase-602-integration-admin".to_string(),
+            recorded_at_ms: now_ms + 1,
+        },
+    )
+    .unwrap();
+    let ready = jobs::runner_volume_fleet_status(pool).unwrap();
+    assert_eq!(ready.legacy_inventory_state, "ready");
+    ready
+}
+
+fn signed_runner_volume_proof(
+    fixture: &SignedRunnerVolumeFixture,
+    operation: &str,
+    request_id: &str,
+    issued_at_ms: i64,
+    payload_sha256: String,
+) -> jobs::RunnerVolumeAuthorityProof {
+    jobs::sign_runner_volume_authority_proof(
+        &fixture.signing_key,
+        jobs::NewRunnerVolumeAuthorityProof {
+            operation: operation.to_string(),
+            request_id: request_id.to_string(),
+            volume_id: fixture.volume_id.clone(),
+            enrollment_epoch: fixture.enrollment_epoch,
+            process_instance_id: fixture.process_instance_id.clone(),
+            issued_at_ms,
+            payload_sha256,
+        },
+    )
+    .unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execution_claim_payload_sha256(
+    worker_id: &str,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    browser_profile_id: &str,
+    owner_id: &str,
+    volume_id: &str,
+    enrollment_epoch: i64,
+    process_instance_id: &str,
+) -> String {
+    let enrollment_epoch = enrollment_epoch.to_string();
+    runner_volume_http_payload_sha256(
+        "/api/jobs/internal/execution-leases/claim",
+        worker_id,
+        &[
+            ("account_id", account_id),
+            ("application_id", application_id),
+            ("run_id", run_id),
+            ("browser_profile_id", browser_profile_id),
+            ("owner_id", owner_id),
+            ("volume_id", volume_id),
+            ("enrollment_epoch", &enrollment_epoch),
+            ("process_instance_id", process_instance_id),
+        ],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn signed_execution_claim_body(
+    fixture: &SignedRunnerVolumeFixture,
+    signing_key: &Ed25519SigningKey,
+    worker_id: &str,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    browser_profile_id: &str,
+    owner_id: &str,
+    request_id: &str,
+) -> serde_json::Value {
+    let issued_at_ms = chrono::Utc::now().timestamp_millis();
+    let payload_sha256 = execution_claim_payload_sha256(
+        worker_id,
+        account_id,
+        application_id,
+        run_id,
+        browser_profile_id,
+        owner_id,
+        &fixture.volume_id,
+        fixture.enrollment_epoch,
+        &fixture.process_instance_id,
+    );
+    let volume_proof = jobs::sign_runner_volume_authority_proof(
+        signing_key,
+        jobs::NewRunnerVolumeAuthorityProof {
+            operation: "execution_lease_claim".to_string(),
+            request_id: request_id.to_string(),
+            volume_id: fixture.volume_id.clone(),
+            enrollment_epoch: fixture.enrollment_epoch,
+            process_instance_id: fixture.process_instance_id.clone(),
+            issued_at_ms,
+            payload_sha256,
+        },
+    )
+    .unwrap();
+    json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "run_id": run_id,
+        "browser_profile_id": browser_profile_id,
+        "owner_id": owner_id,
+        "volume_id": fixture.volume_id,
+        "enrollment_epoch": fixture.enrollment_epoch,
+        "process_instance_id": fixture.process_instance_id,
+        "volume_proof": volume_proof
+    })
+}
+
+async fn setup_signed_runner_volume(
+    harness: &Harness,
+    worker_signing_key: &str,
+    worker_timestamp: u64,
+) -> SignedRunnerVolumeFixture {
+    const WORKER_ID: &str = "signed-execution-worker";
+    let signing_key = Ed25519SigningKey::from_bytes(&[61_u8; 32]);
+    let public_key_base64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(signing_key.verifying_key().to_bytes());
+    let volume_id = jobs::runner_volume_id_from_public_key(&public_key_base64url).unwrap();
+    let key_fingerprint = jobs::runner_volume_key_fingerprint(&public_key_base64url).unwrap();
+    let process_instance_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([62_u8; 32]);
+    let grant_token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([63_u8; 32]);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let resource_fingerprint = hex::encode(Sha256::digest(b"phase-602-http-volume"));
+    let grant_id = "runner-volume-grant-http-602";
+    jobs::create_runner_volume_admission_grant(
+        &harness.pool,
+        &jobs::NewRunnerVolumeAdmissionGrant {
+            grant_id: grant_id.to_string(),
+            token: grant_token.clone(),
+            expected_worker_id: WORKER_ID.to_string(),
+            provider: "integration".to_string(),
+            provider_resource_id: "phase-602-http-volume".to_string(),
+            resource_fingerprint: resource_fingerprint.clone(),
+            authorization_ref: "phase-602-http-admission".to_string(),
+            created_by: "phase-602-integration-admin".to_string(),
+            expires_at_ms: now_ms + 600_000,
+            created_at_ms: now_ms,
+        },
+    )
+    .unwrap();
+    let enrollment_proof = jobs::sign_runner_volume_enrollment_proof(
+        &signing_key,
+        jobs::NewRunnerVolumeEnrollmentProof {
+            admission_grant_id: grant_id.to_string(),
+            volume_id: volume_id.clone(),
+            worker_id: WORKER_ID.to_string(),
+            provider: "integration".to_string(),
+            provider_resource_id: "phase-602-http-volume".to_string(),
+            resource_fingerprint: resource_fingerprint.clone(),
+            enrollment_epoch: 1,
+            public_key_base64url,
+            key_fingerprint: key_fingerprint.clone(),
+            legacy_artifact_count: 0,
+            requested_at_ms: now_ms,
+        },
+    )
+    .unwrap();
+    let enrollment = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/runner-volumes/enroll",
+            "runner-volume",
+            WORKER_ID,
+            worker_timestamp,
+            "runner-volume-enrollment-0001",
+            &json!({
+                "grantToken": grant_token,
+                "proof": enrollment_proof
+            }),
+            worker_signing_key,
+        ))
+        .await
+        .unwrap();
+    let enrollment_status = enrollment.status();
+    let enrollment_body = axum::body::to_bytes(enrollment.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        enrollment_status,
+        StatusCode::OK,
+        "runner-volume enrollment failed: {}",
+        String::from_utf8_lossy(&enrollment_body)
+    );
+    let enrolled: serde_json::Value = serde_json::from_slice(&enrollment_body).unwrap();
+    assert_eq!(enrolled["volumeId"], volume_id);
+    assert_eq!(enrolled["status"], "reconciling");
+
+    let fixture = SignedRunnerVolumeFixture {
+        signing_key,
+        worker_id: WORKER_ID.to_string(),
+        volume_id,
+        enrollment_epoch: 1,
+        process_instance_id,
+        key_fingerprint,
+        resource_fingerprint,
+    };
+    let instance_path = format!(
+        "/api/jobs/internal/runner-volumes/{}/instances/claim",
+        fixture.volume_id
+    );
+    let instance_proof = signed_runner_volume_proof(
+        &fixture,
+        "instance_claim",
+        "runner-volume-instance-claim-0001",
+        chrono::Utc::now().timestamp_millis(),
+        runner_volume_http_payload_sha256(&instance_path, WORKER_ID, &[]),
+    );
+    let instance = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &instance_path,
+            "runner-volume",
+            WORKER_ID,
+            worker_timestamp,
+            "runner-volume-instance-http-0001",
+            &json!({ "proof": instance_proof }),
+            worker_signing_key,
+        ))
+        .await
+        .unwrap();
+    let instance_status = instance.status();
+    let instance_body = axum::body::to_bytes(instance.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        instance_status,
+        StatusCode::OK,
+        "runner-volume instance claim failed: {}",
+        String::from_utf8_lossy(&instance_body)
+    );
+    let instance_lease: serde_json::Value = serde_json::from_slice(&instance_body).unwrap();
+    assert_eq!(instance_lease["volumeId"], fixture.volume_id);
+    assert_eq!(
+        instance_lease["processInstanceId"],
+        fixture.process_instance_id
+    );
+
+    let poll_path = format!(
+        "/api/jobs/internal/runner-volumes/{}/commands/poll",
+        fixture.volume_id
+    );
+    let poll_proof = signed_runner_volume_proof(
+        &fixture,
+        "purge_poll",
+        "runner-volume-command-poll-0001",
+        chrono::Utc::now().timestamp_millis(),
+        runner_volume_http_payload_sha256(
+            &poll_path,
+            WORKER_ID,
+            &[("after_command_id", ""), ("limit", "100")],
+        ),
+    );
+    let poll = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &poll_path,
+            "runner-volume",
+            WORKER_ID,
+            worker_timestamp,
+            "runner-volume-command-http-0001",
+            &json!({ "afterCommandId": null, "proof": poll_proof, "limit": 100 }),
+            worker_signing_key,
+        ))
+        .await
+        .unwrap();
+    let poll_status = poll.status();
+    let poll_body = axum::body::to_bytes(poll.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        poll_status,
+        StatusCode::OK,
+        "runner-volume command poll failed: {}",
+        String::from_utf8_lossy(&poll_body)
+    );
+    let poll_result: serde_json::Value = serde_json::from_slice(&poll_body).unwrap();
+    assert_eq!(poll_result["commands"], json!([]));
+    assert_eq!(poll_result["ready"], false);
+    assert_eq!(poll_result["storageAttestationRequired"], true);
+
+    let attestation_observed_at_ms = chrono::Utc::now().timestamp_millis();
+    let attestation = jobs::sign_runner_volume_storage_attestation(
+        &fixture.signing_key,
+        jobs::NewRunnerVolumeStorageAttestation {
+            attestation_id: "integration-storage-attestation-1".to_string(),
+            volume_id: fixture.volume_id.clone(),
+            volume_key_fingerprint: fixture.key_fingerprint.clone(),
+            resource_fingerprint: fixture.resource_fingerprint.clone(),
+            enrollment_epoch: fixture.enrollment_epoch,
+            enrollment_generation: poll_result["enrollmentGeneration"].as_i64().unwrap(),
+            process_instance_id: fixture.process_instance_id.clone(),
+            predecessor_attestation_generation: poll_result["predecessorAttestationGeneration"]
+                .as_i64()
+                .unwrap(),
+            predecessor_attestation_sha256: poll_result["predecessorAttestationSha256"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            required_tombstone_generation: poll_result["requiredTombstoneGeneration"]
+                .as_i64()
+                .unwrap(),
+            reconciled_tombstone_generation: poll_result["reconciledTombstoneGeneration"]
+                .as_i64()
+                .unwrap(),
+            storage_evidence_version: jobs::RUNNER_PURGE_STORAGE_EVIDENCE_VERSION,
+            subject_storage_layout_version: jobs::RUNNER_SUBJECT_STORAGE_LAYOUT_VERSION,
+            root_device_id: "unix:602:integration-device".to_string(),
+            root_link_count: 7,
+            root_entry_count: 0,
+            root_file_bytes: "0".to_string(),
+            root_sha256: jobs::EMPTY_RUNNER_INVENTORY_SHA256.to_string(),
+            subject_storage_subject_count: 0,
+            subject_storage_subject_set_sha256: jobs::EMPTY_RUNNER_SUBJECT_STORAGE_INVENTORY_SHA256
+                .to_string(),
+            subject_storage_scope_count: 0,
+            subject_storage_complete_root_entry_count: 0,
+            subject_storage_complete_root_file_bytes: "0".to_string(),
+            subject_storage_complete_root_sha256:
+                jobs::EMPTY_RUNNER_SUBJECT_STORAGE_INVENTORY_SHA256.to_string(),
+            locator_count: 0,
+            resident_locator_count: 0,
+            locator_set_sha256: jobs::EMPTY_RUNNER_INVENTORY_SHA256.to_string(),
+            legacy_inventory_version: jobs::RUNNER_LEGACY_INVENTORY_VERSION,
+            legacy_artifact_count: 0,
+            legacy_artifact_bytes: "0".to_string(),
+            legacy_artifact_set_sha256: jobs::EMPTY_RUNNER_LEGACY_ARTIFACT_SET_SHA256.to_string(),
+            unclassified_root_count: 0,
+            runner_build_id: "runner-602".to_string(),
+            observed_at_ms: attestation_observed_at_ms,
+        },
+    )
+    .unwrap();
+    let attestation_sha256 = attestation.attestation_sha256().unwrap();
+    let attestation_path = format!(
+        "/api/jobs/internal/runner-volumes/{}/storage-attestations",
+        fixture.volume_id
+    );
+    let attestation_proof = signed_runner_volume_proof(
+        &fixture,
+        "storage_attestation",
+        "runner-volume-storage-attestation-0001",
+        attestation_observed_at_ms,
+        runner_volume_http_payload_sha256(
+            &attestation_path,
+            WORKER_ID,
+            &[("attestation_sha256", attestation_sha256.as_str())],
+        ),
+    );
+    let attestation_response = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &attestation_path,
+            "runner-volume",
+            WORKER_ID,
+            worker_timestamp,
+            "runner-volume-storage-attestation-http-0001",
+            &json!({ "proof": attestation_proof, "attestation": attestation }),
+            worker_signing_key,
+        ))
+        .await
+        .unwrap();
+    let attestation_status = attestation_response.status();
+    let attestation_body = axum::body::to_bytes(attestation_response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        attestation_status,
+        StatusCode::OK,
+        "runner-volume storage attestation failed: {}",
+        String::from_utf8_lossy(&attestation_body)
+    );
+    let attestation_result: serde_json::Value = serde_json::from_slice(&attestation_body).unwrap();
+    assert_eq!(attestation_result["volumeStatus"], "active");
+    assert_eq!(attestation_result["attestationSha256"], attestation_sha256);
+
+    let fleet = authorize_empty_legacy_runner_inventory(
+        &harness.pool,
+        "phase-602-signed-runner-volume-inventory",
+    );
+    assert_eq!(fleet.non_destroyed_volume_count, 1);
+    assert_eq!(fleet.attested_reconciled_volume_count, 1);
+    assert_eq!(fleet.unresolved_legacy_volume_count, 0);
+    let cutover_at_ms = chrono::Utc::now().timestamp_millis();
+    let cutover = |cutover_state: &str, now_ms: i64| jobs::RecordRunnerVolumeFleetCutoverRequest {
+        cutover_state: cutover_state.to_string(),
+        expected_enrollment_generation: fleet.enrollment_generation,
+        expected_purge_generation: fleet.purge_generation,
+        expected_tombstone_generation: fleet.tombstone_generation,
+        expected_destruction_generation: fleet.destruction_generation,
+        expected_legacy_reconciliation_generation: fleet.legacy_reconciliation_generation,
+        expected_storage_attestation_generation: fleet.storage_attestation_generation,
+        expected_storage_attestation_count: fleet.storage_attestation_count,
+        expected_storage_attestation_set_sha256: fleet.storage_attestation_set_sha256.clone(),
+        expected_legacy_inventory_generation: fleet.legacy_inventory_generation,
+        expected_legacy_inventory_reconciliation_id: fleet
+            .legacy_inventory_reconciliation_id
+            .clone()
+            .unwrap(),
+        expected_legacy_inventory_authority_id: fleet
+            .legacy_inventory_authority_id
+            .clone()
+            .unwrap(),
+        expected_legacy_inventory_authority_sha256: fleet
+            .legacy_inventory_authority_sha256
+            .clone()
+            .unwrap(),
+        expected_legacy_inventory_root_count: fleet.legacy_inventory_root_count.unwrap(),
+        expected_legacy_inventory_root_set_sha256: fleet
+            .legacy_inventory_root_set_sha256
+            .clone()
+            .unwrap(),
+        expected_non_destroyed_volume_count: fleet.non_destroyed_volume_count,
+        expected_destruction_count: fleet.destruction_count,
+        expected_unresolved_legacy_volume_count: fleet.unresolved_legacy_volume_count,
+        evidence_ref: "phase-602-http-cutover".to_string(),
+        evidence_sha256: hex::encode(Sha256::digest(b"phase-602-http-cutover")),
+        authorized_by: "phase-602-integration-admin".to_string(),
+        cutover_at_ms,
+        now_ms,
+    };
+    jobs::record_runner_volume_fleet_cutover(&harness.pool, &cutover("reconciling", cutover_at_ms))
+        .unwrap();
+    jobs::record_runner_volume_fleet_cutover(&harness.pool, &cutover("ready", cutover_at_ms + 1))
+        .unwrap();
+    let ready = jobs::runner_volume_fleet_status(&harness.pool).unwrap();
+    assert_eq!(ready.cutover_state, "ready");
+    assert_eq!(
+        ready.cutover_enrollment_generation,
+        Some(fleet.enrollment_generation)
+    );
+
+    fixture
 }
 
 fn pcm16_mono_wav(seconds: u32) -> Vec<u8> {
@@ -2380,6 +2982,7 @@ async fn post_cloud_receipt(
 async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     const WORKER_TOKEN: &str = "jobs-execution-lease-worker-token";
     const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
+    configure_runner_volume_purge_test_policy();
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
     std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", SIGNING_KEY);
     let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
@@ -2397,18 +3000,97 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
-    let claim_body = json!({
-        "account_id": account_id,
-        "application_id": application_id,
-        "run_id": run_id,
-        "browser_profile_id": browser_profile_id,
-        "owner_id": "integration-worker-one"
-    });
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
+    let volume = setup_signed_runner_volume(&harness, SIGNING_KEY, now).await;
+    let clone_instance_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([65_u8; 32]);
+    let instance_path = format!(
+        "/api/jobs/internal/runner-volumes/{}/instances/claim",
+        volume.volume_id
+    );
+    let clone_proof = jobs::sign_runner_volume_authority_proof(
+        &volume.signing_key,
+        jobs::NewRunnerVolumeAuthorityProof {
+            operation: "instance_claim".to_string(),
+            request_id: "runner-volume-clone-claim-proof-0001".to_string(),
+            volume_id: volume.volume_id.clone(),
+            enrollment_epoch: volume.enrollment_epoch,
+            process_instance_id: clone_instance_id,
+            issued_at_ms: chrono::Utc::now().timestamp_millis(),
+            payload_sha256: runner_volume_http_payload_sha256(
+                &instance_path,
+                &volume.worker_id,
+                &[],
+            ),
+        },
+    )
+    .unwrap();
+    let concurrent_clone = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &instance_path,
+            "runner-volume",
+            &volume.worker_id,
+            now,
+            "runner-volume-clone-claim-http-0001",
+            &json!({ "proof": clone_proof }),
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(concurrent_clone.status(), StatusCode::CONFLICT);
+    let claim_body = signed_execution_claim_body(
+        &volume,
+        &volume.signing_key,
+        &volume.worker_id,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        &volume.worker_id,
+        "execution-lease-claim-success-0001",
+    );
+
+    let mut oversized_claim = claim_body.clone();
+    oversized_claim["padding"] = json!("x".repeat(70 * 1024));
+    let oversized_bytes = serde_json::to_vec(&oversized_claim).unwrap();
+    assert!(oversized_bytes.len() > 64 * 1024);
+    let mut oversized_request = signed_worker_request(SignedWorkerRequest {
+        path: "/api/jobs/internal/execution-leases/claim",
+        scope: "execution",
+        worker_id: &volume.worker_id,
+        timestamp: now,
+        nonce: "execution-claim-body-limit-0001",
+        signed_body: &oversized_bytes,
+        actual_body: &oversized_bytes,
+        signing_key: SIGNING_KEY,
+    });
+    oversized_request.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    let oversized = harness
+        .router
+        .clone()
+        .oneshot(oversized_request)
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let owner_mismatch_body = signed_execution_claim_body(
+        &volume,
+        &volume.signing_key,
+        &volume.worker_id,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        "forged-execution-owner",
+        "execution-owner-binding-proof-0001",
+    );
     let signed_owner_mismatch = harness
         .router
         .clone()
@@ -2418,13 +3100,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
             "signed-execution-worker",
             now,
             "execution-owner-binding-0001",
-            &json!({
-                "account_id": account_id,
-                "application_id": application_id,
-                "run_id": run_id,
-                "browser_profile_id": browser_profile_id,
-                "owner_id": "forged-execution-owner"
-            }),
+            &owner_mismatch_body,
             SIGNING_KEY,
         ))
         .await
@@ -2455,96 +3131,226 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         .unwrap();
     assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
+    let forged_volume_key = Ed25519SigningKey::from_bytes(&[91_u8; 32]);
+    let fleet_hmac_only_body = signed_execution_claim_body(
+        &volume,
+        &forged_volume_key,
+        &volume.worker_id,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        &volume.worker_id,
+        "execution-forged-volume-proof-0001",
+    );
+    let fleet_hmac_only = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/execution-leases/claim",
+            "execution",
+            &volume.worker_id,
+            now,
+            "execution-fleet-hmac-only-0001",
+            &fleet_hmac_only_body,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fleet_hmac_only.status(), StatusCode::UNAUTHORIZED);
+
+    let forged_profile_body = signed_execution_claim_body(
+        &volume,
+        &volume.signing_key,
+        &volume.worker_id,
+        &account_id,
+        &application_id,
+        &run_id,
+        "forged:browser-profile",
+        &volume.worker_id,
+        "execution-forged-profile-proof-0001",
+    );
     let forged_scope = harness
         .router
         .clone()
-        .oneshot(
-            Request::post("/api/jobs/internal/execution-leases/claim")
-                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "account_id": account_id,
-                        "application_id": application_id,
-                        "run_id": run_id,
-                        "browser_profile_id": "forged:browser-profile",
-                        "owner_id": "integration-worker-one"
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/execution-leases/claim",
+            "execution",
+            &volume.worker_id,
+            now,
+            "execution-forged-profile-http-0001",
+            &forged_profile_body,
+            SIGNING_KEY,
+        ))
         .await
         .unwrap();
     assert_eq!(forged_scope.status(), StatusCode::CONFLICT);
 
+    let invalid_claim_body = signed_execution_claim_body(
+        &volume,
+        &volume.signing_key,
+        &volume.worker_id,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        "",
+        "execution-invalid-owner-proof-0001",
+    );
     let invalid_claim = harness
         .router
         .clone()
-        .oneshot(
-            Request::post("/api/jobs/internal/execution-leases/claim")
-                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "account_id": account_id,
-                        "application_id": application_id,
-                        "run_id": run_id,
-                        "browser_profile_id": browser_profile_id,
-                        "owner_id": ""
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/execution-leases/claim",
+            "execution",
+            &volume.worker_id,
+            now,
+            "execution-invalid-owner-http-0001",
+            &invalid_claim_body,
+            SIGNING_KEY,
+        ))
         .await
         .unwrap();
     assert_eq!(invalid_claim.status(), StatusCode::BAD_REQUEST);
 
+    let missing_binding_body = signed_execution_claim_body(
+        &volume,
+        &volume.signing_key,
+        &volume.worker_id,
+        &account_id,
+        &application_id,
+        "different-cloud-run",
+        &browser_profile_id,
+        &volume.worker_id,
+        "execution-missing-run-proof-0001",
+    );
     let missing_binding = harness
         .router
         .clone()
-        .oneshot(
-            Request::post("/api/jobs/internal/execution-leases/claim")
-                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "account_id": account_id,
-                        "application_id": application_id,
-                        "run_id": "different-cloud-run",
-                        "browser_profile_id": browser_profile_id,
-                        "owner_id": "integration-worker-one"
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/execution-leases/claim",
+            "execution",
+            &volume.worker_id,
+            now,
+            "execution-missing-run-http-0001",
+            &missing_binding_body,
+            SIGNING_KEY,
+        ))
         .await
         .unwrap();
     assert_eq!(missing_binding.status(), StatusCode::NOT_FOUND);
+    let unclaimed_rows: (i64, i64, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM jobs_execution_leases WHERE run_id = ?1),
+                (SELECT COUNT(*) FROM jobs_execution_lease_volume_bindings WHERE run_id = ?1),
+                (SELECT COUNT(*) FROM jobs_runner_volume_residencies)",
+            rusqlite::params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(unclaimed_rows, (0, 0, 0));
 
     let claimed = harness
         .router
         .clone()
-        .oneshot(
-            Request::post("/api/jobs/internal/execution-leases/claim")
-                .header("authorization", format!("Bearer {WORKER_TOKEN}"))
-                .header("content-type", "application/json")
-                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
-                .unwrap(),
-        )
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/execution-leases/claim",
+            "execution",
+            &volume.worker_id,
+            now,
+            "execution-lease-claim-http-0001",
+            &claim_body,
+            SIGNING_KEY,
+        ))
         .await
         .unwrap();
-    assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed_status = claimed.status();
     let claimed_body = axum::body::to_bytes(claimed.into_body(), 64 * 1024)
         .await
         .unwrap();
+    assert_eq!(
+        claimed_status,
+        StatusCode::OK,
+        "signed runner-volume execution claim failed: {}",
+        String::from_utf8_lossy(&claimed_body)
+    );
     let lease: serde_json::Value = serde_json::from_slice(&claimed_body).unwrap();
+    let grant_keys = lease
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        grant_keys,
+        [
+            "enrollment_epoch",
+            "fence",
+            "lease_expires_at_ms",
+            "lease_token",
+            "phase",
+            "process_instance_id",
+            "purge_subject",
+            "run_id",
+            "volume_id",
+            "volume_key_fingerprint",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    );
     assert_eq!(lease["run_id"], run_id);
     assert_eq!(lease["phase"], "prepared");
+    assert_eq!(lease["volume_id"], volume.volume_id);
+    assert_eq!(lease["enrollment_epoch"], volume.enrollment_epoch);
+    assert_eq!(lease["process_instance_id"], volume.process_instance_id);
+    assert_eq!(lease["volume_key_fingerprint"], volume.key_fingerprint);
+    let purge_subject = lease["purge_subject"].as_str().unwrap().to_string();
     let lease_token = lease["lease_token"].as_str().unwrap();
     let fence = lease["fence"].as_i64().unwrap();
+    let irreversible_body = json!({
+        "account_id": account_id,
+        "application_id": application_id,
+        "lease_token": lease_token,
+        "fence": fence,
+        "action": "submit",
+        "final_submit_proof": final_submit_proof(&harness, &account_id, &application_id)
+    });
+
+    let durable_binding: (String, i64, String, String) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT volume_id, volume_epoch, process_instance_id, purge_subject_sha256
+               FROM jobs_execution_lease_volume_bindings WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(durable_binding.0, volume.volume_id);
+    assert_eq!(durable_binding.1, volume.enrollment_epoch);
+    assert_eq!(durable_binding.2, volume.process_instance_id);
+    assert_eq!(
+        durable_binding.3,
+        jobs::runner_purge_subject_sha256(&purge_subject).unwrap()
+    );
+    let durable_residency: (String, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT state, purge_generation FROM jobs_runner_volume_residencies
+              WHERE purge_subject = ?1 AND volume_id = ?2 AND volume_epoch = ?3",
+            rusqlite::params![purge_subject, volume.volume_id, volume.enrollment_epoch],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(durable_residency, ("resident".to_string(), 0));
 
     let heartbeat = harness
         .router
@@ -2569,6 +3375,65 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         .await
         .unwrap();
     assert_eq!(heartbeat.status(), StatusCode::OK);
+
+    let replacement_instance_id =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([64_u8; 32]);
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_runner_volumes SET active_instance_id = ?2 WHERE volume_id = ?1",
+            rusqlite::params![volume.volume_id, replacement_instance_id],
+        )
+        .unwrap();
+    let fenced_heartbeat = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/execution-leases/{run_id}/heartbeat"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "account_id": account_id,
+                    "application_id": application_id,
+                    "lease_token": lease_token,
+                    "fence": fence
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fenced_heartbeat.status(), StatusCode::CONFLICT);
+    let fenced_irreversible = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!(
+                "/api/jobs/internal/execution-leases/{run_id}/irreversible"
+            ))
+            .header("authorization", format!("Bearer {WORKER_TOKEN}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&irreversible_body).unwrap()))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fenced_irreversible.status(), StatusCode::CONFLICT);
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_runner_volumes SET active_instance_id = ?2 WHERE volume_id = ?1",
+            rusqlite::params![volume.volume_id, volume.process_instance_id],
+        )
+        .unwrap();
 
     let running = harness
         .router
@@ -2614,14 +3479,6 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         .unwrap();
     assert_eq!(premature_failure.status(), StatusCode::CONFLICT);
 
-    let irreversible_body = json!({
-        "account_id": account_id,
-        "application_id": application_id,
-        "lease_token": lease_token,
-        "fence": fence,
-        "action": "submit",
-        "final_submit_proof": final_submit_proof(&harness, &account_id, &application_id)
-    });
     let irreversible = harness
         .router
         .clone()
@@ -7466,13 +8323,27 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let completed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(completed["deleted"], true);
+    assert_eq!(completed["state"], "deleted");
+    assert!(completed["deleted_at"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
 }
 
 #[tokio::test]
 #[serial]
 async fn account_delete_without_storage_preserves_account_and_deletion_fence() {
+    configure_runner_volume_purge_test_policy();
     let h = boot_harness().await;
+    authorize_empty_legacy_runner_inventory(
+        &h.pool,
+        "phase-602-storage-unavailable-delete-inventory",
+    );
     let email = "delete-storage-unavailable@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -7503,6 +8374,52 @@ async fn account_delete_without_storage_preserves_account_and_deletion_fence() {
             .is_some(),
         "storage configuration failure must retain the durable deletion fence"
     );
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/sync/batch")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("fenced new writes and launches"));
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/account/me")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let retry = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = h.router.clone().oneshot(retry).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
@@ -7611,8 +8528,103 @@ async fn account_delete_uses_audit_fallback_and_sweeps_shared_namespace_once() {
 
 #[tokio::test]
 #[serial]
-async fn account_delete_waits_for_acknowledged_cloud_runner_cleanup() {
-    let h = boot_harness().await;
+async fn account_delete_freezes_unattested_offline_volume_and_returns_durable_pending() {
+    configure_runner_volume_purge_test_policy();
+    let harness = boot_harness().await;
+    let email = "delete-unattested-offline-volume@example.com";
+    let access = signup_and_login(&harness, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let volume = enroll_unattested_offline_runner_volume(&harness.pool, 87, "delete-pending");
+    let fleet = authorize_empty_legacy_runner_inventory(
+        &harness.pool,
+        "phase-602-offline-delete-inventory",
+    );
+    assert_eq!(fleet.non_destroyed_volume_count, 1);
+    assert_eq!(fleet.storage_attestation_count, 0);
+
+    let delete_request = || {
+        Request::post("/account/delete")
+            .header("authorization", format!("Bearer {access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "confirm_text": "DELETE",
+                    "accept_data_loss": true,
+                    "accept_credit_loss": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let response = harness
+        .router
+        .clone()
+        .oneshot(delete_request())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["state"], "pending_runner_volume_purge");
+    assert_eq!(pending["required_target_count"], 1);
+    assert_eq!(pending["resolved_target_count"], 0);
+    let deletion_request_id = pending["request_id"].as_str().unwrap();
+
+    let frozen: (i64, String) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*), MIN(t.volume_id) \
+               FROM jobs_runner_purge_targets t \
+               JOIN jobs_runner_purge_requests r ON r.request_id = t.request_id \
+              WHERE r.deletion_request_id = ?1",
+            rusqlite::params![deletion_request_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(frozen, (1, volume.volume_id));
+    assert!(Account::fetch_by_id(&harness.pool, &account.id)
+        .unwrap()
+        .is_some());
+    assert!(
+        bluey_server::db::account_data::account_deletion_intent(&harness.pool, &account.id,)
+            .unwrap()
+            .is_some()
+    );
+
+    let replay = harness
+        .router
+        .clone()
+        .oneshot(delete_request())
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay_body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let replay_pending: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay_pending["request_id"], deletion_request_id);
+    assert_eq!(replay_pending["required_target_count"], 1);
+    assert_eq!(replay_pending["resolved_target_count"], 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_fences_then_waits_for_legacy_runner_reconciliation() {
+    configure_runner_volume_purge_test_policy();
+    let admin_email = "delete-cloud-runner-admin@example.com";
+    let h = boot_harness_with_upstream_and_admin_emails(
+        UpstreamKeys::default(),
+        vec![admin_email.to_string()],
+    )
+    .await;
+    let admin_access = signup_and_login(&h, admin_email, "longenoughpw").await;
     let email = "delete-cloud-runner-cleanup@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -7635,29 +8647,223 @@ async fn account_delete_waits_for_acknowledged_cloud_runner_cleanup() {
     )
     .unwrap();
 
-    let request = Request::post("/account/delete")
-        .header("authorization", format!("Bearer {access}"))
-        .header("content-type", "application/json")
-        .body(Body::from(
-            serde_json::to_vec(&json!({
-                "confirm_text": "DELETE",
-                "accept_data_loss": true,
-                "accept_credit_loss": true
-            }))
-            .unwrap(),
-        ))
+    let delete_request = || {
+        Request::post("/account/delete")
+            .header("authorization", format!("Bearer {access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "confirm_text": "DELETE",
+                    "accept_data_loss": true,
+                    "accept_credit_loss": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let response = h.router.clone().oneshot(delete_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.headers().get("retry-after").unwrap(), "5");
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
         .unwrap();
-    let response = h.router.clone().oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["deleted"], false);
+    assert_eq!(pending["state"], "pending_runner_legacy_inventory");
+    let request_id = pending["request_id"].as_str().unwrap().to_string();
+    assert!(!request_id.is_empty());
+    assert!(pending.get("required_target_count").is_none());
+    assert!(pending.get("resolved_target_count").is_none());
+    assert!(pending.get("legacy_unresolved_count").is_none());
     assert!(Account::fetch_by_id(&h.pool, &account.id)
         .unwrap()
         .is_some());
     assert!(
         bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
             .unwrap()
-            .is_none(),
-        "cloud cleanup must finish before the durable deletion fence is created"
+            .is_some(),
+        "legacy runner reconciliation must happen after the durable deletion fence"
     );
+
+    let reconciliation_id = "phase-602-http-account-delete-inventory";
+    let scope_ref = "phase-602-http-empty-legacy-root-scope";
+    let authority_request = |body: serde_json::Value| {
+        Request::post("/admin/jobs/runner-volumes/fleet/legacy-inventory-authority")
+            .header("authorization", format!("Bearer {admin_access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap()
+    };
+    let response = h
+        .router
+        .clone()
+        .oneshot(authority_request(json!({
+            "reconciliationId": reconciliation_id,
+            "authorityState": "reconciling",
+            "expectedPredecessorGeneration": 0,
+            "rootCount": 0,
+            "rootSetSha256": jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256,
+            "scopeRef": scope_ref,
+            "evidenceRef": "phase-602-http-account-delete-inventory-reconciling",
+            "evidenceSha256": hex::encode(Sha256::digest(
+                b"phase-602-http-account-delete-inventory-reconciling"
+            ))
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let reconciling: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(reconciling["disposition"], "applied");
+    assert_eq!(reconciling["authority"]["authorityState"], "reconciling");
+
+    let response = h.router.clone().oneshot(delete_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let still_reconciling: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        still_reconciling["state"],
+        "pending_runner_legacy_inventory"
+    );
+    assert_eq!(still_reconciling["request_id"], request_id);
+    assert!(still_reconciling.get("required_target_count").is_none());
+    assert!(still_reconciling.get("resolved_target_count").is_none());
+    assert!(still_reconciling.get("legacy_unresolved_count").is_none());
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(authority_request(json!({
+            "reconciliationId": reconciliation_id,
+            "authorityState": "ready",
+            "expectedPredecessorGeneration": reconciling["authority"]
+                ["authorityGeneration"],
+            "expectedPredecessorAuthorityId": reconciling["authority"]["authorityId"],
+            "expectedPredecessorAuthoritySha256": reconciling["authority"]
+                ["authoritySha256"],
+            "rootCount": 0,
+            "rootSetSha256": jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256,
+            "scopeRef": scope_ref,
+            "evidenceRef": "phase-602-http-account-delete-inventory-ready",
+            "evidenceSha256": hex::encode(Sha256::digest(
+                b"phase-602-http-account-delete-inventory-ready"
+            ))
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let ready: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ready["disposition"], "applied");
+    assert_eq!(ready["authority"]["authorityState"], "ready");
+
+    let response = h.router.clone().oneshot(delete_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["state"], "pending_runner_volume_purge");
+    assert_eq!(pending["request_id"], request_id);
+    assert!(pending.get("required_target_count").is_some());
+    assert!(pending.get("resolved_target_count").is_some());
+    assert!(pending["legacy_unresolved_count"].as_i64().unwrap() >= 1);
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(authority_request(json!({
+            "reconciliationId": "phase-602-http-account-delete-successor",
+            "authorityState": "reconciling",
+            "expectedPredecessorGeneration": ready["authority"]["authorityGeneration"],
+            "expectedPredecessorAuthorityId": ready["authority"]["authorityId"],
+            "expectedPredecessorAuthoritySha256": ready["authority"]["authoritySha256"],
+            "rootCount": 0,
+            "rootSetSha256": jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256,
+            "scopeRef": scope_ref,
+            "evidenceRef": "phase-602-http-account-delete-successor-reconciling",
+            "evidenceSha256": hex::encode(Sha256::digest(
+                b"phase-602-http-account-delete-successor-reconciling"
+            ))
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let successor_reconciling: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        successor_reconciling["authority"]["authorityState"],
+        "reconciling"
+    );
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(authority_request(json!({
+            "reconciliationId": "phase-602-http-account-delete-successor",
+            "authorityState": "ready",
+            "expectedPredecessorGeneration": successor_reconciling["authority"]
+                ["authorityGeneration"],
+            "expectedPredecessorAuthorityId": successor_reconciling["authority"]["authorityId"],
+            "expectedPredecessorAuthoritySha256": successor_reconciling["authority"]
+                ["authoritySha256"],
+            "rootCount": 0,
+            "rootSetSha256": jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256,
+            "scopeRef": scope_ref,
+            "evidenceRef": "phase-602-http-account-delete-successor-ready",
+            "evidenceSha256": hex::encode(Sha256::digest(
+                b"phase-602-http-account-delete-successor-ready"
+            ))
+        })))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = h.router.clone().oneshot(delete_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let successor_pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(successor_pending["state"], "pending_runner_volume_purge");
+    assert_eq!(successor_pending["request_id"], request_id);
+    assert!(
+        successor_pending["required_target_count"].as_i64().unwrap()
+            >= pending["required_target_count"].as_i64().unwrap()
+    );
+    assert!(
+        successor_pending["legacy_unresolved_count"]
+            .as_i64()
+            .unwrap()
+            >= pending["legacy_unresolved_count"].as_i64().unwrap()
+    );
+    let connection = h.pool.get().unwrap();
+    let attempt_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_runner_purge_requests \
+              WHERE account_id = ?1 AND deletion_request_id = ?2",
+            rusqlite::params![account.id, request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let superseded_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_runner_purge_requests \
+              WHERE account_id = ?1 AND deletion_request_id = ?2 AND state = 'superseded'",
+            rusqlite::params![account.id, request_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempt_count, 2);
+    assert_eq!(superseded_count, 1);
 }
 
 #[tokio::test]
@@ -7925,12 +9131,34 @@ fn account_delete_storage_config(endpoint_url: String) -> ObjectStorageConfig {
     }
 }
 
+fn configure_runner_volume_purge_test_policy() {
+    std::env::set_var(
+        "BLUEY_JOBS_RUNNER_PURGE_SIGNING_KEY_ID",
+        "round602-test-key",
+    );
+    std::env::set_var(
+        "BLUEY_JOBS_RUNNER_PURGE_SIGNING_KEY",
+        "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    );
+    std::env::set_var(
+        "BLUEY_JOBS_RUNNER_PURGE_VERIFYING_KEYS_JSON",
+        r#"[{"keyId":"round602-test-key","publicKeyBase64url":"A6EHv_POEL4dcN0Y50vAmWfk1jCbpQ1fHdyGZBJVMbg"}]"#,
+    );
+    std::env::set_var("BLUEY_JOBS_RUNNER_MINIMUM_BUILD_ID", "runner-602.0");
+}
+
 async fn boot_account_delete_storage_harness(object_store: &MockServer) -> Harness {
+    configure_runner_volume_purge_test_policy();
     let storage_config = account_delete_storage_config(object_store.uri());
-    boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
         config.object_storage = Some(storage_config);
     })
-    .await
+    .await;
+    authorize_empty_legacy_runner_inventory(
+        &harness.pool,
+        "phase-602-account-delete-storage-inventory",
+    );
+    harness
 }
 
 async fn mount_empty_account_namespace_sweep(object_store: &MockServer, account_id: &str) {
@@ -7950,8 +9178,9 @@ async fn mount_empty_account_namespace_sweep(object_store: &MockServer, account_
 }
 
 async fn boot_jobs_portability_harness(object_store: &MockServer) -> Harness {
+    configure_runner_volume_purge_test_policy();
     let endpoint_url = object_store.uri();
-    boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
         config.object_storage = Some(ObjectStorageConfig {
             endpoint_url: endpoint_url.clone(),
             bucket: "bucket".to_string(),
@@ -7973,7 +9202,9 @@ async fn boot_jobs_portability_harness(object_store: &MockServer) -> Harness {
             max_object_bytes: 1024 * 1024,
         });
     })
-    .await
+    .await;
+    authorize_empty_legacy_runner_inventory(&harness.pool, "phase-602-jobs-portability-inventory");
+    harness
 }
 
 async fn seed_jobs_portability_fixture(harness: &Harness) -> JobsPortabilityFixture {
@@ -8163,6 +9394,32 @@ fn acknowledge_jobs_portability_cloud_cleanup(harness: &Harness, account_id: &st
         )
         .unwrap();
     transaction.commit().unwrap();
+}
+
+fn resolve_pending_jobs_runner_legacy(
+    harness: &Harness,
+    pending: &serde_json::Value,
+) -> jobs::RunnerPurgeRequestStatus {
+    let request_id = pending["request_id"].as_str().unwrap();
+    let legacy_unresolved_count = pending["legacy_unresolved_count"].as_i64().unwrap();
+    assert!(legacy_unresolved_count > 0);
+    let (_, status) = jobs::resolve_runner_volume_purge_legacy(
+        &harness.pool,
+        &jobs::ResolveRunnerPurgeLegacyRequest {
+            request_id: request_id.to_string(),
+            expected_legacy_unresolved_count: legacy_unresolved_count,
+            resolution_ref: "phase-602-portability-legacy-resolution".to_string(),
+            resolution_sha256: hex::encode(Sha256::digest(
+                b"phase-602-portability-legacy-resolution",
+            )),
+            resolved_by: "phase-602-integration-admin".to_string(),
+            resolved_at_ms: chrono::Utc::now().timestamp_millis(),
+        },
+    )
+    .unwrap();
+    assert_eq!(status.request_id, request_id);
+    assert_eq!(status.legacy_unresolved_count, 0);
+    status
 }
 
 #[tokio::test]
@@ -8492,23 +9749,39 @@ async fn delete_account_removes_every_jobs_object_after_persisting_the_deletion_
         .mount(&object_store)
         .await;
 
+    let delete_request = || {
+        Request::post("/account/delete")
+            .header("authorization", format!("Bearer {}", fixture.access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "confirm_text": "DELETE",
+                    "accept_data_loss": true,
+                    "accept_credit_loss": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let pending = harness
+        .router
+        .clone()
+        .oneshot(delete_request())
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(pending.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["deleted"], false);
+    assert_eq!(pending["state"], "pending_runner_volume_purge");
+    resolve_pending_jobs_runner_legacy(&harness, &pending);
+
     let response = harness
         .router
         .clone()
-        .oneshot(
-            Request::post("/account/delete")
-                .header("authorization", format!("Bearer {}", fixture.access_token))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "confirm_text": "DELETE",
-                        "accept_data_loss": true,
-                        "accept_credit_loss": true
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(delete_request())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -8516,6 +9789,11 @@ async fn delete_account_removes_every_jobs_object_after_persisting_the_deletion_
         .await
         .unwrap();
     let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ack["deleted"], true);
+    assert_eq!(ack["state"], "deleted");
+    assert!(ack["deleted_at"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty()));
     assert_eq!(ack["object_count_deleted"], fixture.objects.len() + 2);
     assert_eq!(fence_observed.load(Ordering::SeqCst), 1);
     assert_eq!(list_calls.load(Ordering::SeqCst), 2);
@@ -8592,23 +9870,39 @@ async fn delete_account_prefix_purge_failure_preserves_fence_and_database_rows()
         .mount(&object_store)
         .await;
 
+    let delete_request = || {
+        Request::post("/account/delete")
+            .header("authorization", format!("Bearer {}", fixture.access_token))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "confirm_text": "DELETE",
+                    "accept_data_loss": true,
+                    "accept_credit_loss": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let pending = harness
+        .router
+        .clone()
+        .oneshot(delete_request())
+        .await
+        .unwrap();
+    assert_eq!(pending.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(pending.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["deleted"], false);
+    assert_eq!(pending["state"], "pending_runner_volume_purge");
+    resolve_pending_jobs_runner_legacy(&harness, &pending);
+
     let response = harness
         .router
         .clone()
-        .oneshot(
-            Request::post("/account/delete")
-                .header("authorization", format!("Bearer {}", fixture.access_token))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "confirm_text": "DELETE",
-                        "accept_data_loss": true,
-                        "accept_credit_loss": true
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
+        .oneshot(delete_request())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -9197,7 +10491,11 @@ async fn jobs_resume_source_upload_is_fenced_before_object_mutation_during_accou
     let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
-    assert!(String::from_utf8_lossy(&body).contains("Account deletion has already fenced"));
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("fenced new writes and launches"),
+        "unexpected fenced resume-upload response: {body}"
+    );
     assert!(object_store.received_requests().await.unwrap().is_empty());
 
     let (upload_count, source_reference_count): (i64, i64) = harness
@@ -9321,6 +10619,7 @@ async fn legacy_artifact_upload_derives_only_an_existing_live_parent() {
 #[tokio::test]
 #[serial]
 async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
+    configure_runner_volume_purge_test_policy();
     let object_store = MockServer::start().await;
     let endpoint = object_store.uri();
     let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
@@ -9336,6 +10635,7 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
         });
     })
     .await;
+    authorize_empty_legacy_runner_inventory(&h.pool, "phase-602-durable-upload-delete-inventory");
     let email = "durable-object-upload@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -9614,6 +10914,7 @@ async fn audit_upload_requires_owned_session_and_live_billing() {
 #[tokio::test]
 #[serial]
 async fn delete_account_deletes_artifact_objects_before_account_rows() {
+    configure_runner_volume_purge_test_policy();
     let object_store = MockServer::start().await;
     let endpoint = object_store.uri();
     let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
@@ -9629,6 +10930,7 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
         });
     })
     .await;
+    authorize_empty_legacy_runner_inventory(&h.pool, "phase-602-artifact-object-delete-inventory");
     let email = "delete-objects@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -9729,7 +11031,9 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
 #[tokio::test]
 #[serial]
 async fn delete_account_establishes_a_durable_fence_before_waiting_for_an_active_put() {
+    configure_runner_volume_purge_test_policy();
     let h = boot_harness().await;
+    authorize_empty_legacy_runner_inventory(&h.pool, "phase-602-active-put-delete-inventory");
     let email = "delete-active-put@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -9775,7 +11079,15 @@ async fn delete_account_establishes_a_durable_fence_before_waiting_for_an_active
         ))
         .unwrap();
     let resp = h.router.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert_eq!(resp.headers().get("retry-after").unwrap(), "5");
+    let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["deleted"], false);
+    assert_eq!(pending["state"], "pending_upload_drain");
+    assert_eq!(pending["retry_after_ms"], 5_000);
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_some());
     let intent: (i64, i64) = h
         .pool

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 
 import { compareJobsSchemas } from "./check-jobs-schema-parity.mjs";
 import {
@@ -8,6 +11,16 @@ import {
   validateWorkspaceLock,
 } from "./check-provenance-licenses.mjs";
 import { classifyTrackedPath, scanTextForSecrets } from "./privacy-gate.mjs";
+
+const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+function runnerVolumeParitySchema(integerType) {
+  const migrationPath =
+    integerType === "INTEGER"
+      ? "infra/sqlite/server-runtime/046_jobs_runner_volume_purge.sql"
+      : "infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql";
+  return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
+}
 
 function testPrivacyPaths() {
   const rejected = [
@@ -225,6 +238,7 @@ function jobsParitySchema(integerType) {
       ON jobs_communication_actions(account_id, application_id, created_at_ms DESC);
     CREATE INDEX IF NOT EXISTS idx_jobs_communication_actions_due
       ON jobs_communication_actions(status, next_attempt_at_ms, lease_expires_at_ms);
+    ${runnerVolumeParitySchema(integerType)}
   `;
 }
 
@@ -232,6 +246,26 @@ function testSchemaParity() {
   const sqlite = jobsParitySchema("INTEGER");
   const postgres = jobsParitySchema("BIGINT");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+
+  const missingRunnerVolumeTable = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_runner_volumes \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingRunnerVolumeTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingRunnerVolumeIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_runner_volumes_worker_status[\s\S]*?updated_at_ms\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingRunnerVolumeIndex).some((issue) =>
+      issue.includes("Postgres jobs_runner_volumes required index"),
+    ),
+  );
 
   const missingDeletionIntentTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS account_deletion_intents \([\s\S]*?\n    \);/,

@@ -45,6 +45,7 @@ pub(super) type ApiError = (StatusCode, String);
 const RECEIPT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const DISCOVERY_SNAPSHOT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+const EXECUTION_LEASE_CLAIM_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const TRUSTED_WORKER_RECEIPT_KEY: &str = "_bluey_worker_receipt_v1";
 const SUBMISSION_FINGERPRINT_KEY: &str = "_bluey_server_submission_fingerprint_v1";
 const MAX_RECEIPT_DOCUMENTS: usize = 8;
@@ -240,7 +241,9 @@ pub fn worker_router() -> Router<AppState> {
     Router::new()
         .route(
             "/api/jobs/internal/execution-leases/claim",
-            post(worker_claim_execution_lease),
+            post(worker_claim_execution_lease).route_layer(DefaultBodyLimit::max(
+                EXECUTION_LEASE_CLAIM_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/api/jobs/internal/execution-leases/:run_id/heartbeat",
@@ -374,30 +377,76 @@ async fn require_jobs_beta(request: Request<Body>, next: Next) -> Result<Respons
     Ok(next.run(request).await)
 }
 
-fn jobs_local_browser_distribution_enabled() -> bool {
-    cfg!(debug_assertions)
-        || std::env::var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false)
+fn runner_volume_fleet_is_distribution_ready(status: &jobs::RunnerVolumeFleetStatus) -> bool {
+    status.cutover_state == "ready"
+        && status.legacy_inventory_state == "ready"
+        && status.unresolved_legacy_volume_count == 0
+        && status.legacy_inventory_reconciliation_id.is_some()
+        && status.legacy_inventory_authority_id.is_some()
+        && status.legacy_inventory_authority_sha256.is_some()
+        && status.legacy_inventory_root_count == Some(0)
+        && status.legacy_inventory_root_set_sha256.as_deref()
+            == Some(jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256)
+        && status.cutover_enrollment_generation == Some(status.enrollment_generation)
+        && status.cutover_purge_generation == Some(status.purge_generation)
+        && status.cutover_tombstone_generation == Some(status.tombstone_generation)
+        && status.cutover_destruction_generation == Some(status.destruction_generation)
+        && status.cutover_legacy_reconciliation_generation
+            == Some(status.legacy_reconciliation_generation)
+        && status.storage_attestation_count == status.non_destroyed_volume_count
+        && status.cutover_storage_attestation_generation
+            == Some(status.storage_attestation_generation)
+        && status.cutover_storage_attestation_count == Some(status.storage_attestation_count)
+        && status.cutover_storage_attestation_set_sha256.as_deref()
+            == Some(status.storage_attestation_set_sha256.as_str())
+        && status.cutover_legacy_inventory_generation == Some(status.legacy_inventory_generation)
+        && status.cutover_legacy_inventory_reconciliation_id
+            == status.legacy_inventory_reconciliation_id
+        && status.cutover_legacy_inventory_authority_id == status.legacy_inventory_authority_id
+        && status.cutover_legacy_inventory_authority_sha256
+            == status.legacy_inventory_authority_sha256
+        && status.cutover_legacy_inventory_root_count == status.legacy_inventory_root_count
+        && status.cutover_legacy_inventory_root_set_sha256
+            == status.legacy_inventory_root_set_sha256
+        && status.cutover_non_destroyed_volume_count == Some(status.non_destroyed_volume_count)
+        && status.cutover_destruction_count == Some(status.destruction_count)
+        && status.cutover_unresolved_legacy_volume_count == Some(0)
+        && status.attested_reconciled_volume_count == status.non_destroyed_volume_count
+        && status.cutover_evidence_ref.is_some()
+        && status.cutover_evidence_sha256.is_some()
+        && status.cutover_authorized_by.is_some()
+        && status.cutover_at_ms.is_some()
 }
 
-fn jobs_cloud_browser_distribution_enabled() -> bool {
+fn runner_volume_fleet_distribution_ready(pool: &crate::db::DbPool) -> bool {
+    jobs::runner_volume_fleet_status(pool)
+        .as_ref()
+        .is_ok_and(runner_volume_fleet_is_distribution_ready)
+}
+
+fn distribution_flag_enabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn jobs_local_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
     cfg!(debug_assertions)
-        || (std::env::var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes"
-                )
-            })
-            .unwrap_or(false)
+        || (distribution_flag_enabled("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
+            && runner_volume_fleet_distribution_ready(pool))
+}
+
+fn jobs_cloud_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
+    cfg!(debug_assertions)
+        || (distribution_flag_enabled("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
             && std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN")
-                .is_ok_and(|value| !value.trim().is_empty()))
+                .is_ok_and(|value| !value.trim().is_empty())
+            && runner_volume_fleet_distribution_ready(pool))
 }
 
 fn apply_jobs_distribution_gates(
@@ -639,8 +688,8 @@ pub async fn workspace(
             ),
         }
     }
-    let local_distribution_enabled = jobs_local_browser_distribution_enabled();
-    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled();
+    let local_distribution_enabled = jobs_local_browser_distribution_enabled(&state.pool);
+    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled(&state.pool);
     workspace.runner_availability = build_runner_availability(
         &workspace.entitlement,
         local_distribution_enabled,
@@ -1443,8 +1492,8 @@ pub async fn prepare_application(
         let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
         let runners = build_runner_availability(
             &entitlement,
-            jobs_local_browser_distribution_enabled(),
-            jobs_cloud_browser_distribution_enabled(),
+            jobs_local_browser_distribution_enabled(&state.pool),
+            jobs_cloud_browser_distribution_enabled(&state.pool),
         );
         if let Some(error) = auto_submit_request_error(&eligibility, &runners) {
             return Err(error);
@@ -2323,8 +2372,8 @@ pub async fn queue_application_run(
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let runners = build_runner_availability(
         &entitlement,
-        jobs_local_browser_distribution_enabled(),
-        jobs_cloud_browser_distribution_enabled(),
+        jobs_local_browser_distribution_enabled(&state.pool),
+        jobs_cloud_browser_distribution_enabled(&state.pool),
     );
     let channel = if req.runner == "local" {
         &runners.local
@@ -3054,8 +3103,8 @@ pub async fn save_browser_session(
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let runners = build_runner_availability(
         &entitlement,
-        jobs_local_browser_distribution_enabled(),
-        jobs_cloud_browser_distribution_enabled(),
+        jobs_local_browser_distribution_enabled(&state.pool),
+        jobs_cloud_browser_distribution_enabled(&state.pool),
     );
     let channel = if session.runner == "local" {
         &runners.local
@@ -3881,7 +3930,7 @@ async fn claim_local_run(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunClaimRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if !jobs_local_browser_distribution_enabled() {
+    if !jobs_local_browser_distribution_enabled(&state.pool) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "Bluey Browser local runs are currently paused.".to_string(),
@@ -4005,7 +4054,7 @@ async fn authorize_local_run_submit(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunSubmitAccessRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if !jobs_local_browser_distribution_enabled() {
+    if !jobs_local_browser_distribution_enabled(&state.pool) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "Bluey Browser local runs are currently paused.".to_string(),
@@ -4571,12 +4620,17 @@ fn local_run_ticket_hash(ticket: &str) -> Result<String, ApiError> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerExecutionLeaseClaimRequest {
     account_id: String,
     application_id: String,
     run_id: String,
     browser_profile_id: String,
     owner_id: String,
+    volume_id: String,
+    enrollment_epoch: i64,
+    process_instance_id: String,
+    volume_proof: jobs::RunnerVolumeAuthorityProof,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4679,18 +4733,65 @@ async fn worker_claim_execution_lease(
     State(state): State<AppState>,
     Extension(worker): Extension<JobsWorkerIdentity>,
     Json(req): Json<WorkerExecutionLeaseClaimRequest>,
-) -> Result<Json<jobs::ExecutionLeaseGrant>, ApiError> {
+) -> Result<Json<jobs::RunnerVolumeExecutionLeaseGrant>, ApiError> {
     if req.run_id.trim().is_empty() {
         return bad_request("Invalid execution lease request.");
     }
     let owner_id = authenticated_execution_lease_owner(&worker, &req.owner_id)?;
-    jobs::claim_execution_lease(
+    if req.volume_proof.volume_id != req.volume_id
+        || req.volume_proof.enrollment_epoch != req.enrollment_epoch
+        || req.volume_proof.process_instance_id != req.process_instance_id
+    {
+        return bad_request("Runner-volume lease proof does not match the claim.");
+    }
+    let server_now_ms = jobs::now_ms();
+    let payload_sha256 =
+        super::jobs_runner_volumes::runner_volume_execution_lease_claim_payload_sha256(
+            &super::jobs_runner_volumes::RunnerVolumeExecutionLeaseClaimPayload {
+                worker_id: &worker.worker_id,
+                account_id: &req.account_id,
+                application_id: &req.application_id,
+                run_id: &req.run_id,
+                browser_profile_id: &req.browser_profile_id,
+                owner_id,
+                volume_id: &req.volume_id,
+                enrollment_epoch: req.enrollment_epoch,
+                process_instance_id: &req.process_instance_id,
+            },
+        );
+    let authority = jobs::verify_runner_volume_authority_proof(
+        &state.pool,
+        &req.volume_proof,
+        "execution_lease_claim",
+        &payload_sha256,
+        server_now_ms,
+        super::jobs_runner_volumes::RUNNER_VOLUME_AUTHORITY_MAX_CLOCK_SKEW_MS,
+    )
+    .map_err(super::jobs_runner_volumes::runner_volume_api_error)?;
+    if authority.volume().worker_id != worker.worker_id {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Runner-volume authority is invalid.".to_string(),
+        ));
+    }
+    let binding = jobs::BindRunnerVolumeResidencyRequest {
+        account_id: req.account_id.clone(),
+        run_id: req.run_id.clone(),
+        worker_id: worker.worker_id.clone(),
+        volume_id: req.volume_id.clone(),
+        enrollment_epoch: req.enrollment_epoch,
+        process_instance_id: req.process_instance_id.clone(),
+        now_ms: server_now_ms,
+    };
+    jobs::claim_execution_lease_for_runner_volume_authorized(
         &state.pool,
         &req.account_id,
         &req.application_id,
         &req.run_id,
         &req.browser_profile_id,
         owner_id,
+        &binding,
+        &authority,
     )
     .map(Json)
     .map_err(execution_lease_error)
@@ -4796,6 +4897,10 @@ async fn worker_restore_browser_profile_snapshot(
     Path(run_id): Path<String>,
     Json(req): Json<WorkerBrowserProfileSnapshotAccessRequest>,
 ) -> Result<Response, ApiError> {
+    let _object_lifecycle_guard =
+        crate::db::account_data::acquire_account_object_writer(&state.pool, &req.account_id)
+            .await
+            .map_err(internal)?;
     let snapshot = jobs::get_browser_profile_snapshot_for_lease(
         &state.pool,
         &req.account_id,
@@ -8213,6 +8318,97 @@ mod tests {
 
         assert!(entitlement.local_browser);
         assert!(entitlement.cloud_browser);
+    }
+
+    fn ready_runner_volume_fleet() -> jobs::RunnerVolumeFleetStatus {
+        jobs::RunnerVolumeFleetStatus {
+            enrollment_generation: 4,
+            purge_generation: 7,
+            tombstone_generation: 6,
+            destruction_generation: 2,
+            legacy_reconciliation_generation: 3,
+            storage_attestation_generation: 8,
+            storage_attestation_count: 2,
+            storage_attestation_set_sha256: "c".repeat(64),
+            legacy_inventory_state: "ready".to_string(),
+            legacy_inventory_generation: 5,
+            legacy_inventory_reconciliation_id: Some("legacy-reconciliation".to_string()),
+            legacy_inventory_authority_id: Some("legacy-authority".to_string()),
+            legacy_inventory_authority_sha256: Some("b".repeat(64)),
+            legacy_inventory_root_count: Some(0),
+            legacy_inventory_root_set_sha256: Some(
+                jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+            ),
+            cutover_state: "ready".to_string(),
+            unresolved_legacy_volume_count: 0,
+            cutover_enrollment_generation: Some(4),
+            cutover_purge_generation: Some(7),
+            cutover_tombstone_generation: Some(6),
+            cutover_destruction_generation: Some(2),
+            cutover_legacy_reconciliation_generation: Some(3),
+            cutover_storage_attestation_generation: Some(8),
+            cutover_storage_attestation_count: Some(2),
+            cutover_storage_attestation_set_sha256: Some("c".repeat(64)),
+            cutover_legacy_inventory_generation: Some(5),
+            cutover_legacy_inventory_reconciliation_id: Some("legacy-reconciliation".to_string()),
+            cutover_legacy_inventory_authority_id: Some("legacy-authority".to_string()),
+            cutover_legacy_inventory_authority_sha256: Some("b".repeat(64)),
+            cutover_legacy_inventory_root_count: Some(0),
+            cutover_legacy_inventory_root_set_sha256: Some(
+                jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+            ),
+            cutover_non_destroyed_volume_count: Some(2),
+            cutover_destruction_count: Some(1),
+            cutover_unresolved_legacy_volume_count: Some(0),
+            cutover_evidence_ref: Some("fleet-evidence".to_string()),
+            cutover_evidence_sha256: Some("a".repeat(64)),
+            cutover_authorized_by: Some("operator".to_string()),
+            cutover_at_ms: Some(100),
+            non_destroyed_volume_count: 2,
+            destruction_count: 1,
+            attested_reconciled_volume_count: 2,
+            updated_at_ms: 100,
+        }
+    }
+
+    #[test]
+    fn distribution_requires_exact_live_runner_volume_cutover_snapshot() {
+        let ready = ready_runner_volume_fleet();
+        assert!(runner_volume_fleet_is_distribution_ready(&ready));
+
+        let mut generation_drift = ready.clone();
+        generation_drift.purge_generation += 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &generation_drift
+        ));
+
+        let mut legacy_unresolved = ready.clone();
+        legacy_unresolved.unresolved_legacy_volume_count = 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &legacy_unresolved
+        ));
+
+        let mut inactive_volume = ready.clone();
+        inactive_volume.attested_reconciled_volume_count = 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(&inactive_volume));
+
+        let mut legacy_inventory_drift = ready.clone();
+        legacy_inventory_drift.legacy_inventory_generation += 1;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &legacy_inventory_drift
+        ));
+
+        let mut nonempty_legacy_inventory = ready.clone();
+        nonempty_legacy_inventory.legacy_inventory_root_count = Some(1);
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &nonempty_legacy_inventory
+        ));
+
+        let mut missing_evidence = ready;
+        missing_evidence.cutover_evidence_sha256 = None;
+        assert!(!runner_volume_fleet_is_distribution_ready(
+            &missing_evidence
+        ));
     }
 
     #[test]

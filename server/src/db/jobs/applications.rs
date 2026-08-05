@@ -237,10 +237,8 @@ fn prepare_application_inner(
         .find(|track| track.id == posting.track_id)
         .ok_or_else(|| anyhow::anyhow!("choose an active Career Track before preparing"))?;
     let track_identity_id = track.application_identity_id.as_deref();
-    let application_identity =
-        selected_application_identity(track_identity_id, &identities).ok_or_else(
-            || anyhow::anyhow!("verify an application email before preparing this packet"),
-        )?
+    let application_identity = selected_application_identity(track_identity_id, &identities)
+        .ok_or_else(|| anyhow::anyhow!("verify an application email before preparing this packet"))?
         .clone();
     let facts = list_facts(pool, account_id)?;
     let approved_fact_ids: Vec<String> = facts
@@ -910,12 +908,7 @@ fn commit_prepared_application(
                 }),
             );
             receipt.insert("claim_ids".to_string(), json!(claim_ids));
-            persist_claim_evidence_sqlite(
-                &tx,
-                account_id,
-                &resume.id,
-                claim_evidence,
-            )?;
+            persist_claim_evidence_sqlite(&tx, account_id, &resume.id, claim_evidence)?;
             let payload = to_json(application, "job application")?;
             let changed = match expected {
                 Some(expected) => tx.execute(
@@ -1227,12 +1220,7 @@ fn commit_prepared_application(
                 }),
             );
             receipt.insert("claim_ids".to_string(), json!(claim_ids));
-            persist_claim_evidence_postgres(
-                &mut tx,
-                account_id,
-                &resume.id,
-                claim_evidence,
-            )?;
+            persist_claim_evidence_postgres(&mut tx, account_id, &resume.id, claim_evidence)?;
             let payload = to_json(application, "job application")?;
             let changed = match expected {
                 Some(expected) => tx.execute(
@@ -1427,7 +1415,12 @@ fn save_application(
     let payload = to_json(application, "job application")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_applications (
                     id, account_id, job_id, resume_version_id, state,
                     application_json, created_at_ms, updated_at_ms, submitted_at_ms
@@ -1450,10 +1443,16 @@ fn save_application(
                     application.submitted_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(application.clone())
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_applications (
                     id, account_id, job_id, resume_version_id, state,
                     application_json, created_at_ms, updated_at_ms, submitted_at_ms
@@ -1476,6 +1475,7 @@ fn save_application(
                     &application.submitted_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(application.clone())
         }
     })
@@ -1493,9 +1493,7 @@ pub fn update_application(
         return Ok(None);
     };
     if state == "submitted" {
-        anyhow::bail!(
-            "only a verified runner receipt can finalize a submitted application"
-        )
+        anyhow::bail!("only a verified runner receipt can finalize a submitted application")
     }
     validate_application_transition(&application.state, state)?;
     if matches!(state, "queued" | "running") {
@@ -1810,11 +1808,9 @@ pub fn commit_packet(
             {
                 anyhow::bail!("committed Jobs allowance has no packet metering row")
             }
-            let pre_reserved = allowance
-                .as_ref()
-                .is_some_and(|(status, held_period)| {
-                    status == "reserved" && *held_period == period_start
-                });
+            let pre_reserved = allowance.as_ref().is_some_and(|(status, held_period)| {
+                status == "reserved" && *held_period == period_start
+            });
             let included = pre_reserved || used < limit;
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };
             if amount_cents > 0 {
@@ -1934,12 +1930,9 @@ pub fn commit_packet(
             {
                 anyhow::bail!("committed Jobs allowance has no packet metering row")
             }
-            let pre_reserved = allowance
-                .as_ref()
-                .is_some_and(|row| {
-                    row.get::<_, String>(0) == "reserved"
-                        && row.get::<_, i64>(1) == period_start
-                });
+            let pre_reserved = allowance.as_ref().is_some_and(|row| {
+                row.get::<_, String>(0) == "reserved" && row.get::<_, i64>(1) == period_start
+            });
             let included = pre_reserved || used < limit;
             let included_db = i32::from(included);
             let amount_cents = if included { 0 } else { PACKET_OVERAGE_CENTS };

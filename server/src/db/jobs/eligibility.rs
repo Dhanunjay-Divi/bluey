@@ -1,4 +1,3 @@
-
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 const LIVE_VERIFICATION_MAX_AGE_MS: i64 = DAY_MS;
 
@@ -22,10 +21,7 @@ fn apply_posting_discovery_evidence(
         .trim()
         .to_ascii_lowercase();
     let scam_status = evidence.scam_risk_status.trim().to_ascii_lowercase();
-    let original_status = evidence
-        .original_source_status
-        .trim()
-        .to_ascii_lowercase();
+    let original_status = evidence.original_source_status.trim().to_ascii_lowercase();
 
     if matches!(
         canonical_status.as_str(),
@@ -99,10 +95,8 @@ fn apply_posting_discovery_evidence(
         .filter(|domain| !domain.is_empty());
     let application_domain_matches = canonical_url_host.is_some()
         && evidence_application_domain.as_ref() == canonical_url_host.as_ref();
-    let employer_source_bound = matches!(
-        employer_status.as_str(),
-        "verified" | "ats_tenant_verified"
-    );
+    let employer_source_bound =
+        matches!(employer_status.as_str(), "verified" | "ats_tenant_verified");
     if employer_source_bound && !application_domain_matches {
         push_reason(
             hard_failures,
@@ -212,10 +206,7 @@ fn apply_posting_discovery_evidence(
 }
 
 fn normalize_discovery_domain(value: &str) -> String {
-    let normalized = value
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let normalized = value.trim().trim_end_matches('.').to_ascii_lowercase();
     normalized
         .strip_prefix("www.")
         .unwrap_or(&normalized)
@@ -546,9 +537,10 @@ fn build_job_eligibility(
     if !preferences.employment_types.is_empty() {
         match candidate_employment_type(posting) {
             Some(kind)
-                if preferences.employment_types.iter().any(|allowed| {
-                    normalize_candidate_employment_type(allowed) == Some(kind)
-                }) =>
+                if preferences
+                    .employment_types
+                    .iter()
+                    .any(|allowed| normalize_candidate_employment_type(allowed) == Some(kind)) =>
             {
                 passed_checks.push("employment_type_allowed".to_string());
             }
@@ -606,11 +598,7 @@ fn build_job_eligibility(
         passed_checks.push("track_engagement_type_allowed".to_string());
     }
     if let Some(reason) = track_work_authorization_failure(profile, posting, track) {
-        push_reason(
-            &mut hard_failures,
-            "work_authorization_mismatch",
-            &reason,
-        );
+        push_reason(&mut hard_failures, "work_authorization_mismatch", &reason);
     } else if track.is_some() {
         passed_checks.push("work_authorization_allowed".to_string());
     }
@@ -621,10 +609,10 @@ fn build_job_eligibility(
         .chain(experience_requirement.title_floor_months)
         .max();
     let required_maximum = experience_requirement.required_max_months;
-    let misses_required_minimum = required_minimum
-        .is_some_and(|months| months > experience_evidence.target_max_months);
-    let exceeds_required_maximum = required_maximum
-        .is_some_and(|months| months < experience_evidence.target_min_months);
+    let misses_required_minimum =
+        required_minimum.is_some_and(|months| months > experience_evidence.target_max_months);
+    let exceeds_required_maximum =
+        required_maximum.is_some_and(|months| months < experience_evidence.target_min_months);
     if misses_required_minimum || exceeds_required_maximum {
         push_reason(
             &mut hard_failures,
@@ -829,10 +817,7 @@ fn submission_capability(posting: &JobPosting) -> String {
     }
     if matches!(
         host.as_str(),
-        "boards.greenhouse.io"
-            | "job-boards.greenhouse.io"
-            | "jobs.lever.co"
-            | "jobs.eu.lever.co"
+        "boards.greenhouse.io" | "job-boards.greenhouse.io" | "jobs.lever.co" | "jobs.eu.lever.co"
     ) {
         return "beta_review".to_string();
     }
@@ -1074,7 +1059,13 @@ fn score_posting(
 
     let target_roles = track
         .map(|value| vec![value.role.as_str()])
-        .unwrap_or_else(|| preferences.desired_roles.iter().map(String::as_str).collect());
+        .unwrap_or_else(|| {
+            preferences
+                .desired_roles
+                .iter()
+                .map(String::as_str)
+                .collect()
+        });
     let role_text_matches = target_roles.iter().any(|role| {
         let role = role.to_lowercase();
         !role.trim().is_empty() && (title.contains(&role) || role.contains(&title))
@@ -1506,6 +1497,9 @@ pub fn update_attempt_reservation_status(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
             if status == "running" {
                 let job_id: String = tx.query_row(
                     "SELECT job_id FROM jobs_applications
@@ -1526,6 +1520,9 @@ pub fn update_attempt_reservation_status(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
             if status == "running" {
                 let job_id: String = tx
                     .query_one(

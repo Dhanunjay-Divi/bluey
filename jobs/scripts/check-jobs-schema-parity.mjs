@@ -9,7 +9,22 @@ export const JOBS_PARITY_TABLES = [
   "jobs_discovery_runs",
   "jobs_discovery_sources",
   "jobs_execution_leases",
+  "jobs_execution_lease_volume_bindings",
   "jobs_local_run_resume_actions",
+  "jobs_runner_legacy_inventory_authorities",
+  "jobs_runner_account_subjects",
+  "jobs_runner_purge_enforcements",
+  "jobs_runner_purge_requests",
+  "jobs_runner_purge_targets",
+  "jobs_runner_purge_tombstones",
+  "jobs_runner_volume_admission_grants",
+  "jobs_runner_volume_authority_uses",
+  "jobs_runner_volume_destructions",
+  "jobs_runner_volume_fleet_state",
+  "jobs_runner_volume_keys",
+  "jobs_runner_volume_residencies",
+  "jobs_runner_volume_storage_attestations",
+  "jobs_runner_volumes",
   "jobs_submission_evidence_capacity",
 ];
 
@@ -45,11 +60,86 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     ].sort(),
   ],
   [
+    "jobs_execution_lease_volume_bindings",
+    [
+      "idx_jobs_execution_lease_volume_bindings_volume on jobs_execution_lease_volume_bindings (volume_id, volume_epoch, bound_at_ms)",
+    ],
+  ],
+  [
     "jobs_local_run_resume_actions",
     [
       "idx_jobs_local_resume_actions_application on jobs_local_run_resume_actions (account_id, application_id, created_at_ms desc)",
       "unique idx_jobs_local_resume_actions_active_run on jobs_local_run_resume_actions (run_id) where status = 'approved'",
     ].sort(),
+  ],
+  [
+    "jobs_runner_legacy_inventory_authorities",
+    [
+      "idx_jobs_runner_legacy_inventory_authorities_reconciliation on jobs_runner_legacy_inventory_authorities (reconciliation_id, authority_generation, authority_state)",
+    ],
+  ],
+  [
+    "jobs_runner_purge_enforcements",
+    [
+      "idx_jobs_runner_purge_enforcements_volume_state on jobs_runner_purge_enforcements (volume_id, volume_epoch, state, updated_at_ms)",
+    ],
+  ],
+  [
+    "jobs_runner_purge_requests",
+    [
+      "idx_jobs_runner_purge_requests_account_state on jobs_runner_purge_requests (account_id, state, updated_at_ms)",
+      "idx_jobs_runner_purge_requests_deletion_attempt on jobs_runner_purge_requests (deletion_request_id, purge_generation, updated_at_ms)",
+    ].sort(),
+  ],
+  [
+    "jobs_runner_purge_targets",
+    [
+      "idx_jobs_runner_purge_targets_request_state on jobs_runner_purge_targets (request_id, state, updated_at_ms)",
+      "idx_jobs_runner_purge_targets_volume_state on jobs_runner_purge_targets (volume_id, volume_epoch, state, updated_at_ms)",
+    ].sort(),
+  ],
+  [
+    "jobs_runner_purge_tombstones",
+    [
+      "idx_jobs_runner_purge_tombstones_request on jobs_runner_purge_tombstones (request_id, completed_at_ms)",
+    ],
+  ],
+  [
+    "jobs_runner_volume_admission_grants",
+    [
+      "idx_jobs_runner_volume_grants_expiry on jobs_runner_volume_admission_grants (expires_at_ms, consumed_at_ms)",
+    ],
+  ],
+  [
+    "jobs_runner_volume_authority_uses",
+    [
+      "idx_jobs_runner_volume_authority_uses_consumed on jobs_runner_volume_authority_uses (consumed_at_ms)",
+    ],
+  ],
+  [
+    "jobs_runner_volume_destructions",
+    [
+      "idx_jobs_runner_volume_destructions_volume on jobs_runner_volume_destructions (volume_id, volume_epoch, recorded_at_ms)",
+    ],
+  ],
+  [
+    "jobs_runner_volume_residencies",
+    [
+      "idx_jobs_runner_residencies_subject_state on jobs_runner_volume_residencies (purge_subject, state, volume_id, volume_epoch)",
+      "idx_jobs_runner_residencies_volume_state on jobs_runner_volume_residencies (volume_id, volume_epoch, state, last_recorded_at_ms)",
+    ].sort(),
+  ],
+  [
+    "jobs_runner_volume_storage_attestations",
+    [
+      "idx_jobs_runner_volume_storage_attestations_latest on jobs_runner_volume_storage_attestations (volume_id, enrollment_epoch, attestation_generation desc)",
+    ],
+  ],
+  [
+    "jobs_runner_volumes",
+    [
+      "idx_jobs_runner_volumes_worker_status on jobs_runner_volumes (worker_id, status, updated_at_ms)",
+    ],
   ],
   [
     "jobs_submission_evidence_capacity",
@@ -115,6 +205,7 @@ function splitTopLevel(value) {
 function normalizeSql(value) {
   return value
     .replace(/--[^\n]*/g, " ")
+    .replace(/\bsmallint\b/gi, "INTEGER")
     .replace(/\bbigint\b/gi, "INTEGER")
     .replace(/\s+/g, " ")
     .trim()
@@ -241,11 +332,20 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/022_jobs_submission_evidence_reservations.sql",
   );
+  const sqliteRunnerPurgePath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/046_jobs_runner_volume_purge.sql",
+  );
+  const postgresRunnerPurgePath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
     sqliteDeletionIntentPath,
     sqliteEvidenceCapacityPath,
+    sqliteRunnerPurgePath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -254,6 +354,7 @@ function main() {
     postgresCommunicationPath,
     postgresDeletionIntentPath,
     postgresEvidenceCapacityPath,
+    postgresRunnerPurgePath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -269,6 +370,14 @@ function main() {
   }
   if (!sqliteSource.includes('"019_jobs_communication_actions.sql"')) {
     issues.push("server migration runner does not record 019_jobs_communication_actions.sql");
+  }
+  const runnerPurgeInclude =
+    'include_str!("../../../infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql")';
+  if (!sqliteSource.includes(runnerPurgeInclude)) {
+    issues.push(`server migration runner does not include 024_jobs_runner_volume_purge.sql via ${runnerPurgeInclude}`);
+  }
+  if (!sqliteSource.includes('"024_jobs_runner_volume_purge.sql"')) {
+    issues.push("server migration runner does not record 024_jobs_runner_volume_purge.sql");
   }
 
   if (issues.length > 0) {

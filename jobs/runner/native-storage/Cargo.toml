@@ -1,0 +1,32 @@
+[package]
+name = "bluey-jobs-runner-native-storage"
+version = "0.1.0"
+edition = "2021"
+license = "UNLICENSED"
+publish = false
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "bluey-runner-storage-lock-probe"
+path = "src/bin/storage-lock-probe.rs"
+
+[dependencies]
+libc = "=0.2.189"
+napi = { version = "=3.10.4", features = ["napi8"] }
+napi-derive = "=3.5.10"
+sha2 = "=0.10.9"
+
+[build-dependencies]
+napi-build = "=2.3.2"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"
+
+[workspace]

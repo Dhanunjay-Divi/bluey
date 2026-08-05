@@ -41,8 +41,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config
 
-      - name: Ensure Rust formatter is available
-        run: rustup component add rustfmt
+      - name: Ensure Rust quality tools are available
+        run: rustup component add rustfmt clippy
 
       - name: Self-test Jobs CI guards
         run: node jobs/scripts/ci-guards-self-test.mjs
@@ -68,6 +68,35 @@ jobs:
       - name: Build all Jobs workspaces
         run: npm run build --prefix jobs
 
+      - name: Test browser account-deletion pending flow
+        run: node --test web/assets/bluey-account-delete.test.cjs
+
+      - name: Check native runner storage formatting
+        run: cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
+
+      - name: Lint native runner storage
+        run: >-
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml
+          --all-targets --locked -- -D warnings
+
+      - name: Test native runner storage
+        run: >-
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml
+          --all-targets --locked
+
+      - name: Build native runner storage release artifact
+        run: >-
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml
+          --release --locked
+
+      - name: Build and smoke the managed runner image
+        run: |
+          docker build --tag bluey-jobs-runner-ci --file jobs/runner/Dockerfile jobs
+          docker run --rm \
+            --entrypoint node \
+            --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
+            bluey-jobs-runner-ci scripts/native-runner-addon-smoke.mjs
+
       - name: Check server Rust formatting
         run: cargo fmt --manifest-path server/Cargo.toml -- --check
 
@@ -79,3 +108,45 @@ jobs:
 
       - name: Run server Jobs integration tests
         run: cargo test --manifest-path server/Cargo.toml --test integration_e2e jobs_
+
+  native-runner-storage-darwin:
+    name: Native runner storage (Darwin)
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust quality toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jobs/package-lock.json
+
+      - name: Build Darwin runner JavaScript
+        run: |
+          npm ci --prefix jobs --no-audit --no-fund
+          npm run build --prefix jobs --workspace @bluey/jobs-automation
+          npm run build --prefix jobs --workspace @bluey/jobs-runner
+
+      - name: Verify Darwin native runner storage
+        run: |
+          cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml --release --locked
+          mkdir -p jobs/runner/dist/native
+          install -m 0555 \
+            jobs/runner/native-storage/target/release/libbluey_jobs_runner_native_storage.dylib \
+            jobs/runner/dist/native/bluey_jobs_runner_native_storage.node
+          SMOKE_ROOT="$GITHUB_WORKSPACE/jobs/runner/native-storage/target/native-addon-smoke"
+          mkdir -m 0700 "$SMOKE_ROOT"
+          BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT="$SMOKE_ROOT" \
+            node jobs/scripts/native-runner-addon-smoke.mjs

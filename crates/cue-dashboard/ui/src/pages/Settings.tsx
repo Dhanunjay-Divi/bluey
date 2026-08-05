@@ -207,8 +207,14 @@ function AccountCard() {
     setAccountError("");
     setDeleteBusy(true);
     try {
-      await invoke("delete_account_now");
-      window.location.href = "/";
+      const outcome = await invoke<{ deleted: boolean; state: string; message: string }>(
+        "delete_account_now",
+      );
+      if (outcome.deleted) {
+        window.location.href = "/";
+      } else {
+        setAccountError(outcome.message);
+      }
     } catch (e) {
       setAccountError(`Your account was not deleted: ${String(e)}`);
     } finally {

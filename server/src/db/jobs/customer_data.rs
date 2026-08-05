@@ -166,7 +166,12 @@ pub fn save_intervention(
     let payload = to_json(&value, "intervention")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_interventions (
                     id, account_id, application_id, kind, status, intervention_json,
                     created_at_ms, resolved_at_ms
@@ -186,10 +191,16 @@ pub fn save_intervention(
                     value.resolved_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_interventions (
                     id, account_id, application_id, kind, status, intervention_json,
                     created_at_ms, resolved_at_ms
@@ -209,6 +220,7 @@ pub fn save_intervention(
                     &value.resolved_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -2408,6 +2420,11 @@ pub fn finalize_submission(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if runner == "cloud" {
+                require_current_runner_volume_identity_sqlite_for_operation(
+                    &tx, account_id, run_id, now,
+                )?;
+            }
             match crate::db::account_data::account_write_fence_sqlite_tx(&tx, account_id)? {
                 crate::db::account_data::AccountWriteFence::Active => {}
                 crate::db::account_data::AccountWriteFence::DeletionRequested => {
@@ -2587,6 +2604,11 @@ pub fn finalize_submission(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            if runner == "cloud" {
+                require_current_runner_volume_identity_postgres_for_operation(
+                    &mut tx, account_id, run_id, now,
+                )?;
+            }
             match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
                 crate::db::account_data::AccountWriteFence::Active => {}
                 crate::db::account_data::AccountWriteFence::DeletionRequested => {
@@ -4223,19 +4245,31 @@ pub fn save_run_event(
     let payload = to_json(&value.event, "Jobs run event")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_run_events(id, account_id, run_id, event_type, event_json, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![value.id, account_id, value.run_id, value.event_type, payload, value.created_at_ms],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_run_events(id, account_id, run_id, event_type, event_json, created_at_ms)
                  VALUES ($1, $2, $3, $4, $5, $6)",
                 &[&value.id, &account_id, &value.run_id, &value.event_type, &payload, &value.created_at_ms],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })

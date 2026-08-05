@@ -96,7 +96,12 @@ pub fn save_local_run_ticket(
     let encrypted_payload = to_json(&value.payload, "Jobs local browser packet")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_local_run_tickets (
                     id, account_id, application_id, ticket_hash, ticket_secret,
                     payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
@@ -122,10 +127,16 @@ pub fn save_local_run_ticket(
                     value.created_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_local_run_tickets (
                     id, account_id, application_id, ticket_hash, ticket_secret,
                     payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
@@ -151,6 +162,7 @@ pub fn save_local_run_ticket(
                     &value.created_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -308,6 +320,22 @@ pub fn claim_authorized_local_run_ticket(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let account_id: Option<String> = tx
+                .query_row(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = ?1 AND ticket_hash = ?2",
+                    params![run_id, ticket_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(account_id) = account_id else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &account_id,
+            )?;
             let value = sqlite_local_run_authority(
                 &tx,
                 run_id,
@@ -337,6 +365,21 @@ pub fn claim_authorized_local_run_ticket(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let account_id = tx
+                .query_opt(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = $1 AND ticket_hash = $2",
+                    &[&run_id, &ticket_hash],
+                )?
+                .map(|row| row.get::<_, String>(0));
+            let Some(account_id) = account_id else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &account_id,
+            )?;
             let value = postgres_local_run_authority(
                 &mut tx,
                 run_id,
@@ -792,18 +835,61 @@ pub fn update_local_run_ticket_status(
     }
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "UPDATE jobs_local_run_tickets SET status = ?3, updated_at_ms = ?4
-              WHERE id = ?1 AND ticket_hash = ?2 AND expires_at_ms > ?4
-                AND (status = 'claimed' OR status = ?3)",
-            params![run_id, ticket_hash, status, now],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "UPDATE jobs_local_run_tickets SET status = $3, updated_at_ms = $4
-              WHERE id = $1 AND ticket_hash = $2 AND expires_at_ms > $4
-                AND (status = 'claimed' OR status = $3)",
-            &[&run_id, &ticket_hash, &status, &now],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let account_id: Option<String> = tx
+                .query_row(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = ?1 AND ticket_hash = ?2",
+                    params![run_id, ticket_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(account_id) = account_id else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &account_id,
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_local_run_tickets SET status = ?3, updated_at_ms = ?4
+                  WHERE id = ?1 AND ticket_hash = ?2 AND expires_at_ms > ?4
+                    AND (status = 'claimed' OR status = ?3)",
+                params![run_id, ticket_hash, status, now],
+            )? > 0;
+            tx.commit()?;
+            Ok(changed)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let account_id = tx
+                .query_opt(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = $1 AND ticket_hash = $2",
+                    &[&run_id, &ticket_hash],
+                )?
+                .map(|row| row.get::<_, String>(0));
+            let Some(account_id) = account_id else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &account_id,
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_local_run_tickets SET status = $3, updated_at_ms = $4
+                  WHERE id = $1 AND ticket_hash = $2 AND expires_at_ms > $4
+                    AND (status = 'claimed' OR status = $3)",
+                &[&run_id, &ticket_hash, &status, &now],
+            )? > 0;
+            tx.commit()?;
+            Ok(changed)
+        }
     })
 }
 
@@ -890,9 +976,7 @@ pub fn finalize_local_side_effect_unknown(
                     )
                     .optional()?;
                 if ticket_status != "side_effect_unknown"
-                    || application
-                        .receipt
-                        .pointer("/local_reconciliation/receipt")
+                    || application.receipt.pointer("/local_reconciliation/receipt")
                         != Some(&reconciliation_receipt)
                     || stored_session.is_none_or(|(raw, runner, status)| {
                         !local_unknown_terminal_session_matches(
@@ -921,7 +1005,10 @@ pub fn finalize_local_side_effect_unknown(
             let prior_application_state = application.state.clone();
             validate_application_transition(&application.state, "side_effect_unknown")?;
             if ticket_expires_at_ms <= now
-                || !matches!(ticket_status.as_str(), "claimed" | "needs_input" | "click_started")
+                || !matches!(
+                    ticket_status.as_str(),
+                    "claimed" | "needs_input" | "click_started"
+                )
             {
                 anyhow::bail!("local run ticket is not active")
             }
@@ -1069,9 +1156,7 @@ pub fn finalize_local_side_effect_unknown(
                         )
                     });
                 if ticket_status != "side_effect_unknown"
-                    || application
-                        .receipt
-                        .pointer("/local_reconciliation/receipt")
+                    || application.receipt.pointer("/local_reconciliation/receipt")
                         != Some(&reconciliation_receipt)
                     || stored_session.is_none_or(|(raw, runner, status)| {
                         !local_unknown_terminal_session_matches(
@@ -1100,7 +1185,10 @@ pub fn finalize_local_side_effect_unknown(
             let prior_application_state = application.state.clone();
             validate_application_transition(&application.state, "side_effect_unknown")?;
             if ticket_expires_at_ms <= now
-                || !matches!(ticket_status.as_str(), "claimed" | "needs_input" | "click_started")
+                || !matches!(
+                    ticket_status.as_str(),
+                    "claimed" | "needs_input" | "click_started"
+                )
             {
                 anyhow::bail!("local run ticket is not active")
             }
@@ -1209,8 +1297,7 @@ fn retain_local_unknown_capacity_sqlite_tx(
     if matches!(ticket_status, "claimed" | "needs_input") {
         crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(tx, capacity)?;
     }
-    let retain_until =
-        ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
+    let retain_until = ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
     if !crate::db::object_uploads::extend_exact_submission_evidence_capacity_expiry_sqlite_tx(
         tx,
         capacity,
@@ -1232,8 +1319,7 @@ fn retain_local_unknown_capacity_postgres_tx(
     if matches!(ticket_status, "claimed" | "needs_input") {
         crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(tx, capacity)?;
     }
-    let retain_until =
-        ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
+    let retain_until = ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
     if !crate::db::object_uploads::extend_exact_submission_evidence_capacity_expiry_postgres_tx(
         tx,
         capacity,
@@ -1284,6 +1370,9 @@ pub fn approve_local_run_resume_action(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
             let ticket_expires_at: Option<i64> = tx
                 .query_row(
                     "SELECT expires_at_ms FROM jobs_local_run_tickets
@@ -1371,6 +1460,9 @@ pub fn approve_local_run_resume_action(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
             let ticket_expires_at = tx
                 .query_opt(
                     "SELECT expires_at_ms FROM jobs_local_run_tickets
@@ -1468,6 +1560,22 @@ pub fn consume_local_run_resume_action(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let account_id: Option<String> = tx
+                .query_row(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = ?1 AND ticket_hash = ?2",
+                    params![run_id, ticket_hash],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(account_id) = account_id else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &account_id,
+            )?;
             let value: Option<(String, String, String, String, String, i64, String)> = tx
                 .query_row(
                     "SELECT a.id, a.account_id, a.application_id, a.intervention_id,
@@ -1540,6 +1648,21 @@ pub fn consume_local_run_resume_action(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let account_id = tx
+                .query_opt(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = $1 AND ticket_hash = $2",
+                    &[&run_id, &ticket_hash],
+                )?
+                .map(|row| row.get::<_, String>(0));
+            let Some(account_id) = account_id else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &account_id,
+            )?;
             let value = tx.query_opt(
                 "SELECT a.id, a.account_id, a.application_id, a.intervention_id,
                         a.action, a.expires_at_ms, a.status

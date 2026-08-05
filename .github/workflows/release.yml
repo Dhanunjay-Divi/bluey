@@ -81,12 +81,14 @@ jobs:
             ~/.cargo/git/db/
             target/
             server/target/
+            jobs/runner/native-storage/target/
           key: ${{ runner.os }}-release-quality-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-release-quality-
 
       - name: Self-test release and source guards
         run: |
           python3 scripts/check-release-artifact-contents.py --self-test
+          node --test web/assets/bluey-account-delete.test.cjs
           node jobs/scripts/ci-guards-self-test.mjs
           node jobs/scripts/privacy-gate.mjs
           node jobs/scripts/check-jobs-schema-parity.mjs
@@ -96,16 +98,24 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo fmt --manifest-path server/Cargo.toml -- --check
+          cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
 
       - name: Lint Rust workspaces
         run: |
           cargo clippy --all-targets -- -D warnings
           cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Test Rust workspaces
         run: |
           cargo test --all-targets
           cargo test --manifest-path server/Cargo.toml --all-targets
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked
+
+      - name: Build native runner storage release artifact
+        run: >-
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml
+          --release --locked
 
       - name: Test and build dashboard UI
         run: |
@@ -119,6 +129,14 @@ jobs:
           npm test --prefix jobs
           npm run typecheck --prefix jobs
           npm run build --prefix jobs
+
+      - name: Build and smoke the managed runner image
+        run: |
+          docker build --tag bluey-jobs-runner-release-gate --file jobs/runner/Dockerfile jobs
+          docker run --rm \
+            --entrypoint node \
+            --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
+            bluey-jobs-runner-release-gate scripts/native-runner-addon-smoke.mjs
 
   build:
     needs: quality
@@ -181,6 +199,34 @@ jobs:
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Set up Node.js for Darwin runner smoke
+        if: startsWith(matrix.os, 'macos') && matrix.platform != 'darwin-universal'
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: jobs/package-lock.json
+
+      - name: Verify native runner storage on Darwin
+        if: startsWith(matrix.os, 'macos') && matrix.platform != 'darwin-universal'
+        run: |
+          npm ci --prefix jobs --no-audit --no-fund
+          npm run build --prefix jobs --workspace @bluey/jobs-automation
+          npm run build --prefix jobs --workspace @bluey/jobs-runner
+          rustup component add rustfmt clippy
+          cargo fmt --manifest-path jobs/runner/native-storage/Cargo.toml --all -- --check
+          cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked
+          cargo build --manifest-path jobs/runner/native-storage/Cargo.toml --release --locked
+          mkdir -p jobs/runner/dist/native
+          install -m 0555 \
+            jobs/runner/native-storage/target/release/libbluey_jobs_runner_native_storage.dylib \
+            jobs/runner/dist/native/bluey_jobs_runner_native_storage.node
+          SMOKE_ROOT="$GITHUB_WORKSPACE/jobs/runner/native-storage/target/native-addon-smoke"
+          mkdir -m 0700 "$SMOKE_ROOT"
+          BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT="$SMOKE_ROOT" \
+            node jobs/scripts/native-runner-addon-smoke.mjs
 
       - name: Configure MSVC
         if: matrix.os == 'windows-latest'

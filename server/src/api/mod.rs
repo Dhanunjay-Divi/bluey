@@ -26,6 +26,7 @@ mod jobs_mailbox;
 pub mod jobs_mailbox_oauth;
 pub(crate) mod jobs_resume_assets;
 pub(crate) mod jobs_resume_generation;
+pub mod jobs_runner_volumes;
 mod jobs_source_directory;
 mod jobs_source_directory_catalog;
 pub mod jobs_worker_auth;
@@ -179,10 +180,12 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             ),
         )
         .merge(
-            jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                jobs_worker_auth::require_jobs_worker,
-            )),
+            jobs::worker_router()
+                .merge(jobs_runner_volumes::worker_router())
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    jobs_worker_auth::require_jobs_worker,
+                )),
         )
         .merge(
             jobs::local_runner_router().route_layer(axum::middleware::from_fn_with_state(
@@ -209,6 +212,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             get(admin::support_account),
         )
         .merge(jobs::admin_router())
+        .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
     // ---- Authenticated (Bearer JWT) -----------------------------------------
@@ -372,6 +376,10 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .merge(admin_only)
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            account::reject_mutation_after_deletion_fence,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::require_auth,
         ));
 
@@ -403,6 +411,17 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
+            account::reject_mutation_after_deletion_fence,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_auth,
+        ));
+
+    let runner_volume_admin = jobs_runner_volumes::admin_router()
+        .route_layer(axum::middleware::from_fn(auth::require_admin))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
             auth::require_auth,
         ));
 
@@ -412,10 +431,12 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
             axum::middleware::from_fn_with_state(state.clone(), crate::rate_limit::limit_auth_otp),
         ))
         .merge(
-            jobs::worker_router().route_layer(axum::middleware::from_fn_with_state(
-                state.clone(),
-                jobs_worker_auth::require_jobs_worker,
-            )),
+            jobs::worker_router()
+                .merge(jobs_runner_volumes::worker_router())
+                .route_layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    jobs_worker_auth::require_jobs_worker,
+                )),
         )
         .merge(
             jobs::local_runner_router().route_layer(axum::middleware::from_fn_with_state(
@@ -423,6 +444,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
                 crate::rate_limit::limit_jobs_local_runner,
             )),
         )
+        .merge(runner_volume_admin)
         .merge(protected)
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)

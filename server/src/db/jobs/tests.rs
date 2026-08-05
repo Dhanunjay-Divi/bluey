@@ -50,6 +50,16 @@ mod tests {
         pool
     }
 
+    fn assert_account_deletion_fence<T>(result: Result<T>) {
+        match result {
+            Err(error) => assert!(matches!(
+                error.downcast_ref::<UploadControlError>(),
+                Some(UploadControlError::AccountDeleting)
+            )),
+            Ok(_) => panic!("account-deletion fence unexpectedly allowed the operation"),
+        }
+    }
+
     fn reserve_verified_jobs_account_object(
         pool: &DbPool,
         logical_id: &str,
@@ -7527,6 +7537,123 @@ mod tests {
     }
 
     #[test]
+    fn account_deletion_fence_blocks_active_lease_and_profile_operations() {
+        fn assert_account_deleting<T>(result: ExecutionLeaseResult<T>) {
+            match result {
+                Err(ExecutionLeaseError::Storage(error)) => assert!(matches!(
+                    error.downcast_ref::<UploadControlError>(),
+                    Some(UploadControlError::AccountDeleting)
+                )),
+                Err(other) => panic!("expected account-deletion storage fence, got {other:?}"),
+                Ok(_) => panic!("account-deletion fence unexpectedly allowed the operation"),
+            }
+        }
+
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "account-delete-active-fence");
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "active-fenced-worker",
+        )
+        .unwrap();
+        let lease_before: (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT phase, lease_expires_at_ms
+                   FROM jobs_execution_leases
+                  WHERE run_id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', ?1, ?1, ?1, 0)",
+                params![now_ms()],
+            )
+            .unwrap();
+
+        assert_account_deleting(heartbeat_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+        ));
+        assert_account_deleting(start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            &test_final_submit_proof(&application),
+            &test_submission_evidence_capacity(&application.id, &run_id),
+        ));
+        let object_key = format!(
+            "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/1.enc"
+        );
+        assert_account_deleting(authorize_browser_profile_snapshot_store(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            0,
+            &object_key,
+            &"a".repeat(64),
+            128,
+            1,
+        ));
+        assert_account_deleting(get_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+        ));
+
+        let lease_after: (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT phase, lease_expires_at_ms
+                   FROM jobs_execution_leases
+                  WHERE run_id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(lease_after, lease_before);
+        let evidence_capacity_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(evidence_capacity_count, 0);
+    }
+
+    #[test]
     fn safe_worker_checkpoint_releases_all_execution_authority_atomically() {
         let pool = test_pool();
         let (application, run_id, browser_profile_id) =
@@ -12193,6 +12320,193 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn account_deletion_fence_blocks_local_launch_and_jobs_mutations() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture(&pool, "account-delete-local-fence");
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', ?1, ?1, ?1, 0)",
+                params![now_ms()],
+            )
+            .unwrap();
+
+        assert_account_deletion_fence(claim_authorized_local_run_ticket(
+            &pool,
+            &run_id,
+            &ticket_hash,
+        ));
+        assert_account_deletion_fence(update_local_run_ticket_status(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "failed",
+        ));
+        assert_account_deletion_fence(save_local_run_ticket(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "fenced-new-local-run",
+            "fenced-new-local-ticket-hash",
+            "fenced-new-local-ticket-secret",
+            json!({ "runId": "fenced-new-local-run" }),
+            now_ms() + 60_000,
+        ));
+        assert_account_deletion_fence(update_application(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "running",
+            None,
+        ));
+        assert_account_deletion_fence(update_attempt_reservation_status(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "running",
+        ));
+        assert_account_deletion_fence(save_run_event(
+            &pool,
+            "acct-jobs",
+            &run_id,
+            "fenced_event",
+            json!({ "application_id": application.id.clone() }),
+        ));
+        assert_account_deletion_fence(save_intervention(
+            &pool,
+            "acct-jobs",
+            &Intervention {
+                id: "fenced-intervention".to_string(),
+                application_id: Some(application.id.clone()),
+                kind: "browser_takeover".to_string(),
+                status: "open".to_string(),
+                title: "Fenced intervention".to_string(),
+                detail: "Must not be written after deletion starts".to_string(),
+                choices: Vec::new(),
+                resolution_kind: "browser_takeover".to_string(),
+                resume_after_resolution: true,
+                provider: String::new(),
+                provider_message_id: String::new(),
+                expires_at_ms: None,
+                metadata: json!({}),
+                created_at_ms: 0,
+                resolved_at_ms: None,
+            },
+        ));
+
+        let ticket_status: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "queued");
+        let forbidden_rows: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM jobs_run_events WHERE event_type = 'fenced_event')
+                    +
+                    (SELECT COUNT(*) FROM jobs_interventions
+                      WHERE id = 'fenced-intervention')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forbidden_rows, 0);
+    }
+
+    #[test]
+    fn account_deletion_fence_blocks_local_resume_approval_and_consumption() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture(&pool, "account-delete-resume-fence");
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_some()
+        );
+        update_application(&pool, "acct-jobs", &application.id, "running", None).unwrap();
+        update_application(&pool, "acct-jobs", &application.id, "needs_input", None).unwrap();
+        assert!(
+            update_local_run_ticket_status(&pool, &run_id, &ticket_hash, "needs_input",).unwrap()
+        );
+        let intervention = save_intervention(
+            &pool,
+            "acct-jobs",
+            &Intervention {
+                id: String::new(),
+                application_id: Some(application.id.clone()),
+                kind: "browser_takeover".to_string(),
+                status: "approved".to_string(),
+                title: "Review the application".to_string(),
+                detail: "Review the form".to_string(),
+                choices: Vec::new(),
+                resolution_kind: "browser_takeover".to_string(),
+                resume_after_resolution: true,
+                provider: String::new(),
+                provider_message_id: String::new(),
+                expires_at_ms: None,
+                metadata: json!({}),
+                created_at_ms: 0,
+                resolved_at_ms: None,
+            },
+        )
+        .unwrap();
+        approve_local_run_resume_action(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &intervention.id,
+        )
+        .unwrap()
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', ?1, ?1, ?1, 0)",
+                params![now_ms()],
+            )
+            .unwrap();
+
+        assert_account_deletion_fence(approve_local_run_resume_action(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &intervention.id,
+        ));
+        assert_account_deletion_fence(consume_local_run_resume_action(
+            &pool,
+            &run_id,
+            &ticket_hash,
+        ));
+        let action_status: (String, Option<i64>) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status, consumed_at_ms FROM jobs_local_run_resume_actions
+                  WHERE run_id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(action_status, ("approved".to_string(), None));
     }
 
     #[test]

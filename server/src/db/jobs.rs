@@ -1489,6 +1489,17 @@ pub struct ExecutionLeaseGrant {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RunnerVolumeExecutionLeaseGrant {
+    #[serde(flatten)]
+    pub lease: ExecutionLeaseGrant,
+    pub purge_subject: String,
+    pub volume_id: String,
+    pub enrollment_epoch: i64,
+    pub process_instance_id: String,
+    pub volume_key_fingerprint: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ExecutionLeaseRecord {
     pub run_id: String,
     pub fence: i64,
@@ -1876,6 +1887,7 @@ include!("jobs/communication_actions.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");
+include!("jobs/runner_volume_purge.rs");
 include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
 

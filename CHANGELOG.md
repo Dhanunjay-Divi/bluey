@@ -7,14 +7,28 @@ under `docs/release/`.
 
 ### Added
 
+- Added signed managed runner-volume identity, process leases, chained
+  current-storage attestations, conservative account-deletion fan-out, exact
+  purge acknowledgements, opaque restore tombstones, provider-bound destruction
+  evidence, and fleet cutover authority. Account deletion now returns durable
+  pending status while any offline or legacy volume is unresolved, and clears
+  account credentials only after verified hard deletion. Signed keyset polling
+  prepares every bounded command page before the first acknowledgement, so
+  global legacy-zero evidence cannot deadlock across subjects; unresolved
+  storage attestations are promoted, retried byte-for-byte, discarded, or
+  rejected according to exact predecessor, tombstone, enrollment, and local
+  evidence bindings. Runner account data crosses a native retained-handle
+  boundary under a dedicated unprivileged container principal. Container bases
+  are digest-pinned, and Linux and Darwin gates load and smoke the exact staged
+  native addon while runtime storage operations reject symlinks, hardlinks,
+  special files, mount/root replacement, or a second runner.
 - Added a durable Bluey Jobs submission-evidence lifecycle with protected
   pre-click capacity, immutable receipt and screenshot objects, authenticated
   integrity-checked downloads, account-deletion write fencing, bounded
   cross-replica PostgreSQL writer/deleter coordination, and migration coverage
-  for legacy resume and encrypted browser-profile objects. Known cloud-runner
-  state now blocks deletion until a future verified volume-purge acknowledgement
-  path is available, and missing or unreachable object-storage namespaces retain
-  the deletion fence instead of allowing an unproven GDPR success response.
+  for legacy resume and encrypted browser-profile objects. Missing or
+  unreachable object-storage namespaces retain the deletion fence instead of
+  allowing an unproven GDPR success response.
 - Added process-crash recovery for cloud and local Jobs runners with offline
   browser startup, guard-before-network restoration, fenced submitted-result
   replay, per-profile failure isolation, and serialized browser-session writes.

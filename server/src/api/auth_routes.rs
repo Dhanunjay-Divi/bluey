@@ -382,7 +382,9 @@ fn cleanup_new_account_after_setup_failure(
         %error,
         "account setup failed; removing newly created account"
     );
-    if let Err(cleanup_error) = account_data::hard_delete_account(&state.pool, account_id) {
+    if let Err(cleanup_error) =
+        account_data::hard_delete_account_after_setup_failure(&state.pool, account_id)
+    {
         tracing::error!(
             account_id_hash = %cue_core::account_id_hash_prefix(account_id),
             stage,

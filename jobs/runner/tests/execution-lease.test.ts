@@ -8,6 +8,22 @@ import {
 } from "../src/execution-lease.js";
 
 const WORKER_SIGNING_KEY = "worker-signing-key-secret-0123456789abcdef";
+const VOLUME_ID = Buffer.alloc(32, 1).toString("base64url");
+const PROCESS_INSTANCE_ID = Buffer.alloc(32, 2).toString("base64url");
+const PURGE_SUBJECT = Buffer.alloc(32, 3).toString("base64url");
+const VOLUME_KEY_FINGERPRINT = "4".repeat(64);
+const VOLUME_PROOF = {
+  version: 1 as const,
+  audience: "bluey-jobs-runner-volume-authority" as const,
+  operation: "execution_lease_claim" as const,
+  requestId: "proof-request-123",
+  volumeId: VOLUME_ID,
+  enrollmentEpoch: 1,
+  processInstanceId: PROCESS_INSTANCE_ID,
+  issuedAtMs: 1_000,
+  payloadSha256: "5".repeat(64),
+  signature: Buffer.alloc(64, 6).toString("base64url"),
+};
 
 const CLAIM = {
   accountId: "account-123",
@@ -36,6 +52,7 @@ describe("execution lease client", () => {
     expect(lease.fence).toBe(7);
     expect(lease.expiresAtMs).toBeGreaterThan(Date.now());
     expect(lease.ownerId).toBe("runner-test-1");
+    expect(lease.purgeSubject).toBe(PURGE_SUBJECT);
     expect(lease.checkpointMetadata()).toEqual({
       leaseToken: "lease-secret-value",
       fence: 7,
@@ -56,6 +73,10 @@ describe("execution lease client", () => {
       run_id: "run-123",
       browser_profile_id: "profile-123",
       owner_id: "runner-test-1",
+      volume_id: VOLUME_ID,
+      enrollment_epoch: 1,
+      process_instance_id: PROCESS_INSTANCE_ID,
+      volume_proof: VOLUME_PROOF,
     });
     expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({
       lease_token: "lease-secret-value",
@@ -280,6 +301,20 @@ describe("execution lease client", () => {
     expect(String(error)).not.toContain("private.example");
   });
 
+  it.each([
+    ["volume id", { volume_id: Buffer.alloc(32, 9).toString("base64url") }],
+    ["enrollment epoch", { enrollment_epoch: 2 }],
+    ["process instance", { process_instance_id: Buffer.alloc(32, 8).toString("base64url") }],
+    ["key fingerprint", { volume_key_fingerprint: "9".repeat(64) }],
+    ["purge subject", { purge_subject: "not-canonical" }],
+  ])("rejects a claim grant with a mismatched %s binding", async (_label, override) => {
+    const fetch = vi.fn(async () => grantResponse(override)) as typeof globalThis.fetch;
+
+    await expect(createClient(fetch).claim(CLAIM)).rejects.toMatchObject({
+      code: "invalid_response",
+    });
+  });
+
   it("heartbeats while active, records failures, and cleans up on finish", async () => {
     vi.useFakeTimers();
     let heartbeatCalls = 0;
@@ -362,12 +397,12 @@ describe("execution lease client", () => {
   });
 
   it("loads the signing key from worker auth env without accepting the legacy token", () => {
-    expect(() => createExecutionLeaseClientFromEnv({
+    expect(() => createExecutionLeaseClientFromEnv(runnerVolume(), {
       BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
       BLUEY_JOBS_WORKER_TOKEN: WORKER_SIGNING_KEY,
       BLUEY_JOBS_RUNNER_ID: "runner-env-test",
     })).toThrow("configuration");
-    expect(() => createExecutionLeaseClientFromEnv({
+    expect(() => createExecutionLeaseClientFromEnv(runnerVolume(), {
       BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
       BLUEY_JOBS_WORKER_SIGNING_KEY: WORKER_SIGNING_KEY,
       BLUEY_JOBS_RUNNER_ID: "runner-env-test",
@@ -383,6 +418,7 @@ function createClient(
     origin: "https://jobs-api.example",
     workerSigningKey: WORKER_SIGNING_KEY,
     ownerId: "runner-test-1",
+    runnerVolume: runnerVolume(),
     heartbeatIntervalMs: 60_000,
     fetch,
     ...overrides,
@@ -459,17 +495,33 @@ function expectSignedWorkerRequest(
   );
 }
 
-function grantResponse(): Response {
+function grantResponse(overrides: Record<string, unknown> = {}): Response {
   return new Response(JSON.stringify({
     run_id: "run-123",
     lease_token: "lease-secret-value",
     fence: 7,
     lease_expires_at_ms: Date.now() + 60_000,
     phase: "prepared",
+    purge_subject: PURGE_SUBJECT,
+    volume_id: VOLUME_ID,
+    enrollment_epoch: 1,
+    process_instance_id: PROCESS_INSTANCE_ID,
+    volume_key_fingerprint: VOLUME_KEY_FINGERPRINT,
+    ...overrides,
   }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });
+}
+
+function runnerVolume() {
+  return {
+    volumeId: VOLUME_ID,
+    enrollmentEpoch: 1,
+    processInstanceId: PROCESS_INSTANCE_ID,
+    keyFingerprint: VOLUME_KEY_FINGERPRINT,
+    createExecutionLeaseClaimProof: () => VOLUME_PROOF,
+  };
 }
 
 function recordResponse(

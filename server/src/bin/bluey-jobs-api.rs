@@ -23,6 +23,8 @@ async fn main() -> anyhow::Result<()> {
     db::jobs::validate_data_encryption_config().context("validate Jobs data encryption")?;
     api::jobs_local_capability::validate_runtime_config()
         .context("validate Bluey Browser capability configuration")?;
+    api::jobs_runner_volumes::validate_runtime_config()
+        .context("validate managed runner-volume purge signing configuration")?;
     let port = std::env::var("BLUEY_JOBS_API_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())

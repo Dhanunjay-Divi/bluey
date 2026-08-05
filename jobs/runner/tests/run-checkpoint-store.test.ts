@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import {
   copyFile,
   mkdir,
@@ -19,17 +19,29 @@ import {
   type NormalizedJob,
 } from "@bluey/jobs-automation";
 import { profilePaths, restoreProfile } from "../src/profile-store.js";
+import type {
+  NativeRunnerInventory,
+  NativeRunnerInventoryEntry,
+  NativeRunnerStorageDirectory,
+} from "../src/native-runner-storage.js";
 import {
   CURRENT_CHECKPOINT_VERSION,
   cloudCheckpointScope,
+  listManagedRunCheckpoints,
   listRunCheckpoints,
+  readManagedRunCheckpoint,
   readRunCheckpoint,
   reconcileOrphanActiveProfiles,
+  removeManagedRunCheckpoint,
   removeRunCheckpoint,
+  scanManagedRunCheckpoints,
   scanRunCheckpoints,
+  writeManagedRunCheckpoint,
   writeRunCheckpoint,
   type CloudRunCheckpoint,
 } from "../src/run-checkpoint-store.js";
+import type { ManagedProfileStorage } from "../src/subject-storage-manager.js";
+import { subjectStoragePaths } from "../src/subject-storage-layout.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -213,6 +225,156 @@ describe("encrypted cloud run checkpoints", () => {
   });
 });
 
+describe("managed v2 cloud run checkpoints", () => {
+  it("atomically replaces and authenticates a checkpoint through retained handles", async () => {
+    const key = randomBytes(32);
+    const checkpoint = fixture();
+    const managed = managedProfileStorage(checkpoint.profileScope);
+    const checkpointScope = cloudCheckpointScope(
+      checkpoint.profileScope,
+      checkpoint.browserSessionId,
+    );
+
+    await writeManagedRunCheckpoint(managed.capability, checkpoint, key);
+
+    const fileName = `${checkpointScope}.json.enc`;
+    const encrypted = managed.checkpoints.bytes(fileName);
+    expect(managed.checkpoints.names()).toEqual([fileName]);
+    expect(managed.checkpoints.operations[0]).toBe(`replace:${fileName}`);
+    expect(encrypted.subarray(0, 8).toString("ascii")).toBe("BLUEYJP2");
+    expect(encrypted.includes(Buffer.from("person@example.test"))).toBe(false);
+    expect(encrypted.includes(Buffer.from("private answer"))).toBe(false);
+    expect(encrypted.includes(Buffer.from("lease-secret-value"))).toBe(false);
+    await expect(readManagedRunCheckpoint<FixtureRequest, unknown>(
+      managed.capability,
+      checkpointScope,
+      key,
+    )).resolves.toEqual(checkpoint);
+    await expect(listManagedRunCheckpoints<FixtureRequest, unknown>(
+      managed.capability,
+      key,
+    )).resolves.toEqual([{ checkpointScope, checkpoint }]);
+  });
+
+  it("binds the capability, ciphertext, and file name to the exact profile and session", async () => {
+    const key = randomBytes(32);
+    const source = fixture();
+    const sourceStorage = managedProfileStorage(source.profileScope);
+    const wrongProfile = managedProfileStorage("b".repeat(40));
+    await expect(writeManagedRunCheckpoint(wrongProfile.capability, source, key))
+      .rejects.toThrow("profile binding");
+
+    await writeManagedRunCheckpoint(sourceStorage.capability, source, key);
+    const sourceScope = cloudCheckpointScope(source.profileScope, source.browserSessionId);
+    const target = fixture({ browserSessionId: "cloud-application-other" });
+    const targetScope = cloudCheckpointScope(target.profileScope, target.browserSessionId);
+    sourceStorage.checkpoints.seedFile(
+      `${targetScope}.json.enc`,
+      sourceStorage.checkpoints.bytes(`${sourceScope}.json.enc`),
+    );
+
+    await expect(readManagedRunCheckpoint(
+      sourceStorage.capability,
+      targetScope,
+      key,
+    )).rejects.toMatchObject({ code: "authentication_failed" });
+  });
+
+  it("rejects a string checkpoint version instead of bypassing the v2 lease-token rule", async () => {
+    const key = randomBytes(32);
+    const checkpoint = fixture();
+    Reflect.set(checkpoint, "version", "2");
+    delete checkpoint.lease.leaseToken;
+
+    await expect(writeManagedRunCheckpoint(
+      managedProfileStorage(checkpoint.profileScope).capability,
+      checkpoint,
+      key,
+    )).rejects.toThrow("Invalid cloud run checkpoint envelope");
+  });
+
+  it("fails closed on unknown, nested, hardlinked, and oversized scan entries", async () => {
+    const key = randomBytes(32);
+    const scenarios: Array<(directory: MemoryNativeDirectory) => void> = [
+      (directory) => directory.seedFile(".DS_Store", Buffer.from("metadata")),
+      (directory) => directory.seedDirectory("nested"),
+      (directory) => directory.seedFile(`${"1".repeat(64)}.json.enc`, Buffer.from("linked"), 2),
+      (directory) => directory.seedFile(
+        `${"2".repeat(64)}.json.enc`,
+        Buffer.alloc(5 * 1024 * 1024 + 65),
+      ),
+    ];
+
+    for (const seed of scenarios) {
+      const managed = managedProfileStorage("a".repeat(40));
+      seed(managed.checkpoints);
+      const scan = await scanManagedRunCheckpoints<FixtureRequest, unknown>(
+        managed.capability,
+        key,
+      );
+      expect(scan).toEqual({
+        checkpoints: [],
+        failures: [{ profileScope: managed.capability.scope, code: "profile_unreadable" }],
+      });
+      expect(managed.checkpoints.readCount).toBe(0);
+    }
+  });
+
+  it("enforces the per-profile bound before reading any checkpoint", async () => {
+    const key = randomBytes(32);
+    const managed = managedProfileStorage("a".repeat(40));
+    for (let index = 0; index < 9; index += 1) {
+      managed.checkpoints.seedFile(
+        `${index.toString(16).padStart(64, "0")}.json.enc`,
+        Buffer.from("not-read"),
+      );
+    }
+
+    await expect(scanManagedRunCheckpoints(managed.capability, key)).resolves.toEqual({
+      checkpoints: [],
+      failures: [{
+        profileScope: managed.capability.scope,
+        code: "checkpoint_limit_exceeded",
+      }],
+    });
+    expect(managed.checkpoints.readCount).toBe(0);
+  });
+
+  it("discards scan results when the closed-world inventory changes mid-read", async () => {
+    const key = randomBytes(32);
+    const checkpoint = fixture();
+    const managed = managedProfileStorage(checkpoint.profileScope);
+    await writeManagedRunCheckpoint(managed.capability, checkpoint, key);
+    managed.checkpoints.mutateAfterNextInventory = () => {
+      managed.checkpoints.seedFile("late-entry", Buffer.from("changed"));
+    };
+
+    await expect(scanManagedRunCheckpoints(managed.capability, key)).resolves.toEqual({
+      checkpoints: [],
+      failures: [{ profileScope: checkpoint.profileScope, code: "profile_unreadable" }],
+    });
+  });
+
+  it("requires exact native readback and verifies removal", async () => {
+    const key = randomBytes(32);
+    const checkpoint = fixture();
+    const failed = managedProfileStorage(checkpoint.profileScope);
+    failed.checkpoints.mutateAfterReplace = (fileName) => {
+      failed.checkpoints.seedFile(fileName, Buffer.from("replaced-after-publication"));
+    };
+    await expect(writeManagedRunCheckpoint(failed.capability, checkpoint, key))
+      .rejects.toThrow("publication failed");
+
+    const managed = managedProfileStorage(checkpoint.profileScope);
+    await writeManagedRunCheckpoint(managed.capability, checkpoint, key);
+    await removeManagedRunCheckpoint(
+      managed.capability,
+      checkpoint.browserSessionId,
+    );
+    expect(managed.checkpoints.names()).toEqual([]);
+  });
+});
+
 describe("cloud runner crash-start profile reconciliation", () => {
   it("seals valid orphan plaintext and removes every active entry before traffic", async () => {
     const root = await temporaryDirectory();
@@ -306,6 +468,156 @@ function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint<Fi
 
 function checkpointPath(root: string, profileScope: string, checkpointScope: string): string {
   return join(root, "run-checkpoints", profileScope, `${checkpointScope}.json.enc`);
+}
+
+interface ManagedProfileFixture {
+  readonly capability: ManagedProfileStorage;
+  readonly checkpoints: MemoryNativeDirectory;
+}
+
+function managedProfileStorage(profileScope: string): ManagedProfileFixture {
+  const subjectSha256 = "1".repeat(64);
+  const paths = subjectStoragePaths(subjectSha256).profile(profileScope);
+  const root = new MemoryNativeDirectory(paths.root.relativePath);
+  const active = new MemoryNativeDirectory(paths.active.relativePath);
+  const snapshots = new MemoryNativeDirectory(paths.snapshots.relativePath);
+  const checkpoints = new MemoryNativeDirectory(paths.checkpoints.relativePath);
+  const receipts = new MemoryNativeDirectory(paths.receipts.relativePath);
+  const temporary = new MemoryNativeDirectory(paths.temporary.relativePath);
+  return {
+    checkpoints,
+    capability: {
+      kind: "profile",
+      subjectSha256,
+      scope: profileScope,
+      paths,
+      root,
+      active,
+      snapshots,
+      checkpoints,
+      receipts,
+      temporary,
+    },
+  };
+}
+
+interface MemoryNativeEntry {
+  readonly kind: "directory" | "file";
+  readonly contents: Buffer;
+  readonly linkCount: number;
+  readonly deviceId: string;
+}
+
+class MemoryNativeDirectory implements NativeRunnerStorageDirectory {
+  readonly deviceId = "unix:602:mount:7";
+  readonly linkCount = 2;
+  readonly canonicalPath: string;
+  readonly operations: string[] = [];
+  readCount = 0;
+  mutateAfterNextInventory: (() => void) | undefined;
+  mutateAfterReplace: ((fileName: string) => void) | undefined;
+  private readonly entries = new Map<string, MemoryNativeEntry>();
+
+  constructor(readonly relativePath: string) {
+    this.canonicalPath = `/srv/bluey-runner/${relativePath}`;
+  }
+
+  names(): string[] {
+    return [...this.entries.keys()].sort((left, right) => (
+      Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"))
+    ));
+  }
+
+  bytes(name: string): Buffer {
+    const entry = this.entries.get(name);
+    if (!entry || entry.kind !== "file") throw new Error("missing memory checkpoint");
+    return Buffer.from(entry.contents);
+  }
+
+  seedFile(name: string, contents: Buffer, linkCount = 1): void {
+    this.entries.set(name, {
+      kind: "file",
+      contents: Buffer.from(contents),
+      linkCount,
+      deviceId: this.deviceId,
+    });
+  }
+
+  seedDirectory(name: string): void {
+    this.entries.set(name, {
+      kind: "directory",
+      contents: Buffer.alloc(0),
+      linkCount: 2,
+      deviceId: this.deviceId,
+    });
+  }
+
+  async ensureChildDirectory(name: string): Promise<NativeRunnerStorageDirectory> {
+    return new MemoryNativeDirectory(`${this.relativePath}/${name}`);
+  }
+
+  async openChildDirectory(name: string): Promise<NativeRunnerStorageDirectory> {
+    return new MemoryNativeDirectory(`${this.relativePath}/${name}`);
+  }
+
+  async writeFileExclusive(name: string, contents: Buffer): Promise<boolean> {
+    if (this.entries.has(name)) return false;
+    this.seedFile(name, contents);
+    this.operations.push(`create:${name}`);
+    return true;
+  }
+
+  async replaceFile(name: string, contents: Buffer): Promise<void> {
+    this.seedFile(name, contents);
+    this.operations.push(`replace:${name}`);
+    this.mutateAfterReplace?.(name);
+  }
+
+  async readFileBounded(name: string, maximumBytes: number): Promise<Buffer> {
+    this.readCount += 1;
+    const entry = this.entries.get(name);
+    if (!entry || entry.kind !== "file") throw new Error("missing memory checkpoint");
+    if (entry.contents.length > maximumBytes) throw new Error("bounded read exceeded");
+    this.operations.push(`read:${name}:${maximumBytes}`);
+    return Buffer.from(entry.contents);
+  }
+
+  async inventory(): Promise<NativeRunnerInventory> {
+    const entries = this.names().map((name): NativeRunnerInventoryEntry => {
+      const entry = this.entries.get(name)!;
+      return Object.freeze({
+        relativePath: name,
+        kind: entry.kind,
+        deviceId: entry.deviceId,
+        linkCount: entry.linkCount,
+        sizeBytes: entry.contents.length,
+        sha256: createHash("sha256")
+          .update(entry.kind === "file" ? entry.contents : Buffer.from("directory"))
+          .digest("hex"),
+      });
+    });
+    const bytes = entries.reduce((total, entry) => total + entry.sizeBytes, 0);
+    const digest = createHash("sha256");
+    for (const entry of entries) {
+      digest.update(JSON.stringify(entry));
+      digest.update("\n");
+    }
+    const inventory = Object.freeze({
+      entries: Object.freeze(entries),
+      count: entries.length,
+      bytes,
+      sha256: digest.digest("hex"),
+    });
+    const mutate = this.mutateAfterNextInventory;
+    this.mutateAfterNextInventory = undefined;
+    mutate?.();
+    return inventory;
+  }
+
+  async removeEntry(name: string): Promise<void> {
+    this.entries.delete(name);
+    this.operations.push(`remove:${name}`);
+  }
 }
 
 async function temporaryDirectory(): Promise<string> {

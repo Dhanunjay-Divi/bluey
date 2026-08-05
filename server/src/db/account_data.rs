@@ -75,15 +75,13 @@ pub enum BeginAccountDeletionResult {
     Ready(AccountDeletionIntent),
     WaitingForUploads(AccountDeletionIntent),
     WaitingForIrreversibleSubmissions { active_submissions: i64 },
-    WaitingForCloudRunnerCleanup { cloud_runner_records: i64 },
 }
 
 impl BeginAccountDeletionResult {
     pub fn intent(&self) -> Option<&AccountDeletionIntent> {
         match self {
             Self::Ready(intent) | Self::WaitingForUploads(intent) => Some(intent),
-            Self::WaitingForIrreversibleSubmissions { .. }
-            | Self::WaitingForCloudRunnerCleanup { .. } => None,
+            Self::WaitingForIrreversibleSubmissions { .. } => None,
         }
     }
 }
@@ -316,10 +314,47 @@ pub fn export_bundle(pool: &DbPool, account_id: &str) -> Result<Option<ExportBun
     Ok(bundle)
 }
 
-pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
+/// Remove a newly-created account whose setup failed before any deletion
+/// workflow or runner-volume authority was established.
+///
+/// This deliberately refuses accounts with a deletion intent or purge request;
+/// normal account deletion must use `hard_delete_account_after_runner_purge`.
+pub(crate) fn hard_delete_account_after_setup_failure(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<bool> {
+    anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => hard_delete_account_sqlite(pool, account_id),
-        DbPool::Postgres(_) => hard_delete_account_postgres(pool, account_id),
+        DbPool::Sqlite(_) => hard_delete_account_after_setup_failure_sqlite(pool, account_id),
+        DbPool::Postgres(_) => hard_delete_account_after_setup_failure_postgres(pool, account_id),
+    })
+}
+
+/// Hard-delete a fenced account only after the exact runner-volume purge
+/// request has completed and its indefinite tombstone is durable.
+///
+/// The caller must hold the account's exclusive object-lifecycle guard across
+/// its final object-store sweep and this transaction. This transaction
+/// independently reasserts the durable fence, drained uploads, absence of an
+/// unresolved irreversible submission, and the exact completed purge
+/// tombstone so no API or alternate call site can bypass the deletion gate.
+pub(crate) fn hard_delete_account_after_runner_purge(
+    pool: &DbPool,
+    account_id: &str,
+    purge_request_id: &str,
+) -> Result<bool> {
+    anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
+    anyhow::ensure!(
+        !purge_request_id.trim().is_empty(),
+        "purge_request_id is required"
+    );
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            hard_delete_account_after_runner_purge_sqlite(pool, account_id, purge_request_id)
+        }
+        DbPool::Postgres(_) => {
+            hard_delete_account_after_runner_purge_postgres(pool, account_id, purge_request_id)
+        }
     })
 }
 
@@ -987,23 +1022,6 @@ fn begin_account_deletion_sqlite(
         ));
     }
 
-    let cloud_runner_records: i64 = tx.query_row(
-        "SELECT
-            (SELECT COUNT(*) FROM jobs_browser_sessions
-              WHERE account_id = ?1 AND runner = 'cloud')
-            +
-            (SELECT COUNT(*) FROM jobs_execution_leases WHERE account_id = ?1)",
-        params![account_id],
-        |row| row.get(0),
-    )?;
-    if cloud_runner_records > 0 {
-        return Ok(Some(
-            BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
-                cloud_runner_records,
-            },
-        ));
-    }
-
     let cutoff_ms = now_ms.saturating_sub(ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS);
     tx.execute(
         "INSERT OR IGNORE INTO account_deletion_intents (
@@ -1081,24 +1099,6 @@ fn begin_account_deletion_postgres(
     if active_submissions > 0 {
         return Ok(Some(
             BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
-        ));
-    }
-
-    let cloud_runner_records: i64 = tx
-        .query_one(
-            "SELECT
-                (SELECT COUNT(*)::bigint FROM jobs_browser_sessions
-                  WHERE account_id = $1 AND runner = 'cloud')
-                +
-                (SELECT COUNT(*)::bigint FROM jobs_execution_leases WHERE account_id = $1)",
-            &[&account_id],
-        )?
-        .try_get(0)?;
-    if cloud_runner_records > 0 {
-        return Ok(Some(
-            BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
-                cloud_runner_records,
-            },
         ));
     }
 
@@ -1257,9 +1257,22 @@ pub(crate) fn account_write_fence_postgres_tx(
     })
 }
 
-fn hard_delete_account_sqlite(pool: &DbPool, account_id: &str) -> Result<bool> {
+fn hard_delete_account_after_setup_failure_sqlite(pool: &DbPool, account_id: &str) -> Result<bool> {
     let mut conn = pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let deletion_authority_exists: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM account_deletion_intents WHERE account_id = ?1
+            UNION ALL
+            SELECT 1 FROM jobs_runner_purge_requests WHERE account_id = ?1
+         )",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        !deletion_authority_exists,
+        "setup-failure cleanup refuses an account with durable deletion authority"
+    );
     tx.execute(
         "DELETE FROM stripe_webhook_events
             WHERE json_extract(body, '$.data.object.client_reference_id') = ?1
@@ -1271,9 +1284,26 @@ fn hard_delete_account_sqlite(pool: &DbPool, account_id: &str) -> Result<bool> {
     Ok(deleted > 0)
 }
 
-fn hard_delete_account_postgres(pool: &DbPool, account_id: &str) -> Result<bool> {
+fn hard_delete_account_after_setup_failure_postgres(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<bool> {
     let mut conn = pool.get_pg()?;
     let mut tx = conn.transaction()?;
+    let deletion_authority_exists: bool = tx
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1 FROM account_deletion_intents WHERE account_id = $1
+                UNION ALL
+                SELECT 1 FROM jobs_runner_purge_requests WHERE account_id = $1
+             )",
+            &[&account_id],
+        )?
+        .get(0);
+    anyhow::ensure!(
+        !deletion_authority_exists,
+        "setup-failure cleanup refuses an account with durable deletion authority"
+    );
     tx.execute(
         "DELETE FROM stripe_webhook_events
             WHERE body::jsonb #>> '{data,object,client_reference_id}' = $1
@@ -1281,6 +1311,264 @@ fn hard_delete_account_postgres(pool: &DbPool, account_id: &str) -> Result<bool>
         &[&account_id],
     )
     .ok();
+    let deleted = tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+    tx.commit()?;
+    Ok(deleted > 0)
+}
+
+fn hard_delete_account_after_runner_purge_sqlite(
+    pool: &DbPool,
+    account_id: &str,
+    purge_request_id: &str,
+) -> Result<bool> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let account_exists = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            params![account_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !account_exists {
+        return Ok(false);
+    }
+
+    let intent = tx
+        .query_row(
+            "SELECT fresh_upload_cutoff_ms, fresh_in_flight_puts
+               FROM account_deletion_intents WHERE account_id = ?1",
+            params![account_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((fresh_upload_cutoff_ms, recorded_fresh_puts)) = intent else {
+        anyhow::bail!("runner-purge hard delete requires a durable deletion fence");
+    };
+    let live_fresh_puts: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM object_uploads
+          WHERE account_id = ?1 AND state = 'pending' AND updated_at_ms > ?2",
+        params![account_id, fresh_upload_cutoff_ms],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        recorded_fresh_puts == 0 && live_fresh_puts == 0,
+        "runner-purge hard delete refuses active object uploads"
+    );
+    let irreversible_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs_applications AS application
+          WHERE application.account_id = ?1 AND application.state <> 'submitted'
+            AND (
+              EXISTS (
+                SELECT 1 FROM jobs_execution_leases AS lease
+                 WHERE lease.account_id = application.account_id
+                   AND lease.application_id = application.id
+                   AND lease.phase IN ('click_started', 'submitted', 'side_effect_unknown')
+              )
+              OR EXISTS (
+                SELECT 1 FROM jobs_local_run_tickets AS ticket
+                 WHERE ticket.account_id = application.account_id
+                   AND ticket.application_id = application.id
+                   AND ticket.status IN ('click_started', 'side_effect_unknown')
+              )
+            )",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        irreversible_count == 0,
+        "runner-purge hard delete refuses unresolved irreversible submissions"
+    );
+    let purge_is_complete: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1
+              FROM jobs_runner_purge_requests AS request
+              JOIN jobs_runner_purge_tombstones AS tombstone
+                ON tombstone.request_id = request.request_id
+               AND tombstone.purge_generation = request.purge_generation
+               AND tombstone.purge_subject = request.purge_subject
+               AND tombstone.target_set_sha256 = request.target_set_sha256
+               AND tombstone.required_target_count = request.required_target_count
+              JOIN jobs_runner_volume_fleet_state AS fleet
+                ON fleet.singleton_id = 1
+               AND fleet.legacy_inventory_state = 'ready'
+               AND fleet.legacy_inventory_generation = request.legacy_inventory_generation
+               AND fleet.legacy_inventory_reconciliation_id =
+                   request.legacy_inventory_reconciliation_id
+               AND fleet.legacy_inventory_authority_id = request.legacy_inventory_authority_id
+               AND fleet.legacy_inventory_authority_sha256 =
+                   request.legacy_inventory_authority_sha256
+             WHERE request.request_id = ?1 AND request.account_id = ?2
+               AND request.state = 'complete'
+               AND request.legacy_unresolved_count = 0
+               AND request.resolved_target_count = request.required_target_count
+               AND request.completed_at_ms IS NOT NULL
+               AND tombstone.completed_at_ms = request.completed_at_ms
+         )",
+        params![purge_request_id, account_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        purge_is_complete,
+        "runner-purge hard delete requires the exact completed purge tombstone"
+    );
+
+    tx.execute(
+        "DELETE FROM stripe_webhook_events
+            WHERE json_extract(body, '$.data.object.client_reference_id') = ?1
+               OR json_extract(body, '$.data.object.metadata.bluey_account_id') = ?1",
+        params![account_id],
+    )?;
+    let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+    tx.commit()?;
+    Ok(deleted > 0)
+}
+
+const POSTGRES_LOCK_RUNNER_PURGE_FLEET_FOR_HARD_DELETE_SQL: &str =
+    "SELECT legacy_inventory_state, legacy_inventory_generation,
+            legacy_inventory_reconciliation_id, legacy_inventory_authority_id,
+            legacy_inventory_authority_sha256
+       FROM jobs_runner_volume_fleet_state
+      WHERE singleton_id = 1
+      FOR UPDATE";
+
+const POSTGRES_LOCK_ACCOUNT_FOR_RUNNER_PURGE_HARD_DELETE_SQL: &str =
+    "SELECT id FROM accounts WHERE id = $1 FOR UPDATE";
+
+fn hard_delete_account_after_runner_purge_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    purge_request_id: &str,
+) -> Result<bool> {
+    let mut conn = pool.get_pg()?;
+    let mut tx = conn.transaction()?;
+
+    // Match every runner-volume mutation's global-to-account lock order. The
+    // singleton lock also prevents legacy authority from drifting after the
+    // exact tombstone check but before the account row is deleted.
+    let locked_fleet = tx.query_one(POSTGRES_LOCK_RUNNER_PURGE_FLEET_FOR_HARD_DELETE_SQL, &[])?;
+    let legacy_inventory_state: String = locked_fleet.try_get(0)?;
+    let legacy_inventory_generation: i64 = locked_fleet.try_get(1)?;
+    let legacy_inventory_reconciliation_id: Option<String> = locked_fleet.try_get(2)?;
+    let legacy_inventory_authority_id: Option<String> = locked_fleet.try_get(3)?;
+    let legacy_inventory_authority_sha256: Option<String> = locked_fleet.try_get(4)?;
+    let (
+        Some(legacy_inventory_reconciliation_id),
+        Some(legacy_inventory_authority_id),
+        Some(legacy_inventory_authority_sha256),
+    ) = (
+        legacy_inventory_reconciliation_id,
+        legacy_inventory_authority_id,
+        legacy_inventory_authority_sha256,
+    )
+    else {
+        anyhow::bail!("runner-purge hard delete requires the exact completed purge tombstone");
+    };
+    anyhow::ensure!(
+        legacy_inventory_state == "ready" && legacy_inventory_generation >= 1,
+        "runner-purge hard delete requires the exact completed purge tombstone"
+    );
+
+    let account_exists = tx
+        .query_opt(
+            POSTGRES_LOCK_ACCOUNT_FOR_RUNNER_PURGE_HARD_DELETE_SQL,
+            &[&account_id],
+        )?
+        .is_some();
+    if !account_exists {
+        return Ok(false);
+    }
+
+    let intent = tx.query_opt(
+        "SELECT fresh_upload_cutoff_ms, fresh_in_flight_puts
+           FROM account_deletion_intents WHERE account_id = $1 FOR UPDATE",
+        &[&account_id],
+    )?;
+    let Some(intent) = intent else {
+        anyhow::bail!("runner-purge hard delete requires a durable deletion fence");
+    };
+    let fresh_upload_cutoff_ms: i64 = intent.try_get(0)?;
+    let recorded_fresh_puts: i64 = intent.try_get(1)?;
+    let live_fresh_puts: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM object_uploads
+              WHERE account_id = $1 AND state = 'pending' AND updated_at_ms > $2",
+            &[&account_id, &fresh_upload_cutoff_ms],
+        )?
+        .try_get(0)?;
+    anyhow::ensure!(
+        recorded_fresh_puts == 0 && live_fresh_puts == 0,
+        "runner-purge hard delete refuses active object uploads"
+    );
+    let irreversible_count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM jobs_applications AS application
+              WHERE application.account_id = $1 AND application.state <> 'submitted'
+                AND (
+                  EXISTS (
+                    SELECT 1 FROM jobs_execution_leases AS lease
+                     WHERE lease.account_id = application.account_id
+                       AND lease.application_id = application.id
+                       AND lease.phase IN ('click_started', 'submitted', 'side_effect_unknown')
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM jobs_local_run_tickets AS ticket
+                     WHERE ticket.account_id = application.account_id
+                       AND ticket.application_id = application.id
+                       AND ticket.status IN ('click_started', 'side_effect_unknown')
+                  )
+                )",
+            &[&account_id],
+        )?
+        .try_get(0)?;
+    anyhow::ensure!(
+        irreversible_count == 0,
+        "runner-purge hard delete refuses unresolved irreversible submissions"
+    );
+    let purge_is_complete: bool = tx
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1
+                  FROM jobs_runner_purge_requests AS request
+                  JOIN jobs_runner_purge_tombstones AS tombstone
+                    ON tombstone.request_id = request.request_id
+                   AND tombstone.purge_generation = request.purge_generation
+                   AND tombstone.purge_subject = request.purge_subject
+                   AND tombstone.target_set_sha256 = request.target_set_sha256
+                   AND tombstone.required_target_count = request.required_target_count
+                 WHERE request.request_id = $1 AND request.account_id = $2
+                   AND request.state = 'complete'
+                   AND request.legacy_unresolved_count = 0
+                   AND request.resolved_target_count = request.required_target_count
+                   AND request.completed_at_ms IS NOT NULL
+                   AND tombstone.completed_at_ms = request.completed_at_ms
+                   AND request.legacy_inventory_generation = $3
+                   AND request.legacy_inventory_reconciliation_id = $4
+                   AND request.legacy_inventory_authority_id = $5
+                   AND request.legacy_inventory_authority_sha256 = $6
+             )",
+            &[
+                &purge_request_id,
+                &account_id,
+                &legacy_inventory_generation,
+                &legacy_inventory_reconciliation_id,
+                &legacy_inventory_authority_id,
+                &legacy_inventory_authority_sha256,
+            ],
+        )?
+        .get(0);
+    anyhow::ensure!(
+        purge_is_complete,
+        "runner-purge hard delete requires the exact completed purge tombstone"
+    );
+
+    tx.execute(
+        "DELETE FROM stripe_webhook_events
+            WHERE body::jsonb #>> '{data,object,client_reference_id}' = $1
+               OR body::jsonb #>> '{data,object,metadata,bluey_account_id}' = $1",
+        &[&account_id],
+    )?;
     let deleted = tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
     tx.commit()?;
     Ok(deleted > 0)
@@ -1755,44 +2043,6 @@ mod tests {
         .expect("finish irreversible submissions");
     }
 
-    fn remove_cloud_runner_records(pool: &DbPool, account_id: &str) {
-        crate::db::run_blocking_db(|| -> Result<()> {
-            match pool {
-                DbPool::Sqlite(_) => {
-                    let mut conn = pool.get()?;
-                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                    tx.execute(
-                        "DELETE FROM jobs_execution_leases WHERE account_id = ?1",
-                        params![account_id],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM jobs_browser_sessions
-                          WHERE account_id = ?1 AND runner = 'cloud'",
-                        params![account_id],
-                    )?;
-                    tx.commit()?;
-                    Ok(())
-                }
-                DbPool::Postgres(_) => {
-                    let mut conn = pool.get_pg()?;
-                    let mut tx = conn.transaction()?;
-                    tx.execute(
-                        "DELETE FROM jobs_execution_leases WHERE account_id = $1",
-                        &[&account_id],
-                    )?;
-                    tx.execute(
-                        "DELETE FROM jobs_browser_sessions
-                          WHERE account_id = $1 AND runner = 'cloud'",
-                        &[&account_id],
-                    )?;
-                    tx.commit()?;
-                    Ok(())
-                }
-            }
-        })
-        .expect("remove acknowledged cloud-runner records");
-    }
-
     fn seed_stale_pending_upload(pool: &DbPool, account_id: &str, prefix: &str) -> String {
         let upload_id = format!("{prefix}-upload");
         let outbox_id = format!("{prefix}-put");
@@ -2132,19 +2382,8 @@ mod tests {
         );
 
         finish_irreversible_submissions(&pool, "acct-delete");
-        assert_eq!(
-            begin_account_deletion(&pool, "acct-delete", 1_000_001).unwrap(),
-            Some(BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
-                cloud_runner_records: 2,
-            })
-        );
-        assert!(account_deletion_intent(&pool, "acct-delete")
-            .unwrap()
-            .is_none());
-
-        remove_cloud_runner_records(&pool, "acct-delete");
         assert!(matches!(
-            begin_account_deletion(&pool, "acct-delete", 1_000_002)
+            begin_account_deletion(&pool, "acct-delete", 1_000_001)
                 .unwrap()
                 .unwrap(),
             BeginAccountDeletionResult::Ready(_)
@@ -2155,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn cloud_browser_state_blocks_deletion_until_cleanup_is_acknowledged() {
+    fn cloud_browser_state_is_fenced_before_async_volume_cleanup() {
         let pool = test_pool();
         pool.get()
             .unwrap()
@@ -2169,26 +2408,15 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(
-            begin_account_deletion(&pool, "acct-delete", 1_000_000).unwrap(),
-            Some(BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
-                cloud_runner_records: 1,
-            })
-        );
-        assert!(
-            account_deletion_intent(&pool, "acct-delete")
-                .unwrap()
-                .is_none(),
-            "cloud-runner cleanup must complete before the deletion fence is created"
-        );
-
-        remove_cloud_runner_records(&pool, "acct-delete");
         assert!(matches!(
-            begin_account_deletion(&pool, "acct-delete", 1_000_001)
+            begin_account_deletion(&pool, "acct-delete", 1_000_000)
                 .unwrap()
                 .unwrap(),
             BeginAccountDeletionResult::Ready(_)
         ));
+        assert!(account_deletion_intent(&pool, "acct-delete")
+            .unwrap()
+            .is_some());
 
         let error = jobs::upsert_browser_session(
             &pool,
@@ -2253,19 +2481,8 @@ mod tests {
         );
 
         finish_irreversible_submissions(&pool, &account_id);
-        assert_eq!(
-            begin_account_deletion(&pool, &account_id, 1_000_001).unwrap(),
-            Some(BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
-                cloud_runner_records: 2,
-            })
-        );
-        assert!(account_deletion_intent(&pool, &account_id)
-            .unwrap()
-            .is_none());
-
-        remove_cloud_runner_records(&pool, &account_id);
         assert!(matches!(
-            begin_account_deletion(&pool, &account_id, 1_000_002)
+            begin_account_deletion(&pool, &account_id, 1_000_001)
                 .unwrap()
                 .unwrap(),
             BeginAccountDeletionResult::Ready(_)
@@ -2460,8 +2677,88 @@ mod tests {
     }
 
     #[test]
-    fn hard_delete_cascades_the_durable_intent() {
+    fn postgres_runner_purge_hard_delete_locks_fleet_before_account() {
+        assert!(POSTGRES_LOCK_RUNNER_PURGE_FLEET_FOR_HARD_DELETE_SQL
+            .contains("WHERE singleton_id = 1\n      FOR UPDATE"));
+        assert!(POSTGRES_LOCK_ACCOUNT_FOR_RUNNER_PURGE_HARD_DELETE_SQL.ends_with("FOR UPDATE"));
+
+        // There is no live PostgreSQL dependency in the unit-test harness, so
+        // keep a structural regression for the security-critical lock order
+        // and exact authority binding used by the production transaction.
+        let source = include_str!("account_data.rs");
+        let function = source
+            .split_once("fn hard_delete_account_after_runner_purge_postgres(")
+            .expect("PostgreSQL runner-purge hard-delete function")
+            .1
+            .split_once("\nfn artifact_object_refs_sqlite")
+            .expect("end of PostgreSQL runner-purge hard-delete function")
+            .0;
+        let fleet_lock = function
+            .find("POSTGRES_LOCK_RUNNER_PURGE_FLEET_FOR_HARD_DELETE_SQL")
+            .expect("fleet singleton lock");
+        let account_lock = function
+            .find("POSTGRES_LOCK_ACCOUNT_FOR_RUNNER_PURGE_HARD_DELETE_SQL")
+            .expect("account row lock");
+        let authority_check = function
+            .find("request.legacy_inventory_generation = $3")
+            .expect("exact locked authority check");
+        let account_delete = function
+            .find("DELETE FROM accounts WHERE id = $1")
+            .expect("account deletion");
+
+        assert!(fleet_lock < account_lock);
+        assert!(account_lock < authority_check);
+        assert!(authority_check < account_delete);
+        for exact_authority_clause in [
+            "request.legacy_inventory_reconciliation_id = $4",
+            "request.legacy_inventory_authority_id = $5",
+            "request.legacy_inventory_authority_sha256 = $6",
+        ] {
+            assert!(function.contains(exact_authority_clause));
+        }
+    }
+
+    #[test]
+    fn hard_delete_requires_exact_completed_runner_purge_tombstone() {
         let pool = test_pool();
+        let reconciling = jobs::record_runner_legacy_inventory_authority(
+            &pool,
+            &jobs::RecordRunnerLegacyInventoryAuthorityRequest {
+                reconciliation_id: "account-delete-inventory".to_string(),
+                authority_state: "reconciling".to_string(),
+                expected_predecessor_generation: 0,
+                expected_predecessor_authority_id: None,
+                expected_predecessor_authority_sha256: None,
+                root_count: 0,
+                root_set_sha256: jobs::EMPTY_RUNNER_LEGACY_ROOT_SET_SHA256.to_string(),
+                scope_ref: "all-managed-runner-storage-roots".to_string(),
+                evidence_ref: "inventory-scan-start".to_string(),
+                evidence_sha256: "1".repeat(64),
+                authorized_by: "account-delete-admin".to_string(),
+                recorded_at_ms: 999_998,
+            },
+        )
+        .unwrap()
+        .authority;
+        let ready = jobs::record_runner_legacy_inventory_authority(
+            &pool,
+            &jobs::RecordRunnerLegacyInventoryAuthorityRequest {
+                reconciliation_id: reconciling.reconciliation_id.clone(),
+                authority_state: "ready".to_string(),
+                expected_predecessor_generation: reconciling.authority_generation,
+                expected_predecessor_authority_id: Some(reconciling.authority_id.clone()),
+                expected_predecessor_authority_sha256: Some(reconciling.authority_sha256.clone()),
+                root_count: reconciling.root_count,
+                root_set_sha256: reconciling.root_set_sha256.clone(),
+                scope_ref: reconciling.scope_ref.clone(),
+                evidence_ref: "inventory-scan-complete".to_string(),
+                evidence_sha256: "2".repeat(64),
+                authorized_by: "account-delete-admin".to_string(),
+                recorded_at_ms: 999_999,
+            },
+        )
+        .unwrap()
+        .authority;
         assert!(matches!(
             begin_account_deletion(&pool, "acct-delete", 1_000_000)
                 .unwrap()
@@ -2472,13 +2769,111 @@ mod tests {
             .unwrap()
             .is_some());
 
-        assert!(hard_delete_account(&pool, "acct-delete").unwrap());
+        assert!(hard_delete_account_after_setup_failure(&pool, "acct-delete").is_err());
+        assert!(
+            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").is_err()
+        );
+
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO jobs_runner_purge_requests (
+                request_id, deletion_request_id, account_id, purge_subject, purge_generation,
+                legacy_inventory_generation, legacy_inventory_reconciliation_id,
+                legacy_inventory_authority_id, legacy_inventory_authority_sha256, state,
+                legacy_unresolved_count, required_target_count, resolved_target_count,
+                target_set_sha256, created_at_ms, updated_at_ms, completed_at_ms
+             ) VALUES (?1, ?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, 'pending', 0, 0, 0, ?8, ?9, ?9, NULL)",
+            params![
+                "delete-request",
+                "acct-delete",
+                "A".repeat(43),
+                ready.authority_generation,
+                ready.reconciliation_id,
+                ready.authority_id,
+                ready.authority_sha256,
+                "0".repeat(64),
+                1_000_001_i64,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(
+            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").is_err()
+        );
+
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_runner_purge_requests
+                SET state = 'complete', updated_at_ms = ?2, completed_at_ms = ?2
+              WHERE request_id = ?1",
+            params!["delete-request", 1_000_001_i64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_runner_purge_tombstones (
+                purge_subject, request_id, purge_generation, tombstone_generation,
+                target_set_sha256, required_target_count, completed_at_ms
+             ) VALUES (?1, ?2, 1, 1, ?3, 0, ?4)",
+            params![
+                "A".repeat(43),
+                "delete-request",
+                "0".repeat(64),
+                1_000_001_i64,
+            ],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_runner_purge_requests SET target_set_sha256 = ?2 \
+                  WHERE request_id = ?1",
+                params!["delete-request", "9".repeat(64)],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_runner_purge_tombstones SET required_target_count = 1 \
+                  WHERE request_id = ?1",
+                params!["delete-request"],
+            )
+            .is_err());
+        drop(conn);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_runner_volume_fleet_state \
+                    SET legacy_inventory_state = 'reconciling' WHERE singleton_id = 1",
+                [],
+            )
+            .unwrap();
+        assert!(
+            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").is_err()
+        );
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_runner_volume_fleet_state \
+                    SET legacy_inventory_state = 'ready' WHERE singleton_id = 1",
+                [],
+            )
+            .unwrap();
+
+        assert!(
+            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").unwrap()
+        );
         assert!(account_deletion_intent(&pool, "acct-delete")
             .unwrap()
             .is_none());
         assert!(begin_account_deletion(&pool, "acct-delete", 1_000_001)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn setup_failure_cleanup_refuses_deletion_authority_but_removes_fresh_account() {
+        let pool = test_pool();
+        assert!(hard_delete_account_after_setup_failure(&pool, "acct-active").unwrap());
+        assert!(!hard_delete_account_after_setup_failure(&pool, "acct-active").unwrap());
     }
 
     #[test]

@@ -1119,6 +1119,7 @@ dependencies = [
  "sha2",
  "tokio",
  "webbrowser",
+ "wiremock",
  "zip",
 ]
 
@@ -1235,6 +1236,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

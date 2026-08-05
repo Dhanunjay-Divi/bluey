@@ -774,7 +774,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       }
     }
 
-    async function apiJson(path, options = {}, hasRetriedAuth = false) {
+    async function apiJsonResponse(path, options = {}, hasRetriedAuth = false) {
       const { skipAuthRefresh, ...fetchOptions } = options;
       const headers = new Headers(options.headers || {});
       headers.set('Content-Type', 'application/json');
@@ -790,13 +790,18 @@ if (!window.__BLUEY_SITE_BOOTED__) {
       if (response.status === 401 && !hasRetriedAuth && !skipAuthRefresh) {
         const refreshed = await refreshAccountToken();
         if (refreshed) {
-          return apiJson(path, options, true);
+          return apiJsonResponse(path, options, true);
         }
       }
       if (!response.ok) {
         throw new Error(body?.error || `${response.status} ${response.statusText}`);
       }
-      return body;
+      return { status: response.status, body };
+    }
+
+    async function apiJson(path, options = {}, hasRetriedAuth = false) {
+      const response = await apiJsonResponse(path, options, hasRetriedAuth);
+      return response.body;
     }
 
     function setTrialModal(open) {
@@ -1952,17 +1957,22 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return;
       }
       accountMessage('Deleting account...');
-      await apiJson('/account/delete', {
-        method: 'POST',
-        body: JSON.stringify({
-          confirm_text: 'DELETE',
-          accept_data_loss: true,
-          accept_credit_loss: true,
+      await window.BlueyAccountDeletion.run({
+        request: () => apiJsonResponse('/account/delete', {
+          method: 'POST',
+          body: JSON.stringify({
+            confirm_text: 'DELETE',
+            accept_data_loss: true,
+            accept_credit_loss: true,
+          }),
         }),
+        onPending: (message) => accountMessage(message),
+        onDeleted: async () => {
+          resetDeleteAccountDialog();
+          clearAccountToken();
+          await loadAccount();
+        },
       });
-      resetDeleteAccountDialog();
-      clearAccountToken();
-      await loadAccount();
     }
 
     async function confirmEmailVerification(token) {

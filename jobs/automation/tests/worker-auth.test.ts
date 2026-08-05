@@ -32,6 +32,9 @@ describe("Bluey Jobs worker authentication", () => {
 
   it("mirrors the server scopes for every internal worker operation", () => {
     expect(jobsWorkerScope("POST", "/api/jobs/internal/execution-leases/claim")).toBe("execution");
+    expect(jobsWorkerScope("POST", "/api/jobs/internal/runner-volumes/enroll")).toBe("runner-volume");
+    expect(jobsWorkerScope("POST", "/api/jobs/internal/runner-volumes/rv_test/poll")).toBe("runner-volume");
+    expect(jobsWorkerScope("POST", "/api/jobs/internal/runner-volumes/rv_test/ack")).toBe("runner-volume");
     expect(jobsWorkerScope("POST", "/api/jobs/internal/discovery/lease")).toBe("discovery");
     expect(jobsWorkerScope("POST", "/api/jobs/internal/global-discovery/lease")).toBe("discovery");
     expect(jobsWorkerScope("POST", "/api/jobs/internal/global-discovery/source/batches")).toBe("discovery");

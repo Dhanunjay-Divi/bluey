@@ -20,13 +20,18 @@ import {
 } from "@bluey/jobs-automation";
 import { decryptBytes, encryptBytes, replaceFileDurably } from "./crypto-envelope.js";
 import { profilePathsFromScope, sealProfile } from "./profile-store.js";
+import type { NativeRunnerInventory, NativeRunnerInventoryEntry } from "./native-runner-storage.js";
+import type { ManagedProfileStorage } from "./subject-storage-manager.js";
+import { subjectStoragePaths } from "./subject-storage-layout.js";
 
 export const CURRENT_CHECKPOINT_VERSION = 2 as const;
 export type RunCheckpointVersion = 1 | typeof CURRENT_CHECKPOINT_VERSION;
 const MAX_CHECKPOINT_BYTES = 5 * 1024 * 1024;
 const MAX_CHECKPOINTS_PER_PROFILE = 8;
+const MAXIMUM_MANAGED_CHECKPOINT_BYTES = MAX_CHECKPOINT_BYTES + 64;
 const PROFILE_SCOPE = /^[a-f0-9]{40}$/;
 const CHECKPOINT_SCOPE = /^[a-f0-9]{64}$/;
+const MANAGED_CHECKPOINT_FILE = /^([a-f0-9]{64})\.json\.enc$/;
 
 export interface CloudRunCheckpoint<Request extends object = Record<string, unknown>, Event = unknown> {
   version: RunCheckpointVersion;
@@ -88,6 +93,77 @@ export async function writeRunCheckpoint<Request extends object, Event>(
   }
 }
 
+/**
+ * Persist a v2-layout checkpoint through the retained native profile
+ * capability. Plaintext exists only in bounded memory and the atomic native
+ * replacement is read back and authenticated before this call succeeds.
+ */
+export async function writeManagedRunCheckpoint<Request extends object, Event>(
+  storage: ManagedProfileStorage,
+  checkpoint: CloudRunCheckpoint<Request, Event>,
+  key: Buffer,
+): Promise<void> {
+  validateCheckpoint(checkpoint);
+  assertManagedCheckpointBinding(storage, checkpoint.profileScope);
+  const checkpointScope = cloudCheckpointScope(
+    checkpoint.profileScope,
+    checkpoint.browserSessionId,
+  );
+  const fileName = managedCheckpointFileName(checkpointScope);
+  const serialized = serializeCheckpoint(checkpoint);
+  let encrypted: Buffer | undefined;
+  try {
+    encrypted = encryptBytes(
+      serialized,
+      key,
+      encryptionContext(checkpoint.profileScope, checkpointScope),
+    );
+    if (encrypted.length > MAXIMUM_MANAGED_CHECKPOINT_BYTES) {
+      throw new Error("Cloud run checkpoint is too large");
+    }
+    await storage.checkpoints.replaceFile(fileName, encrypted);
+    const inventory = await storage.checkpoints.inventory();
+    const entry = inventory.entries.find((candidate) => candidate.relativePath === fileName);
+    if (!entry) throw new Error("Managed cloud run checkpoint publication failed");
+    assertManagedCheckpointEntry(storage, entry, fileName);
+    const persisted = await storage.checkpoints.readFileBounded(
+      fileName,
+      MAXIMUM_MANAGED_CHECKPOINT_BYTES,
+    );
+    try {
+      if (!persisted.equals(encrypted)
+        || persisted.length !== entry.sizeBytes
+        || sha256(persisted) !== entry.sha256) {
+        throw new Error("Managed cloud run checkpoint publication failed");
+      }
+      const verified = decryptBytes(
+        persisted,
+        key,
+        encryptionContext(checkpoint.profileScope, checkpointScope),
+      );
+      try {
+        parseCheckpoint<Request, Event>(
+          verified,
+          checkpoint.profileScope,
+          checkpointScope,
+        );
+      } finally {
+        verified.fill(0);
+      }
+      const after = await storage.checkpoints.inventory();
+      const afterEntry = after.entries.find((candidate) => candidate.relativePath === fileName);
+      if (!afterEntry || !sameInventoryEntry(entry, afterEntry)) {
+        throw new Error("Managed cloud run checkpoint publication failed");
+      }
+    } finally {
+      persisted.fill(0);
+    }
+  } finally {
+    serialized.fill(0);
+    encrypted?.fill(0);
+  }
+}
+
 export async function readRunCheckpoint<Request extends object, Event>(
   root: string,
   profileScope: string,
@@ -115,21 +191,43 @@ export async function readRunCheckpoint<Request extends object, Event>(
     encryptionContext(profileScope, checkpointScope),
   );
   try {
-    if (plaintext.length > MAX_CHECKPOINT_BYTES) throw new Error("Cloud run checkpoint is too large");
-    const checkpoint = JSON.parse(plaintext.toString("utf8")) as unknown;
-    validateCheckpoint(checkpoint);
-    if ((checkpoint as CloudRunCheckpoint).profileScope !== profileScope
-      || cloudCheckpointScope(
-        profileScope,
-        (checkpoint as CloudRunCheckpoint).browserSessionId,
-      ) !== checkpointScope) {
-      throw new Error("Cloud run checkpoint scope mismatch");
-    }
-    return checkpoint as CloudRunCheckpoint<Request, Event>;
+    return parseCheckpoint<Request, Event>(plaintext, profileScope, checkpointScope);
   } finally {
     plaintext.fill(0);
     encrypted.fill(0);
   }
+}
+
+export async function readManagedRunCheckpoint<Request extends object, Event>(
+  storage: ManagedProfileStorage,
+  checkpointScope: string,
+  key: Buffer,
+): Promise<CloudRunCheckpoint<Request, Event> | undefined> {
+  assertManagedCheckpointBinding(storage, storage.scope);
+  if (!CHECKPOINT_SCOPE.test(checkpointScope)) return undefined;
+  const fileName = managedCheckpointFileName(checkpointScope);
+  const before = await storage.checkpoints.inventory();
+  const entry = before.entries.find((candidate) => candidate.relativePath === fileName);
+  if (!entry) {
+    const after = await storage.checkpoints.inventory();
+    if (after.entries.some((candidate) => candidate.relativePath === fileName)) {
+      throw new Error("Managed cloud run checkpoint changed while it was read");
+    }
+    return undefined;
+  }
+  assertManagedCheckpointEntry(storage, entry, fileName);
+  const checkpoint = await readManagedCheckpointEntry<Request, Event>(
+    storage,
+    entry,
+    checkpointScope,
+    key,
+  );
+  const after = await storage.checkpoints.inventory();
+  const afterEntry = after.entries.find((candidate) => candidate.relativePath === fileName);
+  if (!afterEntry || !sameInventoryEntry(entry, afterEntry)) {
+    throw new Error("Managed cloud run checkpoint changed while it was read");
+  }
+  return checkpoint;
 }
 
 export async function listRunCheckpoints<Request extends object, Event>(
@@ -141,6 +239,18 @@ export async function listRunCheckpoints<Request extends object, Event>(
 }>> {
   const scan = await scanRunCheckpoints<Request, Event>(root, key);
   if (scan.failures.length > 0) throw new Error("Cloud run checkpoint scan failed");
+  return scan.checkpoints;
+}
+
+export async function listManagedRunCheckpoints<Request extends object, Event>(
+  storage: ManagedProfileStorage,
+  key: Buffer,
+): Promise<Array<{
+  checkpointScope: string;
+  checkpoint: CloudRunCheckpoint<Request, Event>;
+}>> {
+  const scan = await scanManagedRunCheckpoints<Request, Event>(storage, key);
+  if (scan.failures.length > 0) throw new Error("Managed cloud run checkpoint scan failed");
   return scan.checkpoints;
 }
 
@@ -226,6 +336,79 @@ export async function scanRunCheckpoints<Request extends object, Event>(
   return { checkpoints: results, failures };
 }
 
+/**
+ * Scan one audited v2 profile capability. Unlike the legacy pathname scanner,
+ * this is closed-world: an unknown name, nested directory, hardlink, device
+ * mismatch, or oversized file invalidates the profile scan instead of being
+ * silently skipped.
+ */
+export async function scanManagedRunCheckpoints<Request extends object, Event>(
+  storage: ManagedProfileStorage,
+  key: Buffer,
+): Promise<RunCheckpointScan<Request, Event>> {
+  assertManagedCheckpointBinding(storage, storage.scope);
+  let before: NativeRunnerInventory;
+  try {
+    before = await storage.checkpoints.inventory();
+  } catch {
+    return managedProfileScanFailure(storage.scope);
+  }
+  const candidates: Array<{
+    checkpointScope: string;
+    entry: NativeRunnerInventoryEntry;
+  }> = [];
+  try {
+    for (const entry of before.entries) {
+      const matched = MANAGED_CHECKPOINT_FILE.exec(entry.relativePath);
+      if (!matched) throw new Error("Unknown managed checkpoint entry");
+      assertManagedCheckpointEntry(storage, entry, entry.relativePath);
+      candidates.push({ checkpointScope: matched[1]!, entry });
+    }
+  } catch {
+    return managedProfileScanFailure(storage.scope);
+  }
+  if (candidates.length > MAX_CHECKPOINTS_PER_PROFILE) {
+    return {
+      checkpoints: [],
+      failures: [{ profileScope: storage.scope, code: "checkpoint_limit_exceeded" }],
+    };
+  }
+
+  const checkpoints: Array<{
+    checkpointScope: string;
+    checkpoint: CloudRunCheckpoint<Request, Event>;
+  }> = [];
+  const failures: RunCheckpointScanFailure[] = [];
+  for (const { checkpointScope, entry } of candidates) {
+    try {
+      checkpoints.push({
+        checkpointScope,
+        checkpoint: await readManagedCheckpointEntry<Request, Event>(
+          storage,
+          entry,
+          checkpointScope,
+          key,
+        ),
+      });
+    } catch {
+      failures.push({
+        profileScope: storage.scope,
+        checkpointScope,
+        code: "checkpoint_unreadable",
+      });
+    }
+  }
+
+  let after: NativeRunnerInventory;
+  try {
+    after = await storage.checkpoints.inventory();
+  } catch {
+    return managedProfileScanFailure(storage.scope);
+  }
+  if (!sameInventory(before, after)) return managedProfileScanFailure(storage.scope);
+  return { checkpoints, failures };
+}
+
 export async function removeRunCheckpoint(
   root: string,
   profileScope: string,
@@ -236,6 +419,20 @@ export async function removeRunCheckpoint(
   const path = runCheckpointPath(root, profileScope, scope);
   await rm(path, { force: true });
   await syncDirectory(dirname(path));
+}
+
+export async function removeManagedRunCheckpoint(
+  storage: ManagedProfileStorage,
+  browserSessionId: string,
+): Promise<void> {
+  assertManagedCheckpointBinding(storage, storage.scope);
+  const checkpointScope = cloudCheckpointScope(storage.scope, browserSessionId);
+  const fileName = managedCheckpointFileName(checkpointScope);
+  await storage.checkpoints.removeEntry(fileName);
+  const inventory = await storage.checkpoints.inventory();
+  if (inventory.entries.some((entry) => entry.relativePath === fileName)) {
+    throw new Error("Managed cloud run checkpoint removal failed");
+  }
 }
 
 export function cloudCheckpointScope(profileScope: string, browserSessionId: string): string {
@@ -298,13 +495,151 @@ function runCheckpointPath(root: string, profileScope: string, checkpointScope: 
   return join(root, "run-checkpoints", profileScope, `${checkpointScope}.json.enc`);
 }
 
+function managedCheckpointFileName(checkpointScope: string): string {
+  if (!CHECKPOINT_SCOPE.test(checkpointScope)) {
+    throw new Error("Invalid managed cloud run checkpoint scope");
+  }
+  return `${checkpointScope}.json.enc`;
+}
+
+function assertManagedCheckpointBinding(
+  storage: ManagedProfileStorage,
+  profileScope: string,
+): void {
+  if (!PROFILE_SCOPE.test(profileScope)
+    || storage.kind !== "profile"
+    || storage.scope !== profileScope
+    || !/^[a-f0-9]{64}$/.test(storage.subjectSha256)) {
+    throw new Error("Invalid managed cloud run checkpoint profile binding");
+  }
+  const expected = subjectStoragePaths(storage.subjectSha256).profile(profileScope);
+  if (storage.paths.root.relativePath !== expected.root.relativePath
+    || storage.paths.checkpoints.relativePath !== expected.checkpoints.relativePath
+    || storage.root.relativePath !== expected.root.relativePath
+    || storage.checkpoints.relativePath !== expected.checkpoints.relativePath
+    || storage.root.deviceId !== storage.checkpoints.deviceId) {
+    throw new Error("Invalid managed cloud run checkpoint profile binding");
+  }
+}
+
+function assertManagedCheckpointEntry(
+  storage: ManagedProfileStorage,
+  entry: NativeRunnerInventoryEntry,
+  expectedFileName: string,
+): void {
+  if (entry.relativePath !== expectedFileName
+    || !MANAGED_CHECKPOINT_FILE.test(entry.relativePath)
+    || entry.kind !== "file"
+    || entry.deviceId !== storage.checkpoints.deviceId
+    || entry.linkCount !== 1
+    || entry.sizeBytes < 1
+    || entry.sizeBytes > MAXIMUM_MANAGED_CHECKPOINT_BYTES) {
+    throw new Error("Invalid managed cloud run checkpoint file");
+  }
+}
+
+async function readManagedCheckpointEntry<Request extends object, Event>(
+  storage: ManagedProfileStorage,
+  entry: NativeRunnerInventoryEntry,
+  checkpointScope: string,
+  key: Buffer,
+): Promise<CloudRunCheckpoint<Request, Event>> {
+  const fileName = managedCheckpointFileName(checkpointScope);
+  assertManagedCheckpointEntry(storage, entry, fileName);
+  const encrypted = await storage.checkpoints.readFileBounded(
+    fileName,
+    MAXIMUM_MANAGED_CHECKPOINT_BYTES,
+  );
+  let plaintext: Buffer | undefined;
+  try {
+    if (encrypted.length !== entry.sizeBytes || sha256(encrypted) !== entry.sha256) {
+      throw new Error("Managed cloud run checkpoint changed while it was read");
+    }
+    plaintext = decryptBytes(
+      encrypted,
+      key,
+      encryptionContext(storage.scope, checkpointScope),
+    );
+    return parseCheckpoint<Request, Event>(
+      plaintext,
+      storage.scope,
+      checkpointScope,
+    );
+  } finally {
+    plaintext?.fill(0);
+    encrypted.fill(0);
+  }
+}
+
+function serializeCheckpoint(checkpoint: CloudRunCheckpoint): Buffer {
+  const encoded = JSON.stringify(checkpoint);
+  if (encoded === undefined) throw new Error("Invalid cloud run checkpoint envelope");
+  const serialized = Buffer.from(`${encoded}\n`, "utf8");
+  if (serialized.length > MAX_CHECKPOINT_BYTES) {
+    serialized.fill(0);
+    throw new Error("Cloud run checkpoint is too large");
+  }
+  return serialized;
+}
+
+function parseCheckpoint<Request extends object, Event>(
+  plaintext: Buffer,
+  profileScope: string,
+  checkpointScope: string,
+): CloudRunCheckpoint<Request, Event> {
+  if (plaintext.length > MAX_CHECKPOINT_BYTES) {
+    throw new Error("Cloud run checkpoint is too large");
+  }
+  const checkpoint = JSON.parse(plaintext.toString("utf8")) as unknown;
+  validateCheckpoint(checkpoint);
+  if (checkpoint.profileScope !== profileScope
+    || cloudCheckpointScope(profileScope, checkpoint.browserSessionId) !== checkpointScope) {
+    throw new Error("Cloud run checkpoint scope mismatch");
+  }
+  return checkpoint as CloudRunCheckpoint<Request, Event>;
+}
+
+function sameInventory(left: NativeRunnerInventory, right: NativeRunnerInventory): boolean {
+  return left.count === right.count
+    && left.bytes === right.bytes
+    && left.sha256 === right.sha256
+    && left.entries.length === right.entries.length
+    && left.entries.every((entry, index) => sameInventoryEntry(entry, right.entries[index]));
+}
+
+function sameInventoryEntry(
+  left: NativeRunnerInventoryEntry,
+  right: NativeRunnerInventoryEntry | undefined,
+): boolean {
+  return right !== undefined
+    && left.relativePath === right.relativePath
+    && left.kind === right.kind
+    && left.deviceId === right.deviceId
+    && left.linkCount === right.linkCount
+    && left.sizeBytes === right.sizeBytes
+    && left.sha256 === right.sha256;
+}
+
+function managedProfileScanFailure<Request extends object, Event>(
+  profileScope: string,
+): RunCheckpointScan<Request, Event> {
+  return {
+    checkpoints: [],
+    failures: [{ profileScope, code: "profile_unreadable" }],
+  };
+}
+
+function sha256(contents: Buffer): string {
+  return createHash("sha256").update(contents).digest("hex");
+}
+
 function encryptionContext(profileScope: string, checkpointScope: string) {
   return { purpose: "run-checkpoint", scope: profileScope, checkpointScope } as const;
 }
 
 function validateCheckpoint(value: unknown): asserts value is CloudRunCheckpoint {
   const checkpoint = requireRecord(value, "cloud run checkpoint");
-  if (![1, CURRENT_CHECKPOINT_VERSION].includes(Number(checkpoint.version))
+  if ((checkpoint.version !== 1 && checkpoint.version !== CURRENT_CHECKPOINT_VERSION)
     || !["prepared", "needs_input", "provider_review", "final_submit_started",
       "final_submit_activated", "side_effect_unknown"].includes(String(checkpoint.phase))
     || !isTimestamp(checkpoint.createdAtMs)

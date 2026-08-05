@@ -930,6 +930,7 @@ fn postgres_bind_cloud_attempt(
     Ok(())
 }
 
+#[cfg(debug_assertions)]
 pub fn claim_execution_lease(
     pool: &DbPool,
     account_id: &str,
@@ -938,23 +939,133 @@ pub fn claim_execution_lease(
     supplied_browser_profile_id: &str,
     owner_id: &str,
 ) -> ExecutionLeaseResult<ExecutionLeaseGrant> {
+    claim_execution_lease_inner(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        supplied_browser_profile_id,
+        owner_id,
+        None,
+        None,
+    )
+    .map(|(lease, _)| lease)
+}
+
+#[cfg(debug_assertions)]
+pub fn claim_execution_lease_for_runner_volume(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    supplied_browser_profile_id: &str,
+    owner_id: &str,
+    volume_binding: &BindRunnerVolumeResidencyRequest,
+) -> ExecutionLeaseResult<RunnerVolumeExecutionLeaseGrant> {
+    let (lease, binding) = claim_execution_lease_inner(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        supplied_browser_profile_id,
+        owner_id,
+        Some(volume_binding),
+        None,
+    )?;
+    let binding = binding.ok_or(ExecutionLeaseError::Conflict)?;
+    Ok(RunnerVolumeExecutionLeaseGrant {
+        lease,
+        purge_subject: binding.purge_subject,
+        volume_id: binding.volume_id,
+        enrollment_epoch: binding.enrollment_epoch,
+        process_instance_id: binding.process_instance_id,
+        volume_key_fingerprint: binding.volume_key_fingerprint,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn claim_execution_lease_for_runner_volume_authorized(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    supplied_browser_profile_id: &str,
+    owner_id: &str,
+    volume_binding: &BindRunnerVolumeResidencyRequest,
+    volume_authority: &VerifiedRunnerVolumeAuthority,
+) -> ExecutionLeaseResult<RunnerVolumeExecutionLeaseGrant> {
+    let (lease, binding) = claim_execution_lease_inner(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        supplied_browser_profile_id,
+        owner_id,
+        Some(volume_binding),
+        Some(volume_authority),
+    )?;
+    let binding = binding.ok_or(ExecutionLeaseError::Conflict)?;
+    Ok(RunnerVolumeExecutionLeaseGrant {
+        lease,
+        purge_subject: binding.purge_subject,
+        volume_id: binding.volume_id,
+        enrollment_epoch: binding.enrollment_epoch,
+        process_instance_id: binding.process_instance_id,
+        volume_key_fingerprint: binding.volume_key_fingerprint,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_execution_lease_inner(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    supplied_browser_profile_id: &str,
+    owner_id: &str,
+    volume_binding: Option<&BindRunnerVolumeResidencyRequest>,
+    volume_authority: Option<&VerifiedRunnerVolumeAuthority>,
+) -> ExecutionLeaseResult<(ExecutionLeaseGrant, Option<RunnerVolumeResidencyBinding>)> {
     if !validate_execution_binding(account_id, 240)
         || !validate_execution_binding(application_id, 240)
         || !validate_execution_binding(run_id, 240)
         || !validate_execution_binding(supplied_browser_profile_id, 160)
         || !validate_execution_binding(owner_id, 240)
+        || volume_binding
+            .is_some_and(|binding| binding.account_id != account_id || binding.run_id != run_id)
     {
         return Err(ExecutionLeaseError::InvalidRequest);
     }
     let lease_token = random_execution_lease_token();
     let lease_token_sha256 = execution_lease_token_hash(&lease_token);
-    let now = now_ms();
+    let now = volume_binding.map_or_else(now_ms, |binding| binding.now_ms);
     let lease_expires_at_ms = now.saturating_add(EXECUTION_LEASE_TTL_MS);
+    let proposed_subject = volume_binding.map(|_| new_runner_volume_purge_subject());
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
+                (Some(binding), Some(subject)) => Some(
+                    prepare_runner_volume_lease_binding_sqlite_tx(&tx, binding, subject)
+                        .map_err(execution_lease_from_runner_volume_error)?,
+                ),
+                (None, None) => None,
+                _ => return Err(ExecutionLeaseError::Conflict),
+            };
+            if let (Some(binding), Some(authority)) = (volume_binding, volume_authority) {
+                consume_runner_volume_authority_sqlite_tx(
+                    &tx,
+                    authority,
+                    "execution_lease_claim",
+                    &binding.volume_id,
+                    binding.enrollment_epoch,
+                    &binding.process_instance_id,
+                    binding.now_ms,
+                )
+                .map_err(execution_lease_from_runner_volume_error)?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
@@ -1049,18 +1160,49 @@ pub fn claim_execution_lease(
                 }
                 fence
             };
+            let bound_volume = match (volume_binding, prepared_binding.as_ref()) {
+                (Some(binding), Some(prepared)) => Some(
+                    finalize_runner_volume_lease_binding_sqlite_tx(&tx, binding, prepared)
+                        .map_err(execution_lease_from_runner_volume_error)?,
+                ),
+                (None, None) => None,
+                _ => return Err(ExecutionLeaseError::Conflict),
+            };
             tx.commit()?;
-            Ok(ExecutionLeaseGrant {
-                run_id: run_id.to_string(),
-                lease_token,
-                fence,
-                lease_expires_at_ms,
-                phase: "prepared".to_string(),
-            })
+            Ok((
+                ExecutionLeaseGrant {
+                    run_id: run_id.to_string(),
+                    lease_token,
+                    fence,
+                    lease_expires_at_ms,
+                    phase: "prepared".to_string(),
+                },
+                bound_volume,
+            ))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
+                (Some(binding), Some(subject)) => Some(
+                    prepare_runner_volume_lease_binding_postgres_tx(&mut tx, binding, subject)
+                        .map_err(execution_lease_from_runner_volume_error)?,
+                ),
+                (None, None) => None,
+                _ => return Err(ExecutionLeaseError::Conflict),
+            };
+            if let (Some(binding), Some(authority)) = (volume_binding, volume_authority) {
+                consume_runner_volume_authority_postgres_tx(
+                    &mut tx,
+                    authority,
+                    "execution_lease_claim",
+                    &binding.volume_id,
+                    binding.enrollment_epoch,
+                    &binding.process_instance_id,
+                    binding.now_ms,
+                )
+                .map_err(execution_lease_from_runner_volume_error)?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
@@ -1157,16 +1299,126 @@ pub fn claim_execution_lease(
                 }
                 fence
             };
+            let bound_volume = match (volume_binding, prepared_binding.as_ref()) {
+                (Some(binding), Some(prepared)) => Some(
+                    finalize_runner_volume_lease_binding_postgres_tx(&mut tx, binding, prepared)
+                        .map_err(execution_lease_from_runner_volume_error)?,
+                ),
+                (None, None) => None,
+                _ => return Err(ExecutionLeaseError::Conflict),
+            };
             tx.commit()?;
-            Ok(ExecutionLeaseGrant {
-                run_id: run_id.to_string(),
-                lease_token,
-                fence,
-                lease_expires_at_ms,
-                phase: "prepared".to_string(),
-            })
+            Ok((
+                ExecutionLeaseGrant {
+                    run_id: run_id.to_string(),
+                    lease_token,
+                    fence,
+                    lease_expires_at_ms,
+                    phase: "prepared".to_string(),
+                },
+                bound_volume,
+            ))
         }
     })
+}
+
+fn execution_lease_from_runner_volume_error(error: RunnerVolumePurgeError) -> ExecutionLeaseError {
+    match error {
+        RunnerVolumePurgeError::InvalidRequest => ExecutionLeaseError::InvalidRequest,
+        RunnerVolumePurgeError::NotFound => ExecutionLeaseError::NotFound,
+        RunnerVolumePurgeError::Conflict
+        | RunnerVolumePurgeError::Unauthorized
+        | RunnerVolumePurgeError::NotReady => ExecutionLeaseError::Conflict,
+        RunnerVolumePurgeError::Storage(error) => ExecutionLeaseError::Storage(error),
+    }
+}
+
+fn require_current_runner_volume_binding_sqlite_for_operation(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    run_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    #[cfg(debug_assertions)]
+    {
+        let is_bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs_execution_lease_volume_bindings WHERE run_id = ?1)",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if !is_bound {
+            return Ok(());
+        }
+    }
+    require_current_runner_volume_lease_binding_sqlite_tx(tx, account_id, run_id, now)
+        .map(|_| ())
+        .map_err(execution_lease_from_runner_volume_error)
+}
+
+fn require_current_runner_volume_binding_postgres_for_operation(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    run_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    #[cfg(debug_assertions)]
+    {
+        let is_bound: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs_execution_lease_volume_bindings WHERE run_id = $1)",
+                &[&run_id],
+            )?
+            .get(0);
+        if !is_bound {
+            return Ok(());
+        }
+    }
+    require_current_runner_volume_lease_binding_postgres_tx(tx, account_id, run_id, now)
+        .map(|_| ())
+        .map_err(execution_lease_from_runner_volume_error)
+}
+
+fn require_current_runner_volume_identity_sqlite_for_operation(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    run_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    #[cfg(debug_assertions)]
+    {
+        let is_bound: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs_execution_lease_volume_bindings WHERE run_id = ?1)",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        if !is_bound {
+            return Ok(());
+        }
+    }
+    require_current_runner_volume_identity_binding_sqlite_tx(tx, account_id, run_id, now)
+        .map_err(execution_lease_from_runner_volume_error)
+}
+
+fn require_current_runner_volume_identity_postgres_for_operation(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    run_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    #[cfg(debug_assertions)]
+    {
+        let is_bound: bool = tx
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs_execution_lease_volume_bindings WHERE run_id = $1)",
+                &[&run_id],
+            )?
+            .get(0);
+        if !is_bound {
+            return Ok(());
+        }
+    }
+    require_current_runner_volume_identity_binding_postgres_tx(tx, account_id, run_id, now)
+        .map_err(execution_lease_from_runner_volume_error)
 }
 
 pub fn heartbeat_execution_lease(
@@ -1184,6 +1436,12 @@ pub fn heartbeat_execution_lease(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
             let lease = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1233,6 +1491,12 @@ pub fn heartbeat_execution_lease(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
             let lease = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1479,6 +1743,12 @@ pub fn start_irreversible_submission(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
             let browser_profile_id =
                 sqlite_execution_target(&tx, account_id, application_id, run_id)?;
             let lease = tx
@@ -1540,6 +1810,12 @@ pub fn start_irreversible_submission(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
             let browser_profile_id =
                 postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
             let lease = tx
@@ -2006,6 +2282,51 @@ pub struct ExecutionReceiptAuthority {
     pub phase: String,
 }
 
+#[allow(clippy::too_many_arguments)]
+fn validate_execution_receipt_authority(
+    lease: StoredExecutionLease,
+    finished_at_ms: Option<i64>,
+    capacity_runner: Option<String>,
+    capacity_state: Option<String>,
+    capacity_expires_at_ms: Option<i64>,
+    lease_token: &str,
+    fence: i64,
+    now: i64,
+) -> ExecutionLeaseResult<ExecutionReceiptAuthority> {
+    let capacity_authorized = match (lease.phase.as_str(), finished_at_ms) {
+        ("submitted", Some(_)) => {
+            capacity_runner.as_deref() == Some("cloud")
+                && ((capacity_state.as_deref() == Some("active")
+                    && capacity_expires_at_ms
+                        == Some(SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRES_AT_MS))
+                    || capacity_state.as_deref() == Some("committed"))
+        }
+        ("side_effect_unknown", Some(finished_at_ms)) => {
+            let authority_expires_at_ms =
+                finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
+            capacity_runner.as_deref() == Some("cloud")
+                && capacity_state.as_deref() == Some("active")
+                && capacity_expires_at_ms == Some(authority_expires_at_ms)
+                && authority_expires_at_ms > now
+        }
+        _ => false,
+    };
+    if lease.fence != fence
+        || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
+        || !matches!(lease.phase.as_str(), "submitted" | "side_effect_unknown")
+        || finished_at_ms.is_none()
+        || !capacity_authorized
+    {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(ExecutionReceiptAuthority {
+        owner_id: lease.owner_id,
+        lease_token_sha256: lease.lease_token_sha256,
+        fence: lease.fence,
+        phase: lease.phase,
+    })
+}
+
 pub fn execution_receipt_authority(
     pool: &DbPool,
     account_id: &str,
@@ -2015,13 +2336,17 @@ pub fn execution_receipt_authority(
     fence: i64,
 ) -> ExecutionLeaseResult<ExecutionReceiptAuthority> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
-    crate::db::run_blocking_db(|| {
-        let (lease, finished_at_ms, capacity_runner, capacity_state, capacity_expires_at_ms) =
-            match pool {
-                DbPool::Sqlite(_) => pool
-                    .get()?
-                    .query_row(
-                        "SELECT l.run_id, l.account_id, l.application_id, l.browser_profile_id,
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_identity_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            let (lease, finished_at_ms, capacity_runner, capacity_state, capacity_expires_at_ms) =
+                tx.query_row(
+                    "SELECT l.run_id, l.account_id, l.application_id, l.browser_profile_id,
                             l.owner_id, l.lease_token_sha256, l.fence, l.phase,
                             l.lease_expires_at_ms, l.finished_at_ms,
                             c.runner, c.state, c.expires_at_ms
@@ -2031,82 +2356,75 @@ pub fn execution_receipt_authority(
                         AND c.application_id = l.application_id
                         AND c.run_id = l.run_id
                       WHERE l.run_id = ?1 AND l.account_id = ?2 AND l.application_id = ?3",
-                        params![run_id, account_id, application_id],
-                        |row| {
-                            Ok((
-                                execution_lease_from_sqlite_row(row)?,
-                                row.get::<_, Option<i64>>(9)?,
-                                row.get::<_, Option<String>>(10)?,
-                                row.get::<_, Option<String>>(11)?,
-                                row.get::<_, Option<i64>>(12)?,
-                            ))
-                        },
-                    )
-                    .optional()?
-                    .ok_or(ExecutionLeaseError::NotFound)?,
-                DbPool::Postgres(_) => pool
-                    .get_pg()?
-                    .query_opt(
-                        "SELECT l.run_id, l.account_id, l.application_id, l.browser_profile_id,
-                            l.owner_id, l.lease_token_sha256, l.fence, l.phase,
-                            l.lease_expires_at_ms, l.finished_at_ms,
-                            c.runner, c.state, c.expires_at_ms
-                       FROM jobs_execution_leases l
-                       LEFT JOIN jobs_submission_evidence_capacity c
-                         ON c.account_id = l.account_id
-                        AND c.application_id = l.application_id
-                        AND c.run_id = l.run_id
-                      WHERE l.run_id = $1 AND l.account_id = $2 AND l.application_id = $3",
-                        &[&run_id, &account_id, &application_id],
-                    )?
-                    .map(|row| {
-                        let finished_at_ms = row.get::<_, Option<i64>>(9);
-                        let capacity_runner = row.get::<_, Option<String>>(10);
-                        let capacity_state = row.get::<_, Option<String>>(11);
-                        let capacity_expires_at_ms = row.get::<_, Option<i64>>(12);
-                        (
-                            execution_lease_from_pg_row(row),
-                            finished_at_ms,
-                            capacity_runner,
-                            capacity_state,
-                            capacity_expires_at_ms,
-                        )
-                    })
-                    .ok_or(ExecutionLeaseError::NotFound)?,
-            };
-        let now = now_ms();
-        let capacity_authorized = match (lease.phase.as_str(), finished_at_ms) {
-            ("submitted", Some(_)) => {
-                capacity_runner.as_deref() == Some("cloud")
-                    && ((capacity_state.as_deref() == Some("active")
-                        && capacity_expires_at_ms
-                            == Some(SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRES_AT_MS))
-                        || capacity_state.as_deref() == Some("committed"))
-            }
-            ("side_effect_unknown", Some(finished_at_ms)) => {
-                let authority_expires_at_ms =
-                    finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
-                capacity_runner.as_deref() == Some("cloud")
-                    && capacity_state.as_deref() == Some("active")
-                    && capacity_expires_at_ms == Some(authority_expires_at_ms)
-                    && authority_expires_at_ms > now
-            }
-            _ => false,
-        };
-        if lease.fence != fence
-            || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
-            || !matches!(lease.phase.as_str(), "submitted" | "side_effect_unknown")
-            || finished_at_ms.is_none()
-            || !capacity_authorized
-        {
-            return Err(ExecutionLeaseError::Conflict);
+                    params![run_id, account_id, application_id],
+                    |row| {
+                        Ok((
+                            execution_lease_from_sqlite_row(row)?,
+                            row.get::<_, Option<i64>>(9)?,
+                            row.get::<_, Option<String>>(10)?,
+                            row.get::<_, Option<String>>(11)?,
+                            row.get::<_, Option<i64>>(12)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let authority = validate_execution_receipt_authority(
+                lease,
+                finished_at_ms,
+                capacity_runner,
+                capacity_state,
+                capacity_expires_at_ms,
+                lease_token,
+                fence,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(authority)
         }
-        Ok(ExecutionReceiptAuthority {
-            owner_id: lease.owner_id,
-            lease_token_sha256: lease.lease_token_sha256,
-            fence: lease.fence,
-            phase: lease.phase,
-        })
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            let lease_row = tx
+                .query_opt(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms,
+                            finished_at_ms
+                       FROM jobs_execution_leases
+                      WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                      FOR UPDATE",
+                    &[&run_id, &account_id, &application_id],
+                )?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let finished_at_ms = lease_row.get::<_, Option<i64>>(9);
+            let lease = execution_lease_from_pg_row(lease_row);
+            let capacity = tx.query_opt(
+                "SELECT runner, state, expires_at_ms
+                   FROM jobs_submission_evidence_capacity
+                  WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                  FOR UPDATE",
+                &[&account_id, &application_id, &run_id],
+            )?;
+            let (capacity_runner, capacity_state, capacity_expires_at_ms) = capacity.map_or(
+                (None, None, None),
+                |row| (Some(row.get(0)), Some(row.get(1)), Some(row.get(2))),
+            );
+            let authority = validate_execution_receipt_authority(
+                lease,
+                finished_at_ms,
+                capacity_runner,
+                capacity_state,
+                capacity_expires_at_ms,
+                lease_token,
+                fence,
+                now,
+            )?;
+            tx.commit()?;
+            Ok(authority)
+        }
     })
 }
 
@@ -2131,6 +2449,9 @@ pub fn finish_execution_lease(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_identity_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
@@ -2212,6 +2533,9 @@ pub fn finish_execution_lease(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
@@ -2319,6 +2643,9 @@ pub fn reconcile_execution_lease_checkpoint(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_current_runner_volume_identity_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
@@ -2547,6 +2874,9 @@ pub fn reconcile_execution_lease_checkpoint(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;

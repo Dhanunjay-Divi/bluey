@@ -4,6 +4,10 @@ import {
   type FinalSubmitProof,
 } from "@bluey/jobs-automation";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
+import type {
+  RunnerExecutionLeaseClaimProofInput,
+  RunnerVolumeAuthorityProof,
+} from "./runner-volume-client.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
@@ -34,6 +38,16 @@ export interface ExecutionLeaseClaim {
   applicationId: string;
   runId: string;
   browserProfileId: string;
+}
+
+export interface ExecutionLeaseRunnerVolume {
+  volumeId: string;
+  enrollmentEpoch: number;
+  processInstanceId: string;
+  keyFingerprint: string;
+  createExecutionLeaseClaimProof(
+    input: RunnerExecutionLeaseClaimProofInput,
+  ): RunnerVolumeAuthorityProof;
 }
 
 export type ReconciledCheckpointPhase =
@@ -74,6 +88,7 @@ export interface ExecutionLeaseClientOptions {
   origin: string;
   workerSigningKey: string;
   ownerId: string;
+  runnerVolume: ExecutionLeaseRunnerVolume;
   requestTimeoutMs?: number;
   heartbeatIntervalMs?: number;
   maxResponseBytes?: number;
@@ -95,6 +110,7 @@ interface LeaseGrant {
   leaseToken: string;
   fence: number;
   expiresAtMs: number;
+  purgeSubject: string;
 }
 
 interface LeaseOperations {
@@ -124,6 +140,7 @@ export class ActiveExecutionLease {
     readonly expiresAtMs: number = Date.now() + heartbeatIntervalMs,
     readonly ownerId: string = "runner-unknown",
     leaseToken: string = "",
+    readonly purgeSubject: string = "",
   ) {
     this.#operations = operations;
     this.#heartbeatIntervalMs = heartbeatIntervalMs;
@@ -232,11 +249,13 @@ export class ExecutionLeaseClient {
   readonly #heartbeatIntervalMs: number;
   readonly #maxResponseBytes: number;
   readonly #fetch: typeof globalThis.fetch;
+  readonly #runnerVolume: ExecutionLeaseRunnerVolume;
 
   constructor(options: ExecutionLeaseClientOptions) {
     this.#origin = normalizedOrigin(options.origin);
     this.#workerSigningKey = boundedSigningKey(options.workerSigningKey);
     this.#ownerId = boundedOwnerId(options.ownerId);
+    this.#runnerVolume = boundedRunnerVolume(options.runnerVolume);
     this.#requestTimeoutMs = boundedInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 100, 60_000);
     this.#heartbeatIntervalMs = boundedInteger(
       options.heartbeatIntervalMs,
@@ -261,13 +280,24 @@ export class ExecutionLeaseClient {
       account_id: input.accountId,
       application_id: input.applicationId,
     };
+    const claimBinding = {
+      accountId: input.accountId,
+      applicationId: input.applicationId,
+      runId: input.runId,
+      browserProfileId: input.browserProfileId,
+      ownerId: this.#ownerId,
+    };
     const payload = await this.request("claim", "/api/jobs/internal/execution-leases/claim", {
       ...common,
       run_id: input.runId,
       browser_profile_id: input.browserProfileId,
       owner_id: this.#ownerId,
+      volume_id: this.#runnerVolume.volumeId,
+      enrollment_epoch: this.#runnerVolume.enrollmentEpoch,
+      process_instance_id: this.#runnerVolume.processInstanceId,
+      volume_proof: this.#runnerVolume.createExecutionLeaseClaimProof(claimBinding),
     });
-    const grant = parseGrant(payload, input.runId);
+    const grant = parseGrant(payload, input.runId, this.#runnerVolume);
     const runPath = encodeURIComponent(input.runId);
     const operations: LeaseOperations = {
       heartbeat: async () => {
@@ -279,13 +309,17 @@ export class ExecutionLeaseClient {
         parseLeaseRecord("heartbeat", response, input.runId, grant.fence, ["prepared", "click_started"]);
       },
       irreversible: async (proof) => {
-        const response = await this.request("irreversible", `/api/jobs/internal/execution-leases/${runPath}/irreversible`, {
-          ...common,
-          lease_token: grant.leaseToken,
-          fence: grant.fence,
-          action: "submit",
-          final_submit_proof: proof,
-        });
+        const response = await this.request(
+          "irreversible",
+          `/api/jobs/internal/execution-leases/${runPath}/irreversible`,
+          {
+            ...common,
+            lease_token: grant.leaseToken,
+            fence: grant.fence,
+            action: "submit",
+            final_submit_proof: proof,
+          },
+        );
         parseLeaseRecord("irreversible", response, input.runId, grant.fence, ["click_started"]);
       },
       finish: async (outcome) => {
@@ -304,6 +338,7 @@ export class ExecutionLeaseClient {
       grant.expiresAtMs,
       this.#ownerId,
       grant.leaseToken,
+      grant.purgeSubject,
     );
   }
 
@@ -408,12 +443,14 @@ export class ExecutionLeaseClient {
 }
 
 export function createExecutionLeaseClientFromEnv(
+  runnerVolume: ExecutionLeaseRunnerVolume,
   env: NodeJS.ProcessEnv = process.env,
 ): ExecutionLeaseClient {
   return new ExecutionLeaseClient({
     origin: env.BLUEY_JOBS_API_ORIGIN ?? "",
     workerSigningKey: env.BLUEY_JOBS_WORKER_SIGNING_KEY ?? "",
     ownerId: runnerOwnerId(env.BLUEY_JOBS_RUNNER_ID),
+    runnerVolume,
   });
 }
 
@@ -460,6 +497,18 @@ function boundedOwnerId(value: string): string {
   return `runner-${createHash("sha256").update(value).digest("hex").slice(0, 48)}`;
 }
 
+function boundedRunnerVolume(value: ExecutionLeaseRunnerVolume): ExecutionLeaseRunnerVolume {
+  if (!value || !isCanonicalBase64Url(value.volumeId, 32)
+    || !Number.isSafeInteger(value.enrollmentEpoch)
+    || value.enrollmentEpoch <= 0
+    || !isCanonicalBase64Url(value.processInstanceId, 32)
+    || !/^[0-9a-f]{64}$/.test(value.keyFingerprint)
+    || typeof value.createExecutionLeaseClaimProof !== "function") {
+    throw new ExecutionLeaseError("configuration", "configuration");
+  }
+  return Object.freeze({ ...value });
+}
+
 function boundedInteger(value: number | undefined, fallback: number, minimum: number, maximum: number): number {
   const candidate = value ?? fallback;
   if (!Number.isInteger(candidate) || candidate < minimum || candidate > maximum) {
@@ -468,7 +517,11 @@ function boundedInteger(value: number | undefined, fallback: number, minimum: nu
   return candidate;
 }
 
-function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
+function parseGrant(
+  value: unknown,
+  expectedRunId: string,
+  expectedVolume: ExecutionLeaseRunnerVolume,
+): LeaseGrant {
   if (!value || typeof value !== "object") {
     throw new ExecutionLeaseError("claim", "invalid_response");
   }
@@ -476,7 +529,20 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
   const leaseToken = record.lease_token;
   const fence = record.fence;
   const expiresAtMs = record.lease_expires_at_ms;
-  if (record.run_id !== expectedRunId
+  const purgeSubject = record.purge_subject;
+  if (!hasExactKeys(record, [
+    "enrollment_epoch",
+    "fence",
+    "lease_expires_at_ms",
+    "lease_token",
+    "phase",
+    "process_instance_id",
+    "purge_subject",
+    "run_id",
+    "volume_id",
+    "volume_key_fingerprint",
+  ])
+    || record.run_id !== expectedRunId
     || record.phase !== "prepared"
     || typeof leaseToken !== "string"
     || !leaseToken
@@ -486,10 +552,29 @@ function parseGrant(value: unknown, expectedRunId: string): LeaseGrant {
     || fence <= 0
     || typeof expiresAtMs !== "number"
     || !Number.isSafeInteger(expiresAtMs)
-    || expiresAtMs <= Date.now()) {
+    || expiresAtMs <= Date.now()
+    || typeof purgeSubject !== "string"
+    || !isCanonicalBase64Url(purgeSubject, 32)
+    || record.volume_id !== expectedVolume.volumeId
+    || record.enrollment_epoch !== expectedVolume.enrollmentEpoch
+    || record.process_instance_id !== expectedVolume.processInstanceId
+    || record.volume_key_fingerprint !== expectedVolume.keyFingerprint) {
     throw new ExecutionLeaseError("claim", "invalid_response");
   }
-  return { leaseToken, fence, expiresAtMs };
+  return { leaseToken, fence, expiresAtMs, purgeSubject };
+}
+
+function isCanonicalBase64Url(value: string, expectedBytes: number): boolean {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length === expectedBytes && decoded.toString("base64url") === value;
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const actual = Object.keys(value).sort((left, right) => left.localeCompare(right));
+  const wanted = [...expected].sort((left, right) => left.localeCompare(right));
+  return actual.length === wanted.length
+    && actual.every((key, index) => key === wanted[index]);
 }
 
 function parseLeaseRecord(

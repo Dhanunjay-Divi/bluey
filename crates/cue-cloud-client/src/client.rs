@@ -256,6 +256,21 @@ impl CloudClient {
         self.auth_request(Method::POST, path, Some(body)).await
     }
 
+    /// Authenticated POST returning the successful response without discarding
+    /// its status code. Auto-refreshes once on 401 and maps non-success status
+    /// codes through the same typed errors as `auth_post`.
+    pub async fn auth_post_raw<Req: Serialize>(&self, path: &str, body: &Req) -> Result<Response> {
+        let resp = self.send_with_auth(Method::POST, path, Some(body)).await?;
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            if !self.refresh_tokens().await? {
+                return Err(Error::Unauthorized);
+            }
+            let resp = self.send_with_auth(Method::POST, path, Some(body)).await?;
+            return Self::stream_or_err(resp).await;
+        }
+        Self::stream_or_err(resp).await
+    }
+
     pub async fn sync_batch(&self, batch: &SyncBatchRequest) -> Result<SyncBatchResponse> {
         self.auth_post("/sync/batch", batch).await
     }
@@ -364,15 +379,7 @@ impl CloudClient {
         path: &str,
         body: &Req,
     ) -> Result<Response> {
-        let resp = self.send_with_auth(Method::POST, path, Some(body)).await?;
-        if resp.status() == StatusCode::UNAUTHORIZED {
-            if !self.refresh_tokens().await? {
-                return Err(Error::Unauthorized);
-            }
-            let resp = self.send_with_auth(Method::POST, path, Some(body)).await?;
-            return Self::stream_or_err(resp).await;
-        }
-        Self::stream_or_err(resp).await
+        self.auth_post_raw(path, body).await
     }
 
     async fn auth_request<Req, Resp>(
@@ -1434,6 +1441,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.text().await.unwrap(), "data: hello\n\n");
+    }
+
+    #[tokio::test]
+    async fn auth_post_raw_preserves_accepted_status_and_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/account/delete"))
+            .respond_with(ResponseTemplate::new(202).set_body_json(serde_json::json!({
+                "deleted": false,
+                "state": "pending_runner_volume_purge"
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let response = client
+            .auth_post_raw(
+                "/account/delete",
+                &serde_json::json!({ "confirm_text": "DELETE" }),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["deleted"], false);
+        assert_eq!(body["state"], "pending_runner_volume_purge");
     }
 
     #[tokio::test]
