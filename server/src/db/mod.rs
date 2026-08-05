@@ -14,7 +14,9 @@ use r2d2_sqlite::SqliteConnectionManager;
 use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::sync::Semaphore;
 
 pub mod account_data;
 pub mod accounts;
@@ -49,12 +51,45 @@ pub type PostgresDbPool = Pool<SafePostgresConnectionManager>;
 pub type SqliteDbConn = PooledConnection<SqliteConnectionManager>;
 pub type PostgresDbConn = PooledConnection<SafePostgresConnectionManager>;
 
+const POSTGRES_PRIMARY_POOL_SIZE: u32 = 16;
+const POSTGRES_LIFECYCLE_POOL_SIZE: u32 = 8;
+
+/// PostgreSQL lifecycle locks deliberately use a pool separate from ordinary
+/// database work. Account object guards span network I/O; retaining those
+/// sessions in the primary pool could otherwise starve the finalization calls
+/// needed to release the guards.
+#[derive(Clone)]
+pub struct PostgresPools {
+    primary: PostgresDbPool,
+    lifecycle: PostgresDbPool,
+    lifecycle_slots: Arc<Semaphore>,
+}
+
+impl Deref for PostgresPools {
+    type Target = PostgresDbPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.primary
+    }
+}
+
+impl PostgresPools {
+    pub(crate) fn lifecycle_pool(&self) -> PostgresDbPool {
+        self.lifecycle.clone()
+    }
+
+    pub(crate) fn lifecycle_slots(&self) -> Arc<Semaphore> {
+        Arc::clone(&self.lifecycle_slots)
+    }
+}
+
 pub struct SafePostgresConnectionManager {
     inner: PostgresConnectionManager<MakeTlsConnector>,
 }
 
 pub struct SafePostgresClient {
     inner: Option<postgres::Client>,
+    broken: bool,
 }
 
 impl SafePostgresConnectionManager {
@@ -78,6 +113,12 @@ impl DerefMut for SafePostgresClient {
         self.inner
             .as_mut()
             .expect("safe postgres client missing inner client")
+    }
+}
+
+impl SafePostgresClient {
+    pub(crate) fn mark_broken(&mut self) {
+        self.broken = true;
     }
 }
 
@@ -109,6 +150,7 @@ impl ManageConnection for SafePostgresConnectionManager {
     fn connect(&self) -> Result<Self::Connection, Self::Error> {
         self.inner.connect().map(|client| SafePostgresClient {
             inner: Some(client),
+            broken: false,
         })
     }
 
@@ -117,14 +159,14 @@ impl ManageConnection for SafePostgresConnectionManager {
     }
 
     fn has_broken(&self, client: &mut Self::Connection) -> bool {
-        self.inner.has_broken(client)
+        client.broken || self.inner.has_broken(client)
     }
 }
 
 #[derive(Clone)]
 pub enum DbPool {
     Sqlite(SqliteDbPool),
-    Postgres(PostgresDbPool),
+    Postgres(PostgresPools),
 }
 
 impl DbPool {
@@ -149,13 +191,13 @@ impl DbPool {
 
     pub fn get_pg(&self) -> Result<PostgresDbConn> {
         match self {
-            Self::Postgres(pool) => {
+            Self::Postgres(pools) => {
                 if in_tokio_multithread_runtime() && !in_db_blocking_context() {
                     anyhow::bail!(
                         "Postgres DB access must run inside db::run_blocking_db while on the Tokio runtime"
                     );
                 }
-                pool.get().context("get postgres conn")
+                pools.primary.get().context("get postgres conn")
             }
             Self::Sqlite(_) => anyhow::bail!("postgres connection requested from sqlite backend"),
         }
@@ -256,15 +298,28 @@ pub fn open_postgres_pool(database_url: &str) -> Result<DbPool> {
     let tls = tls_builder
         .build()
         .context("build postgres TLS connector")?;
-    let manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
+    let primary_manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
+        pg_config.clone(),
+        MakeTlsConnector::new(tls.clone()),
+    ));
+    let lifecycle_manager = SafePostgresConnectionManager::new(PostgresConnectionManager::new(
         pg_config,
         MakeTlsConnector::new(tls),
     ));
-    let pool = Pool::builder()
-        .max_size(16)
-        .build(manager)
+    let primary = Pool::builder()
+        .max_size(POSTGRES_PRIMARY_POOL_SIZE)
+        .build(primary_manager)
         .context("build postgres pool")?;
-    Ok(DbPool::Postgres(pool))
+    let lifecycle = Pool::builder()
+        .max_size(POSTGRES_LIFECYCLE_POOL_SIZE)
+        .min_idle(Some(0))
+        .build(lifecycle_manager)
+        .context("build postgres lifecycle pool")?;
+    Ok(DbPool::Postgres(PostgresPools {
+        primary,
+        lifecycle,
+        lifecycle_slots: Arc::new(Semaphore::new(POSTGRES_LIFECYCLE_POOL_SIZE as usize)),
+    }))
 }
 
 /// Migrations, run in order. Each one is idempotent (CREATE TABLE IF NOT
@@ -281,6 +336,14 @@ const SQLITE_JOBS_COMMUNICATION_ACTIONS: &str =
     include_str!("../../../infra/sqlite/server-runtime/041_jobs_communication_actions.sql");
 const SQLITE_JOBS_BROWSER_PROFILE_SNAPSHOTS: &str =
     include_str!("../../../infra/sqlite/server-runtime/042_jobs_browser_profile_snapshots.sql");
+const SQLITE_ACCOUNT_DELETION_INTENTS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/043_account_deletion_intents.sql");
+const SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/044_jobs_submission_evidence_reservations.sql"
+);
+const SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/045_jobs_account_object_upload_backfill.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1597,6 +1660,13 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_COMMUNICATION_ACTIONS,
     // 0042 - durable encrypted Browser profile snapshot generations.
     SQLITE_JOBS_BROWSER_PROFILE_SNAPSHOTS,
+    // 0043 - durable account-deletion write fence and upload drain status.
+    SQLITE_ACCOUNT_DELETION_INTENTS,
+    // 0044 - protected evidence capacity reserved before employer Submit.
+    SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+    // 0045 - adopt existing source resumes and Browser profiles into the
+    // account-scoped object lifecycle.
+    SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2036,6 +2106,19 @@ const POSTGRES_JOBS_COMMUNICATION_ACTIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/019_jobs_communication_actions.sql");
 const POSTGRES_JOBS_BROWSER_PROFILE_SNAPSHOTS: &str =
     include_str!("../../../infra/postgres/server-runtime/020_jobs_browser_profile_snapshots.sql");
+pub const ACCOUNT_DELETION_INTENTS_MIGRATION_ID: &str = "021_account_deletion_intents.sql";
+const POSTGRES_ACCOUNT_DELETION_INTENTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/021_account_deletion_intents.sql");
+pub const JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID: &str =
+    "022_jobs_submission_evidence_reservations.sql";
+const POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/022_jobs_submission_evidence_reservations.sql"
+);
+pub const JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID: &str =
+    "023_jobs_account_object_upload_backfill.sql";
+const POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
+    "../../../infra/postgres/server-runtime/023_jobs_account_object_upload_backfill.sql"
+);
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2104,6 +2187,18 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "020_jobs_browser_profile_snapshots.sql",
         POSTGRES_JOBS_BROWSER_PROFILE_SNAPSHOTS,
+    ),
+    (
+        ACCOUNT_DELETION_INTENTS_MIGRATION_ID,
+        POSTGRES_ACCOUNT_DELETION_INTENTS,
+    ),
+    (
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+    ),
+    (
+        JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
+        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
     ),
 ];
 
@@ -2522,14 +2617,513 @@ mod sqlite_migration_replay_tests {
             "rows older than the fixed maximum window plus grace are deleted"
         );
     }
+
+    #[test]
+    fn jobs_account_objects_are_backfilled_into_the_durable_ledger() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-object-backfill-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account =
+            crate::db::accounts::Account::create(&pool, "jobs-object-backfill@bluey.test", "hash")
+                .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'resume-backfill', '{account_id}', 'Resume.pdf', 'application/pdf', 'pdf',
+                    'accounts/{account_id}/jobs/resume-backfill.pdf', '{resume_sha}', 128, 2,
+                    'converted_layout', {now}, {now}
+                 );
+                 INSERT INTO jobs_browser_profile_snapshots (
+                    account_id, browser_profile_id, generation, object_key, sha256,
+                    size_bytes, envelope_version, writer_run_id, writer_fence, updated_at_ms
+                 ) VALUES (
+                    '{account_id}', 'profile-backfill', 4,
+                    'accounts/{account_id}/jobs/profile-backfill.enc', '{profile_sha}',
+                    256, 2, 'run-backfill', 7, {now}
+                 );",
+                account_id = account.id,
+                resume_sha = "a".repeat(64),
+                profile_sha = "b".repeat(64),
+            ))
+            .unwrap();
+
+        run_migrations(&pool).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let rows: Vec<(String, String, String)> = conn
+            .prepare(
+                "SELECT logical_id, state, metadata_json
+                   FROM object_uploads
+                  WHERE account_id = ?1 AND logical_id LIKE 'jobs-%'
+                  ORDER BY logical_id",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![account.id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].0,
+            format!(
+                "jobs-browser-profile:profile-backfill:4:2:{}",
+                "b".repeat(64)
+            )
+        );
+        assert_eq!(rows[0].1, "ready");
+        assert!(rows[0].2.contains("jobs_browser_profile_snapshot"));
+        assert_eq!(rows[1].0, "jobs-resume-source:resume-backfill");
+        assert_eq!(rows[1].1, "ready");
+        assert!(rows[1].2.contains("jobs_resume_source"));
+        let outbox_counts: (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE
+                              WHEN operation = 'put' AND state = 'completed'
+                               AND attempt_count >= 1 AND last_error IS NULL
+                               AND completed_at_ms IS NOT NULL
+                               AND next_attempt_at_ms = completed_at_ms
+                               AND updated_at_ms = completed_at_ms
+                              THEN 1 ELSE 0
+                            END)
+                   FROM object_storage_outbox WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            outbox_counts,
+            (2, 2),
+            "adopted objects need terminal PUT history without runnable PUT work"
+        );
+    }
+
+    #[test]
+    fn jobs_account_object_backfill_replays_over_current_writer_metadata() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-current-object-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account = crate::db::accounts::Account::create(
+            &pool,
+            "jobs-current-object-replay@bluey.test",
+            "hash",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        let resume_id = "88f64a61-45e5-4d3e-9ad4-a615dfc854f5";
+        let resume_sha = "c".repeat(64);
+        let requested_profile_sha = "d".repeat(64);
+        let resume_key = format!("accounts/{}/jobs/{resume_id}/{resume_sha}.pdf", account.id);
+        let resume_metadata = serde_json::json!({
+            "artifact_class": "jobs_resume_source",
+            "jobs_resume_source_asset_id": resume_id,
+            "request_id": resume_id,
+            "profile_mode": "replace",
+            "base_profile_sha256": null,
+            "requested_profile_sha256": requested_profile_sha,
+            "replaces_source_asset_id": null,
+            "file_name": "Current Resume.pdf",
+            "file_type": "pdf",
+            "media_type": "application/pdf",
+            "page_count": 3,
+            "retention_policy": "account_lifetime_until_deletion",
+        });
+        assert_eq!(resume_metadata.as_object().unwrap().len(), 12);
+        let limits = crate::object_storage::UploadLimits {
+            max_object_bytes: 1_024,
+            max_account_bytes: 4_096,
+            max_daily_bytes: 4_096,
+            max_account_objects: 10,
+        };
+        let resume_input = crate::db::object_uploads::NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: crate::db::object_uploads::ObjectKind::Artifact,
+            logical_id: format!("jobs-resume-source:{resume_id}"),
+            session_id: None,
+            storage_scope: crate::db::object_uploads::StorageScope::Artifact,
+            object_key: resume_key.clone(),
+            size_bytes: 128,
+            sha256: resume_sha.clone(),
+            content_type: "application/pdf".to_string(),
+            expires_at_ms: i64::MAX,
+            metadata_json: resume_metadata.clone(),
+            now_ms: now,
+            limits,
+        };
+        let resume_reservation =
+            crate::db::object_uploads::reserve_account_object_upload(&pool, &resume_input).unwrap();
+        let ready_resume = crate::db::object_uploads::mark_upload_ready(
+            &pool,
+            &resume_reservation.upload.id,
+            now + 1,
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, 'Current Resume.pdf', 'application/pdf', 'pdf', ?3,
+                           ?4, 128, 3, 'converted_layout', ?5, ?6)",
+                rusqlite::params![resume_id, account.id, resume_key, resume_sha, now, now + 1],
+            )
+            .unwrap();
+
+        let browser_profile_id = "profile-current";
+        let browser_sha = "e".repeat(64);
+        let browser_key = format!(
+            "accounts/{}/jobs/browser/{browser_profile_id}/4/{browser_sha}.enc",
+            account.id
+        );
+        let browser_metadata = serde_json::json!({
+            "artifact_class": "jobs_browser_profile_snapshot",
+            "jobs_browser_profile_id": browser_profile_id,
+            "jobs_application_id": "application-current",
+            "jobs_run_id": "run-current",
+            "generation": 4,
+            "expected_generation": 3,
+            "writer_fence": 7,
+            "envelope_version": 2,
+            "retention_policy": "account_lifetime_until_deletion",
+        });
+        assert_eq!(browser_metadata.as_object().unwrap().len(), 9);
+        let browser_input = crate::db::object_uploads::NewObjectUpload {
+            account_id: account.id.clone(),
+            object_kind: crate::db::object_uploads::ObjectKind::Artifact,
+            logical_id: format!("jobs-browser-profile:{browser_profile_id}:4:2:{browser_sha}"),
+            session_id: None,
+            storage_scope: crate::db::object_uploads::StorageScope::Artifact,
+            object_key: browser_key.clone(),
+            size_bytes: 256,
+            sha256: browser_sha.clone(),
+            content_type: crate::db::jobs::BROWSER_PROFILE_SNAPSHOT_CONTENT_TYPE.to_string(),
+            expires_at_ms: i64::MAX,
+            metadata_json: browser_metadata.clone(),
+            now_ms: now + 2,
+            limits,
+        };
+        let browser_reservation =
+            crate::db::object_uploads::reserve_account_object_upload(&pool, &browser_input)
+                .unwrap();
+        let ready_browser = crate::db::object_uploads::mark_upload_ready(
+            &pool,
+            &browser_reservation.upload.id,
+            now + 3,
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_browser_profile_snapshots (
+                    account_id, browser_profile_id, generation, object_key, sha256,
+                    size_bytes, envelope_version, writer_run_id, writer_fence, updated_at_ms
+                 ) VALUES (?1, ?2, 4, ?3, ?4, 256, 2, 'run-current', 7, ?5)",
+                rusqlite::params![
+                    account.id,
+                    browser_profile_id,
+                    browser_key,
+                    browser_sha,
+                    now + 3
+                ],
+            )
+            .unwrap();
+
+        run_migrations(&pool).expect("current writer metadata must survive migration replay");
+
+        let stored_resume = crate::db::object_uploads::artifact_upload(
+            &pool,
+            &account.id,
+            &resume_input.logical_id,
+        )
+        .unwrap()
+        .expect("current resume ledger row");
+        let stored_browser = crate::db::object_uploads::artifact_upload(
+            &pool,
+            &account.id,
+            &browser_input.logical_id,
+        )
+        .unwrap()
+        .expect("current browser ledger row");
+        assert_eq!(stored_resume, ready_resume);
+        assert_eq!(stored_browser, ready_browser);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_resume.metadata_json).unwrap(),
+            resume_metadata
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&stored_browser.metadata_json).unwrap(),
+            browser_metadata
+        );
+
+        let conn = pool.get().unwrap();
+        let resume_pointer: (String, String, String, i64, Option<i64>, i64) = conn
+            .query_row(
+                "SELECT id, storage_key, sha256, size_bytes, page_count, updated_at_ms
+                   FROM jobs_resume_source_assets WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            resume_pointer,
+            (
+                resume_id.to_string(),
+                resume_key,
+                resume_sha,
+                128,
+                Some(3),
+                now + 1,
+            )
+        );
+        let browser_pointer: (String, i64, String, String, i64, i64, String, i64, i64) = conn
+            .query_row(
+                "SELECT browser_profile_id, generation, object_key, sha256, size_bytes,
+                        envelope_version, writer_run_id, writer_fence, updated_at_ms
+                   FROM jobs_browser_profile_snapshots WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            browser_pointer,
+            (
+                browser_profile_id.to_string(),
+                4,
+                browser_key,
+                browser_sha,
+                256,
+                2,
+                "run-current".to_string(),
+                7,
+                now + 3,
+            )
+        );
+        let outboxes = conn
+            .prepare(
+                "SELECT id, upload_id, account_id, operation, state, attempt_count,
+                        next_attempt_at_ms, last_error, created_at_ms, updated_at_ms,
+                        completed_at_ms
+                   FROM object_storage_outbox
+                  WHERE account_id = ?1
+                  ORDER BY upload_id, operation",
+            )
+            .unwrap()
+            .query_map(rusqlite::params![account.id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let mut expected_outboxes = vec![
+            (
+                format!("{}:put", ready_resume.id),
+                ready_resume.id,
+                account.id.clone(),
+                "put".to_string(),
+                "completed".to_string(),
+                1,
+                now + 1,
+                None,
+                now,
+                now + 1,
+                Some(now + 1),
+            ),
+            (
+                format!("{}:put", ready_browser.id),
+                ready_browser.id,
+                account.id.clone(),
+                "put".to_string(),
+                "completed".to_string(),
+                1,
+                now + 3,
+                None,
+                now + 2,
+                now + 3,
+                Some(now + 3),
+            ),
+        ];
+        expected_outboxes.sort_by(|left, right| left.1.cmp(&right.1));
+        assert_eq!(outboxes, expected_outboxes);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM object_uploads WHERE account_id = ?1",
+                rusqlite::params![account.id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2,
+            "migration replay must not add legacy-shaped duplicates"
+        );
+    }
+
+    #[test]
+    fn jobs_account_object_backfill_rejects_a_mismatched_logical_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-object-backfill-conflict-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account = crate::db::accounts::Account::create(
+            &pool,
+            "jobs-object-backfill-conflict@bluey.test",
+            "hash",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'resume-conflict', '{account_id}', 'Resume.pdf', 'application/pdf', 'pdf',
+                    'accounts/{account_id}/jobs/resume-conflict.pdf', '{sha}', 128, 2,
+                    'converted_layout', {now}, {now}
+                 );
+                 INSERT INTO object_uploads (
+                    id, account_id, object_kind, logical_id, session_id, storage_scope,
+                    object_key, size_bytes, sha256, content_type, expires_at_ms, state,
+                    metadata_json, created_at_ms, updated_at_ms, uploaded_at_ms
+                 ) VALUES (
+                    'preexisting-resume-conflict', '{account_id}', 'artifact',
+                    'jobs-resume-source:resume-conflict', NULL, 'artifact',
+                    'accounts/{account_id}/jobs/wrong-object.pdf', 128, '{sha}',
+                    'application/pdf', 9223372036854775807, 'ready',
+                    json_object(
+                      'artifact_class', 'jobs_resume_source',
+                      'jobs_resume_source_asset_id', 'resume-conflict',
+                      'file_name', 'Resume.pdf',
+                      'file_type', 'pdf',
+                      'media_type', 'application/pdf',
+                      'page_count', 2,
+                      'retention_policy', 'account_lifetime_until_deletion'
+                    ),
+                    {now}, {now}, {now}
+                 );",
+                account_id = account.id,
+                sha = "c".repeat(64),
+            ))
+            .unwrap();
+
+        let error = run_migrations(&pool)
+            .expect_err("a logical replay with a different object key must fail closed");
+        assert!(
+            format!("{error:#}").contains("CHECK constraint failed"),
+            "unexpected migration error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn jobs_account_object_backfill_rejects_a_mismatched_put_replay() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-object-backfill-put-conflict-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account = crate::db::accounts::Account::create(
+            &pool,
+            "jobs-object-backfill-put-conflict@bluey.test",
+            "hash",
+        )
+        .unwrap();
+        let now = chrono::Utc::now().timestamp_millis();
+        pool.get()
+            .unwrap()
+            .execute_batch(&format!(
+                "INSERT INTO jobs_resume_source_assets (
+                    id, account_id, file_name, media_type, file_type, storage_key,
+                    sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'resume-put-conflict', '{account_id}', 'Resume.pdf', 'application/pdf', 'pdf',
+                    'accounts/{account_id}/jobs/resume-put-conflict.pdf', '{sha}', 128, 2,
+                    'converted_layout', {now}, {now}
+                 );",
+                account_id = account.id,
+                sha = "d".repeat(64),
+            ))
+            .unwrap();
+        run_migrations(&pool).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE object_storage_outbox
+                    SET state = 'retry', last_error = 'preexisting drift',
+                        completed_at_ms = NULL
+                  WHERE account_id = ?1 AND operation = 'put'",
+                rusqlite::params![account.id],
+            )
+            .unwrap();
+
+        let error = run_migrations(&pool)
+            .expect_err("a terminal PUT replay with different state must fail closed");
+        assert!(
+            format!("{error:#}").contains("CHECK constraint failed"),
+            "unexpected migration error: {error:#}"
+        );
+    }
 }
 
 #[cfg(test)]
 mod postgres_migration_tests {
     use super::{
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
-        POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
-        SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, POSTGRES_ACCOUNT_DELETION_INTENTS,
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_SCHEMA,
+        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_MIGRATIONS,
+        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
+        SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
     };
 
     #[test]
@@ -2702,5 +3296,175 @@ mod postgres_migration_tests {
                 "SQLite migration missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn account_deletion_intents_are_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == ACCOUNT_DELETION_INTENTS_MIGRATION_ID)
+            .expect("account-deletion intent must exist before account deletion is served");
+
+        assert_eq!(*version, "021_account_deletion_intents.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS account_deletion_intents",
+            "account_id",
+            "PRIMARY KEY",
+            "REFERENCES accounts(id) ON DELETE CASCADE",
+            "requested_at_ms",
+            "last_checked_at_ms",
+            "fresh_upload_cutoff_ms",
+            "fresh_in_flight_puts",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_ACCOUNT_DELETION_INTENTS.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+        assert_eq!(*postgres_sql, POSTGRES_ACCOUNT_DELETION_INTENTS);
+    }
+
+    #[test]
+    fn submission_evidence_capacity_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID)
+            .expect("submission evidence capacity must exist before Jobs execution is served");
+
+        assert_eq!(*version, "022_jobs_submission_evidence_reservations.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_submission_evidence_capacity",
+            "PRIMARY KEY(account_id, application_id, run_id)",
+            "REFERENCES accounts(id) ON DELETE CASCADE",
+            "REFERENCES jobs_applications(id) ON DELETE CASCADE",
+            "reserved_bytes",
+            "reserved_objects",
+            "consumed_bytes",
+            "consumed_objects",
+            "expires_at_ms",
+            "state",
+            "WHERE state = 'active'",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS
+        );
+    }
+
+    #[test]
+    fn jobs_account_objects_are_backfilled_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID)
+            .expect("Jobs account objects must join the ledger before object writers start");
+
+        assert_eq!(*version, "023_jobs_account_object_upload_backfill.sql");
+        for required in [
+            "INTO object_uploads",
+            "jobs_resume_source_assets",
+            "jobs_browser_profile_snapshots",
+            "jobs-resume-source:",
+            "jobs-browser-profile:",
+            "generation || ':' ||",
+            "envelope_version || ':' || lower(sha256)",
+            "jobs_resume_source",
+            "jobs_browser_profile_snapshot",
+            "account_lifetime_until_deletion",
+            "9223372036854775807",
+            "'ready'",
+            "ON CONFLICT (account_id, object_kind, logical_id) DO NOTHING",
+            "INTO object_storage_outbox",
+            "'put', 'completed', 1",
+            "ON CONFLICT (upload_id, operation) DO NOTHING",
+            "attempt_count >= 1",
+            "completed_at_ms",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL.contains(required),
+                "SQLite missing {required}"
+            );
+        }
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL);
+        assert!(!postgres_sql.contains("ON CONFLICT DO NOTHING"));
+        assert!(!SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL.contains("INSERT OR IGNORE"));
+        assert!(postgres_sql
+            .contains("RAISE EXCEPTION 'Jobs account-object backfill validation failed'"));
+        assert!(SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL
+            .contains("CREATE TEMP TABLE jobs_account_object_backfill_validation"));
+
+        let postgres_compact = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for current_shape_clause in [
+            "'request_id', source.id",
+            "upload.metadata_json::jsonb ->> 'profile_mode' IN ( 'replace', 'merge_source' )",
+            "upload.metadata_json::jsonb ->> 'base_profile_sha256' ~ '^[0-9a-f]{64}$'",
+            "upload.metadata_json::jsonb ->> 'requested_profile_sha256' ~ '^[0-9a-f]{64}$'",
+            "'replaces_source_asset_id', upload.metadata_json::jsonb -> 'replaces_source_asset_id'",
+            "'jobs_application_id', upload.metadata_json::jsonb -> 'jobs_application_id'",
+            "'jobs_run_id', snapshot.writer_run_id",
+            "'expected_generation', snapshot.generation - 1",
+            "'writer_fence', snapshot.writer_fence",
+            "outbox.id = upload.id || ':put'",
+            "outbox.account_id = upload.account_id",
+            "outbox.next_attempt_at_ms = outbox.completed_at_ms",
+            "outbox.updated_at_ms = outbox.completed_at_ms",
+            "outbox.created_at_ms <= outbox.completed_at_ms",
+        ] {
+            assert!(
+                postgres_compact.contains(current_shape_clause),
+                "PostgreSQL current-shape validation missing {current_shape_clause}"
+            );
+        }
+
+        let sqlite_compact = SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for current_shape_clause in [
+            "(SELECT COUNT(*) FROM json_each(upload.metadata_json)) = 12",
+            "json_extract(upload.metadata_json, '$.request_id') = source.id",
+            "json_extract(upload.metadata_json, '$.profile_mode') IN ( 'replace', 'merge_source' )",
+            "(SELECT COUNT(*) FROM json_each(upload.metadata_json)) = 9",
+            "json_extract(upload.metadata_json, '$.jobs_run_id') = snapshot.writer_run_id",
+            "json_extract(upload.metadata_json, '$.writer_fence') = snapshot.writer_fence",
+            "json_extract(upload.metadata_json, '$.expected_generation') = snapshot.generation - 1",
+        ] {
+            assert!(
+                sqlite_compact.contains(current_shape_clause),
+                "SQLite current-shape validation missing {current_shape_clause}"
+            );
+        }
+
+        let maximum_browser_profile_logical_id_bytes = "jobs-browser-profile:".len()
+            + 240
+            + 1
+            + i64::MAX.to_string().len()
+            + 1
+            + i64::MAX.to_string().len()
+            + 1
+            + 64;
+        assert!(
+            maximum_browser_profile_logical_id_bytes <= 384,
+            "the maximum accepted browser-profile candidate identity must fit the ledger"
+        );
     }
 }

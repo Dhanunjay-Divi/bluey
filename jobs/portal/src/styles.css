@@ -448,12 +448,41 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .evidence-row:last-child { border-bottom: 0; }
 .evidence-icon { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 6px; background: var(--surface-2); color: var(--text-soft); }
 .evidence-icon.resume { background: var(--accent-soft); color: var(--accent); }
+.evidence-icon.application_receipt { background: var(--amber-soft); color: var(--amber); }
 .evidence-icon.submission_confirmation { background: var(--green-soft); color: var(--green); }
 .evidence-icon.status_email, .evidence-icon.interview_event { background: color-mix(in srgb, var(--accent) 9%, var(--surface)); color: var(--accent); }
 .evidence-row > div { min-width: 0; display: grid; gap: 3px; }
 .evidence-row b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 .evidence-row p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-soft); font-size: 10px; }
+.evidence-row-actions { display: grid; justify-items: end; gap: 6px; }
 .evidence-row time { color: var(--muted); font-size: 9px; white-space: nowrap; }
+.evidence-row-actions button {
+  min-height: 28px;
+  padding: 0 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-soft);
+  font-size: 9px;
+  font-weight: 750;
+}
+.evidence-row-actions button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.evidence-row-actions button:disabled { cursor: wait; opacity: .55; }
+.evidence-download-error {
+  min-height: 36px;
+  padding: 8px 10px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid color-mix(in srgb, var(--danger) 40%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--danger) 7%, var(--surface));
+  color: var(--danger);
+  font-size: 10px;
+}
 .evidence-empty { min-height: 68px; padding: 12px; display: flex; align-items: center; gap: 10px; color: var(--amber); }
 .evidence-empty span { display: grid; gap: 3px; }
 .evidence-empty b { color: var(--text); font-size: 11px; }

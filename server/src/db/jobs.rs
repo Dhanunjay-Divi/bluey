@@ -49,7 +49,75 @@ const GLOBAL_DISCOVERY_MAX_MATERIALIZED_PER_ACCOUNT: usize = 500;
 const EXECUTION_LEASE_TTL_MS: i64 = 60 * 1_000;
 const LOCAL_RESUME_ACTION_TTL_MS: i64 = 15 * 60 * 1_000;
 pub const SUBMISSION_RECONCILIATION_GRACE_MS: i64 = 24 * 60 * 60 * 1_000;
+pub const SERVER_SUBMISSION_AUTHORITY_KEY: &str = "_bluey_server_submission_authority_v1";
+pub const FINAL_SUBMIT_PROOF_KEY: &str = "_bluey_final_submit_proof_v1";
 type HmacSha256 = Hmac<Sha256>;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitProof {
+    pub schema_version: i64,
+    pub adapter: String,
+    pub adapter_version: String,
+    pub control: String,
+    pub job: FinalSubmitJobProof,
+    pub target: FinalSubmitTargetProof,
+    pub files: Vec<FinalSubmitFileProof>,
+    pub fields: Vec<FinalSubmitFieldProof>,
+    pub part_order: Vec<FinalSubmitPartOrderProof>,
+    pub documents: Vec<FinalSubmitDocumentProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitJobProof {
+    pub approved_canonical_url: String,
+    pub page_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitTargetProof {
+    pub action_url: String,
+    pub method: String,
+    pub enctype: String,
+    pub form_target: String,
+    pub provider_job_key: String,
+    pub form_identity: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitFileProof {
+    pub field_name: String,
+    pub name: String,
+    pub byte_length: i64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitFieldProof {
+    pub field_name: String,
+    pub value_byte_length: i64,
+    pub value_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitPartOrderProof {
+    pub kind: String,
+    pub index: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalSubmitDocumentProof {
+    pub kind: String,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    pub sha256: String,
+}
 
 fn default_discovery_interval_ms() -> i64 {
     4 * 60 * 60 * 1_000

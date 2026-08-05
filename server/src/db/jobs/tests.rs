@@ -2,6 +2,11 @@
 mod tests {
     use super::*;
     use crate::db;
+    use crate::db::object_uploads::{
+        ApplicationObjectBinding, NewObjectUpload, NewSubmissionEvidenceCapacity, ObjectKind,
+        StorageScope, UploadControlError,
+    };
+    use crate::object_storage::UploadLimits;
 
     fn test_pool() -> DbPool {
         let path = std::env::temp_dir().join(format!(
@@ -45,31 +50,223 @@ mod tests {
         pool
     }
 
+    fn reserve_verified_jobs_account_object(
+        pool: &DbPool,
+        logical_id: &str,
+        object_key: &str,
+        sha256: &str,
+        content_type: &str,
+        size_bytes: i64,
+        metadata_json: serde_json::Value,
+    ) -> crate::db::object_uploads::ObjectUpload {
+        let now = now_ms();
+        let reservation = crate::db::object_uploads::reserve_account_object_upload(
+            pool,
+            &NewObjectUpload {
+                account_id: "acct-jobs".to_string(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: logical_id.to_string(),
+                session_id: None,
+                storage_scope: StorageScope::Artifact,
+                object_key: object_key.to_string(),
+                size_bytes,
+                sha256: sha256.to_string(),
+                content_type: content_type.to_string(),
+                expires_at_ms: i64::MAX,
+                metadata_json,
+                now_ms: now,
+                limits: UploadLimits {
+                    max_object_bytes: 1024 * 1024,
+                    max_account_bytes: 16 * 1024 * 1024,
+                    max_daily_bytes: 16 * 1024 * 1024,
+                    max_account_objects: 100,
+                },
+            },
+        )
+        .unwrap();
+        assert!(reservation.needs_put);
+        crate::db::object_uploads::begin_upload_put(pool, &reservation.upload.id, now).unwrap();
+        crate::db::object_uploads::release_verified_upload_put(pool, &reservation.upload.id, now)
+            .unwrap();
+        assert_eq!(
+            crate::db::object_uploads::artifact_upload(pool, "acct-jobs", logical_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "pending"
+        );
+        reservation.upload
+    }
+
+    fn reserve_verified_resume_source_upload_with_requested_digest(
+        pool: &DbPool,
+        asset_id: &str,
+        file_name: &str,
+        sha256: &str,
+        size_bytes: i64,
+        profile_digests: (Option<&str>, &str),
+        replaces_source_asset_id: Option<&str>,
+    ) -> (crate::db::object_uploads::ObjectUpload, ResumeSourceAsset) {
+        let (base_profile_sha256, requested_profile_sha256) = profile_digests;
+        let logical_id = format!("jobs-resume-source:{asset_id}");
+        let object_key = format!("accounts/acct-jobs/jobs/resume-sources/{asset_id}.pdf");
+        let upload = reserve_verified_jobs_account_object(
+            pool,
+            &logical_id,
+            &object_key,
+            sha256,
+            "application/pdf",
+            size_bytes,
+            json!({
+                "artifact_class": "jobs_resume_source",
+                "jobs_resume_source_asset_id": asset_id,
+                "request_id": asset_id,
+                "profile_mode": "replace",
+                "base_profile_sha256": base_profile_sha256,
+                "requested_profile_sha256": requested_profile_sha256,
+                "replaces_source_asset_id": replaces_source_asset_id,
+                "file_name": file_name,
+                "file_type": "pdf",
+                "media_type": "application/pdf",
+                "page_count": 2,
+                "retention_policy": "account_lifetime_until_deletion",
+            }),
+        );
+        let asset = ResumeSourceAsset {
+            id: asset_id.to_string(),
+            file_name: file_name.to_string(),
+            media_type: upload.content_type.clone(),
+            file_type: "pdf".to_string(),
+            storage_key: upload.object_key.clone(),
+            sha256: upload.sha256.clone(),
+            size_bytes: upload.size_bytes,
+            page_count: Some(2),
+            template_status: "converted_layout".to_string(),
+            created_at_ms: upload.created_at_ms,
+            updated_at_ms: upload.created_at_ms,
+        };
+        (upload, asset)
+    }
+
+    fn reserve_verified_resume_source_upload(
+        pool: &DbPool,
+        asset_id: &str,
+        file_name: &str,
+        sha256: &str,
+        size_bytes: i64,
+        profiles: (Option<&CareerProfile>, &CareerProfile),
+        replaces_source_asset_id: Option<&str>,
+    ) -> (crate::db::object_uploads::ObjectUpload, ResumeSourceAsset) {
+        let (base_profile, requested_profile) = profiles;
+        let base_profile_sha256 = base_profile
+            .map(resume_profile_revision)
+            .transpose()
+            .unwrap();
+        let requested_profile_sha256 = resume_requested_profile_sha256(requested_profile).unwrap();
+        reserve_verified_resume_source_upload_with_requested_digest(
+            pool,
+            asset_id,
+            file_name,
+            sha256,
+            size_bytes,
+            (base_profile_sha256.as_deref(), &requested_profile_sha256),
+            replaces_source_asset_id,
+        )
+    }
+
+    fn reserve_verified_browser_profile_upload(
+        pool: &DbPool,
+        application_id: &str,
+        run_id: &str,
+        browser_profile_id: &str,
+        writer_fence: i64,
+        generations: (i64, i64),
+        object: (&str, &str, i64, i64),
+    ) -> crate::db::object_uploads::ObjectUpload {
+        let (expected_generation, next_generation) = generations;
+        let (object_key, sha256, size_bytes, envelope_version) = object;
+        let logical_id = format!(
+            "jobs-browser-profile:{browser_profile_id}:{next_generation}:{envelope_version}:{sha256}"
+        );
+        reserve_verified_jobs_account_object(
+            pool,
+            &logical_id,
+            object_key,
+            sha256,
+            "application/vnd.bluey.browser-profile+encrypted",
+            size_bytes,
+            json!({
+                "artifact_class": "jobs_browser_profile_snapshot",
+                "jobs_browser_profile_id": browser_profile_id,
+                "jobs_application_id": application_id,
+                "jobs_run_id": run_id,
+                "generation": next_generation,
+                "expected_generation": expected_generation,
+                "writer_fence": writer_fence,
+                "envelope_version": envelope_version,
+                "retention_policy": "account_lifetime_until_deletion",
+            }),
+        )
+    }
+
+    fn requested_resume_profile(headline: &str) -> CareerProfile {
+        let mut profile = default_profile("jobs@example.com");
+        profile.headline = headline.to_string();
+        profile.onboarding_complete = true;
+        profile
+    }
+
+    fn assert_resume_idempotency_conflict(result: Result<ResumeSourcePublication>) {
+        let error = result.expect_err("publication must fail closed");
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::IdempotencyConflict)
+        );
+    }
+
+    fn upload_lifecycle(pool: &DbPool, upload_id: &str) -> (String, String, i64) {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT upload.state, put.state,
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = upload.id
+                            AND deletion.operation = 'delete')
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                  WHERE upload.id = ?1",
+                params![upload_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+
     fn test_posting(url: &str, posted_at_ms: i64, last_verified_at_ms: i64) -> JobPosting {
         verified_test_posting(
             JobPosting {
-            id: String::new(),
-            canonical_key: String::new(),
-            source: "greenhouse".to_string(),
-            external_id: url.to_string(),
-            company: "Acme".to_string(),
-            title: "Software Engineer".to_string(),
-            location: "New York, NY".to_string(),
-            workplace: "hybrid".to_string(),
-            canonical_url: url.to_string(),
-            description: "Build reliable products with Rust and TypeScript.".to_string(),
-            compensation: "$170k-$200k".to_string(),
-            employment_type: "full_time".to_string(),
-            track_id: "track-default".to_string(),
-            match_score: 90,
-            matched_reasons: vec!["Skills fit".to_string()],
-            missing_requirements: Vec::new(),
-            posted_at_ms: Some(posted_at_ms),
-            last_verified_at_ms: Some(last_verified_at_ms),
-            availability_status: "active".to_string(),
-            status: "matched".to_string(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
+                id: String::new(),
+                canonical_key: String::new(),
+                source: "greenhouse".to_string(),
+                external_id: url.to_string(),
+                company: "Acme".to_string(),
+                title: "Software Engineer".to_string(),
+                location: "New York, NY".to_string(),
+                workplace: "hybrid".to_string(),
+                canonical_url: url.to_string(),
+                description: "Build reliable products with Rust and TypeScript.".to_string(),
+                compensation: "$170k-$200k".to_string(),
+                employment_type: "full_time".to_string(),
+                track_id: "track-default".to_string(),
+                match_score: 90,
+                matched_reasons: vec!["Skills fit".to_string()],
+                missing_requirements: Vec::new(),
+                posted_at_ms: Some(posted_at_ms),
+                last_verified_at_ms: Some(last_verified_at_ms),
+                availability_status: "active".to_string(),
+                status: "matched".to_string(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
                 discovery_evidence: JobDiscoveryEvidence::default(),
                 eligibility: None,
             },
@@ -222,7 +419,7 @@ mod tests {
                 .to_string(),
             file_type: "docx".to_string(),
             storage_key: "jobs/acct-jobs/resume-source-one".to_string(),
-            sha256: "resume-source-one-sha256".to_string(),
+            sha256: "a".repeat(64),
             size_bytes: 1_024,
             page_count: Some(2),
             template_status: "exact_docx".to_string(),
@@ -239,13 +436,8 @@ mod tests {
         let (_, profile) =
             save_resume_source_asset(&pool, "acct-jobs", &first_asset, &profile).unwrap();
 
-        let authorization = authorize_auto_submit(
-            &pool,
-            "acct-jobs",
-            "jobs@example.com",
-            "track-default",
-        )
-        .unwrap();
+        let authorization =
+            authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").unwrap();
         assert_eq!(authorization.status, "active");
         assert_eq!(authorization.source_resume_asset_id, first_asset.id);
 
@@ -255,7 +447,7 @@ mod tests {
             media_type: "application/pdf".to_string(),
             file_type: "pdf".to_string(),
             storage_key: "jobs/acct-jobs/resume-source-two".to_string(),
-            sha256: "resume-source-two-sha256".to_string(),
+            sha256: "b".repeat(64),
             size_bytes: 2_048,
             page_count: Some(2),
             template_status: "converted_layout".to_string(),
@@ -269,13 +461,8 @@ mod tests {
         replacement_profile.source_resume_media_type = replacement_asset.media_type.clone();
         replacement_profile.source_resume_template_status =
             replacement_asset.template_status.clone();
-        save_resume_source_asset(
-            &pool,
-            "acct-jobs",
-            &replacement_asset,
-            &replacement_profile,
-        )
-        .unwrap();
+        save_resume_source_asset(&pool, "acct-jobs", &replacement_asset, &replacement_profile)
+            .unwrap();
 
         let authorizations =
             list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com").unwrap();
@@ -290,9 +477,533 @@ mod tests {
         .is_err());
 
         assert!(revoke_auto_submit(&pool, "acct-jobs", "track-default").unwrap());
-        assert!(list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com")
+        assert!(
+            list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn resume_source_publication_commits_pointer_profile_and_prior_cleanup_atomically() {
+        let pool = test_pool();
+        let prior_profile = requested_resume_profile("Prior profile");
+        let (prior_upload, prior_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "atomic-prior",
+            "prior.pdf",
+            &"a".repeat(64),
+            128,
+            (None, &prior_profile),
+            None,
+        );
+        let prior_publication = publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &prior_asset,
+            &prior_profile,
+            &prior_upload.id,
+        )
+        .unwrap();
+        assert!(!prior_publication.replayed);
+
+        let mut next_profile = prior_publication.profile.clone();
+        next_profile.headline = "Next profile".to_string();
+        let (next_upload, next_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "atomic-next",
+            "next.pdf",
+            &"b".repeat(64),
+            256,
+            (Some(&prior_publication.profile), &next_profile),
+            Some(&prior_asset.id),
+        );
+        publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &next_asset,
+            &next_profile,
+            &next_upload.id,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_resume_source_asset(&pool, "acct-jobs").unwrap(),
+            Some(next_asset.clone())
+        );
+        let stored_profile = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(stored_profile.source_resume_asset_id, next_asset.id);
+        assert_eq!(stored_profile.source_resume_sha256, next_asset.sha256);
+        assert_eq!(stored_profile.headline, "Next profile");
+
+        let prior_lifecycle: (String, String, String) = pool
+            .get()
             .unwrap()
-            .is_empty());
+            .query_row(
+                "SELECT upload.state, put.state, deletion.state
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                   JOIN object_storage_outbox deletion
+                     ON deletion.upload_id = upload.id AND deletion.operation = 'delete'
+                  WHERE upload.id = ?1",
+                params![prior_upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            prior_lifecycle,
+            (
+                "delete_pending".into(),
+                "completed".into(),
+                "pending".into()
+            )
+        );
+        let next_lifecycle: (String, String, Option<i64>, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT upload.state, put.state, upload.uploaded_at_ms,
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = upload.id
+                            AND deletion.operation = 'delete')
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                  WHERE upload.id = ?1 AND upload.object_key = ?2
+                    AND upload.sha256 = ?3 AND upload.size_bytes = ?4
+                    AND upload.content_type = ?5",
+                params![
+                    next_upload.id,
+                    next_asset.storage_key,
+                    next_asset.sha256,
+                    next_asset.size_bytes,
+                    next_asset.media_type,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(next_lifecycle.0, "ready");
+        assert_eq!(next_lifecycle.1, "completed");
+        assert!(next_lifecycle.2.is_some());
+        assert_eq!(next_lifecycle.3, 0);
+    }
+
+    #[test]
+    fn resume_source_metadata_failure_rolls_back_publication_and_pointer_replacement() {
+        let pool = test_pool();
+        let prior_profile = requested_resume_profile("Prior profile");
+        let (prior_upload, prior_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "rollback-prior",
+            "prior.pdf",
+            &"c".repeat(64),
+            128,
+            (None, &prior_profile),
+            None,
+        );
+        let prior_publication = publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &prior_asset,
+            &prior_profile,
+            &prior_upload.id,
+        )
+        .unwrap();
+
+        let mut next_profile = prior_publication.profile.clone();
+        next_profile.headline = "Next profile".to_string();
+        let (next_upload, next_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "rollback-next",
+            "next.pdf",
+            &"d".repeat(64),
+            256,
+            (Some(&prior_publication.profile), &next_profile),
+            Some(&prior_asset.id),
+        );
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER fail_resume_profile_metadata_update
+                 BEFORE UPDATE ON jobs_profiles
+                 WHEN NEW.account_id = 'acct-jobs'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced resume profile metadata failure');
+                 END;",
+            )
+            .unwrap();
+
+        assert!(publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &next_asset,
+            &next_profile,
+            &next_upload.id,
+        )
+        .is_err());
+
+        assert_eq!(
+            get_resume_source_asset(&pool, "acct-jobs").unwrap(),
+            Some(prior_asset.clone())
+        );
+        let stored_profile = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(stored_profile.source_resume_asset_id, prior_asset.id);
+        assert_eq!(stored_profile.headline, "Prior profile");
+        let lifecycle: (String, String, String, String, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT prior.state, prior_put.state, next.state, next_put.state,
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = prior.id
+                            AND deletion.operation = 'delete'),
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = next.id
+                            AND deletion.operation = 'delete')
+                   FROM object_uploads prior
+                   JOIN object_storage_outbox prior_put
+                     ON prior_put.upload_id = prior.id AND prior_put.operation = 'put'
+                   JOIN object_uploads next ON next.id = ?2
+                   JOIN object_storage_outbox next_put
+                     ON next_put.upload_id = next.id AND next_put.operation = 'put'
+                  WHERE prior.id = ?1",
+                params![prior_upload.id, next_upload.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            lifecycle,
+            (
+                "ready".into(),
+                "completed".into(),
+                "pending".into(),
+                "retry".into(),
+                0,
+                0,
+            )
+        );
+    }
+
+    #[test]
+    fn concurrent_first_resume_publications_commit_once_and_leave_the_loser_pending() {
+        let pool = test_pool();
+        let first_profile = requested_resume_profile("First profile");
+        let second_profile = requested_resume_profile("Second profile");
+        let (first_upload, first_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "concurrent-first",
+            "first.pdf",
+            &"e".repeat(64),
+            128,
+            (None, &first_profile),
+            None,
+        );
+        let (second_upload, second_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "concurrent-second",
+            "second.pdf",
+            &"f".repeat(64),
+            192,
+            (None, &second_profile),
+            None,
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let workers = [
+            (first_asset.clone(), first_profile, first_upload.id.clone()),
+            (
+                second_asset.clone(),
+                second_profile,
+                second_upload.id.clone(),
+            ),
+        ]
+        .into_iter()
+        .map(|(asset, profile, upload_id)| {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                publish_resume_source_asset(&pool, "acct-jobs", &asset, &profile, &upload_id)
+                    .map(|_| ())
+            })
+        })
+        .collect::<Vec<_>>();
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let conflict = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .expect("one concurrent first publication must lose its predecessor fence");
+        assert_eq!(
+            conflict.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::IdempotencyConflict)
+        );
+
+        let current = get_resume_source_asset(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        assert!(current == first_asset || current == second_asset);
+        let (winner, loser, expected_headline) = if current == first_asset {
+            (&first_upload, &second_upload, "First profile")
+        } else {
+            (&second_upload, &first_upload, "Second profile")
+        };
+        assert_eq!(
+            get_profile(&pool, "acct-jobs", "jobs@example.com")
+                .unwrap()
+                .headline,
+            expected_headline
+        );
+        let pointer_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_resume_source_assets WHERE account_id = ?1",
+                params!["acct-jobs"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pointer_count, 1);
+        let winner_lifecycle = upload_lifecycle(&pool, &winner.id);
+        assert_eq!(winner_lifecycle, ("ready".into(), "completed".into(), 0));
+        let loser_lifecycle = upload_lifecycle(&pool, &loser.id);
+        assert_eq!(
+            loser_lifecycle,
+            ("pending".into(), "retry".into(), 0),
+            "the losing verified object remains retryable and unpublished"
+        );
+    }
+
+    #[test]
+    fn same_resume_request_replay_preserves_newer_same_bound_profile() {
+        let pool = test_pool();
+        let requested_profile = requested_resume_profile("Original profile");
+        let (upload, asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "replay-stable",
+            "resume.pdf",
+            &"1".repeat(64),
+            128,
+            (None, &requested_profile),
+            None,
+        );
+        let first =
+            publish_resume_source_asset(&pool, "acct-jobs", &asset, &requested_profile, &upload.id)
+                .unwrap();
+        assert!(!first.replayed);
+
+        let mut newer_profile = first.profile.clone();
+        newer_profile.headline = "Edited after upload".to_string();
+        newer_profile.summary = "Keep this later profile edit.".to_string();
+        let newer_profile = save_profile(&pool, "acct-jobs", &newer_profile).unwrap();
+        assert_eq!(newer_profile.source_resume_asset_id, asset.id);
+
+        let replay =
+            publish_resume_source_asset(&pool, "acct-jobs", &asset, &requested_profile, &upload.id)
+                .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.previous, None);
+        assert_eq!(replay.asset, asset);
+        assert_eq!(replay.profile.headline, "Edited after upload");
+        assert_eq!(replay.profile.summary, "Keep this later profile edit.");
+        assert_eq!(replay.profile.source_resume_asset_id, replay.asset.id);
+
+        let stored = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(stored.headline, newer_profile.headline);
+        assert_eq!(stored.summary, newer_profile.summary);
+        assert_eq!(stored.source_resume_asset_id, replay.asset.id);
+        assert_eq!(
+            upload_lifecycle(&pool, &upload.id),
+            ("ready".into(), "completed".into(), 0)
+        );
+    }
+
+    #[test]
+    fn delayed_resume_request_cannot_replace_a_newer_successor() {
+        let pool = test_pool();
+        let base_request = requested_resume_profile("Base profile");
+        let (base_upload, base_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "delayed-base",
+            "base.pdf",
+            &"2".repeat(64),
+            128,
+            (None, &base_request),
+            None,
+        );
+        let base_publication = publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &base_asset,
+            &base_request,
+            &base_upload.id,
+        )
+        .unwrap();
+
+        let mut request_a = base_publication.profile.clone();
+        request_a.headline = "Delayed A".to_string();
+        let (upload_a, asset_a) = reserve_verified_resume_source_upload(
+            &pool,
+            "delayed-a",
+            "a.pdf",
+            &"3".repeat(64),
+            160,
+            (Some(&base_publication.profile), &request_a),
+            Some(&base_asset.id),
+        );
+        let mut request_b = base_publication.profile.clone();
+        request_b.headline = "Committed B".to_string();
+        let (upload_b, asset_b) = reserve_verified_resume_source_upload(
+            &pool,
+            "delayed-b",
+            "b.pdf",
+            &"4".repeat(64),
+            192,
+            (Some(&base_publication.profile), &request_b),
+            Some(&base_asset.id),
+        );
+
+        let publication_b =
+            publish_resume_source_asset(&pool, "acct-jobs", &asset_b, &request_b, &upload_b.id)
+                .unwrap();
+        assert_eq!(publication_b.previous, Some(base_asset));
+        assert_resume_idempotency_conflict(publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &asset_a,
+            &request_a,
+            &upload_a.id,
+        ));
+
+        assert_eq!(
+            get_resume_source_asset(&pool, "acct-jobs").unwrap(),
+            Some(asset_b.clone())
+        );
+        let stored = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(stored.headline, "Committed B");
+        assert_eq!(stored.source_resume_asset_id, asset_b.id);
+        assert_eq!(
+            upload_lifecycle(&pool, &base_upload.id),
+            ("delete_pending".into(), "completed".into(), 1)
+        );
+        assert_eq!(
+            upload_lifecycle(&pool, &upload_b.id),
+            ("ready".into(), "completed".into(), 0)
+        );
+        assert_eq!(
+            upload_lifecycle(&pool, &upload_a.id),
+            ("pending".into(), "retry".into(), 0)
+        );
+    }
+
+    #[test]
+    fn resume_publication_conflicts_when_profile_base_changes_during_upload() {
+        let pool = test_pool();
+        let base_request = requested_resume_profile("Base profile");
+        let (base_upload, base_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "base-revision-current",
+            "base.pdf",
+            &"5".repeat(64),
+            128,
+            (None, &base_request),
+            None,
+        );
+        let base_publication = publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &base_asset,
+            &base_request,
+            &base_upload.id,
+        )
+        .unwrap();
+
+        let mut requested_replacement = base_publication.profile.clone();
+        requested_replacement.headline = "Upload request".to_string();
+        let (pending_upload, pending_asset) = reserve_verified_resume_source_upload(
+            &pool,
+            "base-revision-pending",
+            "pending.pdf",
+            &"6".repeat(64),
+            160,
+            (Some(&base_publication.profile), &requested_replacement),
+            Some(&base_asset.id),
+        );
+
+        let mut edited_profile = base_publication.profile.clone();
+        edited_profile.headline = "Saved while upload was pending".to_string();
+        let edited_profile = save_profile(&pool, "acct-jobs", &edited_profile).unwrap();
+        assert_resume_idempotency_conflict(publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &pending_asset,
+            &requested_replacement,
+            &pending_upload.id,
+        ));
+
+        assert_eq!(
+            get_resume_source_asset(&pool, "acct-jobs").unwrap(),
+            Some(base_asset.clone())
+        );
+        let stored = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(stored.headline, edited_profile.headline);
+        assert_eq!(stored.source_resume_asset_id, base_asset.id);
+        assert_eq!(
+            upload_lifecycle(&pool, &base_upload.id),
+            ("ready".into(), "completed".into(), 0)
+        );
+        assert_eq!(
+            upload_lifecycle(&pool, &pending_upload.id),
+            ("pending".into(), "retry".into(), 0)
+        );
+    }
+
+    #[test]
+    fn resume_publication_rejects_requested_profile_digest_mismatch() {
+        let pool = test_pool();
+        let requested_profile = requested_resume_profile("Requested profile");
+        let different_profile = requested_resume_profile("Different profile");
+        let requested_digest = resume_requested_profile_sha256(&requested_profile).unwrap();
+        let different_digest = resume_requested_profile_sha256(&different_profile).unwrap();
+        assert_ne!(requested_digest, different_digest);
+        let (upload, asset) = reserve_verified_resume_source_upload_with_requested_digest(
+            &pool,
+            "digest-mismatch",
+            "resume.pdf",
+            &"7".repeat(64),
+            128,
+            (None, &different_digest),
+            None,
+        );
+
+        assert_resume_idempotency_conflict(publish_resume_source_asset(
+            &pool,
+            "acct-jobs",
+            &asset,
+            &requested_profile,
+            &upload.id,
+        ));
+        assert_eq!(get_resume_source_asset(&pool, "acct-jobs").unwrap(), None);
+        let stored = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert!(stored.source_resume_asset_id.is_empty());
+        assert!(stored.headline.is_empty());
+        assert_eq!(
+            upload_lifecycle(&pool, &upload.id),
+            ("pending".into(), "retry".into(), 0)
+        );
     }
 
     #[test]
@@ -453,7 +1164,7 @@ mod tests {
             },
         )
         .unwrap();
-        let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
+        let mut application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
             .unwrap()
             .unwrap();
         let now = now_ms();
@@ -477,9 +1188,1455 @@ mod tests {
             .receipt
             .pointer("/application_identity/id")
             .and_then(Value::as_str)
-            .unwrap();
-        let browser_profile_id = execution_browser_profile_id("acct-jobs", identity_id);
+            .unwrap()
+            .to_string();
+        let identity_email = application
+            .receipt
+            .pointer("/application_identity/email")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let browser_profile_id = execution_browser_profile_id("acct-jobs", &identity_id);
+        let resume = get_resume_version(
+            pool,
+            "acct-jobs",
+            application
+                .resume_version_id
+                .as_deref()
+                .expect("fixture application has a resume"),
+        )
+        .unwrap()
+        .unwrap();
+        let approved_packet = json!({
+            "applicationId": application.id,
+            "jobId": application.job_id,
+            "resumeVersionId": resume.id,
+            "resumeContent": resume.content,
+            "coverLetterContent": application.cover_letter,
+            "answers": {},
+            "verifiedClaimIds": resume.claim_ids,
+            "applicationIdentityId": identity_id,
+            "applicationEmail": identity_email,
+            "browserProfileId": browser_profile_id,
+        });
+        let approved_job = json!({
+            "externalId": posting.external_id,
+            "canonicalUrl": posting.canonical_url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+            "workplace": posting.workplace,
+            "description": posting.description,
+            "source": posting.source,
+            "compensation": posting.compensation,
+        });
+        let admission = json!({ "kind": "review_approval" });
+        let checksum =
+            approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
+                .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 2,
+            "approved_at_ms": now_ms(),
+            "checksum": checksum,
+            "admission": admission,
+            "packet": approved_packet,
+            "job": approved_job,
+        });
+        application = replace_application_receipt(
+            pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt.clone(),
+        )
+        .unwrap()
+        .unwrap();
         (application, run_id, browser_profile_id)
+    }
+
+    struct FinalSubmissionFixture {
+        application: JobApplication,
+        run_id: String,
+        lease_token: String,
+        lease_fence: i64,
+        fingerprint: String,
+        receipt: Value,
+        evidence: Vec<ApplicationEvidence>,
+        object_uploads: Vec<ApplicationObjectBinding>,
+        session: BrowserSession,
+    }
+
+    fn test_submission_evidence_capacity(
+        application_id: &str,
+        run_id: &str,
+    ) -> NewSubmissionEvidenceCapacity {
+        test_submission_evidence_capacity_with_object_cap(
+            application_id,
+            run_id,
+            SUBMISSION_RECEIPT_BUNDLE_MAX_RESERVED_BYTES,
+        )
+    }
+
+    fn test_submission_evidence_capacity_with_object_cap(
+        application_id: &str,
+        run_id: &str,
+        max_object_bytes: i64,
+    ) -> NewSubmissionEvidenceCapacity {
+        let now = now_ms();
+        NewSubmissionEvidenceCapacity {
+            account_id: "acct-jobs".to_string(),
+            application_id: application_id.to_string(),
+            run_id: run_id.to_string(),
+            runner: "cloud".to_string(),
+            reserved_bytes: submission_evidence_reserved_bytes(max_object_bytes).unwrap(),
+            reserved_objects: SUBMISSION_EVIDENCE_RESERVED_OBJECTS,
+            expires_at_ms: now.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS),
+            now_ms: now,
+            limits: UploadLimits {
+                max_object_bytes,
+                max_account_bytes: 512 * 1024 * 1024,
+                max_daily_bytes: 512 * 1024 * 1024,
+                max_account_objects: 1_000,
+            },
+        }
+    }
+
+    fn test_final_submit_proof(application: &JobApplication) -> FinalSubmitProof {
+        let canonical_url = application
+            .receipt
+            .pointer("/approved_execution/job/canonicalUrl")
+            .and_then(Value::as_str)
+            .expect("test application has a frozen canonical job URL");
+        let resume_version_id = application
+            .receipt
+            .pointer("/approved_execution/packet/resumeVersionId")
+            .and_then(Value::as_str)
+            .or(application.resume_version_id.as_deref())
+            .expect("test application has a frozen resume version");
+        let mut documents = Vec::new();
+        if application
+            .receipt
+            .pointer("/approved_execution/packet/coverLetterContent")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            documents.push(FinalSubmitDocumentProof {
+                kind: "cover_letter".to_string(),
+                version_id: None,
+                sha256: "c".repeat(64),
+            });
+        }
+        documents.push(FinalSubmitDocumentProof {
+            kind: "resume".to_string(),
+            version_id: Some(resume_version_id.to_string()),
+            sha256: "b".repeat(64),
+        });
+        let provider_job_key = final_submit_provider_job_key("greenhouse", canonical_url)
+            .expect("test final-submit URL has a provider job key");
+        let files = documents
+            .iter()
+            .map(|document| FinalSubmitFileProof {
+                field_name: document.kind.clone(),
+                name: format!(
+                    "{}-{}.pdf",
+                    if document.kind == "resume" {
+                        "resume"
+                    } else {
+                        "cover-letter"
+                    },
+                    document.sha256
+                ),
+                byte_length: 1_024,
+                sha256: document.sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        let part_order = std::iter::once(FinalSubmitPartOrderProof {
+            kind: "field".to_string(),
+            index: 0,
+        })
+        .chain(
+            files
+                .iter()
+                .enumerate()
+                .map(|(index, _)| FinalSubmitPartOrderProof {
+                    kind: "file".to_string(),
+                    index: i64::try_from(index).unwrap(),
+                }),
+        )
+        .collect();
+        FinalSubmitProof {
+            schema_version: 3,
+            adapter: "greenhouse".to_string(),
+            adapter_version: "2026.07.1-beta.1".to_string(),
+            control: "greenhouse_submit_application".to_string(),
+            job: FinalSubmitJobProof {
+                approved_canonical_url: canonical_url.to_string(),
+                page_url: canonical_url.to_string(),
+            },
+            target: FinalSubmitTargetProof {
+                action_url: canonical_url.to_string(),
+                method: "post".to_string(),
+                enctype: "multipart/form-data".to_string(),
+                form_target: "_self".to_string(),
+                provider_job_key,
+                form_identity: r#"[0,"application-form","","","","",""]"#.to_string(),
+            },
+            files,
+            fields: vec![FinalSubmitFieldProof {
+                field_name: "candidate_name".to_string(),
+                value_byte_length: 0,
+                value_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                    .to_string(),
+            }],
+            part_order,
+            documents,
+        }
+    }
+
+    fn require_frozen_cover_letter(
+        pool: &DbPool,
+        mut application: JobApplication,
+    ) -> JobApplication {
+        application.receipt["approved_execution"]["packet"]["coverLetterContent"] =
+            json!("Dear Acme, I am excited to apply.");
+        let approved = &application.receipt["approved_execution"];
+        let checksum = approved_submission_checksum(
+            approved["schema_version"].as_i64().unwrap(),
+            &approved["packet"],
+            &approved["job"],
+            approved.get("admission"),
+        )
+        .unwrap();
+        application.receipt["approved_execution"]["checksum"] = json!(checksum);
+        replace_application_receipt(
+            pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt.clone(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn store_test_final_submit_proof(
+        pool: &DbPool,
+        mut application: JobApplication,
+        proof: &FinalSubmitProof,
+    ) -> JobApplication {
+        application.receipt[FINAL_SUBMIT_PROOF_KEY] = serde_json::to_value(proof).unwrap();
+        replace_application_receipt(
+            pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt.clone(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn install_final_submit_proof_order_triggers(pool: &DbPool) {
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE test_final_submit_proof_writes (
+                    application_id TEXT PRIMARY KEY
+                 );
+                 CREATE TRIGGER test_record_final_submit_proof_write
+                   AFTER UPDATE OF application_json ON jobs_applications
+                  BEGIN
+                    INSERT OR REPLACE INTO test_final_submit_proof_writes(application_id)
+                    VALUES (NEW.id);
+                  END;
+                 CREATE TRIGGER test_cloud_proof_precedes_click
+                   BEFORE UPDATE OF phase ON jobs_execution_leases
+                   WHEN NEW.phase = 'click_started'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM test_final_submit_proof_writes
+                         WHERE application_id = NEW.application_id
+                    )
+                  BEGIN
+                    SELECT RAISE(ABORT, 'final submit proof missing before cloud click');
+                  END;
+                 CREATE TRIGGER test_local_proof_precedes_click
+                   BEFORE UPDATE OF status ON jobs_local_run_tickets
+                   WHEN NEW.status = 'click_started'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM test_final_submit_proof_writes
+                         WHERE application_id = NEW.application_id
+                    )
+                  BEGIN
+                    SELECT RAISE(ABORT, 'final submit proof missing before local click');
+                  END;",
+            )
+            .unwrap();
+    }
+
+    fn submission_capacity_count(pool: &DbPool, application_id: &str, run_id: &str) -> i64 {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application_id, run_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn invalid_final_submit_proofs(
+        valid: &FinalSubmitProof,
+    ) -> Vec<(&'static str, FinalSubmitProof)> {
+        let resume = valid
+            .documents
+            .iter()
+            .find(|document| document.kind == "resume")
+            .unwrap()
+            .clone();
+
+        let mut wrong_adapter = valid.clone();
+        wrong_adapter.adapter = "lever".to_string();
+        let mut wrong_version = valid.clone();
+        wrong_version.adapter_version = "2026.07.1-beta.0".to_string();
+        let mut wrong_control = valid.clone();
+        wrong_control.control = "generic_submit".to_string();
+        let mut wrong_approved_job = valid.clone();
+        wrong_approved_job.job.approved_canonical_url =
+            "https://boards.greenhouse.io/acme/jobs/another".to_string();
+        let mut wrong_live_job = valid.clone();
+        wrong_live_job.job.page_url = "https://boards.greenhouse.io/acme/jobs/another".to_string();
+        let mut ambiguous_live_job = valid.clone();
+        ambiguous_live_job.job.page_url =
+            format!("{}?gh_jid=another", valid.job.approved_canonical_url);
+        let mut legacy_schema = valid.clone();
+        legacy_schema.schema_version = 2;
+        let mut wrong_target_job = valid.clone();
+        wrong_target_job.target.action_url =
+            "https://boards.greenhouse.io/acme/jobs/another".to_string();
+        let mut wrong_target_key = valid.clone();
+        wrong_target_key.target.provider_job_key = "greenhouse:acme:another".to_string();
+        let mut wrong_target_origin = valid.clone();
+        wrong_target_origin.target.action_url =
+            valid
+                .target
+                .action_url
+                .replacen("boards.greenhouse.io", "job-boards.greenhouse.io", 1);
+        let mut malformed_target_url = valid.clone();
+        malformed_target_url.target.action_url = "not a URL".to_string();
+        let mut confirmation_target_url = valid.clone();
+        confirmation_target_url.target.action_url = format!(
+            "{}/confirmation",
+            valid.target.action_url.trim_end_matches('/'),
+        );
+        let mut wrong_target_method = valid.clone();
+        wrong_target_method.target.method = "get".to_string();
+        let mut wrong_target_enctype = valid.clone();
+        wrong_target_enctype.target.enctype = "application/x-www-form-urlencoded".to_string();
+        let mut wrong_form_target = valid.clone();
+        wrong_form_target.target.form_target = "_blank".to_string();
+        let mut invalid_form_identity = valid.clone();
+        invalid_form_identity.target.form_identity.clear();
+        let mut missing_file_evidence = valid.clone();
+        missing_file_evidence.files.clear();
+        let mut duplicate_file_evidence = valid.clone();
+        duplicate_file_evidence.files[1] = duplicate_file_evidence.files[0].clone();
+        let mut mismatched_file_hash = valid.clone();
+        mismatched_file_hash.files[0].sha256 = "d".repeat(64);
+        let mut invalid_file_field = valid.clone();
+        invalid_file_field.files[0].field_name.clear();
+        let mut oversized_file = valid.clone();
+        oversized_file.files[0].byte_length = 12 * 1024 * 1024 + 1;
+        let mut missing_field_evidence = valid.clone();
+        missing_field_evidence.fields.clear();
+        let mut invalid_field_name = valid.clone();
+        invalid_field_name.fields[0].field_name.clear();
+        let mut non_ascii_field_name = valid.clone();
+        non_ascii_field_name.fields[0].field_name = "candidate_💸".to_string();
+        let mut cross_type_field_overlap = valid.clone();
+        cross_type_field_overlap.fields[0].field_name = valid.files[0].field_name.clone();
+        let mut missing_part_order = valid.clone();
+        missing_part_order.part_order.clear();
+        let mut duplicate_part_order_index = valid.clone();
+        duplicate_part_order_index.part_order[1] = duplicate_part_order_index.part_order[0].clone();
+        let mut out_of_range_part_order_index = valid.clone();
+        out_of_range_part_order_index.part_order[0].index = i64::MAX;
+        let mut negative_part_order_index = valid.clone();
+        negative_part_order_index.part_order[0].index = -1;
+        let mut invalid_part_order_kind = valid.clone();
+        invalid_part_order_kind.part_order[0].kind = "document".to_string();
+        let mut oversized_field_value = valid.clone();
+        oversized_field_value.fields[0].value_byte_length = 65_537;
+        let mut invalid_field_hash = valid.clone();
+        invalid_field_hash.fields[0].value_sha256 = "F".repeat(64);
+        let mut too_many_fields = valid.clone();
+        too_many_fields.fields = vec![too_many_fields.fields[0].clone(); 257];
+        let mut unsorted = valid.clone();
+        unsorted.documents.reverse();
+        let mut duplicate = valid.clone();
+        duplicate.documents = vec![resume.clone(), resume.clone()];
+        let mut missing_documents = valid.clone();
+        missing_documents.documents.clear();
+        let mut uppercase_hash = valid.clone();
+        uppercase_hash
+            .documents
+            .iter_mut()
+            .find(|document| document.kind == "resume")
+            .unwrap()
+            .sha256 = "B".repeat(64);
+        let mut wrong_resume_version = valid.clone();
+        wrong_resume_version
+            .documents
+            .iter_mut()
+            .find(|document| document.kind == "resume")
+            .unwrap()
+            .version_id = Some("wrong-resume-version".to_string());
+        let mut missing_required_cover = valid.clone();
+        missing_required_cover.documents = vec![resume];
+
+        vec![
+            ("wrong adapter", wrong_adapter),
+            ("wrong adapter version", wrong_version),
+            ("wrong control", wrong_control),
+            ("wrong approved job URL", wrong_approved_job),
+            ("wrong live job URL", wrong_live_job),
+            ("ambiguous live job URL", ambiguous_live_job),
+            ("legacy proof schema", legacy_schema),
+            ("same-provider cross-job target", wrong_target_job),
+            ("wrong provider job key", wrong_target_key),
+            ("same-job cross-origin target", wrong_target_origin),
+            ("malformed target URL", malformed_target_url),
+            ("confirmation target URL", confirmation_target_url),
+            ("wrong target method", wrong_target_method),
+            ("wrong target enctype", wrong_target_enctype),
+            ("wrong form target", wrong_form_target),
+            ("invalid target form identity", invalid_form_identity),
+            ("missing outgoing file evidence", missing_file_evidence),
+            ("duplicate outgoing file evidence", duplicate_file_evidence),
+            ("outgoing file hash mismatch", mismatched_file_hash),
+            ("invalid outgoing file field", invalid_file_field),
+            ("oversized outgoing file", oversized_file),
+            ("missing outgoing field evidence", missing_field_evidence),
+            ("invalid outgoing field name", invalid_field_name),
+            ("non-ASCII outgoing field name", non_ascii_field_name),
+            (
+                "cross-type outgoing field overlap",
+                cross_type_field_overlap,
+            ),
+            ("missing global part order", missing_part_order),
+            ("duplicate global part index", duplicate_part_order_index),
+            (
+                "out-of-range global part index",
+                out_of_range_part_order_index,
+            ),
+            ("negative global part index", negative_part_order_index),
+            ("invalid global part kind", invalid_part_order_kind),
+            ("oversized outgoing field value", oversized_field_value),
+            ("invalid outgoing field hash", invalid_field_hash),
+            ("too many outgoing fields", too_many_fields),
+            ("unsorted documents", unsorted),
+            ("duplicate documents", duplicate),
+            ("missing documents", missing_documents),
+            ("uppercase document hash", uppercase_hash),
+            ("resume version mismatch", wrong_resume_version),
+            ("required cover omission", missing_required_cover),
+        ]
+    }
+
+    #[test]
+    fn final_submit_job_binding_matches_only_the_exact_provider_job() {
+        assert_eq!(
+            final_submit_provider_job_key(
+                "greenhouse",
+                "https://boards.greenhouse.io/acme/jobs/123?gh_jid=123&JOB_ID=123#app",
+            )
+            .unwrap(),
+            final_submit_provider_job_key(
+                "greenhouse",
+                "https://job-boards.greenhouse.io/embed/job_app?FOR=acme&for=acme&token=123",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            final_submit_provider_job_key(
+                "lever",
+                "https://jobs.lever.co/acme/posting-123?Lever_Job_Id=posting-123",
+            )
+            .unwrap(),
+            final_submit_provider_job_key(
+                "lever",
+                "https://jobs.lever.co/acme/posting-123/apply?lever-origin=applied",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            final_submit_provider_job_key(
+                "greenhouse",
+                "https://boards.greenhouse.io/acme/jobs/123",
+            )
+            .unwrap(),
+            final_submit_confirmation_provider_job_key(
+                "greenhouse",
+                "https://boards.greenhouse.io/acme/jobs/123/confirmation?Posting_Id=123",
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            final_submit_provider_job_key("lever", "https://jobs.lever.co/acme/posting-123/apply",)
+                .unwrap(),
+            final_submit_confirmation_provider_job_key(
+                "lever",
+                "https://jobs.lever.co/acme/posting-123/confirmation?JOBID=posting-123",
+            )
+            .unwrap(),
+        );
+        assert!(final_submit_confirmation_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/confirmation",
+        )
+        .is_err());
+        assert!(final_submit_confirmation_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/123",
+        )
+        .is_err());
+        assert!(final_submit_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/123/confirmation",
+        )
+        .is_err());
+        assert!(final_submit_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/456",
+        )
+        .is_ok());
+        assert_ne!(
+            final_submit_provider_job_key(
+                "greenhouse",
+                "https://boards.greenhouse.io/acme/jobs/123",
+            )
+            .unwrap(),
+            final_submit_provider_job_key(
+                "greenhouse",
+                "https://boards.greenhouse.io/acme/jobs/456",
+            )
+            .unwrap(),
+        );
+        assert!(final_submit_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/123?gh_jid=456",
+        )
+        .is_err());
+        assert!(final_submit_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/123?gh_jid=123&Gh_Jid=456",
+        )
+        .is_err());
+        assert!(final_submit_provider_job_key(
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/123?postingid=456",
+        )
+        .is_err());
+        assert!(final_submit_provider_job_key(
+            "lever",
+            "https://jobs.lever.co/acme/posting-123?posting_id=posting-456",
+        )
+        .is_err());
+        assert!(final_submit_confirmation_provider_job_key(
+            "lever",
+            "https://jobs.lever.co/acme/posting-123/confirmation?lever_job_id=posting-456",
+        )
+        .is_err());
+        assert!(final_submit_confirmation_provider_job_key(
+            "lever",
+            "https://jobs.lever.co/acme/posting-123/apply",
+        )
+        .is_err());
+        assert!(final_submit_confirmation_provider_job_key(
+            "lever",
+            "https://jobs.lever.co/acme/posting-123",
+        )
+        .is_err());
+        assert!(final_submit_provider_job_key(
+            "lever",
+            "https://jobs.lever.co/acme/posting-123/another",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn final_submit_proof_wire_requires_exact_target_fields_and_denies_extras() {
+        let pool = test_pool();
+        let (application, _, _) = execution_lease_fixture(&pool, "proof-wire-target");
+        let valid = serde_json::to_value(test_final_submit_proof(&application)).unwrap();
+
+        let mut missing_target = valid.clone();
+        missing_target.as_object_mut().unwrap().remove("target");
+        assert!(serde_json::from_value::<FinalSubmitProof>(missing_target).is_err());
+
+        let mut missing_enctype = valid.clone();
+        missing_enctype["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("enctype");
+        assert!(serde_json::from_value::<FinalSubmitProof>(missing_enctype).is_err());
+
+        let mut missing_form_target = valid.clone();
+        missing_form_target["target"]
+            .as_object_mut()
+            .unwrap()
+            .remove("formTarget");
+        assert!(serde_json::from_value::<FinalSubmitProof>(missing_form_target).is_err());
+
+        let mut extra_target_field = valid.clone();
+        extra_target_field["target"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<FinalSubmitProof>(extra_target_field).is_err());
+
+        let mut missing_files = valid.clone();
+        missing_files.as_object_mut().unwrap().remove("files");
+        assert!(serde_json::from_value::<FinalSubmitProof>(missing_files).is_err());
+
+        let mut extra_file_field = valid.clone();
+        extra_file_field["files"][0]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<FinalSubmitProof>(extra_file_field).is_err());
+
+        let mut missing_fields = valid.clone();
+        missing_fields.as_object_mut().unwrap().remove("fields");
+        assert!(serde_json::from_value::<FinalSubmitProof>(missing_fields).is_err());
+
+        let mut missing_part_order = valid.clone();
+        missing_part_order
+            .as_object_mut()
+            .unwrap()
+            .remove("partOrder");
+        assert!(serde_json::from_value::<FinalSubmitProof>(missing_part_order).is_err());
+
+        let mut extra_part_order_key = valid.clone();
+        extra_part_order_key["partOrder"][0]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<FinalSubmitProof>(extra_part_order_key).is_err());
+
+        let mut extra_field_evidence_key = valid.clone();
+        extra_field_evidence_key["fields"][0]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<FinalSubmitProof>(extra_field_evidence_key).is_err());
+
+        let mut extra_proof_field = valid;
+        extra_proof_field["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<FinalSubmitProof>(extra_proof_field).is_err());
+    }
+
+    #[test]
+    fn cloud_final_submit_proof_is_strict_and_atomic_with_click_and_capacity() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "proof-cloud-strict");
+        let application = require_frozen_cover_letter(&pool, application);
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "proof-cloud-worker",
+        )
+        .unwrap();
+        install_final_submit_proof_order_triggers(&pool);
+        let valid = test_final_submit_proof(&application);
+        assert_eq!(
+            valid
+                .documents
+                .iter()
+                .map(|document| document.kind.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cover_letter", "resume"]
+        );
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
+
+        for (label, invalid) in invalid_final_submit_proofs(&valid) {
+            assert!(
+                matches!(
+                    start_irreversible_submission(
+                        &pool,
+                        "acct-jobs",
+                        &application.id,
+                        &run_id,
+                        &lease.lease_token,
+                        lease.fence,
+                        &invalid,
+                        &capacity,
+                    ),
+                    Err(ExecutionLeaseError::InvalidRequest)
+                ),
+                "{label} must fail closed"
+            );
+            let stored = get_application(&pool, "acct-jobs", &application.id)
+                .unwrap()
+                .unwrap();
+            assert!(
+                stored.receipt.get(FINAL_SUBMIT_PROOF_KEY).is_none(),
+                "{label}"
+            );
+            assert_eq!(
+                submission_capacity_count(&pool, &application.id, &run_id),
+                0
+            );
+            let phase: String = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT phase FROM jobs_execution_leases WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(phase, "prepared", "{label}");
+        }
+
+        let mut quota_blocked = capacity.clone();
+        quota_blocked.limits.max_account_bytes = quota_blocked.reserved_bytes;
+        quota_blocked.limits.max_account_objects = quota_blocked.reserved_objects;
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO object_uploads (
+                    id, account_id, object_kind, logical_id, storage_scope, object_key,
+                    size_bytes, sha256, content_type, expires_at_ms, state, metadata_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'proof-cloud-existing-object', 'acct-jobs', 'session_audit',
+                    'proof-cloud-existing-object', 'audit',
+                    'objects/accounts/acct-jobs/proof-cloud-existing-object', 1, ?1,
+                    'application/json', ?2, 'ready', '{}', ?3, ?3
+                 )",
+                params!["d".repeat(64), i64::MAX, now_ms()],
+            )
+            .unwrap();
+        assert!(start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            &valid,
+            &quota_blocked,
+        )
+        .is_err());
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert!(stored.receipt.get(FINAL_SUBMIT_PROOF_KEY).is_none());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT phase FROM jobs_execution_leases WHERE run_id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "prepared"
+        );
+        pool.get()
+            .unwrap()
+            .execute(
+                "DELETE FROM object_uploads WHERE id = 'proof-cloud-existing-object'",
+                [],
+            )
+            .unwrap();
+
+        let started = start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            &valid,
+            &quota_blocked,
+        )
+        .unwrap();
+        assert_eq!(started.phase, "click_started");
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_final_submit_proof(&stored).unwrap(), valid);
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            1
+        );
+    }
+
+    #[test]
+    fn cloud_final_submit_proof_exact_replay_requires_pre_click_authority() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "proof-cloud-replay");
+        let proof = test_final_submit_proof(&application);
+        let application = store_test_final_submit_proof(&pool, application, &proof);
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "proof-replay-worker",
+        )
+        .unwrap();
+        install_final_submit_proof_order_triggers(&pool);
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            &proof,
+            &capacity,
+        )
+        .unwrap();
+        assert!(matches!(
+            start_irreversible_submission(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &lease.lease_token,
+                lease.fence,
+                &proof,
+                &capacity,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            1
+        );
+
+        let changed_pool = test_pool();
+        let (changed_application, changed_run_id, changed_profile_id) =
+            execution_lease_fixture(&changed_pool, "proof-cloud-conflict");
+        let original = test_final_submit_proof(&changed_application);
+        let changed_application =
+            store_test_final_submit_proof(&changed_pool, changed_application, &original);
+        let changed_lease = claim_execution_lease(
+            &changed_pool,
+            "acct-jobs",
+            &changed_application.id,
+            &changed_run_id,
+            &changed_profile_id,
+            "proof-conflict-worker",
+        )
+        .unwrap();
+        let mut changed = original.clone();
+        changed.fields[0].value_sha256 = "e".repeat(64);
+        assert!(matches!(
+            start_irreversible_submission(
+                &changed_pool,
+                "acct-jobs",
+                &changed_application.id,
+                &changed_run_id,
+                &changed_lease.lease_token,
+                changed_lease.fence,
+                &changed,
+                &test_submission_evidence_capacity(&changed_application.id, &changed_run_id,),
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        let stored = get_application(&changed_pool, "acct-jobs", &changed_application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_final_submit_proof(&stored).unwrap(), original);
+        assert_eq!(
+            submission_capacity_count(&changed_pool, &changed_application.id, &changed_run_id,),
+            0
+        );
+        assert_eq!(
+            changed_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT phase FROM jobs_execution_leases WHERE run_id = ?1",
+                    params![changed_run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "prepared"
+        );
+    }
+
+    #[test]
+    fn local_final_submit_proof_and_capacity_commit_before_click_or_roll_back_together() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture(&pool, "proof-local-atomic");
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_some()
+        );
+        let application = update_application(&pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        upsert_browser_session(
+            &pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "local".to_string(),
+                status: "running".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Ready to submit".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        install_final_submit_proof_order_triggers(&pool);
+        let proof = test_final_submit_proof(&application);
+        let mut invalid = proof.clone();
+        invalid.control = "generic_submit".to_string();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        let application_before_invalid = serde_json::to_value(&application).unwrap();
+
+        assert!(
+            !local_run_submit_authorized(&pool, &run_id, &ticket_hash, &invalid, &capacity,)
+                .unwrap()
+        );
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            application_before_invalid
+        );
+        assert!(stored.receipt.get(FINAL_SUBMIT_PROOF_KEY).is_none());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "claimed"
+        );
+
+        let application = store_test_final_submit_proof(&pool, stored, &proof);
+        let application_before_conflict = serde_json::to_value(&application).unwrap();
+        let mut conflicting = proof.clone();
+        let conflicting_sha256 = "e".repeat(64);
+        conflicting
+            .documents
+            .iter_mut()
+            .find(|document| document.kind == "resume")
+            .unwrap()
+            .sha256 = conflicting_sha256.clone();
+        let conflicting_file = conflicting
+            .files
+            .iter_mut()
+            .find(|file| file.name.starts_with("resume-"))
+            .unwrap();
+        conflicting_file.name = format!("resume-{conflicting_sha256}.pdf");
+        conflicting_file.sha256 = conflicting_sha256;
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &conflicting,
+            &capacity,
+        )
+        .unwrap());
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored).unwrap(),
+            application_before_conflict
+        );
+        assert_eq!(stored_final_submit_proof(&stored).unwrap(), proof);
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "claimed"
+        );
+
+        assert!(
+            local_run_submit_authorized(&pool, &run_id, &ticket_hash, &proof, &capacity,).unwrap()
+        );
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored_final_submit_proof(&stored).unwrap(), proof);
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            1
+        );
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "click_started"
+        );
+        assert!(
+            !local_run_submit_authorized(&pool, &run_id, &ticket_hash, &proof, &capacity,).unwrap()
+        );
+    }
+
+    #[test]
+    fn submission_evidence_capacity_uses_the_exact_storage_bundle_cap() {
+        let one_mib = 1024 * 1024;
+        let one_mib_capacity =
+            test_submission_evidence_capacity_with_object_cap("application", "run", one_mib);
+        assert_eq!(
+            one_mib_capacity.reserved_bytes,
+            SUBMISSION_EVIDENCE_PAYLOAD_RESERVED_BYTES + one_mib
+        );
+        validate_submission_evidence_capacity_binding(
+            "acct-jobs",
+            "application",
+            "run",
+            &one_mib_capacity,
+            one_mib_capacity.now_ms,
+        )
+        .unwrap();
+
+        let larger_than_bundle_cap = 16 * 1024 * 1024;
+        let capped_capacity = test_submission_evidence_capacity_with_object_cap(
+            "application",
+            "run",
+            larger_than_bundle_cap,
+        );
+        assert_eq!(
+            capped_capacity.reserved_bytes,
+            SUBMISSION_EVIDENCE_PAYLOAD_RESERVED_BYTES
+                + SUBMISSION_RECEIPT_BUNDLE_MAX_RESERVED_BYTES
+        );
+        validate_submission_evidence_capacity_binding(
+            "acct-jobs",
+            "application",
+            "run",
+            &capped_capacity,
+            capped_capacity.now_ms,
+        )
+        .unwrap();
+
+        let mut oversized = one_mib_capacity;
+        oversized.reserved_bytes += 1;
+        assert!(matches!(
+            validate_submission_evidence_capacity_binding(
+                "acct-jobs",
+                "application",
+                "run",
+                &oversized,
+                oversized.now_ms,
+            ),
+            Err(ExecutionLeaseError::InvalidRequest)
+        ));
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reserve_submission_object(
+        pool: &DbPool,
+        application_id: &str,
+        run_id: &str,
+        runner: &str,
+        evidence_kind: &str,
+        object_key: &str,
+        size_bytes: i64,
+        sha256: &str,
+        content_type: &str,
+    ) -> ApplicationObjectBinding {
+        let now = now_ms();
+        let reservation = crate::db::object_uploads::reserve_application_object_upload(
+            pool,
+            application_id,
+            &NewObjectUpload {
+                account_id: "acct-jobs".to_string(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: format!("jobs-submission:{application_id}:{evidence_kind}"),
+                session_id: None,
+                storage_scope: StorageScope::Artifact,
+                object_key: object_key.to_string(),
+                size_bytes,
+                sha256: sha256.to_string(),
+                content_type: content_type.to_string(),
+                expires_at_ms: now + 86_400_000,
+                metadata_json: json!({
+                    "artifact_class": "jobs_submission_evidence",
+                    "jobs_application_id": application_id,
+                    "jobs_run_id": run_id,
+                    "jobs_runner": runner,
+                    "evidence_kind": evidence_kind,
+                }),
+                now_ms: now,
+                limits: UploadLimits {
+                    max_object_bytes: 1_024,
+                    max_account_bytes: 4_096,
+                    max_daily_bytes: 4_096,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .unwrap();
+        assert!(reservation.needs_put);
+        ApplicationObjectBinding {
+            upload_id: reservation.upload.id,
+            object_key: reservation.upload.object_key,
+            size_bytes: reservation.upload.size_bytes,
+            sha256: reservation.upload.sha256,
+            content_type: reservation.upload.content_type,
+        }
+    }
+
+    fn final_submission_fixture(pool: &DbPool, suffix: &str) -> FinalSubmissionFixture {
+        let (mut application, run_id, browser_profile_id) = execution_lease_fixture(pool, suffix);
+        let posting = get_posting(pool, "acct-jobs", &application.job_id)
+            .unwrap()
+            .unwrap();
+        let resume = get_resume_version(
+            pool,
+            "acct-jobs",
+            application
+                .resume_version_id
+                .as_deref()
+                .expect("fixture application has a resume"),
+        )
+        .unwrap()
+        .unwrap();
+        let identity_id = application
+            .receipt
+            .pointer("/application_identity/id")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let identity_email = application
+            .receipt
+            .pointer("/application_identity/email")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let confirmation_url = format!(
+            "{}/confirmation",
+            posting.canonical_url.trim_end_matches('/')
+        );
+        let approved_at_ms = now_ms();
+        let approved_packet = json!({
+            "applicationId": application.id,
+            "jobId": application.job_id,
+            "resumeVersionId": resume.id,
+            "resumeContent": resume.content,
+            "coverLetterContent": application.cover_letter,
+            "answers": {
+                "application_email": identity_email,
+                "sponsorship_required": "No",
+            },
+            "verifiedClaimIds": resume.claim_ids,
+            "applicationIdentityId": identity_id,
+            "applicationEmail": identity_email,
+            "browserProfileId": browser_profile_id,
+        });
+        let approved_job = json!({
+            "externalId": posting.external_id,
+            "canonicalUrl": posting.canonical_url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+            "workplace": posting.workplace,
+            "description": posting.description,
+            "source": "greenhouse",
+            "compensation": posting.compensation,
+        });
+        let admission = json!({ "kind": "review_approval" });
+        let checksum =
+            approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
+                .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 2,
+            "approved_at_ms": approved_at_ms,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": approved_packet,
+            "job": approved_job,
+        });
+        application.receipt["packet_revisions"] = json!([{
+            "revision_no": 2,
+            "reason": "intervention_answer_changed",
+            "created_at_ms": approved_at_ms,
+        }]);
+        application = replace_application_receipt(
+            pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        application = update_application(pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        reserve_application_attempt(pool, "acct-jobs", &application.id, "cloud").unwrap();
+        update_attempt_reservation_status(pool, "acct-jobs", &application.id, "running").unwrap();
+        let lease = claim_execution_lease(
+            pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &format!("{suffix}-worker"),
+        )
+        .unwrap();
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        let final_submit_proof = test_final_submit_proof(&application);
+        start_irreversible_submission(
+            pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            &final_submit_proof,
+            &capacity,
+        )
+        .unwrap();
+        application = get_application(pool, "acct-jobs", &application.id)
+            .unwrap()
+            .expect("irreversible start keeps the application");
+        assert_eq!(
+            stored_final_submit_proof(&application).unwrap(),
+            final_submit_proof
+        );
+        finish_execution_lease(
+            pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            "submitted",
+        )
+        .unwrap();
+
+        let fingerprint = "a".repeat(64);
+        let resume_key = format!("accounts/acct-jobs/jobs/{suffix}/resume.pdf");
+        let confirmation_key = format!("accounts/acct-jobs/jobs/{suffix}/confirmation.png");
+        let receipt_key = format!("accounts/acct-jobs/jobs/{suffix}/receipt.json");
+        let resume_sha256 = "b".repeat(64);
+        let confirmation_sha256 = "c".repeat(64);
+        let receipt_sha256 = "d".repeat(64);
+        let receipt_size_bytes = 123;
+        let mut receipt = json!({
+            "schemaVersion": 1,
+            "receiptId": format!("receipt-{suffix}"),
+            "accountId": "acct-jobs",
+            "applicationId": application.id,
+            "runId": run_id,
+            "runner": "cloud",
+            "applicationIdentityId": identity_id,
+            "browserProfileId": browser_profile_id,
+            "adapter": "greenhouse",
+            "adapterVersion": "2026.07.1-beta.1",
+            "job": application.receipt["approved_execution"]["job"],
+            "packet": {
+                "jobId": application.receipt["approved_execution"]["packet"]["jobId"],
+                "resumeVersionId": application.receipt["approved_execution"]["packet"]["resumeVersionId"],
+                "approvedPacketChecksum": application.receipt["approved_execution"]["checksum"],
+                "answers": application.receipt["approved_execution"]["packet"]["answers"],
+                "verifiedClaimIds": application.receipt["approved_execution"]["packet"]["verifiedClaimIds"],
+                "applicationEmail": application.receipt["approved_execution"]["packet"]["applicationEmail"],
+            },
+            "_bluey_server_submission_fingerprint_v1": fingerprint,
+            "documents": [{
+                "kind": "resume",
+                "versionId": application.resume_version_id,
+                "storageKey": resume_key,
+                "sha256": resume_sha256,
+                "mediaType": "application/pdf",
+            }],
+            "events": [],
+            "result": {
+                "status": "submitted",
+                "submitHttpStatus": 302,
+                "confirmationText": "Application received",
+                "confirmationUrl": confirmation_url,
+                "submittedAt": "2026-08-04T12:00:00.000Z",
+                "issues": [],
+            },
+            "finalUrl": confirmation_url,
+            "screenshotKeys": [confirmation_key],
+            "evidenceObjects": [{
+                "kind": "screenshot",
+                "storageKey": confirmation_key,
+                "sha256": confirmation_sha256,
+                "mediaType": "image/png",
+                "sizeBytes": 84,
+            }, {
+                "kind": "resume",
+                "storageKey": resume_key,
+                "sha256": resume_sha256,
+                "mediaType": "application/pdf",
+                "sizeBytes": 42,
+            }],
+            "receiptObject": {
+                "storageKey": receipt_key,
+                "sha256": receipt_sha256,
+                "mediaType": "application/json",
+                "sizeBytes": receipt_size_bytes,
+                "schemaVersion": 1,
+            },
+        });
+        receipt.as_object_mut().unwrap().insert(
+            SERVER_SUBMISSION_AUTHORITY_KEY.to_string(),
+            json!({
+                "schemaVersion": 1,
+                "preSubmissionReceipt": application.receipt,
+                "executionAuthority": {
+                    "kind": "cloud_execution_lease",
+                    "ownerId": format!("{suffix}-worker"),
+                    "leaseTokenSha256": execution_lease_token_hash(&lease.lease_token),
+                    "fence": lease.fence,
+                    "phase": "submitted",
+                },
+            }),
+        );
+        let evidence = vec![
+            ApplicationEvidence {
+                id: String::new(),
+                application_id: application.id.clone(),
+                kind: "resume".to_string(),
+                label: "Resume submitted".to_string(),
+                provider: "greenhouse".to_string(),
+                file_name: "resume.pdf".to_string(),
+                media_type: "application/pdf".to_string(),
+                storage_key: resume_key.clone(),
+                sha256: resume_sha256.clone(),
+                resume_version_id: application.resume_version_id.clone(),
+                occurred_at_ms: 0,
+                metadata: json!({ "size_bytes": 42 }),
+                created_at_ms: 0,
+            },
+            ApplicationEvidence {
+                id: String::new(),
+                application_id: application.id.clone(),
+                kind: "application_receipt".to_string(),
+                label: "Application receipt bundle".to_string(),
+                provider: "greenhouse".to_string(),
+                file_name: format!("receipt-{suffix}.json"),
+                media_type: "application/json".to_string(),
+                storage_key: receipt_key.clone(),
+                sha256: receipt_sha256.clone(),
+                resume_version_id: application.resume_version_id.clone(),
+                occurred_at_ms: 0,
+                metadata: json!({
+                    "receipt_id": format!("receipt-{suffix}"),
+                    "schema_version": 1,
+                    "immutable": true,
+                    "size_bytes": receipt_size_bytes,
+                }),
+                created_at_ms: 0,
+            },
+            ApplicationEvidence {
+                id: String::new(),
+                application_id: application.id.clone(),
+                kind: "submission_confirmation".to_string(),
+                label: "Application received".to_string(),
+                provider: "greenhouse".to_string(),
+                file_name: "confirmation.png".to_string(),
+                media_type: "image/png".to_string(),
+                storage_key: confirmation_key.clone(),
+                sha256: confirmation_sha256.clone(),
+                resume_version_id: application.resume_version_id.clone(),
+                occurred_at_ms: 0,
+                metadata: json!({
+                    "immutable": true,
+                    "confirmation": "Application received",
+                    "evidence_strength": "browser_confirmed",
+                    "receipt_id": format!("receipt-{suffix}"),
+                    "screenshot_keys": [confirmation_key],
+                    "screenshot_index": 1,
+                    "screenshot_count": 1,
+                    "size_bytes": 84,
+                }),
+                created_at_ms: 0,
+            },
+        ];
+        let object_uploads = vec![
+            reserve_submission_object(
+                pool,
+                &application.id,
+                &run_id,
+                "cloud",
+                "resume",
+                &resume_key,
+                42,
+                &resume_sha256,
+                "application/pdf",
+            ),
+            reserve_submission_object(
+                pool,
+                &application.id,
+                &run_id,
+                "cloud",
+                "submission_confirmation",
+                &confirmation_key,
+                84,
+                &confirmation_sha256,
+                "image/png",
+            ),
+            reserve_submission_object(
+                pool,
+                &application.id,
+                &run_id,
+                "cloud",
+                "application_receipt",
+                &receipt_key,
+                receipt_size_bytes,
+                &receipt_sha256,
+                "application/json",
+            ),
+        ];
+        let mut session = list_browser_sessions(pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == run_id)
+            .unwrap();
+        session.status = "complete".to_string();
+
+        FinalSubmissionFixture {
+            application,
+            run_id,
+            lease_token: lease.lease_token,
+            lease_fence: lease.fence,
+            fingerprint,
+            receipt,
+            evidence,
+            object_uploads,
+            session,
+        }
     }
 
     fn local_run_authority_fixture(
@@ -534,7 +2691,7 @@ mod tests {
             },
         )
         .unwrap();
-        let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
+        let mut application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
             .unwrap()
             .unwrap();
         let identity_id = application
@@ -544,6 +2701,65 @@ mod tests {
             .unwrap()
             .to_string();
         let browser_profile_id = execution_browser_profile_id("acct-jobs", &identity_id);
+        let identity_email = application
+            .receipt
+            .pointer("/application_identity/email")
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let resume = get_resume_version(
+            pool,
+            "acct-jobs",
+            application
+                .resume_version_id
+                .as_deref()
+                .expect("fixture application has a resume"),
+        )
+        .unwrap()
+        .unwrap();
+        let approved_packet = json!({
+            "applicationId": application.id,
+            "jobId": application.job_id,
+            "resumeVersionId": resume.id,
+            "resumeContent": resume.content,
+            "coverLetterContent": application.cover_letter,
+            "answers": {},
+            "verifiedClaimIds": resume.claim_ids,
+            "applicationIdentityId": identity_id,
+            "applicationEmail": identity_email,
+            "browserProfileId": browser_profile_id,
+        });
+        let approved_job = json!({
+            "externalId": posting.external_id,
+            "canonicalUrl": posting.canonical_url,
+            "company": posting.company,
+            "title": posting.title,
+            "location": posting.location,
+            "workplace": posting.workplace,
+            "description": posting.description,
+            "source": posting.source,
+            "compensation": posting.compensation,
+        });
+        let admission = json!({ "kind": "review_approval" });
+        let checksum =
+            approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
+                .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 2,
+            "approved_at_ms": now_ms(),
+            "checksum": checksum,
+            "admission": admission,
+            "packet": approved_packet,
+            "job": approved_job,
+        });
+        application = replace_application_receipt(
+            pool,
+            "acct-jobs",
+            &application.id,
+            application.receipt.clone(),
+        )
+        .unwrap()
+        .unwrap();
         let ticket_hash = format!("ticket-hash-{suffix}");
         save_local_run_ticket(
             pool,
@@ -566,6 +2782,51 @@ mod tests {
         )
         .unwrap();
         (application, run_id, ticket_hash, identity_id)
+    }
+
+    fn local_click_started_fixture(
+        pool: &DbPool,
+        suffix: &str,
+    ) -> (JobApplication, String, String) {
+        let (application, run_id, ticket_hash, _) = local_run_authority_fixture(pool, suffix);
+        assert!(
+            claim_authorized_local_run_ticket(pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_some()
+        );
+        let application = update_application(pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        upsert_browser_session(
+            pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: "local".to_string(),
+                status: "running".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Ready to submit".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        assert!(local_run_submit_authorized(
+            pool,
+            &run_id,
+            &ticket_hash,
+            &test_final_submit_proof(&application),
+            &capacity,
+        )
+        .unwrap());
+        let application = get_application(pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        (application, run_id, ticket_hash)
     }
 
     fn answer_intervention_fixture(
@@ -771,10 +3032,7 @@ mod tests {
         input
     }
 
-    fn prepare_archivable_global_candidate(
-        pool: &DbPool,
-        id: &str,
-    ) -> DiscoveredJobInput {
+    fn prepare_archivable_global_candidate(pool: &DbPool, id: &str) -> DiscoveredJobInput {
         let input = insert_global_candidate(
             pool,
             id,
@@ -861,32 +3119,892 @@ mod tests {
     }
 
     #[test]
-    fn final_submission_transaction_rolls_back_if_the_bound_session_disappears() {
+    fn final_submission_requires_one_valid_immutable_receipt() {
+        let application_id = "app-final-evidence";
+        let resume_version_id = Some("resume-final-evidence".to_string());
+        let resume = ApplicationEvidence {
+            id: String::new(),
+            application_id: application_id.to_string(),
+            kind: "resume".to_string(),
+            label: "Resume submitted".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "resume.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            storage_key: "request-owned/resume".to_string(),
+            sha256: "a".repeat(64),
+            resume_version_id: resume_version_id.clone(),
+            occurred_at_ms: 0,
+            metadata: json!({}),
+            created_at_ms: 0,
+        };
+        let confirmation = ApplicationEvidence {
+            id: String::new(),
+            application_id: application_id.to_string(),
+            kind: "submission_confirmation".to_string(),
+            label: "Application received".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "confirmation.png".to_string(),
+            media_type: "image/png".to_string(),
+            storage_key: "request-owned/confirmation".to_string(),
+            sha256: "b".repeat(64),
+            resume_version_id: resume_version_id.clone(),
+            occurred_at_ms: 0,
+            metadata: json!({ "confirmation": "Application received" }),
+            created_at_ms: 0,
+        };
+        let receipt = ApplicationEvidence {
+            id: String::new(),
+            application_id: application_id.to_string(),
+            kind: "application_receipt".to_string(),
+            label: "Application receipt bundle".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "receipt-final-evidence.json".to_string(),
+            media_type: "application/json".to_string(),
+            storage_key: "request-owned/receipt".to_string(),
+            sha256: "c".repeat(64),
+            resume_version_id,
+            occurred_at_ms: 0,
+            metadata: json!({
+                "receipt_id": "receipt-final-evidence",
+                "schema_version": 1,
+                "immutable": true,
+                "size_bytes": 123
+            }),
+            created_at_ms: 0,
+        };
+
+        let missing_receipt = prepare_submission_evidence(
+            application_id,
+            &"d".repeat(64),
+            &[resume.clone(), confirmation.clone()],
+            1,
+        )
+        .err()
+        .expect("submission without an immutable receipt must fail");
+        assert!(missing_receipt.to_string().contains(
+            "final submission needs one resume, one to four confirmations, and one receipt"
+        ));
+
+        let mut mutable_receipt = receipt.clone();
+        mutable_receipt.metadata["immutable"] = json!(false);
+        let mutable_receipt_error = prepare_submission_evidence(
+            application_id,
+            &"e".repeat(64),
+            &[resume.clone(), confirmation.clone(), mutable_receipt],
+            1,
+        )
+        .err()
+        .expect("submission with mutable receipt metadata must fail");
+        assert!(mutable_receipt_error
+            .to_string()
+            .contains("application receipt metadata is incomplete"));
+
+        assert_eq!(
+            prepare_submission_evidence(
+                application_id,
+                &"f".repeat(64),
+                &[resume, confirmation, receipt],
+                1,
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn final_submission_commits_exact_authority_and_durable_object_bindings() {
         let pool = test_pool();
-        let (application, run_id, browser_profile_id) =
-            execution_lease_fixture(&pool, "receipt-rollback");
-        let application = update_application(&pool, "acct-jobs", &application.id, "running", None)
+        let fixture = final_submission_fixture(&pool, "receipt-commit");
+        assert_eq!(
+            fixture.receipt.pointer(&format!(
+                "/{SERVER_SUBMISSION_AUTHORITY_KEY}/preSubmissionReceipt"
+            )),
+            Some(&fixture.application.receipt)
+        );
+        assert!(fixture
+            .receipt
+            .pointer(&format!(
+                "/{SERVER_SUBMISSION_AUTHORITY_KEY}/preSubmissionReceipt/approved_execution"
+            ))
+            .is_some());
+        assert!(fixture
+            .receipt
+            .pointer(&format!(
+                "/{SERVER_SUBMISSION_AUTHORITY_KEY}/preSubmissionReceipt/packet_revisions/0"
+            ))
+            .is_some());
+
+        let mut stale_authority = fixture.receipt.clone();
+        stale_authority[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            ["approved_execution"]["checksum"] = json!("0".repeat(64));
+        let error = validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &stale_authority,
+            "cloud",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("submission authority does not match the approved packet"));
+
+        let finalized = finalize_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt.clone(),
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
+        )
+        .unwrap();
+        let SubmissionFinalizeResult::Committed(application) = finalized else {
+            panic!("first finalization must commit");
+        };
+        assert_eq!(application.state, "submitted");
+        assert_eq!(application.receipt, fixture.receipt);
+        assert_eq!(
+            list_application_evidence(&pool, "acct-jobs", Some(&application.id))
+                .unwrap()
+                .len(),
+            3
+        );
+        let conn = pool.get().unwrap();
+        for binding in &fixture.object_uploads {
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM object_uploads WHERE id = ?1",
+                    params![binding.upload_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "ready");
+            let outbox_state: String = conn
+                .query_row(
+                    "SELECT state FROM object_storage_outbox
+                      WHERE upload_id = ?1 AND operation = 'put'",
+                    params![binding.upload_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(outbox_state, "completed");
+        }
+        let (capacity_state, capacity_expiry, capacity_completed_at_ms): (
+            String,
+            i64,
+            Option<i64>,
+        ) = conn
+            .query_row(
+                "SELECT state, expires_at_ms, completed_at_ms
+                   FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, fixture.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(capacity_state, "committed");
+        assert_eq!(
+            capacity_expiry,
+            SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRES_AT_MS
+        );
+        assert!(capacity_completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn concurrent_identical_final_submission_calls_commit_once_and_replay_exactly() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-concurrent-identical");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let pool = pool.clone();
+            let application_id = fixture.application.id.clone();
+            let run_id = fixture.run_id.clone();
+            let receipt = fixture.receipt.clone();
+            let fingerprint = fixture.fingerprint.clone();
+            let evidence = fixture.evidence.clone();
+            let object_uploads = fixture.object_uploads.clone();
+            let session = fixture.session.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                finalize_submission(
+                    &pool,
+                    "acct-jobs",
+                    &application_id,
+                    &run_id,
+                    "cloud",
+                    receipt,
+                    &fingerprint,
+                    &evidence,
+                    &object_uploads,
+                    &session,
+                    None,
+                )
+            }));
+        }
+
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| { matches!(result, Ok(SubmissionFinalizeResult::Committed(_))) })
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| { matches!(result, Ok(SubmissionFinalizeResult::Replayed(_))) })
+                .count(),
+            1
+        );
+        for result in results {
+            let application = match result.unwrap() {
+                SubmissionFinalizeResult::Committed(application)
+                | SubmissionFinalizeResult::Replayed(application) => application,
+            };
+            assert_eq!(application.state, "submitted");
+            assert_eq!(application.receipt, fixture.receipt);
+        }
+        assert_eq!(
+            list_application_evidence(&pool, "acct-jobs", Some(&fixture.application.id))
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn concurrent_different_final_submission_payloads_have_one_exact_winner() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-concurrent-conflict");
+        let conflicting_fingerprint = "e".repeat(64);
+        let mut conflicting_receipt = fixture.receipt.clone();
+        conflicting_receipt["_bluey_server_submission_fingerprint_v1"] =
+            json!(conflicting_fingerprint);
+        conflicting_receipt["result"]["confirmationText"] = json!("Your application was submitted");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for (receipt, fingerprint) in [
+            (fixture.receipt.clone(), fixture.fingerprint.clone()),
+            (conflicting_receipt.clone(), conflicting_fingerprint.clone()),
+        ] {
+            let pool = pool.clone();
+            let application_id = fixture.application.id.clone();
+            let run_id = fixture.run_id.clone();
+            let evidence = fixture.evidence.clone();
+            let object_uploads = fixture.object_uploads.clone();
+            let session = fixture.session.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                finalize_submission(
+                    &pool,
+                    "acct-jobs",
+                    &application_id,
+                    &run_id,
+                    "cloud",
+                    receipt,
+                    &fingerprint,
+                    &evidence,
+                    &object_uploads,
+                    &session,
+                    None,
+                )
+            }));
+        }
+
+        barrier.wait();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| { matches!(result, Ok(SubmissionFinalizeResult::Committed(_))) })
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    result.as_ref().err().is_some_and(|error| {
+                        error
+                            .to_string()
+                            .contains("application already has a different final receipt")
+                    })
+                })
+                .count(),
+            1
+        );
+        let stored = get_application(&pool, "acct-jobs", &fixture.application.id)
             .unwrap()
             .unwrap();
-        reserve_application_attempt(&pool, "acct-jobs", &application.id, "cloud").unwrap();
-        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running")
+        assert_eq!(stored.state, "submitted");
+        assert!(stored.receipt == fixture.receipt || stored.receipt == conflicting_receipt);
+        assert_eq!(
+            list_application_evidence(&pool, "acct-jobs", Some(&fixture.application.id))
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn final_submit_proof_and_claims_remain_frozen_after_mutable_fact_deletion() {
+        let pool = test_pool();
+        let fact = upsert_fact(
+            &pool,
+            "acct-jobs",
+            &CareerFact {
+                id: "proof-frozen-fact".to_string(),
+                category: "achievement".to_string(),
+                label: "Reliability improvement".to_string(),
+                value: json!({"metric": "30%", "system": "checkout"}),
+                source: "user_entry".to_string(),
+                verification_status: "confirmed".to_string(),
+                confirmed_at_ms: None,
+                confirmed_by: None,
+                schema_version: 1,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let mut fixture = final_submission_fixture(&pool, "proof-frozen-fact");
+        fixture.application.receipt["approved_execution"]["packet"]["verifiedClaimIds"] =
+            json!([fact.id.clone()]);
+        let approved = &fixture.application.receipt["approved_execution"];
+        let checksum = approved_submission_checksum(
+            approved["schema_version"].as_i64().unwrap(),
+            &approved["packet"],
+            &approved["job"],
+            approved.get("admission"),
+        )
+        .unwrap();
+        fixture.application.receipt["approved_execution"]["checksum"] = json!(checksum);
+        fixture.application = replace_application_receipt(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            fixture.application.receipt.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        fixture.receipt["packet"]["verifiedClaimIds"] = json!([fact.id.clone()]);
+        fixture.receipt["packet"]["approvedPacketChecksum"] = json!(checksum);
+        fixture.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"] =
+            fixture.application.receipt.clone();
+        assert!(fixture
+            .application
+            .receipt
+            .pointer("/approved_execution/packet/verifiedClaimIds")
+            .and_then(Value::as_array)
+            .is_some_and(|claims| {
+                claims
+                    .iter()
+                    .any(|claim| claim.as_str() == Some(fact.id.as_str()))
+            }));
+        let proof = stored_final_submit_proof(&fixture.application).unwrap();
+
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .execute(
+                    "DELETE FROM jobs_facts WHERE account_id = 'acct-jobs' AND id = ?1",
+                    params![fact.id],
+                )
+                .unwrap(),
+            1
+        );
+        let finalized = finalize_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
+        )
+        .unwrap();
+        let SubmissionFinalizeResult::Committed(application) = finalized else {
+            panic!("frozen receipt must commit after mutable fact deletion");
+        };
+        assert_eq!(stored_final_submit_proof(&application).unwrap(), proof);
+    }
+
+    #[test]
+    fn final_submission_revalidates_checksum_packet_and_job_at_the_db_boundary() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-approval-binding");
+        validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &fixture.receipt,
+            "cloud",
+        )
+        .unwrap();
+
+        let mut invalid_application = fixture.application.clone();
+        invalid_application.receipt["approved_execution"]["checksum"] = json!("f".repeat(64));
+        let mut invalid_checksum_receipt = fixture.receipt.clone();
+        invalid_checksum_receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"] =
+            invalid_application.receipt.clone();
+        invalid_checksum_receipt["packet"]["approvedPacketChecksum"] = json!("f".repeat(64));
+        let error = validate_submission_authority_snapshot(
+            "acct-jobs",
+            &invalid_application,
+            &fixture.run_id,
+            &invalid_checksum_receipt,
+            "cloud",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("approved execution checksum does not match"));
+
+        let mut changed_answers = fixture.receipt.clone();
+        changed_answers["packet"]["answers"]["sponsorship_required"] = json!("Yes");
+        let error = validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &changed_answers,
+            "cloud",
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("submission authority does not match the approved packet"));
+
+        let mut changed_claims = fixture.receipt.clone();
+        changed_claims["packet"]["verifiedClaimIds"] = json!(["unapproved-claim"]);
+        assert!(validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &changed_claims,
+            "cloud",
+        )
+        .is_err());
+
+        let mut changed_job = fixture.receipt.clone();
+        changed_job["job"]["canonicalUrl"] = json!("https://lookalike.invalid/job");
+        assert!(validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &changed_job,
+            "cloud",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn final_submission_requires_one_to_one_evidence_and_object_bindings() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-object-binding");
+        let prepared = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            now_ms(),
+        )
+        .unwrap();
+        validate_submission_receipt_evidence(&fixture.receipt, &prepared).unwrap();
+        validate_submission_object_bindings(&fixture.receipt, &prepared, &fixture.object_uploads)
             .unwrap();
-        let lease = claim_execution_lease(
+
+        let mut duplicate_key_bindings = fixture.object_uploads.clone();
+        duplicate_key_bindings[1].object_key = duplicate_key_bindings[0].object_key.clone();
+        duplicate_key_bindings[1].size_bytes = duplicate_key_bindings[0].size_bytes;
+        duplicate_key_bindings[1].sha256 = duplicate_key_bindings[0].sha256.clone();
+        duplicate_key_bindings[1].content_type = duplicate_key_bindings[0].content_type.clone();
+        let error = validate_submission_object_bindings(
+            &fixture.receipt,
+            &prepared,
+            &duplicate_key_bindings,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("durable object binding is invalid"));
+
+        let mut mismatched_evidence = fixture.evidence.clone();
+        mismatched_evidence
+            .iter_mut()
+            .find(|item| item.kind == "submission_confirmation")
+            .unwrap()
+            .sha256 = "e".repeat(64);
+        let mismatched_prepared = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &mismatched_evidence,
+            now_ms(),
+        )
+        .unwrap();
+        let error = validate_submission_object_bindings(
+            &fixture.receipt,
+            &mismatched_prepared,
+            &fixture.object_uploads,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("evidence does not match its durable object"));
+
+        let mut mismatched_manifest = fixture.receipt.clone();
+        mismatched_manifest["evidenceObjects"][0]["sizeBytes"] = json!(85);
+        let error = validate_submission_object_bindings(
+            &mismatched_manifest,
+            &prepared,
+            &fixture.object_uploads,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("durable object binding is invalid"));
+    }
+
+    #[test]
+    fn final_submission_requires_exact_multi_screenshot_evidence_coverage() {
+        let pool = test_pool();
+        let mut fixture = final_submission_fixture(&pool, "receipt-multi-screenshot");
+        let first_confirmation = fixture
+            .evidence
+            .iter()
+            .position(|item| item.kind == "submission_confirmation")
+            .unwrap();
+        let first_key = fixture.evidence[first_confirmation].storage_key.clone();
+        let second_key =
+            "accounts/acct-jobs/jobs/receipt-multi-screenshot/confirmation2.png".to_string();
+        let second_sha256 = "e".repeat(64);
+        let screenshot_keys = json!([first_key, second_key]);
+        fixture.receipt["screenshotKeys"] = screenshot_keys.clone();
+        fixture.receipt["evidenceObjects"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({
+                "kind": "screenshot",
+                "storageKey": second_key,
+                "sha256": second_sha256,
+                "mediaType": "image/png",
+                "sizeBytes": 85,
+            }));
+        fixture.receipt["evidenceObjects"]
+            .as_array_mut()
+            .unwrap()
+            .sort_by(|left, right| {
+                left["storageKey"]
+                    .as_str()
+                    .unwrap()
+                    .cmp(right["storageKey"].as_str().unwrap())
+            });
+        fixture.evidence[first_confirmation].file_name =
+            "submission-confirmation-1-of-2.png".to_string();
+        fixture.evidence[first_confirmation].metadata["screenshot_keys"] = screenshot_keys.clone();
+        fixture.evidence[first_confirmation].metadata["screenshot_count"] = json!(2);
+        let mut second_confirmation = fixture.evidence[first_confirmation].clone();
+        second_confirmation.file_name = "submission-confirmation-2-of-2.png".to_string();
+        second_confirmation.storage_key = second_key.clone();
+        second_confirmation.sha256 = second_sha256.clone();
+        second_confirmation.metadata["screenshot_index"] = json!(2);
+        second_confirmation.metadata["size_bytes"] = json!(85);
+        fixture.evidence.push(second_confirmation);
+        fixture.object_uploads.push(ApplicationObjectBinding {
+            upload_id: "multi-screenshot-upload-2".to_string(),
+            object_key: second_key,
+            size_bytes: 85,
+            sha256: second_sha256,
+            content_type: "image/png".to_string(),
+        });
+
+        let prepared = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            now_ms(),
+        )
+        .unwrap();
+        validate_submission_receipt_evidence(&fixture.receipt, &prepared).unwrap();
+        validate_submission_object_bindings(&fixture.receipt, &prepared, &fixture.object_uploads)
+            .unwrap();
+
+        let mut wrong_resume = fixture.evidence.clone();
+        wrong_resume.last_mut().unwrap().resume_version_id = Some("another-resume".to_string());
+        let prepared_wrong_resume = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &wrong_resume,
+            now_ms(),
+        )
+        .unwrap();
+        assert!(validate_submission_evidence_resume_bindings(
+            &prepared_wrong_resume,
+            fixture.application.resume_version_id.as_deref().unwrap(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("confirmation does not match"));
+
+        let mut too_many = fixture.evidence.clone();
+        too_many.extend([
+            fixture.evidence.last().unwrap().clone(),
+            fixture.evidence.last().unwrap().clone(),
+            fixture.evidence.last().unwrap().clone(),
+        ]);
+        let too_many_error = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &too_many,
+            now_ms(),
+        )
+        .err()
+        .expect("five confirmation records must fail");
+        assert!(too_many_error
+            .to_string()
+            .contains("one to four confirmations"));
+
+        let mut missing = fixture.evidence.clone();
+        missing.pop();
+        let prepared_missing = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &missing,
+            now_ms(),
+        )
+        .unwrap();
+        assert!(
+            validate_submission_receipt_evidence(&fixture.receipt, &prepared_missing)
+                .unwrap_err()
+                .to_string()
+                .contains("count is incomplete")
+        );
+
+        let mut duplicate_index = fixture.evidence.clone();
+        duplicate_index.last_mut().unwrap().metadata["screenshot_index"] = json!(1);
+        let prepared_duplicate = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &duplicate_index,
+            now_ms(),
+        )
+        .unwrap();
+        assert!(
+            validate_submission_receipt_evidence(&fixture.receipt, &prepared_duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("immutable object")
+        );
+
+        let mut duplicate_key_receipt = fixture.receipt.clone();
+        duplicate_key_receipt["screenshotKeys"][1] =
+            duplicate_key_receipt["screenshotKeys"][0].clone();
+        assert!(
+            validate_submission_receipt_evidence(&duplicate_key_receipt, &prepared)
+                .unwrap_err()
+                .to_string()
+                .contains("keys are duplicated")
+        );
+
+        let mut mismatched_key = fixture.evidence.clone();
+        mismatched_key.last_mut().unwrap().storage_key = "unbound-screenshot.png".to_string();
+        let prepared_mismatched = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &mismatched_key,
+            now_ms(),
+        )
+        .unwrap();
+        assert!(
+            validate_submission_receipt_evidence(&fixture.receipt, &prepared_mismatched)
+                .unwrap_err()
+                .to_string()
+                .contains("immutable object")
+        );
+    }
+
+    #[test]
+    fn final_submission_authority_matches_cloud_lease_and_local_ticket_exactly() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-execution-authority");
+        let authority = execution_receipt_authority(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.lease_token,
+            fixture.lease_fence,
+        )
+        .unwrap();
+        assert_eq!(authority.fence, fixture.lease_fence);
+        assert_eq!(authority.phase, "submitted");
+        assert_eq!(
+            authority.lease_token_sha256,
+            execution_lease_token_hash(&fixture.lease_token)
+        );
+
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        validate_submission_execution_authority_sqlite_tx(
+            &tx,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            &fixture.receipt,
+            None,
+            now_ms(),
+        )
+        .unwrap();
+        for (field, value) in [
+            ("ownerId", json!("replacement-owner")),
+            ("leaseTokenSha256", json!("0".repeat(64))),
+            ("fence", json!(fixture.lease_fence + 1)),
+            ("phase", json!("side_effect_unknown")),
+        ] {
+            let mut changed = fixture.receipt.clone();
+            changed[SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"][field] = value;
+            assert!(validate_submission_execution_authority_sqlite_tx(
+                &tx,
+                "acct-jobs",
+                &fixture.application.id,
+                &fixture.run_id,
+                "cloud",
+                &changed,
+                None,
+                now_ms(),
+            )
+            .is_err());
+        }
+        drop(tx);
+
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture(&pool, "receipt-local-authority");
+        claim_local_run_ticket(&pool, &run_id, &ticket_hash)
+            .unwrap()
+            .unwrap();
+        let receipt = json!({
+            "_bluey_server_submission_authority_v1": {
+                "executionAuthority": {
+                    "kind": "local_run_ticket",
+                    "ticketHash": ticket_hash,
+                    "runId": run_id,
+                },
+            },
+        });
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        validate_submission_execution_authority_sqlite_tx(
+            &tx,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            "local",
+            &receipt,
+            Some(&ticket_hash),
+            now_ms(),
+        )
+        .unwrap();
+        assert!(validate_submission_execution_authority_sqlite_tx(
+            &tx,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            "local",
+            &receipt,
+            Some("stale-ticket-hash"),
+            now_ms(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn execution_receipt_authority_rejects_nonterminal_and_stale_leases() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "receipt-authority-stale");
+        let first = claim_execution_lease(
             &pool,
             "acct-jobs",
             &application.id,
             &run_id,
             &browser_profile_id,
-            "rollback-worker",
+            "receipt-owner-one",
         )
         .unwrap();
+        assert!(matches!(
+            execution_receipt_authority(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &first.lease_token,
+                first.fence,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_execution_leases SET lease_expires_at_ms = ?2 WHERE run_id = ?1",
+                params![run_id, now_ms() - 1],
+            )
+            .unwrap();
+        let rotated = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "receipt-owner-two",
+        )
+        .unwrap();
+        assert!(matches!(
+            execution_receipt_authority(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &first.lease_token,
+                first.fence,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        let rotated_capacity = test_submission_evidence_capacity(&application.id, &run_id);
         start_irreversible_submission(
             &pool,
             "acct-jobs",
             &application.id,
             &run_id,
-            &lease.lease_token,
-            lease.fence,
+            &rotated.lease_token,
+            rotated.fence,
+            &test_final_submit_proof(&application),
+            &rotated_capacity,
         )
         .unwrap();
         finish_execution_lease(
@@ -894,71 +4012,174 @@ mod tests {
             "acct-jobs",
             &application.id,
             &run_id,
-            &lease.lease_token,
-            lease.fence,
+            &rotated.lease_token,
+            rotated.fence,
             "submitted",
         )
         .unwrap();
-        let fingerprint = "a".repeat(64);
-        let receipt = json!({
-            "receiptId": "receipt-rollback",
-            "_bluey_server_submission_fingerprint_v1": fingerprint,
-        });
-        let evidence = vec![
-            ApplicationEvidence {
-                id: String::new(),
-                application_id: application.id.clone(),
-                kind: "resume".to_string(),
-                label: "Resume submitted".to_string(),
-                provider: "greenhouse".to_string(),
-                file_name: "resume.pdf".to_string(),
-                media_type: "application/pdf".to_string(),
-                storage_key: "request-owned/resume".to_string(),
-                sha256: "b".repeat(64),
-                resume_version_id: application.resume_version_id.clone(),
-                occurred_at_ms: 0,
-                metadata: json!({}),
-                created_at_ms: 0,
-            },
-            ApplicationEvidence {
-                id: String::new(),
-                application_id: application.id.clone(),
-                kind: "submission_confirmation".to_string(),
-                label: "Application received".to_string(),
-                provider: "greenhouse".to_string(),
-                file_name: "confirmation.png".to_string(),
-                media_type: "image/png".to_string(),
-                storage_key: "request-owned/confirmation".to_string(),
-                sha256: "c".repeat(64),
-                resume_version_id: application.resume_version_id.clone(),
-                occurred_at_ms: 0,
-                metadata: json!({ "confirmation": "Application received" }),
-                created_at_ms: 0,
-            },
-        ];
-        let mut session = list_browser_sessions(&pool, "acct-jobs")
-            .unwrap()
-            .into_iter()
-            .find(|session| session.id == run_id)
-            .unwrap();
-        session.status = "complete".to_string();
+        let authority = execution_receipt_authority(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &rotated.lease_token,
+            rotated.fence,
+        )
+        .unwrap();
+        assert_eq!(authority.owner_id, "receipt-owner-two");
+        assert_eq!(authority.fence, rotated.fence);
+        assert_eq!(authority.phase, "submitted");
+        assert!(matches!(
+            execution_receipt_authority(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                "wrong-token",
+                rotated.fence,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert!(matches!(
+            execution_receipt_authority(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &rotated.lease_token,
+                rotated.fence + 1,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+
+        let (unknown_application, unknown_run_id, unknown_profile_id) =
+            execution_lease_fixture(&pool, "receipt-authority-expired-reconciliation");
+        let unknown = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run_id,
+            &unknown_profile_id,
+            "receipt-unknown-owner",
+        )
+        .unwrap();
+        let unknown_capacity =
+            test_submission_evidence_capacity(&unknown_application.id, &unknown_run_id);
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run_id,
+            &unknown.lease_token,
+            unknown.fence,
+            &test_final_submit_proof(&unknown_application),
+            &unknown_capacity,
+        )
+        .unwrap();
+        finish_execution_lease(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run_id,
+            &unknown.lease_token,
+            unknown.fence,
+            "side_effect_unknown",
+        )
+        .unwrap();
+        execution_receipt_authority(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run_id,
+            &unknown.lease_token,
+            unknown.fence,
+        )
+        .unwrap();
         pool.get()
             .unwrap()
             .execute(
-                "DELETE FROM jobs_browser_sessions WHERE account_id = ?1 AND id = ?2",
-                params!["acct-jobs", &run_id],
+                "UPDATE jobs_execution_leases
+                    SET finished_at_ms = ?2
+                  WHERE run_id = ?1",
+                params![
+                    unknown_run_id,
+                    now_ms() - SUBMISSION_RECONCILIATION_GRACE_MS - 1
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            execution_receipt_authority(
+                &pool,
+                "acct-jobs",
+                &unknown_application.id,
+                &unknown_run_id,
+                &unknown.lease_token,
+                unknown.fence,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn final_submission_is_fenced_once_account_deletion_begins() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-account-delete-fence");
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', ?1, ?1, ?1, 3)",
+                params![now_ms()],
             )
             .unwrap();
         let error = finalize_submission(
             &pool,
             "acct-jobs",
-            &application.id,
-            &run_id,
+            &fixture.application.id,
+            &fixture.run_id,
             "cloud",
-            receipt,
-            &fingerprint,
-            &evidence,
-            &session,
+            fixture.receipt,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("account deletion has fenced final submission"));
+        assert!(
+            list_application_evidence(&pool, "acct-jobs", Some(&fixture.application.id))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn final_submission_transaction_rolls_back_if_the_bound_session_disappears() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "receipt-rollback");
+        pool.get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_browser_sessions WHERE account_id = ?1 AND id = ?2",
+                params!["acct-jobs", &fixture.run_id],
+            )
+            .unwrap();
+        let error = finalize_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt.clone(),
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
             None,
         )
         .unwrap_err();
@@ -967,28 +4188,45 @@ mod tests {
             "unexpected finalization error: {error:#}"
         );
         assert!(
-            list_application_evidence(&pool, "acct-jobs", Some(&application.id))
+            list_application_evidence(&pool, "acct-jobs", Some(&fixture.application.id))
                 .unwrap()
                 .is_empty()
         );
-        let stored = get_application(&pool, "acct-jobs", &application.id)
+        let stored = get_application(&pool, "acct-jobs", &fixture.application.id)
             .unwrap()
             .unwrap();
         assert_eq!(stored.state, "running");
-        assert_ne!(
-            stored.receipt.get("receiptId"),
-            Some(&json!("receipt-rollback"))
-        );
+        assert_eq!(stored.receipt, fixture.application.receipt);
         let reservation = list_attempt_reservations(&pool, "acct-jobs")
             .unwrap()
             .into_iter()
-            .find(|reservation| reservation.application_id == application.id)
+            .find(|reservation| reservation.application_id == fixture.application.id)
             .unwrap();
         assert_eq!(reservation.status, "running");
         assert!(list_browser_sessions(&pool, "acct-jobs")
             .unwrap()
             .into_iter()
-            .all(|session| session.id != run_id));
+            .all(|session| session.id != fixture.run_id));
+        let conn = pool.get().unwrap();
+        for binding in &fixture.object_uploads {
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM object_uploads WHERE id = ?1",
+                    params![binding.upload_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(state, "pending");
+            let outbox_state: String = conn
+                .query_row(
+                    "SELECT state FROM object_storage_outbox
+                      WHERE upload_id = ?1 AND operation = 'put'",
+                    params![binding.upload_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(outbox_state, "processing");
+        }
     }
 
     #[test]
@@ -1364,25 +4602,13 @@ mod tests {
                     id, source_id, replay_key, status, expected_rows, received_rows,
                     received_batches, artifact_sha256, started_at_ms
                  ) VALUES (?1, ?2, ?3, 'running', 1, 0, 0, ?4, ?5)",
-                params![
-                    run_id,
-                    source.id,
-                    replay_key,
-                    "a".repeat(64),
-                    started_at_ms,
-                ],
+                params![run_id, source.id, replay_key, "a".repeat(64), started_at_ms,],
             )
             .unwrap();
         }
         let tx = conn.transaction().unwrap();
-        upsert_global_candidate_sqlite(
-            &tx,
-            &source.id,
-            "run-first",
-            &first,
-            first_seen_at_ms,
-        )
-        .unwrap();
+        upsert_global_candidate_sqlite(&tx, &source.id, "run-first", &first, first_seen_at_ms)
+            .unwrap();
         tx.commit().unwrap();
         let (stored_payload, stored_updated_at_ms): (String, i64) = conn
             .query_row(
@@ -1395,14 +4621,8 @@ mod tests {
             .unwrap();
 
         let tx = conn.transaction().unwrap();
-        upsert_global_candidate_sqlite(
-            &tx,
-            &source.id,
-            "run-second",
-            &second,
-            second_seen_at_ms,
-        )
-        .unwrap();
+        upsert_global_candidate_sqlite(&tx, &source.id, "run-second", &second, second_seen_at_ms)
+            .unwrap();
         tx.commit().unwrap();
         let (payload_after_second_run, updated_at_after_second_run): (String, i64) = conn
             .query_row(
@@ -1464,13 +4684,7 @@ mod tests {
                     id, source_id, replay_key, status, expected_rows, received_rows,
                     received_batches, artifact_sha256, started_at_ms
                  ) VALUES (?1, ?2, ?3, 'running', 1, 0, 0, ?4, ?5)",
-                params![
-                    run_id,
-                    source.id,
-                    replay_key,
-                    "a".repeat(64),
-                    started_at_ms,
-                ],
+                params![run_id, source.id, replay_key, "a".repeat(64), started_at_ms,],
             )
             .unwrap();
         }
@@ -1496,14 +4710,8 @@ mod tests {
         .unwrap();
 
         let tx = conn.transaction().unwrap();
-        upsert_global_candidate_sqlite(
-            &tx,
-            &source.id,
-            "run-after-archive",
-            &rediscovered,
-            20_000,
-        )
-        .unwrap();
+        upsert_global_candidate_sqlite(&tx, &source.id, "run-after-archive", &rediscovered, 20_000)
+            .unwrap();
         tx.commit().unwrap();
 
         let restored: (String, String, String, Option<String>, Option<i64>) = conn
@@ -1776,8 +4984,7 @@ mod tests {
         );
         assert!(!committed.replayed);
 
-        let replayed =
-            complete_global_discovery_ingestion(&pool, &source_id, &completion).unwrap();
+        let replayed = complete_global_discovery_ingestion(&pool, &source_id, &completion).unwrap();
         assert!(replayed.replayed);
         assert_eq!(replayed.rejected_rows, 1);
 
@@ -1899,15 +5106,9 @@ mod tests {
     fn verified_archive_completion_replaces_only_heavy_candidate_fields() {
         let pool = test_pool();
         let input = prepare_archivable_global_candidate(&pool, "candidate-archive-complete");
-        let leases = claim_global_candidate_archive_jobs(
-            &pool,
-            "archive-worker",
-            100_000,
-            10,
-            60_000,
-            10,
-        )
-        .unwrap();
+        let leases =
+            claim_global_candidate_archive_jobs(&pool, "archive-worker", 100_000, 10, 60_000, 10)
+                .unwrap();
         assert_eq!(leases.len(), 1);
 
         assert!(complete_global_candidate_archive(
@@ -1989,16 +5190,10 @@ mod tests {
             .unwrap();
         drop(conn);
 
-        let lease = claim_global_candidate_archive_jobs(
-            &pool,
-            "archive-worker",
-            100_000,
-            10,
-            60_000,
-            1,
-        )
-        .unwrap()
-        .remove(0);
+        let lease =
+            claim_global_candidate_archive_jobs(&pool, "archive-worker", 100_000, 10, 60_000, 1)
+                .unwrap()
+                .remove(0);
 
         assert_eq!(lease.candidate_id, candidate_id);
         assert_eq!(
@@ -2048,15 +5243,9 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let leases = claim_global_candidate_archive_jobs(
-            &pool,
-            "archive-worker",
-            100_000,
-            10,
-            60_000,
-            10,
-        )
-        .unwrap();
+        let leases =
+            claim_global_candidate_archive_jobs(&pool, "archive-worker", 100_000, 10, 60_000, 10)
+                .unwrap();
 
         assert_eq!(leases.len(), 1);
         assert_eq!(leases[0].candidate_id, "candidate-archive-valid");
@@ -2099,15 +5288,9 @@ mod tests {
             )
             .unwrap();
 
-        let leases = claim_global_candidate_archive_jobs(
-            &pool,
-            "archive-worker",
-            100_000,
-            10,
-            60_000,
-            10,
-        )
-        .unwrap();
+        let leases =
+            claim_global_candidate_archive_jobs(&pool, "archive-worker", 100_000, 10, 60_000, 10)
+                .unwrap();
         assert!(leases.is_empty());
     }
 
@@ -2143,15 +5326,9 @@ mod tests {
         )
         .unwrap();
 
-        let leases = claim_global_candidate_archive_jobs(
-            &pool,
-            "archive-worker",
-            100_000,
-            10,
-            60_000,
-            10,
-        )
-        .unwrap();
+        let leases =
+            claim_global_candidate_archive_jobs(&pool, "archive-worker", 100_000, 10, 60_000, 10)
+                .unwrap();
         assert!(leases.is_empty());
     }
 
@@ -2168,16 +5345,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        let lease = claim_global_candidate_archive_jobs(
-            &pool,
-            "archive-worker",
-            100_000,
-            10,
-            60_000,
-            1,
-        )
-        .unwrap()
-        .remove(0);
+        let lease =
+            claim_global_candidate_archive_jobs(&pool, "archive-worker", 100_000, 10, 60_000, 1)
+                .unwrap()
+                .remove(0);
 
         assert!(fail_global_candidate_archive(&pool, &lease, 100_001).unwrap());
 
@@ -3785,18 +6956,15 @@ mod tests {
             assert_eq!(membership_status, "active", "{provider}");
             let refreshed = list_postings(&pool, "acct-jobs").unwrap().remove(0);
             assert_eq!(
-                refreshed.discovery_evidence.provenance,
-                "original_source",
+                refreshed.discovery_evidence.provenance, "original_source",
                 "{provider}"
             );
             assert_eq!(
-                refreshed.discovery_evidence.employer_verification_status,
-                "ats_tenant_verified",
+                refreshed.discovery_evidence.employer_verification_status, "ats_tenant_verified",
                 "{provider}"
             );
             assert_eq!(
-                refreshed.discovery_evidence.scam_risk_status,
-                "source_screened",
+                refreshed.discovery_evidence.scam_risk_status, "source_screened",
                 "{provider}"
             );
             let active_eligibility =
@@ -3916,6 +7084,196 @@ mod tests {
     }
 
     #[test]
+    fn terminal_receipt_authority_retains_exact_protected_capacity() {
+        let pool = test_pool();
+        let (submitted_application, submitted_run, submitted_profile) =
+            execution_lease_fixture(&pool, "capacity-submitted");
+        let submitted_lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &submitted_application.id,
+            &submitted_run,
+            &submitted_profile,
+            "capacity-submitted-owner",
+        )
+        .unwrap();
+        let submitted_capacity = test_submission_evidence_capacity_with_object_cap(
+            &submitted_application.id,
+            &submitted_run,
+            1024 * 1024,
+        );
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &submitted_application.id,
+            &submitted_run,
+            &submitted_lease.lease_token,
+            submitted_lease.fence,
+            &test_final_submit_proof(&submitted_application),
+            &submitted_capacity,
+        )
+        .unwrap();
+        finish_execution_lease(
+            &pool,
+            "acct-jobs",
+            &submitted_application.id,
+            &submitted_run,
+            &submitted_lease.lease_token,
+            submitted_lease.fence,
+            "submitted",
+        )
+        .unwrap();
+        let (submitted_state, submitted_expiry): (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT state, expires_at_ms
+                   FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![submitted_application.id, submitted_run],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(submitted_state, "active");
+        assert_eq!(
+            submitted_expiry,
+            SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRES_AT_MS
+        );
+        execution_receipt_authority(
+            &pool,
+            "acct-jobs",
+            &submitted_application.id,
+            &submitted_run,
+            &submitted_lease.lease_token,
+            submitted_lease.fence,
+        )
+        .unwrap();
+
+        let (unknown_application, unknown_run, unknown_profile) =
+            execution_lease_fixture(&pool, "capacity-side-effect-unknown");
+        let unknown_lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run,
+            &unknown_profile,
+            "capacity-unknown-owner",
+        )
+        .unwrap();
+        let unknown_capacity = test_submission_evidence_capacity_with_object_cap(
+            &unknown_application.id,
+            &unknown_run,
+            16 * 1024 * 1024,
+        );
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run,
+            &unknown_lease.lease_token,
+            unknown_lease.fence,
+            &test_final_submit_proof(&unknown_application),
+            &unknown_capacity,
+        )
+        .unwrap();
+        let shortened_expiry = now_ms().saturating_add(1_000);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_submission_evidence_capacity
+                    SET expires_at_ms = ?3
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![unknown_application.id, unknown_run, shortened_expiry],
+            )
+            .unwrap();
+        finish_execution_lease(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run,
+            &unknown_lease.lease_token,
+            unknown_lease.fence,
+            "side_effect_unknown",
+        )
+        .unwrap();
+        let (unknown_state, unknown_expiry, finished_at_ms): (String, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT c.state, c.expires_at_ms, l.finished_at_ms
+                   FROM jobs_submission_evidence_capacity c
+                   JOIN jobs_execution_leases l
+                     ON l.account_id = c.account_id
+                    AND l.application_id = c.application_id
+                    AND l.run_id = c.run_id
+                  WHERE c.account_id = 'acct-jobs'
+                    AND c.application_id = ?1 AND c.run_id = ?2",
+                params![unknown_application.id, unknown_run],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(unknown_state, "active");
+        assert!(unknown_expiry > shortened_expiry);
+        assert_eq!(
+            unknown_expiry,
+            finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS)
+        );
+        execution_receipt_authority(
+            &pool,
+            "acct-jobs",
+            &unknown_application.id,
+            &unknown_run,
+            &unknown_lease.lease_token,
+            unknown_lease.fence,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn safe_terminal_lease_outcomes_release_unused_protected_capacity() {
+        let pool = test_pool();
+        for outcome in ["failed", "released"] {
+            let suffix = format!("capacity-{outcome}");
+            let (application, run_id, browser_profile_id) = execution_lease_fixture(&pool, &suffix);
+            let lease = claim_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                &format!("capacity-{outcome}-owner"),
+            )
+            .unwrap();
+            let capacity = test_submission_evidence_capacity(&application.id, &run_id);
+            crate::db::object_uploads::reserve_submission_evidence_capacity(&pool, &capacity)
+                .unwrap();
+            finish_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &lease.lease_token,
+                lease.fence,
+                outcome,
+            )
+            .unwrap();
+            let (state, completed_at_ms): (String, Option<i64>) = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT state, completed_at_ms
+                       FROM jobs_submission_evidence_capacity
+                      WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                    params![application.id, run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(state, "released");
+            assert!(completed_at_ms.is_some());
+        }
+    }
+
+    #[test]
     fn execution_lease_expiry_rotation_and_finish_are_replay_safe() {
         let pool = test_pool();
         let (application, run_id, browser_profile_id) =
@@ -3989,6 +7347,7 @@ mod tests {
             ),
             Err(ExecutionLeaseError::Conflict)
         ));
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
         let started = start_irreversible_submission(
             &pool,
             "acct-jobs",
@@ -3996,6 +7355,8 @@ mod tests {
             &run_id,
             &rotated.lease_token,
             rotated.fence,
+            &test_final_submit_proof(&application),
+            &capacity,
         )
         .unwrap();
         assert_eq!(started.phase, "click_started");
@@ -4113,6 +7474,59 @@ mod tests {
     }
 
     #[test]
+    fn execution_lease_claim_is_fenced_before_account_child_mutation() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "account-delete-claim-fence");
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', ?1, ?1, ?1, 0)",
+                params![now_ms()],
+            )
+            .unwrap();
+
+        let error = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "fenced-worker",
+        )
+        .unwrap_err();
+        match error {
+            ExecutionLeaseError::Storage(error) => assert!(matches!(
+                error.downcast_ref::<UploadControlError>(),
+                Some(UploadControlError::AccountDeleting)
+            )),
+            other => panic!("expected account-deletion storage fence, got {other:?}"),
+        }
+
+        let conn = pool.get().unwrap();
+        let lease_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_execution_leases WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let attempt_runner: String = conn
+            .query_row(
+                "SELECT runner FROM jobs_attempt_reservations
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![application.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(lease_count, 0);
+        assert_eq!(attempt_runner, "unassigned");
+    }
+
+    #[test]
     fn safe_worker_checkpoint_releases_all_execution_authority_atomically() {
         let pool = test_pool();
         let (application, run_id, browser_profile_id) =
@@ -4127,6 +7541,8 @@ mod tests {
             "safe-owner",
         )
         .unwrap();
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        crate::db::object_uploads::reserve_submission_evidence_capacity(&pool, &capacity).unwrap();
 
         for _ in 0..2 {
             let reconciled = reconcile_execution_lease_checkpoint(
@@ -4172,13 +7588,27 @@ mod tests {
             .find(|session| session.id == run_id)
             .unwrap();
         assert_eq!(session.status, "failed");
-        assert_eq!(session.current_step, "Browser run stopped before submission");
+        assert_eq!(
+            session.current_step,
+            "Browser run stopped before submission"
+        );
         let attempt = list_attempt_reservations(&pool, "acct-jobs")
             .unwrap()
             .into_iter()
             .find(|attempt| attempt.application_id == application.id)
             .unwrap();
         assert_eq!(attempt.status, "released");
+        let capacity_state: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(capacity_state, "released");
     }
 
     #[test]
@@ -4194,6 +7624,18 @@ mod tests {
             &run_id,
             &browser_profile_id,
             "unsafe-owner",
+        )
+        .unwrap();
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &lease.lease_token,
+            lease.fence,
+            &test_final_submit_proof(&application),
+            &capacity,
         )
         .unwrap();
 
@@ -4222,9 +7664,11 @@ mod tests {
             stored.receipt.pointer("/cloud_recovery/checkpoint_phase"),
             Some(&json!("final_submit_started"))
         );
-        assert!(list_application_evidence(&pool, "acct-jobs", Some(&application.id))
-            .unwrap()
-            .is_empty());
+        assert!(
+            list_application_evidence(&pool, "acct-jobs", Some(&application.id))
+                .unwrap()
+                .is_empty()
+        );
         let session = list_browser_sessions(&pool, "acct-jobs")
             .unwrap()
             .into_iter()
@@ -4238,6 +7682,27 @@ mod tests {
             .find(|attempt| attempt.application_id == application.id)
             .unwrap();
         assert_eq!(attempt.status, "side_effect_unknown");
+        let (capacity_state, capacity_expiry, finished_at_ms): (String, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT c.state, c.expires_at_ms, l.finished_at_ms
+                   FROM jobs_submission_evidence_capacity c
+                   JOIN jobs_execution_leases l
+                     ON l.account_id = c.account_id
+                    AND l.application_id = c.application_id
+                    AND l.run_id = c.run_id
+                  WHERE c.account_id = 'acct-jobs'
+                    AND c.application_id = ?1 AND c.run_id = ?2",
+                params![application.id, run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(capacity_state, "active");
+        assert_eq!(
+            capacity_expiry,
+            finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS)
+        );
     }
 
     #[test]
@@ -4255,6 +7720,7 @@ mod tests {
             "submitted-owner",
         )
         .unwrap();
+        let capacity = test_submission_evidence_capacity(&application.id, &run_id);
         start_irreversible_submission(
             &pool,
             "acct-jobs",
@@ -4262,6 +7728,8 @@ mod tests {
             &run_id,
             &lease.lease_token,
             lease.fence,
+            &test_final_submit_proof(&application),
+            &capacity,
         )
         .unwrap();
         finish_execution_lease(
@@ -4293,6 +7761,31 @@ mod tests {
             .unwrap();
         assert_eq!(stored.state, "side_effect_unknown");
         assert_eq!(stored.submitted_at_ms, None);
+        let (capacity_state, capacity_expiry, finished_at_ms): (String, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT c.state, c.expires_at_ms, l.finished_at_ms
+                   FROM jobs_submission_evidence_capacity c
+                   JOIN jobs_execution_leases l
+                     ON l.account_id = c.account_id
+                    AND l.application_id = c.application_id
+                    AND l.run_id = c.run_id
+                  WHERE c.account_id = 'acct-jobs'
+                    AND c.application_id = ?1 AND c.run_id = ?2",
+                params![application.id, run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(capacity_state, "active");
+        assert_ne!(
+            capacity_expiry,
+            SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRES_AT_MS
+        );
+        assert_eq!(
+            capacity_expiry,
+            finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS)
+        );
     }
 
     #[test]
@@ -4342,6 +7835,7 @@ mod tests {
             "race-owner",
         )
         .unwrap();
+        let final_submit_proof = test_final_submit_proof(&application);
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
         let mut workers = Vec::new();
         for _ in 0..2 {
@@ -4350,9 +7844,11 @@ mod tests {
             let run_id = run_id.clone();
             let token = lease.lease_token.clone();
             let fence = lease.fence;
+            let final_submit_proof = final_submit_proof.clone();
             let barrier = barrier.clone();
             workers.push(std::thread::spawn(move || {
                 barrier.wait();
+                let capacity = test_submission_evidence_capacity(&application_id, &run_id);
                 start_irreversible_submission(
                     &pool,
                     "acct-jobs",
@@ -4360,6 +7856,8 @@ mod tests {
                     &run_id,
                     &token,
                     fence,
+                    &final_submit_proof,
+                    &capacity,
                 )
             }));
         }
@@ -4384,6 +7882,8 @@ mod tests {
                 &run_id,
                 &lease.lease_token,
                 lease.fence,
+                &final_submit_proof,
+                &test_submission_evidence_capacity(&application.id, &run_id),
             ),
             Err(ExecutionLeaseError::Conflict)
         ));
@@ -4491,9 +7991,8 @@ mod tests {
             .iter()
             .any(|reason| reason.code == "original_source_unverified"));
 
-        posting.discovery_evidence = JobDiscoveryEvidence::external_feed_lead(
-            posting.canonical_key.clone(),
-        );
+        posting.discovery_evidence =
+            JobDiscoveryEvidence::external_feed_lead(posting.canonical_key.clone());
         let feed_lead = discovery_decision(&posting, true);
         assert!(!feed_lead.can_prepare);
         assert!(feed_lead
@@ -4809,11 +8308,9 @@ mod tests {
         .unwrap();
         let error =
             update_application(&pool, "acct-jobs", &application.id, "submitted", None).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("only a verified runner receipt can finalize")
-        );
+        assert!(error
+            .to_string()
+            .contains("only a verified runner receipt can finalize"));
         let unchanged = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
@@ -4834,30 +8331,30 @@ mod tests {
             "acct-jobs",
             &verified_test_posting(
                 JobPosting {
-                id: String::new(),
-                canonical_key: String::new(),
-                source: "pasted_link".to_string(),
-                external_id: String::new(),
-                company: "Northstar".to_string(),
-                title: "Software Product Engineer".to_string(),
-                location: "Remote".to_string(),
-                workplace: "remote".to_string(),
-                canonical_url: "https://example.com/jobs/42".to_string(),
-                description: "Rust and TypeScript".to_string(),
-                compensation: String::new(),
-                employment_type: String::new(),
-                track_id: "track-default".to_string(),
-                match_score: 86,
-                matched_reasons: vec!["Skills fit".to_string()],
-                missing_requirements: Vec::new(),
-                posted_at_ms: Some(now_ms()),
-                last_verified_at_ms: Some(now_ms()),
-                availability_status: "active".to_string(),
-                status: "matched".to_string(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                discovery_evidence: JobDiscoveryEvidence::default(),
-                eligibility: None,
+                    id: String::new(),
+                    canonical_key: String::new(),
+                    source: "pasted_link".to_string(),
+                    external_id: String::new(),
+                    company: "Northstar".to_string(),
+                    title: "Software Product Engineer".to_string(),
+                    location: "Remote".to_string(),
+                    workplace: "remote".to_string(),
+                    canonical_url: "https://example.com/jobs/42".to_string(),
+                    description: "Rust and TypeScript".to_string(),
+                    compensation: String::new(),
+                    employment_type: String::new(),
+                    track_id: "track-default".to_string(),
+                    match_score: 86,
+                    matched_reasons: vec!["Skills fit".to_string()],
+                    missing_requirements: Vec::new(),
+                    posted_at_ms: Some(now_ms()),
+                    last_verified_at_ms: Some(now_ms()),
+                    availability_status: "active".to_string(),
+                    status: "matched".to_string(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    discovery_evidence: JobDiscoveryEvidence::default(),
+                    eligibility: None,
                 },
                 now_ms(),
             ),
@@ -5214,30 +8711,30 @@ mod tests {
             "acct-jobs",
             &verified_test_posting(
                 JobPosting {
-                id: String::new(),
-                canonical_key: String::new(),
-                source: "pasted_link".to_string(),
-                external_id: String::new(),
-                company: "Acme".to_string(),
-                title: "Engineer".to_string(),
-                location: "Remote".to_string(),
-                workplace: "remote".to_string(),
-                canonical_url: "https://example.com/jobs/1".to_string(),
-                description: String::new(),
-                compensation: String::new(),
-                employment_type: String::new(),
-                track_id: "track-default".to_string(),
-                match_score: 80,
-                matched_reasons: Vec::new(),
-                missing_requirements: Vec::new(),
-                posted_at_ms: Some(now_ms()),
-                last_verified_at_ms: Some(now_ms()),
-                availability_status: "active".to_string(),
-                status: "matched".to_string(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                discovery_evidence: JobDiscoveryEvidence::default(),
-                eligibility: None,
+                    id: String::new(),
+                    canonical_key: String::new(),
+                    source: "pasted_link".to_string(),
+                    external_id: String::new(),
+                    company: "Acme".to_string(),
+                    title: "Engineer".to_string(),
+                    location: "Remote".to_string(),
+                    workplace: "remote".to_string(),
+                    canonical_url: "https://example.com/jobs/1".to_string(),
+                    description: String::new(),
+                    compensation: String::new(),
+                    employment_type: String::new(),
+                    track_id: "track-default".to_string(),
+                    match_score: 80,
+                    matched_reasons: Vec::new(),
+                    missing_requirements: Vec::new(),
+                    posted_at_ms: Some(now_ms()),
+                    last_verified_at_ms: Some(now_ms()),
+                    availability_status: "active".to_string(),
+                    status: "matched".to_string(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    discovery_evidence: JobDiscoveryEvidence::default(),
+                    eligibility: None,
                 },
                 now_ms(),
             ),
@@ -5277,13 +8774,8 @@ mod tests {
                 .unwrap();
         let generation_key = "generation-same-period";
         let crate::db::jobs_generation::ResumeGenerationReservation::Start(generation) =
-            crate::db::jobs_generation::reserve(
-                &pool,
-                "acct-jobs",
-                &posting.id,
-                generation_key,
-            )
-            .unwrap()
+            crate::db::jobs_generation::reserve(&pool, "acct-jobs", &posting.id, generation_key)
+                .unwrap()
         else {
             panic!("generation reservation must start")
         };
@@ -5344,13 +8836,8 @@ mod tests {
                 .unwrap();
         let generation_key = "generation-before-rollover";
         let crate::db::jobs_generation::ResumeGenerationReservation::Start(generation) =
-            crate::db::jobs_generation::reserve(
-                &pool,
-                "acct-jobs",
-                &posting.id,
-                generation_key,
-            )
-            .unwrap()
+            crate::db::jobs_generation::reserve(&pool, "acct-jobs", &posting.id, generation_key)
+                .unwrap()
         else {
             panic!("generation reservation must start")
         };
@@ -5416,32 +8903,35 @@ mod tests {
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &verified_test_posting(JobPosting {
-                id: String::new(),
-                canonical_key: String::new(),
-                source: "linkedin_handoff".to_string(),
-                external_id: String::new(),
-                company: "Northstar".to_string(),
-                title: "Software Engineer".to_string(),
-                location: "Remote".to_string(),
-                workplace: "remote".to_string(),
-                canonical_url: "https://linkedin.com/jobs/view/123".to_string(),
-                description: "Distributed systems".to_string(),
-                compensation: String::new(),
-                employment_type: "full_time".to_string(),
-                track_id: "track-default".to_string(),
-                match_score: 96,
-                matched_reasons: Vec::new(),
-                missing_requirements: Vec::new(),
-                posted_at_ms: Some(now_ms()),
-                last_verified_at_ms: Some(now_ms()),
-                availability_status: "active".to_string(),
-                status: "matched".to_string(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                discovery_evidence: JobDiscoveryEvidence::default(),
-                eligibility: None,
-            }, now_ms()),
+            &verified_test_posting(
+                JobPosting {
+                    id: String::new(),
+                    canonical_key: String::new(),
+                    source: "linkedin_handoff".to_string(),
+                    external_id: String::new(),
+                    company: "Northstar".to_string(),
+                    title: "Software Engineer".to_string(),
+                    location: "Remote".to_string(),
+                    workplace: "remote".to_string(),
+                    canonical_url: "https://linkedin.com/jobs/view/123".to_string(),
+                    description: "Distributed systems".to_string(),
+                    compensation: String::new(),
+                    employment_type: "full_time".to_string(),
+                    track_id: "track-default".to_string(),
+                    match_score: 96,
+                    matched_reasons: Vec::new(),
+                    missing_requirements: Vec::new(),
+                    posted_at_ms: Some(now_ms()),
+                    last_verified_at_ms: Some(now_ms()),
+                    availability_status: "active".to_string(),
+                    status: "matched".to_string(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    discovery_evidence: JobDiscoveryEvidence::default(),
+                    eligibility: None,
+                },
+                now_ms(),
+            ),
             &profile,
             &JobPreferences::default(),
         )
@@ -6110,7 +9600,10 @@ mod tests {
             "https://jobs.lever.co/acme/1",
             "https://jobs.eu.lever.co/acme/1",
         ] {
-            assert_eq!(submission_capability(&test_posting(url, now, now)), "beta_review");
+            assert_eq!(
+                submission_capability(&test_posting(url, now, now)),
+                "beta_review"
+            );
         }
 
         for url in [
@@ -6132,11 +9625,17 @@ mod tests {
             "https://www.linkedin.com/jobs/view/1",
             "https://subdomain.indeed.com/viewjob/1",
         ] {
-            assert_eq!(submission_capability(&test_posting(url, now, now)), "handoff");
+            assert_eq!(
+                submission_capability(&test_posting(url, now, now)),
+                "handoff"
+            );
         }
 
         for url in ["file:///etc/passwd", "not a URL"] {
-            assert_eq!(submission_capability(&test_posting(url, now, now)), "blocked");
+            assert_eq!(
+                submission_capability(&test_posting(url, now, now)),
+                "blocked"
+            );
         }
     }
 
@@ -6549,18 +10048,16 @@ mod tests {
         let final_posting = verified_test_posting(final_posting, now_ms());
         let final_posting =
             upsert_posting(&pool, "acct-jobs", &final_posting, &profile, &preferences).unwrap();
-        assert!(
-            prepare_application(
-                &pool,
-                "acct-jobs",
-                &final_posting.id,
-                "factual",
-                "review_first",
-            )
-                .unwrap_err()
-                .to_string()
-                .contains("Today's application limit")
-        );
+        assert!(prepare_application(
+            &pool,
+            "acct-jobs",
+            &final_posting.id,
+            "factual",
+            "review_first",
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("Today's application limit"));
 
         let reservations = list_attempt_reservations(&pool, "acct-jobs").unwrap();
         assert_eq!(reservations.len(), 10);
@@ -6603,30 +10100,31 @@ mod tests {
             "acct-jobs",
             &verified_test_posting(
                 JobPosting {
-                id: String::new(),
-                canonical_key: String::new(),
-                source: "greenhouse".to_string(),
-                external_id: String::new(),
-                company: "Acme".to_string(),
-                title: "Engineer".to_string(),
-                location: "Remote".to_string(),
-                workplace: "remote".to_string(),
-                canonical_url: "https://boards.greenhouse.io/acme/jobs/state-machine".to_string(),
-                description: String::new(),
-                compensation: String::new(),
-                employment_type: String::new(),
-                track_id: "track-default".to_string(),
-                match_score: 84,
-                matched_reasons: Vec::new(),
-                missing_requirements: Vec::new(),
-                posted_at_ms: Some(now_ms()),
-                last_verified_at_ms: Some(now_ms()),
-                availability_status: "active".to_string(),
-                status: "matched".to_string(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                discovery_evidence: JobDiscoveryEvidence::default(),
-                eligibility: None,
+                    id: String::new(),
+                    canonical_key: String::new(),
+                    source: "greenhouse".to_string(),
+                    external_id: String::new(),
+                    company: "Acme".to_string(),
+                    title: "Engineer".to_string(),
+                    location: "Remote".to_string(),
+                    workplace: "remote".to_string(),
+                    canonical_url: "https://boards.greenhouse.io/acme/jobs/state-machine"
+                        .to_string(),
+                    description: String::new(),
+                    compensation: String::new(),
+                    employment_type: String::new(),
+                    track_id: "track-default".to_string(),
+                    match_score: 84,
+                    matched_reasons: Vec::new(),
+                    missing_requirements: Vec::new(),
+                    posted_at_ms: Some(now_ms()),
+                    last_verified_at_ms: Some(now_ms()),
+                    availability_status: "active".to_string(),
+                    status: "matched".to_string(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    discovery_evidence: JobDiscoveryEvidence::default(),
+                    eligibility: None,
                 },
                 now_ms(),
             ),
@@ -7062,15 +10560,11 @@ mod tests {
                 .status,
             "reauthorization_required"
         );
-        assert!(claim_mailbox_sync(
-            &pool,
-            "acct-jobs",
-            &mailbox.id,
-            "single-worker",
-            60_000
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            claim_mailbox_sync(&pool, "acct-jobs", &mailbox.id, "single-worker", 60_000)
+                .unwrap()
+                .is_none()
+        );
         assert!(claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 10)
             .unwrap()
             .is_empty());
@@ -7092,8 +10586,7 @@ mod tests {
             .any(|(account_id, state)| {
                 account_id == "acct-jobs" && state.connection_id == mailbox.id
             }));
-        assert!(!mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id)
-            .unwrap());
+        assert!(!mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id).unwrap());
     }
 
     #[test]
@@ -7187,8 +10680,7 @@ mod tests {
         )
         .unwrap();
         let (application, _) =
-            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first")
-                .unwrap();
+            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
         application
     }
 
@@ -7303,8 +10795,7 @@ mod tests {
         let action =
             communication_test_action(&application, &mailbox, &message, "reply-interview-1");
 
-        let (stored, inserted) =
-            create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        let (stored, inserted) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
         assert!(inserted);
         assert_eq!(stored.status, "awaiting_approval");
         let (replayed, inserted_again) =
@@ -7766,30 +11257,30 @@ mod tests {
             "acct-jobs",
             &verified_test_posting(
                 JobPosting {
-                id: String::new(),
-                canonical_key: String::new(),
-                source: "greenhouse".to_string(),
-                external_id: "email-test".to_string(),
-                company: "Northstar".to_string(),
-                title: "Product Engineer".to_string(),
-                location: "New York, NY".to_string(),
-                workplace: "hybrid".to_string(),
-                canonical_url: "https://example.com/jobs/email-test".to_string(),
-                description: "Product engineering".to_string(),
-                compensation: String::new(),
-                employment_type: String::new(),
-                track_id: track.id,
-                match_score: 88,
-                matched_reasons: Vec::new(),
-                missing_requirements: Vec::new(),
-                posted_at_ms: Some(now_ms()),
-                last_verified_at_ms: Some(now_ms()),
-                availability_status: "active".to_string(),
-                status: "matched".to_string(),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                discovery_evidence: JobDiscoveryEvidence::default(),
-                eligibility: None,
+                    id: String::new(),
+                    canonical_key: String::new(),
+                    source: "greenhouse".to_string(),
+                    external_id: "email-test".to_string(),
+                    company: "Northstar".to_string(),
+                    title: "Product Engineer".to_string(),
+                    location: "New York, NY".to_string(),
+                    workplace: "hybrid".to_string(),
+                    canonical_url: "https://example.com/jobs/email-test".to_string(),
+                    description: "Product engineering".to_string(),
+                    compensation: String::new(),
+                    employment_type: String::new(),
+                    track_id: track.id,
+                    match_score: 88,
+                    matched_reasons: Vec::new(),
+                    missing_requirements: Vec::new(),
+                    posted_at_ms: Some(now_ms()),
+                    last_verified_at_ms: Some(now_ms()),
+                    availability_status: "active".to_string(),
+                    status: "matched".to_string(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    discovery_evidence: JobDiscoveryEvidence::default(),
+                    eligibility: None,
                 },
                 now_ms(),
             ),
@@ -8155,12 +11646,52 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
-
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
         set_entitlement_plan(&pool, "acct-jobs", "free").unwrap();
-        assert!(!local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+        let final_submit_proof = test_final_submit_proof(&application);
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &final_submit_proof,
+            &capacity,
+        )
+        .unwrap());
         set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
-        assert!(local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+        assert!(local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &final_submit_proof,
+            &capacity,
+        )
+        .unwrap());
+        let (ticket_status, capacity_state): (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, capacity.state
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_submission_evidence_capacity capacity
+                     ON capacity.account_id = ticket.account_id
+                    AND capacity.application_id = ticket.application_id
+                    AND capacity.run_id = ticket.id
+                  WHERE ticket.id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "click_started");
+        assert_eq!(capacity_state, "active");
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &final_submit_proof,
+            &capacity,
+        )
+        .unwrap());
 
         pool.get()
             .unwrap()
@@ -8169,7 +11700,470 @@ mod tests {
                 params!["acct-jobs", identity_id],
             )
             .unwrap();
-        assert!(!local_run_submit_authorized(&pool, &run_id, &ticket_hash).unwrap());
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &final_submit_proof,
+            &capacity,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn local_click_started_ticket_rejects_retryable_status_downgrades() {
+        for status in ["failed", "needs_input"] {
+            let pool = test_pool();
+            let suffix = format!("click-downgrade-{status}");
+            let (application, run_id, ticket_hash) = local_click_started_fixture(&pool, &suffix);
+            let application_before = serde_json::to_value(&application).unwrap();
+
+            assert!(
+                !update_local_run_ticket_status(&pool, &run_id, &ticket_hash, status).unwrap(),
+                "click_started must not become {status}"
+            );
+            let (ticket_status, capacity_state): (String, String) = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT ticket.status, capacity.state
+                       FROM jobs_local_run_tickets ticket
+                       JOIN jobs_submission_evidence_capacity capacity
+                         ON capacity.account_id = ticket.account_id
+                        AND capacity.application_id = ticket.application_id
+                        AND capacity.run_id = ticket.id
+                      WHERE ticket.id = ?1",
+                    params![run_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(ticket_status, "click_started");
+            assert_eq!(capacity_state, "active");
+            let stored = get_application(&pool, "acct-jobs", &application.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(serde_json::to_value(stored).unwrap(), application_before);
+        }
+    }
+
+    #[test]
+    fn local_unknown_before_authorize_reserves_capacity_and_replays_exactly() {
+        for initial_ticket_status in ["claimed", "needs_input"] {
+            let pool = test_pool();
+            let suffix = format!("unknown-before-authorize-{initial_ticket_status}");
+            let (application, run_id, ticket_hash, _) = local_run_authority_fixture(&pool, &suffix);
+            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+            assert!(
+                claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                    .unwrap()
+                    .is_some()
+            );
+            let mut application =
+                update_application(&pool, "acct-jobs", &application.id, "running", None)
+                    .unwrap()
+                    .unwrap();
+            let mut session = BrowserSession {
+                id: run_id.clone(),
+                runner: "local".to_string(),
+                status: "running".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Posting local result".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            };
+            if initial_ticket_status == "needs_input" {
+                application =
+                    update_application(&pool, "acct-jobs", &application.id, "needs_input", None)
+                        .unwrap()
+                        .unwrap();
+                session.status = "needs_input".to_string();
+                assert!(update_local_run_ticket_status(
+                    &pool,
+                    &run_id,
+                    &ticket_hash,
+                    "needs_input",
+                )
+                .unwrap());
+            }
+            upsert_browser_session(&pool, "acct-jobs", &session).unwrap();
+            let capacity_count: i64 = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                      WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                    params![application.id, run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(capacity_count, 0);
+
+            let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+            capacity.runner = "local".to_string();
+            let receipt = json!({
+                "status": "side_effect_unknown",
+                "issues": [{
+                    "field": "submission",
+                    "message": "The submit response was lost."
+                }]
+            });
+            let finalized = finalize_local_side_effect_unknown(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &ticket_hash,
+                &capacity,
+                receipt.clone(),
+                &session,
+            )
+            .unwrap();
+            assert_eq!(finalized.state, "side_effect_unknown");
+            let finalized_value = serde_json::to_value(&finalized).unwrap();
+            let (
+                ticket_status,
+                application_state,
+                attempt_status,
+                session_status,
+                capacity_runner,
+                reserved_bytes,
+                reserved_objects,
+                capacity_state,
+                capacity_expiry,
+                ticket_expiry,
+            ): (
+                String,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                i64,
+                String,
+                i64,
+                i64,
+            ) = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT ticket.status, application.state, attempt.status, session.status,
+                            capacity.runner, capacity.reserved_bytes,
+                            capacity.reserved_objects, capacity.state,
+                            capacity.expires_at_ms, ticket.expires_at_ms
+                       FROM jobs_local_run_tickets ticket
+                       JOIN jobs_applications application
+                         ON application.account_id = ticket.account_id
+                        AND application.id = ticket.application_id
+                       JOIN jobs_attempt_reservations attempt
+                         ON attempt.account_id = ticket.account_id
+                        AND attempt.application_id = ticket.application_id
+                       JOIN jobs_browser_sessions session
+                         ON session.account_id = ticket.account_id AND session.id = ticket.id
+                       JOIN jobs_submission_evidence_capacity capacity
+                         ON capacity.account_id = ticket.account_id
+                        AND capacity.application_id = ticket.application_id
+                        AND capacity.run_id = ticket.id
+                      WHERE ticket.id = ?1",
+                    params![run_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                            row.get(9)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(ticket_status, "side_effect_unknown");
+            assert_eq!(application_state, "side_effect_unknown");
+            assert_eq!(attempt_status, "side_effect_unknown");
+            assert_eq!(session_status, "needs_input");
+            assert_eq!(capacity_runner, "local");
+            assert_eq!(reserved_bytes, capacity.reserved_bytes);
+            assert_eq!(reserved_objects, capacity.reserved_objects);
+            assert_eq!(capacity_state, "active");
+            assert_eq!(
+                capacity_expiry,
+                ticket_expiry.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS)
+            );
+
+            let shortened_expiry = now_ms().saturating_add(10_000);
+            pool.get()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs_submission_evidence_capacity SET expires_at_ms = ?3
+                      WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                    params![application.id, run_id, shortened_expiry],
+                )
+                .unwrap();
+            let terminal_session = list_browser_sessions(&pool, "acct-jobs")
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == run_id)
+                .unwrap();
+            let replayed = finalize_local_side_effect_unknown(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &ticket_hash,
+                &capacity,
+                receipt,
+                &terminal_session,
+            )
+            .unwrap();
+            assert_eq!(serde_json::to_value(replayed).unwrap(), finalized_value);
+            let replay_expiry: i64 = pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT expires_at_ms FROM jobs_submission_evidence_capacity
+                      WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                    params![application.id, run_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(replay_expiry, capacity_expiry);
+        }
+    }
+
+    #[test]
+    fn local_unknown_capacity_failure_rolls_back_every_lifecycle_row() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture(&pool, "unknown-capacity-failure");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        assert!(
+            claim_authorized_local_run_ticket(&pool, &run_id, &ticket_hash)
+                .unwrap()
+                .is_some()
+        );
+        let application = update_application(&pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
+        let session = BrowserSession {
+            id: run_id.clone(),
+            runner: "local".to_string(),
+            status: "running".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Posting local result".to_string(),
+            application_id: Some(application.id.clone()),
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        upsert_browser_session(&pool, "acct-jobs", &session).unwrap();
+        let application_before = serde_json::to_value(&application).unwrap();
+        reserve_verified_browser_profile_upload(
+            &pool,
+            &application.id,
+            &run_id,
+            "unknown-capacity-profile",
+            1,
+            (0, 1),
+            (
+                "accounts/acct-jobs/artifacts/unknown-capacity-existing-object",
+                &"d".repeat(64),
+                1,
+                1,
+            ),
+        );
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        capacity.limits.max_account_bytes = capacity.reserved_bytes;
+
+        let error = finalize_local_side_effect_unknown(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &capacity,
+            json!({ "status": "side_effect_unknown" }),
+            &session,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::AccountBytesQuotaExceeded)
+        );
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::to_value(stored).unwrap(), application_before);
+        let (ticket_status, attempt_status, session_status, capacity_count): (
+            String,
+            String,
+            String,
+            i64,
+        ) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, attempt.status, session.status,
+                        (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                          WHERE capacity.account_id = ticket.account_id
+                            AND capacity.application_id = ticket.application_id
+                            AND capacity.run_id = ticket.id)
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_attempt_reservations attempt
+                     ON attempt.account_id = ticket.account_id
+                    AND attempt.application_id = ticket.application_id
+                   JOIN jobs_browser_sessions session
+                     ON session.account_id = ticket.account_id AND session.id = ticket.id
+                  WHERE ticket.id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "claimed");
+        assert_eq!(attempt_status, "reserved");
+        assert_eq!(session_status, "running");
+        assert_eq!(capacity_count, 0);
+    }
+
+    #[test]
+    fn local_click_started_unknown_requires_and_retains_exact_capacity() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash) =
+            local_click_started_fixture(&pool, "unknown-after-click");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        let shortened_expiry = now_ms().saturating_add(10_000);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_submission_evidence_capacity SET expires_at_ms = ?3
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, run_id, shortened_expiry],
+            )
+            .unwrap();
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run_id)
+            .unwrap();
+        finalize_local_side_effect_unknown(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &capacity,
+            json!({ "status": "side_effect_unknown" }),
+            &session,
+        )
+        .unwrap();
+        let (ticket_status, reserved_bytes, reserved_objects, capacity_expiry, ticket_expiry): (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, capacity.reserved_bytes, capacity.reserved_objects,
+                        capacity.expires_at_ms, ticket.expires_at_ms
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_submission_evidence_capacity capacity
+                     ON capacity.account_id = ticket.account_id
+                    AND capacity.application_id = ticket.application_id
+                    AND capacity.run_id = ticket.id
+                  WHERE ticket.id = ?1",
+                params![run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "side_effect_unknown");
+        assert_eq!(reserved_bytes, capacity.reserved_bytes);
+        assert_eq!(reserved_objects, capacity.reserved_objects);
+        assert_eq!(
+            capacity_expiry,
+            ticket_expiry.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS)
+        );
+
+        let missing_pool = test_pool();
+        let (application, run_id, ticket_hash) =
+            local_click_started_fixture(&missing_pool, "unknown-after-click-missing");
+        reserve_application_attempt(&missing_pool, "acct-jobs", &application.id, "local").unwrap();
+        missing_pool
+            .get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, run_id],
+            )
+            .unwrap();
+        let session = list_browser_sessions(&missing_pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run_id)
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        let error = finalize_local_side_effect_unknown(
+            &missing_pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &capacity,
+            json!({ "status": "side_effect_unknown" }),
+            &session,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("local submission evidence capacity is missing"));
+        let (ticket_status, application_state, attempt_status, session_status): (
+            String,
+            String,
+            String,
+            String,
+        ) = missing_pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, application.state, attempt.status, session.status
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_applications application
+                     ON application.account_id = ticket.account_id
+                    AND application.id = ticket.application_id
+                   JOIN jobs_attempt_reservations attempt
+                     ON attempt.account_id = ticket.account_id
+                    AND attempt.application_id = ticket.application_id
+                   JOIN jobs_browser_sessions session
+                     ON session.account_id = ticket.account_id AND session.id = ticket.id
+                  WHERE ticket.id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "click_started");
+        assert_eq!(application_state, "running");
+        assert_eq!(attempt_status, "reserved");
+        assert_eq!(session_status, "running");
     }
 
     #[test]
@@ -8247,8 +12241,18 @@ mod tests {
             now_ms() + 60_000,
         )
         .unwrap();
-        update_local_run_ticket_status(&pool, &run_id, "local-resume-ticket-hash", "needs_input")
-            .unwrap();
+        assert!(
+            claim_local_run_ticket(&pool, &run_id, "local-resume-ticket-hash")
+                .unwrap()
+                .is_some()
+        );
+        assert!(update_local_run_ticket_status(
+            &pool,
+            &run_id,
+            "local-resume-ticket-hash",
+            "needs_input",
+        )
+        .unwrap());
         assert!(
             claim_local_run_ticket(&pool, &run_id, "local-resume-ticket-hash")
                 .unwrap()
@@ -8427,7 +12431,14 @@ mod tests {
                         "sha256": "b".repeat(64)
                     }
                 ],
-                "screenshotKeys": ["accounts/acct-jobs/jobs/export/confirmation.png"]
+                "screenshotKeys": ["accounts/acct-jobs/jobs/export/confirmation.png"],
+                "receiptObject": {
+                    "storageKey": "accounts/acct-jobs/jobs/export/receipt.json",
+                    "sha256": "c".repeat(64),
+                    "mediaType": "application/json",
+                    "sizeBytes": 84,
+                    "schemaVersion": 1
+                }
             }),
         )
         .unwrap();
@@ -8444,7 +12455,7 @@ mod tests {
         assert!(!serialized.contains("must-not-export"));
 
         let refs = crate::db::account_data::artifact_object_refs(&pool, "acct-jobs").unwrap();
-        assert_eq!(refs.len(), 3);
+        assert_eq!(refs.len(), 4);
         assert!(refs.iter().any(|reference| reference.object_key
             == "accounts/acct-jobs/jobs/export/resume.pdf"
             && reference.size_bytes == Some(42)));
@@ -8453,6 +12464,11 @@ mod tests {
         }));
         assert!(refs.iter().any(|reference| {
             reference.object_key == "accounts/acct-jobs/jobs/export/confirmation.png"
+        }));
+        assert!(refs.iter().any(|reference| {
+            reference.object_key == "accounts/acct-jobs/jobs/export/receipt.json"
+                && reference.content_type.as_deref() == Some("application/json")
+                && reference.size_bytes == Some(84)
         }));
     }
 
@@ -8534,6 +12550,276 @@ mod tests {
             ),
             Err(ExecutionLeaseError::Conflict)
         ));
+    }
+
+    #[test]
+    fn browser_profile_publication_replays_exactly_and_schedules_the_prior_generation() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "profile-atomic-publish");
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "profile-atomic-worker",
+        )
+        .unwrap();
+        let first_key = format!(
+            "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/1-a.enc"
+        );
+        let first_upload = reserve_verified_browser_profile_upload(
+            &pool,
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            lease.fence,
+            (0, 1),
+            (&first_key, &"a".repeat(64), 128, 1),
+        );
+        let first = publish_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            0,
+            &first_key,
+            &first_upload.sha256,
+            first_upload.size_bytes,
+            1,
+            &first_upload.id,
+        )
+        .unwrap();
+        let replay = publish_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            0,
+            &first_key,
+            &first_upload.sha256,
+            first_upload.size_bytes,
+            1,
+            &first_upload.id,
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+        assert_eq!(first.generation, 1);
+
+        let second_key = format!(
+            "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/2-b.enc"
+        );
+        let second_upload = reserve_verified_browser_profile_upload(
+            &pool,
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            lease.fence,
+            (1, 2),
+            (&second_key, &"b".repeat(64), 192, 1),
+        );
+        let second = publish_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            1,
+            &second_key,
+            &second_upload.sha256,
+            second_upload.size_bytes,
+            1,
+            &second_upload.id,
+        )
+        .unwrap();
+        assert_eq!(second.generation, 2);
+        assert_eq!(second.object_key, second_key);
+        assert_eq!(
+            get_browser_profile_snapshot_for_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                &lease.lease_token,
+                lease.fence,
+            )
+            .unwrap(),
+            Some(second.clone())
+        );
+
+        let first_lifecycle: (String, String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT upload.state, put.state, deletion.state
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                   JOIN object_storage_outbox deletion
+                     ON deletion.upload_id = upload.id AND deletion.operation = 'delete'
+                  WHERE upload.id = ?1",
+                params![first_upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            first_lifecycle,
+            (
+                "delete_pending".into(),
+                "completed".into(),
+                "pending".into()
+            )
+        );
+        let second_lifecycle: (String, String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT upload.state, put.state,
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = upload.id
+                            AND deletion.operation = 'delete')
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                  WHERE upload.id = ?1",
+                params![second_upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(second_lifecycle, ("ready".into(), "completed".into(), 0));
+    }
+
+    #[test]
+    fn losing_browser_profile_cas_leaves_verified_upload_pending_and_current_ready() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "profile-atomic-cas");
+        let lease = claim_execution_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            "profile-cas-worker",
+        )
+        .unwrap();
+        let current_key = format!(
+            "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/1-winner.enc"
+        );
+        let current_upload = reserve_verified_browser_profile_upload(
+            &pool,
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            lease.fence,
+            (0, 1),
+            (&current_key, &"c".repeat(64), 128, 1),
+        );
+        let current = publish_browser_profile_snapshot_for_lease(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &lease.lease_token,
+            lease.fence,
+            0,
+            &current_key,
+            &current_upload.sha256,
+            current_upload.size_bytes,
+            1,
+            &current_upload.id,
+        )
+        .unwrap();
+
+        let losing_key = format!(
+            "accounts/acct-jobs/jobs/browser-profiles/{browser_profile_id}/generation/1-loser.enc"
+        );
+        let losing_upload = reserve_verified_browser_profile_upload(
+            &pool,
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            lease.fence,
+            (0, 1),
+            (&losing_key, &"d".repeat(64), 160, 1),
+        );
+        assert!(matches!(
+            publish_browser_profile_snapshot_for_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                &lease.lease_token,
+                lease.fence,
+                0,
+                &losing_key,
+                &losing_upload.sha256,
+                losing_upload.size_bytes,
+                1,
+                &losing_upload.id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            get_browser_profile_snapshot_for_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                &lease.lease_token,
+                lease.fence,
+            )
+            .unwrap(),
+            Some(current)
+        );
+
+        let current_lifecycle: (String, String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT upload.state, put.state,
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = upload.id
+                            AND deletion.operation = 'delete')
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                  WHERE upload.id = ?1",
+                params![current_upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(current_lifecycle, ("ready".into(), "completed".into(), 0));
+        let losing_lifecycle: (String, String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT upload.state, put.state,
+                        (SELECT COUNT(*) FROM object_storage_outbox deletion
+                          WHERE deletion.upload_id = upload.id
+                            AND deletion.operation = 'delete')
+                   FROM object_uploads upload
+                   JOIN object_storage_outbox put
+                     ON put.upload_id = upload.id AND put.operation = 'put'
+                  WHERE upload.id = ?1",
+                params![losing_upload.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(losing_lifecycle, ("pending".into(), "retry".into(), 0));
     }
 
     #[test]
@@ -8619,22 +12905,14 @@ mod tests {
         let pool = test_pool();
         let (mut application, run_id, browser_profile_id) =
             execution_lease_fixture(&pool, "answer-cloud");
-        application
-            .receipt
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "approved_execution".to_string(),
-                json!({"schema_version": 2, "checksum": "approved-cloud-checksum"}),
-            );
-        application = replace_application_receipt(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            application.receipt,
-        )
-        .unwrap()
-        .unwrap();
+        application.receipt.as_object_mut().unwrap().insert(
+            "approved_execution".to_string(),
+            json!({"schema_version": 2, "checksum": "approved-cloud-checksum"}),
+        );
+        application =
+            replace_application_receipt(&pool, "acct-jobs", &application.id, application.receipt)
+                .unwrap()
+                .unwrap();
         let lease = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -8645,20 +12923,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lease.phase, "prepared");
-        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running")
-            .unwrap();
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running").unwrap();
         application = update_application(&pool, "acct-jobs", &application.id, "running", None)
             .unwrap()
             .unwrap();
-        application = update_application(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            "needs_input",
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        application = update_application(&pool, "acct-jobs", &application.id, "needs_input", None)
+            .unwrap()
+            .unwrap();
         upsert_browser_session(
             &pool,
             "acct-jobs",
@@ -8675,8 +12946,7 @@ mod tests {
             },
         )
         .unwrap();
-        let intervention =
-            answer_intervention_fixture(&pool, &application.id, "answer-cloud");
+        let intervention = answer_intervention_fixture(&pool, &application.id, "answer-cloud");
 
         let revision = resolve_intervention_answer_for_review(
             &pool,
@@ -8689,7 +12959,11 @@ mod tests {
         assert_eq!(revision.application.state, "awaiting_review");
         assert_eq!(revision.application.run_id, None);
         assert_eq!(revision.question, "Are you willing to travel?");
-        assert!(revision.application.receipt.get("approved_execution").is_none());
+        assert!(revision
+            .application
+            .receipt
+            .get("approved_execution")
+            .is_none());
         assert_eq!(
             revision
                 .application
@@ -8772,41 +13046,26 @@ mod tests {
         let pool = test_pool();
         let (mut application, run_id, ticket_hash, _) =
             local_run_authority_fixture(&pool, "answer-local");
-        application
-            .receipt
-            .as_object_mut()
+        application.receipt.as_object_mut().unwrap().insert(
+            "approved_execution".to_string(),
+            json!({"schema_version": 2, "checksum": "approved-local-checksum"}),
+        );
+        application =
+            replace_application_receipt(&pool, "acct-jobs", &application.id, application.receipt)
+                .unwrap()
+                .unwrap();
+        assert!(claim_local_run_ticket(&pool, &run_id, &ticket_hash)
             .unwrap()
-            .insert(
-                "approved_execution".to_string(),
-                json!({"schema_version": 2, "checksum": "approved-local-checksum"}),
-            );
-        application = replace_application_receipt(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            application.receipt,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(update_local_run_ticket_status(
-            &pool,
-            &run_id,
-            &ticket_hash,
-            "needs_input"
-        )
-        .unwrap());
+            .is_some());
+        assert!(
+            update_local_run_ticket_status(&pool, &run_id, &ticket_hash, "needs_input").unwrap()
+        );
         application = update_application(&pool, "acct-jobs", &application.id, "running", None)
             .unwrap()
             .unwrap();
-        application = update_application(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            "needs_input",
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        application = update_application(&pool, "acct-jobs", &application.id, "needs_input", None)
+            .unwrap()
+            .unwrap();
         upsert_browser_session(
             &pool,
             "acct-jobs",
@@ -8823,20 +13082,19 @@ mod tests {
             },
         )
         .unwrap();
-        let intervention =
-            answer_intervention_fixture(&pool, &application.id, "answer-local");
+        let intervention = answer_intervention_fixture(&pool, &application.id, "answer-local");
 
-        let revision = resolve_intervention_answer_for_review(
-            &pool,
-            "acct-jobs",
-            &intervention.id,
-            "No",
-        )
-        .unwrap();
+        let revision =
+            resolve_intervention_answer_for_review(&pool, "acct-jobs", &intervention.id, "No")
+                .unwrap();
 
         assert_eq!(revision.application.state, "awaiting_review");
         assert_eq!(revision.application.run_id, None);
-        assert!(revision.application.receipt.get("approved_execution").is_none());
+        assert!(revision
+            .application
+            .receipt
+            .get("approved_execution")
+            .is_none());
         let ticket_status: String = pool
             .get()
             .unwrap()
@@ -8856,26 +13114,61 @@ mod tests {
     }
 
     #[test]
+    fn local_intervention_answer_is_rejected_after_submission_click_started() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash) =
+            local_click_started_fixture(&pool, "answer-local-after-click");
+        let application =
+            update_application(&pool, "acct-jobs", &application.id, "needs_input", None)
+                .unwrap()
+                .unwrap();
+        let proof = stored_final_submit_proof(&application).unwrap();
+        let intervention =
+            answer_intervention_fixture(&pool, &application.id, "answer-local-after-click");
+
+        let error =
+            resolve_intervention_answer_for_review(&pool, "acct-jobs", &intervention.id, "Yes")
+                .unwrap_err();
+        assert!(error.to_string().contains("awaiting reconciliation"));
+
+        let stored = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.state, "needs_input");
+        assert_eq!(stored.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(stored_final_submit_proof(&stored).unwrap(), proof);
+        assert!(stored.receipt.get("approved_execution").is_some());
+        assert!(stored.receipt.get("packet_revision").is_none());
+        let stored_intervention = list_interventions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == intervention.id)
+            .unwrap();
+        assert_eq!(stored_intervention.status, "open");
+        let (ticket_status, capacity_state): (String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, capacity.state
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_submission_evidence_capacity capacity
+                     ON capacity.account_id = ticket.account_id
+                    AND capacity.application_id = ticket.application_id
+                    AND capacity.run_id = ticket.id
+                  WHERE ticket.id = ?1 AND ticket.ticket_hash = ?2",
+                params![run_id, ticket_hash],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "click_started");
+        assert_eq!(capacity_state, "active");
+    }
+
+    #[test]
     fn intervention_answer_is_rejected_after_submission_click_started() {
         let pool = test_pool();
         let (mut application, run_id, browser_profile_id) =
             execution_lease_fixture(&pool, "answer-after-click");
-        application
-            .receipt
-            .as_object_mut()
-            .unwrap()
-            .insert(
-                "approved_execution".to_string(),
-                json!({"schema_version": 2, "checksum": "approved-click-checksum"}),
-            );
-        application = replace_application_receipt(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            application.receipt,
-        )
-        .unwrap()
-        .unwrap();
         let lease = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -8885,8 +13178,7 @@ mod tests {
             "click-worker",
         )
         .unwrap();
-        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running")
-            .unwrap();
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running").unwrap();
         application = update_application(&pool, "acct-jobs", &application.id, "running", None)
             .unwrap()
             .unwrap();
@@ -8897,17 +13189,13 @@ mod tests {
             &run_id,
             &lease.lease_token,
             lease.fence,
+            &test_final_submit_proof(&application),
+            &test_submission_evidence_capacity(&application.id, &run_id),
         )
         .unwrap();
-        application = update_application(
-            &pool,
-            "acct-jobs",
-            &application.id,
-            "needs_input",
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        application = update_application(&pool, "acct-jobs", &application.id, "needs_input", None)
+            .unwrap()
+            .unwrap();
         upsert_browser_session(
             &pool,
             "acct-jobs",
@@ -8927,13 +13215,9 @@ mod tests {
         let intervention =
             answer_intervention_fixture(&pool, &application.id, "answer-after-click");
 
-        let error = resolve_intervention_answer_for_review(
-            &pool,
-            "acct-jobs",
-            &intervention.id,
-            "Yes",
-        )
-        .unwrap_err();
+        let error =
+            resolve_intervention_answer_for_review(&pool, "acct-jobs", &intervention.id, "Yes")
+                .unwrap_err();
         assert!(error.to_string().contains("awaiting reconciliation"));
 
         let stored = get_application(&pool, "acct-jobs", &application.id)

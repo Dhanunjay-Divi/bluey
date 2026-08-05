@@ -1,11 +1,9 @@
 import type {
   ApplicationPacket,
-  ApplicationReceiptBundle,
   ApplicationState,
   NormalizedJob,
   RunnerKind,
   SubmissionReceipt,
-  EvidenceObjectUpload,
 } from "@bluey/jobs-automation";
 
 export interface ApplicationWorkflowInput {
@@ -30,10 +28,31 @@ export interface ApplicationWorkflowResult {
   requiresReapproval?: boolean;
 }
 
+export interface SubmissionReceiptAuthority {
+  leaseToken: string;
+  fence: number;
+}
+
 export interface RunnerExecutionResult {
+  /**
+   * A deep-allowlisted receipt safe to serialize into Temporal history. The
+   * runner's durable evidence, local paths, and fenced capability stay behind
+   * the activity boundary.
+   */
   receipt: SubmissionReceipt;
-  receiptBundle?: ApplicationReceiptBundle;
-  evidenceObjects?: EvidenceObjectUpload[];
+}
+
+export function isSubmissionReceiptAuthority(
+  value: unknown,
+): value is SubmissionReceiptAuthority {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return Object.keys(record).length === 2
+    && typeof record.leaseToken === "string"
+    && /^[A-Za-z0-9_-]{43}$/.test(record.leaseToken)
+    && typeof record.fence === "number"
+    && Number.isSafeInteger(record.fence)
+    && record.fence > 0;
 }
 
 export interface InterventionResolution {
@@ -52,9 +71,9 @@ export interface JobsActivities {
     requestId: string;
     resolution: InterventionResolution;
   }): Promise<RunnerExecutionResult>;
-  persistReceipt(input: ApplicationWorkflowInput & {
-    receiptBundle: ApplicationReceiptBundle;
-    evidenceObjects: EvidenceObjectUpload[];
+  persistSubmissionReceipt(input: ApplicationWorkflowInput & {
+    browserSessionId: string;
+    resultRequestId: string;
   }): Promise<void>;
   releaseBrowser(browserSessionId: string): Promise<void>;
   recordState(input: ApplicationWorkflowInput, state: ApplicationState): Promise<void>;

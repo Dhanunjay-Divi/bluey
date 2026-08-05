@@ -222,7 +222,7 @@ async function requestDownload(
   }
   if (!response.ok) {
     const text = await response.text();
-    throw new ApiError(response.status, text || "Bluey could not download that resume.");
+    throw new ApiError(response.status, text || "Bluey could not download that file.");
   }
   const disposition = response.headers.get("content-disposition") || "";
   const match = disposition.match(/filename="([^"]+)"/i);
@@ -264,10 +264,16 @@ export const jobsApi = {
   saveProfile: (profile: CareerProfile) =>
     request<CareerProfile>("/api/jobs/profile", { method: "PUT", body: JSON.stringify(profile) }),
   resumeSource: () => request<ResumeSourceMetadata | null>("/api/jobs/resume-source"),
-  uploadResumeSource: async (file: File, profile: CareerProfile, pageCount?: number) =>
+  uploadResumeSource: async (
+    file: File,
+    profile: CareerProfile,
+    pageCount?: number,
+    requestId = crypto.randomUUID(),
+  ) =>
     request<UploadResumeSourceResponse>("/api/jobs/resume-source", {
       method: "POST",
       body: JSON.stringify({
+        request_id: requestId,
         file_name: file.name,
         media_type: resumeMediaType(file),
         bytes_base64: await fileBase64(file),
@@ -356,6 +362,15 @@ export const jobsApi = {
     }),
   applicationEvidence: (id: string) =>
     request<ApplicationEvidence[]>(`/api/jobs/applications/${encodeURIComponent(id)}/evidence`),
+  downloadApplicationEvidence: (
+    applicationId: string,
+    evidenceId: string,
+    fallbackName: string,
+  ) =>
+    requestDownload(
+      `/api/jobs/applications/${encodeURIComponent(applicationId)}/evidence/${encodeURIComponent(evidenceId)}/download`,
+      fallbackName,
+    ),
   resumeVersion: (id: string) =>
     request<ResumeVersion>(`/api/jobs/resume-versions/${encodeURIComponent(id)}`),
   saveBrowserSession: (session: BrowserSession) =>

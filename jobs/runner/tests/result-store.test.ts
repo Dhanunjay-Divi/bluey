@@ -5,7 +5,9 @@ import { basename, dirname, join, sep } from "node:path";
 import { describe, expect, it } from "vitest";
 import { encryptFile } from "../src/crypto-envelope.js";
 import {
+  promoteStagedResult,
   readResult,
+  readResultState,
   resultPath,
   stageResult,
   writeResult,
@@ -49,7 +51,7 @@ describe("runner step result store", () => {
     })).toThrow(expect.objectContaining({ code: "invalid_result_scope" }));
   });
 
-  it("does not expose a staged terminal result until it is committed", async () => {
+  it("promotes only the exact staged terminal result", async () => {
     const root = await mkdtemp(join(tmpdir(), "bluey-jobs-result-stage-"));
     const key = randomBytes(32);
     const result = { receipt: { status: "submitted" }, receiptPath: "/receipt.json" };
@@ -57,9 +59,25 @@ describe("runner step result store", () => {
 
     await stageResult(root, context, result, key);
     await expect(readResult(root, context, key)).resolves.toBeUndefined();
+    const staged = await readResultState<typeof result>(root, context, key);
+    expect(staged).toMatchObject({ state: "staged", result });
 
-    await writeResult(root, context, result, key);
+    await expect(promoteStagedResult(
+      root,
+      context,
+      "0".repeat(64),
+      key,
+    )).rejects.toMatchObject({ code: "result_promotion_conflict" });
+    await expect(readResult(root, context, key)).resolves.toBeUndefined();
+
+    await promoteStagedResult(root, context, staged!.resultSha256, key);
     await expect(readResult(root, context, key)).resolves.toEqual(result);
+    await expect(promoteStagedResult(
+      root,
+      context,
+      staged!.resultSha256,
+      key,
+    )).resolves.toEqual(result);
   });
 
   it("rejects ciphertext swapped between durable request scopes", async () => {

@@ -106,6 +106,88 @@ describe("browser profile snapshot client", () => {
     expectSignedWorkerRequest(calls[0]!, "runner-test-1");
   });
 
+  it("uses the store deadline and retries the identical request after a timeout", async () => {
+    vi.useFakeTimers();
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const digest = sha256(SNAPSHOT_BYTES);
+    const fetch = vi.fn((input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (calls.length === 1) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+            once: true,
+          });
+        });
+      }
+      return Promise.resolve(storedSnapshotResponse(digest));
+    }) as typeof globalThis.fetch;
+    const storing = createClient(fetch, {
+      requestTimeoutMs: 100,
+      storeRequestTimeoutMs: 200,
+    }).store(CONTEXT, {
+      bytes: SNAPSHOT_BYTES,
+      generation: 4,
+      envelopeVersion: 2,
+    });
+    const expectation = expect(storing).resolves.toMatchObject({ generation: 5, sha256: digest });
+
+    await vi.advanceTimersByTimeAsync(100);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.signal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(100);
+    await expectation;
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.init?.body).toBe(calls[1]?.init?.body);
+  });
+
+  it("reconciles a committed store after the first response is lost", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const digest = sha256(SNAPSHOT_BYTES);
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      if (calls.length === 1) throw new Error("connection closed after commit");
+      return storedSnapshotResponse(digest);
+    }) as typeof globalThis.fetch;
+
+    await expect(createClient(fetch).store(CONTEXT, {
+      bytes: SNAPSHOT_BYTES,
+      generation: 4,
+      envelopeVersion: 2,
+    })).resolves.toMatchObject({ generation: 5, sha256: digest });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[0]?.init?.body).toBe(calls[1]?.init?.body);
+    expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({
+      expected_generation: 4,
+      envelope_version: 2,
+      sha256: digest,
+      size_bytes: SNAPSHOT_BYTES.length,
+    });
+  });
+
+  it("bounds ambiguous retries and never retries a definitive conflict", async () => {
+    const ambiguousFetch = vi.fn(async () => {
+      throw new Error("response lost");
+    }) as typeof globalThis.fetch;
+    await expect(createClient(ambiguousFetch).store(CONTEXT, {
+      bytes: SNAPSHOT_BYTES,
+      generation: 4,
+      envelopeVersion: 2,
+    })).rejects.toMatchObject({ code: "request_failed" });
+    expect(ambiguousFetch).toHaveBeenCalledTimes(2);
+
+    const conflictFetch = vi.fn(async () => (
+      jsonResponse({ error: "generation conflict" }, 409)
+    )) as typeof globalThis.fetch;
+    await expect(createClient(conflictFetch).store(CONTEXT, {
+      bytes: SNAPSHOT_BYTES,
+      generation: 4,
+      envelopeVersion: 2,
+    })).rejects.toMatchObject({ code: "request_failed", status: 409 });
+    expect(conflictFetch).toHaveBeenCalledTimes(1);
+  });
+
   it("rejects corrupt, cross-profile, and stale-generation responses", async () => {
     const digest = sha256(SNAPSHOT_BYTES);
     const corrupt = createClient(vi.fn(async () => jsonResponse({
@@ -130,18 +212,20 @@ describe("browser profile snapshot client", () => {
       code: "invalid_response",
     });
 
-    const staleStore = createClient(vi.fn(async () => jsonResponse({
+    const staleStoreFetch = vi.fn(async () => jsonResponse({
       browser_profile_id: CONTEXT.browserProfileId,
       generation: 4,
       envelope_version: 2,
       sha256: digest,
       size_bytes: SNAPSHOT_BYTES.length,
-    })) as typeof globalThis.fetch);
+    })) as typeof globalThis.fetch;
+    const staleStore = createClient(staleStoreFetch);
     await expect(staleStore.store(CONTEXT, {
       bytes: SNAPSHOT_BYTES,
       generation: 4,
       envelopeVersion: 2,
     })).rejects.toMatchObject({ code: "invalid_response" });
+    expect(staleStoreFetch).toHaveBeenCalledTimes(1);
   });
 
   it("blocks redirects, oversized responses, and stalled requests", async () => {
@@ -255,6 +339,16 @@ function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
     headers: { "Content-Type": "application/json" },
+  });
+}
+
+function storedSnapshotResponse(digest: string): Response {
+  return jsonResponse({
+    browser_profile_id: CONTEXT.browserProfileId,
+    generation: 5,
+    envelope_version: 2,
+    sha256: digest,
+    size_bytes: SNAPSHOT_BYTES.length,
   });
 }
 

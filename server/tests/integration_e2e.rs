@@ -14,8 +14,12 @@ use serde_json::json;
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use tower::ServiceExt;
-use wiremock::matchers::{header, method, path, path_regex};
+use wiremock::matchers::{header, method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use bluey_server::auth;
@@ -24,11 +28,13 @@ use bluey_server::config::{
 };
 use bluey_server::db::accounts::Account;
 use bluey_server::db::jobs::{
-    self, BrowserSession, DiscoverySourceInput, Intervention, JobDiscoveryEvidence, JobPosting,
-    JobPreferences,
+    self, ApplicationEvidence, BrowserSession, DiscoverySourceInput, Intervention,
+    JobDiscoveryEvidence, JobPosting, JobPreferences,
 };
+use bluey_server::db::object_uploads::NewSubmissionEvidenceCapacity;
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
+use bluey_server::object_storage::UploadLimits;
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
 /// returns the axum Router ready for ServiceExt::oneshot.
@@ -876,6 +882,739 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
     (account.id, application.id, run_id, browser_profile_id)
 }
 
+struct EvidenceDownloadFixture {
+    account_id: String,
+    application_id: String,
+    resume: ApplicationEvidence,
+    receipt: ApplicationEvidence,
+    confirmation: ApplicationEvidence,
+    resume_bytes: Vec<u8>,
+    receipt_bytes: Vec<u8>,
+    confirmation_bytes: Vec<u8>,
+}
+
+fn persist_test_application(
+    harness: &Harness,
+    account_id: &str,
+    application: &jobs::JobApplication,
+) {
+    let payload = serde_json::to_string(application).unwrap();
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_applications
+                SET state = ?3, application_json = ?4, updated_at_ms = ?5,
+                    submitted_at_ms = ?6
+              WHERE account_id = ?1 AND id = ?2",
+            rusqlite::params![
+                account_id,
+                &application.id,
+                &application.state,
+                payload,
+                application.updated_at_ms,
+                application.submitted_at_ms,
+            ],
+        )
+        .unwrap();
+}
+
+fn persist_test_application_evidence(
+    harness: &Harness,
+    account_id: &str,
+    evidence: &ApplicationEvidence,
+) {
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_application_evidence SET evidence_json = ?3
+              WHERE account_id = ?1 AND id = ?2",
+            rusqlite::params![
+                account_id,
+                &evidence.id,
+                serde_json::to_string(evidence).unwrap()
+            ],
+        )
+        .unwrap();
+}
+
+async fn setup_application_evidence_download(harness: &Harness) -> EvidenceDownloadFixture {
+    let (account_id, application_id, run_id, _) = setup_execution_lease_run(harness).await;
+    let mut application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    let resume_version_id = application.resume_version_id.clone().unwrap();
+    let resume_bytes = valid_receipt_pdf();
+    let resume_sha256 = hex::encode(Sha256::digest(&resume_bytes));
+    let resume_key = format!(
+        "bluey-cloud/accounts/{account_id}/jobs/applications/{application_id}/evidence/resume.pdf"
+    );
+    let confirmation_bytes = valid_receipt_png();
+    let confirmation_sha256 = hex::encode(Sha256::digest(&confirmation_bytes));
+    let confirmation_key = format!(
+        "bluey-cloud/accounts/{account_id}/jobs/applications/{application_id}/evidence/confirmation.png"
+    );
+    let receipt_id = format!("receipt-download-{application_id}");
+    let fingerprint = "d".repeat(64);
+    let frozen_job = application
+        .receipt
+        .pointer("/approved_execution/job")
+        .cloned()
+        .expect("approved application must contain a frozen job snapshot");
+    let confirmation_url = format!(
+        "{}/confirmation",
+        frozen_job["canonicalUrl"]
+            .as_str()
+            .expect("approved job has a canonical URL")
+            .trim_end_matches('/')
+    );
+    let receipt_without_object = json!({
+        "schemaVersion": 1,
+        "receiptId": receipt_id,
+        "accountId": account_id,
+        "applicationId": application_id,
+        "runId": run_id,
+        "runner": "cloud",
+        "adapter": "greenhouse",
+        "adapterVersion": "2026.07.1-beta.1",
+        "packet": { "jobId": application.job_id },
+        "job": &frozen_job,
+        "documents": [{
+            "kind": "resume",
+            "versionId": &resume_version_id,
+            "storageKey": &resume_key,
+            "sha256": &resume_sha256,
+            "mediaType": "application/pdf"
+        }],
+        "events": [],
+        "result": {
+            "status": "submitted",
+            "submitHttpStatus": 302,
+            "confirmationText": "Application received",
+            "confirmationUrl": &confirmation_url,
+            "submittedAt": "2026-08-04T12:00:00Z",
+            "issues": []
+        },
+        "finalUrl": &confirmation_url,
+        "screenshotKeys": [&confirmation_key],
+        "evidenceObjects": [{
+            "kind": "screenshot",
+            "storageKey": &confirmation_key,
+            "sha256": &confirmation_sha256,
+            "mediaType": "image/png",
+            "sizeBytes": confirmation_bytes.len()
+        }, {
+            "kind": "resume",
+            "storageKey": &resume_key,
+            "sha256": &resume_sha256,
+            "mediaType": "application/pdf",
+            "sizeBytes": resume_bytes.len()
+        }],
+        "_bluey_server_submission_fingerprint_v1": &fingerprint,
+        "_bluey_server_submission_authority_v1": {
+            "schemaVersion": 1,
+            "runner": "cloud"
+        }
+    });
+    let receipt_bytes = serde_json::to_vec(&json!({
+        "schemaVersion": 1,
+        "bundleId": fingerprint,
+        "accountId": account_id,
+        "applicationId": application_id,
+        "receiptId": receipt_id,
+        "job": &frozen_job,
+        "resume": { "id": resume_version_id },
+        "receipt": receipt_without_object
+    }))
+    .unwrap();
+    let receipt_sha256 = hex::encode(Sha256::digest(&receipt_bytes));
+    let receipt_key = format!(
+        "bluey-cloud/accounts/{account_id}/jobs/applications/{application_id}/evidence/receipt.json"
+    );
+    let receipt_size = i64::try_from(receipt_bytes.len()).unwrap();
+    let resume_size = i64::try_from(resume_bytes.len()).unwrap();
+    let confirmation_size = i64::try_from(confirmation_bytes.len()).unwrap();
+    let mut final_receipt = receipt_without_object;
+    final_receipt["receiptObject"] = json!({
+        "storageKey": &receipt_key,
+        "sha256": &receipt_sha256,
+        "mediaType": "application/json",
+        "sizeBytes": receipt_size,
+        "schemaVersion": 1
+    });
+    let now = chrono::Utc::now().timestamp_millis();
+    application.receipt = final_receipt;
+    application.state = "submitted".to_string();
+    application.submitted_at_ms = Some(now);
+    application.updated_at_ms = now;
+    persist_test_application(harness, &account_id, &application);
+
+    let resume = jobs::save_application_evidence(
+        &harness.pool,
+        &account_id,
+        &ApplicationEvidence {
+            id: "download-resume-evidence".to_string(),
+            application_id: application_id.clone(),
+            kind: "resume".to_string(),
+            label: "Resume submitted".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "../../submitted\r\nresume.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            storage_key: resume_key,
+            sha256: resume_sha256,
+            resume_version_id: Some(resume_version_id.clone()),
+            occurred_at_ms: now,
+            metadata: json!({
+                "attached_to_submission": true,
+                "receipt_id": receipt_id,
+                "size_bytes": resume_size
+            }),
+            created_at_ms: now,
+        },
+    )
+    .unwrap();
+    let receipt = jobs::save_application_evidence(
+        &harness.pool,
+        &account_id,
+        &ApplicationEvidence {
+            id: "download-receipt-evidence".to_string(),
+            application_id: application_id.clone(),
+            kind: "application_receipt".to_string(),
+            label: "Application receipt bundle".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "../../bad\r\nname.json".to_string(),
+            media_type: "application/json".to_string(),
+            storage_key: receipt_key,
+            sha256: receipt_sha256,
+            resume_version_id: Some(resume_version_id.clone()),
+            occurred_at_ms: now,
+            metadata: json!({
+                "immutable": true,
+                "receipt_id": receipt_id,
+                "schema_version": 1,
+                "size_bytes": receipt_size,
+                "runner": "cloud",
+                "run_id": run_id
+            }),
+            created_at_ms: now,
+        },
+    )
+    .unwrap();
+    let confirmation = jobs::save_application_evidence(
+        &harness.pool,
+        &account_id,
+        &ApplicationEvidence {
+            id: "download-confirmation-evidence".to_string(),
+            application_id: application_id.clone(),
+            kind: "submission_confirmation".to_string(),
+            label: "Application received".to_string(),
+            provider: "greenhouse".to_string(),
+            file_name: "submission-confirmation.png".to_string(),
+            media_type: "image/png".to_string(),
+            storage_key: confirmation_key.clone(),
+            sha256: confirmation_sha256,
+            resume_version_id: Some(resume_version_id),
+            occurred_at_ms: now,
+            metadata: json!({
+                "confirmation": "Application received",
+                "screenshot_keys": [confirmation_key],
+                "evidence_strength": "browser_confirmed",
+                "receipt_id": receipt_id,
+                "size_bytes": confirmation_size
+            }),
+            created_at_ms: now,
+        },
+    )
+    .unwrap();
+    EvidenceDownloadFixture {
+        account_id,
+        application_id,
+        resume,
+        receipt,
+        confirmation,
+        resume_bytes,
+        receipt_bytes,
+        confirmation_bytes,
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_evidence_download_is_authenticated_tenant_scoped_and_verified() {
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let fixture = setup_application_evidence_download(&harness).await;
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{}", fixture.resume.storage_key)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(fixture.resume_bytes.clone(), "application/pdf"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{}", fixture.receipt.storage_key)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(fixture.receipt_bytes.clone(), "application/json"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/bucket/{}",
+            fixture.confirmation.storage_key
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(fixture.confirmation_bytes.clone(), "image/png"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let receipt_path = format!(
+        "/api/jobs/applications/{}/evidence/{}/download",
+        fixture.application_id, fixture.receipt.id
+    );
+    let unauthenticated = harness
+        .jobs_router
+        .clone()
+        .oneshot(Request::get(&receipt_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+
+    let owner = login(
+        &harness,
+        "jobs-execution-lease@example.com",
+        "valid-password-123",
+    )
+    .await;
+    let owner_token = owner["access_token"].as_str().unwrap();
+    let missing = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/jobs/applications/{}/evidence/not-present/download",
+                fixture.application_id
+            ))
+            .header("authorization", format!("Bearer {owner_token}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    let other_token = signup_and_login(
+        &harness,
+        "jobs-evidence-download-other@example.com",
+        "valid-password-123",
+    )
+    .await;
+    let cross_account = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&receipt_path)
+                .header("authorization", format!("Bearer {other_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_account.status(), StatusCode::NOT_FOUND);
+
+    let resume_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/jobs/applications/{}/evidence/{}/download",
+                fixture.application_id, fixture.resume.id
+            ))
+            .header("authorization", format!("Bearer {owner_token}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume_response.status(), StatusCode::OK);
+    assert_eq!(
+        resume_response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/pdf"
+    );
+    assert_eq!(
+        resume_response.headers()[axum::http::header::CONTENT_DISPOSITION],
+        "attachment; filename=\"submitted-resume.pdf\""
+    );
+    let resume_body = axum::body::to_bytes(resume_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(resume_body.as_ref(), fixture.resume_bytes);
+
+    let receipt_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&receipt_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(receipt_response.status(), StatusCode::OK);
+    assert_eq!(
+        receipt_response.headers()[axum::http::header::CONTENT_TYPE],
+        "application/json"
+    );
+    assert_eq!(
+        receipt_response.headers()[axum::http::header::CONTENT_DISPOSITION],
+        "attachment; filename=\"bad-name.json\""
+    );
+    assert_eq!(
+        receipt_response.headers()[axum::http::header::CACHE_CONTROL],
+        "private, no-store"
+    );
+    assert_eq!(
+        receipt_response.headers()["x-content-type-options"],
+        "nosniff"
+    );
+    let receipt_body = axum::body::to_bytes(receipt_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(receipt_body.as_ref(), fixture.receipt_bytes);
+
+    let confirmation_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(format!(
+                "/api/jobs/applications/{}/evidence/{}/download",
+                fixture.application_id, fixture.confirmation.id
+            ))
+            .header("authorization", format!("Bearer {owner_token}"))
+            .body(Body::empty())
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(confirmation_response.status(), StatusCode::OK);
+    assert_eq!(
+        confirmation_response.headers()[axum::http::header::CONTENT_TYPE],
+        "image/png"
+    );
+    let confirmation_body = axum::body::to_bytes(confirmation_response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(confirmation_body.as_ref(), fixture.confirmation_bytes);
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_evidence_download_fails_closed_on_tamper_media_missing_object_and_bad_scope() {
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let fixture = setup_application_evidence_download(&harness).await;
+    let receipt_path = format!(
+        "/api/jobs/applications/{}/evidence/{}/download",
+        fixture.application_id, fixture.receipt.id
+    );
+    let resume_path = format!(
+        "/api/jobs/applications/{}/evidence/{}/download",
+        fixture.application_id, fixture.resume.id
+    );
+    let confirmation_path = format!(
+        "/api/jobs/applications/{}/evidence/{}/download",
+        fixture.application_id, fixture.confirmation.id
+    );
+    let structurally_invalid_receipt_bytes = b"{}".to_vec();
+    let structurally_invalid_receipt_sha256 =
+        hex::encode(Sha256::digest(&structurally_invalid_receipt_bytes));
+    let structurally_invalid_receipt_size =
+        i64::try_from(structurally_invalid_receipt_bytes.len()).unwrap();
+    let mut structurally_invalid_receipt = fixture.receipt.clone();
+    structurally_invalid_receipt.sha256 = structurally_invalid_receipt_sha256.clone();
+    structurally_invalid_receipt.metadata["size_bytes"] = json!(structurally_invalid_receipt_size);
+    persist_test_application_evidence(&harness, &fixture.account_id, &structurally_invalid_receipt);
+    let mut application =
+        jobs::get_application(&harness.pool, &fixture.account_id, &fixture.application_id)
+            .unwrap()
+            .unwrap();
+    application.receipt["receiptObject"]["sha256"] = json!(structurally_invalid_receipt_sha256);
+    application.receipt["receiptObject"]["sizeBytes"] = json!(structurally_invalid_receipt_size);
+    persist_test_application(&harness, &fixture.account_id, &application);
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{}", fixture.receipt.storage_key)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(structurally_invalid_receipt_bytes, "application/json"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/bucket/{}",
+            fixture.confirmation.storage_key
+        )))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let owner = login(
+        &harness,
+        "jobs-execution-lease@example.com",
+        "valid-password-123",
+    )
+    .await;
+    let owner_token = owner["access_token"].as_str().unwrap();
+
+    let tampered = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&receipt_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(tampered.status(), StatusCode::CONFLICT);
+
+    persist_test_application_evidence(&harness, &fixture.account_id, &fixture.receipt);
+    application.receipt["receiptObject"]["sha256"] = json!(fixture.receipt.sha256);
+    application.receipt["receiptObject"]["sizeBytes"] =
+        fixture.receipt.metadata["size_bytes"].clone();
+    persist_test_application(&harness, &fixture.account_id, &application);
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{}", fixture.receipt.storage_key)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(fixture.receipt_bytes.clone(), "text/plain"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let wrong_media_type = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&receipt_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_media_type.status(), StatusCode::CONFLICT);
+
+    let missing = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&confirmation_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing.status(), StatusCode::BAD_GATEWAY);
+
+    let structurally_invalid_png_bytes = b"not a valid PNG".to_vec();
+    let structurally_invalid_png_sha256 =
+        hex::encode(Sha256::digest(&structurally_invalid_png_bytes));
+    let structurally_invalid_png_size =
+        i64::try_from(structurally_invalid_png_bytes.len()).unwrap();
+    let mut structurally_invalid_confirmation = fixture.confirmation.clone();
+    structurally_invalid_confirmation.sha256 = structurally_invalid_png_sha256.clone();
+    structurally_invalid_confirmation.metadata["size_bytes"] = json!(structurally_invalid_png_size);
+    persist_test_application_evidence(
+        &harness,
+        &fixture.account_id,
+        &structurally_invalid_confirmation,
+    );
+    let confirmation_manifest = application.receipt["evidenceObjects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["storageKey"] == fixture.confirmation.storage_key)
+        .unwrap();
+    confirmation_manifest["sha256"] = json!(structurally_invalid_png_sha256);
+    confirmation_manifest["sizeBytes"] = json!(structurally_invalid_png_size);
+    persist_test_application(&harness, &fixture.account_id, &application);
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/bucket/{}",
+            fixture.confirmation.storage_key
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(structurally_invalid_png_bytes, "image/png"),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let invalid_png = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&confirmation_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_png.status(), StatusCode::CONFLICT);
+
+    persist_test_application_evidence(&harness, &fixture.account_id, &fixture.confirmation);
+    let confirmation_manifest = application.receipt["evidenceObjects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["storageKey"] == fixture.confirmation.storage_key)
+        .unwrap();
+    confirmation_manifest["sha256"] = json!(fixture.confirmation.sha256);
+    confirmation_manifest["sizeBytes"] = fixture.confirmation.metadata["size_bytes"].clone();
+    persist_test_application(&harness, &fixture.account_id, &application);
+
+    let structurally_invalid_pdf_bytes = b"%PDF-1.7\nmissing cross-reference and trailer".to_vec();
+    let structurally_invalid_pdf_sha256 =
+        hex::encode(Sha256::digest(&structurally_invalid_pdf_bytes));
+    let structurally_invalid_pdf_size =
+        i64::try_from(structurally_invalid_pdf_bytes.len()).unwrap();
+    let mut structurally_invalid_resume = fixture.resume.clone();
+    structurally_invalid_resume.sha256 = structurally_invalid_pdf_sha256.clone();
+    structurally_invalid_resume.metadata["size_bytes"] = json!(structurally_invalid_pdf_size);
+    persist_test_application_evidence(&harness, &fixture.account_id, &structurally_invalid_resume);
+    let resume_document = application.receipt["documents"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["storageKey"] == fixture.resume.storage_key)
+        .unwrap();
+    resume_document["sha256"] = json!(structurally_invalid_pdf_sha256);
+    let resume_manifest = application.receipt["evidenceObjects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["storageKey"] == fixture.resume.storage_key)
+        .unwrap();
+    resume_manifest["sha256"] = json!(structurally_invalid_resume.sha256);
+    resume_manifest["sizeBytes"] = json!(structurally_invalid_pdf_size);
+    persist_test_application(&harness, &fixture.account_id, &application);
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{}", fixture.resume.storage_key)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(structurally_invalid_pdf_bytes, "application/pdf"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let invalid_pdf = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&resume_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_pdf.status(), StatusCode::CONFLICT);
+
+    persist_test_application_evidence(&harness, &fixture.account_id, &fixture.resume);
+    let resume_document = application.receipt["documents"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["storageKey"] == fixture.resume.storage_key)
+        .unwrap();
+    resume_document["sha256"] = json!(fixture.resume.sha256);
+    let resume_manifest = application.receipt["evidenceObjects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|item| item["storageKey"] == fixture.resume.storage_key)
+        .unwrap();
+    resume_manifest["sha256"] = json!(fixture.resume.sha256);
+    resume_manifest["sizeBytes"] = fixture.resume.metadata["size_bytes"].clone();
+    persist_test_application(&harness, &fixture.account_id, &application);
+
+    let mut invalid_size = fixture.receipt.clone();
+    invalid_size.metadata["size_bytes"] = json!(0);
+    persist_test_application_evidence(&harness, &fixture.account_id, &invalid_size);
+    let invalid_metadata = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&receipt_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_metadata.status(), StatusCode::CONFLICT);
+
+    let mut cross_scope = fixture.receipt.clone();
+    cross_scope.storage_key =
+        "bluey-cloud/accounts/not-the-owner/jobs/evidence/receipt.json".to_string();
+    persist_test_application_evidence(&harness, &fixture.account_id, &cross_scope);
+    application.receipt["receiptObject"]["storageKey"] = json!(cross_scope.storage_key);
+    persist_test_application(&harness, &fixture.account_id, &application);
+    let invalid_scope = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(&receipt_path)
+                .header("authorization", format!("Bearer {owner_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_scope.status(), StatusCode::CONFLICT);
+}
+
 #[tokio::test]
 #[serial]
 async fn jobs_worker_round_trips_a_fenced_encrypted_browser_profile_snapshot() {
@@ -952,8 +1691,11 @@ async fn jobs_worker_round_trips_a_fenced_encrypted_browser_profile_snapshot() {
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/bucket/{object_key}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(encrypted.as_slice()))
-        .expect(2)
+        .respond_with(ResponseTemplate::new(200).set_body_raw(
+            encrypted.as_slice(),
+            "application/vnd.bluey.browser-profile+encrypted",
+        ))
+        .expect(3)
         .mount(&object_store)
         .await;
 
@@ -1164,16 +1906,77 @@ async fn jobs_customer_routes_cannot_forge_submission_evidence_or_submitted_stat
 }
 
 fn valid_receipt_pdf() -> Vec<u8> {
-    b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\nstartxref\n0\n%%EOF\n".to_vec()
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for object in [
+        b"<< /Type /Catalog /Pages 2 0 R >>".as_slice(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".as_slice(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] >>".as_slice(),
+    ] {
+        offsets.push(pdf.len());
+        let object_number = offsets.len();
+        pdf.extend_from_slice(format!("{object_number} 0 obj\n").as_bytes());
+        pdf.extend_from_slice(object);
+        pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = pdf.len();
+    pdf.extend_from_slice(b"xref\n0 4\n0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n").as_bytes(),
+    );
+    pdf
 }
 
 fn valid_receipt_png() -> Vec<u8> {
-    let mut png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR".to_vec();
-    png.extend_from_slice(&1u32.to_be_bytes());
-    png.extend_from_slice(&1u32.to_be_bytes());
-    png.extend_from_slice(&[8, 2, 0, 0, 0]);
-    png.extend_from_slice(&[0, 0, 0, 0]);
-    png
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, 1, 1);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&[0, 0, 0]).unwrap();
+    }
+    bytes
+}
+
+async fn mount_receipt_bundle_store(object_store: &MockServer) -> Arc<Mutex<Vec<u8>>> {
+    mount_receipt_bundle_store_with_readback(object_store, false).await
+}
+
+async fn mount_receipt_bundle_store_with_readback(
+    object_store: &MockServer,
+    tamper: bool,
+) -> Arc<Mutex<Vec<u8>>> {
+    let bundle_path = r"^/bucket/bluey-cloud/accounts/[^/]+/jobs/applications/[^/]+/receipts/[^/]+/bundles/[^/]+/sha256/[0-9a-f]{64}\.json$";
+    let stored_body = Arc::new(Mutex::new(Vec::new()));
+    let put_body = Arc::clone(&stored_body);
+    Mock::given(method("PUT"))
+        .and(path_regex(bundle_path))
+        .respond_with(move |request: &wiremock::Request| {
+            *put_body.lock().unwrap() = request.body.clone();
+            ResponseTemplate::new(200)
+        })
+        .expect(1)
+        .mount(object_store)
+        .await;
+    let get_body = Arc::clone(&stored_body);
+    Mock::given(method("GET"))
+        .and(path_regex(bundle_path))
+        .respond_with(move |_request: &wiremock::Request| {
+            let body = if tamper {
+                b"{}".to_vec()
+            } else {
+                get_body.lock().unwrap().clone()
+            };
+            ResponseTemplate::new(200).set_body_raw(body, "application/json")
+        })
+        .expect(1)
+        .mount(object_store)
+        .await;
+    stored_body
 }
 
 fn cloud_receipt_request(
@@ -1181,13 +1984,12 @@ fn cloud_receipt_request(
     account_id: &str,
     application_id: &str,
     run_id: &str,
+    lease_token: &str,
+    fence: i64,
 ) -> serde_json::Value {
     use sha2::{Digest, Sha256};
 
     let application = jobs::get_application(&harness.pool, account_id, application_id)
-        .unwrap()
-        .unwrap();
-    let posting = jobs::get_posting(&harness.pool, account_id, &application.job_id)
         .unwrap()
         .unwrap();
     let resume_id = application.resume_version_id.as_deref().unwrap();
@@ -1211,6 +2013,18 @@ fn cloud_receipt_request(
         .pointer("/approved_execution/checksum")
         .and_then(serde_json::Value::as_str)
         .unwrap();
+    let approved_job = application
+        .receipt
+        .pointer("/approved_execution/job")
+        .cloned()
+        .unwrap();
+    let confirmation_url = format!(
+        "{}/confirmation",
+        approved_job["canonicalUrl"]
+            .as_str()
+            .expect("approved job has a canonical URL")
+            .trim_end_matches('/')
+    );
     let pdf = valid_receipt_pdf();
     let png = valid_receipt_png();
     let pdf_sha = hex::encode(Sha256::digest(&pdf));
@@ -1219,6 +2033,8 @@ fn cloud_receipt_request(
     let screenshot_key = "local-run/final.png";
     json!({
         "account_id": account_id,
+        "lease_token": lease_token,
+        "fence": fence,
         "receipt": {
             "schemaVersion": 1,
             "receiptId": format!("receipt-{run_id}"),
@@ -1230,7 +2046,7 @@ fn cloud_receipt_request(
             "applicationIdentityId": identity_id,
             "browserProfileId": jobs::execution_browser_profile_id(account_id, identity_id),
             "adapter": "greenhouse",
-            "adapterVersion": "1.0.0",
+            "adapterVersion": "2026.07.1-beta.1",
             "packet": {
                 "jobId": application.job_id,
                 "resumeVersionId": resume_id,
@@ -1242,7 +2058,7 @@ fn cloud_receipt_request(
                     .unwrap_or_else(|| json!([])),
                 "approvedPacketChecksum": approved_packet_checksum
             },
-            "job": { "canonicalUrl": posting.canonical_url },
+            "job": approved_job,
             "documents": [{
                 "kind": "resume",
                 "versionId": resume_id,
@@ -1250,13 +2066,25 @@ fn cloud_receipt_request(
                 "sha256": pdf_sha,
                 "mediaType": "application/pdf"
             }],
-            "events": [],
+            "events": [{
+                "id": format!("{run_id}:provider-receipt"),
+                "occurredAt": "2026-07-12T12:00:00Z",
+                "type": "greenhouse_state_transition",
+                "detail": {
+                    "state": "receipt",
+                    "status": "submitted",
+                    "capability": "beta_review"
+                }
+            }],
             "result": {
                 "status": "submitted",
+                "submitHttpStatus": 302,
                 "confirmationText": "Application received",
-                "confirmationUrl": "https://boards.greenhouse.io/acme/confirmation",
-                "submittedAt": "2026-07-12T12:00:00Z"
+                "confirmationUrl": &confirmation_url,
+                "submittedAt": "2026-07-12T12:00:00Z",
+                "issues": []
             },
+            "finalUrl": &confirmation_url,
             "screenshotKeys": [screenshot_key]
         },
         "evidence_objects": [{
@@ -1281,7 +2109,7 @@ fn prepare_cloud_submission(
     application_id: &str,
     run_id: &str,
     browser_profile_id: &str,
-) {
+) -> (String, i64) {
     jobs::reserve_application_attempt(&harness.pool, account_id, application_id, "cloud").unwrap();
     jobs::update_application(&harness.pool, account_id, application_id, "running", None)
         .unwrap()
@@ -1297,6 +2125,8 @@ fn prepare_cloud_submission(
         "receipt-integration-worker",
     )
     .unwrap();
+    let capacity = cloud_submission_evidence_capacity(account_id, application_id, run_id);
+    let final_submit_proof = final_submit_proof(harness, account_id, application_id);
     jobs::start_irreversible_submission(
         &harness.pool,
         account_id,
@@ -1304,6 +2134,8 @@ fn prepare_cloud_submission(
         run_id,
         &lease.lease_token,
         lease.fence,
+        &final_submit_proof,
+        &capacity,
     )
     .unwrap();
     jobs::finish_execution_lease(
@@ -1316,6 +2148,7 @@ fn prepare_cloud_submission(
         "submitted",
     )
     .unwrap();
+    (lease.lease_token, lease.fence)
 }
 
 fn prepare_cloud_side_effect_unknown(
@@ -1324,7 +2157,7 @@ fn prepare_cloud_side_effect_unknown(
     application_id: &str,
     run_id: &str,
     browser_profile_id: &str,
-) {
+) -> (String, i64) {
     jobs::reserve_application_attempt(&harness.pool, account_id, application_id, "cloud").unwrap();
     jobs::update_application(&harness.pool, account_id, application_id, "running", None)
         .unwrap()
@@ -1338,6 +2171,8 @@ fn prepare_cloud_side_effect_unknown(
         "receipt-reconciliation-worker",
     )
     .unwrap();
+    let capacity = cloud_submission_evidence_capacity(account_id, application_id, run_id);
+    let final_submit_proof = final_submit_proof(harness, account_id, application_id);
     jobs::start_irreversible_submission(
         &harness.pool,
         account_id,
@@ -1345,6 +2180,8 @@ fn prepare_cloud_side_effect_unknown(
         run_id,
         &lease.lease_token,
         lease.fence,
+        &final_submit_proof,
+        &capacity,
     )
     .unwrap();
     jobs::update_application(
@@ -1389,6 +2226,131 @@ fn prepare_cloud_side_effect_unknown(
         "side_effect_unknown",
     )
     .unwrap();
+    (lease.lease_token, lease.fence)
+}
+
+fn cloud_submission_evidence_capacity(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> NewSubmissionEvidenceCapacity {
+    submission_evidence_capacity(account_id, application_id, run_id, "cloud")
+}
+
+fn local_submission_evidence_capacity(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> NewSubmissionEvidenceCapacity {
+    submission_evidence_capacity(account_id, application_id, run_id, "local")
+}
+
+fn submission_evidence_capacity(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+) -> NewSubmissionEvidenceCapacity {
+    const MAX_OBJECT_BYTES: i64 = 1024 * 1024;
+    const MAX_RECEIPT_EVIDENCE_BYTES: i64 = 40 * 1024 * 1024;
+    let now = chrono::Utc::now().timestamp_millis();
+    NewSubmissionEvidenceCapacity {
+        account_id: account_id.to_string(),
+        application_id: application_id.to_string(),
+        run_id: run_id.to_string(),
+        runner: runner.to_string(),
+        reserved_bytes: MAX_RECEIPT_EVIDENCE_BYTES + MAX_OBJECT_BYTES,
+        reserved_objects: 13,
+        expires_at_ms: now.saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS),
+        now_ms: now,
+        limits: UploadLimits {
+            max_object_bytes: MAX_OBJECT_BYTES,
+            max_account_bytes: 128 * 1024 * 1024,
+            max_daily_bytes: 128 * 1024 * 1024,
+            max_account_objects: 100,
+        },
+    }
+}
+
+fn final_submit_proof(
+    harness: &Harness,
+    account_id: &str,
+    application_id: &str,
+) -> jobs::FinalSubmitProof {
+    let application = jobs::get_application(&harness.pool, account_id, application_id)
+        .unwrap()
+        .expect("final-submit application exists");
+    assert!(
+        application
+            .receipt
+            .pointer("/approved_execution/packet/coverLetterContent")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|value| value.trim().is_empty()),
+        "integration proof helper only supports a resume-only packet"
+    );
+    let canonical_url = application
+        .receipt
+        .pointer("/approved_execution/job/canonicalUrl")
+        .and_then(serde_json::Value::as_str)
+        .expect("final-submit application has a frozen canonical URL");
+    let provider_url = reqwest::Url::parse(canonical_url).expect("final-submit URL is valid");
+    let provider_segments = provider_url
+        .path_segments()
+        .expect("final-submit URL has path segments")
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    assert_eq!(provider_segments.get(1), Some(&"jobs"));
+    let provider_job_key = format!(
+        "greenhouse:{}:{}",
+        provider_segments.first().expect("Greenhouse tenant"),
+        provider_segments.get(2).expect("Greenhouse job")
+    );
+    let resume_sha256 = hex::encode(Sha256::digest(valid_receipt_pdf()));
+    jobs::FinalSubmitProof {
+        schema_version: 3,
+        adapter: "greenhouse".to_string(),
+        adapter_version: "2026.07.1-beta.1".to_string(),
+        control: "greenhouse_submit_application".to_string(),
+        job: jobs::FinalSubmitJobProof {
+            approved_canonical_url: canonical_url.to_string(),
+            page_url: canonical_url.to_string(),
+        },
+        target: jobs::FinalSubmitTargetProof {
+            action_url: canonical_url.to_string(),
+            method: "post".to_string(),
+            enctype: "multipart/form-data".to_string(),
+            form_target: "_self".to_string(),
+            provider_job_key,
+            form_identity: r#"[0,"application-form","","","","",""]"#.to_string(),
+        },
+        files: vec![jobs::FinalSubmitFileProof {
+            field_name: "resume".to_string(),
+            name: format!("resume-{resume_sha256}.pdf"),
+            byte_length: valid_receipt_pdf().len() as i64,
+            sha256: resume_sha256.clone(),
+        }],
+        fields: vec![jobs::FinalSubmitFieldProof {
+            field_name: "candidate_name".to_string(),
+            value_byte_length: 0,
+            value_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                .to_string(),
+        }],
+        part_order: vec![
+            jobs::FinalSubmitPartOrderProof {
+                kind: "field".to_string(),
+                index: 0,
+            },
+            jobs::FinalSubmitPartOrderProof {
+                kind: "file".to_string(),
+                index: 0,
+            },
+        ],
+        documents: vec![jobs::FinalSubmitDocumentProof {
+            kind: "resume".to_string(),
+            version_id: application.resume_version_id,
+            sha256: resume_sha256,
+        }],
+    }
 }
 
 async fn post_cloud_receipt(
@@ -1417,8 +2379,22 @@ async fn post_cloud_receipt(
 #[serial]
 async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     const WORKER_TOKEN: &str = "jobs-execution-lease-worker-token";
+    const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
-    let harness = boot_harness().await;
+    std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", SIGNING_KEY);
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: "https://objects.example.test".to_string(),
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
     let claim_body = json!({
@@ -1428,6 +2404,43 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         "browser_profile_id": browser_profile_id,
         "owner_id": "integration-worker-one"
     });
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let signed_owner_mismatch = harness
+        .router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            "/api/jobs/internal/execution-leases/claim",
+            "execution",
+            "signed-execution-worker",
+            now,
+            "execution-owner-binding-0001",
+            &json!({
+                "account_id": account_id,
+                "application_id": application_id,
+                "run_id": run_id,
+                "browser_profile_id": browser_profile_id,
+                "owner_id": "forged-execution-owner"
+            }),
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(signed_owner_mismatch.status(), StatusCode::BAD_REQUEST);
+    let lease_count: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_execution_leases WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(lease_count, 0);
 
     let unauthorized = harness
         .router
@@ -1606,7 +2619,8 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         "application_id": application_id,
         "lease_token": lease_token,
         "fence": fence,
-        "action": "submit"
+        "action": "submit",
+        "final_submit_proof": final_submit_proof(&harness, &account_id, &application_id)
     });
     let irreversible = harness
         .router
@@ -1622,10 +2636,16 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         )
         .await
         .unwrap();
-    assert_eq!(irreversible.status(), StatusCode::OK);
+    let irreversible_status = irreversible.status();
     let irreversible_bytes = axum::body::to_bytes(irreversible.into_body(), 64 * 1024)
         .await
         .unwrap();
+    assert_eq!(
+        irreversible_status,
+        StatusCode::OK,
+        "irreversible transition failed: {}",
+        String::from_utf8_lossy(&irreversible_bytes)
+    );
     let irreversible_value: serde_json::Value =
         serde_json::from_slice(&irreversible_bytes).unwrap();
     assert_eq!(irreversible_value["phase"], "click_started");
@@ -1742,6 +2762,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         assert_eq!(finished.status(), StatusCode::NO_CONTENT);
     }
     std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+    std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
 }
 
 #[tokio::test]
@@ -1916,12 +2937,19 @@ async fn jobs_cloud_receipt_requires_an_exact_terminal_submitted_lease_binding()
     jobs::update_application(&harness.pool, &account_id, &application_id, "running", None)
         .unwrap()
         .unwrap();
-    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
+    let body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        "missing-lease-token",
+        1,
+    );
 
     let missing = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
     assert_eq!(missing.status(), StatusCode::CONFLICT);
 
-    jobs::claim_execution_lease(
+    let lease = jobs::claim_execution_lease(
         &harness.pool,
         &account_id,
         &application_id,
@@ -1930,7 +2958,21 @@ async fn jobs_cloud_receipt_requires_an_exact_terminal_submitted_lease_binding()
         "nonterminal-receipt-worker",
     )
     .unwrap();
-    let nonterminal = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    let exact_nonterminal_body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease.lease_token,
+        lease.fence,
+    );
+    let nonterminal = post_cloud_receipt(
+        &harness,
+        WORKER_TOKEN,
+        &application_id,
+        &exact_nonterminal_body,
+    )
+    .await;
     assert_eq!(nonterminal.status(), StatusCode::CONFLICT);
 
     let mut mismatched = body;
@@ -1954,7 +2996,7 @@ async fn jobs_cloud_side_effect_unknown_can_be_reconciled_not_submitted() {
     let harness = boot_harness().await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
-    prepare_cloud_side_effect_unknown(
+    let (lease_token, fence) = prepare_cloud_side_effect_unknown(
         &harness,
         &account_id,
         &application_id,
@@ -2028,8 +3070,27 @@ async fn jobs_cloud_side_effect_unknown_can_be_reconciled_not_submitted() {
         .unwrap();
     assert_eq!(session.status, "failed");
     assert_eq!(session.current_step, "Confirmed not submitted");
+    let evidence_capacity_state: String = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT state FROM jobs_submission_evidence_capacity
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![&account_id, &application_id, &run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(evidence_capacity_state, "released");
 
-    let receipt = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
+    let receipt = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease_token,
+        fence,
+    );
     let late_receipt = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &receipt).await;
     assert_eq!(late_receipt.status(), StatusCode::CONFLICT);
     std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
@@ -2057,16 +3118,23 @@ async fn jobs_cloud_side_effect_unknown_accepts_late_trusted_receipt() {
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
-    prepare_cloud_side_effect_unknown(
+    let (lease_token, fence) = prepare_cloud_side_effect_unknown(
         &harness,
         &account_id,
         &application_id,
         &run_id,
         &browser_profile_id,
     );
-    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
-    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/resume-[0-9a-f]{20}$";
-    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/screenshot-[0-9a-f]{20}$";
+    let body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease_token,
+        fence,
+    );
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-screenshot-[0-9a-f]{20}$";
     Mock::given(method("PUT"))
         .and(path_regex(resume_path))
         .respond_with(ResponseTemplate::new(200))
@@ -2093,6 +3161,7 @@ async fn jobs_cloud_side_effect_unknown_accepts_late_trusted_receipt() {
         .expect(1)
         .mount(&object_store)
         .await;
+    let _bundle_body = mount_receipt_bundle_store(&object_store).await;
 
     let accepted = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
     assert_eq!(accepted.status(), StatusCode::OK);
@@ -2128,8 +3197,37 @@ async fn jobs_cloud_side_effect_unknown_accepts_late_trusted_receipt() {
         jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
             .unwrap()
             .len(),
-        2
+        3
     );
+    let connection = harness.pool.get().unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM jobs_submission_evidence_capacity
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                rusqlite::params![&account_id, &application_id, &run_id],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM jobs_execution_leases
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                rusqlite::params![&account_id, &application_id, &run_id],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    let exact_replay = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(exact_replay.status(), StatusCode::OK);
+    let mut wrong_authority = body.clone();
+    wrong_authority["lease_token"] = json!("z".repeat(43));
+    let wrong_authority_replay =
+        post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &wrong_authority).await;
+    assert_eq!(wrong_authority_replay.status(), StatusCode::CONFLICT);
 
     let auth = login(
         &harness,
@@ -2184,16 +3282,56 @@ async fn jobs_cloud_receipt_is_atomic_and_exactly_idempotent() {
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
-    prepare_cloud_submission(
+    let (lease_token, fence) = prepare_cloud_submission(
         &harness,
         &account_id,
         &application_id,
         &run_id,
         &browser_profile_id,
     );
-    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
-    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/resume-[0-9a-f]{20}$";
-    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/screenshot-[0-9a-f]{20}$";
+    let pre_submission_application =
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap();
+    let pre_submission_receipt = pre_submission_application.receipt.clone();
+    let frozen_job = pre_submission_receipt
+        .pointer("/approved_execution/job")
+        .cloned()
+        .expect("approved execution must freeze the job snapshot");
+    let body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease_token,
+        fence,
+    );
+    let mut live_posting = jobs::get_posting(
+        &harness.pool,
+        &account_id,
+        &pre_submission_application.job_id,
+    )
+    .unwrap()
+    .unwrap();
+    live_posting.company = "Mutable Company Name".to_string();
+    live_posting.title = "Mutable Posting Title".to_string();
+    live_posting.canonical_url =
+        "https://boards.greenhouse.io/acme/jobs/mutated-after-submit".to_string();
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_postings SET posting_json = ?3 WHERE account_id = ?1 AND id = ?2",
+            rusqlite::params![
+                &account_id,
+                &pre_submission_application.job_id,
+                serde_json::to_string(&live_posting).unwrap(),
+            ],
+        )
+        .unwrap();
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-screenshot-[0-9a-f]{20}$";
     Mock::given(method("PUT"))
         .and(path_regex(resume_path))
         .respond_with(ResponseTemplate::new(200))
@@ -2220,6 +3358,7 @@ async fn jobs_cloud_receipt_is_atomic_and_exactly_idempotent() {
         .expect(1)
         .mount(&object_store)
         .await;
+    let bundle_body = mount_receipt_bundle_store(&object_store).await;
 
     harness
         .pool
@@ -2266,30 +3405,235 @@ async fn jobs_cloud_receipt_is_atomic_and_exactly_idempotent() {
     )
     .unwrap();
 
+    let mut missing_submit_status = body.clone();
+    missing_submit_status["receipt"]["result"]
+        .as_object_mut()
+        .unwrap()
+        .remove("submitHttpStatus");
+    let missing_submit_status_response = post_cloud_receipt(
+        &harness,
+        WORKER_TOKEN,
+        &application_id,
+        &missing_submit_status,
+    )
+    .await;
+    assert_eq!(
+        missing_submit_status_response.status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let mut not_modified_submit_status = body.clone();
+    not_modified_submit_status["receipt"]["result"]["submitHttpStatus"] = json!(304);
+    let not_modified_submit_status_response = post_cloud_receipt(
+        &harness,
+        WORKER_TOKEN,
+        &application_id,
+        &not_modified_submit_status,
+    )
+    .await;
+    assert_eq!(
+        not_modified_submit_status_response.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert!(object_store.received_requests().await.unwrap().is_empty());
+
     let first = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
-    assert_eq!(first.status(), StatusCode::OK);
+    let first_status = first.status();
+    let first_bytes = axum::body::to_bytes(first.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        first_status,
+        StatusCode::OK,
+        "receipt failed: {}",
+        String::from_utf8_lossy(&first_bytes)
+    );
     let replay = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
     assert_eq!(replay.status(), StatusCode::OK);
+    let mut wrong_authority = body.clone();
+    wrong_authority["lease_token"] = json!("z".repeat(43));
+    let wrong_authority_replay =
+        post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &wrong_authority).await;
+    assert_eq!(wrong_authority_replay.status(), StatusCode::CONFLICT);
     let mut changed = body.clone();
     changed["receipt"]["result"]["confirmationText"] = json!("Different receipt content");
     let conflicting = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &changed).await;
     assert_eq!(conflicting.status(), StatusCode::CONFLICT);
 
+    let bundle_bytes = bundle_body.lock().unwrap().clone();
+    let bundle: serde_json::Value = serde_json::from_slice(&bundle_bytes).unwrap();
+    assert_eq!(bundle.get("job"), Some(&frozen_job));
+    assert_eq!(bundle.pointer("/receipt/job"), Some(&frozen_job));
+    assert_eq!(
+        bundle
+            .pointer("/receipt/result/submitHttpStatus")
+            .and_then(serde_json::Value::as_i64),
+        Some(302)
+    );
+    assert_ne!(
+        bundle
+            .pointer("/job/title")
+            .and_then(serde_json::Value::as_str),
+        Some("Mutable Posting Title")
+    );
+    assert_eq!(
+        bundle
+            .pointer("/schemaVersion")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        bundle.pointer("/receipt/_bluey_server_submission_authority_v1/preSubmissionReceipt"),
+        Some(&pre_submission_receipt)
+    );
+    assert_eq!(
+        bundle
+            .pointer("/receipt/_bluey_server_submission_authority_v1/preSubmissionReceipt/approved_execution/packet")
+            .and_then(serde_json::Value::as_object),
+        pre_submission_receipt
+            .pointer("/approved_execution/packet")
+            .and_then(serde_json::Value::as_object)
+    );
+
     let application = jobs::get_application(&harness.pool, &account_id, &application_id)
         .unwrap()
         .unwrap();
     assert_eq!(application.state, "submitted");
+    assert_eq!(
+        application
+            .receipt
+            .pointer("/result/submitHttpStatus")
+            .and_then(serde_json::Value::as_i64),
+        Some(302)
+    );
     assert!(application
         .receipt
         .get("_bluey_server_submission_fingerprint_v1")
         .and_then(serde_json::Value::as_str)
         .is_some());
+    let receipt_object = application
+        .receipt
+        .get("receiptObject")
+        .and_then(serde_json::Value::as_object)
+        .expect("submitted application must retain its immutable receipt object");
+    let receipt_storage_key = receipt_object
+        .get("storageKey")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    let receipt_sha256 = receipt_object
+        .get("sha256")
+        .and_then(serde_json::Value::as_str)
+        .unwrap();
+    let expected_receipt_sha256 = hex::encode(Sha256::digest(&bundle_bytes));
+    assert_eq!(receipt_sha256, expected_receipt_sha256);
+    assert!(receipt_storage_key.ends_with(&format!("/sha256/{receipt_sha256}.json")));
     assert_eq!(
-        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
-            .unwrap()
-            .len(),
-        2
+        receipt_object
+            .get("mediaType")
+            .and_then(serde_json::Value::as_str),
+        Some("application/json")
     );
+    assert_eq!(
+        receipt_object
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(
+        receipt_object
+            .get("sizeBytes")
+            .and_then(serde_json::Value::as_u64),
+        Some(bundle_bytes.len() as u64)
+    );
+    let stored_manifest = bundle
+        .pointer("/receipt/evidenceObjects")
+        .and_then(serde_json::Value::as_array)
+        .expect("immutable bundle must carry its exact evidence manifest");
+    assert_eq!(stored_manifest.len(), 2);
+    for (kind, expected_sha256, expected_size, media_type) in [
+        (
+            "resume",
+            hex::encode(Sha256::digest(valid_receipt_pdf())),
+            valid_receipt_pdf().len() as u64,
+            "application/pdf",
+        ),
+        (
+            "screenshot",
+            hex::encode(Sha256::digest(valid_receipt_png())),
+            valid_receipt_png().len() as u64,
+            "image/png",
+        ),
+    ] {
+        let stored = stored_manifest
+            .iter()
+            .find(|item| item.get("kind").and_then(serde_json::Value::as_str) == Some(kind))
+            .expect("each employer-facing evidence object must be manifested");
+        assert_eq!(
+            stored.get("sha256").and_then(serde_json::Value::as_str),
+            Some(expected_sha256.as_str())
+        );
+        assert_eq!(
+            stored.get("sizeBytes").and_then(serde_json::Value::as_u64),
+            Some(expected_size)
+        );
+        assert_eq!(
+            stored.get("mediaType").and_then(serde_json::Value::as_str),
+            Some(media_type)
+        );
+        let storage_key = stored
+            .get("storageKey")
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        assert!(storage_key.contains(&format!("-{kind}-")));
+    }
+    let evidence =
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id)).unwrap();
+    assert_eq!(evidence.len(), 3);
+    let resume_evidence = evidence
+        .iter()
+        .find(|item| item.kind == "resume")
+        .expect("submitted resume evidence must be present");
+    assert_eq!(
+        resume_evidence.file_name,
+        "Acme-Platform-Engineer-resume.pdf"
+    );
+    let receipt_evidence = evidence
+        .iter()
+        .find(|item| item.kind == "application_receipt")
+        .expect("immutable receipt evidence must be committed atomically");
+    assert_eq!(receipt_evidence.storage_key, receipt_storage_key);
+    assert_eq!(receipt_evidence.sha256, receipt_sha256);
+    assert_eq!(
+        receipt_evidence.resume_version_id,
+        application.resume_version_id
+    );
+    let (ready_uploads, total_uploads): (i64, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT SUM(CASE WHEN state = 'ready' THEN 1 ELSE 0 END), COUNT(*)
+               FROM object_uploads
+              WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((ready_uploads, total_uploads), (3, 3));
+    let account_lifetime_objects: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM object_uploads
+              WHERE account_id = ?1 AND expires_at_ms = ?2
+                AND json_extract(metadata_json, '$.retention_policy') =
+                    'account_lifetime_until_deletion'",
+            rusqlite::params![&account_id, i64::MAX],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(account_lifetime_objects, 3);
     let reservation = jobs::list_attempt_reservations(&harness.pool, &account_id)
         .unwrap()
         .into_iter()
@@ -2307,7 +3651,251 @@ async fn jobs_cloud_receipt_is_atomic_and_exactly_idempotent() {
 
 #[tokio::test]
 #[serial]
-async fn jobs_receipt_deletes_request_owned_uploads_after_partial_failure() {
+async fn jobs_concurrent_identical_cloud_receipts_replay_after_winner_commits() {
+    const WORKER_TOKEN: &str = "jobs-receipt-concurrent-replay-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness).await;
+    let (lease_token, fence) = prepare_cloud_submission(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+    );
+    let body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease_token,
+        fence,
+    );
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-screenshot-[0-9a-f]{20}$";
+    Mock::given(method("PUT"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1..=2)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(resume_path))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(valid_receipt_pdf(), "application/pdf"),
+        )
+        .expect(1..=2)
+        .mount(&object_store)
+        .await;
+    let screenshot_put_calls = Arc::new(AtomicUsize::new(0));
+    let screenshot_put_responder = Arc::clone(&screenshot_put_calls);
+    Mock::given(method("PUT"))
+        .and(path_regex(screenshot_path))
+        .respond_with(move |_request: &wiremock::Request| {
+            let response = ResponseTemplate::new(200);
+            if screenshot_put_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                response.set_delay(std::time::Duration::from_millis(500))
+            } else {
+                response
+            }
+        })
+        .expect(1..=2)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(valid_receipt_png(), "image/png"))
+        .expect(1..=2)
+        .mount(&object_store)
+        .await;
+    let _bundle_body = mount_receipt_bundle_store(&object_store).await;
+
+    let first = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body);
+    let second = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body);
+    let (first, second) = tokio::join!(first, second);
+    let mut committed = 0;
+    let mut retryable = 0;
+    for response in [first, second] {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        match status {
+            StatusCode::OK => committed += 1,
+            StatusCode::BAD_GATEWAY => retryable += 1,
+            _ => panic!(
+                "concurrent exact receipt returned {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            ),
+        }
+    }
+    assert!(committed >= 1, "one concurrent request must commit");
+    for _ in 0..retryable {
+        let replay = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+        assert_eq!(replay.status(), StatusCode::OK);
+    }
+
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.state, "submitted");
+    assert_eq!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .len(),
+        3
+    );
+    let (ready_uploads, total_uploads): (i64, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT SUM(CASE WHEN state = 'ready' THEN 1 ELSE 0 END), COUNT(*)
+               FROM object_uploads
+              WHERE account_id = ?1",
+            rusqlite::params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((ready_uploads, total_uploads), (3, 3));
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_receipt_rejects_tampered_bundle_without_deleting_protected_retry_set() {
+    const WORKER_TOKEN: &str = "jobs-receipt-tamper-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
+    let (account_id, application_id, run_id, browser_profile_id) =
+        setup_execution_lease_run(&harness).await;
+    let (lease_token, fence) = prepare_cloud_submission(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+    );
+    let body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease_token,
+        fence,
+    );
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-screenshot-[0-9a-f]{20}$";
+    Mock::given(method("PUT"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(resume_path))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(valid_receipt_pdf(), "application/pdf"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(valid_receipt_png(), "image/png"))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let _bundle_body = mount_receipt_bundle_store_with_readback(&object_store, true).await;
+    let response = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .is_empty()
+    );
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.state, "running");
+    assert!(application.receipt.get("receiptObject").is_none());
+    assert!(application
+        .receipt
+        .get("_bluey_server_submission_fingerprint_v1")
+        .is_none());
+    let protected_retry_states = harness
+        .pool
+        .get()
+        .unwrap()
+        .prepare("SELECT state FROM object_uploads WHERE account_id = ?1 ORDER BY created_at_ms")
+        .unwrap()
+        .query_map(rusqlite::params![account_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        protected_retry_states,
+        vec!["pending", "pending", "pending"]
+    );
+    let capacity: (String, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT state, consumed_objects FROM jobs_submission_evidence_capacity
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(capacity, ("active".to_string(), 3));
+    let reservation = jobs::list_attempt_reservations(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|reservation| reservation.application_id == application_id)
+        .unwrap();
+    assert_ne!(reservation.status, "submitted");
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_receipt_exact_retry_reuses_partial_uploads_without_duplicates() {
     const WORKER_TOKEN: &str = "jobs-receipt-cleanup-token";
     std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", WORKER_TOKEN);
     let object_store = MockServer::start().await;
@@ -2327,20 +3915,27 @@ async fn jobs_receipt_deletes_request_owned_uploads_after_partial_failure() {
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
-    prepare_cloud_submission(
+    let (lease_token, fence) = prepare_cloud_submission(
         &harness,
         &account_id,
         &application_id,
         &run_id,
         &browser_profile_id,
     );
-    let body = cloud_receipt_request(&harness, &account_id, &application_id, &run_id);
-    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/resume-[0-9a-f]{20}$";
-    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/screenshot-[0-9a-f]{20}$";
+    let body = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        &lease_token,
+        fence,
+    );
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-screenshot-[0-9a-f]{20}$";
     Mock::given(method("PUT"))
         .and(path_regex(resume_path))
         .respond_with(ResponseTemplate::new(200))
-        .expect(1)
+        .expect(2)
         .mount(&object_store)
         .await;
     Mock::given(method("GET"))
@@ -2348,24 +3943,33 @@ async fn jobs_receipt_deletes_request_owned_uploads_after_partial_failure() {
         .respond_with(
             ResponseTemplate::new(200).set_body_raw(valid_receipt_pdf(), "application/pdf"),
         )
-        .expect(1)
+        .expect(2)
         .mount(&object_store)
         .await;
+    let screenshot_put_attempts = Arc::new(AtomicUsize::new(0));
+    let screenshot_put_responder = Arc::clone(&screenshot_put_attempts);
     Mock::given(method("PUT"))
         .and(path_regex(screenshot_path))
-        .respond_with(ResponseTemplate::new(500))
+        .respond_with(move |_request: &wiremock::Request| {
+            if screenshot_put_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(500)
+            } else {
+                ResponseTemplate::new(200)
+            }
+        })
+        .expect(2)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(valid_receipt_png(), "image/png"))
         .expect(1)
         .mount(&object_store)
         .await;
-    Mock::given(method("DELETE"))
-        .and(path_regex(resume_path))
-        .respond_with(ResponseTemplate::new(204))
-        .expect(1)
-        .mount(&object_store)
-        .await;
+    let _bundle_body = mount_receipt_bundle_store(&object_store).await;
 
-    let response = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let first = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
     assert!(
         jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
             .unwrap()
@@ -2379,12 +3983,72 @@ async fn jobs_receipt_deletes_request_owned_uploads_after_partial_failure() {
         .receipt
         .get("_bluey_server_submission_fingerprint_v1")
         .is_none());
+    let pending_states = harness
+        .pool
+        .get()
+        .unwrap()
+        .prepare("SELECT state FROM object_uploads WHERE account_id = ?1 ORDER BY created_at_ms")
+        .unwrap()
+        .query_map(rusqlite::params![account_id], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(pending_states, vec!["pending", "pending"]);
+    let capacity_before_retry: (String, i64, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT state, consumed_bytes, consumed_objects
+               FROM jobs_submission_evidence_capacity
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(capacity_before_retry.0, "active");
+    assert_eq!(capacity_before_retry.2, 2);
+
+    let retry = post_cloud_receipt(&harness, WORKER_TOKEN, &application_id, &body).await;
+    let retry_status = retry.status();
+    let retry_bytes = axum::body::to_bytes(retry.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        retry_status,
+        StatusCode::OK,
+        "exact receipt retry failed: {}",
+        String::from_utf8_lossy(&retry_bytes)
+    );
+    assert_eq!(screenshot_put_attempts.load(Ordering::SeqCst), 2);
+    let application = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(application.state, "submitted");
+    let publication: (i64, i64, String, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT
+                SUM(CASE WHEN state = 'ready' THEN 1 ELSE 0 END),
+                COUNT(*),
+                (SELECT state FROM jobs_submission_evidence_capacity
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3),
+                (SELECT consumed_objects FROM jobs_submission_evidence_capacity
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3)
+               FROM object_uploads WHERE account_id = ?1",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(publication, (3, 3, "committed".to_string(), 3));
     let reservation = jobs::list_attempt_reservations(&harness.pool, &account_id)
         .unwrap()
         .into_iter()
         .find(|reservation| reservation.application_id == application_id)
         .unwrap();
-    assert_ne!(reservation.status, "submitted");
+    assert_eq!(reservation.status, "submitted");
     std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
 }
 
@@ -2708,7 +4372,21 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
     use sha2::{Digest, Sha256};
 
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
-    let harness = boot_harness().await;
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
     jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
@@ -2737,6 +4415,8 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         },
     )
     .unwrap();
+    jobs::reserve_application_attempt(&harness.pool, &account_id, &application_id, "local")
+        .unwrap();
     let ticket = "b".repeat(64);
     let ticket_hash = hex::encode(Sha256::digest(ticket.as_bytes()));
     let application = jobs::get_application(&harness.pool, &account_id, &application_id)
@@ -2876,6 +4556,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         .unwrap();
     assert_eq!(unapproved_resume.status(), StatusCode::CONFLICT);
 
+    let submit_proof = final_submit_proof(&harness, &account_id, &application_id);
     let unapproved_authority = harness
         .router
         .clone()
@@ -2883,7 +4564,11 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "capability": &submit_capability })).unwrap(),
+                    serde_json::to_vec(&json!({
+                        "capability": &submit_capability,
+                        "final_submit_proof": &submit_proof
+                    }))
+                    .unwrap(),
                 ))
                 .unwrap(),
         )
@@ -3005,11 +4690,62 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
     )
     .unwrap());
 
+    let mut job_b_proof = submit_proof.clone();
+    job_b_proof.job.page_url =
+        "https://boards.greenhouse.io/acme/jobs/different-official-job".to_string();
+    let wrong_job = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &submit_capability,
+                        "final_submit_proof": &job_b_proof
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(wrong_job.status(), StatusCode::CONFLICT);
+    let (ticket_status, capacity_count): (String, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT ticket.status,
+                    (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                      WHERE capacity.account_id = ticket.account_id
+                        AND capacity.application_id = ticket.application_id
+                        AND capacity.run_id = ticket.id)
+               FROM jobs_local_run_tickets ticket WHERE ticket.id = ?1",
+            rusqlite::params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(ticket_status, "claimed");
+    assert_eq!(capacity_count, 0);
+    let application_after_wrong_job =
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap();
+    assert!(application_after_wrong_job
+        .receipt
+        .get("_bluey_final_submit_proof_v1")
+        .is_none());
+
     let authorize_submit = || {
         Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::to_vec(&json!({ "capability": &submit_capability })).unwrap(),
+                serde_json::to_vec(&json!({
+                    "capability": &submit_capability,
+                    "final_submit_proof": &submit_proof
+                }))
+                .unwrap(),
             ))
             .unwrap()
     };
@@ -3070,24 +4806,141 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         )
         .unwrap();
 
+    let mut receipt_request = cloud_receipt_request(
+        &harness,
+        &account_id,
+        &application_id,
+        &run_id,
+        "unused-local-token",
+        0,
+    );
+    let mut receipt_bundle = receipt_request["receipt"].take();
+    receipt_bundle["runner"] = json!("local");
+    let evidence_objects = receipt_request["evidence_objects"].take();
+    let receipt_pdf = valid_receipt_pdf();
+    let receipt_png = valid_receipt_png();
+    let resume_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-resume-[0-9a-f]{20}$";
+    let screenshot_path = r"^/bucket/bluey-cloud/accounts/[^/]+/context/jobs/[^/]+/receipts/[^/]+/[0-9]+-screenshot-[0-9a-f]{20}$";
+    Mock::given(method("PUT"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(resume_path))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(receipt_pdf, "application/pdf"))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(screenshot_path))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(receipt_png, "image/png"))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let stored_bundle = mount_receipt_bundle_store(&object_store).await;
+    let terminal_body = json!({
+        "capability": &result_capability,
+        "receipt": { "status": "submitted", "issues": [] },
+        "receiptBundle": receipt_bundle,
+        "evidenceObjects": evidence_objects,
+    });
     let terminal = harness
         .router
         .clone()
         .oneshot(
             Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
                 .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "ticket": ticket,
-                        "receipt": { "status": "failed" }
-                    }))
-                    .unwrap(),
-                ))
+                .body(Body::from(serde_json::to_vec(&terminal_body).unwrap()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(terminal.status(), StatusCode::OK);
+    let terminal_status = terminal.status();
+    let terminal_bytes = axum::body::to_bytes(terminal.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(
+        terminal_status,
+        StatusCode::OK,
+        "local receipt failed: {}",
+        String::from_utf8_lossy(&terminal_bytes)
+    );
+    let terminal_application: serde_json::Value = serde_json::from_slice(&terminal_bytes).unwrap();
+    assert_eq!(terminal_application["state"], "submitted");
+    assert_eq!(terminal_application["receipt"]["runner"], "local");
+    assert_eq!(
+        terminal_application["receipt"]["_bluey_server_submission_authority_v1"]
+            ["executionAuthority"]["kind"],
+        "local_run_ticket"
+    );
+    assert!(!stored_bundle.lock().unwrap().is_empty());
+    assert_eq!(
+        jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let connection = harness.pool.get().unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM jobs_submission_evidence_capacity
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                rusqlite::params![&account_id, &application_id, &run_id],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM jobs_local_run_tickets
+                  WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
+                rusqlite::params![&account_id, &application_id, &run_id],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+
+    let exact_replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&terminal_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_replay.status(), StatusCode::OK);
+
+    let mut conflicting_body = terminal_body;
+    conflicting_body["receiptBundle"]["result"]["confirmationText"] =
+        json!("A different confirmation");
+    let conflicting_replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&conflicting_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflicting_replay.status(), StatusCode::CONFLICT);
+
     let after_terminal = harness
         .router
         .clone()
@@ -3101,7 +4954,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         )
         .await
         .unwrap();
-    assert_eq!(after_terminal.status(), StatusCode::CONFLICT);
+    assert_eq!(after_terminal.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -3109,7 +4962,21 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
 async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation() {
     use sha2::{Digest, Sha256};
 
-    let harness = boot_harness().await;
+    let object_store = MockServer::start().await;
+    let endpoint = object_store.uri();
+    let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await;
     let (account_id, application_id, run_id, browser_profile_id) =
         setup_execution_lease_run(&harness).await;
     jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
@@ -3187,6 +5054,8 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .await
         .unwrap();
     assert_eq!(claimed.status(), StatusCode::OK);
+    let initial_capacity =
+        local_submission_evidence_capacity(&account_id, &application_id, &run_id);
 
     let uncertain_body = json!({
         "ticket": ticket,
@@ -3265,7 +5134,69 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .unwrap()
         .unwrap();
     assert_eq!(ticket_after.status, "side_effect_unknown");
+    let (capacity_runner, reserved_bytes, reserved_objects, capacity_state, capacity_expiry): (
+        String,
+        i64,
+        i64,
+        String,
+        i64,
+    ) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT runner, reserved_bytes, reserved_objects, state, expires_at_ms
+               FROM jobs_submission_evidence_capacity
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(capacity_runner, "local");
+    assert_eq!(reserved_bytes, initial_capacity.reserved_bytes);
+    assert_eq!(reserved_objects, initial_capacity.reserved_objects);
+    assert_eq!(capacity_state, "active");
+    assert!(
+        capacity_expiry
+            >= ticket_after
+                .expires_at_ms
+                .saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS)
+    );
 
+    let expired_ticket_at = chrono::Utc::now().timestamp_millis() - 1;
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_local_run_tickets SET expires_at_ms = ?4
+              WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
+            rusqlite::params![account_id, application_id, run_id, expired_ticket_at,],
+        )
+        .unwrap();
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_submission_evidence_capacity SET expires_at_ms = ?4
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![
+                account_id,
+                application_id,
+                run_id,
+                chrono::Utc::now().timestamp_millis() + 10_000,
+            ],
+        )
+        .unwrap();
     let replay = harness
         .router
         .clone()
@@ -3278,6 +5209,36 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .await
         .unwrap();
     assert_eq!(replay.status(), StatusCode::OK);
+    let replay_capacity_expiry: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT expires_at_ms FROM jobs_submission_evidence_capacity
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        replay_capacity_expiry,
+        expired_ticket_at.saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS)
+    );
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_local_run_tickets SET expires_at_ms = ?4
+              WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
+            rusqlite::params![
+                account_id,
+                application_id,
+                run_id,
+                ticket_after.expires_at_ms,
+            ],
+        )
+        .unwrap();
     let downgrade = harness
         .router
         .clone()
@@ -3437,6 +5398,18 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .unwrap()
         .unwrap();
     assert_eq!(ticket_after.status, "failed");
+    let capacity_state: String = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT state FROM jobs_submission_evidence_capacity
+              WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(capacity_state, "released");
 
     let idempotent = harness
         .jobs_router
@@ -3883,12 +5856,17 @@ async fn trial_start_requires_and_records_terms_acceptance() {
 #[tokio::test]
 #[serial]
 async fn signup_after_account_delete_reuses_email_without_new_trial() {
-    let h = boot_harness().await;
+    let object_store = MockServer::start().await;
+    let h = boot_account_delete_storage_harness(&object_store).await;
 
     let email = "delete-resignup@bluey.sh";
     let auth = signup_with_otp(&h, email, "longenoughpw").await;
     assert_eq!(auth["account"]["trial_seconds_remaining"], 900);
     let access = auth["access_token"].as_str().unwrap();
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    mount_empty_account_namespace_sweep(&object_store, &account.id).await;
 
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
@@ -5439,9 +7417,13 @@ async fn auth_device_approve_cannot_overwrite_approved_code() {
 #[tokio::test]
 #[serial]
 async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
-    let h = boot_harness().await;
+    let object_store = MockServer::start().await;
+    let h = boot_account_delete_storage_harness(&object_store).await;
     let email = "delete-confirm@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
 
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
@@ -5468,6 +7450,8 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_some());
 
+    mount_empty_account_namespace_sweep(&object_store, &account.id).await;
+
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
@@ -5483,6 +7467,197 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_without_storage_preserves_account_and_deletion_fence() {
+    let h = boot_harness().await;
+    let email = "delete-storage-unavailable@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+
+    let request = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(Account::fetch_by_id(&h.pool, &account.id)
+        .unwrap()
+        .is_some());
+    assert!(
+        bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
+            .unwrap()
+            .is_some(),
+        "storage configuration failure must retain the durable deletion fence"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_uses_audit_fallback_and_sweeps_shared_namespace_once() {
+    let object_store = MockServer::start().await;
+    let h = boot_account_delete_storage_harness(&object_store).await;
+    let email = "delete-audit-fallback@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let diagnostic_key = format!(
+        "bluey-cloud/accounts/{}/sessions/delete/audit/fallback.json",
+        account.id
+    );
+    let orphan_key = format!(
+        "bluey-cloud/accounts/{}/audit/unindexed-orphan.json",
+        account.id
+    );
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    bluey_server::db::diagnostic_logs::record_chunk(
+        &h.pool,
+        bluey_server::db::diagnostic_logs::DiagnosticLogChunkInput {
+            id: Some("delete-audit-fallback".to_string()),
+            account_id: Some(account.id.clone()),
+            workspace_id: None,
+            session_id: None,
+            session_code: None,
+            kind: "audit".to_string(),
+            storage: "r2".to_string(),
+            object_key: Some(diagnostic_key.clone()),
+            local_path: None,
+            bytes: 12,
+            sha256: Some("a".repeat(64)),
+            created_at_ms: now_ms,
+            expires_at_ms: now_ms + 60_000,
+            metadata_json: json!({}),
+        },
+    )
+    .unwrap();
+
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{diagnostic_key}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{orphan_key}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let account_prefix = format!("bluey-cloud/accounts/{}/", account.id);
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let list_responder_calls = Arc::clone(&list_calls);
+    let account_prefix_for_listing = account_prefix.clone();
+    let orphan_key_for_listing = orphan_key.clone();
+    Mock::given(method("GET"))
+        .and(path("/bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", account_prefix))
+        .respond_with(move |_request: &wiremock::Request| {
+            if list_responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_string(account_object_list_xml(
+                    &account_prefix_for_listing,
+                    &[&orphan_key_for_listing],
+                ))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_string(account_object_list_xml(&account_prefix_for_listing, &[]))
+            }
+        })
+        .expect(2)
+        .mount(&object_store)
+        .await;
+
+    let request = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ack["object_count_deleted"], 2);
+    assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    assert!(Account::fetch_by_id(&h.pool, &account.id)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_waits_for_acknowledged_cloud_runner_cleanup() {
+    let h = boot_harness().await;
+    let email = "delete-cloud-runner-cleanup@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    jobs::upsert_browser_session(
+        &h.pool,
+        &account.id,
+        &BrowserSession {
+            id: "delete-cloud-runner-session".to_string(),
+            runner: "cloud".to_string(),
+            status: "needs_input".to_string(),
+            current_company: "Acme".to_string(),
+            current_step: "Waiting for user input".to_string(),
+            application_id: None,
+            takeover_url: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+
+    let request = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(Account::fetch_by_id(&h.pool, &account.id)
+        .unwrap()
+        .is_some());
+    assert!(
+        bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
+            .unwrap()
+            .is_none(),
+        "cloud cleanup must finish before the durable deletion fence is created"
+    );
 }
 
 #[tokio::test]
@@ -5706,6 +7881,1338 @@ async fn account_export_zip_contains_readable_bundle() {
         )
         .unwrap();
     assert_eq!(event_count, 1);
+}
+
+#[derive(Clone)]
+struct JobsPortabilityObject {
+    logical_id: String,
+    artifact_class: &'static str,
+    title: &'static str,
+    storage_key: String,
+    media_type: &'static str,
+    bytes: Vec<u8>,
+}
+
+struct JobsPortabilityFixture {
+    account_id: String,
+    access_token: String,
+    application_id: String,
+    objects: Vec<JobsPortabilityObject>,
+}
+
+fn account_object_list_xml(prefix: &str, keys: &[&str]) -> String {
+    let contents = keys
+        .iter()
+        .map(|key| format!("<Contents><Key>{key}</Key></Contents>"))
+        .collect::<String>();
+    format!(
+        "<ListBucketResult><Prefix>{prefix}</Prefix><KeyCount>{}</KeyCount>\
+         <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>",
+        keys.len()
+    )
+}
+
+fn account_delete_storage_config(endpoint_url: String) -> ObjectStorageConfig {
+    ObjectStorageConfig {
+        endpoint_url,
+        bucket: "bucket".to_string(),
+        access_key_id: "ak".to_string(),
+        secret_access_key: "secret".to_string(),
+        region: "auto".to_string(),
+        key_prefix: "bluey-cloud".to_string(),
+        retention_days: 365,
+        max_object_bytes: 1024 * 1024,
+    }
+}
+
+async fn boot_account_delete_storage_harness(object_store: &MockServer) -> Harness {
+    let storage_config = account_delete_storage_config(object_store.uri());
+    boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
+        config.object_storage = Some(storage_config);
+    })
+    .await
+}
+
+async fn mount_empty_account_namespace_sweep(object_store: &MockServer, account_id: &str) {
+    let account_prefix = format!("bluey-cloud/accounts/{account_id}/");
+    Mock::given(method("GET"))
+        .and(path("/bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", account_prefix.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(account_object_list_xml(&account_prefix, &[])),
+        )
+        .expect(1)
+        .mount(object_store)
+        .await;
+}
+
+async fn boot_jobs_portability_harness(object_store: &MockServer) -> Harness {
+    let endpoint_url = object_store.uri();
+    boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url: endpoint_url.clone(),
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+        config.log_storage = Some(ObjectStorageConfig {
+            endpoint_url,
+            bucket: "logs".to_string(),
+            access_key_id: "log-ak".to_string(),
+            secret_access_key: "log-secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-logs".to_string(),
+            retention_days: 180,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await
+}
+
+async fn seed_jobs_portability_fixture(harness: &Harness) -> JobsPortabilityFixture {
+    let evidence = setup_application_evidence_download(harness).await;
+    let auth = login(
+        harness,
+        "jobs-execution-lease@example.com",
+        "valid-password-123",
+    )
+    .await;
+    let access_token = auth["access_token"].as_str().unwrap().to_string();
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let resume_source_id = "portability-resume-source";
+    let resume_source_bytes = b"Exact source resume bytes for account export".to_vec();
+    let resume_source_sha256 = hex::encode(Sha256::digest(&resume_source_bytes));
+    let resume_source_key = format!(
+        "bluey-cloud/accounts/{}/jobs/resumes/{resume_source_id}/sha256/{resume_source_sha256}.txt",
+        evidence.account_id
+    );
+    let browser_profile_id = "portability-browser-profile";
+    let browser_profile_bytes = b"BLUEYJP2 encrypted browser profile export bytes".to_vec();
+    let browser_profile_sha256 = hex::encode(Sha256::digest(&browser_profile_bytes));
+    let browser_profile_key = format!(
+        "bluey-cloud/accounts/{}/jobs/browser-profiles/{browser_profile_id}/generation/1/sha256/{browser_profile_sha256}.enc",
+        evidence.account_id
+    );
+
+    let connection = harness.pool.get().unwrap();
+    connection
+        .execute(
+            "INSERT INTO jobs_resume_source_assets (
+                id, account_id, file_name, media_type, file_type, storage_key,
+                sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, 'source-resume.txt', 'text/plain', 'txt', ?3, ?4, ?5,
+                       NULL, 'text_only', ?6, ?6)",
+            rusqlite::params![
+                resume_source_id,
+                &evidence.account_id,
+                &resume_source_key,
+                &resume_source_sha256,
+                resume_source_bytes.len() as i64,
+                now_ms,
+            ],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO jobs_browser_profile_snapshots (
+                account_id, browser_profile_id, generation, object_key, sha256, size_bytes,
+                envelope_version, writer_run_id, writer_fence, updated_at_ms
+             ) VALUES (?1, ?2, 1, ?3, ?4, ?5, 2, 'portability-run', 1, ?6)",
+            rusqlite::params![
+                &evidence.account_id,
+                browser_profile_id,
+                &browser_profile_key,
+                &browser_profile_sha256,
+                browser_profile_bytes.len() as i64,
+                now_ms,
+            ],
+        )
+        .unwrap();
+
+    let objects = vec![
+        JobsPortabilityObject {
+            logical_id: format!("jobs-submission-bundle:{}", evidence.receipt.sha256),
+            artifact_class: "jobs_submission_evidence",
+            title: "Application receipt bundle",
+            storage_key: evidence.receipt.storage_key.clone(),
+            media_type: "application/json",
+            bytes: evidence.receipt_bytes,
+        },
+        JobsPortabilityObject {
+            logical_id: format!("jobs-submission-resume:{}", evidence.resume.sha256),
+            artifact_class: "jobs_submission_evidence",
+            title: "Resume submitted",
+            storage_key: evidence.resume.storage_key,
+            media_type: "application/pdf",
+            bytes: evidence.resume_bytes,
+        },
+        JobsPortabilityObject {
+            logical_id: format!(
+                "jobs-submission-confirmation:{}",
+                evidence.confirmation.sha256
+            ),
+            artifact_class: "jobs_submission_evidence",
+            title: "Application confirmation screenshot",
+            storage_key: evidence.confirmation.storage_key,
+            media_type: "image/png",
+            bytes: evidence.confirmation_bytes,
+        },
+        JobsPortabilityObject {
+            logical_id: format!("jobs-resume-source:{resume_source_id}"),
+            artifact_class: "jobs_resume_source",
+            title: "Source resume",
+            storage_key: resume_source_key,
+            media_type: "text/plain",
+            bytes: resume_source_bytes,
+        },
+        JobsPortabilityObject {
+            logical_id: format!(
+                "jobs-browser-profile:{browser_profile_id}:1:2:{browser_profile_sha256}"
+            ),
+            artifact_class: "jobs_browser_profile_snapshot",
+            title: "Encrypted Bluey Browser profile snapshot",
+            storage_key: browser_profile_key,
+            media_type: "application/vnd.bluey.browser-profile+encrypted",
+            bytes: browser_profile_bytes,
+        },
+    ];
+
+    for (index, object) in objects.iter().enumerate() {
+        let upload_id = format!("portability-upload-{index}");
+        let object_sha256 = hex::encode(Sha256::digest(&object.bytes));
+        let object_created_at_ms = now_ms + index as i64;
+        connection
+            .execute(
+                "INSERT INTO object_uploads (
+                    id, account_id, object_kind, logical_id, session_id, storage_scope,
+                    object_key, size_bytes, sha256, content_type, expires_at_ms, state,
+                    metadata_json, created_at_ms, updated_at_ms, uploaded_at_ms, deleted_at_ms
+                 ) VALUES (?1, ?2, 'artifact', ?3, NULL, 'artifact', ?4, ?5, ?6, ?7,
+                           ?8, 'ready', ?9, ?10, ?10, ?10, NULL)",
+                rusqlite::params![
+                    &upload_id,
+                    &evidence.account_id,
+                    &object.logical_id,
+                    &object.storage_key,
+                    object.bytes.len() as i64,
+                    object_sha256,
+                    object.media_type,
+                    i64::MAX,
+                    serde_json::to_string(&json!({
+                        "artifact_class": object.artifact_class,
+                        "title": object.title,
+                        "retention_policy": "account_lifetime_until_deletion"
+                    }))
+                    .unwrap(),
+                    object_created_at_ms,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO object_storage_outbox (
+                    id, upload_id, account_id, operation, state, attempt_count,
+                    next_attempt_at_ms, last_error, created_at_ms, updated_at_ms, completed_at_ms
+                 ) VALUES (?1, ?2, ?3, 'put', 'completed', 1, ?4, NULL, ?4, ?4, ?4)",
+                rusqlite::params![
+                    format!("portability-put-{index}"),
+                    &upload_id,
+                    &evidence.account_id,
+                    object_created_at_ms,
+                ],
+            )
+            .unwrap();
+    }
+    drop(connection);
+
+    assert_eq!(
+        bluey_server::db::account_data::artifact_object_refs(&harness.pool, &evidence.account_id,)
+            .unwrap()
+            .len(),
+        objects.len()
+    );
+    JobsPortabilityFixture {
+        account_id: evidence.account_id,
+        access_token,
+        application_id: evidence.application_id,
+        objects,
+    }
+}
+
+fn acknowledge_jobs_portability_cloud_cleanup(harness: &Harness, account_id: &str) {
+    let mut connection = harness.pool.get().unwrap();
+    let transaction = connection.transaction().unwrap();
+    transaction
+        .execute(
+            "DELETE FROM jobs_execution_leases WHERE account_id = ?1",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+    transaction
+        .execute(
+            "DELETE FROM jobs_browser_sessions
+              WHERE account_id = ?1 AND runner = 'cloud'",
+            rusqlite::params![account_id],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn account_export_zip_includes_verified_jobs_objects_and_fails_closed_on_tamper() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_portability_harness(&object_store).await;
+    let fixture = seed_jobs_portability_fixture(&harness).await;
+    let tampered_index = fixture.objects.len() - 1;
+
+    for (index, object) in fixture.objects.iter().enumerate() {
+        let object_path = format!("/bucket/{}", object.storage_key);
+        if index == tampered_index {
+            let valid_bytes = object.bytes.clone();
+            let media_type = object.media_type.to_string();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let responder_calls = Arc::clone(&calls);
+            Mock::given(method("GET"))
+                .and(path(object_path))
+                .respond_with(move |_request: &wiremock::Request| {
+                    match responder_calls.fetch_add(1, Ordering::SeqCst) {
+                        0 => ResponseTemplate::new(200)
+                            .set_body_raw(valid_bytes.clone(), &media_type),
+                        1 => {
+                            let mut body = valid_bytes.clone();
+                            body[0] ^= 0xff;
+                            ResponseTemplate::new(200).set_body_raw(body, &media_type)
+                        }
+                        2 => ResponseTemplate::new(200)
+                            .set_body_raw(valid_bytes.clone(), "application/octet-stream"),
+                        _ => ResponseTemplate::new(200).set_body_raw(
+                            valid_bytes[..valid_bytes.len() - 1].to_vec(),
+                            &media_type,
+                        ),
+                    }
+                })
+                .expect(4)
+                .mount(&object_store)
+                .await;
+        } else {
+            Mock::given(method("GET"))
+                .and(path(object_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_raw(object.bytes.clone(), object.media_type),
+                )
+                .expect(4)
+                .mount(&object_store)
+                .await;
+        }
+    }
+
+    let request = || {
+        Request::get("/account/export?format=zip&include_objects=true")
+            .header("authorization", format!("Bearer {}", fixture.access_token))
+            .body(Body::empty())
+            .unwrap()
+    };
+    let response = harness.router.clone().oneshot(request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(Cursor::new(body.to_vec())).unwrap();
+    let mut account_export = String::new();
+    archive
+        .by_name("account-export.json")
+        .unwrap()
+        .read_to_string(&mut account_export)
+        .unwrap();
+    assert!(account_export.contains(&fixture.application_id));
+
+    let mut manifest_text = String::new();
+    archive
+        .by_name("manifest.json")
+        .unwrap()
+        .read_to_string(&mut manifest_text)
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest["include_objects_requested"], true);
+    assert_eq!(
+        manifest["objects"].as_array().unwrap().len(),
+        fixture.objects.len()
+    );
+    for object in &fixture.objects {
+        assert!(!manifest_text.contains(&object.storage_key));
+        let exported = manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["artifact_id"] == object.logical_id)
+            .expect("every Jobs object must be represented in the export manifest");
+        assert_eq!(exported["included"], true);
+        assert_eq!(exported["content_type"], object.media_type);
+        assert_eq!(exported["size_bytes"], object.bytes.len() as i64);
+        assert_eq!(
+            exported["sha256"],
+            hex::encode(Sha256::digest(&object.bytes))
+        );
+        let zip_path = exported["zip_path"].as_str().unwrap();
+        let mut exported_bytes = Vec::new();
+        archive
+            .by_name(zip_path)
+            .unwrap()
+            .read_to_end(&mut exported_bytes)
+            .unwrap();
+        assert_eq!(exported_bytes, object.bytes);
+    }
+
+    for _ in 0..3 {
+        let tampered = harness.router.clone().oneshot(request()).await.unwrap();
+        assert_eq!(tampered.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let tampered_body = axum::body::to_bytes(tampered.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let tampered_body = String::from_utf8_lossy(&tampered_body);
+        for object in &fixture.objects {
+            assert!(!tampered_body.contains(&object.storage_key));
+        }
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn account_export_zip_includes_legacy_jobs_evidence_without_size_or_media_authority() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_portability_harness(&object_store).await;
+    let fixture = setup_application_evidence_download(&harness).await;
+    let auth = login(
+        &harness,
+        "jobs-execution-lease@example.com",
+        "valid-password-123",
+    )
+    .await;
+    let access_token = auth["access_token"].as_str().unwrap();
+
+    for mut evidence in
+        jobs::list_application_evidence(&harness.pool, &fixture.account_id, None).unwrap()
+    {
+        evidence.media_type.clear();
+        evidence
+            .metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("size_bytes");
+        persist_test_application_evidence(&harness, &fixture.account_id, &evidence);
+    }
+
+    let legacy_objects = [
+        (
+            fixture.resume.id.as_str(),
+            fixture.resume.storage_key.as_str(),
+            fixture.resume_bytes.as_slice(),
+            "application/pdf",
+        ),
+        (
+            fixture.receipt.id.as_str(),
+            fixture.receipt.storage_key.as_str(),
+            fixture.receipt_bytes.as_slice(),
+            "application/json",
+        ),
+        (
+            fixture.confirmation.id.as_str(),
+            fixture.confirmation.storage_key.as_str(),
+            fixture.confirmation_bytes.as_slice(),
+            "image/png",
+        ),
+    ];
+    for (_, object_key, bytes, media_type) in legacy_objects {
+        Mock::given(method("GET"))
+            .and(path(format!("/bucket/{object_key}")))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(bytes.to_vec(), media_type))
+            .expect(1)
+            .mount(&object_store)
+            .await;
+    }
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::get("/account/export?format=zip&include_objects=true")
+                .header("authorization", format!("Bearer {access_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let mut archive = zip::ZipArchive::new(Cursor::new(body.to_vec())).unwrap();
+    let mut manifest_text = String::new();
+    archive
+        .by_name("manifest.json")
+        .unwrap()
+        .read_to_string(&mut manifest_text)
+        .unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
+    assert_eq!(manifest["objects"].as_array().unwrap().len(), 3);
+    for (artifact_id, object_key, bytes, _) in legacy_objects {
+        assert!(!manifest_text.contains(object_key));
+        let exported = manifest["objects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["artifact_id"] == artifact_id)
+            .expect("legacy Jobs evidence must be represented in the export manifest");
+        assert!(exported["size_bytes"].is_null());
+        assert!(exported["content_type"].is_null());
+        assert_eq!(exported["sha256"], hex::encode(Sha256::digest(bytes)));
+        let mut exported_bytes = Vec::new();
+        archive
+            .by_name(exported["zip_path"].as_str().unwrap())
+            .unwrap()
+            .read_to_end(&mut exported_bytes)
+            .unwrap();
+        assert_eq!(exported_bytes, bytes);
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_account_removes_every_jobs_object_after_persisting_the_deletion_fence() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_portability_harness(&object_store).await;
+    let fixture = seed_jobs_portability_fixture(&harness).await;
+    acknowledge_jobs_portability_cloud_cleanup(&harness, &fixture.account_id);
+    let fence_observed = Arc::new(AtomicUsize::new(0));
+    let account_prefix = format!("bluey-cloud/accounts/{}/", fixture.account_id);
+    let legacy_orphan_key = format!("{account_prefix}jobs/legacy/orphan-profile.enc");
+    let log_prefix = format!("bluey-logs/accounts/{}/", fixture.account_id);
+    let legacy_log_orphan_key = format!("{log_prefix}audit/legacy/orphan-log.json");
+
+    for (index, object) in fixture.objects.iter().enumerate() {
+        let mock =
+            Mock::given(method("DELETE")).and(path(format!("/bucket/{}", object.storage_key)));
+        if index == 0 {
+            let pool = harness.pool.clone();
+            let account_id = fixture.account_id.clone();
+            let observed = Arc::clone(&fence_observed);
+            mock.respond_with(move |_request: &wiremock::Request| {
+                let connection = pool.get().unwrap();
+                let (intent_count, upload_count): (i64, i64) = connection
+                    .query_row(
+                        "SELECT
+                            (SELECT COUNT(*) FROM account_deletion_intents WHERE account_id = ?1),
+                            (SELECT COUNT(*) FROM object_uploads WHERE account_id = ?1)",
+                        rusqlite::params![&account_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                if (intent_count, upload_count) == (1, 5) {
+                    observed.store(1, Ordering::SeqCst);
+                }
+                ResponseTemplate::new(204)
+            })
+            .expect(1)
+            .mount(&object_store)
+            .await;
+        } else {
+            mock.respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&object_store)
+                .await;
+        }
+    }
+
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let list_responder_calls = Arc::clone(&list_calls);
+    let account_prefix_for_listing = account_prefix.clone();
+    let orphan_key_for_listing = legacy_orphan_key.clone();
+    Mock::given(method("GET"))
+        .and(path("/bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", account_prefix))
+        .respond_with(move |_request: &wiremock::Request| {
+            if list_responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_string(account_object_list_xml(
+                    &account_prefix_for_listing,
+                    &[&orphan_key_for_listing],
+                ))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_string(account_object_list_xml(&account_prefix_for_listing, &[]))
+            }
+        })
+        .expect(2)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{legacy_orphan_key}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let log_list_calls = Arc::new(AtomicUsize::new(0));
+    let log_list_responder_calls = Arc::clone(&log_list_calls);
+    let log_prefix_for_listing = log_prefix.clone();
+    let log_orphan_key_for_listing = legacy_log_orphan_key.clone();
+    Mock::given(method("GET"))
+        .and(path("/logs"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", log_prefix))
+        .respond_with(move |_request: &wiremock::Request| {
+            if log_list_responder_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(200).set_body_string(account_object_list_xml(
+                    &log_prefix_for_listing,
+                    &[&log_orphan_key_for_listing],
+                ))
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_string(account_object_list_xml(&log_prefix_for_listing, &[]))
+            }
+        })
+        .expect(2)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path(format!("/logs/{legacy_log_orphan_key}")))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/account/delete")
+                .header("authorization", format!("Bearer {}", fixture.access_token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "confirm_text": "DELETE",
+                        "accept_data_loss": true,
+                        "accept_credit_loss": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(ack["object_count_deleted"], fixture.objects.len() + 2);
+    assert_eq!(fence_observed.load(Ordering::SeqCst), 1);
+    assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(log_list_calls.load(Ordering::SeqCst), 2);
+    assert!(Account::fetch_by_id(&harness.pool, &fixture.account_id)
+        .unwrap()
+        .is_none());
+
+    let connection = harness.pool.get().unwrap();
+    let remaining: (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM object_uploads WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM object_storage_outbox WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_application_evidence WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_resume_source_assets WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_browser_profile_snapshots WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM account_deletion_intents WHERE account_id = ?1)",
+            rusqlite::params![&fixture.account_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(remaining, (0, 0, 0, 0, 0, 0));
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_account_prefix_purge_failure_preserves_fence_and_database_rows() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_portability_harness(&object_store).await;
+    let fixture = seed_jobs_portability_fixture(&harness).await;
+    acknowledge_jobs_portability_cloud_cleanup(&harness, &fixture.account_id);
+
+    for object in &fixture.objects {
+        Mock::given(method("DELETE"))
+            .and(path(format!("/bucket/{}", object.storage_key)))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&object_store)
+            .await;
+    }
+    let account_prefix = format!("bluey-cloud/accounts/{}/", fixture.account_id);
+    Mock::given(method("GET"))
+        .and(path("/bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", account_prefix.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(account_object_list_xml(&account_prefix, &[])),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/logs"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param(
+            "prefix",
+            format!("bluey-logs/accounts/{}/", fixture.account_id),
+        ))
+        .respond_with(ResponseTemplate::new(503))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let response = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/account/delete")
+                .header("authorization", format!("Bearer {}", fixture.access_token))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "confirm_text": "DELETE",
+                        "accept_data_loss": true,
+                        "accept_credit_loss": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let body = String::from_utf8_lossy(&body);
+    for object in &fixture.objects {
+        assert!(!body.contains(&object.storage_key));
+    }
+    assert!(Account::fetch_by_id(&harness.pool, &fixture.account_id)
+        .unwrap()
+        .is_some());
+
+    let connection = harness.pool.get().unwrap();
+    let preserved: (i64, i64, i64, i64, i64, i64) = connection
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM object_uploads WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM object_storage_outbox WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_application_evidence WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_resume_source_assets WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_browser_profile_snapshots WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM account_deletion_intents WHERE account_id = ?1)",
+            rusqlite::params![&fixture.account_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(preserved, (5, 5, 3, 1, 1, 1));
+}
+
+const JOBS_RESUME_SOURCE_OBJECT_PATH: &str =
+    r"^/bucket/bluey-cloud/accounts/[^/]+/jobs/resumes/[^/]+/sha256/[0-9a-f]{64}\.txt$";
+
+async fn boot_jobs_resume_storage_harness(object_store: &MockServer) -> Harness {
+    let endpoint_url = object_store.uri();
+    boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
+        config.object_storage = Some(ObjectStorageConfig {
+            endpoint_url,
+            bucket: "bucket".to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: "secret".to_string(),
+            region: "auto".to_string(),
+            key_prefix: "bluey-cloud".to_string(),
+            retention_days: 365,
+            max_object_bytes: 1024 * 1024,
+        });
+    })
+    .await
+}
+
+fn jobs_resume_source_upload_request(
+    access_token: &str,
+    request_id: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> Request<Body> {
+    Request::post("/api/jobs/resume-source")
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": request_id,
+                "file_name": file_name,
+                "media_type": "text/plain",
+                "bytes_base64": base64::engine::general_purpose::STANDARD.encode(bytes)
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+fn jobs_resume_source_upload_request_with_profile(
+    access_token: &str,
+    request_id: &str,
+    file_name: &str,
+    bytes: &[u8],
+    profile: &jobs::CareerProfile,
+) -> Request<Body> {
+    Request::post("/api/jobs/resume-source")
+        .header("authorization", format!("Bearer {access_token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": request_id,
+                "file_name": file_name,
+                "media_type": "text/plain",
+                "bytes_base64": base64::engine::general_purpose::STANDARD.encode(bytes),
+                "profile": profile,
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+async fn mount_jobs_resume_source_round_trip(
+    object_store: &MockServer,
+    expected_puts: u64,
+    expected_gets: u64,
+) -> Arc<Mutex<Vec<u8>>> {
+    let stored_bytes = Arc::new(Mutex::new(Vec::new()));
+    let put_bytes = Arc::clone(&stored_bytes);
+    Mock::given(method("PUT"))
+        .and(path_regex(JOBS_RESUME_SOURCE_OBJECT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            *put_bytes.lock().unwrap() = request.body.clone();
+            ResponseTemplate::new(200)
+        })
+        .expect(expected_puts)
+        .mount(object_store)
+        .await;
+    let get_bytes = Arc::clone(&stored_bytes);
+    Mock::given(method("GET"))
+        .and(path_regex(JOBS_RESUME_SOURCE_OBJECT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            ResponseTemplate::new(200).set_body_raw(get_bytes.lock().unwrap().clone(), "text/plain")
+        })
+        .expect(expected_gets)
+        .mount(object_store)
+        .await;
+    stored_bytes
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_resume_source_upload_readback_and_replacement_use_the_durable_ledger() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_resume_storage_harness(&object_store).await;
+    let email = "jobs-resume-source-ledger@example.com";
+    let access_token = signup_and_login(&harness, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let first_bytes = b"First exact source resume";
+    let replacement_bytes = b"Replacement exact source resume";
+    mount_jobs_resume_source_round_trip(&object_store, 2, 3).await;
+
+    let first_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000001",
+            "first-resume.txt",
+            first_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first_response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let first_value: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    let first_id = first_value["asset"]["id"].as_str().unwrap().to_string();
+    let first_asset = jobs::get_resume_source_asset(&harness.pool, &account.id)
+        .unwrap()
+        .expect("first source resume should be installed");
+    assert_eq!(first_asset.id, first_id);
+    assert_eq!(first_asset.sha256, hex::encode(Sha256::digest(first_bytes)));
+    assert_eq!(first_asset.size_bytes, first_bytes.len() as i64);
+
+    let replay_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000001",
+            "first-resume.txt",
+            first_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay_response.status(), StatusCode::OK);
+    let replay_body = axum::body::to_bytes(replay_response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let replay_value: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay_value["asset"]["id"], first_id);
+
+    let changed_replay = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000001",
+            "changed-under-same-request.txt",
+            b"different bytes",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(changed_replay.status(), StatusCode::CONFLICT);
+
+    let replacement_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000002",
+            "replacement-resume.txt",
+            replacement_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replacement_response.status(), StatusCode::OK);
+    let replacement_body = axum::body::to_bytes(replacement_response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let replacement_value: serde_json::Value = serde_json::from_slice(&replacement_body).unwrap();
+    let replacement_id = replacement_value["asset"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let replacement_asset = jobs::get_resume_source_asset(&harness.pool, &account.id)
+        .unwrap()
+        .expect("replacement source resume should be installed");
+    assert_eq!(replacement_asset.id, replacement_id);
+    assert_ne!(replacement_asset.id, first_asset.id);
+    assert_ne!(replacement_asset.storage_key, first_asset.storage_key);
+    assert_eq!(
+        replacement_asset.sha256,
+        hex::encode(Sha256::digest(replacement_bytes))
+    );
+    assert_eq!(
+        replacement_value["profile"]["source_resume_asset_id"],
+        replacement_id
+    );
+    assert_eq!(
+        replacement_value["profile"]["source_resume_sha256"],
+        replacement_asset.sha256
+    );
+
+    let conn = harness.pool.get().unwrap();
+    let first_ledger: (
+        String,
+        String,
+        String,
+        i64,
+        String,
+        i64,
+        String,
+        String,
+        Option<String>,
+        String,
+    ) = conn
+        .query_row(
+            "SELECT upload.logical_id, upload.object_key, upload.sha256,
+                    upload.size_bytes, upload.content_type, upload.expires_at_ms,
+                    upload.state, put_outbox.state, delete_outbox.state,
+                    upload.metadata_json
+               FROM object_uploads upload
+               JOIN object_storage_outbox put_outbox
+                 ON put_outbox.upload_id = upload.id AND put_outbox.operation = 'put'
+               LEFT JOIN object_storage_outbox delete_outbox
+                 ON delete_outbox.upload_id = upload.id
+                AND delete_outbox.operation = 'delete'
+              WHERE upload.account_id = ?1 AND upload.object_key = ?2",
+            rusqlite::params![&account.id, &first_asset.storage_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(first_ledger.0, format!("jobs-resume-source:{first_id}"));
+    assert_eq!(first_ledger.1, first_asset.storage_key);
+    assert_eq!(first_ledger.2, first_asset.sha256);
+    assert_eq!(first_ledger.3, first_bytes.len() as i64);
+    assert_eq!(first_ledger.4, "text/plain");
+    assert_eq!(first_ledger.5, i64::MAX);
+    assert_eq!(first_ledger.6, "delete_pending");
+    assert_eq!(first_ledger.7, "completed");
+    assert_eq!(first_ledger.8.as_deref(), Some("pending"));
+    let first_metadata: serde_json::Value = serde_json::from_str(&first_ledger.9).unwrap();
+    assert_eq!(first_metadata["artifact_class"], "jobs_resume_source");
+    assert_eq!(first_metadata["jobs_resume_source_asset_id"], first_id);
+    assert_eq!(
+        first_metadata["retention_policy"],
+        "account_lifetime_until_deletion"
+    );
+
+    let replacement_ledger: (String, String, String, i64, String, Option<String>) = conn
+        .query_row(
+            "SELECT upload.logical_id, upload.sha256, upload.state,
+                    upload.expires_at_ms, put_outbox.state, delete_outbox.state
+               FROM object_uploads upload
+               JOIN object_storage_outbox put_outbox
+                 ON put_outbox.upload_id = upload.id AND put_outbox.operation = 'put'
+               LEFT JOIN object_storage_outbox delete_outbox
+                 ON delete_outbox.upload_id = upload.id
+                AND delete_outbox.operation = 'delete'
+              WHERE upload.account_id = ?1 AND upload.object_key = ?2",
+            rusqlite::params![&account.id, &replacement_asset.storage_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        replacement_ledger.0,
+        format!("jobs-resume-source:{replacement_id}")
+    );
+    assert_eq!(replacement_ledger.1, replacement_asset.sha256);
+    assert_eq!(replacement_ledger.2, "ready");
+    assert_eq!(replacement_ledger.3, i64::MAX);
+    assert_eq!(replacement_ledger.4, "completed");
+    assert_eq!(replacement_ledger.5, None);
+    drop(conn);
+
+    let requests = object_store.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 5);
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect::<Vec<_>>(),
+        vec!["PUT", "GET", "GET", "PUT", "GET"]
+    );
+    assert_eq!(requests[0].body, first_bytes);
+    assert_eq!(requests[3].body, replacement_bytes);
+    assert!(requests.iter().all(|request| request.method != "DELETE"));
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_resume_source_explicit_profile_replay_preserves_newer_profile_edits() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_resume_storage_harness(&object_store).await;
+    let email = "jobs-resume-source-profile-replay@example.com";
+    let access_token = signup_and_login(&harness, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let base_profile =
+        jobs::save_profile(&harness.pool, &account.id, &jobs::default_profile(email)).unwrap();
+    let mut requested_profile = base_profile;
+    requested_profile.headline = "Profile captured with upload".to_string();
+    let bytes = b"Explicit profile source resume";
+    mount_jobs_resume_source_round_trip(&object_store, 1, 2).await;
+    let request_id = "00000000-0000-4000-8000-000000000010";
+
+    let first = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request_with_profile(
+            &access_token,
+            request_id,
+            "profile-resume.txt",
+            bytes,
+            &requested_profile,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status(), StatusCode::OK);
+    let first_body = axum::body::to_bytes(first.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let first_value: serde_json::Value = serde_json::from_slice(&first_body).unwrap();
+    assert_eq!(
+        first_value["profile"]["headline"],
+        "Profile captured with upload"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let mut newer_profile = jobs::get_profile(&harness.pool, &account.id, email).unwrap();
+    newer_profile.headline = "Newer cross-tab profile edit".to_string();
+    let newer_profile = jobs::save_profile(&harness.pool, &account.id, &newer_profile).unwrap();
+
+    let replay = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request_with_profile(
+            &access_token,
+            request_id,
+            "profile-resume.txt",
+            bytes,
+            &requested_profile,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_body = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let replay_value: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+    assert_eq!(replay_value["profile"]["headline"], newer_profile.headline);
+    assert_eq!(
+        replay_value["profile"]["updated_at_ms"],
+        newer_profile.updated_at_ms
+    );
+    assert_eq!(
+        jobs::get_profile(&harness.pool, &account.id, email)
+            .unwrap()
+            .headline,
+        newer_profile.headline
+    );
+
+    let mut changed_request = requested_profile;
+    changed_request.headline = "Changed under the same request id".to_string();
+    let conflict = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request_with_profile(
+            &access_token,
+            request_id,
+            "profile-resume.txt",
+            bytes,
+            &changed_request,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_resume_source_upload_corrupt_readback_keeps_the_previous_database_reference() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_resume_storage_harness(&object_store).await;
+    let email = "jobs-resume-source-corrupt-readback@example.com";
+    let access_token = signup_and_login(&harness, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    mount_jobs_resume_source_round_trip(&object_store, 1, 1).await;
+
+    let original_bytes = b"Original verified resume";
+    let original_response = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000003",
+            "original-resume.txt",
+            original_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(original_response.status(), StatusCode::OK);
+    let original_asset = jobs::get_resume_source_asset(&harness.pool, &account.id)
+        .unwrap()
+        .expect("original source resume should be installed");
+
+    object_store.reset().await;
+    Mock::given(method("PUT"))
+        .and(path_regex(JOBS_RESUME_SOURCE_OBJECT_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(JOBS_RESUME_SOURCE_OBJECT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(b"object-store corruption".to_vec(), "text/plain"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
+    let replacement_bytes = b"New resume that must not become authoritative";
+    let replacement_sha256 = hex::encode(Sha256::digest(replacement_bytes));
+    let rejected = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000004",
+            "unverified-replacement.txt",
+            replacement_bytes,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_GATEWAY);
+
+    let current_asset = jobs::get_resume_source_asset(&harness.pool, &account.id)
+        .unwrap()
+        .expect("the prior verified source resume should remain installed");
+    assert_eq!(current_asset.id, original_asset.id);
+    assert_eq!(current_asset.storage_key, original_asset.storage_key);
+    assert_eq!(current_asset.sha256, original_asset.sha256);
+    let profile = jobs::get_profile(&harness.pool, &account.id, email).unwrap();
+    assert_eq!(profile.source_resume_asset_id, original_asset.id);
+    assert_eq!(profile.source_resume_sha256, original_asset.sha256);
+
+    let rejected_ledger: (String, String, String, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT upload.state, put_outbox.state, upload.sha256,
+                    COUNT(delete_outbox.id)
+               FROM object_uploads upload
+               JOIN object_storage_outbox put_outbox
+                 ON put_outbox.upload_id = upload.id AND put_outbox.operation = 'put'
+               LEFT JOIN object_storage_outbox delete_outbox
+                 ON delete_outbox.upload_id = upload.id
+                AND delete_outbox.operation = 'delete'
+              WHERE upload.account_id = ?1 AND upload.sha256 = ?2
+              GROUP BY upload.state, put_outbox.state, upload.sha256",
+            rusqlite::params![&account.id, &replacement_sha256],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(rejected_ledger.0, "pending");
+    assert_eq!(rejected_ledger.1, "retry");
+    assert_eq!(rejected_ledger.2, replacement_sha256);
+    assert_eq!(rejected_ledger.3, 0);
+    let rejected_reference_count: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_resume_source_assets
+              WHERE account_id = ?1 AND sha256 = ?2",
+            rusqlite::params![&account.id, &replacement_sha256],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected_reference_count, 0);
+    let requests = object_store.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].method.as_str(), "PUT");
+    assert_eq!(requests[0].body, replacement_bytes);
+    assert_eq!(requests[1].method.as_str(), "GET");
+    assert!(requests.iter().all(|request| request.method != "DELETE"));
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_resume_source_upload_is_fenced_before_object_mutation_during_account_deletion() {
+    let object_store = MockServer::start().await;
+    let harness = boot_jobs_resume_storage_harness(&object_store).await;
+    let email = "jobs-resume-source-delete-fence@example.com";
+    let access_token = signup_and_login(&harness, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let deletion = bluey_server::db::account_data::begin_account_deletion(
+        &harness.pool,
+        &account.id,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .unwrap();
+    assert!(matches!(
+        deletion,
+        Some(bluey_server::db::account_data::BeginAccountDeletionResult::Ready(_))
+    ));
+
+    let response = harness
+        .jobs_router
+        .clone()
+        .oneshot(jobs_resume_source_upload_request(
+            &access_token,
+            "00000000-0000-4000-8000-000000000005",
+            "fenced-resume.txt",
+            b"These bytes must never reach object storage",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("Account deletion has already fenced"));
+    assert!(object_store.received_requests().await.unwrap().is_empty());
+
+    let (upload_count, source_reference_count): (i64, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM object_uploads WHERE account_id = ?1),
+                (SELECT COUNT(*) FROM jobs_resume_source_assets WHERE account_id = ?1)",
+            rusqlite::params![&account.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((upload_count, source_reference_count), (0, 0));
 }
 
 #[tokio::test]
@@ -5956,6 +9463,19 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
         .expect(1)
         .mount(&object_store)
         .await;
+    let account_prefix = format!("bluey-cloud/accounts/{}/", account.id);
+    Mock::given(method("GET"))
+        .and(path("/bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", account_prefix.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(account_object_list_xml(&account_prefix, &[])),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
@@ -6125,6 +9645,19 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
         .expect(1)
         .mount(&object_store)
         .await;
+    let account_prefix = format!("bluey-cloud/accounts/{}/", account.id);
+    Mock::given(method("GET"))
+        .and(path("/bucket"))
+        .and(query_param("list-type", "2"))
+        .and(query_param("max-keys", "1000"))
+        .and(query_param("prefix", account_prefix.clone()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(account_object_list_xml(&account_prefix, &[])),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
 
     let batch = json!({
         "sessions": [{
@@ -6191,6 +9724,72 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
         )
         .unwrap();
     assert_eq!(event_count, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn delete_account_establishes_a_durable_fence_before_waiting_for_an_active_put() {
+    let h = boot_harness().await;
+    let email = "delete-active-put@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "INSERT INTO object_uploads (
+                id, account_id, object_kind, logical_id, storage_scope,
+                object_key, size_bytes, sha256, content_type, expires_at_ms,
+                state, metadata_json, created_at_ms, updated_at_ms
+             ) VALUES (
+                'active-account-delete-put', ?1, 'artifact', 'active-delete-artifact',
+                'artifact', ?2, 12, ?3, 'application/octet-stream', ?4,
+                'pending', '{}', ?5, ?5
+             )",
+            rusqlite::params![
+                &account.id,
+                format!(
+                    "bluey-cloud/accounts/{}/context/active-delete-artifact",
+                    account.id
+                ),
+                "a".repeat(64),
+                now_ms + 60_000,
+                now_ms,
+            ],
+        )
+        .unwrap();
+
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_some());
+    let intent: (i64, i64) = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT fresh_in_flight_puts, requested_at_ms
+               FROM account_deletion_intents WHERE account_id = ?1",
+            rusqlite::params![&account.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(intent.0, 1);
+    assert!(intent.1 >= now_ms);
 }
 
 #[tokio::test]

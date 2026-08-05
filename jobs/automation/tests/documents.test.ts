@@ -1,11 +1,27 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+  chmod,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  truncate,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import { afterEach, describe, expect, it } from "vitest";
-import type { ApplicationPacket } from "../src/contracts.js";
-import { materializeApplicationDocuments } from "../src/index.js";
+import type { ApplicationPacket, NormalizedJob } from "../src/contracts.js";
+import {
+  approvedExecutionChecksum,
+  assertApprovedExecutionChecksum,
+  assertMaterializedDocumentSnapshot,
+  materializeApplicationDocuments,
+  type MaterializedDocument,
+} from "../src/index.js";
 
 const directories: string[] = [];
 
@@ -48,10 +64,15 @@ describe("application document materialization", () => {
     const first = await materializeApplicationDocuments(value, firstDirectory);
     const second = await materializeApplicationDocuments(value, secondDirectory);
 
-    expect(first.packet.resumePath).toMatch(/resume-resume-version-1\.pdf$/);
+    expect(first.packet.resumePath).toBe(first.resume.path);
+    expect(first.packet.coverLetterPath).toBe(first.coverLetter?.path);
+    expect(first.resume.path).toMatch(/resume-[a-f0-9]{64}\.pdf$/);
+    expect(first.coverLetter?.path).toMatch(/cover-letter-[a-f0-9]{64}\.pdf$/);
     expect((await readFile(first.resume.path)).subarray(0, 5).toString()).toBe("%PDF-");
     expect(first.resume.sha256).toBe(second.resume.sha256);
     expect(first.coverLetter?.sha256).toBe(second.coverLetter?.sha256);
+    expectSnapshot(first.resume, await readFile(first.resume.path));
+    expectSnapshot(first.coverLetter!, await readFile(first.coverLetter!.path));
     expect(first.resume.sha256).toBe("6b26db284724ff0c9fabc920d0c22077207f810216b0ee24785ddd85cc96f3f0");
     expect(first.coverLetter?.sha256).toBe("6ec2ecdc6a8273eb19aefb367b949b384b736af1e05a6f60206a1a71624fda2c");
 
@@ -90,14 +111,48 @@ describe("application document materialization", () => {
     }), directory)).rejects.toThrow(/contact information is required/i);
   });
 
-  it("fails closed on blank resume or cover-letter content", async () => {
+  it("fails closed on blank resume content and normalizes a blank cover letter to absence", async () => {
     const directory = await temporaryDirectory();
     await expect(materializeApplicationDocuments(packet({
       resumeContent: { contact: { name: "Ada Lovelace", email: "ada@example.com" } },
     }), directory)).rejects.toThrow(/resume content is blank/i);
 
-    await expect(materializeApplicationDocuments(packet({ coverLetterContent: " \n\t " }), directory))
-      .rejects.toThrow(/cover letter content is blank/i);
+    const withoutCoverLetter = await materializeApplicationDocuments(
+      packet({ coverLetterContent: " \n\t " }),
+      directory,
+    );
+    expect(withoutCoverLetter.coverLetter).toBeUndefined();
+    expect(withoutCoverLetter.packet.coverLetterPath).toBeUndefined();
+  });
+
+  it("materializes a server v2 packet with a blank cover letter as resume-only", async () => {
+    const directory = await temporaryDirectory();
+    const job: NormalizedJob = {
+      externalId: "job-1",
+      canonicalUrl: "https://boards.greenhouse.io/acme/jobs/123",
+      company: "Acme",
+      title: "Engineer",
+      location: "Remote",
+      workplace: "remote",
+      description: "Build reliable systems.",
+      source: "greenhouse",
+    };
+    const serverPacket = packet({
+      approvedPacketChecksum: "",
+      approvedExecutionSchemaVersion: 2,
+      approvedExecutionAdmission: { kind: "review_approval" },
+      coverLetterContent: " \n\t ",
+    });
+    serverPacket.approvedPacketChecksum = approvedExecutionChecksum(serverPacket, job);
+    expect(assertApprovedExecutionChecksum(serverPacket, job))
+      .toBe(serverPacket.approvedPacketChecksum);
+
+    const materialized = await materializeApplicationDocuments(serverPacket, directory);
+
+    expect(materialized.coverLetter).toBeUndefined();
+    expect(materialized.packet.coverLetterPath).toBeUndefined();
+    expect(materialized.packet.approvedExecutionSchemaVersion).toBe(2);
+    expect(materialized.packet.approvedExecutionAdmission).toEqual({ kind: "review_approval" });
   });
 
   it("fails closed instead of dropping unsupported scripts, glyphs, or controls", async () => {
@@ -133,8 +188,161 @@ describe("application document materialization", () => {
       coverLetterContent: "Dear hiring team,\n\nI am excited to apply for this role.",
     }), directory);
 
-    expect(result.packet.resumePath).toBe(resumePath);
+    expect(result.packet.resumePath).toBe(result.resume.path);
+    expect(result.resume.path).not.toBe(resumePath);
     expect(await extractPdfText(result.coverLetter!.path)).toContain("applications@example.com");
+  }, 20_000);
+
+  it("retains the validated bytes after a same-name resume replacement", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "resume.pdf");
+    const replacementPath = join(directory, "replacement.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    await writeTextPdf(replacementPath, "Replacement resume content that validation never observed.");
+    const originalBytes = await readFile(resumePath);
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterContent: undefined,
+    }), directory);
+
+    await rename(replacementPath, resumePath);
+
+    expect(await readFile(resumePath)).not.toEqual(originalBytes);
+    expect(result.packet.resumePath).toBe(result.resume.path);
+    expect(result.resume.path).not.toBe(resumePath);
+    expectSnapshot(result.resume, originalBytes);
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("retains the validated bytes after the resume path is truncated", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "resume.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    const originalBytes = await readFile(resumePath);
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterContent: undefined,
+    }), directory);
+
+    await truncate(resumePath, 5);
+
+    expect((await readFile(resumePath)).byteLength).toBe(5);
+    expectSnapshot(result.resume, originalBytes);
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("retains each validated snapshot after resume and cover-letter paths are swapped", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "resume.pdf");
+    const coverLetterPath = join(directory, "cover-letter.pdf");
+    const swapPath = join(directory, "swap.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    await writeTextPdf(coverLetterPath, "Original validated cover letter content for the hiring team.");
+    const resumeBytes = await readFile(resumePath);
+    const coverLetterBytes = await readFile(coverLetterPath);
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterPath,
+      coverLetterContent: undefined,
+    }), directory);
+
+    await rename(resumePath, swapPath);
+    await rename(coverLetterPath, resumePath);
+    await rename(swapPath, coverLetterPath);
+
+    expect(await readFile(resumePath)).toEqual(coverLetterBytes);
+    expect(await readFile(coverLetterPath)).toEqual(resumeBytes);
+    expectSnapshot(result.resume, resumeBytes);
+    expectSnapshot(result.coverLetter!, coverLetterBytes);
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).resolves.toBeUndefined();
+    await expect(assertMaterializedDocumentSnapshot(result.coverLetter!)).resolves.toBeUndefined();
+  }, 20_000);
+
+  it("rejects a same-name replacement of a frozen materialized snapshot", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "source-resume.pdf");
+    const replacementPath = join(directory, "replacement.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    await writeTextPdf(replacementPath, "Tampered resume content that validation never observed.");
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterContent: undefined,
+    }), directory);
+
+    expect(Object.isFrozen(result.resume)).toBe(true);
+    expect(Reflect.set(result.resume, "sha256", "0".repeat(64))).toBe(false);
+    await rename(replacementPath, result.resume.path);
+
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).rejects.toThrow(
+      /snapshot is unavailable or has changed/i,
+    );
+  }, 20_000);
+
+  it("rejects a symlink substituted for a frozen materialized snapshot", async () => {
+    if (process.platform === "win32") return;
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "source-resume.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterContent: undefined,
+    }), directory);
+    const retainedPath = join(directory, "retained-resume.pdf");
+    await rename(result.resume.path, retainedPath);
+    await symlink(retainedPath, result.resume.path, "file");
+
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).rejects.toThrow(
+      /snapshot is unavailable or has changed/i,
+    );
+  }, 20_000);
+
+  it("rejects truncation of a frozen materialized snapshot", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "source-resume.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterContent: undefined,
+    }), directory);
+
+    await chmod(result.resume.path, 0o600);
+    await truncate(result.resume.path, 5);
+
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).rejects.toThrow(
+      /snapshot is unavailable or has changed/i,
+    );
+  }, 20_000);
+
+  it("rejects swapped frozen resume and cover-letter snapshots", async () => {
+    const directory = await temporaryDirectory();
+    const resumePath = join(directory, "source-resume.pdf");
+    const coverLetterPath = join(directory, "source-cover-letter.pdf");
+    const swapPath = join(directory, "swap.pdf");
+    await writeTextPdf(resumePath, "Original validated resume content for Ada Lovelace and Bluey.");
+    await writeTextPdf(coverLetterPath, "Original validated cover letter content for the hiring team.");
+    const result = await materializeApplicationDocuments(packet({
+      resumePath,
+      resumeContent: undefined,
+      coverLetterPath,
+      coverLetterContent: undefined,
+    }), directory);
+
+    await rename(result.resume.path, swapPath);
+    await rename(result.coverLetter!.path, result.resume.path);
+    await rename(swapPath, result.coverLetter!.path);
+
+    await expect(assertMaterializedDocumentSnapshot(result.resume)).rejects.toThrow(
+      /snapshot is unavailable or has changed/i,
+    );
+    await expect(assertMaterializedDocumentSnapshot(result.coverLetter!)).rejects.toThrow(
+      /snapshot is unavailable or has changed/i,
+    );
   }, 20_000);
 
   it("rejects blank, image-only, invalid, oversized, and over-page-limit PDFs", async () => {
@@ -251,4 +459,11 @@ async function expectReferencedResumeFailure(path: string, directory: string, me
 function pdfBaseFonts(bytes: Uint8Array): string[] {
   return [...Buffer.from(bytes).toString("latin1").matchAll(/\/BaseFont\s+\/([A-Za-z0-9_.+-]+)/g)]
     .map((match) => match[1]);
+}
+
+function expectSnapshot(document: MaterializedDocument, expectedBytes: Uint8Array): void {
+  const snapshot = Buffer.from(document.bytesBase64, "base64");
+  expect(snapshot).toEqual(Buffer.from(expectedBytes));
+  expect(document.sha256).toBe(createHash("sha256").update(snapshot).digest("hex"));
+  expect(Object.isFrozen(document)).toBe(true);
 }

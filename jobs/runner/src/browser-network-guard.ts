@@ -7,7 +7,7 @@ import { assertPublicApplicationUrl } from "@bluey/jobs-automation";
  * Application-level DNS validation is defense in depth, not a DNS TOCTOU fix.
  */
 export const NETWORK_EGRESS_REQUIREMENT =
-  "Browser network egress must deny private and infrastructure address ranges by default.";
+  "Browser network egress must deny private and infrastructure address ranges, WebSockets, UDP, WebRTC, WebTransport, and QUIC by default.";
 
 type PublicNetworkValidator = (url: string) => Promise<unknown>;
 
@@ -25,12 +25,7 @@ export async function installBrowserNetworkGuard(
   });
 
   await context.routeWebSocket(/^wss?:\/\//i, async (route) => {
-    try {
-      await assertPublicBrowserTarget(route.url(), validate);
-      route.connectToServer();
-    } catch {
-      await route.close({ code: 1008 });
-    }
+    await route.close({ code: 1008 });
   });
 }
 

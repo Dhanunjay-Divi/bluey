@@ -17,12 +17,14 @@ import {
   MonitorUp,
   MoreHorizontal,
   Play,
+  ReceiptText,
   Search,
   Send,
   Sparkles,
   TriangleAlert,
 } from "lucide-react";
 import type { ApplicationEvidence, CandidateEventInput, Intervention, JobApplication, JobEligibilityDecision, JobPosting, JobsWorkspace, ResumeVersion, RunnerAvailability } from "../types";
+import { jobsApi } from "../api";
 import { relativeTime, titleCase } from "../lib/format";
 import { ConfirmDialog, Dialog } from "../components/Dialog";
 import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
@@ -30,6 +32,7 @@ import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
 import { applicationAfterInterventionResolution } from "../lib/application-flow";
+import { safeDownloadFileName, saveDownloadedBlob } from "../lib/download";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -41,6 +44,8 @@ interface Props {
   onResolveIntervention(intervention: Intervention, action: string, resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string }): Promise<void>;
   onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
 }
+
+const SERVER_SUBMISSION_FINGERPRINT_KEY = "_bluey_server_submission_fingerprint_v1";
 
 const stateGroups = [
   ["active", "Active"],
@@ -561,20 +566,404 @@ function capabilityLabel(capability: JobEligibilityDecision["capability"]): stri
   return "Review only";
 }
 
-function ReceiptView({ application, resume, evidence }: { application: JobApplication; resume?: ResumeVersion; evidence: ApplicationEvidence[] }) {
+export function hasVerifiedSubmissionEvidence(
+  application: Pick<
+    JobApplication,
+    "id" | "state" | "resume_version_id" | "receipt" | "submitted_at_ms"
+  >,
+  evidence: ApplicationEvidence[],
+): boolean {
+  if (application.state !== "submitted"
+    || !application.resume_version_id
+    || positiveInteger(application.submitted_at_ms) === undefined) {
+    return false;
+  }
+  const applicationEvidence = evidence.filter((item) => item.application_id === application.id);
+  const resumeEvidence = applicationEvidence.filter((item) => item.kind === "resume");
+  const receiptEvidence = applicationEvidence.filter((item) => item.kind === "application_receipt");
+  const confirmationEvidence = applicationEvidence.filter(
+    (item) => item.kind === "submission_confirmation",
+  );
+
+  if (resumeEvidence.length !== 1
+    || receiptEvidence.length !== 1
+    || confirmationEvidence.length < 1
+    || confirmationEvidence.length > 4) {
+    return false;
+  }
+
+  const resume = resumeEvidence[0];
+  const receipt = receiptEvidence[0];
+  const resumeVersionId = application.resume_version_id;
+  if ([resume, receipt, ...confirmationEvidence]
+    .some((item) => item.resume_version_id !== resumeVersionId)) {
+    return false;
+  }
+
+  const resumeMetadata = objectValue(resume.metadata);
+  const receiptMetadata = objectValue(receipt.metadata);
+  const confirmationMetadata = confirmationEvidence.map((item) => objectValue(item.metadata));
+  if (!resumeMetadata || !receiptMetadata || confirmationMetadata.some((item) => !item)) return false;
+  const confirmationRecords = confirmationEvidence.map((item, index) => ({
+    evidence: item,
+    metadata: confirmationMetadata[index] as Record<string, unknown>,
+  }));
+  const receiptId = recordString(receiptMetadata, "receipt_id");
+  if (!receiptId
+    || recordString(resumeMetadata, "receipt_id") !== receiptId
+    || confirmationRecords.some(({ metadata }) => recordString(metadata, "receipt_id") !== receiptId)) {
+    return false;
+  }
+
+  if (resume.media_type !== "application/pdf"
+    || receipt.media_type !== "application/json"
+    || resumeMetadata.attached_to_submission !== true
+    || receiptMetadata.immutable !== true
+    || receiptMetadata.schema_version !== 1
+    || confirmationRecords.some(({ evidence: confirmation, metadata }) => (
+      confirmation.media_type !== "image/png"
+      || !confirmation.file_name.toLowerCase().endsWith(".png")
+      || metadata.evidence_strength !== "browser_confirmed"
+      || !recordString(metadata, "confirmation")
+    ))) {
+    return false;
+  }
+
+  if (!validSha256(resume.sha256)
+    || !validSha256(receipt.sha256)
+    || positiveInteger(resumeMetadata.size_bytes) === undefined
+    || positiveInteger(receiptMetadata.size_bytes) === undefined
+    || confirmationRecords.some(({ evidence: confirmation, metadata }) => (
+      !validSha256(confirmation.sha256)
+      || positiveInteger(metadata.size_bytes) === undefined
+    ))) {
+    return false;
+  }
+
+  const scopes = [resume, receipt, ...confirmationEvidence]
+    .map((item) => accountStorageScope(item.storage_key));
+  if (scopes.some((scope) => !scope) || new Set(scopes).size !== 1) return false;
+  const accountScope = scopes[0];
+  if (!accountScope) return false;
+
+  const storedReceipt = objectValue(application.receipt);
+  if (!storedReceipt) return false;
+  if (recordString(storedReceipt, "receiptId") !== receiptId
+    || recordString(storedReceipt, "applicationId") !== application.id
+    || recordString(storedReceipt, "accountId") !== accountScope.split("/").at(-1)
+    || !validSha256(recordString(storedReceipt, SERVER_SUBMISSION_FINGERPRINT_KEY))) {
+    return false;
+  }
+  const packet = objectValue(storedReceipt.packet);
+  if (!packet || recordString(packet, "resumeVersionId") !== resumeVersionId) return false;
+  const receiptObject = objectValue(storedReceipt.receiptObject);
+  if (!receiptObject
+    || recordString(receiptObject, "storageKey") !== receipt.storage_key
+    || !sameSha256(recordString(receiptObject, "sha256"), receipt.sha256)
+    || recordString(receiptObject, "mediaType") !== receipt.media_type
+    || positiveInteger(receiptObject.sizeBytes) !== positiveInteger(receiptMetadata.size_bytes)
+    || receiptObject.schemaVersion !== 1) {
+    return false;
+  }
+
+  const documents = arrayOfRecords(storedReceipt.documents);
+  if (!documents) return false;
+  const resumeDocuments = documents.filter((document) => recordString(document, "kind") === "resume");
+  if (resumeDocuments.length !== 1
+    || new Set(documents.map((document) => recordString(document, "storageKey"))).size
+      !== documents.length
+    || documents.some((document) => !validReceiptDocument(document, accountScope))) {
+    return false;
+  }
+  const resumeDocument = resumeDocuments[0];
+  if (recordString(resumeDocument, "versionId") !== resumeVersionId
+    || recordString(resumeDocument, "storageKey") !== resume.storage_key
+    || !sameSha256(recordString(resumeDocument, "sha256"), resume.sha256)
+    || recordString(resumeDocument, "mediaType") !== resume.media_type) {
+    return false;
+  }
+
+  const screenshotKeys = stringArray(storedReceipt.screenshotKeys);
+  if (!screenshotKeys
+    || screenshotKeys.length === 0
+    || screenshotKeys.length > 4
+    || screenshotKeys.length !== confirmationRecords.length
+    || new Set(screenshotKeys).size !== screenshotKeys.length
+    || screenshotKeys.some((key) => accountStorageScope(key) !== accountScope)) {
+    return false;
+  }
+  const indexedConfirmations = confirmationRecords.map(({ evidence: confirmation, metadata }) => {
+    const metadataKeys = stringArray(metadata.screenshot_keys);
+    const screenshotIndex = positiveInteger(metadata.screenshot_index);
+    const screenshotCount = positiveInteger(metadata.screenshot_count);
+    const legacySingle = screenshotKeys.length === 1
+      && !Object.prototype.hasOwnProperty.call(metadata, "screenshot_index")
+      && !Object.prototype.hasOwnProperty.call(metadata, "screenshot_count")
+      && !Object.prototype.hasOwnProperty.call(metadata, "immutable");
+    if (!metadataKeys
+      || !sameStringArray(screenshotKeys, metadataKeys)
+      || (!legacySingle && (
+        metadata.immutable !== true
+        || screenshotCount !== screenshotKeys.length
+        || screenshotIndex === undefined
+        || screenshotIndex > screenshotKeys.length
+      ))) {
+      return undefined;
+    }
+    const index = legacySingle ? 0 : (screenshotIndex as number) - 1;
+    return confirmation.storage_key === screenshotKeys[index]
+      ? { confirmation, metadata, index }
+      : undefined;
+  });
+  if (indexedConfirmations.some((item) => !item)
+    || new Set(indexedConfirmations.map((item) => item?.index)).size !== screenshotKeys.length
+    || new Set(confirmationEvidence.map((item) => item.storage_key)).size !== screenshotKeys.length
+    || new Set(confirmationEvidence.map((item) => item.file_name)).size !== screenshotKeys.length) {
+    return false;
+  }
+
+  const manifest = arrayOfRecords(storedReceipt.evidenceObjects);
+  if (!manifest
+    || manifest.length === 0
+    || manifest.length !== documents.length + screenshotKeys.length
+    || new Set(manifest.map((item) => recordString(item, "storageKey"))).size !== manifest.length
+    || manifest.some((item) => !validManifestObject(item, accountScope))
+    || manifest.filter((item) => recordString(item, "kind") === "resume").length !== 1
+    || documents.some((document) => !receiptDocumentMatchesManifest(document, manifest))
+    || screenshotKeys.some((key) => !manifest.some((item) => (
+      recordString(item, "storageKey") === key && recordString(item, "kind") === "screenshot"
+    )))
+    || !manifestObjectMatches(
+      manifest,
+      "resume",
+      resume.storage_key,
+      resume.sha256,
+      resume.media_type,
+      positiveInteger(resumeMetadata.size_bytes),
+    )
+    || indexedConfirmations.some((item) => !item || !manifestObjectMatches(
+      manifest,
+      "screenshot",
+      item.confirmation.storage_key,
+      item.confirmation.sha256,
+      item.confirmation.media_type,
+      positiveInteger(item.metadata.size_bytes),
+    ))) {
+    return false;
+  }
+
+  const documentEvidence = applicationEvidence.filter((item) => (
+    ["resume", "cover_letter", "attachment"].includes(item.kind)
+  ));
+  if (documentEvidence.length !== documents.length
+    || documents.some((document) => {
+      const storageKey = recordString(document, "storageKey");
+      const matchingEvidence = documentEvidence.filter((item) => item.storage_key === storageKey);
+      return matchingEvidence.length !== 1
+        || !evidenceRecordMatchesReceiptDocument(
+          matchingEvidence[0],
+          document,
+          manifest,
+          receiptId,
+          accountScope,
+          resumeVersionId,
+        );
+    })) {
+    return false;
+  }
+
+  return true;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function arrayOfRecords(value: unknown): Record<string, unknown>[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const records = value.map(objectValue);
+  return records.some((item) => !item)
+    ? undefined
+    : records as Record<string, unknown>[];
+}
+
+function recordString(value: Record<string, unknown>, key: string): string {
+  const item = value[key];
+  return typeof item === "string" ? item.trim() : "";
+}
+
+function positiveInteger(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+function validSha256(value: string): boolean {
+  return /^[a-f\d]{64}$/i.test(value);
+}
+
+function sameSha256(left: string, right: string): boolean {
+  return validSha256(left) && validSha256(right) && left.toLowerCase() === right.toLowerCase();
+}
+
+function accountStorageScope(storageKey: string): string | undefined {
+  if (!storageKey || storageKey !== storageKey.trim() || storageKey.startsWith("/")) return undefined;
+  const parts = storageKey.split("/");
+  if (parts.some((part) => !part || part === "." || part === ".." || part.includes("\\"))) {
+    return undefined;
+  }
+  const accountsIndex = parts.indexOf("accounts");
+  if (accountsIndex < 0
+    || accountsIndex !== parts.lastIndexOf("accounts")
+    || accountsIndex + 2 >= parts.length
+    || !/^[a-zA-Z0-9_-]+$/.test(parts[accountsIndex + 1])) {
+    return undefined;
+  }
+  return parts.slice(0, accountsIndex + 2).join("/");
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)
+    || value.some((item) => typeof item !== "string" || !item.trim() || item !== item.trim())) {
+    return undefined;
+  }
+  return value as string[];
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+  return left.length === right.length && left.every((item, index) => item === right[index]);
+}
+
+function validManifestObject(item: Record<string, unknown>, accountScope: string): boolean {
+  const kind = recordString(item, "kind");
+  const mediaType = recordString(item, "mediaType");
+  const expectedMediaType = kind === "screenshot" ? "image/png" : "application/pdf";
+  return ["resume", "cover_letter", "attachment", "screenshot"].includes(kind)
+    && mediaType === expectedMediaType
+    && accountStorageScope(recordString(item, "storageKey")) === accountScope
+    && validSha256(recordString(item, "sha256"))
+    && positiveInteger(item.sizeBytes) !== undefined;
+}
+
+function validReceiptDocument(item: Record<string, unknown>, accountScope: string): boolean {
+  const kind = recordString(item, "kind");
+  return ["resume", "cover_letter", "attachment"].includes(kind)
+    && recordString(item, "mediaType") === "application/pdf"
+    && accountStorageScope(recordString(item, "storageKey")) === accountScope
+    && validSha256(recordString(item, "sha256"));
+}
+
+function receiptDocumentMatchesManifest(
+  document: Record<string, unknown>,
+  manifest: Record<string, unknown>[],
+): boolean {
+  const storageKey = recordString(document, "storageKey");
+  const match = manifest.filter((item) => recordString(item, "storageKey") === storageKey);
+  return match.length === 1
+    && recordString(match[0], "kind") === recordString(document, "kind")
+    && sameSha256(recordString(match[0], "sha256"), recordString(document, "sha256"))
+    && recordString(match[0], "mediaType") === recordString(document, "mediaType");
+}
+
+function evidenceRecordMatchesReceiptDocument(
+  evidence: ApplicationEvidence,
+  document: Record<string, unknown>,
+  manifest: Record<string, unknown>[],
+  receiptId: string,
+  accountScope: string,
+  resumeVersionId: string,
+): boolean {
+  const kind = recordString(document, "kind");
+  const storageKey = recordString(document, "storageKey");
+  const metadata = objectValue(evidence.metadata);
+  const sizeBytes = metadata && positiveInteger(metadata.size_bytes);
+  return Boolean(metadata)
+    && evidence.kind === kind
+    && evidence.storage_key === storageKey
+    && accountStorageScope(evidence.storage_key) === accountScope
+    && sameSha256(evidence.sha256, recordString(document, "sha256"))
+    && evidence.media_type === recordString(document, "mediaType")
+    && metadata?.attached_to_submission === true
+    && recordString(metadata as Record<string, unknown>, "receipt_id") === receiptId
+    && (kind !== "resume" || evidence.resume_version_id === resumeVersionId)
+    && manifestObjectMatches(
+      manifest,
+      kind,
+      evidence.storage_key,
+      evidence.sha256,
+      evidence.media_type,
+      sizeBytes,
+    );
+}
+
+function manifestObjectMatches(
+  manifest: Record<string, unknown>[],
+  kind: string,
+  storageKey: string,
+  sha256: string,
+  mediaType: string,
+  sizeBytes: number | undefined,
+): boolean {
+  if (sizeBytes === undefined) return false;
+  const matchingKey = manifest.filter((item) => recordString(item, "storageKey") === storageKey);
+  return matchingKey.length === 1
+    && recordString(matchingKey[0], "kind") === kind
+    && sameSha256(recordString(matchingKey[0], "sha256"), sha256)
+    && recordString(matchingKey[0], "mediaType") === mediaType
+    && positiveInteger(matchingKey[0].sizeBytes) === sizeBytes;
+}
+
+export function ReceiptView({ application, resume, evidence }: {
+  application: JobApplication;
+  resume?: ResumeVersion;
+  evidence: ApplicationEvidence[];
+}) {
+  const [downloadingEvidenceId, setDownloadingEvidenceId] = useState("");
+  const [downloadError, setDownloadError] = useState("");
   const orderedEvidence = [...evidence].sort((left, right) => right.occurred_at_ms - left.occurred_at_ms);
   const resumeEvidence = orderedEvidence.find((item) => item.kind === "resume" && item.resume_version_id === application.resume_version_id);
-  const confirmation = orderedEvidence.find((item) => item.kind === "submission_confirmation");
-  const applicationEmail = application.receipt.application_identity && typeof application.receipt.application_identity === "object"
-    ? String((application.receipt.application_identity as Record<string, unknown>).email || "")
-    : application.receipt.packet && typeof application.receipt.packet === "object"
-      ? String((application.receipt.packet as Record<string, unknown>).applicationEmail || "")
+  const submissionVerified = hasVerifiedSubmissionEvidence(application, orderedEvidence);
+  const storedReceipt = objectValue(application.receipt) || {};
+  const applicationIdentity = objectValue(storedReceipt.application_identity);
+  const packet = objectValue(storedReceipt.packet);
+  const applicationEmail = applicationIdentity
+    ? recordString(applicationIdentity, "email")
+    : packet
+      ? recordString(packet, "applicationEmail")
       : "";
+
+  const downloadEvidence = async (item: ApplicationEvidence) => {
+    setDownloadingEvidenceId(item.id);
+    setDownloadError("");
+    try {
+      const fallbackName = evidenceDownloadFileName(item);
+      const downloaded = await jobsApi.downloadApplicationEvidence(application.id, item.id, fallbackName);
+      saveDownloadedBlob(downloaded.blob, downloaded.fileName);
+    } catch (cause) {
+      setDownloadError(cause instanceof Error && cause.message.trim()
+        ? cause.message
+        : "Bluey could not download that evidence. Please try again.");
+    } finally {
+      setDownloadingEvidenceId("");
+    }
+  };
+
   return (
     <div className="receipt-view">
-      <div className={`receipt-check ${resumeEvidence && confirmation ? "verified" : "warning"}`}>
-        {resumeEvidence && confirmation ? <CheckCircle2 size={22} /> : <AlertCircle size={22} />}
-        <span><b>{resumeEvidence && confirmation ? "Submission verified" : "Evidence incomplete"}</b><small>{application.submitted_at_ms ? new Date(application.submitted_at_ms).toLocaleString() : "Submission time pending"}</small></span>
+      <div
+        className={`receipt-check ${submissionVerified ? "verified" : "warning"}`}
+        role="status"
+        aria-live="polite"
+      >
+        {submissionVerified ? <CheckCircle2 size={22} /> : <AlertCircle size={22} />}
+        <span>
+          <b>{submissionVerified ? "Submission verified" : "Evidence not verified"}</b>
+          <small>
+            {application.submitted_at_ms
+              ? new Date(application.submitted_at_ms).toLocaleString()
+              : "Submission time pending"}
+          </small>
+        </span>
       </div>
       <dl>
         <div><dt>Status</dt><dd>{titleCase(application.state)}</dd></div>
@@ -582,13 +971,31 @@ function ReceiptView({ application, resume, evidence }: { application: JobApplic
         {applicationEmail && <div><dt>Application email</dt><dd>{applicationEmail}</dd></div>}
         <div><dt>Application ID</dt><dd>{application.id}</dd></div>
       </dl>
-      <section className="receipt-evidence">
+      <section className="receipt-evidence" aria-busy={Boolean(downloadingEvidenceId)}>
         <div className="receipt-section-heading"><div><p>EVIDENCE TRAIL</p><h3>What was sent and what happened next</h3></div><span>{orderedEvidence.length} record{orderedEvidence.length === 1 ? "" : "s"}</span></div>
+        {downloadError && <div className="evidence-download-error" role="alert">
+          <AlertCircle size={15} />
+          <span>{downloadError}</span>
+        </div>}
         <div className="evidence-list">
           {orderedEvidence.map((item) => <div className="evidence-row" key={item.id}>
             <span className={`evidence-icon ${item.kind}`}>{evidenceIcon(item.kind)}</span>
             <div><b>{item.label || evidenceTitle(item.kind)}</b><p>{evidenceDetail(item, resume)}</p></div>
-            <time>{new Date(item.occurred_at_ms).toLocaleString([], { dateStyle: "medium", timeStyle: "short" })}</time>
+            <aside className="evidence-row-actions">
+              <time>{new Date(item.occurred_at_ms).toLocaleString([], {
+                dateStyle: "medium",
+                timeStyle: "short",
+              })}</time>
+              {evidenceDownloadAction(item.kind) && <button
+                type="button"
+                disabled={Boolean(downloadingEvidenceId)}
+                aria-label={`${evidenceDownloadAction(item.kind)} for application ${application.id}`}
+                onClick={() => void downloadEvidence(item)}
+              >
+                <Download size={13} />
+                {downloadingEvidenceId === item.id ? "Downloading..." : evidenceDownloadAction(item.kind)}
+              </button>}
+            </aside>
           </div>)}
           {orderedEvidence.length === 0 && <div className="evidence-empty"><AlertCircle size={18} /><span><b>No evidence attached</b><p>Bluey will not treat future applications as submitted until the exact resume and confirmation are recorded.</p></span></div>}
         </div>
@@ -597,15 +1004,39 @@ function ReceiptView({ application, resume, evidence }: { application: JobApplic
   );
 }
 
+function evidenceDownloadAction(kind: string): string {
+  if (kind === "resume") return "Download submitted resume";
+  if (kind === "cover_letter") return "Download submitted cover letter";
+  if (kind === "attachment") return "Download submitted attachment";
+  if (kind === "application_receipt") return "Download receipt JSON";
+  if (kind === "submission_confirmation") return "Download confirmation screenshot";
+  return "";
+}
+
+function evidenceDownloadFileName(item: ApplicationEvidence): string {
+  const fallback = item.kind === "resume"
+    ? "bluey-submitted-resume.pdf"
+    : item.kind === "cover_letter"
+      ? "bluey-submitted-cover-letter.pdf"
+      : item.kind === "attachment"
+        ? "bluey-submitted-attachment.pdf"
+        : item.kind === "application_receipt"
+          ? "bluey-application-receipt.json"
+          : "bluey-submission-confirmation.png";
+  return safeDownloadFileName(typeof item.file_name === "string" ? item.file_name : "", fallback);
+}
+
 function evidenceIcon(kind: string) {
   if (kind === "status_email") return <Mail size={16} />;
   if (kind === "interview_event") return <CalendarDays size={16} />;
+  if (kind === "application_receipt") return <ReceiptText size={16} />;
   if (kind === "submission_confirmation") return <CheckCircle2 size={16} />;
   return <FileText size={16} />;
 }
 
 function evidenceTitle(kind: string): string {
   if (kind === "resume") return "Resume attached";
+  if (kind === "application_receipt") return "Immutable application receipt";
   if (kind === "status_email") return "Inbox update";
   if (kind === "interview_event") return "Interview scheduled";
   if (kind === "submission_confirmation") return "Application submitted";
@@ -613,19 +1044,26 @@ function evidenceTitle(kind: string): string {
 }
 
 function evidenceDetail(item: ApplicationEvidence, resume?: ResumeVersion): string {
+  const metadata = objectValue(item.metadata) || {};
   if (item.kind === "resume") {
     const version = resume && item.resume_version_id === resume.id ? `Resume v${resume.version_no}` : "Job-specific resume";
     const checksum = item.sha256 ? ` · SHA-256 ${item.sha256.slice(0, 10)}…` : "";
     return `${version}${checksum}`;
   }
+  if (item.kind === "application_receipt") {
+    const receiptId = recordString(metadata, "receipt_id");
+    const reference = receiptId ? `Receipt ${receiptId}` : item.file_name || "Application receipt";
+    const checksum = item.sha256 ? ` · SHA-256 ${item.sha256.slice(0, 10)}…` : "";
+    return `${reference} · Immutable JSON${checksum}`;
+  }
   if (item.kind === "status_email") {
-    return `${String(item.metadata.subject || "Application status message")} · ${providerName(item.provider)}`;
+    return `${recordString(metadata, "subject") || "Application status message"} · ${providerName(item.provider)}`;
   }
   if (item.kind === "interview_event") {
     return providerName(item.provider);
   }
   if (item.kind === "submission_confirmation") {
-    return `${String(item.metadata.confirmation || "Application received")} · ${providerName(item.provider)}`;
+    return `${recordString(metadata, "confirmation") || "Application received"} · ${providerName(item.provider)}`;
   }
   return item.file_name || providerName(item.provider);
 }

@@ -4,6 +4,12 @@ import type {
   NormalizedJob,
 } from "@bluey/jobs-automation";
 import {
+  ApprovedExecutionIntegrityError,
+  CertifiedProviderJobKeyError,
+  assertCertifiedProviderNavigationJob,
+  assertApprovedExecutionChecksum,
+} from "@bluey/jobs-automation";
+import {
   scopedLocalRunAuthorization,
   type LocalRunCapabilities,
   type LocalRunCapabilityOperation,
@@ -39,6 +45,17 @@ export function validateStartRunRequest(request: StartRunRequest): void {
   if (request.packet.applicationIdentityId
     && request.packet.applicationIdentityId !== request.applicationIdentityId) {
     throw new LocalBrowserError("identity_mismatch");
+  }
+  if (!request.job) throw new LocalBrowserError("run_request_invalid");
+  try {
+    assertApprovedExecutionChecksum(request.packet, request.job);
+    assertCertifiedProviderNavigationJob(request.url, request.job);
+  } catch (error) {
+    if (error instanceof ApprovedExecutionIntegrityError
+      || error instanceof CertifiedProviderJobKeyError) {
+      throw new LocalBrowserError("launch_mismatch");
+    }
+    throw error;
   }
 }
 

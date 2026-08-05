@@ -65,6 +65,24 @@ describe("leased runner lifecycle", () => {
     expect(order).toEqual(["cleanup", "stage", "finish:submitted", "commit"]);
   });
 
+  it("keeps a successfully finished submission recoverable when promotion fails", async () => {
+    const order: string[] = [];
+    const lease = fakeLease(true, order);
+
+    await expect(finalizeLeasedRun({
+      lease,
+      intendedOutcome: "submitted",
+      async cleanup() { order.push("cleanup"); },
+      async stage() { order.push("stage"); },
+      async commit() {
+        order.push("commit");
+        throw new Error("promotion interrupted");
+      },
+    })).rejects.toMatchObject({ outcome: "submitted_result_pending" });
+
+    expect(order).toEqual(["cleanup", "stage", "finish:submitted", "commit"]);
+  });
+
   it("never persists a retryable receipt after a final-submit fence", async () => {
     const order: string[] = [];
     const lease = fakeLease(true, order);

@@ -1,7 +1,7 @@
-import { lazy, Suspense, useCallback, useEffect, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { Navigate, Route, Routes, useNavigate } from "react-router-dom";
 import { AlertCircle, LoaderCircle } from "lucide-react";
-import { accessToken, jobsApi } from "./api";
+import { accessToken, ApiError, jobsApi } from "./api";
 import { previewWorkspace, previewWorkspaceForScenario } from "./data/preview";
 import type {
   AccountSummary,
@@ -26,6 +26,7 @@ import type {
   MailboxProviderAvailability,
   MailboxSyncState,
   ResumeVersion,
+  UploadResumeSourceResponse,
   UserJobInput,
 } from "./types";
 import { AppShell } from "./components/AppShell";
@@ -55,6 +56,98 @@ const previewSearch = isPreview
   : "";
 const initialPreviewWorkspace = previewWorkspaceForScenario(previewWorkspace, previewScenario);
 
+type ResumeUploadRequestId = ReturnType<Crypto["randomUUID"]>;
+
+type ResumeSourceUploader = (
+  file: File,
+  profile: CareerProfile,
+  pageCount: number | undefined,
+  requestId: ResumeUploadRequestId,
+) => Promise<UploadResumeSourceResponse>;
+
+interface ResumeUploadAttempt {
+  fingerprint: string;
+  requestId: ResumeUploadRequestId;
+}
+
+export class ResumeUploadAttemptLineage {
+  private readonly attempts = new WeakMap<File, ResumeUploadAttempt>();
+  private activeAttempt?: ResumeUploadAttempt;
+
+  constructor(
+    private readonly createRequestId: () => ResumeUploadRequestId = () => crypto.randomUUID(),
+  ) {}
+
+  requestId(file: File, profile: CareerProfile, pageCount?: number): ResumeUploadRequestId {
+    const fingerprint = resumeUploadAttemptFingerprint(profile, pageCount);
+    const current = this.attempts.get(file);
+    if (current && current === this.activeAttempt && current.fingerprint === fingerprint) {
+      return current.requestId;
+    }
+
+    const requestId = this.createRequestId();
+    const next = { fingerprint, requestId };
+    this.attempts.set(file, next);
+    this.activeAttempt = next;
+    return requestId;
+  }
+
+  clear(
+    file: File,
+    profile: CareerProfile,
+    pageCount: number | undefined,
+    requestId: ResumeUploadRequestId,
+  ): void {
+    const current = this.attempts.get(file);
+    if (
+      current === this.activeAttempt &&
+      current?.requestId === requestId &&
+      current.fingerprint === resumeUploadAttemptFingerprint(profile, pageCount)
+    ) {
+      this.attempts.delete(file);
+      this.activeAttempt = undefined;
+    }
+  }
+}
+
+export async function uploadResumeSourceWithLineage(
+  lineage: ResumeUploadAttemptLineage,
+  file: File,
+  profile: CareerProfile,
+  pageCount?: number,
+  upload: ResumeSourceUploader = jobsApi.uploadResumeSource,
+): Promise<UploadResumeSourceResponse> {
+  const requestId = lineage.requestId(file, profile, pageCount);
+  try {
+    const result = await upload(file, profile, pageCount, requestId);
+    lineage.clear(file, profile, pageCount, requestId);
+    return result;
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      lineage.clear(file, profile, pageCount, requestId);
+    }
+    throw error;
+  }
+}
+
+function resumeUploadAttemptFingerprint(profile: CareerProfile, pageCount?: number): string {
+  return `${pageCount ?? ""}:${canonicalResumeUploadValue(profile)}`;
+}
+
+function canonicalResumeUploadValue(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalResumeUploadValue).join(",")}]`;
+  }
+  if (value !== null && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${canonicalResumeUploadValue(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "undefined";
+}
+
 export default function App() {
   const [workspace, setWorkspace] = useState<JobsWorkspace | null>(isPreview ? initialPreviewWorkspace : null);
   const [account, setAccount] = useState<AccountSummary | null>(
@@ -64,6 +157,7 @@ export default function App() {
   const [loading, setLoading] = useState(!isPreview && Boolean(accessToken()));
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
+  const resumeUploadAttempts = useRef(new ResumeUploadAttemptLineage());
   const navigate = useNavigate();
 
   const refresh = useCallback(async () => {
@@ -188,7 +282,12 @@ export default function App() {
             source_resume_template_status: extension === "docx" ? "exact_docx" : "ats_layout",
           };
         } else {
-          const result = await jobsApi.uploadResumeSource(file, profile, pageCount);
+          const result = await uploadResumeSourceWithLineage(
+            resumeUploadAttempts.current,
+            file,
+            profile,
+            pageCount,
+          );
           saved = result.profile;
         }
         setWorkspace((current) => (current ? { ...current, profile: saved } : current));

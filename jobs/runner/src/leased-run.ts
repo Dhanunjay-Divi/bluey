@@ -10,7 +10,7 @@ export interface ReceiptLike {
 }
 
 export class LeasedRunError extends Error {
-  constructor(readonly outcome: "failed" | "side_effect_unknown") {
+  constructor(readonly outcome: "failed" | "side_effect_unknown" | "submitted_result_pending") {
     super(`Leased runner execution ended as ${outcome}.`);
     this.name = "LeasedRunError";
   }
@@ -68,7 +68,9 @@ export async function finalizeLeasedRun<T>(options: {
   try {
     return await options.commit();
   } catch {
-    throw new LeasedRunError(options.lease.finalSubmitAttempted ? "side_effect_unknown" : "failed");
+    throw new LeasedRunError(
+      options.intendedOutcome === "submitted" ? "submitted_result_pending" : "failed",
+    );
   }
 }
 

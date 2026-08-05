@@ -17,9 +17,16 @@ interface StoredResultEnvelope {
   result: unknown;
 }
 
+export interface DurableResultState<T> {
+  state: "staged" | "committed";
+  result: T;
+  resultSha256: string;
+}
+
 export type ResultStoreErrorCode =
   | "invalid_result_envelope"
   | "invalid_result_scope"
+  | "result_promotion_conflict"
   | "unsupported_result_envelope_version";
 
 export class ResultStoreError extends Error {
@@ -27,6 +34,7 @@ export class ResultStoreError extends Error {
     super({
       invalid_result_envelope: "Stored runner result has an invalid envelope.",
       invalid_result_scope: "Stored runner result scope is invalid.",
+      result_promotion_conflict: "Stored runner result does not match the recoverable submission.",
       unsupported_result_envelope_version: "Stored runner result uses an unsupported envelope version.",
     }[code]);
     this.name = "ResultStoreError";
@@ -42,6 +50,15 @@ export async function readResult<T>(
   context: DurableResultContext,
   key: Buffer,
 ): Promise<T | undefined> {
+  const stored = await readResultState<T>(root, context, key);
+  return stored?.state === "committed" ? stored.result : undefined;
+}
+
+export async function readResultState<T>(
+  root: string,
+  context: DurableResultContext,
+  key: Buffer,
+): Promise<DurableResultState<T> | undefined> {
   const encrypted = resultPath(root, context);
   const temporary = `${encrypted}.${temporarySuffix()}.read.json`;
   try {
@@ -52,10 +69,33 @@ export async function readResult<T>(
   }
   try {
     const stored = parseResultEnvelope(await readFile(temporary, "utf8"));
-    return stored.committed ? stored.result as T : undefined;
+    return {
+      state: stored.committed ? "committed" : "staged",
+      result: stored.result as T,
+      resultSha256: resultSha256(stored.result),
+    };
   } finally {
     await rm(temporary, { force: true });
   }
+}
+
+export async function promoteStagedResult<T>(
+  root: string,
+  context: DurableResultContext,
+  expectedResultSha256: string,
+  key: Buffer,
+): Promise<T> {
+  if (!/^[a-f0-9]{64}$/.test(expectedResultSha256)) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  const stored = await readResultState<T>(root, context, key);
+  if (!stored || stored.resultSha256 !== expectedResultSha256) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  if (stored.state === "staged") {
+    await writeStoredResult(root, context, stored.result, key, true);
+  }
+  return stored.result;
 }
 
 export async function writeResult(
@@ -150,6 +190,15 @@ function requestScopeFor(context: DurableResultContext): string {
     throw new ResultStoreError("invalid_result_scope");
   }
   return createHash("sha256").update(context.requestId).digest("hex");
+}
+
+function resultSha256(result: unknown): string {
+  const serialized = JSON.stringify(result);
+  if (serialized === undefined) throw new ResultStoreError("invalid_result_envelope");
+  return createHash("sha256")
+    .update("bluey-jobs-runner\0durable-result-promotion\0")
+    .update(serialized)
+    .digest("hex");
 }
 
 function temporarySuffix(): string {

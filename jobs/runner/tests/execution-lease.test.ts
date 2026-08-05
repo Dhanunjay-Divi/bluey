@@ -42,7 +42,7 @@ describe("execution lease client", () => {
       expiresAtMs: lease.expiresAtMs,
       ownerId: "runner-test-1",
     });
-    await lease.beforeFinalSubmit();
+    await lease.beforeFinalSubmit(finalSubmitProof());
     await lease.afterFinalSubmit("activated");
     await lease.finish("submitted");
 
@@ -61,6 +61,7 @@ describe("execution lease client", () => {
       lease_token: "lease-secret-value",
       fence: 7,
       action: "submit",
+      final_submit_proof: finalSubmitProof(),
     });
     expect(JSON.parse(String(calls[2]?.init?.body))).toMatchObject({
       lease_token: "lease-secret-value",
@@ -71,6 +72,37 @@ describe("execution lease client", () => {
     expect(new Set(calls.map((call) => new Headers(call.init?.headers)
       .get("x-bluey-jobs-worker-nonce"))).size).toBe(calls.length);
     expect(JSON.stringify(lease)).not.toContain("lease-secret-value");
+  });
+
+  it.each([
+    ["missing proof", undefined],
+    ["wrong provider control", {
+      ...finalSubmitProof(),
+      control: "lever_application_submit",
+    }],
+    ["unsorted documents", {
+      ...finalSubmitProof(),
+      documents: [
+        finalSubmitProof().documents[0],
+        { kind: "cover_letter", sha256: "b".repeat(64) },
+      ],
+    }],
+  ])("rejects %s before consuming the irreversible lease fence", async (_label, proof) => {
+    let irreversibleCalls = 0;
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/claim")) return grantResponse();
+      irreversibleCalls += 1;
+      return recordResponse("click_started");
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch).claim(CLAIM);
+
+    await expect(lease.beforeFinalSubmit(proof as never)).rejects.toMatchObject({
+      code: "invalid_state",
+    });
+
+    expect(irreversibleCalls).toBe(0);
+    expect(lease.finalSubmitAttempted).toBe(false);
+    await lease.finish("failed");
   });
 
   it("reconciles an encrypted restart checkpoint with a signed bounded request", async () => {
@@ -104,6 +136,36 @@ describe("execution lease client", () => {
       lease_token: "lease-secret-value",
       checkpoint_version: 2,
       checkpoint_phase: "final_submit_started",
+    });
+    expectSignedWorkerRequest(calls[0]!, "runner-test-1");
+  });
+
+  it("replays the exact submitted finish from durable checkpoint authority", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(input), init });
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const client = createClient(fetch);
+
+    await client.replaySubmittedFinish({
+      accountId: "account-123",
+      applicationId: "application-123",
+      runId: "run-123",
+      leaseToken: "lease-secret-value",
+      fence: 7,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toBe(
+      "https://jobs-api.example/api/jobs/internal/execution-leases/run-123/finish",
+    );
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      account_id: "account-123",
+      application_id: "application-123",
+      lease_token: "lease-secret-value",
+      fence: 7,
+      outcome: "submitted",
     });
     expectSignedWorkerRequest(calls[0]!, "runner-test-1");
   });
@@ -148,8 +210,8 @@ describe("execution lease client", () => {
     }) as typeof globalThis.fetch;
     const lease = await createClient(fetch).claim(CLAIM);
 
-    const first = await lease.beforeFinalSubmit().catch((error: unknown) => error);
-    const second = await lease.beforeFinalSubmit().catch((error: unknown) => error);
+    const first = await lease.beforeFinalSubmit(finalSubmitProof()).catch((error: unknown) => error);
+    const second = await lease.beforeFinalSubmit(finalSubmitProof()).catch((error: unknown) => error);
 
     expect(first).toBeInstanceOf(ExecutionLeaseError);
     expect(String(first)).not.toContain(WORKER_SIGNING_KEY);
@@ -168,7 +230,9 @@ describe("execution lease client", () => {
     }) as typeof globalThis.fetch;
     const lease = await createClient(fetch).claim(CLAIM);
 
-    await expect(lease.beforeFinalSubmit()).rejects.toMatchObject({ code: "invalid_response" });
+    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+      code: "invalid_response",
+    });
     expect(lease.finalSubmitAttempted).toBe(true);
     expect(lease.finalSubmitAuthorized).toBe(false);
     await lease.finish("side_effect_unknown");
@@ -264,7 +328,7 @@ describe("execution lease client", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(lease.heartbeatFailureCode).toBe("request_failed");
 
-    await expect(lease.beforeFinalSubmit()).rejects.toMatchObject({ status: 409 });
+    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({ status: 409 });
 
     expect(irreversibleCalls).toBe(1);
     expect(lease.finalSubmitAttempted).toBe(true);
@@ -323,6 +387,44 @@ function createClient(
     fetch,
     ...overrides,
   });
+}
+
+function finalSubmitProof() {
+  return {
+    schemaVersion: 3 as const,
+    adapter: "greenhouse" as const,
+    adapterVersion: "2026.07.1-beta.1",
+    control: "greenhouse_submit_application" as const,
+    target: {
+      actionUrl: "https://boards.greenhouse.io/acme/jobs/123",
+      method: "post",
+      enctype: "multipart/form-data",
+      formTarget: "_self",
+      providerJobKey: "greenhouse:acme:123",
+      formIdentity: "greenhouse-form",
+    },
+    files: [{
+      fieldName: "resume",
+      name: `resume-${"a".repeat(64)}.pdf`,
+      byteLength: 1,
+      sha256: "a".repeat(64),
+    }],
+    fields: [{
+      fieldName: "job_id",
+      valueByteLength: 3,
+      valueSha256: "d".repeat(64),
+    }],
+    partOrder: [{ kind: "field" as const, index: 0 }, { kind: "file" as const, index: 0 }],
+    job: {
+      approvedCanonicalUrl: "https://boards.greenhouse.io/acme/jobs/123",
+      pageUrl: "https://boards.greenhouse.io/acme/jobs/123#app",
+    },
+    documents: [{
+      kind: "resume" as const,
+      versionId: "resume-version-123",
+      sha256: "a".repeat(64),
+    }],
+  };
 }
 
 function expectSignedWorkerRequest(

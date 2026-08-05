@@ -1,5 +1,6 @@
 import type { ApplicationPacket } from "./contracts.js";
 import type { ApplicationReceiptBundle } from "./receipts.js";
+import { isSuccessfulExactSubmitHttpStatus } from "./trusted-submit.js";
 
 export function assertRunnablePacket(packet: ApplicationPacket): void {
   const missing = [
@@ -49,6 +50,14 @@ export function assertSubmissionReceiptComplete(receipt: ApplicationReceiptBundl
   if (receipt.result.status === "submitted") {
     const hasConfirmation = Boolean(receipt.result.confirmationText?.trim() || receipt.result.confirmationUrl?.trim());
     if (!hasConfirmation) missing.push("submission confirmation");
+    const exactSubmitAdapter = receipt.adapter === "greenhouse" || receipt.adapter === "lever";
+    if (exactSubmitAdapter
+      && !isSuccessfulExactSubmitHttpStatus(receipt.result.submitHttpStatus)) {
+      missing.push("successful submit HTTP status");
+    } else if (receipt.result.submitHttpStatus !== undefined
+      && !isSuccessfulExactSubmitHttpStatus(receipt.result.submitHttpStatus)) {
+      missing.push("valid submit HTTP status");
+    }
     if (!receipt.screenshotKeys.length) missing.push("confirmation screenshot");
   }
   if (missing.length) {

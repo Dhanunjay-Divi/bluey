@@ -241,9 +241,9 @@ export class StandardAtsAdapter implements ApplicationAdapter {
           ? context.packet.coverLetterPath
           : context.packet.resumePath;
         if (file) {
-          await context.page.locator(control.selector).setInputFiles([file]);
+          const selectedFiles = await context.page.locator(control.selector).setInputFiles([file]);
           expectations.push(
-            fileExpectation(control, displayField(control), file),
+            fileExpectation(control, displayField(control), file, selectedFiles),
           );
           filled += 1;
         }

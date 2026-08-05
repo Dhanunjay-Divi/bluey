@@ -7,6 +7,17 @@ under `docs/release/`.
 
 ### Added
 
+- Added a durable Bluey Jobs submission-evidence lifecycle with protected
+  pre-click capacity, immutable receipt and screenshot objects, authenticated
+  integrity-checked downloads, account-deletion write fencing, bounded
+  cross-replica PostgreSQL writer/deleter coordination, and migration coverage
+  for legacy resume and encrypted browser-profile objects. Known cloud-runner
+  state now blocks deletion until a future verified volume-purge acknowledgement
+  path is available, and missing or unreachable object-storage namespaces retain
+  the deletion fence instead of allowing an unproven GDPR success response.
+- Added process-crash recovery for cloud and local Jobs runners with offline
+  browser startup, guard-before-network restoration, fenced submitted-result
+  replay, per-profile failure isolation, and serialized browser-session writes.
 - Added durable, encrypted Bluey Browser profile recovery for cloud runners,
   with account-scoped object storage, lease-fenced generation updates,
   integrity-checked replacement-runner restore, and replay-safe metadata.
@@ -62,6 +73,17 @@ under `docs/release/`.
 
 ### Fixed
 
+- Bound certified Greenhouse and Lever final submission to the exact approved
+  provider job, submit target, ordered successful controls, and content-addressed
+  PDF bytes. A Chromium isolated world and boundary-preserving multipart
+  verification now prevent page-script mutation or unrelated post-fill traffic
+  from widening the authorized employer-facing action; unintended redirect
+  statuses and returned or ambiguous submit forms, as well as contradictory
+  negative submission text, cannot be promoted as successful confirmations.
+- Preserved every bounded confirmation screenshot as a separately indexed,
+  immutable evidence object and required the server and portal to verify the
+  exact complete set while retaining compatibility with legacy single-image
+  receipts.
 - Prevented intervention answers from resuming an application under an obsolete
   approved packet. Answer changes now revise the stored packet and receipt,
   invalidate prior execution approval, fence cloud and local runner authority,

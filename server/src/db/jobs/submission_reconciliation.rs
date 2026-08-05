@@ -82,6 +82,13 @@ pub fn reconcile_submission_not_submitted(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match crate::db::account_data::account_write_fence_sqlite_tx(&tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced submission reconciliation")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => return Ok(None),
+            }
             let row: Option<(String, String)> = tx
                 .query_row(
                     "SELECT job_id, application_json FROM jobs_applications
@@ -165,6 +172,13 @@ pub fn reconcile_submission_not_submitted(
             {
                 anyhow::bail!("browser session changed")
             }
+            let _ = crate::db::object_uploads::release_submission_evidence_capacity_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                &run_id,
+                now,
+            )?;
             validate_application_transition(&application.state, "failed")?;
             let application = resolved_not_submitted_application(application, &run_id, now)?;
             let application_payload = to_json(&application, "Jobs application")?;
@@ -184,6 +198,15 @@ pub fn reconcile_submission_not_submitted(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            match crate::db::account_data::account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced submission reconciliation")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => return Ok(None),
+            }
             let row = tx.query_opt(
                 "SELECT job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
@@ -268,6 +291,13 @@ pub fn reconcile_submission_not_submitted(
             {
                 anyhow::bail!("browser session changed")
             }
+            let _ = crate::db::object_uploads::release_submission_evidence_capacity_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                &run_id,
+                now,
+            )?;
             validate_application_transition(&application.state, "failed")?;
             let application = resolved_not_submitted_application(application, &run_id, now)?;
             let application_payload = to_json(&application, "Jobs application")?;

@@ -4,7 +4,7 @@
 //! large provider SDK dependency in the server binary.
 
 use anyhow::{anyhow, Context, Result};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use reqwest::{header, Method, Url};
@@ -19,6 +19,8 @@ type HmacSha256 = Hmac<Sha256>;
 const DEFAULT_ACCOUNT_QUOTA_BYTES: i64 = 1024 * 1024 * 1024;
 const DEFAULT_DAILY_QUOTA_BYTES: i64 = 256 * 1024 * 1024;
 const DEFAULT_ACCOUNT_MAX_OBJECTS: i64 = 10_000;
+const MAX_ACCOUNT_PREFIX_DELETE_ROUNDS: usize = 10_000;
+const MAX_LIST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct ObjectStorage {
@@ -108,6 +110,26 @@ impl ObjectStorage {
         self.account_key(
             &format!(
                 "jobs/browser-profiles/{profile_scope}/generation/{generation}/sha256/{sha256}.enc"
+            ),
+            account_id,
+        )
+    }
+
+    pub fn jobs_submission_bundle_key(
+        &self,
+        account_id: &str,
+        application_id: &str,
+        receipt_id: &str,
+        bundle_id: &str,
+        sha256: &str,
+    ) -> String {
+        let application_scope = hex::encode(Sha256::digest(application_id.as_bytes()));
+        let receipt_scope = hex::encode(Sha256::digest(receipt_id.as_bytes()));
+        let bundle_scope = hex::encode(Sha256::digest(bundle_id.as_bytes()));
+        self.account_key(
+            &format!(
+                "jobs/applications/{application_scope}/receipts/{receipt_scope}/bundles/\
+                 {bundle_scope}/sha256/{sha256}.json"
             ),
             account_id,
         )
@@ -213,9 +235,37 @@ impl ObjectStorage {
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("application/octet-stream")
             .to_string();
-        let bytes = response.bytes().await.context("read object body")?;
+        let maximum_bytes = self.config.max_object_bytes;
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum_bytes as u64)
+        {
+            return Err(anyhow!(
+                "object body exceeds configured maximum of {maximum_bytes} bytes"
+            ));
+        }
+        let mut response = response;
+        let mut body = BytesMut::with_capacity(
+            response
+                .content_length()
+                .and_then(|length| usize::try_from(length).ok())
+                .unwrap_or_default()
+                .min(maximum_bytes),
+        );
+        while let Some(chunk) = response.chunk().await.context("read object body")? {
+            if body
+                .len()
+                .checked_add(chunk.len())
+                .is_none_or(|length| length > maximum_bytes)
+            {
+                return Err(anyhow!(
+                    "object body exceeds configured maximum of {maximum_bytes} bytes"
+                ));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(StoredObject {
-            bytes,
+            bytes: body.freeze(),
             content_type,
         })
     }
@@ -244,10 +294,107 @@ impl ObjectStorage {
         ))
     }
 
+    /// Delete every object under the authenticated account namespace, including
+    /// legacy bytes that predate the durable object-upload ledger. Each page is
+    /// deleted before listing the prefix again so a continuation token cannot
+    /// skip keys removed from an earlier page.
+    pub async fn delete_all_account_objects(&self, account_id: &str) -> Result<usize> {
+        let prefix = self.account_prefix(account_id)?;
+        let mut deleted = 0usize;
+        for _ in 0..MAX_ACCOUNT_PREFIX_DELETE_ROUNDS {
+            let keys = self.list_object_keys(&prefix).await?;
+            if keys.is_empty() {
+                return Ok(deleted);
+            }
+            for key in keys {
+                if !self.key_belongs_to_account(&key, account_id) {
+                    return Err(anyhow!("listed object is outside the account namespace"));
+                }
+                self.delete(&key).await?;
+                deleted = deleted
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("account object deletion count overflow"))?;
+            }
+        }
+        Err(anyhow!(
+            "account object prefix did not become empty within the deletion bound"
+        ))
+    }
+
+    async fn list_object_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let url = self.list_objects_url(prefix)?;
+        let payload_hash = sha256_hex([]);
+        let auth = self.authorization(Method::GET, &url, &payload_hash)?;
+        let response = self
+            .http
+            .get(url)
+            .header("x-amz-date", auth.amz_date)
+            .header("x-amz-content-sha256", payload_hash)
+            .header(header::AUTHORIZATION, auth.authorization)
+            .send()
+            .await
+            .context("list account objects")?;
+        if !response.status().is_success() {
+            return Err(anyhow!(
+                "account object listing failed with status {}",
+                response.status()
+            ));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_LIST_RESPONSE_BYTES as u64)
+        {
+            return Err(anyhow!("account object listing response is too large"));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .context("read account object listing")?;
+        if bytes.len() > MAX_LIST_RESPONSE_BYTES {
+            return Err(anyhow!("account object listing response is too large"));
+        }
+        parse_list_object_keys(&bytes, prefix)
+    }
+
+    fn list_objects_url(&self, prefix: &str) -> Result<Url> {
+        let mut url = self.bucket_url()?;
+        url.set_query(Some(&format!(
+            "list-type=2&max-keys=1000&prefix={}",
+            encode_segment(prefix)
+        )));
+        Ok(url)
+    }
+
     fn object_url(&self, key: &str) -> Result<Url> {
         let endpoint = self.config.endpoint_url.trim_end_matches('/');
         let encoded_path = [encode_segment(&self.config.bucket), encode_key_path(key)].join("/");
         Url::parse(&format!("{endpoint}/{encoded_path}")).context("parse object URL")
+    }
+
+    fn bucket_url(&self) -> Result<Url> {
+        let endpoint = self.config.endpoint_url.trim_end_matches('/');
+        Url::parse(&format!(
+            "{endpoint}/{}",
+            encode_segment(&self.config.bucket)
+        ))
+        .context("parse object storage bucket URL")
+    }
+
+    fn account_prefix(&self, account_id: &str) -> Result<String> {
+        if account_id.is_empty()
+            || account_id.len() > 240
+            || !account_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(anyhow!("invalid account object namespace"));
+        }
+        let prefix = self.config.key_prefix.trim_matches('/');
+        Ok(if prefix.is_empty() {
+            format!("accounts/{account_id}/")
+        } else {
+            format!("{prefix}/accounts/{account_id}/")
+        })
     }
 
     fn account_key(&self, suffix: &str, account_id: &str) -> String {
@@ -272,10 +419,12 @@ impl ObjectStorage {
         let signed_headers = "host;x-amz-content-sha256;x-amz-date";
         let canonical_headers =
             format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+        let canonical_query = canonical_query(url);
         let canonical_request = format!(
-            "{}\n{}\n\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}",
             method.as_str(),
             canonical_uri,
+            canonical_query,
             canonical_headers,
             signed_headers,
             payload_hash
@@ -294,6 +443,235 @@ impl ObjectStorage {
             authorization,
         })
     }
+}
+
+fn parse_list_object_keys(xml: &[u8], prefix: &str) -> Result<Vec<String>> {
+    use quick_xml::{events::Event, Reader};
+
+    let mut reader = Reader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut elements = Vec::<Vec<u8>>::new();
+    let mut keys = Vec::new();
+    let mut listed_prefix = None;
+    let mut key_count = None;
+    let mut is_truncated = None;
+    let mut saw_prefix = false;
+    let mut saw_key_count = false;
+    let mut saw_is_truncated = false;
+    let mut open_contents_key_count = None;
+    let mut open_key_had_value = None;
+    let mut root_closed = false;
+    loop {
+        match reader
+            .read_event()
+            .context("parse account object listing")?
+        {
+            Event::Start(element) => {
+                let name = element.name().as_ref().to_vec();
+                if root_closed {
+                    return Err(anyhow!(
+                        "account object listing contains content after its root element"
+                    ));
+                }
+                if elements.is_empty() {
+                    if name.as_slice() != b"ListBucketResult" {
+                        return Err(anyhow!(
+                            "account object listing has an unexpected root element"
+                        ));
+                    }
+                } else if matches!(
+                    elements.as_slice(),
+                    [root] if root.as_slice() == b"ListBucketResult"
+                ) && matches!(name.as_slice(), b"Prefix" | b"KeyCount" | b"IsTruncated")
+                {
+                    let already_seen = match name.as_slice() {
+                        b"Prefix" => std::mem::replace(&mut saw_prefix, true),
+                        b"KeyCount" => std::mem::replace(&mut saw_key_count, true),
+                        b"IsTruncated" => std::mem::replace(&mut saw_is_truncated, true),
+                        _ => unreachable!(),
+                    };
+                    if already_seen {
+                        return Err(anyhow!("account object listing repeats an authority field"));
+                    }
+                } else if name.as_slice() == b"Contents" {
+                    if !matches!(
+                        elements.as_slice(),
+                        [root] if root.as_slice() == b"ListBucketResult"
+                    ) || open_contents_key_count.replace(keys.len()).is_some()
+                    {
+                        return Err(anyhow!("account object listing contents are malformed"));
+                    }
+                } else if name.as_slice() == b"Key"
+                    && (!matches!(
+                        elements.as_slice(),
+                        [root, contents]
+                            if root.as_slice() == b"ListBucketResult"
+                                && contents.as_slice() == b"Contents"
+                    ) || open_key_had_value.replace(false).is_some())
+                {
+                    return Err(anyhow!("account object listing key is malformed"));
+                }
+                elements.push(name);
+            }
+            Event::Empty(_) => {
+                return Err(anyhow!(
+                    "account object listing contains an unexpected empty element"
+                ));
+            }
+            Event::Text(value) => {
+                let value = value
+                    .unescape()
+                    .context("decode account object listing value")?
+                    .into_owned();
+                match elements.as_slice() {
+                    [root, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && field.as_slice() == b"Prefix"
+                            && listed_prefix.replace(value.clone()).is_some() =>
+                    {
+                        return Err(anyhow!(
+                            "account object listing repeats its requested prefix"
+                        ));
+                    }
+                    [root, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && field.as_slice() == b"KeyCount" =>
+                    {
+                        let value = value
+                            .parse::<usize>()
+                            .context("parse account object listing key count")?;
+                        if value > 1_000 || key_count.replace(value).is_some() {
+                            return Err(anyhow!("account object listing has an invalid key count"));
+                        }
+                    }
+                    [root, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && field.as_slice() == b"IsTruncated" =>
+                    {
+                        let value = match value.as_str() {
+                            "true" => true,
+                            "false" => false,
+                            _ => {
+                                return Err(anyhow!(
+                                    "account object listing has an invalid truncation marker"
+                                ));
+                            }
+                        };
+                        if is_truncated.replace(value).is_some() {
+                            return Err(anyhow!(
+                                "account object listing repeats its truncation marker"
+                            ));
+                        }
+                    }
+                    [root, contents, field]
+                        if root.as_slice() == b"ListBucketResult"
+                            && contents.as_slice() == b"Contents"
+                            && field.as_slice() == b"Key" =>
+                    {
+                        if open_key_had_value != Some(false)
+                            || value.is_empty()
+                            || !value.starts_with(prefix)
+                            || keys.len() >= 1_000
+                            || keys.contains(&value)
+                        {
+                            return Err(anyhow!(
+                                "account object listing escaped its requested prefix"
+                            ));
+                        }
+                        open_key_had_value = Some(true);
+                        keys.push(value);
+                    }
+                    [root] if root.as_slice() == b"ListBucketResult" && !value.is_empty() => {
+                        return Err(anyhow!(
+                            "account object listing contains text inside its result root"
+                        ));
+                    }
+                    [] if !value.is_empty() => {
+                        return Err(anyhow!(
+                            "account object listing contains text outside its result root"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            Event::End(element) => {
+                let Some(opened) = elements.pop() else {
+                    return Err(anyhow!(
+                        "account object listing contains an unmatched closing element"
+                    ));
+                };
+                if opened.as_slice() != element.name().as_ref() {
+                    return Err(anyhow!(
+                        "account object listing contains mismatched elements"
+                    ));
+                }
+                if opened.as_slice() == b"Key" && open_key_had_value.take() != Some(true) {
+                    return Err(anyhow!("account object listing key is empty"));
+                }
+                if opened.as_slice() == b"Contents" {
+                    let Some(previous_count) = open_contents_key_count.take() else {
+                        return Err(anyhow!("account object listing contents are malformed"));
+                    };
+                    if keys.len() != previous_count + 1 {
+                        return Err(anyhow!(
+                            "account object listing contents must contain exactly one key"
+                        ));
+                    }
+                }
+                if elements.is_empty() {
+                    root_closed = true;
+                }
+            }
+            Event::Eof => {
+                if !elements.is_empty() {
+                    return Err(anyhow!("account object listing is incomplete"));
+                }
+                break;
+            }
+            Event::CData(_) => {
+                return Err(anyhow!(
+                    "account object listing contains an unsupported value"
+                ));
+            }
+            Event::Decl(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_) => {}
+        }
+    }
+    if !root_closed {
+        return Err(anyhow!("account object listing is missing its result root"));
+    }
+    if listed_prefix.as_deref() != Some(prefix) {
+        return Err(anyhow!(
+            "account object listing does not match its requested prefix"
+        ));
+    }
+    let key_count =
+        key_count.ok_or_else(|| anyhow!("account object listing is missing its key count"))?;
+    let is_truncated = is_truncated
+        .ok_or_else(|| anyhow!("account object listing is missing its truncation marker"))?;
+    if key_count != keys.len() {
+        return Err(anyhow!(
+            "account object listing key count does not match its contents"
+        ));
+    }
+    if is_truncated && keys.is_empty() {
+        return Err(anyhow!(
+            "account object listing is truncated without a deletable page"
+        ));
+    }
+    Ok(keys)
+}
+
+fn canonical_query(url: &Url) -> String {
+    let mut pairs = url
+        .query_pairs()
+        .map(|(key, value)| (encode_segment(&key), encode_segment(&value)))
+        .collect::<Vec<_>>();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 pub fn spawn_cleanup_worker(
@@ -479,7 +857,11 @@ mod tests {
     use crate::db::object_uploads::{
         record_put_failure, reserve_upload, NewObjectUpload, ObjectKind,
     };
-    use wiremock::matchers::{method, path};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
@@ -515,6 +897,186 @@ mod tests {
             archive_key,
             format!("bluey-cloud/global/jobs/candidates/candidate/sha256/{hash}.json")
         );
+        let bundle_key = storage.jobs_submission_bundle_key(
+            "acct",
+            "app-secret",
+            "receipt-secret",
+            "bundle-secret",
+            &hash,
+        );
+        assert!(bundle_key.starts_with("bluey-cloud/accounts/acct/jobs/applications/"));
+        assert!(bundle_key.ends_with(&format!("/sha256/{hash}.json")));
+        assert!(!bundle_key.contains("app-secret"));
+        assert!(!bundle_key.contains("receipt-secret"));
+        assert!(!bundle_key.contains("bundle-secret"));
+    }
+
+    #[tokio::test]
+    async fn object_get_rejects_a_body_larger_than_the_configured_maximum() {
+        let object_store = MockServer::start().await;
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: object_store.uri(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey-cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 4,
+        });
+        Mock::given(method("GET"))
+            .and(path("/bucket/oversized"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0_u8; 5]))
+            .expect(1)
+            .mount(&object_store)
+            .await;
+
+        let error = storage.get("oversized").await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("object body exceeds configured maximum of 4 bytes"));
+    }
+
+    #[tokio::test]
+    async fn account_prefix_delete_removes_legacy_objects_until_listing_is_empty() {
+        let object_store = MockServer::start().await;
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: object_store.uri(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey-cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 100,
+        });
+        let prefix = "bluey-cloud/accounts/acct-one/";
+        let first_key = format!("{prefix}jobs/browser-profiles/legacy-one.enc");
+        let second_key = format!("{prefix}jobs/resumes/legacy-two.pdf");
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let list_responder = Arc::clone(&list_calls);
+        let first_key_for_xml = first_key.clone();
+        let second_key_for_xml = second_key.clone();
+        Mock::given(method("GET"))
+            .and(path("/bucket"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("max-keys", "1000"))
+            .and(query_param("prefix", prefix))
+            .respond_with(move |_request: &wiremock::Request| {
+                if list_responder.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(200).set_body_string(format!(
+                        "<ListBucketResult><Prefix>{prefix}</Prefix><KeyCount>2</KeyCount>\
+                         <IsTruncated>false</IsTruncated>\
+                         <Contents><Key>{first_key_for_xml}</Key></Contents>\
+                         <Contents><Key>{second_key_for_xml}</Key></Contents></ListBucketResult>"
+                    ))
+                } else {
+                    ResponseTemplate::new(200).set_body_string(format!(
+                        "<ListBucketResult><Prefix>{prefix}</Prefix><KeyCount>0</KeyCount>\
+                         <IsTruncated>false</IsTruncated></ListBucketResult>"
+                    ))
+                }
+            })
+            .expect(2)
+            .mount(&object_store)
+            .await;
+        for key in [&first_key, &second_key] {
+            Mock::given(method("DELETE"))
+                .and(path(format!("/bucket/{key}")))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(&object_store)
+                .await;
+        }
+
+        assert_eq!(
+            storage
+                .delete_all_account_objects("acct-one")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(list_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn account_object_listing_rejects_a_key_outside_the_requested_prefix() {
+        let error = parse_list_object_keys(
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>1</KeyCount><IsTruncated>false</IsTruncated>\
+              <Contents><Key>bluey-cloud/accounts/other/private</Key></Contents>\
+              </ListBucketResult>",
+            "bluey-cloud/accounts/acct-one/",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escaped its requested prefix"));
+    }
+
+    #[test]
+    fn account_object_listing_rejects_non_authoritative_success_bodies() {
+        let prefix = "bluey-cloud/accounts/acct-one/";
+        for body in [
+            b"".as_slice(),
+            b"<Error><Code>AccessDenied</Code></Error>".as_slice(),
+            b"<ListBucketResult></ListBucketResult>".as_slice(),
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>\
+              <Contents><Key></Key></Contents></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount><IsTruncated>false</IsTruncated>\
+              <Contents></Contents></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult>garbage\
+              <Prefix>bluey-cloud/accounts/acct-one/</Prefix><KeyCount>0</KeyCount>\
+              <IsTruncated>false</IsTruncated></ListBucketResult>"
+                .as_slice(),
+            b"<ListBucketResult><Prefix></Prefix>\
+              <Prefix>bluey-cloud/accounts/acct-one/</Prefix><KeyCount>0</KeyCount>\
+              <IsTruncated>false</IsTruncated></ListBucketResult>"
+                .as_slice(),
+        ] {
+            assert!(parse_list_object_keys(body, prefix).is_err());
+        }
+    }
+
+    #[test]
+    fn account_object_listing_rejects_inconsistent_empty_pages() {
+        let prefix = "bluey-cloud/accounts/acct-one/";
+        let error = parse_list_object_keys(
+            b"<ListBucketResult><Prefix>bluey-cloud/accounts/acct-one/</Prefix>\
+              <KeyCount>0</KeyCount><IsTruncated>true</IsTruncated></ListBucketResult>",
+            prefix,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("truncated without a deletable page"));
+    }
+
+    #[test]
+    fn account_object_listing_query_is_sigv4_canonical() {
+        let storage = ObjectStorage::new(ObjectStorageConfig {
+            endpoint_url: "https://objects.example.test".into(),
+            bucket: "bucket".into(),
+            access_key_id: "ak".into(),
+            secret_access_key: "sk".into(),
+            region: "auto".into(),
+            key_prefix: "bluey cloud".into(),
+            retention_days: 365,
+            max_object_bytes: 100,
+        });
+        let url = storage
+            .list_objects_url("bluey cloud/accounts/acct-one/")
+            .unwrap();
+        let expected = "list-type=2&max-keys=1000&prefix=bluey%20cloud%2Faccounts%2Facct-one%2F";
+
+        assert_eq!(url.query(), Some(expected));
+        assert_eq!(canonical_query(&url), expected);
+        assert!(!url.as_str().contains('+'));
     }
 
     #[tokio::test]

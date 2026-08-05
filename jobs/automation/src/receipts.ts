@@ -27,6 +27,22 @@ export interface ReceiptEvent {
   detail?: Record<string, unknown>;
 }
 
+export interface StoredReceiptObject {
+  storageKey: string;
+  sha256: string;
+  mediaType: "application/json";
+  sizeBytes: number;
+  schemaVersion: 1;
+}
+
+export interface StoredEvidenceObject {
+  kind: "resume" | "cover_letter" | "attachment" | "screenshot";
+  storageKey: string;
+  sha256: string;
+  mediaType: "application/pdf" | "image/png";
+  sizeBytes: number;
+}
+
 export interface EvidenceObjectUpload {
   original_key: string;
   kind: "resume" | "cover_letter" | "attachment" | "screenshot";
@@ -61,6 +77,8 @@ export interface ApplicationReceiptBundle {
   result: SubmissionReceipt;
   finalUrl?: string;
   screenshotKeys: string[];
+  evidenceObjects?: StoredEvidenceObject[];
+  receiptObject?: StoredReceiptObject;
 }
 
 export interface CreateReceiptInput {
@@ -85,7 +103,14 @@ export interface CreateReceiptInput {
 export interface ApplicationEvidenceRecord {
   id: string;
   application_id: string;
-  kind: "resume" | "cover_letter" | "attachment" | "submission_confirmation" | "status_email" | "interview_event";
+  kind:
+    | "resume"
+    | "cover_letter"
+    | "attachment"
+    | "application_receipt"
+    | "submission_confirmation"
+    | "status_email"
+    | "interview_event";
   label: string;
   provider: string;
   file_name: string;
@@ -177,8 +202,33 @@ export function applicationEvidenceFromReceipt(receipt: ApplicationReceiptBundle
         external_id: receipt.result.confirmationUrl || receipt.receiptId,
         confirmation,
         confirmation_url: receipt.result.confirmationUrl,
+        submit_http_status: receipt.result.submitHttpStatus,
         final_url: receipt.finalUrl,
         screenshot_keys: receipt.screenshotKeys,
+      },
+      created_at_ms: createdAt,
+    });
+  }
+  if (receipt.receiptObject) {
+    documents.push({
+      id: `${receipt.receiptId}:receipt`,
+      application_id: receipt.applicationId,
+      kind: "application_receipt",
+      label: "Application receipt bundle",
+      provider: receipt.job.source,
+      file_name: `${receipt.receiptId}.json`,
+      media_type: receipt.receiptObject.mediaType,
+      storage_key: receipt.receiptObject.storageKey,
+      sha256: receipt.receiptObject.sha256,
+      resume_version_id: receipt.packet.resumeVersionId,
+      occurred_at_ms: occurredAt,
+      metadata: {
+        immutable: true,
+        receipt_id: receipt.receiptId,
+        schema_version: receipt.receiptObject.schemaVersion,
+        size_bytes: receipt.receiptObject.sizeBytes,
+        runner: receipt.runner,
+        run_id: receipt.runId,
       },
       created_at_ms: createdAt,
     });

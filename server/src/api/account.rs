@@ -15,7 +15,7 @@ use crate::auth::AuthedAccount;
 use crate::billing::policy::{
     is_internal_or_test_billing_account, INTERNAL_TEST_BILLING_BLOCK_MESSAGE,
 };
-use crate::config::BillingProvider;
+use crate::config::{BillingProvider, ObjectStorageConfig};
 use crate::db::devices::{DeviceRecord, DeviceRegistration};
 use crate::db::{account_data, diagnostic_logs};
 use crate::object_storage::ObjectStorage;
@@ -799,6 +799,12 @@ pub struct DeleteAccountRequest {
     pub accept_credit_loss: bool,
 }
 
+fn same_object_storage_namespace(left: &ObjectStorageConfig, right: &ObjectStorageConfig) -> bool {
+    left.endpoint_url.trim_end_matches('/') == right.endpoint_url.trim_end_matches('/')
+        && left.bucket == right.bucket
+        && left.key_prefix.trim_matches('/') == right.key_prefix.trim_matches('/')
+}
+
 pub async fn delete_account(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -807,6 +813,78 @@ pub async fn delete_account(
     if req.confirm_text.trim() != "DELETE" || !req.accept_data_loss || !req.accept_credit_loss {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
+
+    let _object_deletion_guard =
+        account_data::acquire_account_object_deletion(&state.pool, &account.id)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    error = %error,
+                    "failed to serialize account deletion with object writers"
+                );
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+    match account_data::begin_account_deletion(
+        &state.pool,
+        &account.id,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed to establish account-deletion write fence"
+        );
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+    })? {
+        Some(account_data::BeginAccountDeletionResult::Ready(_)) => {}
+        Some(account_data::BeginAccountDeletionResult::WaitingForUploads(intent)) => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                fresh_in_flight_puts = intent.fresh_in_flight_puts,
+                "account deletion is fenced and waiting for active object uploads"
+            );
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
+        Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+            active_submissions,
+        }) => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                active_submissions,
+                "account deletion is waiting for an irreversible submission outcome"
+            );
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
+        Some(account_data::BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
+            cloud_runner_records,
+        }) => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                cloud_runner_records,
+                "account deletion is waiting for acknowledged cloud-runner cleanup"
+            );
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
+        None => return Err(axum::http::StatusCode::NOT_FOUND),
+    }
+
+    let artifact_storage_config = state.config.object_storage.clone().ok_or_else(|| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            "account deletion is fenced but artifact storage is unavailable"
+        );
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    })?;
+    let audit_storage_config = state
+        .config
+        .log_storage
+        .clone()
+        .unwrap_or_else(|| artifact_storage_config.clone());
+    let artifact_storage = ObjectStorage::new(artifact_storage_config.clone());
+    let audit_storage = ObjectStorage::new(audit_storage_config.clone());
 
     let object_refs =
         account_data::artifact_object_refs(&state.pool, &account.id).map_err(|e| {
@@ -819,14 +897,8 @@ pub async fn delete_account(
         })?;
     let mut object_count_deleted = 0usize;
     if !object_refs.is_empty() {
-        let storage_config = state
-            .config
-            .object_storage
-            .clone()
-            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
-        let storage = ObjectStorage::new(storage_config);
         for object_ref in &object_refs {
-            if !storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
+            if !artifact_storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
                 tracing::error!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     artifact_id = %object_ref.artifact_id,
@@ -836,15 +908,17 @@ pub async fn delete_account(
             }
         }
         for object_ref in &object_refs {
-            storage.delete(&object_ref.object_key).await.map_err(|e| {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    artifact_id = %object_ref.artifact_id,
-                    error = %e,
-                    "failed to delete account artifact object"
-                );
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            artifact_storage
+                .delete(&object_ref.object_key)
+                .await
+                .map_err(|_| {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        artifact_id = %object_ref.artifact_id,
+                        "failed to delete account artifact object"
+                    );
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                })?;
             object_count_deleted += 1;
         }
     }
@@ -859,15 +933,8 @@ pub async fn delete_account(
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         })?;
     if !diagnostic_object_refs.is_empty() {
-        let storage_config = state
-            .config
-            .log_storage
-            .clone()
-            .or_else(|| state.config.object_storage.clone())
-            .ok_or(axum::http::StatusCode::SERVICE_UNAVAILABLE)?;
-        let storage = ObjectStorage::new(storage_config);
         for object_ref in &diagnostic_object_refs {
-            if !storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
+            if !audit_storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
                 tracing::error!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
@@ -877,19 +944,43 @@ pub async fn delete_account(
             }
         }
         for object_ref in &diagnostic_object_refs {
-            storage.delete(&object_ref.object_key).await.map_err(|e| {
-                tracing::warn!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
-                    bytes = object_ref.bytes,
-                    sha256 = object_ref.sha256.as_deref().unwrap_or(""),
-                    error = %e,
-                    "failed to delete account diagnostic log object"
-                );
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            audit_storage
+                .delete(&object_ref.object_key)
+                .await
+                .map_err(|_| {
+                    tracing::warn!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
+                        bytes = object_ref.bytes,
+                        sha256 = object_ref.sha256.as_deref().unwrap_or(""),
+                        "failed to delete account diagnostic log object"
+                    );
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE
+                })?;
             object_count_deleted += 1;
         }
+    }
+
+    let mut storage_namespaces = vec![("artifact", artifact_storage_config)];
+    if !same_object_storage_namespace(&storage_namespaces[0].1, &audit_storage_config) {
+        storage_namespaces.push(("audit", audit_storage_config));
+    }
+    for (storage_scope, storage_config) in storage_namespaces {
+        let storage = ObjectStorage::new(storage_config);
+        let orphan_count = storage
+            .delete_all_account_objects(&account.id)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    storage_scope,
+                    "failed to purge account object namespace"
+                );
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        object_count_deleted = object_count_deleted
+            .checked_add(orphan_count)
+            .ok_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
     }
 
     // Hard delete. ON DELETE CASCADE on the foreign keys (accounts ->
@@ -1005,15 +1096,62 @@ async fn export_zip(
             );
             return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         }
-        let expected_size = object_ref.size_bytes.unwrap_or(0).max(0) as u64;
-        if expected_size > 0
-            && exported_object_bytes.saturating_add(expected_size) > object_budget_bytes
-        {
+        let expected_size = object_ref
+            .size_bytes
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    tracing::error!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                        artifact_id = %object_ref.artifact_id,
+                        "refusing account export because artifact size authority is invalid"
+                    );
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                })
+            })
+            .transpose()?;
+        if expected_size.is_some_and(|expected_size| {
+            exported_object_bytes.saturating_add(expected_size) > object_budget_bytes
+        }) {
             return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
         }
+        let expected_content_type = object_ref
+            .content_type
+            .as_deref()
+            .map(|value| {
+                let media_type = base_media_type(value);
+                if media_type.is_empty() {
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
+                Ok(media_type)
+            })
+            .transpose()
+            .inspect_err(|_| {
+                tracing::error!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                    artifact_id = %object_ref.artifact_id,
+                    "refusing account export because artifact media-type authority is invalid"
+                );
+            })?;
         match storage.get(&object_ref.object_key).await {
             Ok(stored) => {
                 let bytes_len = stored.bytes.len() as u64;
+                let expected_sha256 = object_ref.sha256.as_deref();
+                let integrity_matches = expected_size.is_none_or(|expected| bytes_len == expected)
+                    && expected_content_type.is_none_or(|expected| {
+                        base_media_type(&stored.content_type).eq_ignore_ascii_case(expected)
+                    })
+                    && expected_sha256.is_none_or(|expected| {
+                        valid_sha256(expected)
+                            && sha256_bytes(&stored.bytes).eq_ignore_ascii_case(expected)
+                    });
+                if !integrity_matches {
+                    tracing::error!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(account_id),
+                        artifact_id = %object_ref.artifact_id,
+                        "refusing account export because artifact read-back failed integrity verification"
+                    );
+                    return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+                }
                 if exported_object_bytes.saturating_add(bytes_len) > object_budget_bytes {
                     return Err(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
                 }
@@ -1028,11 +1166,10 @@ async fn export_zip(
                 object_manifest["zip_path"] = serde_json::json!(name);
                 object_manifest["downloaded_content_type"] = serde_json::json!(stored.content_type);
             }
-            Err(error) => {
+            Err(_) => {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(account_id),
                     artifact_id = %object_ref.artifact_id,
-                    error = %error,
                     "failed to include account artifact object in export"
                 );
                 return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -1190,6 +1327,18 @@ fn safe_zip_name(value: &str) -> String {
 }
 
 fn sha256_text(value: &str) -> String {
+    sha256_bytes(value.as_bytes())
+}
+
+fn sha256_bytes(value: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    hex::encode(Sha256::digest(value.as_bytes()))
+    hex::encode(Sha256::digest(value))
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn base_media_type(value: &str) -> &str {
+    value.split(';').next().unwrap_or_default().trim()
 }

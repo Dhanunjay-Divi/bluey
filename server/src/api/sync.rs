@@ -17,13 +17,16 @@ use serde::{Deserialize, Serialize};
 
 use super::AppState;
 use crate::auth::AuthedAccount;
-use crate::db::object_uploads::{
-    self, NewObjectUpload, ObjectKind, ObjectUpload, StorageScope, UploadControlError,
-};
 use crate::db::sync::{
     self, CloudDeletedSession, CloudSessionBundle, CloudSessionSummary, RagMatch,
     SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord,
     SyncSessionRecord, SyncTranscriptSegment,
+};
+use crate::db::{
+    account_data,
+    object_uploads::{
+        self, NewObjectUpload, ObjectKind, ObjectUpload, StorageScope, UploadControlError,
+    },
 };
 use crate::object_storage::{sha256_hex, ObjectStorage};
 
@@ -733,6 +736,20 @@ async fn reserve_put_and_finalize(
         return Ok(reservation.upload);
     }
 
+    let _object_writer =
+        account_data::acquire_account_object_writer(&state.pool, &reservation.upload.account_id)
+            .await
+            .map_err(internal)?;
+
+    if let Err(error) =
+        object_uploads::begin_upload_put(&state.pool, &reservation.upload.id, now_ms())
+    {
+        if is_upload_lifecycle_conflict(&error) {
+            cleanup_lifecycle_conflict(state, storage, &reservation.upload).await;
+        }
+        return Err(upload_error(error));
+    }
+
     if let Err(error) = storage
         .put(
             &reservation.upload.object_key,
@@ -767,40 +784,77 @@ async fn reserve_put_and_finalize(
     match object_uploads::mark_upload_ready(&state.pool, &reservation.upload.id, now_ms()) {
         Ok(upload) => Ok(upload),
         Err(error) => {
-            let lifecycle_conflict =
-                error
-                    .downcast_ref::<UploadControlError>()
-                    .is_some_and(|policy| {
-                        matches!(
-                            policy,
-                            UploadControlError::UploadGone | UploadControlError::UploadNotFound
-                        )
-                    });
-            if lifecycle_conflict {
-                match storage.delete(&reservation.upload.object_key).await {
-                    Ok(()) => {
-                        let _ = object_uploads::mark_cleanup_succeeded(
-                            &state.pool,
-                            &reservation.upload.id,
-                            now_ms(),
-                        );
-                    }
-                    Err(cleanup_error) => {
-                        let _ = object_uploads::mark_cleanup_failed(
-                            &state.pool,
-                            &reservation.upload.id,
-                            &cleanup_error.to_string(),
-                            now_ms(),
-                        );
-                        tracing::error!(
-                            error = %cleanup_error,
-                            upload_id_hash = %sha256_hex(reservation.upload.id.as_bytes()),
-                            "object PUT completed after lifecycle deletion; cleanup will retry"
-                        );
-                    }
-                }
+            if is_upload_lifecycle_conflict(&error) {
+                cleanup_lifecycle_conflict(state, storage, &reservation.upload).await;
             }
             Err(upload_error(error))
+        }
+    }
+}
+
+fn is_upload_lifecycle_conflict(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<UploadControlError>()
+        .is_some_and(|policy| {
+            matches!(
+                policy,
+                UploadControlError::AccountDeleting
+                    | UploadControlError::SessionNotOwned
+                    | UploadControlError::UploadGone
+                    | UploadControlError::UploadNotFound
+            )
+        })
+}
+
+async fn cleanup_lifecycle_conflict(
+    state: &AppState,
+    storage: &ObjectStorage,
+    upload: &ObjectUpload,
+) {
+    if let Err(schedule_error) =
+        object_uploads::schedule_upload_cleanup(&state.pool, &upload.id, now_ms())
+    {
+        if schedule_error.downcast_ref::<UploadControlError>()
+            != Some(&UploadControlError::UploadGone)
+        {
+            tracing::error!(
+                error = %schedule_error,
+                upload_id_hash = %sha256_hex(upload.id.as_bytes()),
+                "lifecycle-conflicted object cleanup could not be scheduled"
+            );
+        }
+        return;
+    }
+    match storage.delete(&upload.object_key).await {
+        Ok(()) => {
+            if let Err(index_error) =
+                object_uploads::mark_cleanup_succeeded(&state.pool, &upload.id, now_ms())
+            {
+                tracing::error!(
+                    error = %index_error,
+                    upload_id_hash = %sha256_hex(upload.id.as_bytes()),
+                    "object deletion succeeded but cleanup completion was not persisted"
+                );
+            }
+        }
+        Err(cleanup_error) => {
+            if let Err(index_error) = object_uploads::mark_cleanup_failed(
+                &state.pool,
+                &upload.id,
+                &cleanup_error.to_string(),
+                now_ms(),
+            ) {
+                tracing::error!(
+                    error = %index_error,
+                    upload_id_hash = %sha256_hex(upload.id.as_bytes()),
+                    "object deletion and cleanup retry persistence both failed"
+                );
+            }
+            tracing::error!(
+                error = %cleanup_error,
+                upload_id_hash = %sha256_hex(upload.id.as_bytes()),
+                "object PUT conflicted with deletion; cleanup will retry"
+            );
         }
     }
 }
@@ -887,6 +941,15 @@ fn upload_error(error: anyhow::Error) -> (StatusCode, String) {
         UploadControlError::UploadInProgress => (
             StatusCode::CONFLICT,
             "object upload is already in progress".to_string(),
+        ),
+        UploadControlError::AccountDeleting => (
+            StatusCode::CONFLICT,
+            "account deletion is in progress".to_string(),
+        ),
+        UploadControlError::SubmissionEvidenceCapacityUnavailable
+        | UploadControlError::SubmissionEvidenceCapacityExceeded => (
+            StatusCode::CONFLICT,
+            "submission evidence capacity is unavailable".to_string(),
         ),
         UploadControlError::UploadGone => (
             StatusCode::GONE,

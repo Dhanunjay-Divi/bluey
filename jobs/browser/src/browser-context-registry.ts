@@ -1,6 +1,7 @@
 import { mkdir, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { chromium, type BrowserContext } from "playwright";
+import { CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS } from "@bluey/jobs-automation";
 import {
   installBrowserNetworkGuard,
   LOCAL_BROWSER_SERVICE_WORKERS,
@@ -62,10 +63,16 @@ export class BrowserContextRegistry {
       : undefined;
     const context = await chromium.launchPersistentContext(profile, {
       headless: false,
+      // A restored profile can contain tabs that begin loading before
+      // Playwright returns the context. Keep the browser offline until the
+      // caller has selected one run-bound page and installed its exact-submit
+      // guard.
+      offline: true,
       ...(executablePath ? { executablePath } : { channel: "chromium" }),
       viewport: null,
       acceptDownloads: true,
       serviceWorkers: LOCAL_BROWSER_SERVICE_WORKERS,
+      args: [...CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS],
     });
     try {
       await installBrowserNetworkGuard(context);

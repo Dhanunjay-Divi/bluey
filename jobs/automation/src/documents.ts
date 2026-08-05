@@ -1,16 +1,25 @@
 import * as fontkitModule from "@pdf-lib/fontkit";
-import { createHash } from "node:crypto";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { createHash, timingSafeEqual } from "node:crypto";
+import { chmod, lstat, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { PDFDocument, rgb, type PDFFont, type PDFPage } from "pdf-lib";
 import type { ApplicationPacket } from "./contracts.js";
 
+export interface MaterializedDocument {
+  readonly path: string;
+  readonly sha256: string;
+  /** Canonical, immutable encoding of the exact bytes from the successful validation read. */
+  readonly bytesBase64: string;
+}
+
 export interface MaterializedDocuments {
   packet: ApplicationPacket;
-  resume: { path: string; sha256: string };
-  coverLetter?: { path: string; sha256: string };
+  resume: MaterializedDocument;
+  coverLetter?: MaterializedDocument;
 }
+
+type MaterializedDocumentKind = "resume" | "cover-letter";
 
 interface CandidateContact {
   name: string;
@@ -60,27 +69,62 @@ export async function materializeApplicationDocuments(
   directory: string,
 ): Promise<MaterializedDocuments> {
   await mkdir(directory, { recursive: true });
-  const resumePath = packet.resumePath || join(directory, `resume-${safeName(packet.resumeVersionId)}.pdf`);
+  const resumeSourcePath = packet.resumePath || join(directory, `resume-${safeName(packet.resumeVersionId)}.pdf`);
   if (!packet.resumePath) {
     if (!packet.resumeContent) throw new Error("This application has no tailored resume content");
-    await writeResumePdf(packet.resumeContent, resumePath);
+    await writeResumePdf(packet.resumeContent, resumeSourcePath);
   }
-  const resume = await inspectPdf(resumePath, "Resume");
+  const resume = await snapshotPdf(resumeSourcePath, directory, "resume", "Resume");
 
-  let coverLetterPath = packet.coverLetterPath;
-  if (!coverLetterPath && packet.coverLetterContent !== undefined) {
+  let coverLetterSourcePath = packet.coverLetterPath;
+  if (!coverLetterSourcePath && packet.coverLetterContent !== undefined) {
     const letter = normalizeText(packet.coverLetterContent, "Cover letter");
-    if (!letter) throw new Error("Cover letter content is blank");
-    const contact = coverLetterContact(packet);
-    coverLetterPath = join(directory, "cover-letter.pdf");
-    await writeLetterPdf(letter, contact, coverLetterPath);
+    if (letter) {
+      const contact = coverLetterContact(packet);
+      coverLetterSourcePath = join(directory, "cover-letter.pdf");
+      await writeLetterPdf(letter, contact, coverLetterSourcePath);
+    }
   }
+  const coverLetter = coverLetterSourcePath
+    ? await snapshotPdf(coverLetterSourcePath, directory, "cover-letter", "Cover letter")
+    : undefined;
 
   return {
-    packet: { ...packet, resumePath, coverLetterPath },
+    packet: {
+      ...packet,
+      resumePath: resume.path,
+      coverLetterPath: coverLetter?.path,
+    },
     resume,
-    coverLetter: coverLetterPath ? await inspectPdf(coverLetterPath, "Cover letter") : undefined,
+    coverLetter,
   };
+}
+
+export async function assertMaterializedDocumentSnapshot(
+  document: MaterializedDocument,
+): Promise<void> {
+  try {
+    if (!document || typeof document !== "object" || !Object.isFrozen(document)) {
+      throw new Error("mutable snapshot metadata");
+    }
+    const retainedBytes = Buffer.from(document.bytesBase64, "base64");
+    if (!document.bytesBase64
+      || retainedBytes.toString("base64") !== document.bytesBase64
+      || sha256(retainedBytes) !== document.sha256
+      || !document.path.endsWith(`-${document.sha256}.pdf`)) {
+      throw new Error("invalid snapshot metadata");
+    }
+    const metadata = await lstat(document.path);
+    if (!metadata.isFile() || metadata.size !== retainedBytes.byteLength) {
+      throw new Error("snapshot path changed");
+    }
+    const snapshotBytes = await readFile(document.path);
+    if (!sameBytes(snapshotBytes, retainedBytes) || sha256(snapshotBytes) !== document.sha256) {
+      throw new Error("snapshot bytes changed");
+    }
+  } catch {
+    throw new Error("Materialized document snapshot is unavailable or has changed");
+  }
 }
 
 async function writeResumePdf(content: Record<string, unknown>, path: string): Promise<void> {
@@ -413,13 +457,68 @@ async function savePdf(document: PDFDocument, path: string, label: string): Prom
   await writeFile(path, bytes, { mode: 0o600 });
 }
 
-async function inspectPdf(path: string, label: string): Promise<{ path: string; sha256: string }> {
-  const metadata = await stat(path);
+async function snapshotPdf(
+  sourcePath: string,
+  directory: string,
+  kind: MaterializedDocumentKind,
+  label: string,
+): Promise<MaterializedDocument> {
+  const metadata = await stat(sourcePath);
   if (!metadata.isFile()) throw new Error(`${label} path is not a file`);
   if (metadata.size > MAX_PDF_BYTES) throw new Error(`${label} PDF is too large`);
-  const bytes = await readFile(path);
+  const bytes = await readFile(sourcePath);
   await assertUsablePdf(bytes, label);
-  return { path, sha256: sha256(bytes) };
+  const digest = sha256(bytes);
+  const snapshotPath = join(directory, `${kind}-${digest}.pdf`);
+  if (resolve(sourcePath) !== resolve(snapshotPath)) {
+    await writeSnapshotFile(snapshotPath, bytes, label);
+  }
+  await assertSnapshotFile(snapshotPath, bytes, digest, label);
+  await chmod(snapshotPath, 0o400);
+  const document = Object.freeze({
+    path: snapshotPath,
+    sha256: digest,
+    bytesBase64: bytes.toString("base64"),
+  });
+  await assertMaterializedDocumentSnapshot(document);
+  return document;
+}
+
+async function writeSnapshotFile(path: string, bytes: Uint8Array, label: string): Promise<void> {
+  try {
+    await writeFile(path, bytes, { flag: "wx", mode: 0o400 });
+  } catch (error) {
+    if (!isFileExistsError(error)) throw error;
+    const metadata = await lstat(path);
+    if (!metadata.isFile()) throw new Error(`${label} snapshot path is not a regular file`);
+    const existing = await readFile(path);
+    if (!sameBytes(existing, bytes)) throw new Error(`${label} snapshot path is occupied by different bytes`);
+  }
+}
+
+async function assertSnapshotFile(
+  path: string,
+  expectedBytes: Uint8Array,
+  expectedSha256: string,
+  label: string,
+): Promise<void> {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.size !== expectedBytes.byteLength) {
+    throw new Error(`${label} snapshot path is not a regular file`);
+  }
+  const snapshotBytes = await readFile(path);
+  if (!sameBytes(snapshotBytes, expectedBytes) || sha256(snapshotBytes) !== expectedSha256) {
+    throw new Error(`${label} snapshot could not be materialized safely`);
+  }
+}
+
+function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
+  return left.byteLength === right.byteLength
+    && timingSafeEqual(Buffer.from(left), Buffer.from(right));
+}
+
+function isFileExistsError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "EEXIST";
 }
 
 async function assertUsablePdf(bytes: Uint8Array, label: string): Promise<void> {

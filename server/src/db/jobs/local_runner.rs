@@ -1,3 +1,72 @@
+pub fn local_result_replay_credential_sha256(capability: &str) -> Option<String> {
+    if capability.is_empty() || capability.len() > 4_096 {
+        return None;
+    }
+    let mut parts = capability.split('.');
+    let payload = parts.next().unwrap_or_default();
+    let signature = parts.next().unwrap_or_default();
+    if payload.is_empty()
+        || signature.len() != 64
+        || !signature.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || parts.next().is_some()
+    {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(capability.as_bytes())))
+}
+
+/// Verifies possession of the exact nonce-bearing result capability that was
+/// frozen into an immutable local submission receipt. This authorizes only an
+/// already-Submitted no-op replay and deliberately does not extend the bounded
+/// reconciliation window for an uncertain employer outcome.
+pub fn submitted_local_receipt_replay_authorized(
+    application: &JobApplication,
+    run_id: &str,
+    result_capability: &str,
+) -> bool {
+    if application.state != "submitted"
+        || application.run_id.as_deref() != Some(run_id)
+        || application.receipt.get("runner").and_then(Value::as_str) != Some("local")
+        || application.receipt.get("runId").and_then(Value::as_str) != Some(run_id)
+    {
+        return false;
+    }
+    let Some(supplied_hash) = local_result_replay_credential_sha256(result_capability) else {
+        return false;
+    };
+    let Some(execution) = application
+        .receipt
+        .pointer(&format!(
+            "/{SERVER_SUBMISSION_AUTHORITY_KEY}/executionAuthority"
+        ))
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let ticket_hash = execution
+        .get("ticketHash")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let stored_hash = execution
+        .get("resultCapabilitySha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    execution.len() == 4
+        && execution.get("kind").and_then(Value::as_str) == Some("local_run_ticket")
+        && execution.get("runId").and_then(Value::as_str) == Some(run_id)
+        && ticket_hash.len() == 64
+        && ticket_hash == ticket_hash.to_ascii_lowercase()
+        && ticket_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && stored_hash.len() == 64
+        && stored_hash == stored_hash.to_ascii_lowercase()
+        && stored_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && supplied_hash.len() == stored_hash.len()
+        && supplied_hash
+            .as_bytes()
+            .ct_eq(stored_hash.as_bytes())
+            .unwrap_u8()
+            == 1
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn save_local_run_ticket(
@@ -297,38 +366,114 @@ pub fn claim_authorized_local_run_ticket(
     })
 }
 
-/// Performs a non-mutating, current-authority check immediately before the
-/// local browser crosses the irreversible employer Submit boundary.
-pub fn local_run_submit_authorized(pool: &DbPool, run_id: &str, ticket_hash: &str) -> Result<bool> {
+/// Atomically validates the exact local-run authority and reserves protected
+/// evidence headroom immediately before the local browser crosses the
+/// irreversible employer Submit boundary.
+pub fn local_run_submit_authorized(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> Result<bool> {
+    if capacity.run_id != run_id || capacity.runner != "local" {
+        return Ok(false);
+    }
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-            let authorized = sqlite_local_run_authority(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(
+                &tx, capacity,
+            )?;
+            let ticket = sqlite_local_run_authority(
                 &tx,
                 run_id,
                 ticket_hash,
                 now,
                 LocalRunAuthorityPhase::Submit,
-            )?
-            .is_some();
+            )?;
+            let authorized = ticket.is_some_and(|ticket| {
+                ticket.account_id == capacity.account_id
+                    && ticket.application_id == capacity.application_id
+            });
+            if !authorized {
+                return Ok(false);
+            }
+            match bind_final_submit_proof_sqlite_tx(
+                &tx,
+                &capacity.account_id,
+                &capacity.application_id,
+                final_submit_proof,
+                now,
+            ) {
+                Ok(()) => {}
+                Err(
+                    ExecutionLeaseError::InvalidRequest
+                    | ExecutionLeaseError::NotFound
+                    | ExecutionLeaseError::Conflict,
+                ) => return Ok(false),
+                Err(ExecutionLeaseError::Storage(error)) => return Err(error),
+            }
+            if tx.execute(
+                "UPDATE jobs_local_run_tickets
+                    SET status = 'click_started', updated_at_ms = ?3
+                  WHERE id = ?1 AND ticket_hash = ?2 AND status = 'claimed'",
+                params![run_id, ticket_hash, now],
+            )? != 1
+            {
+                return Ok(false);
+            }
             tx.commit()?;
-            Ok(authorized)
+            Ok(true)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let authorized = postgres_local_run_authority(
+            crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(
+                &mut tx, capacity,
+            )?;
+            let ticket = postgres_local_run_authority(
                 &mut tx,
                 run_id,
                 ticket_hash,
                 now,
                 LocalRunAuthorityPhase::Submit,
-            )?
-            .is_some();
+            )?;
+            let authorized = ticket.is_some_and(|ticket| {
+                ticket.account_id == capacity.account_id
+                    && ticket.application_id == capacity.application_id
+            });
+            if !authorized {
+                return Ok(false);
+            }
+            match bind_final_submit_proof_postgres_tx(
+                &mut tx,
+                &capacity.account_id,
+                &capacity.application_id,
+                final_submit_proof,
+                now,
+            ) {
+                Ok(()) => {}
+                Err(
+                    ExecutionLeaseError::InvalidRequest
+                    | ExecutionLeaseError::NotFound
+                    | ExecutionLeaseError::Conflict,
+                ) => return Ok(false),
+                Err(ExecutionLeaseError::Storage(error)) => return Err(error),
+            }
+            if tx.execute(
+                "UPDATE jobs_local_run_tickets
+                    SET status = 'click_started', updated_at_ms = $3
+                  WHERE id = $1 AND ticket_hash = $2 AND status = 'claimed'",
+                &[&run_id, &ticket_hash, &now],
+            )? != 1
+            {
+                return Ok(false);
+            }
             tx.commit()?;
-            Ok(authorized)
+            Ok(true)
         }
     })
 }
@@ -642,27 +787,34 @@ pub fn update_local_run_ticket_status(
     ticket_hash: &str,
     status: &str,
 ) -> Result<bool> {
+    if !matches!(status, "needs_input" | "complete" | "failed") {
+        return Ok(false);
+    }
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => Ok(pool.get()?.execute(
             "UPDATE jobs_local_run_tickets SET status = ?3, updated_at_ms = ?4
-              WHERE id = ?1 AND ticket_hash = ?2 AND expires_at_ms > ?4",
+              WHERE id = ?1 AND ticket_hash = ?2 AND expires_at_ms > ?4
+                AND (status = 'claimed' OR status = ?3)",
             params![run_id, ticket_hash, status, now],
         )? > 0),
         DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
             "UPDATE jobs_local_run_tickets SET status = $3, updated_at_ms = $4
-              WHERE id = $1 AND ticket_hash = $2 AND expires_at_ms > $4",
+              WHERE id = $1 AND ticket_hash = $2 AND expires_at_ms > $4
+                AND (status = 'claimed' OR status = $3)",
             &[&run_id, &ticket_hash, &status, &now],
         )? > 0),
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn finalize_local_side_effect_unknown(
     pool: &DbPool,
     account_id: &str,
     application_id: &str,
     run_id: &str,
     ticket_hash: &str,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
     reconciliation_receipt: Value,
     session: &BrowserSession,
 ) -> Result<JobApplication> {
@@ -672,6 +824,13 @@ pub fn finalize_local_side_effect_unknown(
         || session.application_id.as_deref() != Some(application_id)
     {
         anyhow::bail!("invalid local reconciliation result")
+    }
+    if capacity.account_id != account_id
+        || capacity.application_id != application_id
+        || capacity.run_id != run_id
+        || capacity.runner != "local"
+    {
+        anyhow::bail!("local submission evidence capacity does not match this application")
     }
     let now = now_ms();
     let mut terminal_session = session.clone();
@@ -684,6 +843,15 @@ pub fn finalize_local_side_effect_unknown(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match crate::db::account_data::account_write_fence_sqlite_tx(&tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced local reconciliation")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("application not found")
+                }
+            }
             let raw: Option<(String, String)> = tx
                 .query_row(
                     "SELECT job_id, application_json FROM jobs_applications
@@ -700,30 +868,84 @@ pub fn finalize_local_side_effect_unknown(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("local run ticket does not match this application")
             }
+            let ticket: Option<(String, i64)> = tx
+                .query_row(
+                    "SELECT status, expires_at_ms FROM jobs_local_run_tickets
+                      WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
+                        AND ticket_hash = ?4",
+                    params![run_id, account_id, application_id, ticket_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((ticket_status, ticket_expires_at_ms)) = ticket else {
+                anyhow::bail!("local run ticket is not active")
+            };
             if application.state == "side_effect_unknown" {
-                let status: Option<String> = tx
+                let stored_session: Option<(String, String, String)> = tx
                     .query_row(
-                        "SELECT status FROM jobs_local_run_tickets
-                          WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
-                            AND ticket_hash = ?4",
-                        params![run_id, account_id, application_id, ticket_hash],
-                        |row| row.get(0),
+                        "SELECT session_json, runner, status FROM jobs_browser_sessions
+                          WHERE account_id = ?1 AND id = ?2",
+                        params![account_id, run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                     )
                     .optional()?;
-                if status.as_deref() == Some("side_effect_unknown") {
-                    tx.commit()?;
-                    return Ok(application);
+                if ticket_status != "side_effect_unknown"
+                    || application
+                        .receipt
+                        .pointer("/local_reconciliation/receipt")
+                        != Some(&reconciliation_receipt)
+                    || stored_session.is_none_or(|(raw, runner, status)| {
+                        !local_unknown_terminal_session_matches(
+                            raw,
+                            &runner,
+                            &status,
+                            run_id,
+                            application_id,
+                            &terminal_session,
+                        )
+                        .unwrap_or(false)
+                    })
+                {
+                    anyhow::bail!("submission outcome changed")
                 }
+                retain_local_unknown_capacity_sqlite_tx(
+                    &tx,
+                    &ticket_status,
+                    ticket_expires_at_ms,
+                    now,
+                    capacity,
+                )?;
+                tx.commit()?;
+                return Ok(application);
+            }
+            let prior_application_state = application.state.clone();
+            validate_application_transition(&application.state, "side_effect_unknown")?;
+            if ticket_expires_at_ms <= now
+                || !matches!(ticket_status.as_str(), "claimed" | "needs_input" | "click_started")
+            {
                 anyhow::bail!("local run ticket is not active")
             }
-            validate_application_transition(&application.state, "side_effect_unknown")?;
+            retain_local_unknown_capacity_sqlite_tx(
+                &tx,
+                &ticket_status,
+                ticket_expires_at_ms,
+                now,
+                capacity,
+            )?;
             if tx.execute(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'side_effect_unknown', updated_at_ms = ?5
                   WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
                     AND ticket_hash = ?4 AND expires_at_ms > ?5
-                    AND status IN ('claimed', 'needs_input')",
-                params![run_id, account_id, application_id, ticket_hash, now],
+                    AND status = ?6",
+                params![
+                    run_id,
+                    account_id,
+                    application_id,
+                    ticket_hash,
+                    now,
+                    ticket_status,
+                ],
             )? != 1
             {
                 anyhow::bail!("local run ticket is not active")
@@ -731,17 +953,30 @@ pub fn finalize_local_side_effect_unknown(
             if tx.execute(
                 "UPDATE jobs_attempt_reservations
                     SET status = 'side_effect_unknown', updated_at_ms = ?3
-                  WHERE account_id = ?1 AND application_id = ?2",
+                  WHERE account_id = ?1 AND application_id = ?2
+                    AND status IN ('reserved', 'running')",
                 params![account_id, application_id, now],
             )? != 1
             {
                 anyhow::bail!("application attempt reservation is missing")
             }
+            let prior_session_status = if ticket_status == "needs_input" {
+                "needs_input"
+            } else {
+                "running"
+            };
             if tx.execute(
                 "UPDATE jobs_browser_sessions
                     SET status = 'needs_input', session_json = ?3, updated_at_ms = ?4
-                  WHERE account_id = ?1 AND id = ?2",
-                params![account_id, run_id, session_payload, now],
+                  WHERE account_id = ?1 AND id = ?2 AND runner = 'local'
+                    AND status = ?5",
+                params![
+                    account_id,
+                    run_id,
+                    session_payload,
+                    now,
+                    prior_session_status,
+                ],
             )? != 1
             {
                 anyhow::bail!("browser session not found")
@@ -767,8 +1002,14 @@ pub fn finalize_local_side_effect_unknown(
             if tx.execute(
                 "UPDATE jobs_applications SET state = 'side_effect_unknown',
                         application_json = ?3, updated_at_ms = ?4
-                  WHERE account_id = ?1 AND id = ?2",
-                params![account_id, application_id, application_payload, now],
+                  WHERE account_id = ?1 AND id = ?2 AND state = ?5",
+                params![
+                    account_id,
+                    application_id,
+                    application_payload,
+                    now,
+                    prior_application_state,
+                ],
             )? != 1
             {
                 anyhow::bail!("application not found")
@@ -779,6 +1020,15 @@ pub fn finalize_local_side_effect_unknown(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced local reconciliation")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("application not found")
+                }
+            }
             let row = tx.query_opt(
                 "SELECT job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
@@ -793,29 +1043,88 @@ pub fn finalize_local_side_effect_unknown(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("local run ticket does not match this application")
             }
+            let ticket = tx
+                .query_opt(
+                    "SELECT status, expires_at_ms FROM jobs_local_run_tickets
+                      WHERE id = $1 AND account_id = $2 AND application_id = $3
+                        AND ticket_hash = $4 FOR UPDATE",
+                    &[&run_id, &account_id, &application_id, &ticket_hash],
+                )?
+                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)));
+            let Some((ticket_status, ticket_expires_at_ms)) = ticket else {
+                anyhow::bail!("local run ticket is not active")
+            };
             if application.state == "side_effect_unknown" {
-                let status = tx
+                let stored_session = tx
                     .query_opt(
-                        "SELECT status FROM jobs_local_run_tickets
-                          WHERE id = $1 AND account_id = $2 AND application_id = $3
-                            AND ticket_hash = $4 FOR UPDATE",
-                        &[&run_id, &account_id, &application_id, &ticket_hash],
+                        "SELECT session_json, runner, status FROM jobs_browser_sessions
+                          WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                        &[&account_id, &run_id],
                     )?
-                    .map(|row| row.get::<_, String>(0));
-                if status.as_deref() == Some("side_effect_unknown") {
-                    tx.commit()?;
-                    return Ok(application);
+                    .map(|row| {
+                        (
+                            row.get::<_, String>(0),
+                            row.get::<_, String>(1),
+                            row.get::<_, String>(2),
+                        )
+                    });
+                if ticket_status != "side_effect_unknown"
+                    || application
+                        .receipt
+                        .pointer("/local_reconciliation/receipt")
+                        != Some(&reconciliation_receipt)
+                    || stored_session.is_none_or(|(raw, runner, status)| {
+                        !local_unknown_terminal_session_matches(
+                            raw,
+                            &runner,
+                            &status,
+                            run_id,
+                            application_id,
+                            &terminal_session,
+                        )
+                        .unwrap_or(false)
+                    })
+                {
+                    anyhow::bail!("submission outcome changed")
                 }
+                retain_local_unknown_capacity_postgres_tx(
+                    &mut tx,
+                    &ticket_status,
+                    ticket_expires_at_ms,
+                    now,
+                    capacity,
+                )?;
+                tx.commit()?;
+                return Ok(application);
+            }
+            let prior_application_state = application.state.clone();
+            validate_application_transition(&application.state, "side_effect_unknown")?;
+            if ticket_expires_at_ms <= now
+                || !matches!(ticket_status.as_str(), "claimed" | "needs_input" | "click_started")
+            {
                 anyhow::bail!("local run ticket is not active")
             }
-            validate_application_transition(&application.state, "side_effect_unknown")?;
+            retain_local_unknown_capacity_postgres_tx(
+                &mut tx,
+                &ticket_status,
+                ticket_expires_at_ms,
+                now,
+                capacity,
+            )?;
             if tx.execute(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'side_effect_unknown', updated_at_ms = $5
                   WHERE id = $1 AND account_id = $2 AND application_id = $3
                     AND ticket_hash = $4 AND expires_at_ms > $5
-                    AND status IN ('claimed', 'needs_input')",
-                &[&run_id, &account_id, &application_id, &ticket_hash, &now],
+                    AND status = $6",
+                &[
+                    &run_id,
+                    &account_id,
+                    &application_id,
+                    &ticket_hash,
+                    &now,
+                    &ticket_status,
+                ],
             )? != 1
             {
                 anyhow::bail!("local run ticket is not active")
@@ -823,17 +1132,30 @@ pub fn finalize_local_side_effect_unknown(
             if tx.execute(
                 "UPDATE jobs_attempt_reservations
                     SET status = 'side_effect_unknown', updated_at_ms = $3
-                  WHERE account_id = $1 AND application_id = $2",
+                  WHERE account_id = $1 AND application_id = $2
+                    AND status IN ('reserved', 'running')",
                 &[&account_id, &application_id, &now],
             )? != 1
             {
                 anyhow::bail!("application attempt reservation is missing")
             }
+            let prior_session_status = if ticket_status == "needs_input" {
+                "needs_input"
+            } else {
+                "running"
+            };
             if tx.execute(
                 "UPDATE jobs_browser_sessions
                     SET status = 'needs_input', session_json = $3, updated_at_ms = $4
-                  WHERE account_id = $1 AND id = $2",
-                &[&account_id, &run_id, &session_payload, &now],
+                  WHERE account_id = $1 AND id = $2 AND runner = 'local'
+                    AND status = $5",
+                &[
+                    &account_id,
+                    &run_id,
+                    &session_payload,
+                    &now,
+                    &prior_session_status,
+                ],
             )? != 1
             {
                 anyhow::bail!("browser session not found")
@@ -859,8 +1181,14 @@ pub fn finalize_local_side_effect_unknown(
             if tx.execute(
                 "UPDATE jobs_applications SET state = 'side_effect_unknown',
                         application_json = $3, updated_at_ms = $4
-                  WHERE account_id = $1 AND id = $2",
-                &[&account_id, &application_id, &application_payload, &now],
+                  WHERE account_id = $1 AND id = $2 AND state = $5",
+                &[
+                    &account_id,
+                    &application_id,
+                    &application_payload,
+                    &now,
+                    &prior_application_state,
+                ],
             )? != 1
             {
                 anyhow::bail!("application not found")
@@ -869,6 +1197,73 @@ pub fn finalize_local_side_effect_unknown(
             Ok(application)
         }
     })
+}
+
+fn retain_local_unknown_capacity_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    ticket_status: &str,
+    ticket_expires_at_ms: i64,
+    now: i64,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> Result<()> {
+    if matches!(ticket_status, "claimed" | "needs_input") {
+        crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(tx, capacity)?;
+    }
+    let retain_until =
+        ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
+    if !crate::db::object_uploads::extend_exact_submission_evidence_capacity_expiry_sqlite_tx(
+        tx,
+        capacity,
+        retain_until,
+        now,
+    )? {
+        anyhow::bail!("local submission evidence capacity is missing")
+    }
+    Ok(())
+}
+
+fn retain_local_unknown_capacity_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    ticket_status: &str,
+    ticket_expires_at_ms: i64,
+    now: i64,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> Result<()> {
+    if matches!(ticket_status, "claimed" | "needs_input") {
+        crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(tx, capacity)?;
+    }
+    let retain_until =
+        ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
+    if !crate::db::object_uploads::extend_exact_submission_evidence_capacity_expiry_postgres_tx(
+        tx,
+        capacity,
+        retain_until,
+        now,
+    )? {
+        anyhow::bail!("local submission evidence capacity is missing")
+    }
+    Ok(())
+}
+
+fn local_unknown_terminal_session_matches(
+    raw: String,
+    runner: &str,
+    status: &str,
+    run_id: &str,
+    application_id: &str,
+    expected: &BrowserSession,
+) -> Result<bool> {
+    let stored: BrowserSession = parse_json(raw, "browser session")?;
+    Ok(runner == "local"
+        && status == "needs_input"
+        && stored.id == run_id
+        && stored.runner == runner
+        && stored.status == status
+        && stored.application_id.as_deref() == Some(application_id)
+        && stored.current_company == expected.current_company
+        && stored.current_step == expected.current_step
+        && stored.takeover_url == expected.takeover_url
+        && stored.created_at_ms == expected.created_at_ms)
 }
 
 pub fn approve_local_run_resume_action(

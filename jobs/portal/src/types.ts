@@ -337,7 +337,15 @@ export interface InterventionResolutionResult {
 export interface ApplicationEvidence {
   id: string;
   application_id: string;
-  kind: "resume" | "cover_letter" | "attachment" | "submission_confirmation" | "status_email" | "interview_event" | string;
+  kind:
+    | "resume"
+    | "cover_letter"
+    | "attachment"
+    | "application_receipt"
+    | "submission_confirmation"
+    | "status_email"
+    | "interview_event"
+    | string;
   label: string;
   provider: string;
   file_name: string;

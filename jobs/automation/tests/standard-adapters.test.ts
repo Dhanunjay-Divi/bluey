@@ -16,6 +16,7 @@ const PROVIDERS = [
   ["smartrecruiters", "https://jobs.smartrecruiters.com/Acme/123"],
   ["workday", "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/123"],
 ] as const;
+const RESUME_SHA256 = "a".repeat(64);
 
 describe("deterministic ATS application adapters", () => {
   for (const [provider, url] of PROVIDERS.slice(2)) {
@@ -35,7 +36,7 @@ describe("deterministic ATS application adapters", () => {
       expect(result.receipt.intervention?.kind).toBe("browser_takeover");
       expect(page.control("first_name").value).toBe("Ada");
       expect(page.control("email").value).toBe("ada@example.com");
-      expect(page.control("resume").value).toBe("resume.pdf");
+      expect(page.control("resume").value).toBe(`resume-${RESUME_SHA256}.pdf`);
       expect(page.submitClicks).toBe(0);
       expect(events).toContain("application_execution_finished");
       expect(submitHooks).toEqual([]);
@@ -216,6 +217,8 @@ describe("deterministic ATS application adapters", () => {
   it("downgrades an unauthorized adapter that claims a submitted result", async () => {
     const page = new FixturePage("https://careers.acme.com/jobs/123/apply", []);
     const events: string[] = [];
+    const submitHooks: string[] = [];
+    let finalSubmitHookExposed = false;
     const unsafeAdapter: ApplicationAdapter = {
       kind: "semantic",
       version: "unsafe-test-adapter",
@@ -233,22 +236,27 @@ describe("deterministic ATS application adapters", () => {
       prepare: async () => undefined,
       fill: async () => undefined,
       validate: async () => [],
-      submit: async () => ({
-        status: "submitted",
-        confirmationText: "Synthetic confirmation",
-        submittedAt: new Date().toISOString(),
-        issues: [],
-      }),
+      submit: async (adapterContext) => {
+        finalSubmitHookExposed = adapterContext.beforeFinalSubmit !== undefined;
+        return {
+          status: "submitted",
+          confirmationText: "Synthetic confirmation",
+          submittedAt: new Date().toISOString(),
+          issues: [],
+        };
+      },
     };
 
     const result = await executeApplication(
-      context(page, events),
+      context(page, events, submitHooks),
       createDefaultAdapterRegistry(unsafeAdapter),
     );
 
     expect(result.receipt.status).toBe("needs_input");
     expect(result.receipt.intervention?.kind).toBe("browser_takeover");
     expect(events).toContain("adapter_submission_authority_violation");
+    expect(finalSubmitHookExposed).toBe(false);
+    expect(submitHooks).toEqual([]);
   });
 });
 
@@ -261,13 +269,14 @@ function context(
     runner: "local",
     runId: "run-123",
     accountId: "account-123",
+    approvedCanonicalUrl: page.url(),
     page,
     packet: {
       applicationId: "application-123",
       jobId: "job-123",
       resumeVersionId: "resume-version-123",
       approvedPacketChecksum: "c".repeat(64),
-      resumePath: "/tmp/resume.pdf",
+      resumePath: `/tmp/resume-${RESUME_SHA256}.pdf`,
       answers: { first_name: "Ada", email: "ada@example.com" },
       verifiedClaimIds: ["claim-1"],
       applicationIdentityId: "identity-123",
@@ -330,6 +339,15 @@ class FixturePage implements BrowserPage {
   url(): string {
     return this.currentUrl;
   }
+  installExactSubmitGuard(): Promise<void> {
+    return Promise.resolve();
+  }
+  beginExactSubmitGuard(): Promise<void> {
+    return Promise.resolve();
+  }
+  assertExactSubmitGuardClean(): Promise<void> {
+    return Promise.resolve();
+  }
   async title(): Promise<string> {
     return "Software Engineer | Acme";
   }
@@ -391,9 +409,26 @@ class FixturePage implements BrowserPage {
       },
       setInputFiles: async (paths) => {
         if (control && !this.ignoredWrites.has(selector)) {
-          control.value = paths[0]?.split("/").at(-1) || "";
+          const files = paths.map(fileEvidenceForSnapshotPath);
+          control.value = files.map((file) => file.name).join(", ");
+          control.files = files;
+          return files;
         }
+        return [];
+      },
+      effectiveSubmitTarget: async () => {
+        throw new Error("Review-only fixture has no certified submit target");
+      },
+      successfulSubmitEvidence: async () => ({ fields: [], partOrder: [] }),
+      clickWithExactSubmit: async () => {
+        throw new Error("Review-only fixture cannot activate final submit");
       },
     };
   }
+}
+
+function fileEvidenceForSnapshotPath(path: string) {
+  const name = path.split(/[\\/]/u).at(-1) ?? "";
+  const sha256 = /-([a-f0-9]{64})\.pdf$/u.exec(name)?.[1] ?? "";
+  return { name, byteLength: 1_024, sha256 };
 }

@@ -3,6 +3,7 @@ import type {
   ProviderAdapterRegistryOptions,
   SubmissionReceipt,
 } from "@bluey/jobs-automation";
+import { certifiedProviderJobKey } from "@bluey/jobs-automation";
 
 export const LOCAL_PROVIDER_APPROVAL_PENDING =
   "Approve this submission in Bluey Jobs, then continue here. This resume link cannot authorize the final click by itself.";
@@ -14,17 +15,32 @@ export interface LocalProviderFinalReview {
 
 const CONFIRMATION_PATTERNS: Record<LocalProviderFinalReview["adapter"], readonly RegExp[]> = {
   greenhouse: [
-    /\b(?:thank you|thanks) for applying\b/i,
-    /\b(?:your )?application (?:has been|was) (?:successfully )?(?:submitted|received)\b/i,
-    /\bwe(?: have|'ve) received your application\b/i,
+    /^(?:your )?application (?:has been|was) (?:successfully )?(?:submitted|received)[.!]?$/i,
+    /^we(?: have|'ve) received your application[.!]?$/i,
   ],
   lever: [
-    /\bthank you for (?:submitting )?your application\b/i,
-    /\b(?:thank you|thanks) for applying\b/i,
-    /\b(?:your )?application (?:has been|was) (?:successfully )?(?:submitted|received)\b/i,
-    /\bwe(?: have|'ve) received your application\b/i,
+    /^thank you for submitting your application[.!]?$/i,
+    /^(?:your )?application (?:has been|was) (?:successfully )?(?:submitted|received)[.!]?$/i,
+    /^we(?: have|'ve) received your application[.!]?$/i,
   ],
 };
+
+const NON_CONFIRMATION_PATTERNS = [
+  /\balready (?:applied|submitted (?:an|your) application)\b/i,
+  /\bapplication (?:was|has been) already submitted\b/i,
+  /\b(?:unable|failed) to submit (?:the |your )?application\b/i,
+  /\bcould not submit (?:the |your )?application\b/i,
+] as const;
+
+export interface LocalProviderConfirmationObservation {
+  readonly kind: "manual_submission_observed";
+  readonly binding: "exact_job" | "unbound";
+}
+
+export type LocalProviderConfirmationDisposition =
+  | "continue"
+  | "manual_submission_observed"
+  | "submit_outcome_unknown";
 
 export function localProviderFinalReview(
   execution: ExecutionResult,
@@ -44,25 +60,28 @@ export function localProviderFinalReview(
 
 export function reconcileLocalProviderConfirmation(
   review: LocalProviderFinalReview,
+  expectedCanonicalJobUrl: string,
   bodyText: string,
   confirmationUrl: string,
-  now: () => Date = () => new Date(),
-): ExecutionResult | undefined {
-  const normalized = bodyText.replace(/\s+/g, " ").trim();
-  if (!CONFIRMATION_PATTERNS[review.adapter].some((pattern) => pattern.test(normalized))) {
-    return undefined;
-  }
-  return {
-    adapter: review.adapter,
-    adapterVersion: review.adapterVersion,
-    receipt: {
-      status: "submitted",
-      confirmationText: normalized.slice(0, 500),
-      confirmationUrl,
-      submittedAt: now().toISOString(),
-      issues: [],
-    },
-  };
+): LocalProviderConfirmationObservation | undefined {
+  const expectedJobKey = providerJobKey(review.adapter, expectedCanonicalJobUrl, "submit");
+  const observedJobKey = providerJobKey(review.adapter, confirmationUrl, "confirmation");
+  const confirmationText = confirmationEvidence(review.adapter, bodyText);
+  if (!confirmationText) return undefined;
+  return Object.freeze({
+    kind: "manual_submission_observed",
+    binding: expectedJobKey && observedJobKey && expectedJobKey === observedJobKey
+      ? "exact_job"
+      : "unbound",
+  });
+}
+
+export function localProviderConfirmationDisposition(
+  observation: LocalProviderConfirmationObservation | undefined,
+  markerExists: boolean,
+): LocalProviderConfirmationDisposition {
+  if (observation) return "manual_submission_observed";
+  return markerExists ? "submit_outcome_unknown" : "continue";
 }
 
 export function pendingProviderReviewReceipt(): SubmissionReceipt {
@@ -100,4 +119,33 @@ export function providerOptionsForApprovedReview(
   return review.adapter === "greenhouse"
     ? { greenhouse: { finalReviewApproval: async () => true } }
     : { lever: { finalReviewApproval: async () => true } };
+}
+
+function confirmationEvidence(
+  adapter: LocalProviderFinalReview["adapter"],
+  bodyText: string,
+): string | undefined {
+  const lines = bodyText.split(/\n+/u).map((line) => line.replace(/\s+/g, " ").trim()).filter(Boolean);
+  for (const line of lines) {
+    const sentences = line.match(/[^.!?]+[.!?]?/gu) ?? [];
+    const candidates = [line, ...sentences.map((sentence) => sentence.trim())];
+    const evidence = candidates.find((candidate) => (
+      CONFIRMATION_PATTERNS[adapter].some((pattern) => pattern.test(candidate))
+      || NON_CONFIRMATION_PATTERNS.some((pattern) => pattern.test(candidate))
+    ));
+    if (evidence) return evidence.slice(0, 500);
+  }
+  return undefined;
+}
+
+function providerJobKey(
+  adapter: LocalProviderFinalReview["adapter"],
+  rawUrl: string,
+  purpose: "submit" | "confirmation",
+): string | undefined {
+  try {
+    return certifiedProviderJobKey(adapter, rawUrl, purpose);
+  } catch {
+    return undefined;
+  }
 }

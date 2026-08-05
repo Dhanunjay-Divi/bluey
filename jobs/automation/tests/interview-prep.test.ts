@@ -62,6 +62,7 @@ function receipt(): ApplicationReceiptBundle {
     events: [{ id: "event-1", occurredAt: "2026-07-10T11:59:00.000Z", type: "submitted" }],
     result: {
       status: "submitted",
+      submitHttpStatus: 200,
       confirmationText: "Application received",
       confirmationUrl: "https://boards.greenhouse.io/acme/jobs/1/confirmation",
       submittedAt: "2026-07-10T11:59:00.000Z",

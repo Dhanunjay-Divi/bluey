@@ -1,7 +1,10 @@
 import { constants } from "node:fs";
 import { lstat, open } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import type { FinalSubmitActivationOutcome } from "@bluey/jobs-automation";
+import type {
+  FinalSubmitActivationOutcome,
+  ProviderFinalSubmitProof,
+} from "@bluey/jobs-automation";
 
 export const FINAL_SUBMIT_MARKER_FILE = "irreversible-submit.jsonl";
 
@@ -31,15 +34,14 @@ export interface FinalSubmitAuthority {
 }
 
 export interface FinalSubmitHooks {
-  beforeFinalSubmit(): Promise<void>;
+  beforeFinalSubmit(proof: ProviderFinalSubmitProof): Promise<void>;
   afterFinalSubmit(outcome: FinalSubmitActivationOutcome): Promise<void>;
 }
 
 type FinalSubmitMarkerPhase =
   | "authority_acquired"
   | "activation_observed"
-  | "activation_uncertain"
-  | "confirmation_reconciled";
+  | "activation_uncertain";
 
 export function finalSubmitMarkerPath(runDirectory: string): string {
   if (!isAbsolute(runDirectory) || runDirectory.length > 4_096 || runDirectory.includes("\0")) {
@@ -72,21 +74,9 @@ export async function acquireFinalSubmitAuthority(
   return new FileFinalSubmitAuthority(markerPath, now);
 }
 
-export async function recordReconciledSubmitConfirmation(
-  runDirectory: string,
-  now: () => Date = () => new Date(),
-): Promise<void> {
-  try {
-    await createExclusiveMarker(runDirectory, "confirmation_reconciled", now);
-  } catch (error) {
-    if (error instanceof FinalSubmitMarkerError && error.code === "submit_authority_exists") return;
-    throw error;
-  }
-}
-
 async function createExclusiveMarker(
   runDirectory: string,
-  phase: "authority_acquired" | "confirmation_reconciled",
+  phase: "authority_acquired",
   now: () => Date,
 ): Promise<string> {
   const markerPath = finalSubmitMarkerPath(runDirectory);
@@ -126,7 +116,7 @@ export function durableFinalSubmitHooks(
 ): FinalSubmitHooks {
   let authority: FinalSubmitAuthority | undefined;
   return {
-    async beforeFinalSubmit() {
+    async beforeFinalSubmit(_proof) {
       if (authority) throw new FinalSubmitMarkerError("submit_authority_exists");
       authority = await acquireFinalSubmitAuthority(runDirectory, now);
     },

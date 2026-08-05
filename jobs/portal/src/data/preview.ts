@@ -1,6 +1,13 @@
 import type { JobEligibilityDecision, JobsWorkspace } from "../types";
 
 const now = Date.now();
+const previewEvidenceScope = "bluey-cloud/accounts/preview-account";
+const previewResumeKey = `${previewEvidenceScope}/context/jobs/app-3/receipt/resume.pdf`;
+const previewReceiptKey = `${previewEvidenceScope}/jobs/applications/app-3/receipt.json`;
+const previewConfirmationKey = `${previewEvidenceScope}/context/jobs/app-3/receipt/confirmation.png`;
+const previewResumeSha256 = "a".repeat(64);
+const previewReceiptSha256 = "b".repeat(64);
+const previewConfirmationSha256 = "c".repeat(64);
 
 const betaEligibility = (extraReview: JobEligibilityDecision["review_reasons"] = []): JobEligibilityDecision => ({
   capability: "beta_review",
@@ -322,6 +329,7 @@ export const previewWorkspace: JobsWorkspace = {
         receiptId: "receipt-app-3",
         accountId: "preview-account",
         applicationId: "app-3",
+        _bluey_server_submission_fingerprint_v1: "d".repeat(64),
         runId: "run-app-3",
         generatedAt: new Date(now - 82_000_000).toISOString(),
         runner: "cloud",
@@ -350,8 +358,9 @@ export const previewWorkspace: JobsWorkspace = {
         documents: [{
           kind: "resume",
           versionId: "resume-3",
-          storageKey: "jobs/app-3/Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
-          sha256: "a".repeat(64),
+          storageKey: previewResumeKey,
+          sha256: previewResumeSha256,
+          mediaType: "application/pdf",
         }],
         events: [{ id: "event-app-3-submit", occurredAt: new Date(now - 82_000_000).toISOString(), type: "submitted" }],
         result: {
@@ -362,7 +371,30 @@ export const previewWorkspace: JobsWorkspace = {
           issues: [],
         },
         finalUrl: "https://boards.greenhouse.io/northwind/jobs/92831/confirmation",
-        screenshotKeys: ["jobs/app-3/confirmation.png"],
+        screenshotKeys: [previewConfirmationKey],
+        evidenceObjects: [
+          {
+            kind: "resume",
+            storageKey: previewResumeKey,
+            sha256: previewResumeSha256,
+            mediaType: "application/pdf",
+            sizeBytes: 16_384,
+          },
+          {
+            kind: "screenshot",
+            storageKey: previewConfirmationKey,
+            sha256: previewConfirmationSha256,
+            mediaType: "image/png",
+            sizeBytes: 32_768,
+          },
+        ],
+        receiptObject: {
+          storageKey: previewReceiptKey,
+          sha256: previewReceiptSha256,
+          mediaType: "application/json",
+          sizeBytes: 2_048,
+          schemaVersion: 1,
+        },
         application_identity: { email: "taylor@example.com", verified: true },
       },
       created_at_ms: now - 86_400_000,
@@ -393,11 +425,37 @@ export const previewWorkspace: JobsWorkspace = {
       provider: "greenhouse",
       file_name: "Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
       media_type: "application/pdf",
-      storage_key: "jobs/app-3/Taylor-Rivera-Northwind-Senior-Product-Engineer.pdf",
-      sha256: "a".repeat(64),
+      storage_key: previewResumeKey,
+      sha256: previewResumeSha256,
       resume_version_id: "resume-3",
       occurred_at_ms: now - 82_000_000,
-      metadata: { attached_to_submission: true },
+      metadata: {
+        attached_to_submission: true,
+        receipt_id: "receipt-app-3",
+        size_bytes: 16_384,
+      },
+      created_at_ms: now - 82_000_000,
+    },
+    {
+      id: "evidence-receipt-app-3",
+      application_id: "app-3",
+      kind: "application_receipt",
+      label: "Application receipt bundle",
+      provider: "greenhouse",
+      file_name: "receipt-app-3.json",
+      media_type: "application/json",
+      storage_key: previewReceiptKey,
+      sha256: previewReceiptSha256,
+      resume_version_id: "resume-3",
+      occurred_at_ms: now - 82_000_000,
+      metadata: {
+        immutable: true,
+        receipt_id: "receipt-app-3",
+        schema_version: 1,
+        size_bytes: 2_048,
+        runner: "cloud",
+        run_id: "run-app-3",
+      },
       created_at_ms: now - 82_000_000,
     },
     {
@@ -406,12 +464,19 @@ export const previewWorkspace: JobsWorkspace = {
       kind: "submission_confirmation",
       label: "Application received",
       provider: "greenhouse",
-      file_name: "",
-      media_type: "",
-      storage_key: "",
-      sha256: "",
+      file_name: "submission-confirmation.png",
+      media_type: "image/png",
+      storage_key: previewConfirmationKey,
+      sha256: previewConfirmationSha256,
+      resume_version_id: "resume-3",
       occurred_at_ms: now - 82_000_000,
-      metadata: { external_id: "northwind-confirmation-92831", confirmation: "Application received" },
+      metadata: {
+        confirmation: "Application received",
+        evidence_strength: "browser_confirmed",
+        receipt_id: "receipt-app-3",
+        screenshot_keys: [previewConfirmationKey],
+        size_bytes: 32_768,
+      },
       created_at_ms: now - 82_000_000,
     },
     {

@@ -1,13 +1,33 @@
 import { createHash, randomUUID } from "node:crypto";
-import type { ApplicationReceiptBundle, ApplicationState, EvidenceObjectUpload, SubmissionReceipt } from "@bluey/jobs-automation";
+import {
+  isSuccessfulExactSubmitHttpStatus,
+  type ApplicationReceiptBundle,
+  type ApplicationState,
+  type EvidenceObjectUpload,
+  type InterventionRequest,
+  type SubmissionReceipt,
+  type ValidationIssue,
+} from "@bluey/jobs-automation";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
-import type { ApplicationWorkflowInput, InterventionResolution, RunnerExecutionResult } from "./contracts.js";
+import {
+  isSubmissionReceiptAuthority,
+  type ApplicationWorkflowInput,
+  type InterventionResolution,
+  type RunnerExecutionResult,
+  type SubmissionReceiptAuthority,
+} from "./contracts.js";
 
-const apiOrigin = process.env.BLUEY_JOBS_API_ORIGIN || "http://127.0.0.1:8080";
+const apiOrigin = serviceOrigin(
+  process.env.BLUEY_JOBS_API_ORIGIN || "http://127.0.0.1:8080",
+  "BLUEY_JOBS_API_ORIGIN",
+);
 const workerSigningKey = process.env.BLUEY_JOBS_WORKER_SIGNING_KEY || "";
 const workerId = process.env.BLUEY_JOBS_WORKFLOW_WORKER_ID
   || `workflow-${process.pid}-${randomUUID()}`;
-const runnerOrigin = process.env.BLUEY_JOBS_RUNNER_ORIGIN || "http://127.0.0.1:8091";
+const runnerOrigin = serviceOrigin(
+  process.env.BLUEY_JOBS_RUNNER_ORIGIN || "http://127.0.0.1:8091",
+  "BLUEY_JOBS_RUNNER_ORIGIN",
+);
 const runnerToken = process.env.BLUEY_JOBS_RUNNER_TOKEN || "";
 
 export async function assertEntitlement(input: ApplicationWorkflowInput): Promise<void> {
@@ -33,8 +53,13 @@ export async function allocateBrowser(input: ApplicationWorkflowInput): Promise<
   return { browserSessionId };
 }
 
-export async function runApplication(input: ApplicationWorkflowInput & { browserSessionId: string }): Promise<RunnerExecutionResult> {
+export async function runApplication(
+  input: ApplicationWorkflowInput & { browserSessionId: string },
+): Promise<RunnerExecutionResult> {
   if (!runnerToken) throw new Error("BLUEY_JOBS_RUNNER_TOKEN is required");
+  const resultRequestId = `${input.idempotencyKey}:initial`;
+  const completed = await loadDurableRunnerExecution(input, resultRequestId);
+  if (completed) return workflowExecutionResult(completed);
   await event(input, "runner_requested", {
     runner: input.runner,
     browser_session_id: input.browserSessionId,
@@ -44,13 +69,10 @@ export async function runApplication(input: ApplicationWorkflowInput & { browser
     method: "POST",
     headers: { Authorization: `Bearer ${runnerToken}`, "Content-Type": "application/json" },
     body: JSON.stringify({ ...input, runId: input.idempotencyKey }),
+    redirect: "error",
   });
   if (!response.ok) throw new Error(`Bluey Jobs runner returned ${response.status}`);
-  const result = await response.json() as RunnerExecutionResult;
-  if (!result.receipt || !["submitted", "needs_input", "failed"].includes(result.receipt.status)) {
-    throw new Error("Bluey Jobs runner returned an invalid receipt");
-  }
-  return result;
+  return workflowExecutionResult(parseRunnerExecutionResult(await response.json()));
 }
 
 export async function resumeApplication(input: ApplicationWorkflowInput & {
@@ -59,6 +81,8 @@ export async function resumeApplication(input: ApplicationWorkflowInput & {
   resolution: InterventionResolution;
 }): Promise<RunnerExecutionResult> {
   if (!runnerToken) throw new Error("BLUEY_JOBS_RUNNER_TOKEN is required");
+  const completed = await loadDurableRunnerExecution(input, input.requestId);
+  if (completed) return workflowExecutionResult(completed);
   await event(input, "runner_resuming", {
     browser_session_id: input.browserSessionId,
     action: input.resolution.action,
@@ -71,13 +95,34 @@ export async function resumeApplication(input: ApplicationWorkflowInput & {
       headers: { Authorization: `Bearer ${runnerToken}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         ...input.resolution,
+        accountId: input.accountId,
+        applicationId: input.applicationId,
+        applicationIdentityId: input.applicationIdentityId,
+        runId: input.idempotencyKey,
         requestId: input.requestId,
         profileScope: runnerProfileScope(input.accountId, input.applicationIdentityId),
       }),
+      redirect: "error",
     },
   );
   if (!response.ok) throw new Error(`Bluey Jobs runner resume returned ${response.status}`);
-  return response.json() as Promise<RunnerExecutionResult>;
+  return workflowExecutionResult(parseRunnerExecutionResult(await response.json()));
+}
+
+export async function persistSubmissionReceipt(input: ApplicationWorkflowInput & {
+  browserSessionId: string;
+  resultRequestId: string;
+}): Promise<void> {
+  if (!runnerToken) throw new Error("BLUEY_JOBS_RUNNER_TOKEN is required");
+  const execution = await loadDurableRunnerExecution(input, input.resultRequestId);
+  if (!execution) throw new Error("The runner's committed submission result is not available");
+  const evidence = submittedExecutionEvidence(execution);
+  await persistReceipt({
+    ...input,
+    receiptBundle: evidence.receiptBundle,
+    evidenceObjects: evidence.evidenceObjects,
+    receiptAuthority: evidence.receiptAuthority,
+  });
 }
 
 function runnerProfileScope(accountId: string, applicationIdentityId: string): string {
@@ -89,16 +134,21 @@ function runnerProfileScope(accountId: string, applicationIdentityId: string): s
     .slice(0, 40);
 }
 
-export async function persistReceipt(input: ApplicationWorkflowInput & {
+async function persistReceipt(input: ApplicationWorkflowInput & {
   receiptBundle: ApplicationReceiptBundle;
   evidenceObjects: EvidenceObjectUpload[];
+  receiptAuthority: SubmissionReceiptAuthority;
 }): Promise<void> {
+  if (!isSubmissionReceiptAuthority(input.receiptAuthority)) {
+    throw new Error("Submitted run has invalid fenced receipt authority");
+  }
   await workerRequest(`/api/jobs/internal/applications/${encodeURIComponent(input.applicationId)}/receipt`, {
     account_id: input.accountId,
+    lease_token: input.receiptAuthority.leaseToken,
+    fence: input.receiptAuthority.fence,
     receipt: input.receiptBundle,
     evidence_objects: input.evidenceObjects,
   });
-  await event(input, "receipt_persisted", { receipt_id: input.receiptBundle.receiptId });
 }
 
 export async function releaseBrowser(browserSessionId: string): Promise<void> {
@@ -107,6 +157,7 @@ export async function releaseBrowser(browserSessionId: string): Promise<void> {
   const response = await fetch(`${runnerOrigin}/runs/${encodeURIComponent(browserSessionId)}`, {
     method: "DELETE",
     headers: { Authorization: `Bearer ${runnerToken}` },
+    redirect: "error",
   });
   if (!response.ok && response.status !== 404) {
     throw new Error(`Bluey Jobs runner release returned ${response.status}`);
@@ -153,8 +204,292 @@ async function workerRequest<T = unknown>(path: string, body: unknown): Promise<
       "Content-Type": "application/json",
     },
     body: serializedBody,
+    redirect: "error",
   });
   if (!response.ok) throw new Error(`Jobs API returned ${response.status}`);
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+interface RawRunnerExecutionResult {
+  receipt: SubmissionReceipt;
+  receiptBundle?: ApplicationReceiptBundle;
+  evidenceObjects?: EvidenceObjectUpload[];
+  receiptAuthority?: SubmissionReceiptAuthority;
+}
+
+function workflowExecutionResult(execution: RawRunnerExecutionResult): RunnerExecutionResult {
+  if (execution.receipt.status === "submitted") submittedExecutionEvidence(execution);
+  return { receipt: execution.receipt };
+}
+
+function submittedExecutionEvidence(execution: RawRunnerExecutionResult): {
+  receiptBundle: ApplicationReceiptBundle;
+  evidenceObjects: EvidenceObjectUpload[];
+  receiptAuthority: SubmissionReceiptAuthority;
+} {
+  if (execution.receipt.status !== "submitted") {
+    throw new Error("The runner's committed result is not a submission");
+  }
+  if (!execution.receiptBundle
+    || typeof execution.receiptBundle !== "object"
+    || Array.isArray(execution.receiptBundle)) {
+    throw new Error("Submitted runner result is missing its receipt bundle");
+  }
+  if (!Array.isArray(execution.evidenceObjects) || execution.evidenceObjects.length === 0) {
+    throw new Error("Submitted runner result is missing evidence bytes");
+  }
+  if (!isSubmissionReceiptAuthority(execution.receiptAuthority)) {
+    throw new Error("Submitted runner result is missing fenced receipt authority");
+  }
+  return {
+    receiptBundle: execution.receiptBundle,
+    evidenceObjects: execution.evidenceObjects,
+    receiptAuthority: execution.receiptAuthority,
+  };
+}
+
+async function loadDurableRunnerExecution(
+  input: Pick<
+    ApplicationWorkflowInput,
+    | "accountId"
+    | "applicationId"
+    | "applicationIdentityId"
+    | "idempotencyKey"
+  > & {
+    browserSessionId: string;
+  },
+  requestId: string,
+): Promise<RawRunnerExecutionResult | undefined> {
+  const response = await fetch(`${runnerOrigin}/results`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${runnerToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      accountId: input.accountId,
+      applicationId: input.applicationId,
+      applicationIdentityId: input.applicationIdentityId,
+      browserSessionId: input.browserSessionId,
+      runId: input.idempotencyKey,
+      requestId,
+    }),
+    redirect: "error",
+  });
+  if (response.status === 404 || response.status === 204) return undefined;
+  if (!response.ok) throw new Error(`Bluey Jobs runner result lookup returned ${response.status}`);
+  return parseRunnerExecutionResult(await response.json());
+}
+
+function parseRunnerExecutionResult(value: unknown): RawRunnerExecutionResult {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Bluey Jobs runner returned an invalid receipt");
+  }
+  const result = value as Record<string, unknown>;
+  const receipt = parseWorkflowReceipt(result.receipt);
+  const hasAuthority = Object.prototype.hasOwnProperty.call(result, "receiptAuthority");
+  if (receipt.status === "submitted") {
+    if (!isSubmissionReceiptAuthority(result.receiptAuthority)) {
+      throw new Error("Submitted runner result is missing fenced receipt authority");
+    }
+  } else if (hasAuthority) {
+    throw new Error("Non-submitted runner result included receipt authority");
+  }
+  return {
+    receipt,
+    ...(Object.prototype.hasOwnProperty.call(result, "receiptBundle")
+      ? { receiptBundle: result.receiptBundle as ApplicationReceiptBundle }
+      : {}),
+    ...(Object.prototype.hasOwnProperty.call(result, "evidenceObjects")
+      ? { evidenceObjects: result.evidenceObjects as EvidenceObjectUpload[] }
+      : {}),
+    ...(hasAuthority
+      ? { receiptAuthority: result.receiptAuthority as SubmissionReceiptAuthority }
+      : {}),
+  };
+}
+
+function parseWorkflowReceipt(value: unknown): SubmissionReceipt {
+  const receipt = objectRecord(value, "Bluey Jobs runner returned an invalid receipt");
+  const status = receipt.status;
+  if (status !== "submitted" && status !== "needs_input" && status !== "failed") {
+    throw new Error("Bluey Jobs runner returned an invalid receipt");
+  }
+  if (!Array.isArray(receipt.issues) || receipt.issues.length > 100) {
+    throw new Error("Bluey Jobs runner returned invalid receipt issues");
+  }
+  const parsed: SubmissionReceipt = {
+    status,
+    issues: receipt.issues.map(parseValidationIssue),
+  };
+  const confirmationText = optionalString(receipt, "confirmationText", 8_000);
+  if (confirmationText !== undefined) parsed.confirmationText = confirmationText;
+  const confirmationUrl = optionalWebUrl(receipt, "confirmationUrl");
+  if (confirmationUrl !== undefined) parsed.confirmationUrl = confirmationUrl;
+  if (Object.prototype.hasOwnProperty.call(receipt, "submitHttpStatus")) {
+    const submitHttpStatus = receipt.submitHttpStatus;
+    if (!isSuccessfulExactSubmitHttpStatus(submitHttpStatus)) {
+      throw new Error("Bluey Jobs runner returned an invalid receipt");
+    }
+    parsed.submitHttpStatus = submitHttpStatus;
+  }
+  const submittedAt = optionalTimestamp(receipt, "submittedAt");
+  if (submittedAt !== undefined) parsed.submittedAt = submittedAt;
+  if (Object.prototype.hasOwnProperty.call(receipt, "intervention")) {
+    parsed.intervention = parseIntervention(receipt.intervention);
+  }
+  return parsed;
+}
+
+function parseValidationIssue(value: unknown): ValidationIssue {
+  const issue = objectRecord(value, "Bluey Jobs runner returned an invalid receipt issue");
+  const severity = issue.severity;
+  if (severity !== "blocking" && severity !== "warning") {
+    throw new Error("Bluey Jobs runner returned an invalid receipt issue");
+  }
+  return {
+    field: requiredString(issue, "field", 256),
+    message: requiredString(issue, "message", 4_000),
+    severity,
+  };
+}
+
+function parseIntervention(value: unknown): InterventionRequest {
+  const intervention = objectRecord(
+    value,
+    "Bluey Jobs runner returned an invalid receipt intervention",
+  );
+  const kind = intervention.kind;
+  if (kind !== "captcha"
+    && kind !== "two_factor"
+    && kind !== "assessment"
+    && kind !== "unknown_question"
+    && kind !== "missing_fact"
+    && kind !== "sensitive_question"
+    && kind !== "browser_takeover") {
+    throw new Error("Bluey Jobs runner returned an invalid receipt intervention");
+  }
+  const parsed: InterventionRequest = {
+    kind,
+    title: requiredString(intervention, "title", 1_000),
+    detail: requiredString(intervention, "detail", 8_000),
+  };
+  const field = optionalString(intervention, "field", 256);
+  if (field !== undefined) parsed.field = field;
+  if (Object.prototype.hasOwnProperty.call(intervention, "choices")) {
+    if (!Array.isArray(intervention.choices) || intervention.choices.length > 100) {
+      throw new Error("Bluey Jobs runner returned invalid intervention choices");
+    }
+    parsed.choices = intervention.choices.map((choice) => {
+      if (typeof choice !== "string" || choice.length > 1_000) {
+        throw new Error("Bluey Jobs runner returned invalid intervention choices");
+      }
+      return choice;
+    });
+  }
+  const takeoverUrl = optionalWebUrl(intervention, "takeoverUrl");
+  if (takeoverUrl !== undefined) parsed.takeoverUrl = takeoverUrl;
+  if (Object.prototype.hasOwnProperty.call(intervention, "resolution")) {
+    parsed.resolution = parseInterventionResolution(intervention.resolution);
+  }
+  return parsed;
+}
+
+function parseInterventionResolution(value: unknown): NonNullable<InterventionRequest["resolution"]> {
+  const resolution = objectRecord(
+    value,
+    "Bluey Jobs runner returned an invalid intervention resolution",
+  );
+  const kind = resolution.kind;
+  if ((kind !== "browser_takeover" && kind !== "email_otp_approval" && kind !== "answer")
+    || typeof resolution.resumeAfter !== "boolean") {
+    throw new Error("Bluey Jobs runner returned an invalid intervention resolution");
+  }
+  const parsed: NonNullable<InterventionRequest["resolution"]> = {
+    kind,
+    resumeAfter: resolution.resumeAfter,
+  };
+  const expiresAt = optionalTimestamp(resolution, "expiresAt");
+  if (expiresAt !== undefined) parsed.expiresAt = expiresAt;
+  if (Object.prototype.hasOwnProperty.call(resolution, "provider")) {
+    if (resolution.provider !== "gmail" && resolution.provider !== "outlook_email") {
+      throw new Error("Bluey Jobs runner returned an invalid intervention provider");
+    }
+    parsed.provider = resolution.provider;
+  }
+  const messageId = optionalString(resolution, "messageId", 1_000);
+  if (messageId !== undefined) parsed.messageId = messageId;
+  return parsed;
+}
+
+function objectRecord(value: unknown, message: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(message);
+  return value as Record<string, unknown>;
+}
+
+function requiredString(
+  record: Record<string, unknown>,
+  key: string,
+  maximumLength: number,
+): string {
+  const value = record[key];
+  if (typeof value !== "string" || value.length === 0 || value.length > maximumLength) {
+    throw new Error(`Bluey Jobs runner returned an invalid ${key}`);
+  }
+  return value;
+}
+
+function optionalString(
+  record: Record<string, unknown>,
+  key: string,
+  maximumLength: number,
+): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(record, key)) return undefined;
+  const value = record[key];
+  if (typeof value !== "string" || value.length > maximumLength) {
+    throw new Error(`Bluey Jobs runner returned an invalid ${key}`);
+  }
+  return value;
+}
+
+function optionalTimestamp(record: Record<string, unknown>, key: string): string | undefined {
+  const value = optionalString(record, key, 64);
+  if (value === undefined) return undefined;
+  if (!Number.isFinite(Date.parse(value))) {
+    throw new Error(`Bluey Jobs runner returned an invalid ${key}`);
+  }
+  return value;
+}
+
+function optionalWebUrl(record: Record<string, unknown>, key: string): string | undefined {
+  const value = optionalString(record, key, 4_096);
+  if (value === undefined) return undefined;
+  try {
+    const url = new URL(value);
+    const loopback = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(url.hostname);
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+      || url.username
+      || url.password) {
+      throw new Error("invalid URL");
+    }
+    return url.toString();
+  } catch {
+    throw new Error(`Bluey Jobs runner returned an invalid ${key}`);
+  }
+}
+
+function serviceOrigin(rawOrigin: string, name: string): string {
+  try {
+    const url = new URL(rawOrigin);
+    const loopback = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]).has(url.hostname);
+    if ((url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+      || url.username
+      || url.password
+      || url.pathname !== "/"
+      || url.search
+      || url.hash) {
+      throw new Error("invalid origin");
+    }
+    return url.origin;
+  } catch {
+    throw new Error(`${name} must be an HTTPS origin or a loopback HTTP origin`);
+  }
 }

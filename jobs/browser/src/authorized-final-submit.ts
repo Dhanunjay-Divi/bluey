@@ -1,4 +1,13 @@
-import type { FinalSubmitActivationOutcome } from "@bluey/jobs-automation";
+import {
+  ApprovedExecutionIntegrityError,
+  assertMaterializedDocumentSnapshot,
+  assertApprovedExecutionChecksum,
+  createFinalSubmitProof,
+  FinalSubmitProofError,
+  type FinalSubmitActivationOutcome,
+  type MaterializedDocuments,
+  type ProviderFinalSubmitProof,
+} from "@bluey/jobs-automation";
 import {
   durableFinalSubmitHooks,
   type FinalSubmitHooks,
@@ -27,24 +36,58 @@ export type FinalSubmitFetch = (
  */
 export function authorizedFinalSubmitHooks(
   runDirectory: string,
-  request: Pick<StartRunRequest, "runId">,
+  request: Pick<StartRunRequest, "runId" | "job" | "packet">,
   delivery: LocalRunDelivery,
+  documents: MaterializedDocuments,
+  currentPageUrl: () => string,
   fetchImpl: FinalSubmitFetch = fetch,
 ): FinalSubmitHooks {
   const durable = durableFinalSubmitHooks(runDirectory);
   return {
-    async beforeFinalSubmit(): Promise<void> {
+    async beforeFinalSubmit(providerProof: ProviderFinalSubmitProof): Promise<void> {
+      let finalSubmitProof;
+      try {
+        if (!request.job) throw new FinalSubmitProofError();
+        assertApprovedExecutionChecksum(request.packet, request.job);
+        localRunAuthorization(delivery, "submit");
+        await assertMaterializedDocumentSnapshot(documents.resume);
+        if (documents.coverLetter) {
+          await assertMaterializedDocumentSnapshot(documents.coverLetter);
+        }
+        finalSubmitProof = createFinalSubmitProof(providerProof, {
+          resume: {
+            versionId: request.packet.resumeVersionId,
+            sha256: documents.resume.sha256,
+          },
+          ...(documents.coverLetter ? {
+            coverLetter: { sha256: documents.coverLetter.sha256 },
+          } : {}),
+        }, {
+          approvedCanonicalUrl: request.job.canonicalUrl,
+          pageUrl: currentPageUrl(),
+        });
+        assertApprovedExecutionChecksum(request.packet, request.job);
+      } catch (error) {
+        if (error instanceof FinalSubmitProofError
+          || error instanceof ApprovedExecutionIntegrityError) {
+          throw new LocalBrowserError("launch_mismatch");
+        }
+        throw error;
+      }
       const { capability } = localRunAuthorization(delivery, "submit");
+      // The marker is the local crash boundary. It must reach durable storage
+      // before the server can advance this run to click_started.
+      await durable.beforeFinalSubmit(providerProof);
       await authorizeFinalSubmit(
         delivery.apiOrigin,
         request.runId,
         capability,
+        finalSubmitProof,
         fetchImpl,
       );
       // The request can outlive a near-expiry capability. Re-check locally
-      // immediately before acquiring the irreversible marker.
+      // immediately before allowing the employer-facing click.
       localRunAuthorization(delivery, "submit");
-      await durable.beforeFinalSubmit();
     },
     async afterFinalSubmit(outcome: FinalSubmitActivationOutcome): Promise<void> {
       await durable.afterFinalSubmit(outcome);
@@ -56,6 +99,7 @@ async function authorizeFinalSubmit(
   apiOrigin: string,
   runId: string,
   capability: string,
+  finalSubmitProof: ReturnType<typeof createFinalSubmitProof>,
   fetchImpl: FinalSubmitFetch,
 ): Promise<void> {
   let response: Response;
@@ -68,7 +112,10 @@ async function authorizeFinalSubmit(
           Accept: "application/json",
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ capability }),
+        body: JSON.stringify({
+          capability,
+          final_submit_proof: finalSubmitProof,
+        }),
         cache: "no-store",
         credentials: "omit",
         redirect: "error",

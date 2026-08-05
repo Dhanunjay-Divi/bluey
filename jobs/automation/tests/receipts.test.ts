@@ -53,6 +53,7 @@ describe("application receipt bundles", () => {
       ],
       result: {
         status: "submitted",
+        submitHttpStatus: 200,
         confirmationText: "Application received",
         confirmationUrl: "https://jobs.acme.com/job-1/confirmation",
         submittedAt: "2026-07-10T11:59:02.000Z",
@@ -62,6 +63,13 @@ describe("application receipt bundles", () => {
       finalUrl: "https://jobs.acme.com/job-1/confirmation",
       screenshotKeys: ["receipts/confirmation.png"],
     });
+    receipt.receiptObject = {
+      storageKey: "receipts/receipt-1.json",
+      sha256: "c".repeat(64),
+      mediaType: "application/json",
+      sizeBytes: 123,
+      schemaVersion: 1,
+    };
 
     expect(receipt.packet.verifiedClaimIds).toEqual(["claim-1", "claim-2"]);
     expect(receipt.events.map((event) => event.type)).toEqual(["started", "submitted"]);
@@ -72,7 +80,7 @@ describe("application receipt bundles", () => {
     expect(receipt.packet.answers).toEqual(packet.answers);
     expect(receipt.packet.approvedPacketChecksum).toBe(packet.approvedPacketChecksum);
     const evidence = applicationEvidenceFromReceipt(receipt);
-    expect(evidence).toHaveLength(2);
+    expect(evidence).toHaveLength(3);
     expect(evidence[0]).toMatchObject({
       application_id: "application-1",
       kind: "resume",
@@ -80,6 +88,20 @@ describe("application receipt bundles", () => {
       resume_version_id: "resume-job-1",
     });
     expect(evidence[1]).toMatchObject({ kind: "submission_confirmation", label: "Application received" });
+    expect(evidence[2]).toMatchObject({
+      kind: "application_receipt",
+      file_name: "receipt-1.json",
+      media_type: "application/json",
+      storage_key: "receipts/receipt-1.json",
+      sha256: "c".repeat(64),
+      resume_version_id: "resume-job-1",
+      metadata: {
+        immutable: true,
+        receipt_id: "receipt-1",
+        schema_version: 1,
+        size_bytes: 123,
+      },
+    });
     expect(await fingerprintReceipt(receipt)).toMatch(/^[a-f0-9]{64}$/);
     expect(await fingerprintReceipt(receipt)).toBe(await fingerprintReceipt(structuredClone(receipt)));
 

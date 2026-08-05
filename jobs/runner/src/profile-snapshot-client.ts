@@ -4,6 +4,8 @@ import { runnerOwnerId } from "./execution-lease.js";
 import type { EncryptedProfileSnapshot } from "./profile-store.js";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const DEFAULT_STORE_REQUEST_TIMEOUT_MS = 270_000;
+const DEFAULT_STORE_MAX_ATTEMPTS = 2;
 const MAX_ENCRYPTED_SNAPSHOT_BYTES = 25 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 36 * 1024 * 1024;
 const MAX_SIGNING_KEY_BYTES = 4_096;
@@ -29,6 +31,8 @@ export interface BrowserProfileSnapshotClientOptions {
   workerSigningKey: string;
   ownerId: string;
   requestTimeoutMs?: number;
+  storeRequestTimeoutMs?: number;
+  storeMaxAttempts?: number;
   fetch?: typeof globalThis.fetch;
 }
 
@@ -56,6 +60,8 @@ export class BrowserProfileSnapshotClient {
   readonly #workerSigningKey: string;
   readonly #ownerId: string;
   readonly #requestTimeoutMs: number;
+  readonly #storeRequestTimeoutMs: number;
+  readonly #storeMaxAttempts: number;
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: BrowserProfileSnapshotClientOptions) {
@@ -67,6 +73,18 @@ export class BrowserProfileSnapshotClient {
       DEFAULT_REQUEST_TIMEOUT_MS,
       100,
       60_000,
+    );
+    this.#storeRequestTimeoutMs = boundedInteger(
+      options.storeRequestTimeoutMs,
+      DEFAULT_STORE_REQUEST_TIMEOUT_MS,
+      100,
+      300_000,
+    );
+    this.#storeMaxAttempts = boundedInteger(
+      options.storeMaxAttempts,
+      DEFAULT_STORE_MAX_ATTEMPTS,
+      1,
+      3,
     );
     this.#fetch = options.fetch ?? globalThis.fetch;
     if (typeof this.#fetch !== "function") {
@@ -81,7 +99,7 @@ export class BrowserProfileSnapshotClient {
       "restore",
       profilePath(context.runId, "restore"),
       accessBody(context),
-      true,
+      { allowNoContent: true },
     );
     if (response === undefined) return undefined;
     const record = objectRecord(response, "restore");
@@ -111,38 +129,49 @@ export class BrowserProfileSnapshotClient {
   ): Promise<StoredBrowserProfileSnapshot> {
     assertSnapshot(snapshot);
     const digest = sha256(snapshot.bytes);
-    const response = await this.request("store", profilePath(context.runId, "store"), {
+    const path = profilePath(context.runId, "store");
+    const body = {
       ...accessBody(context),
       expected_generation: snapshot.generation,
       envelope_version: snapshot.envelopeVersion,
       sha256: digest,
       size_bytes: snapshot.bytes.length,
       encrypted_snapshot_base64: snapshot.bytes.toString("base64"),
-    });
-    const record = objectRecord(response, "store");
-    assertIdentity(record, context, "store");
-    const metadata = parseMetadata(record, "store");
-    if (metadata.generation !== snapshot.generation + 1
-      || metadata.sha256 !== digest
-      || metadata.sizeBytes !== snapshot.bytes.length
-      || metadata.envelopeVersion !== snapshot.envelopeVersion) {
-      throw invalidResponse("store");
+    };
+    for (let attempt = 1; attempt <= this.#storeMaxAttempts; attempt += 1) {
+      try {
+        const response = await this.request("store", path, body, {
+          timeoutMs: this.#storeRequestTimeoutMs,
+        });
+        const record = objectRecord(response, "store");
+        assertIdentity(record, context, "store");
+        const metadata = parseMetadata(record, "store");
+        if (metadata.generation !== snapshot.generation + 1
+          || metadata.sha256 !== digest
+          || metadata.sizeBytes !== snapshot.bytes.length
+          || metadata.envelopeVersion !== snapshot.envelopeVersion) {
+          throw invalidResponse("store");
+        }
+        return metadata;
+      } catch (error) {
+        if (attempt >= this.#storeMaxAttempts || !isAmbiguousStoreFailure(error)) throw error;
+      }
     }
-    return metadata;
+    throw new BrowserProfileSnapshotError("store", "request_failed");
   }
 
   private async request(
     operation: "restore" | "store",
     path: string,
     body: Record<string, unknown>,
-    allowNoContent = false,
+    options: { allowNoContent?: boolean; timeoutMs?: number } = {},
   ): Promise<unknown> {
     const controller = new AbortController();
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
       controller.abort();
-    }, this.#requestTimeoutMs);
+    }, options.timeoutMs ?? this.#requestTimeoutMs);
     timeout.unref?.();
     try {
       const serializedBody = JSON.stringify(body);
@@ -167,7 +196,7 @@ export class BrowserProfileSnapshotClient {
         throw new BrowserProfileSnapshotError(operation, "redirect_blocked", response.status);
       }
       const responseText = await readBounded(response, operation);
-      if (allowNoContent && response.status === 204) return undefined;
+      if (options.allowNoContent && response.status === 204) return undefined;
       if (!response.ok || !responseText) {
         throw new BrowserProfileSnapshotError(operation, "request_failed", response.status);
       }
@@ -384,4 +413,19 @@ function invalidResponse(
   status?: number,
 ): BrowserProfileSnapshotError {
   return new BrowserProfileSnapshotError(operation, "invalid_response", status);
+}
+
+function isAmbiguousStoreFailure(error: unknown): boolean {
+  if (!(error instanceof BrowserProfileSnapshotError) || error.operation !== "store") return false;
+  if (error.code === "timed_out") return true;
+  if (error.code === "invalid_response") {
+    return error.status !== undefined && error.status >= 200 && error.status < 300;
+  }
+  if (error.code !== "request_failed") return false;
+  return error.status === undefined
+    || (error.status >= 200 && error.status < 300)
+    || error.status === 408
+    || error.status === 425
+    || error.status === 429
+    || error.status >= 500;
 }

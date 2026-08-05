@@ -4,7 +4,14 @@ import {
   parseRunnerInterventionResolution,
 } from "../src/intervention-policy.js";
 
-const base = { requestId: "run-1:resume:1", profileScope: "a".repeat(40) };
+const base = {
+  accountId: "account-1",
+  applicationId: "application-1",
+  applicationIdentityId: "identity-1",
+  runId: "run-1",
+  requestId: "run-1:resume:1",
+  profileScope: "a".repeat(40),
+};
 
 describe("runner intervention reapproval policy", () => {
   it.each([

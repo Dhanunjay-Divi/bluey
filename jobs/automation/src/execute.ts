@@ -30,6 +30,11 @@ export interface ProviderAdapterRegistryOptions {
   lever?: LeverAdapterOptions;
 }
 
+const ADAPTER_CONTEXTS = new WeakMap<
+  AdapterContext,
+  WeakMap<ApplicationAdapter, AdapterContext>
+>();
+
 class ProviderFirstAdapterRegistry extends AdapterRegistry {
   constructor(
     private readonly providerAdapters: readonly ApplicationAdapter[],
@@ -78,15 +83,16 @@ export async function executeApplication(
   assertRunnablePacket(context.packet);
   const adapter = registry.resolve(context.page.url());
   const capability = atsCapabilityProfile(adapter.kind);
+  const adapterContext = submitContextForAdapter(context, adapter);
   await context.log("adapter_selected", {
     kind: adapter.kind,
     version: adapter.version,
     capability: capability.capability,
     final_submission: adapterCanFinalize(adapter.kind, adapter.version),
   });
-  await adapter.prepare(context);
-  await adapter.fill(context);
-  const issues = await adapter.validate(context);
+  await adapter.prepare(adapterContext);
+  await adapter.fill(adapterContext);
+  const issues = await adapter.validate(adapterContext);
   if (issues.some((issue) => issue.severity === "blocking")) {
     const field = issues[0]?.field || "required field";
     const kind = issueKind(field);
@@ -114,7 +120,7 @@ export async function executeApplication(
     });
     return { adapter: adapter.kind, adapterVersion: adapter.version, receipt };
   }
-  let receipt = await adapter.submit(context);
+  let receipt = await adapter.submit(adapterContext);
   if (
     receipt.status === "submitted" &&
     !adapterCanFinalize(adapter.kind, adapter.version)
@@ -148,6 +154,47 @@ export async function executeApplication(
     issue_count: receipt.issues.length,
   });
   return { adapter: adapter.kind, adapterVersion: adapter.version, receipt };
+}
+
+function submitContextForAdapter(
+  context: AdapterContext,
+  adapter: ApplicationAdapter,
+): AdapterContext {
+  let contexts = ADAPTER_CONTEXTS.get(context);
+  if (!contexts) {
+    contexts = new WeakMap<ApplicationAdapter, AdapterContext>();
+    ADAPTER_CONTEXTS.set(context, contexts);
+  }
+  const existing = contexts.get(adapter);
+  if (existing) return existing;
+  if (!adapterCanFinalize(adapter.kind, adapter.version)) {
+    const restricted = {
+      ...context,
+      beforeFinalSubmit: undefined,
+      afterFinalSubmit: undefined,
+    };
+    contexts.set(adapter, restricted);
+    return restricted;
+  }
+  const expectedControl = adapter.kind === "greenhouse"
+    ? "greenhouse_submit_application"
+    : "lever_application_submit";
+  const providerContext: AdapterContext = {
+    ...context,
+    ...(context.beforeFinalSubmit ? {
+      beforeFinalSubmit: async (proof) => {
+        if (proof.adapter !== adapter.kind
+          || proof.adapterVersion !== adapter.version
+          || proof.control !== expectedControl) {
+          throw new Error("Provider final submit proof does not match the selected adapter");
+        }
+        await context.beforeFinalSubmit!(proof);
+      },
+    } : { beforeFinalSubmit: undefined }),
+    afterFinalSubmit: context.afterFinalSubmit,
+  };
+  contexts.set(adapter, providerContext);
+  return providerContext;
 }
 
 function issueKind(

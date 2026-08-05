@@ -26,6 +26,7 @@ import {
   readRunCheckpoint,
   reconcileOrphanActiveProfiles,
   removeRunCheckpoint,
+  scanRunCheckpoints,
   writeRunCheckpoint,
   type CloudRunCheckpoint,
 } from "../src/run-checkpoint-store.js";
@@ -156,6 +157,60 @@ describe("encrypted cloud run checkpoints", () => {
     await expect(writeRunCheckpoint(root, checkpoint, key))
       .rejects.toThrow("Invalid cloud run checkpoint lease metadata");
   });
+
+  it("isolates a corrupt checkpoint while retaining it and reading another profile", async () => {
+    const root = await temporaryDirectory();
+    const key = randomBytes(32);
+    const corrupt = fixture({
+      profileScope: "a".repeat(40),
+      browserSessionId: "cloud-application-corrupt",
+    });
+    const healthy = fixture({
+      profileScope: "b".repeat(40),
+      browserSessionId: "cloud-application-healthy",
+    });
+    await writeRunCheckpoint(root, corrupt, key);
+    await writeRunCheckpoint(root, healthy, key);
+    const corruptScope = cloudCheckpointScope(corrupt.profileScope, corrupt.browserSessionId);
+    const corruptPath = checkpointPath(root, corrupt.profileScope, corruptScope);
+    const corruptedBytes = await readFile(corruptPath);
+    corruptedBytes[20] ^= 0x01;
+    await writeFile(corruptPath, corruptedBytes, { mode: 0o600 });
+
+    const scan = await scanRunCheckpoints<FixtureRequest, unknown>(root, key);
+
+    expect(scan.checkpoints).toHaveLength(1);
+    expect(scan.checkpoints[0]?.checkpoint.profileScope).toBe(healthy.profileScope);
+    expect(scan.failures).toEqual([{
+      profileScope: corrupt.profileScope,
+      checkpointScope: corruptScope,
+      code: "checkpoint_unreadable",
+    }]);
+    await expect(readFile(corruptPath)).resolves.toEqual(corruptedBytes);
+  });
+
+  it("treats a non-directory profile checkpoint scope as isolated corruption", async () => {
+    const root = await temporaryDirectory();
+    const key = randomBytes(32);
+    const corruptProfileScope = "a".repeat(40);
+    const healthy = fixture({
+      profileScope: "b".repeat(40),
+      browserSessionId: "cloud-application-healthy",
+    });
+    await writeRunCheckpoint(root, healthy, key);
+    const invalidProfilePath = join(root, "run-checkpoints", corruptProfileScope);
+    await writeFile(invalidProfilePath, "retained-corrupt-profile", { mode: 0o600 });
+
+    const scan = await scanRunCheckpoints<FixtureRequest, unknown>(root, key);
+
+    expect(scan.checkpoints).toHaveLength(1);
+    expect(scan.checkpoints[0]?.checkpoint.profileScope).toBe(healthy.profileScope);
+    expect(scan.failures).toEqual([{
+      profileScope: corruptProfileScope,
+      code: "profile_unreadable",
+    }]);
+    await expect(readFile(invalidProfilePath, "utf8")).resolves.toBe("retained-corrupt-profile");
+  });
 });
 
 describe("cloud runner crash-start profile reconciliation", () => {
@@ -190,7 +245,7 @@ interface FixtureRequest {
 }
 
 function fixture(overrides: Record<string, unknown> = {}): CloudRunCheckpoint<FixtureRequest> {
-  const profileScope = "a".repeat(40);
+  const profileScope = String(overrides.profileScope || "a".repeat(40));
   const browserSessionId = String(overrides.browserSessionId || "cloud-application-123");
   const version = overrides.version === 1 ? 1 : CURRENT_CHECKPOINT_VERSION;
   const job: NormalizedJob = {

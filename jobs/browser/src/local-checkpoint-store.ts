@@ -22,6 +22,7 @@ import {
 import { dirname, join } from "node:path";
 import type { DurableRunPhase } from "@bluey/jobs-automation";
 import type { LocalRunCapabilities } from "./local-capabilities.js";
+import type { LocalSideEffectReason } from "./local-failure.js";
 
 const CHECKPOINT_VERSION = 1;
 const MAGIC = Buffer.from("BLUEYLJ1");
@@ -64,6 +65,7 @@ export interface LocalRunCheckpoint<Request extends object = Record<string, unkn
     status: "prepared" | "needs_input" | "provider_review" | "side_effect_unknown";
     adapter?: string;
     approvedSubmitActionConsumed?: boolean;
+    sideEffectReason?: LocalSideEffectReason;
   };
   providerFinalReview?: ProviderReview;
   events: Array<{ event: string; details: Record<string, unknown>; at: string }>;
@@ -261,6 +263,12 @@ function validateCheckpoint(value: unknown): asserts value is LocalRunCheckpoint
   if (workflow.approvedSubmitActionConsumed !== undefined
     && typeof workflow.approvedSubmitActionConsumed !== "boolean") {
     throw new Error("Invalid local run checkpoint approval state");
+  }
+  if (workflow.sideEffectReason !== undefined
+    && (workflow.status !== "side_effect_unknown"
+      || !["manual_submission_observed", "submit_marker_state_unavailable", "submit_outcome_unknown"]
+        .includes(String(workflow.sideEffectReason)))) {
+    throw new Error("Invalid local run checkpoint side-effect reason");
   }
   if (!Array.isArray(checkpoint.events) || checkpoint.events.length > 10_000) {
     throw new Error("Invalid local run checkpoint events");

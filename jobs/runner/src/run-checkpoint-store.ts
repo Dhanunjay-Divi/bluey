@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type Dirent } from "node:fs";
 import {
   chmod,
   lstat,
@@ -24,7 +24,7 @@ import { profilePathsFromScope, sealProfile } from "./profile-store.js";
 export const CURRENT_CHECKPOINT_VERSION = 2 as const;
 export type RunCheckpointVersion = 1 | typeof CURRENT_CHECKPOINT_VERSION;
 const MAX_CHECKPOINT_BYTES = 5 * 1024 * 1024;
-const MAX_CHECKPOINTS = 512;
+const MAX_CHECKPOINTS_PER_PROFILE = 8;
 const PROFILE_SCOPE = /^[a-f0-9]{40}$/;
 const CHECKPOINT_SCOPE = /^[a-f0-9]{64}$/;
 
@@ -139,6 +139,33 @@ export async function listRunCheckpoints<Request extends object, Event>(
   checkpointScope: string;
   checkpoint: CloudRunCheckpoint<Request, Event>;
 }>> {
+  const scan = await scanRunCheckpoints<Request, Event>(root, key);
+  if (scan.failures.length > 0) throw new Error("Cloud run checkpoint scan failed");
+  return scan.checkpoints;
+}
+
+export interface RunCheckpointScanFailure {
+  profileScope: string;
+  checkpointScope?: string;
+  code: "checkpoint_limit_exceeded" | "checkpoint_unreadable" | "profile_unreadable";
+}
+
+export interface RunCheckpointScan<Request extends object, Event> {
+  checkpoints: Array<{
+    checkpointScope: string;
+    checkpoint: CloudRunCheckpoint<Request, Event>;
+  }>;
+  failures: RunCheckpointScanFailure[];
+}
+
+export async function scanRunCheckpoints<Request extends object, Event>(
+  root: string,
+  key: Buffer,
+  onlyProfileScope?: string,
+): Promise<RunCheckpointScan<Request, Event>> {
+  if (onlyProfileScope !== undefined && !PROFILE_SCOPE.test(onlyProfileScope)) {
+    throw new Error("Invalid cloud run checkpoint profile scope");
+  }
   const base = join(root, "run-checkpoints");
   await ensurePrivateDirectory(base);
   const profileDirectories = await readdir(base, { withFileTypes: true }).catch((error: unknown) => {
@@ -149,25 +176,54 @@ export async function listRunCheckpoints<Request extends object, Event>(
     checkpointScope: string;
     checkpoint: CloudRunCheckpoint<Request, Event>;
   }> = [];
-  for (const profileEntry of profileDirectories) {
-    if (!profileEntry.isDirectory() || !PROFILE_SCOPE.test(profileEntry.name)) continue;
+  const failures: RunCheckpointScanFailure[] = [];
+  for (const profileEntry of profileDirectories.sort((left, right) => left.name.localeCompare(right.name))) {
+    if (!PROFILE_SCOPE.test(profileEntry.name)
+      || (onlyProfileScope !== undefined && profileEntry.name !== onlyProfileScope)) continue;
+    if (!profileEntry.isDirectory() || profileEntry.isSymbolicLink()) {
+      failures.push({ profileScope: profileEntry.name, code: "profile_unreadable" });
+      continue;
+    }
     const profileDirectory = join(base, profileEntry.name);
-    await ensurePrivateDirectory(profileDirectory);
-    const entries = await readdir(profileDirectory, { withFileTypes: true });
-    for (const entry of entries) {
-      const matched = entry.isFile() && entry.name.match(/^([a-f0-9]{64})\.json\.enc$/);
-      if (!matched) continue;
-      if (results.length >= MAX_CHECKPOINTS) throw new Error("Too many cloud run checkpoints");
-      const checkpoint = await readRunCheckpoint<Request, Event>(
-        root,
-        profileEntry.name,
-        matched[1]!,
-        key,
-      );
-      if (checkpoint) results.push({ checkpointScope: matched[1]!, checkpoint });
+    let entries: Dirent[];
+    try {
+      await ensurePrivateDirectory(profileDirectory);
+      entries = await readdir(profileDirectory, { withFileTypes: true });
+    } catch {
+      failures.push({ profileScope: profileEntry.name, code: "profile_unreadable" });
+      continue;
+    }
+    const checkpointEntries = entries
+      .map((entry) => ({
+        entry,
+        matched: entry.name.match(/^([a-f0-9]{64})\.json\.enc$/),
+      }))
+      .filter((candidate) => candidate.matched !== null)
+      .sort((left, right) => left.entry.name.localeCompare(right.entry.name));
+    if (checkpointEntries.length > MAX_CHECKPOINTS_PER_PROFILE) {
+      failures.push({ profileScope: profileEntry.name, code: "checkpoint_limit_exceeded" });
+      continue;
+    }
+    for (const { matched } of checkpointEntries) {
+      const checkpointScope = matched![1]!;
+      try {
+        const checkpoint = await readRunCheckpoint<Request, Event>(
+          root,
+          profileEntry.name,
+          checkpointScope,
+          key,
+        );
+        if (checkpoint) results.push({ checkpointScope, checkpoint });
+      } catch {
+        failures.push({
+          profileScope: profileEntry.name,
+          checkpointScope,
+          code: "checkpoint_unreadable",
+        });
+      }
     }
   }
-  return results;
+  return { checkpoints: results, failures };
 }
 
 export async function removeRunCheckpoint(
@@ -290,7 +346,8 @@ function validateCheckpoint(value: unknown): asserts value is CloudRunCheckpoint
   if (!["prepared", "needs_input", "provider_review", "side_effect_unknown"]
     .includes(String(workflow.status))
     || typeof workflow.requestId !== "string"
-    || !/^[A-Za-z0-9:_-]{3,240}$/.test(workflow.requestId)) {
+    || !/^[A-Za-z0-9:_-]{3,240}$/.test(workflow.requestId)
+    || !requestIdMatchesRun(String(request.runId), workflow.requestId)) {
     throw new Error("Invalid cloud run checkpoint workflow state");
   }
   if (!phaseMatchesWorkflow(String(checkpoint.phase), String(workflow.status))) {
@@ -373,6 +430,12 @@ function phaseMatchesWorkflow(phase: string, status: string): boolean {
   if (phase === "needs_input") return status === "needs_input";
   if (phase === "provider_review") return status === "provider_review";
   return status === "side_effect_unknown";
+}
+
+function requestIdMatchesRun(runId: string, requestId: string): boolean {
+  return requestId === `${runId}:initial`
+    || (requestId.startsWith(`${runId}:resume:`)
+      && /^:resume:[1-6]$/.test(requestId.slice(runId.length)));
 }
 
 function nodeErrorCode(error: unknown): string | undefined {

@@ -78,6 +78,26 @@ describe("encrypted local browser checkpoints", () => {
     await expect(store.list()).resolves.toEqual([]);
   });
 
+  it("round-trips the non-PII manual-submission side-effect reason", async () => {
+    const root = await temporaryDirectory();
+    const store = await LocalCheckpointStore.open(root);
+    const checkpoint: LocalRunCheckpoint = {
+      ...fixture(),
+      phase: "side_effect_unknown",
+      workflow: {
+        status: "side_effect_unknown",
+        adapter: "greenhouse",
+        approvedSubmitActionConsumed: true,
+        sideEffectReason: "manual_submission_observed",
+      },
+    };
+    const scope = store.scopeFor(checkpoint.request);
+
+    await store.write(checkpoint);
+
+    await expect(store.read(scope)).resolves.toEqual(checkpoint);
+  });
+
   it("loads legacy checkpoints without manufacturing submit authority", async () => {
     const root = await temporaryDirectory();
     const store = await LocalCheckpointStore.open(root);

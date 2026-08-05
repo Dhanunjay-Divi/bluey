@@ -18,17 +18,38 @@ export interface ApprovedExecutionSnapshot {
 }
 
 /**
- * Reproduce the server's canonical approved-execution checksum. The checksum
- * covers the reviewed packet before approvedPacketChecksum is attached.
+ * Reproduce the server's canonical approved-execution checksum. Runtime
+ * metadata selects the explicit server schema and admission proof, while the
+ * checksum covers the reviewed packet before those transport fields and
+ * approvedPacketChecksum are attached.
  */
 export function approvedExecutionChecksum(
   packet: ApplicationPacket,
   job: NormalizedJob,
 ): string {
-  const packetWithoutChecksum = cloneJson(packet) as ApplicationPacket;
+  const packetWithoutChecksum = { ...packet } as ApplicationPacket;
   delete (packetWithoutChecksum as Partial<ApplicationPacket>).approvedPacketChecksum;
+  const schemaVersion = packet.approvedExecutionSchemaVersion ?? 1;
+  const admission = packet.approvedExecutionAdmission;
+  delete packetWithoutChecksum.approvedExecutionSchemaVersion;
+  delete packetWithoutChecksum.approvedExecutionAdmission;
+  if (schemaVersion === 1) {
+    if (admission !== undefined) {
+      throw new ApprovedExecutionIntegrityError("Legacy approval cannot carry admission authority");
+    }
+    return sha256Hex(canonicalJson({
+      schema_version: 1,
+      packet: packetWithoutChecksum,
+      job,
+    }));
+  }
+  if (schemaVersion !== 2) {
+    throw new ApprovedExecutionIntegrityError("Unsupported approved execution checksum version");
+  }
+  assertApprovedExecutionAdmission(admission);
   return sha256Hex(canonicalJson({
-    schema_version: 1,
+    schema_version: 2,
+    admission,
     packet: packetWithoutChecksum,
     job,
   }));
@@ -70,23 +91,108 @@ function canonicalJson(value: unknown): string {
 
 function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) {
-    return value.map((entry) => entry === undefined ? null : canonicalValue(entry));
+    return value.map((entry) => canonicalValue(entry));
   }
   if (value && typeof value === "object") {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new ApprovedExecutionIntegrityError(
+        "Approved execution contains a non-JSON object",
+      );
+    }
     const record = value as Record<string, unknown>;
     const sorted: Record<string, unknown> = {};
-    for (const key of Object.keys(record).sort(compareCodeUnits)) {
+    for (const key of Object.keys(record).sort(compareUnicodeScalars)) {
       const entry = record[key];
-      if (entry !== undefined) sorted[key] = canonicalValue(entry);
+      if (hasUnpairedSurrogate(key)) {
+        throw new ApprovedExecutionIntegrityError(
+          "Approved execution contains a non-interoperable string",
+        );
+      }
+      sorted[key] = canonicalValue(entry);
     }
     return sorted;
   }
-  if (typeof value === "number" && !Number.isFinite(value)) return null;
-  return value;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || Object.is(value, -0)) {
+      throw new ApprovedExecutionIntegrityError(
+        "Approved execution contains a non-interoperable number",
+      );
+    }
+    return value;
+  }
+  if (typeof value === "string") {
+    if (hasUnpairedSurrogate(value)) {
+      throw new ApprovedExecutionIntegrityError(
+        "Approved execution contains a non-interoperable string",
+      );
+    }
+    return value;
+  }
+  if (value === null || typeof value === "boolean") return value;
+  throw new ApprovedExecutionIntegrityError("Approved execution contains a non-JSON value");
 }
 
 function cloneJson(value: unknown): unknown {
+  canonicalValue(value);
   return JSON.parse(JSON.stringify(value)) as unknown;
+}
+
+function hasUnpairedSurrogate(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!Number.isInteger(next) || next < 0xdc00 || next > 0xdfff) return true;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function assertApprovedExecutionAdmission(value: unknown): void {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ApprovedExecutionIntegrityError("Approved execution admission is missing");
+  }
+  const admission = value as Record<string, unknown>;
+  if (admission.kind === "review_approval") {
+    if (!sameKeys(admission, ["kind"])) {
+      throw new ApprovedExecutionIntegrityError("Review approval admission is invalid");
+    }
+    return;
+  }
+  if (admission.kind !== "track_auto_submit"
+    || !sameKeys(admission, [
+      "authority_fingerprint",
+      "authorization_id",
+      "career_track_id",
+      "kind",
+      "revision_no",
+    ])
+    || !validAdmissionId(admission.authorization_id)
+    || !validAdmissionId(admission.career_track_id)
+    || !Number.isSafeInteger(admission.revision_no)
+    || (admission.revision_no as number) <= 0
+    || typeof admission.authority_fingerprint !== "string"
+    || !CHECKSUM_PATTERN.test(admission.authority_fingerprint)) {
+    throw new ApprovedExecutionIntegrityError("Auto-submit admission is invalid");
+  }
+}
+
+function sameKeys(value: Record<string, unknown>, expected: string[]): boolean {
+  const actual = Object.keys(value).sort();
+  return actual.length === expected.length
+    && actual.every((key, index) => key === expected[index]);
+}
+
+function validAdmissionId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= 240
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function deepFreeze<T>(value: T): T {
@@ -95,8 +201,16 @@ function deepFreeze<T>(value: T): T {
   return Object.freeze(value);
 }
 
-function compareCodeUnits(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+function compareUnicodeScalars(left: string, right: string): number {
+  const leftScalars = [...left];
+  const rightScalars = [...right];
+  const length = Math.min(leftScalars.length, rightScalars.length);
+  for (let index = 0; index < length; index += 1) {
+    const leftCodePoint = leftScalars[index]!.codePointAt(0)!;
+    const rightCodePoint = rightScalars[index]!.codePointAt(0)!;
+    if (leftCodePoint !== rightCodePoint) return leftCodePoint - rightCodePoint;
+  }
+  return leftScalars.length - rightScalars.length;
 }
 
 function constantTimeTextEqual(left: string, right: string): boolean {

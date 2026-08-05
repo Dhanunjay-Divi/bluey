@@ -1,4 +1,8 @@
 import { createHash, randomBytes } from "node:crypto";
+import {
+  assertFinalSubmitProof,
+  type FinalSubmitProof,
+} from "@bluey/jobs-automation";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
@@ -51,6 +55,14 @@ export interface ExecutionLeaseCheckpointReconciliation {
   checkpointPhase: ReconciledCheckpointPhase;
 }
 
+export interface ExecutionLeaseSubmittedFinishReplay {
+  accountId: string;
+  applicationId: string;
+  runId: string;
+  leaseToken: string;
+  fence: number;
+}
+
 export interface ExecutionLeaseCheckpointMetadata {
   leaseToken: string;
   fence: number;
@@ -87,7 +99,7 @@ interface LeaseGrant {
 
 interface LeaseOperations {
   heartbeat(): Promise<void>;
-  irreversible(): Promise<void>;
+  irreversible(proof: FinalSubmitProof): Promise<void>;
   finish(outcome: ExecutionLeaseFinishOutcome): Promise<void>;
 }
 
@@ -148,13 +160,18 @@ export class ActiveExecutionLease {
     };
   }
 
-  async beforeFinalSubmit(): Promise<void> {
+  async beforeFinalSubmit(proof: FinalSubmitProof): Promise<void> {
     if (this.#finishPromise || this.#finalSubmitAttempted) {
+      throw new ExecutionLeaseError("irreversible", "invalid_state");
+    }
+    try {
+      assertFinalSubmitProof(proof);
+    } catch {
       throw new ExecutionLeaseError("irreversible", "invalid_state");
     }
     // Set this before I/O: a lost success response must permanently consume the local attempt.
     this.#finalSubmitAttempted = true;
-    await this.#operations.irreversible();
+    await this.#operations.irreversible(proof);
     this.#finalSubmitAuthorized = true;
   }
 
@@ -261,12 +278,13 @@ export class ExecutionLeaseClient {
         });
         parseLeaseRecord("heartbeat", response, input.runId, grant.fence, ["prepared", "click_started"]);
       },
-      irreversible: async () => {
+      irreversible: async (proof) => {
         const response = await this.request("irreversible", `/api/jobs/internal/execution-leases/${runPath}/irreversible`, {
           ...common,
           lease_token: grant.leaseToken,
           fence: grant.fence,
           action: "submit",
+          final_submit_proof: proof,
         });
         parseLeaseRecord("irreversible", response, input.runId, grant.fence, ["click_started"]);
       },
@@ -310,6 +328,21 @@ export class ExecutionLeaseClient {
       input.runId,
       input.fence,
       ["released", "side_effect_unknown", "submitted"],
+    );
+  }
+
+  async replaySubmittedFinish(input: ExecutionLeaseSubmittedFinishReplay): Promise<void> {
+    const runPath = encodeURIComponent(input.runId);
+    await this.request(
+      "finish",
+      `/api/jobs/internal/execution-leases/${runPath}/finish`,
+      {
+        account_id: input.accountId,
+        application_id: input.applicationId,
+        lease_token: input.leaseToken,
+        fence: input.fence,
+        outcome: "submitted",
+      },
     );
   }
 

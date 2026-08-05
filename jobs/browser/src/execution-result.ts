@@ -1,23 +1,24 @@
-import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import {
   type EvidenceObjectUpload,
   type ExecutionResult,
+  type MaterializedDocument,
   type NormalizedJob,
   PlaywrightBrowserPage,
 } from "@bluey/jobs-automation";
 
 export async function evidenceObject(
-  path: string,
+  document: MaterializedDocument,
   kind: "resume" | "cover_letter" | "attachment",
   mediaType: string,
-  sha256: string,
 ): Promise<EvidenceObjectUpload> {
+  const bytes = Buffer.from(document.bytesBase64, "base64");
   return {
-    original_key: path,
+    original_key: document.path,
     kind,
     media_type: mediaType,
-    sha256,
-    bytes_base64: (await readFile(path)).toString("base64"),
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+    bytes_base64: bytes.toString("base64"),
   };
 }
 

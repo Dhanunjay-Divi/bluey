@@ -33,6 +33,12 @@ export type FormControlKind =
   | "hidden"
   | "other";
 
+export interface FormFileEvidence {
+  name: string;
+  byteLength: number;
+  sha256: string;
+}
+
 export interface FormControl {
   selector: string;
   kind: FormControlKind;
@@ -43,9 +49,16 @@ export interface FormControl {
   value: string;
   checked?: boolean;
   options?: Array<{ label: string; value: string }>;
+  files?: FormFileEvidence[];
 }
 
 export interface BrowserPage {
+  installExactSubmitGuard(
+    adapter: CertifiedFinalSubmitAdapter,
+    approvedCanonicalUrl: string,
+  ): Promise<void>;
+  beginExactSubmitGuard(): Promise<void>;
+  assertExactSubmitGuardClean(): Promise<void>;
   url(): string;
   title(): Promise<string>;
   locator(selector: string): BrowserLocator;
@@ -64,7 +77,15 @@ export interface BrowserLocator {
   isVisible(): Promise<boolean>;
   selectOption(value: string): Promise<void>;
   setChecked(checked: boolean): Promise<void>;
-  setInputFiles(paths: string[]): Promise<void>;
+  setInputFiles(paths: string[]): Promise<FormFileEvidence[]>;
+  effectiveSubmitTarget(
+    adapter: CertifiedFinalSubmitAdapter,
+  ): Promise<EffectiveSubmitTargetIdentity>;
+  successfulSubmitEvidence(
+    trustedFields: ReadonlyArray<Readonly<TrustedSubmitFieldValue>>,
+    providerJobKey: string,
+  ): Promise<Readonly<ExactSubmitFormEvidence>>;
+  clickWithExactSubmit(expectation: ExactSubmitExpectation): Promise<number>;
 }
 
 export interface NormalizedJob {
@@ -97,6 +118,16 @@ export interface ApplicationPacket {
   applicationIdentityId?: string;
   applicationEmail?: string;
   browserProfileId?: string;
+  approvedExecutionSchemaVersion?: 1 | 2;
+  approvedExecutionAdmission?:
+    | { kind: "review_approval" }
+    | {
+        kind: "track_auto_submit";
+        authorization_id: string;
+        career_track_id: string;
+        revision_no: number;
+        authority_fingerprint: string;
+      };
 }
 
 export interface InterventionRequest {
@@ -132,6 +163,7 @@ export interface ValidationIssue {
 
 export interface SubmissionReceipt {
   status: "submitted" | "needs_input" | "failed";
+  submitHttpStatus?: number;
   confirmationText?: string;
   confirmationUrl?: string;
   screenshotPath?: string;
@@ -142,14 +174,94 @@ export interface SubmissionReceipt {
 
 export type FinalSubmitActivationOutcome = "activated" | "activation_uncertain";
 
+export type CertifiedFinalSubmitAdapter = "greenhouse" | "lever";
+
+export type CertifiedFinalSubmitControl =
+  | "greenhouse_submit_application"
+  | "lever_application_submit";
+
+export interface EffectiveSubmitTargetIdentity {
+  actionUrl: string;
+  method: string;
+  enctype: string;
+  formTarget: string;
+  providerJobKey: string;
+  formIdentity: string;
+}
+
+export interface ExactSubmitFileEvidence extends FormFileEvidence {
+  fieldName: string;
+}
+
+export interface ExactSubmitFieldEvidence {
+  fieldName: string;
+  valueByteLength: number;
+  valueSha256: string;
+}
+
+export interface ExactSubmitPartOrderEntry {
+  kind: "field" | "file";
+  index: number;
+}
+
+export interface ExactSubmitFormEvidence {
+  fields: ReadonlyArray<Readonly<ExactSubmitFieldEvidence>>;
+  partOrder: ReadonlyArray<Readonly<ExactSubmitPartOrderEntry>>;
+}
+
+export interface TrustedSubmitFieldValue {
+  fieldName: string;
+  value: string;
+}
+
+export interface ExactSubmitExpectation {
+  target: EffectiveSubmitTargetIdentity;
+  files: ReadonlyArray<Readonly<ExactSubmitFileEvidence>>;
+  fields: ReadonlyArray<Readonly<ExactSubmitFieldEvidence>>;
+  partOrder: ReadonlyArray<Readonly<ExactSubmitPartOrderEntry>>;
+}
+
+/**
+ * Provider-owned evidence emitted only at the exact certified submit-control
+ * transition. Document evidence is deliberately added by the runner after the
+ * approved PDFs have been materialized and hashed.
+ */
+export interface ProviderFinalSubmitProof {
+  adapter: CertifiedFinalSubmitAdapter;
+  adapterVersion: string;
+  control: CertifiedFinalSubmitControl;
+  target: EffectiveSubmitTargetIdentity;
+  files: ReadonlyArray<Readonly<ExactSubmitFileEvidence>>;
+  fields: ReadonlyArray<Readonly<ExactSubmitFieldEvidence>>;
+  partOrder: ReadonlyArray<Readonly<ExactSubmitPartOrderEntry>>;
+}
+
+export interface FinalSubmitDocumentProof {
+  kind: "resume" | "cover_letter";
+  versionId?: string;
+  sha256: string;
+}
+
+export interface FinalSubmitJobProof {
+  approvedCanonicalUrl: string;
+  pageUrl: string;
+}
+
+export interface FinalSubmitProof extends ProviderFinalSubmitProof {
+  schemaVersion: 3;
+  job: FinalSubmitJobProof;
+  documents: FinalSubmitDocumentProof[];
+}
+
 export interface AdapterContext {
   runner: RunnerKind;
   runId: string;
   accountId: string;
+  approvedCanonicalUrl: string;
   page: BrowserPage;
   packet: ApplicationPacket;
   log(event: string, details?: Record<string, unknown>): Promise<void>;
-  beforeFinalSubmit?(): Promise<void>;
+  beforeFinalSubmit?(proof: ProviderFinalSubmitProof): Promise<void>;
   afterFinalSubmit?(outcome: FinalSubmitActivationOutcome): Promise<void>;
 }
 

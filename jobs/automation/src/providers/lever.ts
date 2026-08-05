@@ -4,6 +4,8 @@ import type {
   ApplicationPacket,
   BrowserLocator,
   BrowserPage,
+  EffectiveSubmitTargetIdentity,
+  ExactSubmitFormEvidence,
   FormControl,
   InterventionRequest,
   NormalizedJob,
@@ -12,11 +14,24 @@ import type {
 } from "../contracts.js";
 import {
   checkedExpectation,
+  exactSubmitFileEvidence,
+  exactSubmitTrustedFieldValues,
   fileExpectation,
   type FormFillExpectation,
   valueExpectation,
   verifyFillExpectations,
 } from "../form-readback.js";
+import {
+  assertApprovedProviderJob,
+  assertApprovedProviderJobOrConfirmation,
+  captureEffectiveSubmitTarget,
+  isApprovedProviderConfirmation,
+  sameEffectiveSubmitTarget,
+  sameExactSubmitFields,
+  sameExactSubmitPartOrder,
+} from "../effective-submit-target.js";
+import { ExactSubmitEvidenceError } from "../trusted-submit.js";
+import { hasNegativeSubmissionOutcome } from "../submission-confirmation.js";
 
 export const LEVER_ADAPTER_VERSION = "2026.07.0-beta.1";
 
@@ -79,6 +94,8 @@ interface LeverSession {
   operationalIssues: ValidationIssue[];
   validationIssues: ValidationIssue[];
   fillExpectations: FormFillExpectation[];
+  authorizedProviderJobKey?: string;
+  submitHttpStatus?: number;
   challenge?: InterventionRequest;
   current?: LeverStateSnapshot;
   history: LeverStateSnapshot[];
@@ -106,6 +123,19 @@ const SUBMIT_SELECTORS = [
   "#application-form .last-section-apply button.template-btn-submit[type='submit']",
 ];
 
+const SUBMIT_IDENTITY_ATTRIBUTES = [
+  "id",
+  "name",
+  "type",
+  "value",
+  "data-testid",
+  "data-qa",
+  "formaction",
+  "aria-label",
+  "disabled",
+  "aria-disabled",
+] as const;
+
 const CONFIRMATION_PATTERNS = [
   /thank you for (?:submitting )?your application[.!]?/i,
   /thank you for applying[.!]?/i,
@@ -113,13 +143,6 @@ const CONFIRMATION_PATTERNS = [
   /your application (?:was|has been) (?:successfully )?submitted[.!]?/i,
   /your application has been received[.!]?/i,
   /we (?:have|'ve) received your application[.!]?/i,
-];
-
-const NON_CONFIRMATION_PATTERNS = [
-  /already (?:applied|submitted (?:an|your) application)/i,
-  /application (?:was|has been) already submitted/i,
-  /unable to submit (?:the |your )?application/i,
-  /could not submit (?:the |your )?application/i,
 ];
 
 const CLOSED_PATTERNS = [
@@ -130,7 +153,7 @@ const CLOSED_PATTERNS = [
 ];
 
 const VISIBLE_FORM_ERROR_PATTERNS = [
-  /please (?:complete|fill (?:out )?)all required fields/i,
+  /please (?:complete|fill (?:out )?)\s+all required fields/i,
   /please enter a valid email(?: address)?/i,
   /there (?:was|were) (?:an error|errors) (?:with|submitting) your application/i,
   /correct the highlighted fields/i,
@@ -266,6 +289,12 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
 
   async prepare(context: AdapterContext): Promise<void> {
     const session = this.startSession(context);
+    await context.page.installExactSubmitGuard("lever", context.approvedCanonicalUrl);
+    assertApprovedProviderJobOrConfirmation(
+      "lever",
+      context.approvedCanonicalUrl,
+      context.page.url(),
+    );
     session.pageKind = await recognizePage(context.page, this.detect.bind(this));
     await this.transition(
       context,
@@ -365,12 +394,15 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       return;
     }
 
+    assertApprovedProviderJob("lever", context.approvedCanonicalUrl, context.page.url());
+    await context.page.beginExactSubmitGuard();
     session.prepared = true;
     await this.transition(context, session, "prepare", "ready");
   }
 
   async fill(context: AdapterContext): Promise<void> {
     const session = await this.ensureSession(context);
+    await context.page.installExactSubmitGuard("lever", context.approvedCanonicalUrl);
     const challenge = await detectChallenge(context.page);
     if (challenge) {
       session.challenge = challenge;
@@ -393,6 +425,8 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       return;
     }
 
+    assertApprovedProviderJob("lever", context.approvedCanonicalUrl, context.page.url());
+    await context.page.beginExactSubmitGuard();
     const controls = await leverControls(context.page);
     session.fillExpectations = [];
     let filled = 0;
@@ -404,8 +438,13 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
         if (control.kind === "file") {
           const path = attachmentPath(control, context.packet);
           if (!path) continue;
-          await locator.setInputFiles([path]);
-          session.fillExpectations.push(fileExpectation(control, displayField(control), path));
+          const selectedFiles = await locator.setInputFiles([path]);
+          session.fillExpectations.push(fileExpectation(
+            control,
+            displayField(control),
+            path,
+            selectedFiles,
+          ));
           filled += 1;
           continue;
         }
@@ -442,6 +481,7 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
         });
       }
     }
+    Object.freeze(session.fillExpectations);
 
     session.validationIssues = [];
     await this.transition(context, session, "fill", "completed", filled);
@@ -485,6 +525,11 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       await this.transition(context, session, "submit", "blocked");
       return this.emitReceipt(context, session, issueReceipt(blocking, context.page.url()), "blocked");
     }
+    const authorizedFileEvidence = exactSubmitFileEvidence(
+      session.fillExpectations,
+      await leverControls(context.page),
+    );
+    const trustedFieldValues = exactSubmitTrustedFieldValues(session.fillExpectations);
 
     const finalReviewApproved = submitOptions.finalReviewApproved === true
       || await this.options.finalReviewApproval?.(context) === true;
@@ -512,15 +557,59 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       await this.transition(context, session, "submit", "blocked");
       return this.emitReceipt(context, session, result, "blocked");
     }
+    const authorizedUrl = context.page.url();
+    const authorizedSubmit = submit.locator;
+    const authorizedSubmitIdentity = await submitControlIdentity(authorizedSubmit);
+    const authorizedSubmitTarget = await captureEffectiveSubmitTarget(
+      authorizedSubmit,
+      "lever",
+      context.approvedCanonicalUrl,
+      authorizedUrl,
+    );
+    const authorizedSubmitEvidence = await authorizedSubmit.successfulSubmitEvidence(
+      trustedFieldValues,
+      authorizedSubmitTarget.providerJobKey,
+    );
+    session.authorizedProviderJobKey = authorizedSubmitTarget.providerJobKey;
+    await context.page.assertExactSubmitGuardClean();
 
     // Fence the irreversible action before awaiting the browser. Any exception
     // from this point forward is side-effect uncertainty, never a retry signal.
+    if (!context.beforeFinalSubmit) {
+      throw new Error("Lever final submit authority is unavailable");
+    }
     session.submitClicked = true;
     await this.transition(context, session, "submit", "click_started");
-    await context.beforeFinalSubmit?.();
+    await context.beforeFinalSubmit({
+      adapter: "lever",
+      adapterVersion: LEVER_ADAPTER_VERSION,
+      control: "lever_application_submit",
+      target: authorizedSubmitTarget,
+      files: authorizedFileEvidence,
+      fields: authorizedSubmitEvidence.fields,
+      partOrder: authorizedSubmitEvidence.partOrder,
+    });
+    const finalSubmit = await this.verifyAuthorizedSubmitState(
+      context,
+      session,
+      authorizedUrl,
+      authorizedSubmit,
+      authorizedSubmitIdentity,
+      authorizedSubmitTarget,
+      authorizedSubmitEvidence,
+      trustedFieldValues,
+    );
     try {
-      await submit.locator.click();
-    } catch {
+      session.submitHttpStatus = await finalSubmit.clickWithExactSubmit({
+        target: authorizedSubmitTarget,
+        files: authorizedFileEvidence,
+        fields: authorizedSubmitEvidence.fields,
+        partOrder: authorizedSubmitEvidence.partOrder,
+      });
+    } catch (error) {
+      if (error instanceof ExactSubmitEvidenceError) {
+        throw new Error("Lever submit evidence changed during activation");
+      }
       await context.afterFinalSubmit?.("activation_uncertain");
       return this.emitReceipt(context, session, uncertainReceipt(context.page.url()), "uncertain");
     }
@@ -543,11 +632,36 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
     }
 
     const body = await context.page.bodyText();
+    const applicationForm = context.page.locator(APPLICATION_FORM);
+    const applicationFormVisible = await applicationForm.count().catch(() => 0) === 1
+      && await applicationForm.isVisible().catch(() => false);
+    const rerenderedSubmit = await locateUniqueVisible(context.page, SUBMIT_SELECTORS);
+    if (session.submitClicked && (applicationFormVisible
+      || rerenderedSubmit.locator
+      || rerenderedSubmit.problem === "ambiguous"
+      || VISIBLE_FORM_ERROR_PATTERNS.some((pattern) => pattern.test(body)))) {
+      return this.emitReceipt(
+        context,
+        session,
+        postSubmitFormReceipt(context.page.url()),
+        "uncertain",
+      );
+    }
     const confirmationText = confirmationExcerpt(body);
-    if (confirmationText && session.submitClicked) {
+    if (confirmationText
+      && session.submitClicked
+      && session.submitHttpStatus !== undefined
+      && session.authorizedProviderJobKey
+      && isApprovedProviderConfirmation(
+        "lever",
+        context.approvedCanonicalUrl,
+        context.page.url(),
+        session.authorizedProviderJobKey,
+      )) {
       session.pageKind = "confirmation";
       return this.emitReceipt(context, session, {
         status: "submitted",
+        submitHttpStatus: session.submitHttpStatus,
         confirmationText,
         confirmationUrl: context.page.url(),
         submittedAt: (this.options.now?.() ?? new Date()).toISOString(),
@@ -600,6 +714,8 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       operationalIssues: [],
       validationIssues: [],
       fillExpectations: [],
+      authorizedProviderJobKey: previous?.authorizedProviderJobKey,
+      submitHttpStatus: previous?.submitHttpStatus,
       history: previous?.history ?? [],
     };
     this.sessions.set(context, session);
@@ -683,6 +799,17 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       const answer = answerFor(control, context.packet);
       const known = Boolean(attachment || matchCanonicalField(control) || answer !== undefined);
 
+      if (control.kind === "file"
+        && hasAcceptedValue(control, controls)
+        && (!attachment || !attachmentPath(control, context.packet))) {
+        addIssue(issues, {
+          field,
+          message: `Lever found an attachment in ${field} that is not part of the approved packet.`,
+          severity: "blocking",
+        });
+        continue;
+      }
+
       if (control.required && (control.kind === "other" || (control.kind === "file" && !attachment))) {
         addIssue(issues, {
           field,
@@ -739,6 +866,82 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
       });
     }
     return issues;
+  }
+
+  private async verifyAuthorizedSubmitState(
+    context: AdapterContext,
+    session: LeverSession,
+    authorizedUrl: string,
+    authorizedSubmit: BrowserLocator,
+    authorizedSubmitIdentity: string,
+    authorizedSubmitTarget: EffectiveSubmitTargetIdentity,
+    authorizedSubmitEvidence: Readonly<ExactSubmitFormEvidence>,
+    trustedFieldValues: ReturnType<typeof exactSubmitTrustedFieldValues>,
+  ): Promise<BrowserLocator> {
+    if (context.page.url() !== authorizedUrl) {
+      throw new Error("Lever page changed after final submit authority");
+    }
+    if (await detectChallenge(context.page)) {
+      throw new Error("Lever application changed after final submit authority");
+    }
+
+    let issues: ValidationIssue[];
+    try {
+      issues = await this.collectValidationIssues(context, session);
+    } catch {
+      throw new Error("Lever controls changed after final submit authority");
+    }
+    if (issues.some((issue) => issue.severity === "blocking")) {
+      throw new Error("Lever fields changed after final submit authority");
+    }
+
+    const originalCount = await authorizedSubmit.count().catch(() => 0);
+    const originalVisible = originalCount === 1
+      && await authorizedSubmit.isVisible().catch(() => false);
+    if (!originalVisible) {
+      throw new Error("Lever submit control changed after final submit authority");
+    }
+
+    const currentSubmit = await locateUniqueVisible(context.page, SUBMIT_SELECTORS);
+    if (!currentSubmit.locator) {
+      throw new Error("Lever submit control changed after final submit authority");
+    }
+    const currentSubmitIdentity = await submitControlIdentity(currentSubmit.locator);
+    let currentSubmitTarget: EffectiveSubmitTargetIdentity;
+    try {
+      currentSubmitTarget = await captureEffectiveSubmitTarget(
+        currentSubmit.locator,
+        "lever",
+        context.approvedCanonicalUrl,
+        context.page.url(),
+      );
+    } catch {
+      throw new Error("Lever submit target changed after final submit authority");
+    }
+    if (currentSubmitIdentity !== authorizedSubmitIdentity) {
+      throw new Error("Lever submit control changed after final submit authority");
+    }
+    if (!sameEffectiveSubmitTarget(currentSubmitTarget, authorizedSubmitTarget)) {
+      throw new Error("Lever submit target changed after final submit authority");
+    }
+    const currentSubmitEvidence = await currentSubmit.locator.successfulSubmitEvidence(
+      trustedFieldValues,
+      currentSubmitTarget.providerJobKey,
+    );
+    if (!sameExactSubmitFields(
+      currentSubmitEvidence.fields,
+      authorizedSubmitEvidence.fields,
+    ) || !sameExactSubmitPartOrder(
+      currentSubmitEvidence.partOrder,
+      authorizedSubmitEvidence.partOrder,
+    )) {
+      throw new Error("Lever submit fields changed after final submit authority");
+    }
+    await context.page.assertExactSubmitGuardClean();
+    if (context.page.url() !== authorizedUrl) {
+      throw new Error("Lever page changed after final submit authority");
+    }
+    return currentSubmit.locator;
   }
 
   private async transition(
@@ -828,6 +1031,17 @@ async function locateUniqueVisible(page: BrowserPage, selectors: string[]): Prom
   }
   if (matches.length > 1) return { problem: "ambiguous" };
   return matches[0] ? { locator: matches[0] } : { problem: "missing" };
+}
+
+async function submitControlIdentity(locator: BrowserLocator): Promise<string> {
+  const [text, ...attributes] = await Promise.all([
+    locator.textContent(),
+    ...SUBMIT_IDENTITY_ATTRIBUTES.map((attribute) => locator.getAttribute(attribute)),
+  ]);
+  return JSON.stringify([
+    (text ?? "").replace(/\s+/g, " ").trim(),
+    ...attributes,
+  ]);
 }
 
 async function detectChallenge(page: BrowserPage): Promise<InterventionRequest | undefined> {
@@ -962,6 +1176,7 @@ function hasAcceptedValue(control: FormControl, controls: FormControl[]): boolea
       && candidate.checked === true);
   }
   if (control.kind === "checkbox") return control.checked === true;
+  if (control.kind === "file" && control.files !== undefined) return control.files.length > 0;
   return control.value.trim().length > 0;
 }
 
@@ -989,7 +1204,10 @@ function normalize(value: string): string {
 
 function confirmationExcerpt(body: string): string | undefined {
   const normalized = body.replace(/\s+/g, " ").trim();
-  if ([...NON_CONFIRMATION_PATTERNS, ...CLOSED_PATTERNS].some((pattern) => pattern.test(normalized))) return undefined;
+  if (hasNegativeSubmissionOutcome(normalized)
+    || CLOSED_PATTERNS.some((pattern) => pattern.test(normalized))) {
+    return undefined;
+  }
   for (const pattern of CONFIRMATION_PATTERNS) {
     const match = pattern.exec(normalized);
     if (!match || match.index === undefined) continue;
@@ -1067,6 +1285,22 @@ function uncertainReceipt(url: string): SubmissionReceipt {
       kind: "browser_takeover",
       title: "Confirm the Lever application result",
       detail: "The submit response is uncertain. Inspect the preserved browser or employer evidence before deciding what happened.",
+      takeoverUrl: url,
+      resolution: { kind: "browser_takeover", resumeAfter: false },
+    },
+  };
+}
+
+function postSubmitFormReceipt(url: string): SubmissionReceipt {
+  const message = "Lever returned the application form or a validation error after Submit; "
+    + "the side effect is uncertain.";
+  return {
+    status: "needs_input",
+    issues: [{ field: "submission", message, severity: "blocking" }],
+    intervention: {
+      kind: "browser_takeover",
+      title: "Review the Lever submission error",
+      detail: `${message} Bluey will not treat confirmation-looking text as success or retry.`,
       takeoverUrl: url,
       resolution: { kind: "browser_takeover", resumeAfter: false },
     },

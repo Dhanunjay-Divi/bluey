@@ -3,12 +3,14 @@ import { fileURLToPath } from "node:url";
 import path from "node:path";
 
 export const JOBS_PARITY_TABLES = [
+  "account_deletion_intents",
   "jobs_communication_actions",
   "jobs_discovery_memberships",
   "jobs_discovery_runs",
   "jobs_discovery_sources",
   "jobs_execution_leases",
   "jobs_local_run_resume_actions",
+  "jobs_submission_evidence_capacity",
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
@@ -47,6 +49,13 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     [
       "idx_jobs_local_resume_actions_application on jobs_local_run_resume_actions (account_id, application_id, created_at_ms desc)",
       "unique idx_jobs_local_resume_actions_active_run on jobs_local_run_resume_actions (run_id) where status = 'approved'",
+    ].sort(),
+  ],
+  [
+    "jobs_submission_evidence_capacity",
+    [
+      "idx_jobs_submission_evidence_capacity_account on jobs_submission_evidence_capacity (account_id, state, expires_at_ms)",
+      "unique idx_jobs_submission_evidence_capacity_active_application on jobs_submission_evidence_capacity (account_id, application_id) where state = 'active'",
     ].sort(),
   ],
 ]);
@@ -134,16 +143,16 @@ function extractIndexes(sql, tableName) {
 }
 
 function parityTableNames(sql) {
-  return [...sql.matchAll(/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+(jobs_[A-Za-z0-9_]+)/gi)]
+  const expectedNames = new Set(JOBS_PARITY_TABLES);
+  const names = [...sql.matchAll(
+    /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gi,
+  )]
     .map((match) => match[1].toLowerCase())
     .filter(
       (tableName) =>
-        tableName === "jobs_communication_actions" ||
-        tableName.startsWith("jobs_discovery_") ||
-        tableName === "jobs_execution_leases" ||
-        tableName === "jobs_local_run_resume_actions",
-    )
-    .sort();
+        expectedNames.has(tableName) || tableName.startsWith("jobs_discovery_"),
+    );
+  return [...new Set(names)].sort();
 }
 
 function firstDifference(left, right) {
@@ -211,15 +220,41 @@ function main() {
     repoRoot,
     "infra/sqlite/server-runtime/041_jobs_communication_actions.sql",
   );
+  const sqliteDeletionIntentPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/043_account_deletion_intents.sql",
+  );
+  const sqliteEvidenceCapacityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/044_jobs_submission_evidence_reservations.sql",
+  );
   const postgresPath = path.join(repoRoot, "infra/postgres/server-runtime/002_jobs.sql");
   const postgresCommunicationPath = path.join(
     repoRoot,
     "infra/postgres/server-runtime/019_jobs_communication_actions.sql",
   );
-  const sqliteSource = [sqlitePath, sqliteCommunicationPath]
+  const postgresDeletionIntentPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/021_account_deletion_intents.sql",
+  );
+  const postgresEvidenceCapacityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/022_jobs_submission_evidence_reservations.sql",
+  );
+  const sqliteSource = [
+    sqlitePath,
+    sqliteCommunicationPath,
+    sqliteDeletionIntentPath,
+    sqliteEvidenceCapacityPath,
+  ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
-  const postgresSource = [postgresPath, postgresCommunicationPath]
+  const postgresSource = [
+    postgresPath,
+    postgresCommunicationPath,
+    postgresDeletionIntentPath,
+    postgresEvidenceCapacityPath,
+  ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
   const issues = compareJobsSchemas(sqliteSource, postgresSource);

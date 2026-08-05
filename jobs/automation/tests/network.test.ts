@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { assertPublicApplicationUrl, isPrivateAddress } from "../src/network.js";
+import {
+  CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS,
+  assertPublicApplicationUrl,
+  isPrivateAddress,
+} from "../src/network.js";
 
 describe("application navigation policy", () => {
   it.each([
@@ -24,5 +28,13 @@ describe("application navigation policy", () => {
   it("rejects private and credential-bearing application URLs", async () => {
     await expect(assertPublicApplicationUrl("https://127.0.0.1/jobs/1")).rejects.toThrow("Private network");
     await expect(assertPublicApplicationUrl("https://user:pass@8.8.8.8/jobs/1")).rejects.toThrow("credentials");
+  });
+
+  it("ships defense-in-depth browser transport restrictions", () => {
+    expect(CERTIFIED_BROWSER_TRANSPORT_HARDENING_ARGS).toEqual([
+      "--disable-quic",
+      "--disable-features=WebTransport",
+      "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+    ]);
   });
 });

@@ -1,4 +1,3 @@
-
 pub fn list_browser_sessions(pool: &DbPool, account_id: &str) -> Result<Vec<BrowserSession>> {
     list_payloads(
         pool,
@@ -27,7 +26,12 @@ pub fn upsert_browser_session(
     let payload = to_json(&value, "browser session")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_browser_sessions (
                     id, account_id, runner, status, session_json, created_at_ms, updated_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -44,10 +48,16 @@ pub fn upsert_browser_session(
                     value.updated_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            tx.execute(
                 "INSERT INTO jobs_browser_sessions (
                     id, account_id, runner, status, session_json, created_at_ms, updated_at_ms
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -64,6 +74,7 @@ pub fn upsert_browser_session(
                     &value.updated_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -301,15 +312,16 @@ fn prepare_intervention_answer_revision(
     let revisions = receipt
         .entry("packet_revisions".to_string())
         .or_insert_with(|| json!([]));
-    let revisions = revisions.as_array_mut().ok_or_else(|| {
-        anyhow::anyhow!("application packet revision history is invalid")
-    })?;
+    let revisions = revisions
+        .as_array_mut()
+        .ok_or_else(|| anyhow::anyhow!("application packet revision history is invalid"))?;
     revisions.push(revision.clone());
     receipt.insert("packet_revision".to_string(), revision);
 
-    let metadata = intervention.metadata.as_object_mut().ok_or_else(|| {
-        anyhow::anyhow!("this intervention cannot be answered")
-    })?;
+    let metadata = intervention
+        .metadata
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("this intervention cannot be answered"))?;
     metadata.insert("resolved_answer".to_string(), json!(answer));
     metadata.insert("answered_at_ms".to_string(), json!(now));
     metadata.insert("reapproval_required".to_string(), json!(true));
@@ -338,7 +350,7 @@ fn reject_irreversible_answer_revision(
         Some("click_started" | "submitted" | "side_effect_unknown")
     ) || matches!(
         local_ticket_status,
-        Some("complete" | "side_effect_unknown")
+        Some("click_started" | "complete" | "side_effect_unknown")
     ) {
         anyhow::bail!(
             "application submission is awaiting reconciliation; answers cannot change yet"
@@ -391,12 +403,8 @@ pub fn resolve_intervention_answer_for_review(
             let Some((job_id, raw)) = row else {
                 anyhow::bail!("application not found")
             };
-            let application = parse_application_json(
-                raw,
-                &application_id,
-                &job_id,
-                "job application",
-            )?;
+            let application =
+                parse_application_json(raw, &application_id, &job_id, "job application")?;
             let (revision, previous_run_id) =
                 prepare_intervention_answer_revision(intervention, application, answer, now)?;
 
@@ -475,8 +483,7 @@ pub fn resolve_intervention_answer_for_review(
                 )?;
                 if let Some(mut session) = browser_session {
                     session.status = "paused".to_string();
-                    session.current_step =
-                        "Application kit changed; review required".to_string();
+                    session.current_step = "Application kit changed; review required".to_string();
                     session.updated_at_ms = now;
                     let payload = to_json(&session, "browser session")?;
                     if tx.execute(
@@ -540,12 +547,8 @@ pub fn resolve_intervention_answer_for_review(
                 anyhow::bail!("application not found")
             };
             let job_id: String = row.get(0);
-            let application = parse_application_json(
-                row.get(1),
-                &application_id,
-                &job_id,
-                "job application",
-            )?;
+            let application =
+                parse_application_json(row.get(1), &application_id, &job_id, "job application")?;
             let (revision, previous_run_id) =
                 prepare_intervention_answer_revision(intervention, application, answer, now)?;
 
@@ -622,8 +625,7 @@ pub fn resolve_intervention_answer_for_review(
                 )?;
                 if let Some(mut session) = browser_session {
                     session.status = "paused".to_string();
-                    session.current_step =
-                        "Application kit changed; review required".to_string();
+                    session.current_step = "Application kit changed; review required".to_string();
                     session.updated_at_ms = now;
                     let payload = to_json(&session, "browser session")?;
                     if tx.execute(
@@ -1095,6 +1097,7 @@ pub fn save_application_evidence(
         "resume"
             | "cover_letter"
             | "attachment"
+            | "application_receipt"
             | "submission_confirmation"
             | "status_email"
             | "interview_event"
@@ -1134,6 +1137,22 @@ pub fn save_application_evidence(
         "cover_letter" | "attachment" => {
             validate_document_evidence(&value)?;
             format!("{}:{}", value.storage_key, value.sha256)
+        }
+        "application_receipt" => {
+            let resume_version_id = value
+                .resume_version_id
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("application receipt needs a resume version"))?;
+            if application.resume_version_id.as_deref() != Some(resume_version_id) {
+                anyhow::bail!("application receipt does not match this application's resume")
+            }
+            validate_application_receipt_evidence(&value)?;
+            let receipt_id = value
+                .metadata
+                .get("receipt_id")
+                .and_then(Value::as_str)
+                .expect("application receipt validation checks receipt_id");
+            format!("{}:{}", receipt_id, value.sha256)
         }
         "status_email" | "interview_event" => {
             if value.provider.trim().is_empty() {
@@ -1240,11 +1259,40 @@ fn validate_document_evidence(evidence: &ApplicationEvidence) -> Result<()> {
     Ok(())
 }
 
+fn validate_application_receipt_evidence(evidence: &ApplicationEvidence) -> Result<()> {
+    validate_document_evidence(evidence)?;
+    if evidence.media_type != "application/json" || !evidence.file_name.ends_with(".json") {
+        anyhow::bail!("application receipt needs a JSON evidence object")
+    }
+    if evidence
+        .metadata
+        .get("receipt_id")
+        .and_then(Value::as_str)
+        .is_none_or(|receipt_id| receipt_id.trim().is_empty())
+        || evidence
+            .metadata
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            != Some(1)
+        || evidence.metadata.get("immutable").and_then(Value::as_bool) != Some(true)
+        || evidence
+            .metadata
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .is_none_or(|size_bytes| size_bytes <= 0)
+    {
+        anyhow::bail!("application receipt metadata is incomplete")
+    }
+    Ok(())
+}
+
 struct PreparedSubmissionEvidence {
     value: ApplicationEvidence,
     provider_event_hash: String,
     payload: String,
 }
+
+const MAX_SUBMISSION_CONFIRMATIONS: usize = 4;
 
 fn prepare_submission_evidence(
     application_id: &str,
@@ -1252,25 +1300,35 @@ fn prepare_submission_evidence(
     evidence: &[ApplicationEvidence],
     now: i64,
 ) -> Result<Vec<PreparedSubmissionEvidence>> {
-    if evidence.is_empty() || evidence.len() > 9 {
+    if evidence.is_empty() || evidence.len() > 14 {
         anyhow::bail!("invalid final submission evidence")
     }
     let mut resume_count = 0usize;
     let mut confirmation_count = 0usize;
+    let mut receipt_count = 0usize;
     let mut prepared = Vec::with_capacity(evidence.len());
     for (index, item) in evidence.iter().enumerate() {
         let mut value = item.clone();
         if value.application_id != application_id
             || !matches!(
                 value.kind.as_str(),
-                "resume" | "cover_letter" | "attachment" | "submission_confirmation"
+                "resume"
+                    | "cover_letter"
+                    | "attachment"
+                    | "application_receipt"
+                    | "submission_confirmation"
             )
         {
             anyhow::bail!("invalid final submission evidence")
         }
         resume_count += usize::from(value.kind == "resume");
         confirmation_count += usize::from(value.kind == "submission_confirmation");
-        validate_document_evidence(&value)?;
+        receipt_count += usize::from(value.kind == "application_receipt");
+        if value.kind == "application_receipt" {
+            validate_application_receipt_evidence(&value)?;
+        } else {
+            validate_document_evidence(&value)?;
+        }
         if value.kind == "submission_confirmation"
             && value
                 .metadata
@@ -1306,10 +1364,994 @@ fn prepare_submission_evidence(
             payload,
         });
     }
-    if resume_count != 1 || confirmation_count != 1 {
-        anyhow::bail!("final submission needs one resume and one confirmation")
+    if resume_count != 1
+        || !(1..=MAX_SUBMISSION_CONFIRMATIONS).contains(&confirmation_count)
+        || receipt_count != 1
+    {
+        anyhow::bail!(
+            "final submission needs one resume, one to four confirmations, and one receipt"
+        )
     }
     Ok(prepared)
+}
+
+fn validate_submission_evidence_resume_bindings(
+    evidence: &[PreparedSubmissionEvidence],
+    resume_version_id: &str,
+) -> Result<()> {
+    for (kind, message) in [
+        (
+            "resume",
+            "final receipt resume does not match the application",
+        ),
+        (
+            "application_receipt",
+            "final receipt bundle does not match the application resume",
+        ),
+        (
+            "submission_confirmation",
+            "final receipt confirmation does not match the application resume",
+        ),
+    ] {
+        if evidence.iter().any(|item| {
+            item.value.kind == kind
+                && item.value.resume_version_id.as_deref() != Some(resume_version_id)
+        }) {
+            anyhow::bail!(message)
+        }
+        if !evidence.iter().any(|item| {
+            item.value.kind == kind
+                && item.value.resume_version_id.as_deref() == Some(resume_version_id)
+        }) {
+            anyhow::bail!(message)
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod submission_evidence_resume_binding_tests {
+    use super::*;
+
+    fn prepared(kind: &str, resume_version_id: Option<&str>) -> PreparedSubmissionEvidence {
+        PreparedSubmissionEvidence {
+            value: ApplicationEvidence {
+                id: format!("evidence-{kind}"),
+                application_id: "application-1".to_string(),
+                kind: kind.to_string(),
+                label: kind.to_string(),
+                provider: "test".to_string(),
+                file_name: format!("{kind}.bin"),
+                media_type: "application/octet-stream".to_string(),
+                storage_key: format!("objects/{kind}"),
+                sha256: "a".repeat(64),
+                resume_version_id: resume_version_id.map(str::to_string),
+                occurred_at_ms: 1,
+                metadata: json!({}),
+                created_at_ms: 1,
+            },
+            provider_event_hash: format!("hash-{kind}"),
+            payload: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn submission_confirmation_requires_the_exact_application_resume_revision() {
+        let mut evidence = vec![
+            prepared("resume", Some("resume-exact")),
+            prepared("application_receipt", Some("resume-exact")),
+            prepared("submission_confirmation", Some("resume-exact")),
+        ];
+        validate_submission_evidence_resume_bindings(&evidence, "resume-exact").unwrap();
+
+        evidence[2].value.resume_version_id = Some("resume-stale".to_string());
+        let error = validate_submission_evidence_resume_bindings(&evidence, "resume-exact")
+            .expect_err("confirmation from a stale resume revision must fail closed");
+        assert!(error
+            .to_string()
+            .contains("confirmation does not match the application resume"));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SubmissionManifestObject {
+    kind: String,
+    sha256: String,
+    media_type: String,
+    size_bytes: i64,
+}
+
+fn submission_evidence_manifest(
+    receipt: &Value,
+) -> Result<BTreeMap<String, SubmissionManifestObject>> {
+    let values = receipt
+        .get("evidenceObjects")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest is missing"))?;
+    if values.is_empty() || values.len() > 12 {
+        anyhow::bail!("final receipt evidence manifest has an invalid object count")
+    }
+    let mut manifest = BTreeMap::new();
+    let mut previous_key: Option<&str> = None;
+    for value in values {
+        let key = value
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest key is invalid"))?;
+        let kind = value
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|value| {
+                matches!(
+                    *value,
+                    "resume" | "cover_letter" | "attachment" | "screenshot"
+                )
+            })
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest kind is invalid"))?;
+        let sha256 = value
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| {
+                anyhow::anyhow!("final receipt evidence manifest checksum is invalid")
+            })?;
+        let media_type = value
+            .get("mediaType")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "application/pdf" | "image/png"))
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest media is invalid"))?;
+        let size_bytes = value
+            .get("sizeBytes")
+            .and_then(Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| anyhow::anyhow!("final receipt evidence manifest size is invalid"))?;
+        if previous_key.is_some_and(|previous| previous >= key)
+            || (kind == "screenshot") != (media_type == "image/png")
+            || manifest
+                .insert(
+                    key.to_string(),
+                    SubmissionManifestObject {
+                        kind: kind.to_string(),
+                        sha256: sha256.to_ascii_lowercase(),
+                        media_type: media_type.to_string(),
+                        size_bytes,
+                    },
+                )
+                .is_some()
+        {
+            anyhow::bail!("final receipt evidence manifest is not canonical")
+        }
+        previous_key = Some(key);
+    }
+    Ok(manifest)
+}
+
+fn validate_submission_receipt_evidence(
+    receipt: &Value,
+    evidence: &[PreparedSubmissionEvidence],
+) -> Result<()> {
+    let receipt_id = receipt
+        .get("receiptId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("final receipt id is missing"))?;
+    let receipt_object = receipt
+        .get("receiptObject")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt object is missing"))?;
+    let storage_key = receipt_object
+        .get("storageKey")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("final receipt object key is missing"))?;
+    let sha256 = receipt_object
+        .get("sha256")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("final receipt object checksum is invalid"))?;
+    let size_bytes = receipt_object
+        .get("sizeBytes")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| anyhow::anyhow!("final receipt object size is invalid"))?;
+    if receipt_object.get("mediaType").and_then(Value::as_str) != Some("application/json")
+        || receipt_object.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+    {
+        anyhow::bail!("final receipt object metadata is invalid")
+    }
+    let stored_receipt = evidence
+        .iter()
+        .find(|item| item.value.kind == "application_receipt")
+        .ok_or_else(|| anyhow::anyhow!("final receipt evidence is missing"))?;
+    if stored_receipt.value.storage_key != storage_key
+        || stored_receipt.value.sha256 != sha256
+        || stored_receipt.value.media_type != "application/json"
+        || stored_receipt
+            .value
+            .metadata
+            .get("receipt_id")
+            .and_then(Value::as_str)
+            != Some(receipt_id)
+        || stored_receipt
+            .value
+            .metadata
+            .get("schema_version")
+            .and_then(Value::as_i64)
+            != Some(1)
+        || stored_receipt
+            .value
+            .metadata
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            != Some(size_bytes)
+    {
+        anyhow::bail!("final receipt evidence does not match its immutable object")
+    }
+    let screenshots = receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .filter(|items| !items.is_empty() && items.len() <= MAX_SUBMISSION_CONFIRMATIONS)
+        .ok_or_else(|| anyhow::anyhow!("final receipt confirmation is missing"))?;
+    let mut screenshot_keys = Vec::with_capacity(screenshots.len());
+    let mut unique_screenshot_keys = BTreeSet::new();
+    for screenshot in screenshots {
+        let key = screenshot
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt confirmation key is invalid"))?;
+        if !unique_screenshot_keys.insert(key) {
+            anyhow::bail!("final receipt confirmation keys are duplicated")
+        }
+        screenshot_keys.push(key);
+    }
+    let confirmations = evidence
+        .iter()
+        .filter(|item| item.value.kind == "submission_confirmation")
+        .collect::<Vec<_>>();
+    if confirmations.len() != screenshot_keys.len() {
+        anyhow::bail!("final receipt confirmation evidence count is incomplete")
+    }
+    let mut seen_indexes = BTreeSet::new();
+    let mut seen_storage_keys = BTreeSet::new();
+    let mut seen_file_names = BTreeSet::new();
+    for confirmation in confirmations {
+        let value = &confirmation.value;
+        let index = value
+            .metadata
+            .get("screenshot_index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .filter(|index| (1..=screenshot_keys.len()).contains(index))
+            .ok_or_else(|| anyhow::anyhow!("final receipt confirmation index is invalid"))?;
+        let count = value
+            .metadata
+            .get("screenshot_count")
+            .and_then(Value::as_u64)
+            .and_then(|count| usize::try_from(count).ok())
+            .filter(|count| *count == screenshot_keys.len())
+            .ok_or_else(|| anyhow::anyhow!("final receipt confirmation count is invalid"))?;
+        let evidence_screenshot_keys = value
+            .metadata
+            .get("screenshot_keys")
+            .and_then(Value::as_array)
+            .filter(|keys| {
+                keys.len() == screenshot_keys.len()
+                    && keys
+                        .iter()
+                        .zip(&screenshot_keys)
+                        .all(|(actual, expected)| actual.as_str() == Some(*expected))
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("final receipt confirmation screenshot set is invalid")
+            })?;
+        debug_assert_eq!(evidence_screenshot_keys.len(), count);
+        if value.storage_key != screenshot_keys[index - 1]
+            || value.media_type != "image/png"
+            || !value.file_name.to_ascii_lowercase().ends_with(".png")
+            || value.metadata.get("immutable").and_then(Value::as_bool) != Some(true)
+            || value
+                .metadata
+                .get("evidence_strength")
+                .and_then(Value::as_str)
+                != Some("browser_confirmed")
+            || value.metadata.get("receipt_id").and_then(Value::as_str) != Some(receipt_id)
+            || value
+                .metadata
+                .get("size_bytes")
+                .and_then(Value::as_i64)
+                .is_none_or(|size| size <= 0)
+            || !seen_indexes.insert(index)
+            || !seen_storage_keys.insert(value.storage_key.as_str())
+            || !seen_file_names.insert(value.file_name.as_str())
+        {
+            anyhow::bail!("final receipt confirmation does not match its immutable object")
+        }
+    }
+    for document in receipt
+        .get("documents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("final receipt documents are missing"))?
+    {
+        let kind = document
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let key = document
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let hash = document
+            .get("sha256")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !evidence.iter().any(|item| {
+            item.value.kind == kind && item.value.storage_key == key && item.value.sha256 == hash
+        }) {
+            anyhow::bail!("final receipt document does not match its immutable evidence")
+        }
+    }
+    Ok(())
+}
+
+fn validate_submission_object_bindings(
+    receipt: &Value,
+    evidence: &[PreparedSubmissionEvidence],
+    bindings: &[crate::db::object_uploads::ApplicationObjectBinding],
+) -> Result<()> {
+    let mut expected = submission_evidence_manifest(receipt)?;
+    let mut referenced = BTreeSet::new();
+    let documents = receipt
+        .get("documents")
+        .and_then(Value::as_array)
+        .filter(|documents| !documents.is_empty() && documents.len() <= 12)
+        .ok_or_else(|| anyhow::anyhow!("final receipt documents are missing"))?;
+    let mut resume_count = 0usize;
+    for document in documents {
+        let kind = document
+            .get("kind")
+            .and_then(Value::as_str)
+            .filter(|kind| matches!(*kind, "resume" | "cover_letter" | "attachment"))
+            .ok_or_else(|| anyhow::anyhow!("final receipt document kind is invalid"))?;
+        let key = document
+            .get("storageKey")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt document key is invalid"))?;
+        let sha256 = document
+            .get("sha256")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| anyhow::anyhow!("final receipt document checksum is invalid"))?;
+        resume_count += usize::from(kind == "resume");
+        let Some(object) = expected.get(key) else {
+            anyhow::bail!("final receipt document is missing from its evidence manifest")
+        };
+        if !referenced.insert(key)
+            || object.kind != kind
+            || object.media_type != "application/pdf"
+            || !object.sha256.eq_ignore_ascii_case(sha256)
+        {
+            anyhow::bail!("final receipt document does not match its evidence manifest")
+        }
+    }
+    if resume_count != 1 {
+        anyhow::bail!("final receipt needs exactly one submitted resume")
+    }
+    let screenshots = receipt
+        .get("screenshotKeys")
+        .and_then(Value::as_array)
+        .filter(|screenshots| {
+            !screenshots.is_empty() && screenshots.len() <= MAX_SUBMISSION_CONFIRMATIONS
+        })
+        .ok_or_else(|| anyhow::anyhow!("final receipt screenshots are missing"))?;
+    for screenshot in screenshots {
+        let key = screenshot
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("final receipt screenshot key is invalid"))?;
+        let Some(object) = expected.get(key) else {
+            anyhow::bail!("final receipt screenshot is missing from its evidence manifest")
+        };
+        if !referenced.insert(key)
+            || object.kind != "screenshot"
+            || object.media_type != "image/png"
+        {
+            anyhow::bail!("final receipt screenshot does not match its evidence manifest")
+        }
+    }
+    if referenced.len() != expected.len() {
+        anyhow::bail!("final receipt evidence manifest has unreferenced objects")
+    }
+    let receipt_object = receipt
+        .get("receiptObject")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt object is missing"))?;
+    let receipt_key = receipt_object
+        .get("storageKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let receipt_sha256 = receipt_object
+        .get("sha256")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let receipt_size = receipt_object
+        .get("sizeBytes")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if receipt_key.is_empty()
+        || expected
+            .insert(
+                receipt_key.to_string(),
+                SubmissionManifestObject {
+                    kind: "application_receipt".to_string(),
+                    sha256: receipt_sha256.to_ascii_lowercase(),
+                    media_type: "application/json".to_string(),
+                    size_bytes: receipt_size,
+                },
+            )
+            .is_some()
+        || bindings.len() != expected.len()
+    {
+        anyhow::bail!("final receipt object bindings are incomplete")
+    }
+    let mut seen_uploads = BTreeSet::new();
+    let mut seen_binding_keys = BTreeSet::new();
+    for binding in bindings {
+        let Some(object) = expected.get(&binding.object_key) else {
+            anyhow::bail!("final receipt has an unreferenced durable object")
+        };
+        if !seen_uploads.insert(binding.upload_id.as_str())
+            || !seen_binding_keys.insert(binding.object_key.as_str())
+            || binding.content_type != object.media_type
+            || binding.size_bytes != object.size_bytes
+            || !binding.sha256.eq_ignore_ascii_case(&object.sha256)
+        {
+            anyhow::bail!("final receipt durable object binding is invalid")
+        }
+    }
+    if seen_binding_keys.len() != expected.len()
+        || expected
+            .keys()
+            .any(|key| !seen_binding_keys.contains(key.as_str()))
+    {
+        anyhow::bail!("final receipt durable object bindings are incomplete")
+    }
+    let mut expected_evidence_keys = documents
+        .iter()
+        .filter_map(|document| document.get("storageKey").and_then(Value::as_str))
+        .collect::<BTreeSet<_>>();
+    expected_evidence_keys.insert(receipt_key);
+    expected_evidence_keys.extend(screenshots.iter().filter_map(Value::as_str));
+    let mut seen_evidence = BTreeSet::new();
+    for item in evidence {
+        let Some(object) = expected.get(&item.value.storage_key) else {
+            anyhow::bail!("final submission evidence is not durably tracked")
+        };
+        let expected_kind = if item.value.kind == "submission_confirmation" {
+            "screenshot"
+        } else {
+            item.value.kind.as_str()
+        };
+        if !seen_evidence.insert(item.value.storage_key.as_str())
+            || object.kind != expected_kind
+            || item.value.media_type != object.media_type
+            || !item.value.sha256.eq_ignore_ascii_case(&object.sha256)
+            || item
+                .value
+                .metadata
+                .get("size_bytes")
+                .and_then(Value::as_i64)
+                != Some(object.size_bytes)
+        {
+            anyhow::bail!("final submission evidence does not match its durable object")
+        }
+    }
+    if seen_evidence != expected_evidence_keys {
+        anyhow::bail!("final submission evidence records are incomplete")
+    }
+    Ok(())
+}
+
+struct ApprovedSubmissionSnapshot<'a> {
+    packet: &'a Value,
+    job: &'a Value,
+    checksum: &'a str,
+}
+
+fn canonical_submission_json(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonical_submission_json).collect())
+        }
+        Value::Object(values) => Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical_submission_json(value)))
+                .collect::<BTreeMap<_, _>>()
+                .into_iter()
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn approved_submission_checksum(
+    schema_version: i64,
+    packet: &Value,
+    job: &Value,
+    admission: Option<&Value>,
+) -> Result<String> {
+    let value = match (schema_version, admission) {
+        (1, None) => json!({
+            "schema_version": 1,
+            "packet": packet,
+            "job": job,
+        }),
+        (2, Some(admission)) => json!({
+            "schema_version": 2,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        }),
+        _ => anyhow::bail!("approved execution checksum inputs are invalid"),
+    };
+    let bytes = serde_json::to_vec(&canonical_submission_json(&value))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn validate_approved_submission_admission(
+    application: &JobApplication,
+    schema_version: i64,
+    admission: Option<&Value>,
+) -> Result<()> {
+    if schema_version == 1 {
+        if application.submission_mode == "auto_submit" {
+            anyhow::bail!("legacy approval cannot grant Auto-submit authority")
+        }
+        return Ok(());
+    }
+    let admission = admission
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?;
+    let kind = admission
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if application.submission_mode == "auto_submit" {
+        let complete = kind == "track_auto_submit"
+            && admission
+                .get("authorization_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            && admission
+                .get("career_track_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+            && admission
+                .get("revision_no")
+                .and_then(Value::as_i64)
+                .is_some_and(|value| value > 0)
+            && admission
+                .get("authority_fingerprint")
+                .and_then(Value::as_str)
+                .is_some_and(|value| {
+                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+        if !complete {
+            anyhow::bail!("approved Auto-submit admission is incomplete")
+        }
+    } else if kind != "review_approval" {
+        anyhow::bail!("approved execution does not contain review authority")
+    }
+    Ok(())
+}
+
+fn validate_canonical_claim_ids(value: Option<&Value>) -> Result<()> {
+    let claims = value
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("approved execution verified claims are missing"))?;
+    let mut previous: Option<&str> = None;
+    for claim in claims {
+        let claim = claim
+            .as_str()
+            .filter(|claim| !claim.trim().is_empty())
+            .ok_or_else(|| anyhow::anyhow!("approved execution verified claims are invalid"))?;
+        if previous.is_some_and(|previous| previous >= claim) {
+            anyhow::bail!("approved execution verified claims are not canonical")
+        }
+        previous = Some(claim);
+    }
+    Ok(())
+}
+
+fn approved_submission_snapshot<'a>(
+    account_id: &str,
+    application: &'a JobApplication,
+) -> Result<ApprovedSubmissionSnapshot<'a>> {
+    let approved = application
+        .receipt
+        .get("approved_execution")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("approved execution snapshot is missing"))?;
+    let schema_version = approved
+        .get("schema_version")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if !matches!(schema_version, 1 | 2) {
+        anyhow::bail!("approved execution schema is unsupported")
+    }
+    let packet = approved
+        .get("packet")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("approved execution packet is missing"))?;
+    let job = approved
+        .get("job")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("approved execution job is missing"))?;
+    let checksum = approved
+        .get("checksum")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("approved execution checksum is invalid"))?;
+    let admission = approved.get("admission");
+    validate_approved_submission_admission(application, schema_version, admission)?;
+    let expected_checksum = approved_submission_checksum(
+        schema_version,
+        packet,
+        job,
+        (schema_version == 2).then_some(
+            admission.ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?,
+        ),
+    )?;
+    if !constant_time_equal(checksum, &expected_checksum) {
+        anyhow::bail!("approved execution checksum does not match its exact packet")
+    }
+
+    let resume_version_id = application
+        .resume_version_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("application resume version is missing"))?;
+    let identity_id = application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("application identity binding is missing"))?;
+    let identity_email = application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("application email binding is missing"))?;
+    let expected_browser_profile_id = execution_browser_profile_id(account_id, identity_id);
+    if packet.get("applicationId").and_then(Value::as_str) != Some(application.id.as_str())
+        || packet.get("jobId").and_then(Value::as_str) != Some(application.job_id.as_str())
+        || packet.get("resumeVersionId").and_then(Value::as_str) != Some(resume_version_id)
+        || packet.get("applicationIdentityId").and_then(Value::as_str) != Some(identity_id)
+        || packet.get("applicationEmail").and_then(Value::as_str) != Some(identity_email)
+        || packet.get("browserProfileId").and_then(Value::as_str)
+            != Some(expected_browser_profile_id.as_str())
+        || packet.get("answers").is_none_or(|value| !value.is_object())
+    {
+        anyhow::bail!("approved execution is not bound to this application")
+    }
+    validate_canonical_claim_ids(packet.get("verifiedClaimIds"))?;
+
+    Ok(ApprovedSubmissionSnapshot {
+        packet,
+        job,
+        checksum,
+    })
+}
+
+fn validate_submission_authority_snapshot(
+    account_id: &str,
+    application: &JobApplication,
+    run_id: &str,
+    receipt: &Value,
+    runner: &str,
+) -> Result<()> {
+    let authority = receipt
+        .get(SERVER_SUBMISSION_AUTHORITY_KEY)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt submission authority is missing"))?;
+    let execution = authority
+        .get("executionAuthority")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    let approved = approved_submission_snapshot(account_id, application)?;
+    let receipt_packet = receipt
+        .get("packet")
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt approved packet is missing"))?;
+    let identity_id = approved
+        .packet
+        .get("applicationIdentityId")
+        .and_then(Value::as_str)
+        .expect("approved packet identity checked above");
+    let browser_profile_id = approved
+        .packet
+        .get("browserProfileId")
+        .and_then(Value::as_str)
+        .expect("approved packet browser profile checked above");
+    let resume_version_id = approved
+        .packet
+        .get("resumeVersionId")
+        .and_then(Value::as_str)
+        .expect("approved packet resume checked above");
+    let submitted_resume =
+        receipt
+            .get("documents")
+            .and_then(Value::as_array)
+            .and_then(|documents| {
+                let mut resumes = documents.iter().filter(|document| {
+                    document.get("kind").and_then(Value::as_str) == Some("resume")
+                });
+                let resume = resumes.next()?;
+                resumes.next().is_none().then_some(resume)
+            });
+    let confirmation = receipt
+        .get("result")
+        .and_then(Value::as_object)
+        .filter(|result| result.get("status").and_then(Value::as_str) == Some("submitted"))
+        .filter(|result| {
+            result
+                .get("confirmationText")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+                || result
+                    .get("confirmationUrl")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+        });
+    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+        || receipt.get("accountId").and_then(Value::as_str) != Some(account_id)
+        || receipt.get("applicationId").and_then(Value::as_str) != Some(application.id.as_str())
+        || receipt.get("runId").and_then(Value::as_str) != Some(run_id)
+        || receipt.get("runner").and_then(Value::as_str) != Some(runner)
+        || receipt.get("applicationIdentityId").and_then(Value::as_str) != Some(identity_id)
+        || receipt.get("browserProfileId").and_then(Value::as_str) != Some(browser_profile_id)
+        || receipt
+            .get("adapter")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || receipt
+            .get("adapterVersion")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || confirmation.is_none()
+        || receipt_packet.get("jobId") != approved.packet.get("jobId")
+        || receipt_packet.get("resumeVersionId") != approved.packet.get("resumeVersionId")
+        || receipt_packet.get("applicationEmail") != approved.packet.get("applicationEmail")
+        || receipt_packet
+            .get("approvedPacketChecksum")
+            .and_then(Value::as_str)
+            != Some(approved.checksum)
+        || receipt_packet.get("answers") != approved.packet.get("answers")
+        || receipt_packet.get("verifiedClaimIds") != approved.packet.get("verifiedClaimIds")
+        || receipt.get("job") != Some(approved.job)
+        || submitted_resume
+            .and_then(|resume| resume.get("versionId"))
+            .and_then(Value::as_str)
+            != Some(resume_version_id)
+        || authority.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+        || authority.get("preSubmissionReceipt") != Some(&application.receipt)
+        || match runner {
+            "cloud" => {
+                execution.get("kind").and_then(Value::as_str) != Some("cloud_execution_lease")
+            }
+            "local" => execution.get("kind").and_then(Value::as_str) != Some("local_run_ticket"),
+            _ => true,
+        }
+    {
+        anyhow::bail!("final receipt submission authority does not match the approved packet")
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_submission_execution_authority_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+    receipt: &Value,
+    local_ticket_hash: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let execution = receipt
+        .pointer(&format!(
+            "/{SERVER_SUBMISSION_AUTHORITY_KEY}/executionAuthority"
+        ))
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    if runner == "cloud" {
+        let stored = tx
+            .query_row(
+                "SELECT owner_id, lease_token_sha256, fence, phase, finished_at_ms
+                   FROM jobs_execution_leases
+                  WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                params![account_id, application_id, run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((owner_id, token_sha256, fence, phase, finished_at_ms)) = stored else {
+            anyhow::bail!("final receipt cloud execution authority is missing")
+        };
+        validate_cloud_submission_execution_authority(
+            execution,
+            &owner_id,
+            &token_sha256,
+            fence,
+            &phase,
+            finished_at_ms,
+            now,
+        )?;
+    } else {
+        let supplied_ticket_hash = local_ticket_hash
+            .ok_or_else(|| anyhow::anyhow!("final receipt local authority is missing"))?;
+        let stored = tx
+            .query_row(
+                "SELECT ticket_hash, status, expires_at_ms
+                   FROM jobs_local_run_tickets
+                  WHERE id = ?1 AND account_id = ?2 AND application_id = ?3",
+                params![run_id, account_id, application_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((stored_ticket_hash, status, expires_at_ms)) = stored else {
+            anyhow::bail!("final receipt local execution authority is missing")
+        };
+        let active = (matches!(status.as_str(), "claimed" | "needs_input" | "click_started")
+            && expires_at_ms > now)
+            || (status == "side_effect_unknown"
+                && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
+        if execution
+            .get("ticketHash")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !constant_time_equal(value, &stored_ticket_hash))
+            || !constant_time_equal(supplied_ticket_hash, &stored_ticket_hash)
+            || execution.get("runId").and_then(Value::as_str) != Some(run_id)
+            || !active
+        {
+            anyhow::bail!("final receipt local execution authority changed")
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_submission_execution_authority_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+    receipt: &Value,
+    local_ticket_hash: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let execution = receipt
+        .pointer(&format!(
+            "/{SERVER_SUBMISSION_AUTHORITY_KEY}/executionAuthority"
+        ))
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    if runner == "cloud" {
+        let stored = tx.query_opt(
+            "SELECT owner_id, lease_token_sha256, fence, phase, finished_at_ms
+               FROM jobs_execution_leases
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?;
+        let Some(stored) = stored else {
+            anyhow::bail!("final receipt cloud execution authority is missing")
+        };
+        let owner_id: String = stored.try_get(0)?;
+        let token_sha256: String = stored.try_get(1)?;
+        let fence: i64 = stored.try_get(2)?;
+        let phase: String = stored.try_get(3)?;
+        let finished_at_ms: Option<i64> = stored.try_get(4)?;
+        validate_cloud_submission_execution_authority(
+            execution,
+            &owner_id,
+            &token_sha256,
+            fence,
+            &phase,
+            finished_at_ms,
+            now,
+        )?;
+    } else {
+        let supplied_ticket_hash = local_ticket_hash
+            .ok_or_else(|| anyhow::anyhow!("final receipt local authority is missing"))?;
+        let stored = tx.query_opt(
+            "SELECT ticket_hash, status, expires_at_ms
+               FROM jobs_local_run_tickets
+              WHERE id = $1 AND account_id = $2 AND application_id = $3
+              FOR UPDATE",
+            &[&run_id, &account_id, &application_id],
+        )?;
+        let Some(stored) = stored else {
+            anyhow::bail!("final receipt local execution authority is missing")
+        };
+        let stored_ticket_hash: String = stored.try_get(0)?;
+        let status: String = stored.try_get(1)?;
+        let expires_at_ms: i64 = stored.try_get(2)?;
+        let active = (matches!(status.as_str(), "claimed" | "needs_input" | "click_started")
+            && expires_at_ms > now)
+            || (status == "side_effect_unknown"
+                && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
+        if execution
+            .get("ticketHash")
+            .and_then(Value::as_str)
+            .is_none_or(|value| !constant_time_equal(value, &stored_ticket_hash))
+            || !constant_time_equal(supplied_ticket_hash, &stored_ticket_hash)
+            || execution.get("runId").and_then(Value::as_str) != Some(run_id)
+            || !active
+        {
+            anyhow::bail!("final receipt local execution authority changed")
+        }
+    }
+    Ok(())
+}
+
+fn validate_cloud_submission_execution_authority(
+    execution: &serde_json::Map<String, Value>,
+    owner_id: &str,
+    token_sha256: &str,
+    fence: i64,
+    phase: &str,
+    finished_at_ms: Option<i64>,
+    now: i64,
+) -> Result<()> {
+    let token_matches = execution
+        .get("leaseTokenSha256")
+        .and_then(Value::as_str)
+        .is_some_and(|value| constant_time_equal(value, token_sha256));
+    if !matches!(phase, "submitted" | "side_effect_unknown")
+        || finished_at_ms.is_none()
+        || (phase == "side_effect_unknown"
+            && finished_at_ms.is_none_or(|finished_at_ms| {
+                finished_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) <= now
+            }))
+        || execution.get("ownerId").and_then(Value::as_str) != Some(owner_id)
+        || !token_matches
+        || execution.get("fence").and_then(Value::as_i64) != Some(fence)
+        || execution.get("phase").and_then(Value::as_str) != Some(phase)
+    {
+        anyhow::bail!("final receipt cloud execution authority changed")
+    }
+    Ok(())
+}
+
+#[derive(Debug, Error)]
+#[error("final submission commit outcome is uncertain: {detail}")]
+pub struct SubmissionCommitUncertain {
+    detail: String,
+}
+
+fn submission_commit_uncertain(error: impl std::fmt::Display) -> anyhow::Error {
+    SubmissionCommitUncertain {
+        detail: error.to_string(),
+    }
+    .into()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1322,6 +2364,7 @@ pub fn finalize_submission(
     receipt: Value,
     request_fingerprint: &str,
     evidence: &[ApplicationEvidence],
+    object_uploads: &[crate::db::object_uploads::ApplicationObjectBinding],
     terminal_session: &BrowserSession,
     local_ticket_hash: Option<&str>,
 ) -> Result<SubmissionFinalizeResult> {
@@ -1346,6 +2389,8 @@ pub fn finalize_submission(
     let now = now_ms();
     let prepared_evidence =
         prepare_submission_evidence(application_id, request_fingerprint, evidence, now)?;
+    validate_submission_receipt_evidence(&receipt, &prepared_evidence)?;
+    validate_submission_object_bindings(&receipt, &prepared_evidence, object_uploads)?;
     let mut terminal_session = terminal_session.clone();
     if terminal_session.application_id.as_deref() != Some(application_id)
         || terminal_session.id != run_id
@@ -1363,6 +2408,15 @@ pub fn finalize_submission(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match crate::db::account_data::account_write_fence_sqlite_tx(&tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced final submission")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("account not found")
+                }
+            }
             let raw: Option<(String, String)> = tx
                 .query_row(
                     "SELECT job_id, application_json FROM jobs_applications
@@ -1383,7 +2437,7 @@ pub fn finalize_submission(
                     .and_then(Value::as_str)
                     == Some(request_fingerprint)
                 {
-                    tx.commit()?;
+                    tx.commit().map_err(submission_commit_uncertain)?;
                     return Ok(SubmissionFinalizeResult::Replayed(application));
                 }
                 anyhow::bail!("application already has a different final receipt")
@@ -1391,17 +2445,29 @@ pub fn finalize_submission(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("application browser run does not match final receipt")
             }
+            validate_submission_authority_snapshot(
+                account_id,
+                &application,
+                run_id,
+                &receipt,
+                runner,
+            )?;
+            validate_submission_execution_authority_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                &receipt,
+                local_ticket_hash,
+                now,
+            )?;
             validate_application_transition(&application.state, "submitted")?;
             let resume_version_id = application
                 .resume_version_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("application resume version is missing"))?;
-            if !prepared_evidence.iter().any(|item| {
-                item.value.kind == "resume"
-                    && item.value.resume_version_id.as_deref() == Some(resume_version_id)
-            }) {
-                anyhow::bail!("final receipt resume does not match the application")
-            }
+            validate_submission_evidence_resume_bindings(&prepared_evidence, resume_version_id)?;
             if runner == "cloud" {
                 let phase: Option<String> = tx
                     .query_row(
@@ -1434,7 +2500,8 @@ pub fn finalize_submission(
                   WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
                     AND ticket_hash = ?4
                     AND (
-                        (expires_at_ms > ?5 AND status IN ('claimed', 'needs_input'))
+                        (expires_at_ms > ?5
+                            AND status IN ('claimed', 'needs_input', 'click_started'))
                         OR (status = 'side_effect_unknown'
                             AND expires_at_ms + ?6 > ?5)
                     )",
@@ -1491,6 +2558,15 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("browser session not found")
             }
+            crate::db::object_uploads::commit_application_object_uploads_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                object_uploads,
+                now,
+            )?;
             application.receipt = receipt;
             application.state = "submitted".to_string();
             application.updated_at_ms = now;
@@ -1505,12 +2581,21 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("application not found")
             }
-            tx.commit()?;
+            tx.commit().map_err(submission_commit_uncertain)?;
             Ok(SubmissionFinalizeResult::Committed(application))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced final submission")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("account not found")
+                }
+            }
             let row = tx.query_opt(
                 "SELECT job_id, application_json FROM jobs_applications
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
@@ -1529,7 +2614,7 @@ pub fn finalize_submission(
                     .and_then(Value::as_str)
                     == Some(request_fingerprint)
                 {
-                    tx.commit()?;
+                    tx.commit().map_err(submission_commit_uncertain)?;
                     return Ok(SubmissionFinalizeResult::Replayed(application));
                 }
                 anyhow::bail!("application already has a different final receipt")
@@ -1537,17 +2622,29 @@ pub fn finalize_submission(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("application browser run does not match final receipt")
             }
+            validate_submission_authority_snapshot(
+                account_id,
+                &application,
+                run_id,
+                &receipt,
+                runner,
+            )?;
+            validate_submission_execution_authority_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                &receipt,
+                local_ticket_hash,
+                now,
+            )?;
             validate_application_transition(&application.state, "submitted")?;
             let resume_version_id = application
                 .resume_version_id
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("application resume version is missing"))?;
-            if !prepared_evidence.iter().any(|item| {
-                item.value.kind == "resume"
-                    && item.value.resume_version_id.as_deref() == Some(resume_version_id)
-            }) {
-                anyhow::bail!("final receipt resume does not match the application")
-            }
+            validate_submission_evidence_resume_bindings(&prepared_evidence, resume_version_id)?;
             if runner == "cloud" {
                 let phase = tx
                     .query_opt(
@@ -1580,7 +2677,8 @@ pub fn finalize_submission(
                   WHERE id = $1 AND account_id = $2 AND application_id = $3
                     AND ticket_hash = $4
                     AND (
-                        (expires_at_ms > $5 AND status IN ('claimed', 'needs_input'))
+                        (expires_at_ms > $5
+                            AND status IN ('claimed', 'needs_input', 'click_started'))
                         OR (status = 'side_effect_unknown'
                             AND expires_at_ms + $6 > $5)
                     )",
@@ -1637,6 +2735,15 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("browser session not found")
             }
+            crate::db::object_uploads::commit_application_object_uploads_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+                object_uploads,
+                now,
+            )?;
             application.receipt = receipt;
             application.state = "submitted".to_string();
             application.updated_at_ms = now;
@@ -1651,7 +2758,7 @@ pub fn finalize_submission(
             {
                 anyhow::bail!("application not found")
             }
-            tx.commit()?;
+            tx.commit().map_err(submission_commit_uncertain)?;
             Ok(SubmissionFinalizeResult::Committed(application))
         }
     })
@@ -2300,10 +3407,8 @@ pub fn save_mailbox_connection_with_credential(
     }
 
     let provider_subject = credential.provider_subject.trim();
-    let subject_hash = private_lookup_hash(
-        &format!("mailbox:{}", mailbox.provider),
-        provider_subject,
-    )?;
+    let subject_hash =
+        private_lookup_hash(&format!("mailbox:{}", mailbox.provider), provider_subject)?;
     let existing =
         mailbox_connection_by_subject(pool, account_id, &mailbox.provider, &subject_hash)?;
     let is_new = existing.is_none();
@@ -2653,12 +3758,7 @@ pub fn mark_mailbox_reauthorization_required(
                     connection_json = ?3,
                     updated_at_ms = ?4
               WHERE account_id = ?1 AND id = ?2",
-            params![
-                account_id,
-                connection_id,
-                payload,
-                mailbox.updated_at_ms
-            ],
+            params![account_id, connection_id, payload, mailbox.updated_at_ms],
         )? > 0),
         DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
             "UPDATE jobs_mailbox_connections
@@ -2770,10 +3870,7 @@ pub fn consume_jobs_oauth_state(
             if expires_at_ms <= now {
                 return Ok(None);
             }
-            Ok(Some((
-                account_id,
-                parse_json(payload, "Jobs OAuth state")?,
-            )))
+            Ok(Some((account_id, parse_json(payload, "Jobs OAuth state")?)))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;

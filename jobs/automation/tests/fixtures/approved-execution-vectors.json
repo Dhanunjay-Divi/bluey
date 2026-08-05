@@ -1,0 +1,119 @@
+{
+  "vectors": [
+    {
+      "name": "legacy_v1_ascii",
+      "schemaVersion": 1,
+      "packet": {
+        "applicationId": "application-1",
+        "jobId": "job-1",
+        "resumeVersionId": "resume-1",
+        "answers": {
+          "email": "ada@example.com",
+          "sponsorship": "No"
+        },
+        "verifiedClaimIds": ["claim-2", "claim-1"]
+      },
+      "job": {
+        "externalId": "job-1",
+        "canonicalUrl": "https://jobs.acme.test/job-1",
+        "company": "Acme",
+        "title": "Engineer",
+        "location": "Remote",
+        "workplace": "remote",
+        "description": "Build useful things.",
+        "source": "greenhouse"
+      },
+      "checksum": "558834e9f04f81657522eca710b10d988535188f0cb3d6daba37b7e839bbff8a"
+    },
+    {
+      "name": "review_v2_ascii",
+      "schemaVersion": 2,
+      "admission": {
+        "kind": "review_approval"
+      },
+      "packet": {
+        "applicationId": "application-1",
+        "jobId": "job-1",
+        "resumeVersionId": "resume-1",
+        "answers": {
+          "email": "ada@example.com",
+          "sponsorship": "No"
+        },
+        "verifiedClaimIds": ["claim-2", "claim-1"]
+      },
+      "job": {
+        "externalId": "job-1",
+        "canonicalUrl": "https://jobs.acme.test/job-1",
+        "company": "Acme",
+        "title": "Engineer",
+        "location": "Remote",
+        "workplace": "remote",
+        "description": "Build useful things.",
+        "source": "greenhouse"
+      },
+      "checksum": "a27ae7ce7e97f13a1190374f88a556afd8812dc1bf2b1c318f0de2894d5f7e59"
+    },
+    {
+      "name": "track_auto_submit_v2_ascii",
+      "schemaVersion": 2,
+      "admission": {
+        "kind": "track_auto_submit",
+        "authorization_id": "authorization-1",
+        "career_track_id": "track-1",
+        "revision_no": 3,
+        "authority_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "packet": {
+        "applicationId": "application-1",
+        "jobId": "job-1",
+        "resumeVersionId": "resume-1",
+        "answers": {
+          "email": "ada@example.com",
+          "sponsorship": "No"
+        },
+        "verifiedClaimIds": ["claim-2", "claim-1"]
+      },
+      "job": {
+        "externalId": "job-1",
+        "canonicalUrl": "https://jobs.acme.test/job-1",
+        "company": "Acme",
+        "title": "Engineer",
+        "location": "Remote",
+        "workplace": "remote",
+        "description": "Build useful things.",
+        "source": "greenhouse"
+      },
+      "checksum": "e1b2e1dc90a86ebee87701c7279baae571ed423485acb85f6fe9b4ec4e816c4e"
+    },
+    {
+      "name": "review_v2_unicode_scalar_key_order",
+      "schemaVersion": 2,
+      "admission": {
+        "kind": "review_approval"
+      },
+      "packet": {
+        "applicationId": "application-1",
+        "jobId": "job-1",
+        "resumeVersionId": "resume-1",
+        "answers": {
+          "email": "ada@example.com",
+          "sponsorship": "No",
+          "\uD83D\uDE00": "astral",
+          "\uE000": "private-use"
+        },
+        "verifiedClaimIds": ["claim-2", "claim-1"]
+      },
+      "job": {
+        "externalId": "job-1",
+        "canonicalUrl": "https://jobs.acme.test/job-1",
+        "company": "Acme",
+        "title": "Engineer",
+        "location": "Remote",
+        "workplace": "remote",
+        "description": "Build useful things.",
+        "source": "greenhouse"
+      },
+      "checksum": "87f5fc186a29e5717d11b8b1d39b7ac3fd88eb99071af38e906387c4d7f0d725"
+    }
+  ]
+}

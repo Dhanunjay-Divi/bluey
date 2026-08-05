@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { assertRunnablePacket, assertSubmissionReceiptComplete, type ApplicationReceiptBundle, type ApplicationPacket } from "../src/index.js";
 
+const SUCCESSFUL_SUBMIT_HTTP_STATUSES = [200, 204, 299, 301, 302, 303, 307, 308] as const;
+const UNSUCCESSFUL_SUBMIT_HTTP_STATUSES = [199, 300, 304, 305, 306, 309, 399, 400] as const;
+
 describe("application runner guards", () => {
   it("requires the frozen application identity and browser profile before a browser run", () => {
     expect(() => assertRunnablePacket(packet({ applicationIdentityId: undefined })))
@@ -20,7 +23,28 @@ describe("application runner guards", () => {
       result: { status: "submitted", issues: [] },
       screenshotKeys: [],
     }))).toThrow("submission confirmation");
+    expect(() => assertSubmissionReceiptComplete(receipt({
+      result: { ...receipt().result, submitHttpStatus: 304 },
+    }))).toThrow("successful submit HTTP status");
   });
+
+  it.each(SUCCESSFUL_SUBMIT_HTTP_STATUSES)(
+    "accepts submitted receipt HTTP status %i",
+    (submitHttpStatus) => {
+      expect(() => assertSubmissionReceiptComplete(receipt({
+        result: { ...receipt().result, submitHttpStatus },
+      }))).not.toThrow();
+    },
+  );
+
+  it.each(UNSUCCESSFUL_SUBMIT_HTTP_STATUSES)(
+    "rejects submitted receipt HTTP status %i",
+    (submitHttpStatus) => {
+      expect(() => assertSubmissionReceiptComplete(receipt({
+        result: { ...receipt().result, submitHttpStatus },
+      }))).toThrow("successful submit HTTP status");
+    },
+  );
 });
 
 function packet(overrides: Partial<ApplicationPacket> = {}): ApplicationPacket {
@@ -73,6 +97,7 @@ function receipt(overrides: Partial<ApplicationReceiptBundle> = {}): Application
     events: [],
     result: {
       status: "submitted",
+      submitHttpStatus: 200,
       confirmationText: "Application received",
       confirmationUrl: "https://boards.greenhouse.io/acme/jobs/1/confirmation",
       submittedAt: "2026-07-11T12:00:00.000Z",

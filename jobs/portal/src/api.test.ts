@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { jobsApi } from "./api";
+import { previewWorkspace } from "./data/preview";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -95,5 +96,57 @@ describe("Jobs API authentication", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({ outcome: "not_submitted", confirmed: true });
     expect(new Headers(init.headers).get("Authorization")).toBe("Bearer dummy-access-token");
+  });
+
+  it("downloads account-scoped application evidence with owner authentication", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const fetchMock = vi.fn(async () => new Response("immutable evidence", {
+      headers: {
+        "Content-Disposition": "attachment; filename=\"application-receipt.json\"",
+        "Content-Type": "application/json",
+      },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const downloaded = await jobsApi.downloadApplicationEvidence(
+      "application/one",
+      "evidence two",
+      "fallback.json",
+    );
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(path).toBe(
+      "/api/jobs/applications/application%2Fone/evidence/evidence%20two/download",
+    );
+    expect(new Headers(init.headers).get("Authorization")).toBe("Bearer dummy-access-token");
+    expect(downloaded.fileName).toBe("application-receipt.json");
+    expect(await downloaded.blob.text()).toBe("immutable evidence");
+  });
+
+  it("binds a stable client request id to a resume source upload", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const fetchMock = vi.fn(async () => Response.json({
+      asset: { id: "00000000-0000-4000-8000-000000000001" },
+      profile: { full_name: "Ada Lovelace" },
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const file = new File(["exact resume"], "resume.txt", { type: "text/plain" });
+
+    await jobsApi.uploadResumeSource(
+      file,
+      previewWorkspace.profile,
+      undefined,
+      "00000000-0000-4000-8000-000000000001",
+    );
+
+    const [path, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(path).toBe("/api/jobs/resume-source");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      request_id: "00000000-0000-4000-8000-000000000001",
+      file_name: "resume.txt",
+      media_type: "text/plain",
+    });
   });
 });

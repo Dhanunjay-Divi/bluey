@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import greenhouseNegativeJson from "./fixtures/greenhouse/negative-cases.json";
 import greenhousePublicJson from "./fixtures/greenhouse/public-modern.json";
@@ -9,6 +11,7 @@ import {
   LEVER_CAPABILITY,
   GreenhouseAdapter,
   LeverApplicationStateMachine,
+  certifiedProviderJobKey,
   createDefaultAdapterRegistry,
   executeApplication,
   submissionPolicy,
@@ -16,7 +19,9 @@ import {
   type ApplicationAdapter,
   type BrowserLocator,
   type BrowserPage,
+  type CertifiedFinalSubmitAdapter,
   type FormControl,
+  type TrustedSubmitFieldValue,
   type InterventionRequest,
 } from "../src/index.js";
 
@@ -55,6 +60,8 @@ const GREENHOUSE = greenhousePublicJson as GreenhouseFixture;
 const GREENHOUSE_NEGATIVE = greenhouseNegativeJson as NegativeCases;
 const LEVER = leverCurrentJson as LeverFixture;
 const LEVER_NEGATIVE = leverNegativeJson as NegativeCases;
+const RESUME_SHA256 = "a".repeat(64);
+const COVER_LETTER_SHA256 = "b".repeat(64);
 
 describe("registered provider-specific beta adapters", () => {
   it("exports review-only metadata and replaces only the generic Greenhouse and Lever adapters", () => {
@@ -108,6 +115,22 @@ describe("registered provider-specific beta adapters", () => {
 
       await expect(executeApplication(context)).rejects.toThrow("browserProfileId");
       expect(page.interactions).toBe(0);
+      expect(page.submitClicks).toBe(0);
+    });
+
+    it(`refuses the ${provider} final control when submit authority is missing`, async () => {
+      const page = provider === "greenhouse"
+        ? new GreenhousePage()
+        : new LeverPage();
+      const context = makeContext(page, provider === "lever" ? LEVER.answers : {});
+      context.beforeFinalSubmit = undefined;
+      const registry = createDefaultAdapterRegistry(undefined, provider === "greenhouse"
+        ? { greenhouse: { finalReviewApproval: () => true } }
+        : { lever: { finalReviewApproval: () => true } });
+
+      await expect(executeApplication(context, registry)).rejects.toThrow(
+        `${provider === "greenhouse" ? "Greenhouse" : "Lever"} final submit authority is unavailable`,
+      );
       expect(page.submitClicks).toBe(0);
     });
   }
@@ -223,21 +246,22 @@ describe("Greenhouse review-only safety", () => {
       expect.objectContaining({ severity: "blocking" }),
     ]));
     expect((await adapter.submit(wrongHostContext)).status).toBe("failed");
+    expect(wrongHostPage.submitClicks).toBe(0);
 
-    for (const options of [
-      { body: GREENHOUSE_NEGATIVE.closedBody },
-      {
-        url: GREENHOUSE_NEGATIVE.unsupportedUrl,
-        controls: [],
-        markers: [],
-        submitCount: 0,
-      },
-    ]) {
-      const page = new GreenhousePage(options);
-      const result = await executeApplication(makeContext(page));
-      expect(result.receipt.status).not.toBe("submitted");
-      expect(page.submitClicks).toBe(0);
-    }
+    const closedPage = new GreenhousePage({ body: GREENHOUSE_NEGATIVE.closedBody });
+    const closedResult = await executeApplication(makeContext(closedPage));
+    expect(closedResult.receipt.status).not.toBe("submitted");
+    expect(closedPage.submitClicks).toBe(0);
+
+    const unsupportedPage = new GreenhousePage({
+      url: GREENHOUSE_NEGATIVE.unsupportedUrl,
+      controls: [],
+      markers: [],
+      submitCount: 0,
+    });
+    await expect(executeApplication(makeContext(unsupportedPage)))
+      .rejects.toThrow("does not match");
+    expect(unsupportedPage.submitClicks).toBe(0);
   });
 
   it("treats unclear confirmation as uncertain and never retries", async () => {
@@ -359,22 +383,18 @@ describe("Lever review-only safety", () => {
 
     const wrongHostPage = new LeverPage({ url: LEVER_NEGATIVE.wrongHost });
     const wrongHostContext = makeContext(wrongHostPage, LEVER.answers);
-    await adapter.prepare(wrongHostContext);
-    await adapter.fill(wrongHostContext);
-    expect(await adapter.validate(wrongHostContext)).toEqual(expect.arrayContaining([
-      expect.objectContaining({ severity: "blocking" }),
-    ]));
-    expect((await adapter.submit(wrongHostContext, { finalReviewApproved: true })).status).not.toBe("submitted");
+    await expect(adapter.prepare(wrongHostContext)).rejects.toThrow("does not match");
+    expect(wrongHostPage.submitClicks).toBe(0);
 
-    for (const options of [
-      { body: LEVER_NEGATIVE.closedBody },
-      { url: LEVER_NEGATIVE.unsupportedUrl },
-    ]) {
-      const page = new LeverPage(options);
-      const result = await executeApplication(makeContext(page, LEVER.answers));
-      expect(result.receipt.status).not.toBe("submitted");
-      expect(page.submitClicks).toBe(0);
-    }
+    const closedPage = new LeverPage({ body: LEVER_NEGATIVE.closedBody });
+    const closedResult = await executeApplication(makeContext(closedPage, LEVER.answers));
+    expect(closedResult.receipt.status).not.toBe("submitted");
+    expect(closedPage.submitClicks).toBe(0);
+
+    const unsupportedPage = new LeverPage({ url: LEVER_NEGATIVE.unsupportedUrl });
+    await expect(executeApplication(makeContext(unsupportedPage, LEVER.answers)))
+      .rejects.toThrow("does not match");
+    expect(unsupportedPage.submitClicks).toBe(0);
   });
 
   it("treats unclear confirmation as uncertain and never retries", async () => {
@@ -388,27 +408,30 @@ describe("Lever review-only safety", () => {
     });
 
     const first = await executeApplication(context, registry);
-    const second = await executeApplication(context, registry);
     expect(first.receipt).toMatchObject({ status: "needs_input" });
     expect(first.receipt.confirmationText).toBeUndefined();
-    expect(second.receipt.status).not.toBe("submitted");
+    await expect(executeApplication(context, registry)).rejects.toThrow("does not match");
     expect(page.submitClicks).toBe(1);
   });
 });
 
-function makeContext(page: BrowserPage, answers: Record<string, string> = {}): AdapterContext {
+function makeContext(
+  page: GreenhousePage | LeverPage,
+  answers: Record<string, string> = {},
+): AdapterContext {
   return {
     runner: "local",
     runId: "run-provider-beta",
     accountId: "account-provider-beta",
+    approvedCanonicalUrl: page.fixtureUrl(),
     page,
     packet: {
       applicationId: "application-provider-beta",
       jobId: "job-provider-beta",
       resumeVersionId: "resume-provider-beta",
       approvedPacketChecksum: "c".repeat(64),
-      resumePath: "/packets/resume.pdf",
-      coverLetterPath: "/packets/cover-letter.pdf",
+      resumePath: `/packets/resume-${RESUME_SHA256}.pdf`,
+      coverLetterPath: `/packets/cover-letter-${COVER_LETTER_SHA256}.pdf`,
       answers: {
         first_name: "Ada",
         last_name: "Lovelace",
@@ -423,6 +446,8 @@ function makeContext(page: BrowserPage, answers: Record<string, string> = {}): A
       browserProfileId: "profile-provider-beta",
     },
     async log() {},
+    async beforeFinalSubmit() {},
+    async afterFinalSubmit() {},
   };
 }
 
@@ -459,6 +484,16 @@ class GreenhousePage implements BrowserPage {
     this.interactions += 1;
     return this.currentUrl;
   }
+
+  fixtureUrl(): string {
+    return this.currentUrl;
+  }
+
+  async installExactSubmitGuard(): Promise<void> {}
+
+  async beginExactSubmitGuard(): Promise<void> {}
+
+  async assertExactSubmitGuardClean(): Promise<void> {}
 
   async title(): Promise<string> {
     this.interactions += 1;
@@ -522,7 +557,32 @@ class GreenhousePage implements BrowserPage {
       selectOption: async (value) => { if (control) control.value = value; },
       setChecked: async (checked) => { if (control) control.checked = checked; },
       setInputFiles: async (paths) => {
-        if (control) control.value = paths[0]?.split("/").at(-1) ?? "";
+        if (!control) return [];
+        const files = paths.map(fileEvidenceForSnapshotPath);
+        control.value = files.map((file) => file.name).join(", ");
+        control.files = files;
+        return files;
+      },
+      effectiveSubmitTarget: async (adapter) => ({
+        actionUrl: this.currentUrl,
+        method: "post",
+        enctype: "multipart/form-data",
+        formTarget: "_self",
+        providerJobKey: providerJobKey(adapter, this.currentUrl),
+        formIdentity: "[0,\"application_form\"]",
+      }),
+      successfulSubmitEvidence: async (trustedFields, providerJobKeyValue) => (
+        fixtureSubmitEvidence(this.controlsState, trustedFields, providerJobKeyValue)
+      ),
+      clickWithExactSubmit: async (expectation) => {
+        if (expectation.target.providerJobKey !== providerJobKey("greenhouse", this.currentUrl)) {
+          throw new Error("Fixture submit job changed");
+        }
+        this.submitClicks += 1;
+        this.submitted = true;
+        this.body = this.options.afterSubmitBody ?? GREENHOUSE.confirmationBody;
+        this.currentUrl = this.options.afterSubmitUrl ?? `${GREENHOUSE.url}/confirmation`;
+        return 200;
       },
     };
   }
@@ -562,6 +622,16 @@ class LeverPage implements BrowserPage {
     this.interactions += 1;
     return this.currentUrl;
   }
+
+  fixtureUrl(): string {
+    return this.currentUrl;
+  }
+
+  async installExactSubmitGuard(): Promise<void> {}
+
+  async beginExactSubmitGuard(): Promise<void> {}
+
+  async assertExactSubmitGuardClean(): Promise<void> {}
 
   async title(): Promise<string> {
     this.interactions += 1;
@@ -630,7 +700,33 @@ class LeverPage implements BrowserPage {
       selectOption: async (value) => { if (control) control.value = value; },
       setChecked: async (checked) => { if (control) control.checked = checked; },
       setInputFiles: async (paths) => {
-        if (control) control.value = paths[0]?.split("/").at(-1) ?? "";
+        if (!control) return [];
+        const files = paths.map(fileEvidenceForSnapshotPath);
+        control.value = files.map((file) => file.name).join(", ");
+        control.files = files;
+        return files;
+      },
+      effectiveSubmitTarget: async (adapter) => ({
+        actionUrl: this.currentUrl,
+        method: "post",
+        enctype: "multipart/form-data",
+        formTarget: "_self",
+        providerJobKey: providerJobKey(adapter, this.currentUrl),
+        formIdentity: "[0,\"application-form\"]",
+      }),
+      successfulSubmitEvidence: async (trustedFields, providerJobKeyValue) => (
+        fixtureSubmitEvidence(this.controlsState, trustedFields, providerJobKeyValue)
+      ),
+      clickWithExactSubmit: async (expectation) => {
+        if (expectation.target.providerJobKey !== providerJobKey("lever", this.currentUrl)) {
+          throw new Error("Fixture submit job changed");
+        }
+        this.submitClicks += 1;
+        this.submitted = true;
+        this.body = this.options.afterSubmitBody ?? "Thank you for applying.";
+        this.currentUrl = this.options.afterSubmitUrl
+          ?? leverConfirmationUrl(LEVER.applicationUrl);
+        return 200;
       },
     };
   }
@@ -660,4 +756,78 @@ function leverSubmitQuery(selector: string): boolean {
 
 function leverApplyQuery(selector: string): boolean {
   return selector.includes("show-page-apply") || selector.includes("postings-btn");
+}
+
+function providerJobKey(adapter: CertifiedFinalSubmitAdapter, url: string): string {
+  return certifiedProviderJobKey(adapter, url, "submit");
+}
+
+function leverConfirmationUrl(rawUrl: string): string {
+  const url = new URL(rawUrl);
+  url.pathname = `${url.pathname.replace(/\/apply$/u, "")}/confirmation`;
+  return url.toString();
+}
+
+function fileEvidenceForSnapshotPath(path: string) {
+  const name = path.split(/[\\/]/u).at(-1) ?? "";
+  const sha256 = /-([a-f0-9]{64})\.pdf$/u.exec(name)?.[1] ?? "";
+  return { name, byteLength: 1_024, sha256 };
+}
+
+function fixtureSubmitFields(
+  controls: readonly FormControl[],
+  trustedFields: ReadonlyArray<Readonly<TrustedSubmitFieldValue>> = [],
+  providerJobKeyValue?: string,
+) {
+  const trustedByName = new Map<string, string[]>();
+  for (const field of trustedFields) {
+    const values = trustedByName.get(field.fieldName) ?? [];
+    values.push(field.value);
+    trustedByName.set(field.fieldName, values);
+  }
+  const offsets = new Map<string, number>();
+  const approvedJobId = providerJobKeyValue?.split(":").at(-1);
+  return controls.flatMap((control) => {
+    if (!control.name
+      || control.kind === "file"
+      || ((control.kind === "checkbox" || control.kind === "radio") && !control.checked)) {
+      return [];
+    }
+    const offset = offsets.get(control.name) ?? 0;
+    const trustedValue = trustedByName.get(control.name)?.[offset];
+    if (trustedValue !== undefined) offsets.set(control.name, offset + 1);
+    let value = trustedValue ?? control.value;
+    if (approvedJobId && /^(?:job_id|jobid|gh_jid|posting_id|postingid)$/iu.test(control.name)) {
+      value = approvedJobId;
+    }
+    if (!value) return [];
+    const normalized = value.replace(/\r\n|\r|\n/gu, "\r\n");
+    const bytes = Buffer.from(normalized, "utf8");
+    return [{
+      fieldName: control.name,
+      valueByteLength: bytes.byteLength,
+      valueSha256: createHash("sha256").update(bytes).digest("hex"),
+    }];
+  });
+}
+
+function fixtureSubmitEvidence(
+  controls: readonly FormControl[],
+  trustedFields: ReadonlyArray<Readonly<TrustedSubmitFieldValue>> = [],
+  providerJobKeyValue?: string,
+) {
+  const fields = fixtureSubmitFields(controls, trustedFields, providerJobKeyValue);
+  const fileCount = controls.reduce((count, control) => (
+    count + (control.kind === "file" ? (control.files ?? []).length : 0)
+  ), 0);
+  return {
+    fields,
+    partOrder: [
+      ...fields.map((_field, index) => ({ kind: "field" as const, index })),
+      ...Array.from({ length: fileCount }, (_unused, index) => ({
+        kind: "file" as const,
+        index,
+      })),
+    ],
+  };
 }

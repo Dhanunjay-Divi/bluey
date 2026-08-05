@@ -1,11 +1,24 @@
 //! Account dashboard/export/delete read models.
 
 use anyhow::{Context, Result};
-use postgres::Row as PgRow;
-use rusqlite::{params, OptionalExtension};
-use std::collections::HashSet;
+use postgres::{Row as PgRow, Transaction as PgTransaction};
+use rusqlite::{params, OptionalExtension, Transaction as SqliteTransaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashSet,
+    sync::{mpsc, Arc, LazyLock},
+};
+use tokio::sync::{
+    oneshot, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, OwnedSemaphorePermit, RwLock,
+};
 
-use crate::db::{jobs, DbPool};
+use crate::db::{jobs, DbPool, PostgresDbConn};
+
+/// A pending object remains an active PUT/finalization risk for this long.
+/// This matches the five-minute object-storage processing lease: deletion
+/// fences new writers immediately, then waits for recent writers to drain or
+/// become eligible for durable stale-upload cleanup.
+pub const ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS: i64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageSummary {
@@ -48,6 +61,227 @@ pub struct ArtifactObjectRef {
     pub expires_at_ms: Option<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AccountDeletionIntent {
+    pub account_id: String,
+    pub requested_at_ms: i64,
+    pub last_checked_at_ms: i64,
+    pub fresh_upload_cutoff_ms: i64,
+    pub fresh_in_flight_puts: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BeginAccountDeletionResult {
+    Ready(AccountDeletionIntent),
+    WaitingForUploads(AccountDeletionIntent),
+    WaitingForIrreversibleSubmissions { active_submissions: i64 },
+    WaitingForCloudRunnerCleanup { cloud_runner_records: i64 },
+}
+
+impl BeginAccountDeletionResult {
+    pub fn intent(&self) -> Option<&AccountDeletionIntent> {
+        match self {
+            Self::Ready(intent) | Self::WaitingForUploads(intent) => Some(intent),
+            Self::WaitingForIrreversibleSubmissions { .. }
+            | Self::WaitingForCloudRunnerCleanup { .. } => None,
+        }
+    }
+}
+
+// SQLite is a local/dev backend, so a process-wide reader/writer lock keeps its
+// in-process async object I/O ordered with deletion. PostgreSQL uses a database
+// advisory reader/writer lock so coordination spans every server replica and
+// remains held across the physical object-store operation.
+static SQLITE_ACCOUNT_OBJECT_LIFECYCLE_LOCK: LazyLock<Arc<RwLock<()>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(())));
+
+#[must_use = "the account-object lifecycle guard must live across object-store I/O"]
+pub enum AccountObjectLifecycleGuard {
+    SqliteWriter(OwnedRwLockReadGuard<()>),
+    SqliteDeletion(OwnedRwLockWriteGuard<()>),
+    PostgresAdvisory(PostgresAccountObjectLifecycleGuard),
+}
+
+/// Releases a session-level PostgreSQL advisory lock on its dedicated blocking
+/// coordination thread. The pooled connection never returns while still
+/// carrying an advisory lock.
+pub struct PostgresAccountObjectLifecycleGuard {
+    release: Option<mpsc::Sender<()>>,
+}
+
+struct LockedPostgresAdvisorySession {
+    connection: Option<PostgresDbConn>,
+    lock_key: i64,
+    shared: bool,
+}
+
+impl Drop for LockedPostgresAdvisorySession {
+    fn drop(&mut self) {
+        let Some(mut connection) = self.connection.take() else {
+            return;
+        };
+        let unlock_sql = if self.shared {
+            "SELECT pg_advisory_unlock_shared($1)"
+        } else {
+            "SELECT pg_advisory_unlock($1)"
+        };
+        let unlocked = connection
+            .query_one(unlock_sql, &[&self.lock_key])
+            .and_then(|row| row.try_get::<_, bool>(0))
+            .unwrap_or(false);
+        if !unlocked {
+            tracing::error!(
+                shared = self.shared,
+                "failed to release PostgreSQL account object lifecycle lock; discarding session"
+            );
+            connection.mark_broken();
+        }
+    }
+}
+
+impl Drop for PostgresAccountObjectLifecycleGuard {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
+/// Acquire object-writer coordination before reserving or beginning a physical
+/// account-scoped PUT. Callers retain the returned guard through terminal ledger
+/// state and every awaited object-store operation.
+pub async fn acquire_account_object_writer(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<AccountObjectLifecycleGuard> {
+    acquire_account_object_lifecycle_guard(pool, account_id, true).await
+}
+
+/// Enter account-object deletion coordination. The exclusive guard remains live
+/// through prefix purge and hard delete, preventing a previously paused PUT or
+/// another server replica from recreating account bytes after the final sweep.
+pub async fn acquire_account_object_deletion(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<AccountObjectLifecycleGuard> {
+    acquire_account_object_lifecycle_guard(pool, account_id, false).await
+}
+
+async fn acquire_account_object_lifecycle_guard(
+    pool: &DbPool,
+    account_id: &str,
+    shared: bool,
+) -> Result<AccountObjectLifecycleGuard> {
+    anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
+    match pool {
+        DbPool::Sqlite(_) if shared => Ok(AccountObjectLifecycleGuard::SqliteWriter(
+            SQLITE_ACCOUNT_OBJECT_LIFECYCLE_LOCK
+                .clone()
+                .read_owned()
+                .await,
+        )),
+        DbPool::Sqlite(_) => Ok(AccountObjectLifecycleGuard::SqliteDeletion(
+            SQLITE_ACCOUNT_OBJECT_LIFECYCLE_LOCK
+                .clone()
+                .write_owned()
+                .await,
+        )),
+        DbPool::Postgres(pools) => {
+            let lifecycle_slot = pools
+                .lifecycle_slots()
+                .acquire_owned()
+                .await
+                .context("wait for PostgreSQL lifecycle lock capacity")?;
+            acquire_postgres_account_object_guard(
+                pools.lifecycle_pool(),
+                lifecycle_slot,
+                account_id,
+                shared,
+            )
+            .await
+            .map(AccountObjectLifecycleGuard::PostgresAdvisory)
+        }
+    }
+}
+
+async fn acquire_postgres_account_object_guard(
+    pool: crate::db::PostgresDbPool,
+    lifecycle_slot: OwnedSemaphorePermit,
+    account_id: &str,
+    shared: bool,
+) -> Result<PostgresAccountObjectLifecycleGuard> {
+    let lock_key = postgres_account_object_lock_key(account_id);
+    let (acquired_tx, acquired_rx) = oneshot::channel::<std::result::Result<(), String>>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    std::thread::Builder::new()
+        .name("bluey-account-object-lock".to_string())
+        .spawn(move || {
+            let lock_sql = if shared {
+                "SELECT pg_advisory_lock_shared($1)"
+            } else {
+                "SELECT pg_advisory_lock($1)"
+            };
+            let _lifecycle_slot = lifecycle_slot;
+            let mut connection = match pool.get().context("get PostgreSQL lifecycle lock") {
+                Ok(connection) => connection,
+                Err(error) => {
+                    let _ = acquired_tx.send(Err(format!("{error:#}")));
+                    return;
+                }
+            };
+            if let Err(error) = connection
+                .query_one(lock_sql, &[&lock_key])
+                .context("acquire PostgreSQL lifecycle lock")
+            {
+                let _ = acquired_tx.send(Err(format!("{error:#}")));
+                return;
+            }
+            let locked_session = LockedPostgresAdvisorySession {
+                connection: Some(connection),
+                lock_key,
+                shared,
+            };
+            if acquired_tx.send(Ok(())).is_err() {
+                return;
+            }
+            let _ = release_rx.recv();
+            drop(locked_session);
+        })
+        .context("spawn PostgreSQL lifecycle lock thread")?;
+    acquired_rx
+        .await
+        .context("PostgreSQL lifecycle lock thread stopped")?
+        .map_err(anyhow::Error::msg)?;
+    Ok(PostgresAccountObjectLifecycleGuard {
+        release: Some(release_tx),
+    })
+}
+
+fn postgres_account_object_lock_key(account_id: &str) -> i64 {
+    let digest = Sha256::digest(
+        [
+            b"bluey-account-object-lifecycle\0".as_slice(),
+            account_id.as_bytes(),
+        ]
+        .concat(),
+    );
+    i64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is eight bytes"),
+    )
+}
+
+/// Transaction-scoped account write authority used by reservation and
+/// finalization paths. PostgreSQL checks take the account row `FOR UPDATE`;
+/// SQLite callers must already hold an `IMMEDIATE` transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AccountWriteFence {
+    Active,
+    DeletionRequested,
+    Missing,
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct ExportAccount {
     pub id: String,
@@ -86,6 +320,34 @@ pub fn hard_delete_account(pool: &DbPool, account_id: &str) -> Result<bool> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => hard_delete_account_sqlite(pool, account_id),
         DbPool::Postgres(_) => hard_delete_account_postgres(pool, account_id),
+    })
+}
+
+/// Persist the account-deletion write fence and report whether recent pending
+/// object PUTs still need to drain. A `WaitingForUploads` result is durable:
+/// callers must stop deletion, while all subsequent fenced writers fail
+/// closed until hard deletion removes the account and intent by cascade.
+pub fn begin_account_deletion(
+    pool: &DbPool,
+    account_id: &str,
+    now_ms: i64,
+) -> Result<Option<BeginAccountDeletionResult>> {
+    anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
+    anyhow::ensure!(now_ms >= 0, "now_ms must be non-negative");
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => begin_account_deletion_sqlite(pool, account_id, now_ms),
+        DbPool::Postgres(_) => begin_account_deletion_postgres(pool, account_id, now_ms),
+    })
+}
+
+/// Read the durable deletion fence without acquiring write authority.
+pub fn account_deletion_intent(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Option<AccountDeletionIntent>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => account_deletion_intent_sqlite(pool, account_id),
+        DbPool::Postgres(_) => account_deletion_intent_postgres(pool, account_id),
     })
 }
 
@@ -167,6 +429,36 @@ pub fn artifact_object_refs(pool: &DbPool, account_id: &str) -> Result<Vec<Artif
                 expires_at_ms: None,
             });
         }
+        if let Some(receipt_object) = receipt
+            .get("receiptObject")
+            .and_then(serde_json::Value::as_object)
+        {
+            let key = receipt_object
+                .get("storageKey")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if !key.is_empty() && seen.insert(key.to_string()) {
+                refs.push(ArtifactObjectRef {
+                    artifact_id: format!("{}:receipt", application.id),
+                    title: "Application receipt bundle".to_string(),
+                    object_key: key.to_string(),
+                    content_type: receipt_object
+                        .get("mediaType")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| Some("application/json".to_string())),
+                    size_bytes: receipt_object
+                        .get("sizeBytes")
+                        .and_then(serde_json::Value::as_i64),
+                    sha256: receipt_object
+                        .get("sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .map(ToString::to_string),
+                    expires_at_ms: None,
+                });
+            }
+        }
         for (index, screenshot) in receipt
             .get("screenshotKeys")
             .and_then(serde_json::Value::as_array)
@@ -203,7 +495,73 @@ pub fn artifact_object_refs(pool: &DbPool, account_id: &str) -> Result<Vec<Artif
             });
         }
     }
+    for reference in browser_profile_snapshot_object_refs(pool, account_id)? {
+        if seen.insert(reference.object_key.clone()) {
+            refs.push(reference);
+        }
+    }
     Ok(refs)
+}
+
+fn browser_profile_snapshot_object_refs(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<ArtifactObjectRef>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT browser_profile_id, generation, object_key, size_bytes, sha256
+                   FROM jobs_browser_profile_snapshots WHERE account_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| {
+                let browser_profile_id: String = row.get(0)?;
+                let generation: i64 = row.get(1)?;
+                Ok(ArtifactObjectRef {
+                    artifact_id: format!(
+                        "browser-profile-snapshot:{browser_profile_id}:{generation}"
+                    ),
+                    title: "Encrypted Bluey Browser profile snapshot".to_string(),
+                    object_key: row.get(2)?,
+                    content_type: Some(
+                        "application/vnd.bluey.browser-profile+encrypted".to_string(),
+                    ),
+                    size_bytes: Some(row.get(3)?),
+                    sha256: Some(row.get(4)?),
+                    expires_at_ms: None,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(Into::into)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.query(
+                "SELECT browser_profile_id, generation, object_key, size_bytes, sha256
+                   FROM jobs_browser_profile_snapshots WHERE account_id = $1",
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(|row| {
+                let browser_profile_id: String = row.try_get(0)?;
+                let generation: i64 = row.try_get(1)?;
+                Ok(ArtifactObjectRef {
+                    artifact_id: format!(
+                        "browser-profile-snapshot:{browser_profile_id}:{generation}"
+                    ),
+                    title: "Encrypted Bluey Browser profile snapshot".to_string(),
+                    object_key: row.try_get(2)?,
+                    content_type: Some(
+                        "application/vnd.bluey.browser-profile+encrypted".to_string(),
+                    ),
+                    size_bytes: Some(row.try_get(3)?),
+                    sha256: Some(row.try_get(4)?),
+                    expires_at_ms: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+        }
+    })
 }
 
 fn usage_summary_sqlite(pool: &DbPool, account_id: &str) -> Result<UsageSummary> {
@@ -580,9 +938,328 @@ fn export_bundle_postgres(pool: &DbPool, account_id: &str) -> Result<Option<Expo
     }))
 }
 
+fn begin_account_deletion_sqlite(
+    pool: &DbPool,
+    account_id: &str,
+    now_ms: i64,
+) -> Result<Option<BeginAccountDeletionResult>> {
+    let mut conn = pool
+        .get()
+        .context("get sqlite account-deletion connection")?;
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .context("begin sqlite account-deletion fence")?;
+    let account_exists = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            params![account_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !account_exists {
+        return Ok(None);
+    }
+
+    let active_submissions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs_applications AS application
+          WHERE application.account_id = ?1 AND application.state <> 'submitted'
+            AND (
+              EXISTS (
+                SELECT 1 FROM jobs_execution_leases AS lease
+                 WHERE lease.account_id = application.account_id
+                   AND lease.application_id = application.id
+                   AND lease.phase IN ('click_started', 'submitted', 'side_effect_unknown')
+              )
+              OR EXISTS (
+                SELECT 1 FROM jobs_local_run_tickets AS ticket
+                 WHERE ticket.account_id = application.account_id
+                   AND ticket.application_id = application.id
+                   AND ticket.status IN ('click_started', 'side_effect_unknown')
+              )
+            )",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    if active_submissions > 0 {
+        return Ok(Some(
+            BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
+        ));
+    }
+
+    let cloud_runner_records: i64 = tx.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM jobs_browser_sessions
+              WHERE account_id = ?1 AND runner = 'cloud')
+            +
+            (SELECT COUNT(*) FROM jobs_execution_leases WHERE account_id = ?1)",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    if cloud_runner_records > 0 {
+        return Ok(Some(
+            BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
+                cloud_runner_records,
+            },
+        ));
+    }
+
+    let cutoff_ms = now_ms.saturating_sub(ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS);
+    tx.execute(
+        "INSERT OR IGNORE INTO account_deletion_intents (
+            account_id, requested_at_ms, last_checked_at_ms,
+            fresh_upload_cutoff_ms, fresh_in_flight_puts
+         ) VALUES (?1, ?2, ?2, ?3, 0)",
+        params![account_id, now_ms, cutoff_ms],
+    )?;
+    let fresh_in_flight_puts: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM object_uploads
+          WHERE account_id = ?1 AND state = 'pending' AND updated_at_ms > ?2",
+        params![account_id, cutoff_ms],
+        |row| row.get(0),
+    )?;
+    tx.execute(
+        "UPDATE account_deletion_intents
+            SET last_checked_at_ms = ?2, fresh_upload_cutoff_ms = ?3,
+                fresh_in_flight_puts = ?4
+          WHERE account_id = ?1",
+        params![account_id, now_ms, cutoff_ms, fresh_in_flight_puts],
+    )?;
+    let intent = tx.query_row(
+        "SELECT account_id, requested_at_ms, last_checked_at_ms,
+                fresh_upload_cutoff_ms, fresh_in_flight_puts
+           FROM account_deletion_intents WHERE account_id = ?1",
+        params![account_id],
+        account_deletion_intent_from_sqlite,
+    )?;
+    tx.commit()?;
+    Ok(Some(classify_account_deletion_intent(intent)))
+}
+
+fn begin_account_deletion_postgres(
+    pool: &DbPool,
+    account_id: &str,
+    now_ms: i64,
+) -> Result<Option<BeginAccountDeletionResult>> {
+    let mut conn = pool
+        .get_pg()
+        .context("get postgres account-deletion connection")?;
+    let mut tx = conn
+        .transaction()
+        .context("begin postgres account-deletion fence")?;
+    let account_exists = tx
+        .query_opt(
+            "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+            &[&account_id],
+        )?
+        .is_some();
+    if !account_exists {
+        return Ok(None);
+    }
+
+    let active_submissions: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM jobs_applications AS application
+              WHERE application.account_id = $1 AND application.state <> 'submitted'
+                AND (
+                  EXISTS (
+                    SELECT 1 FROM jobs_execution_leases AS lease
+                     WHERE lease.account_id = application.account_id
+                       AND lease.application_id = application.id
+                       AND lease.phase IN ('click_started', 'submitted', 'side_effect_unknown')
+                  )
+                  OR EXISTS (
+                    SELECT 1 FROM jobs_local_run_tickets AS ticket
+                     WHERE ticket.account_id = application.account_id
+                       AND ticket.application_id = application.id
+                       AND ticket.status IN ('click_started', 'side_effect_unknown')
+                  )
+                )",
+            &[&account_id],
+        )?
+        .try_get(0)?;
+    if active_submissions > 0 {
+        return Ok(Some(
+            BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
+        ));
+    }
+
+    let cloud_runner_records: i64 = tx
+        .query_one(
+            "SELECT
+                (SELECT COUNT(*)::bigint FROM jobs_browser_sessions
+                  WHERE account_id = $1 AND runner = 'cloud')
+                +
+                (SELECT COUNT(*)::bigint FROM jobs_execution_leases WHERE account_id = $1)",
+            &[&account_id],
+        )?
+        .try_get(0)?;
+    if cloud_runner_records > 0 {
+        return Ok(Some(
+            BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
+                cloud_runner_records,
+            },
+        ));
+    }
+
+    let cutoff_ms = now_ms.saturating_sub(ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS);
+    tx.execute(
+        "INSERT INTO account_deletion_intents (
+            account_id, requested_at_ms, last_checked_at_ms,
+            fresh_upload_cutoff_ms, fresh_in_flight_puts
+         ) VALUES ($1, $2, $2, $3, 0)
+         ON CONFLICT(account_id) DO NOTHING",
+        &[&account_id, &now_ms, &cutoff_ms],
+    )?;
+    let fresh_in_flight_puts: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM object_uploads
+              WHERE account_id = $1 AND state = 'pending' AND updated_at_ms > $2",
+            &[&account_id, &cutoff_ms],
+        )?
+        .try_get(0)?;
+    tx.execute(
+        "UPDATE account_deletion_intents
+            SET last_checked_at_ms = $2, fresh_upload_cutoff_ms = $3,
+                fresh_in_flight_puts = $4
+          WHERE account_id = $1",
+        &[&account_id, &now_ms, &cutoff_ms, &fresh_in_flight_puts],
+    )?;
+    let row = tx.query_one(
+        "SELECT account_id, requested_at_ms, last_checked_at_ms,
+                fresh_upload_cutoff_ms, fresh_in_flight_puts
+           FROM account_deletion_intents WHERE account_id = $1",
+        &[&account_id],
+    )?;
+    let intent = account_deletion_intent_from_pg(&row)?;
+    tx.commit()?;
+    Ok(Some(classify_account_deletion_intent(intent)))
+}
+
+fn account_deletion_intent_sqlite(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Option<AccountDeletionIntent>> {
+    let conn = pool
+        .get()
+        .context("get sqlite account-deletion read connection")?;
+    Ok(conn
+        .query_row(
+            "SELECT account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+               FROM account_deletion_intents WHERE account_id = ?1",
+            params![account_id],
+            account_deletion_intent_from_sqlite,
+        )
+        .optional()?)
+}
+
+fn account_deletion_intent_postgres(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Option<AccountDeletionIntent>> {
+    let mut conn = pool
+        .get_pg()
+        .context("get postgres account-deletion read connection")?;
+    conn.query_opt(
+        "SELECT account_id, requested_at_ms, last_checked_at_ms,
+                fresh_upload_cutoff_ms, fresh_in_flight_puts
+           FROM account_deletion_intents WHERE account_id = $1",
+        &[&account_id],
+    )?
+    .map(|row| account_deletion_intent_from_pg(&row))
+    .transpose()
+}
+
+fn classify_account_deletion_intent(intent: AccountDeletionIntent) -> BeginAccountDeletionResult {
+    if intent.fresh_in_flight_puts == 0 {
+        BeginAccountDeletionResult::Ready(intent)
+    } else {
+        BeginAccountDeletionResult::WaitingForUploads(intent)
+    }
+}
+
+fn account_deletion_intent_from_sqlite(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AccountDeletionIntent> {
+    Ok(AccountDeletionIntent {
+        account_id: row.get(0)?,
+        requested_at_ms: row.get(1)?,
+        last_checked_at_ms: row.get(2)?,
+        fresh_upload_cutoff_ms: row.get(3)?,
+        fresh_in_flight_puts: row.get(4)?,
+    })
+}
+
+fn account_deletion_intent_from_pg(row: &PgRow) -> Result<AccountDeletionIntent> {
+    Ok(AccountDeletionIntent {
+        account_id: row.try_get(0)?,
+        requested_at_ms: row.try_get(1)?,
+        last_checked_at_ms: row.try_get(2)?,
+        fresh_upload_cutoff_ms: row.try_get(3)?,
+        fresh_in_flight_puts: row.try_get(4)?,
+    })
+}
+
+pub(crate) fn account_write_fence_sqlite_tx(
+    tx: &SqliteTransaction<'_>,
+    account_id: &str,
+) -> Result<AccountWriteFence> {
+    let account_exists = tx
+        .query_row(
+            "SELECT 1 FROM accounts WHERE id = ?1",
+            params![account_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !account_exists {
+        return Ok(AccountWriteFence::Missing);
+    }
+    let deletion_requested = tx
+        .query_row(
+            "SELECT 1 FROM account_deletion_intents WHERE account_id = ?1",
+            params![account_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    Ok(if deletion_requested {
+        AccountWriteFence::DeletionRequested
+    } else {
+        AccountWriteFence::Active
+    })
+}
+
+pub(crate) fn account_write_fence_postgres_tx(
+    tx: &mut PgTransaction<'_>,
+    account_id: &str,
+) -> Result<AccountWriteFence> {
+    let account_exists = tx
+        .query_opt(
+            "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
+            &[&account_id],
+        )?
+        .is_some();
+    if !account_exists {
+        return Ok(AccountWriteFence::Missing);
+    }
+    let deletion_requested = tx
+        .query_opt(
+            "SELECT 1 FROM account_deletion_intents WHERE account_id = $1",
+            &[&account_id],
+        )?
+        .is_some();
+    Ok(if deletion_requested {
+        AccountWriteFence::DeletionRequested
+    } else {
+        AccountWriteFence::Active
+    })
+}
+
 fn hard_delete_account_sqlite(pool: &DbPool, account_id: &str) -> Result<bool> {
     let mut conn = pool.get()?;
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute(
         "DELETE FROM stripe_webhook_events
             WHERE json_extract(body, '$.data.object.client_reference_id') = ?1
@@ -669,7 +1346,8 @@ fn append_upload_ledger_artifact_refs_sqlite(
         .map(|reference| reference.object_key.clone())
         .collect::<HashSet<_>>();
     let mut stmt = conn.prepare(
-        "SELECT logical_id, object_key, content_type, size_bytes, sha256, expires_at_ms
+        "SELECT logical_id, object_key, content_type, size_bytes, sha256, expires_at_ms,
+                metadata_json
            FROM object_uploads
           WHERE account_id = ?1 AND object_kind = 'artifact' AND state <> 'deleted'
           ORDER BY created_at_ms",
@@ -677,7 +1355,7 @@ fn append_upload_ledger_artifact_refs_sqlite(
     let rows = stmt.query_map(params![account_id], |row| {
         Ok(ArtifactObjectRef {
             artifact_id: row.get(0)?,
-            title: "Uploaded artifact".to_string(),
+            title: upload_ledger_title(&row.get::<_, String>(6)?),
             object_key: row.get(1)?,
             content_type: row.get(2)?,
             size_bytes: row.get(3)?,
@@ -704,7 +1382,8 @@ fn append_upload_ledger_artifact_refs_postgres(
         .map(|reference| reference.object_key.clone())
         .collect::<HashSet<_>>();
     let rows = conn.query(
-        "SELECT logical_id, object_key, content_type, size_bytes, sha256, expires_at_ms
+        "SELECT logical_id, object_key, content_type, size_bytes, sha256, expires_at_ms,
+                metadata_json
            FROM object_uploads
           WHERE account_id = $1 AND object_kind = 'artifact' AND state <> 'deleted'
           ORDER BY created_at_ms",
@@ -713,7 +1392,7 @@ fn append_upload_ledger_artifact_refs_postgres(
     for row in rows {
         let reference = ArtifactObjectRef {
             artifact_id: row.try_get(0)?,
-            title: "Uploaded artifact".to_string(),
+            title: upload_ledger_title(&row.try_get::<_, String>(6)?),
             object_key: row.try_get(1)?,
             content_type: row.try_get(2)?,
             size_bytes: row.try_get(3)?,
@@ -725,6 +1404,20 @@ fn append_upload_ledger_artifact_refs_postgres(
         }
     }
     Ok(())
+}
+
+fn upload_ledger_title(metadata_json: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(metadata_json)
+        .ok()
+        .and_then(|metadata| {
+            metadata
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(ToString::to_string)
+        })
+        .unwrap_or_else(|| "Uploaded artifact".to_string())
 }
 
 fn object_ref_from_metadata(
@@ -817,5 +1510,987 @@ fn sqlite_value_to_json(value: rusqlite::types::Value) -> serde_json::Value {
         rusqlite::types::Value::Real(v) => serde_json::json!(v),
         rusqlite::types::Value::Text(v) => serde_json::Value::String(v),
         rusqlite::types::Value::Blob(_) => serde_json::Value::String("<blob>".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{open_pool, open_postgres_pool, run_migrations};
+    use std::path::{Path, PathBuf};
+    use tokio::sync::oneshot;
+
+    fn test_pool() -> DbPool {
+        let pool = open_pool(":memory:".as_ref()).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        for (id, email) in [
+            ("acct-delete", "delete@example.test"),
+            ("acct-active", "active@example.test"),
+        ] {
+            conn.execute(
+                "INSERT INTO accounts(id, email, password_hash) VALUES (?1, ?2, 'hash')",
+                params![id, email],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        pool
+    }
+
+    fn file_test_pool(label: &str) -> (DbPool, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-account-data-{label}-{}.db",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let pool = open_pool(&path).expect("open file-backed SQLite test pool");
+        run_migrations(&pool).expect("apply SQLite test migrations");
+        (pool, path)
+    }
+
+    fn remove_sqlite_test_files(path: &Path) {
+        for candidate in [
+            path.to_path_buf(),
+            PathBuf::from(format!("{}-wal", path.display())),
+            PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            if let Err(error) = std::fs::remove_file(&candidate) {
+                assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "remove SQLite test file {}",
+                    candidate.display()
+                );
+            }
+        }
+    }
+
+    fn postgres_test_pool() -> Option<DbPool> {
+        let database_url = std::env::var("BLUEY_TEST_POSTGRES_URL").ok()?;
+        let pool = open_postgres_pool(&database_url).expect("open PostgreSQL test pool");
+        run_migrations(&pool).expect("apply PostgreSQL test migrations");
+        Some(pool)
+    }
+
+    fn insert_test_account(pool: &DbPool, account_id: &str) {
+        let email = format!("{account_id}@example.test");
+        crate::db::run_blocking_db(|| -> Result<()> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    pool.get()?.execute(
+                        "INSERT INTO accounts(id, email, password_hash) VALUES (?1, ?2, 'hash')",
+                        params![account_id, email],
+                    )?;
+                    Ok(())
+                }
+                DbPool::Postgres(_) => {
+                    pool.get_pg()?.execute(
+                        "INSERT INTO accounts(id, email, password_hash) VALUES ($1, $2, 'hash')",
+                        &[&account_id, &email],
+                    )?;
+                    Ok(())
+                }
+            }
+        })
+        .expect("insert account-deletion test account");
+    }
+
+    fn seed_irreversible_submissions(pool: &DbPool, account_id: &str, prefix: &str) {
+        let cases = [
+            ("cloud-click", "cloud", "click_started"),
+            ("cloud-unknown", "cloud", "side_effect_unknown"),
+            ("local-click", "local", "click_started"),
+            ("local-unknown", "local", "side_effect_unknown"),
+        ];
+        crate::db::run_blocking_db(|| -> Result<()> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    for (label, authority, phase) in cases {
+                        let job_id = format!("{prefix}-job-{label}");
+                        let application_id = format!("{prefix}-app-{label}");
+                        tx.execute(
+                            "INSERT INTO jobs_postings (
+                            id, account_id, canonical_key, posting_json, source, company, title,
+                            created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, '{}', 'test', 'Acme', 'Engineer', 1, 1)",
+                            params![job_id, account_id, format!("{prefix}-canonical-{label}")],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO jobs_applications (
+                            id, account_id, job_id, state, application_json,
+                            created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, 'running', '{}', 1, 1)",
+                            params![application_id, account_id, job_id],
+                        )?;
+                        if authority == "cloud" {
+                            tx.execute(
+                                "INSERT INTO jobs_execution_leases (
+                                run_id, account_id, application_id, browser_profile_id, owner_id,
+                                lease_token_sha256, fence, phase, lease_expires_at_ms,
+                                created_at_ms, updated_at_ms
+                             ) VALUES (?1, ?2, ?3, ?4, 'worker', ?5, 1, ?6, 10000, 1, 1)",
+                                params![
+                                    format!("{prefix}-run-{label}"),
+                                    account_id,
+                                    application_id,
+                                    format!("{prefix}-profile-{label}"),
+                                    "a".repeat(64),
+                                    phase,
+                                ],
+                            )?;
+                        } else {
+                            tx.execute(
+                                "INSERT INTO jobs_local_run_tickets (
+                                id, account_id, application_id, ticket_hash, ticket_secret,
+                                payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                             ) VALUES (?1, ?2, ?3, ?4, 'encrypted', '{}', ?5, 10000, 1, 1)",
+                                params![
+                                    format!("{prefix}-ticket-{label}"),
+                                    account_id,
+                                    application_id,
+                                    format!("{prefix}-hash-{label}"),
+                                    phase,
+                                ],
+                            )?;
+                        }
+                    }
+                    tx.commit()?;
+                    Ok(())
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    for (label, authority, phase) in cases {
+                        let job_id = format!("{prefix}-job-{label}");
+                        let application_id = format!("{prefix}-app-{label}");
+                        tx.execute(
+                            "INSERT INTO jobs_postings (
+                            id, account_id, canonical_key, posting_json, source, company, title,
+                            created_at_ms, updated_at_ms
+                         ) VALUES ($1, $2, $3, '{}', 'test', 'Acme', 'Engineer', 1, 1)",
+                            &[&job_id, &account_id, &format!("{prefix}-canonical-{label}")],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO jobs_applications (
+                            id, account_id, job_id, state, application_json,
+                            created_at_ms, updated_at_ms
+                         ) VALUES ($1, $2, $3, 'running', '{}', 1, 1)",
+                            &[&application_id, &account_id, &job_id],
+                        )?;
+                        if authority == "cloud" {
+                            tx.execute(
+                                "INSERT INTO jobs_execution_leases (
+                                run_id, account_id, application_id, browser_profile_id, owner_id,
+                                lease_token_sha256, fence, phase, lease_expires_at_ms,
+                                created_at_ms, updated_at_ms
+                             ) VALUES ($1, $2, $3, $4, 'worker', $5, 1, $6, 10000, 1, 1)",
+                                &[
+                                    &format!("{prefix}-run-{label}"),
+                                    &account_id,
+                                    &application_id,
+                                    &format!("{prefix}-profile-{label}"),
+                                    &"a".repeat(64),
+                                    &phase,
+                                ],
+                            )?;
+                        } else {
+                            tx.execute(
+                                "INSERT INTO jobs_local_run_tickets (
+                                id, account_id, application_id, ticket_hash, ticket_secret,
+                                payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+                             ) VALUES ($1, $2, $3, $4, 'encrypted', '{}', $5, 10000, 1, 1)",
+                                &[
+                                    &format!("{prefix}-ticket-{label}"),
+                                    &account_id,
+                                    &application_id,
+                                    &format!("{prefix}-hash-{label}"),
+                                    &phase,
+                                ],
+                            )?;
+                        }
+                    }
+                    tx.commit()?;
+                    Ok(())
+                }
+            }
+        })
+        .expect("seed active irreversible submissions");
+    }
+
+    fn finish_irreversible_submissions(pool: &DbPool, account_id: &str) {
+        crate::db::run_blocking_db(|| -> Result<()> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    tx.execute(
+                        "UPDATE jobs_execution_leases SET phase = 'failed' WHERE account_id = ?1",
+                        params![account_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE jobs_local_run_tickets SET status = 'failed' WHERE account_id = ?1",
+                        params![account_id],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    tx.execute(
+                        "UPDATE jobs_execution_leases SET phase = 'failed' WHERE account_id = $1",
+                        &[&account_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE jobs_local_run_tickets SET status = 'failed' WHERE account_id = $1",
+                        &[&account_id],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                }
+            }
+        })
+        .expect("finish irreversible submissions");
+    }
+
+    fn remove_cloud_runner_records(pool: &DbPool, account_id: &str) {
+        crate::db::run_blocking_db(|| -> Result<()> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    tx.execute(
+                        "DELETE FROM jobs_execution_leases WHERE account_id = ?1",
+                        params![account_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM jobs_browser_sessions
+                          WHERE account_id = ?1 AND runner = 'cloud'",
+                        params![account_id],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    tx.execute(
+                        "DELETE FROM jobs_execution_leases WHERE account_id = $1",
+                        &[&account_id],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM jobs_browser_sessions
+                          WHERE account_id = $1 AND runner = 'cloud'",
+                        &[&account_id],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                }
+            }
+        })
+        .expect("remove acknowledged cloud-runner records");
+    }
+
+    fn seed_stale_pending_upload(pool: &DbPool, account_id: &str, prefix: &str) -> String {
+        let upload_id = format!("{prefix}-upload");
+        let outbox_id = format!("{prefix}-put");
+        crate::db::run_blocking_db(|| -> Result<()> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    tx.execute(
+                        "INSERT INTO object_uploads (
+                            id, account_id, object_kind, logical_id, storage_scope,
+                            object_key, size_bytes, sha256, content_type, expires_at_ms,
+                            state, metadata_json, created_at_ms, updated_at_ms
+                         ) VALUES (
+                            ?1, ?2, 'session_audit', ?3, 'audit', ?4, 10, ?5,
+                            'application/json', 2000000, 'pending', '{}', 1, 1
+                         )",
+                        params![
+                            upload_id,
+                            account_id,
+                            format!("{prefix}-logical"),
+                            format!("objects/accounts/{account_id}/{prefix}"),
+                            "c".repeat(64),
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO object_storage_outbox (
+                            id, upload_id, account_id, operation, state, attempt_count,
+                            next_attempt_at_ms, created_at_ms, updated_at_ms
+                         ) VALUES (?1, ?2, ?3, 'put', 'pending', 0, 1, 1, 1)",
+                        params![outbox_id, upload_id, account_id],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    tx.execute(
+                        "INSERT INTO object_uploads (
+                            id, account_id, object_kind, logical_id, storage_scope,
+                            object_key, size_bytes, sha256, content_type, expires_at_ms,
+                            state, metadata_json, created_at_ms, updated_at_ms
+                         ) VALUES (
+                            $1, $2, 'session_audit', $3, 'audit', $4, 10, $5,
+                            'application/json', 2000000, 'pending', '{}', 1, 1
+                         )",
+                        &[
+                            &upload_id,
+                            &account_id,
+                            &format!("{prefix}-logical"),
+                            &format!("objects/accounts/{account_id}/{prefix}"),
+                            &"c".repeat(64),
+                        ],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO object_storage_outbox (
+                            id, upload_id, account_id, operation, state, attempt_count,
+                            next_attempt_at_ms, created_at_ms, updated_at_ms
+                         ) VALUES ($1, $2, $3, 'put', 'pending', 0, 1, 1, 1)",
+                        &[&outbox_id, &upload_id, &account_id],
+                    )?;
+                    tx.commit()?;
+                    Ok(())
+                }
+            }
+        })
+        .expect("seed stale pending object upload");
+        upload_id
+    }
+
+    fn test_account_write_fence(pool: &DbPool, account_id: &str) -> AccountWriteFence {
+        crate::db::run_blocking_db(|| -> Result<AccountWriteFence> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    let fence = account_write_fence_sqlite_tx(&tx, account_id)?;
+                    tx.commit()?;
+                    Ok(fence)
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    let fence = account_write_fence_postgres_tx(&mut tx, account_id)?;
+                    tx.commit()?;
+                    Ok(fence)
+                }
+            }
+        })
+        .expect("read account write fence")
+    }
+
+    fn delete_test_account(pool: &DbPool, account_id: &str) {
+        crate::db::run_blocking_db(|| -> Result<()> {
+            match pool {
+                DbPool::Sqlite(_) => {
+                    pool.get()?
+                        .execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+                    Ok(())
+                }
+                DbPool::Postgres(_) => {
+                    pool.get_pg()?
+                        .execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+                    Ok(())
+                }
+            }
+        })
+        .expect("delete account-deletion test account");
+    }
+
+    async fn assert_sqlite_account_object_lifecycle_serialization(
+        pool: &DbPool,
+        account_id: &str,
+        upload_id: &str,
+    ) {
+        let active_writer = acquire_account_object_writer(pool, account_id)
+            .await
+            .expect("acquire active object writer");
+
+        let (deletion_waiting_tx, deletion_waiting_rx) = oneshot::channel();
+        let (deletion_fenced_tx, deletion_fenced_rx) = oneshot::channel();
+        let (release_deletion_tx, release_deletion_rx) = oneshot::channel();
+        let deletion_pool = pool.clone();
+        let deletion_account_id = account_id.to_string();
+        let deletion = tokio::spawn(async move {
+            deletion_waiting_tx
+                .send(())
+                .expect("signal deletion lock attempt");
+            let deletion_guard =
+                acquire_account_object_deletion(&deletion_pool, &deletion_account_id)
+                    .await
+                    .expect("acquire exclusive deletion guard");
+            let result = begin_account_deletion(&deletion_pool, &deletion_account_id, 1_000_000)
+                .expect("establish account-deletion fence")
+                .expect("deletion account exists");
+            deletion_fenced_tx
+                .send(result)
+                .expect("signal durable deletion fence");
+            release_deletion_rx
+                .await
+                .expect("release exclusive deletion guard");
+            drop(deletion_guard);
+        });
+        deletion_waiting_rx
+            .await
+            .expect("deletion task reached exclusive lock");
+
+        let (late_writer_waiting_tx, late_writer_waiting_rx) = oneshot::channel();
+        let (late_writer_acquired_tx, mut late_writer_acquired_rx) = oneshot::channel();
+        let (continue_late_writer_tx, continue_late_writer_rx) = oneshot::channel();
+        let late_pool = pool.clone();
+        let late_account_id = account_id.to_string();
+        let late_upload_id = upload_id.to_string();
+        let late_writer = tokio::spawn(async move {
+            late_writer_waiting_tx
+                .send(())
+                .expect("signal late writer lock attempt");
+            let writer_guard = acquire_account_object_writer(&late_pool, &late_account_id)
+                .await
+                .expect("acquire late object writer");
+            late_writer_acquired_tx
+                .send(())
+                .expect("signal late writer acquisition");
+            continue_late_writer_rx
+                .await
+                .expect("continue late object writer");
+            let fence = test_account_write_fence(&late_pool, &late_account_id);
+            let put_may_start = match crate::db::object_uploads::begin_upload_put(
+                &late_pool,
+                &late_upload_id,
+                1_000_001,
+            ) {
+                Ok(_) => true,
+                Err(error) => {
+                    assert_eq!(
+                        error.downcast_ref::<crate::db::object_uploads::UploadControlError>(),
+                        Some(&crate::db::object_uploads::UploadControlError::AccountDeleting)
+                    );
+                    false
+                }
+            };
+            drop(writer_guard);
+            (fence, put_may_start)
+        });
+        late_writer_waiting_rx
+            .await
+            .expect("late writer reached shared lock");
+
+        drop(active_writer);
+        let deletion_result = tokio::select! {
+            biased;
+            acquired = &mut late_writer_acquired_rx => {
+                acquired.expect("late writer acquisition signal");
+                panic!("a writer queued after deletion bypassed the exclusive deletion guard");
+            }
+            fenced = deletion_fenced_rx => fenced.expect("deletion fence signal"),
+        };
+        assert!(matches!(
+            deletion_result,
+            BeginAccountDeletionResult::Ready(_)
+        ));
+        assert!(account_deletion_intent(pool, account_id)
+            .expect("read durable deletion intent")
+            .is_some());
+
+        release_deletion_tx.send(()).expect("release deletion task");
+        deletion.await.expect("join deletion task");
+        late_writer_acquired_rx
+            .await
+            .expect("late writer acquires after deletion releases");
+        continue_late_writer_tx
+            .send(())
+            .expect("continue fenced late writer");
+        let (fence, put_may_start) = late_writer.await.expect("join late writer task");
+        assert_eq!(fence, AccountWriteFence::DeletionRequested);
+        assert!(
+            !put_may_start,
+            "a writer must revalidate the durable fence before beginning its PUT"
+        );
+    }
+
+    #[test]
+    fn deletion_intent_fences_writes_and_reports_fresh_pending_uploads() {
+        let pool = test_pool();
+        let now_ms = 1_000_000;
+        let fresh_updated_at_ms = now_ms - 1;
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO object_uploads (
+                    id, account_id, object_kind, logical_id, storage_scope,
+                    object_key, size_bytes, sha256, content_type, expires_at_ms,
+                    state, metadata_json, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'upload-fresh', 'acct-delete', 'artifact', 'receipt', 'artifact',
+                    'objects/accounts/acct-delete/receipt', 10, ?1,
+                    'application/json', ?2, 'pending', '{}', ?3, ?3
+                 )",
+                params!["a".repeat(64), now_ms + 10_000, fresh_updated_at_ms],
+            )
+            .unwrap();
+
+        let started = begin_account_deletion(&pool, "acct-delete", now_ms)
+            .unwrap()
+            .expect("account exists");
+        let BeginAccountDeletionResult::WaitingForUploads(intent) = started else {
+            panic!("fresh pending upload must hold deletion");
+        };
+        assert_eq!(intent.fresh_in_flight_puts, 1);
+        assert_eq!(intent.requested_at_ms, now_ms);
+        assert_eq!(
+            intent.fresh_upload_cutoff_ms,
+            now_ms - ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS
+        );
+        assert_eq!(
+            account_deletion_intent(&pool, "acct-delete").unwrap(),
+            Some(intent.clone()),
+            "the fence must commit even while deletion waits"
+        );
+
+        let mut conn = pool.get().unwrap();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        assert_eq!(
+            account_write_fence_sqlite_tx(&tx, "acct-delete").unwrap(),
+            AccountWriteFence::DeletionRequested
+        );
+        assert_eq!(
+            account_write_fence_sqlite_tx(&tx, "acct-active").unwrap(),
+            AccountWriteFence::Active
+        );
+        assert_eq!(
+            account_write_fence_sqlite_tx(&tx, "acct-missing").unwrap(),
+            AccountWriteFence::Missing
+        );
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn deletion_retry_preserves_request_time_and_accepts_stale_pending_uploads() {
+        let pool = test_pool();
+        let first_check_ms = 1_000_000;
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO object_uploads (
+                    id, account_id, object_kind, logical_id, storage_scope,
+                    object_key, size_bytes, sha256, content_type, expires_at_ms,
+                    state, metadata_json, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'upload-aging', 'acct-delete', 'artifact', 'receipt', 'artifact',
+                    'objects/accounts/acct-delete/receipt', 10, ?1,
+                    'application/json', ?2, 'pending', '{}', ?3, ?3
+                 )",
+                params!["b".repeat(64), first_check_ms + 1_000_000, first_check_ms],
+            )
+            .unwrap();
+        assert!(matches!(
+            begin_account_deletion(&pool, "acct-delete", first_check_ms)
+                .unwrap()
+                .unwrap(),
+            BeginAccountDeletionResult::WaitingForUploads(_)
+        ));
+
+        let retry_ms = first_check_ms + ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS;
+        let retried = begin_account_deletion(&pool, "acct-delete", retry_ms)
+            .unwrap()
+            .expect("account still exists");
+        let BeginAccountDeletionResult::Ready(intent) = retried else {
+            panic!("an upload at the stale cutoff must no longer block deletion");
+        };
+        assert_eq!(intent.requested_at_ms, first_check_ms);
+        assert_eq!(intent.last_checked_at_ms, retry_ms);
+        assert_eq!(intent.fresh_upload_cutoff_ms, first_check_ms);
+        assert_eq!(intent.fresh_in_flight_puts, 0);
+    }
+
+    #[test]
+    fn irreversible_submission_outcomes_block_deletion_without_creating_a_fence() {
+        let pool = test_pool();
+        seed_irreversible_submissions(&pool, "acct-delete", "sqlite-irreversible");
+
+        assert_eq!(
+            begin_account_deletion(&pool, "acct-delete", 1_000_000).unwrap(),
+            Some(
+                BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+                    active_submissions: 4,
+                }
+            )
+        );
+        assert_eq!(
+            account_deletion_intent(&pool, "acct-delete").unwrap(),
+            None,
+            "click_started and side_effect_unknown outcomes must not create deletion intent"
+        );
+
+        finish_irreversible_submissions(&pool, "acct-delete");
+        assert_eq!(
+            begin_account_deletion(&pool, "acct-delete", 1_000_001).unwrap(),
+            Some(BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
+                cloud_runner_records: 2,
+            })
+        );
+        assert!(account_deletion_intent(&pool, "acct-delete")
+            .unwrap()
+            .is_none());
+
+        remove_cloud_runner_records(&pool, "acct-delete");
+        assert!(matches!(
+            begin_account_deletion(&pool, "acct-delete", 1_000_002)
+                .unwrap()
+                .unwrap(),
+            BeginAccountDeletionResult::Ready(_)
+        ));
+        assert!(account_deletion_intent(&pool, "acct-delete")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn cloud_browser_state_blocks_deletion_until_cleanup_is_acknowledged() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_browser_sessions (
+                    id, account_id, runner, status, session_json, created_at_ms, updated_at_ms
+                 ) VALUES
+                    ('cloud-session', 'acct-delete', 'cloud', 'needs_input', '{}', 1, 1),
+                    ('local-session', 'acct-delete', 'local', 'completed', '{}', 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            begin_account_deletion(&pool, "acct-delete", 1_000_000).unwrap(),
+            Some(BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
+                cloud_runner_records: 1,
+            })
+        );
+        assert!(
+            account_deletion_intent(&pool, "acct-delete")
+                .unwrap()
+                .is_none(),
+            "cloud-runner cleanup must complete before the deletion fence is created"
+        );
+
+        remove_cloud_runner_records(&pool, "acct-delete");
+        assert!(matches!(
+            begin_account_deletion(&pool, "acct-delete", 1_000_001)
+                .unwrap()
+                .unwrap(),
+            BeginAccountDeletionResult::Ready(_)
+        ));
+
+        let error = jobs::upsert_browser_session(
+            &pool,
+            "acct-delete",
+            &jobs::BrowserSession {
+                id: "late-cloud-session".to_string(),
+                runner: "cloud".to_string(),
+                status: "queued".to_string(),
+                current_company: "Acme".to_string(),
+                current_step: "Waiting for runner".to_string(),
+                application_id: None,
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .expect_err("the deletion fence must reject new cloud browser state");
+        assert_eq!(
+            error.downcast_ref::<crate::db::object_uploads::UploadControlError>(),
+            Some(&crate::db::object_uploads::UploadControlError::AccountDeleting)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_deletion_guard_precedes_late_writer_and_exposes_the_durable_fence() {
+        let (pool, path) = file_test_pool("lifecycle-serialization");
+        let account_id = "acct-lifecycle-sqlite";
+        insert_test_account(&pool, account_id);
+        let upload_id = seed_stale_pending_upload(&pool, account_id, "sqlite-lifecycle");
+
+        assert_sqlite_account_object_lifecycle_serialization(&pool, account_id, &upload_id).await;
+
+        delete_test_account(&pool, account_id);
+        drop(pool);
+        remove_sqlite_test_files(&path);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_irreversible_submission_outcomes_block_deletion_without_creating_a_fence() {
+        let Some(pool) = postgres_test_pool() else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct-delete-pg-{suffix}");
+        let prefix = format!("pg-irreversible-{suffix}");
+        insert_test_account(&pool, &account_id);
+        seed_irreversible_submissions(&pool, &account_id, &prefix);
+
+        assert_eq!(
+            begin_account_deletion(&pool, &account_id, 1_000_000).unwrap(),
+            Some(
+                BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+                    active_submissions: 4,
+                }
+            )
+        );
+        assert_eq!(
+            account_deletion_intent(&pool, &account_id).unwrap(),
+            None,
+            "PostgreSQL must not create a deletion intent around an irreversible outcome"
+        );
+
+        finish_irreversible_submissions(&pool, &account_id);
+        assert_eq!(
+            begin_account_deletion(&pool, &account_id, 1_000_001).unwrap(),
+            Some(BeginAccountDeletionResult::WaitingForCloudRunnerCleanup {
+                cloud_runner_records: 2,
+            })
+        );
+        assert!(account_deletion_intent(&pool, &account_id)
+            .unwrap()
+            .is_none());
+
+        remove_cloud_runner_records(&pool, &account_id);
+        assert!(matches!(
+            begin_account_deletion(&pool, &account_id, 1_000_002)
+                .unwrap()
+                .unwrap(),
+            BeginAccountDeletionResult::Ready(_)
+        ));
+        delete_test_account(&pool, &account_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn postgres_advisory_coordination_blocks_deletion_behind_an_active_writer() {
+        let Some(pool) = postgres_test_pool() else {
+            return;
+        };
+        let deletion_replica = open_postgres_pool(
+            &std::env::var("BLUEY_TEST_POSTGRES_URL")
+                .expect("PostgreSQL test URL was present for the first replica"),
+        )
+        .expect("open independent PostgreSQL deletion replica");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct-lifecycle-pg-{suffix}");
+        insert_test_account(&pool, &account_id);
+        let upload_id =
+            seed_stale_pending_upload(&pool, &account_id, &format!("pg-lifecycle-{suffix}"));
+
+        let writer_coordination = acquire_account_object_writer(&pool, &account_id)
+            .await
+            .expect("enter PostgreSQL object-writer coordination");
+
+        let (attempting_tx, attempting_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let deletion_pool = deletion_replica.clone();
+        let deletion_account_id = account_id.clone();
+        let deletion_task = tokio::spawn(async move {
+            attempting_tx
+                .send(())
+                .expect("signal PostgreSQL deletion lock attempt");
+            let deletion_guard =
+                acquire_account_object_deletion(&deletion_pool, &deletion_account_id)
+                    .await
+                    .expect("acquire PostgreSQL deletion lock");
+            acquired_tx
+                .send(())
+                .expect("signal PostgreSQL deletion lock acquisition");
+            release_rx.await.expect("release PostgreSQL deletion lock");
+            drop(deletion_guard);
+        });
+        attempting_rx
+            .await
+            .expect("deletion task reached PostgreSQL advisory lock");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut acquired_rx)
+                .await
+                .is_err(),
+            "the exclusive deletion lock must wait for an active shared writer"
+        );
+
+        let put_started_at_ms = 1_000_000;
+        crate::db::object_uploads::begin_upload_put(&pool, &upload_id, put_started_at_ms)
+            .expect("renew the durable PUT lease before object I/O");
+        drop(writer_coordination);
+        acquired_rx
+            .await
+            .expect("deletion acquires after the active writer releases");
+
+        let deletion =
+            begin_account_deletion(&deletion_replica, &account_id, put_started_at_ms + 1)
+                .expect("establish the durable PostgreSQL deletion fence")
+                .expect("deletion account exists");
+        let BeginAccountDeletionResult::WaitingForUploads(intent) = deletion else {
+            panic!("the fresh durable PUT lease must stop account deletion");
+        };
+        assert_eq!(intent.fresh_in_flight_puts, 1);
+        assert_eq!(
+            account_deletion_intent(&pool, &account_id).unwrap(),
+            Some(intent),
+            "the deletion fence must commit while the caller waits for the lease"
+        );
+        release_tx
+            .send(())
+            .expect("release PostgreSQL deletion coordination");
+        deletion_task.await.expect("join PostgreSQL deletion task");
+
+        let error =
+            crate::db::object_uploads::begin_upload_put(&pool, &upload_id, put_started_at_ms + 2)
+                .expect_err("the durable deletion intent must reject every later PUT begin");
+        assert_eq!(
+            error.downcast_ref::<crate::db::object_uploads::UploadControlError>(),
+            Some(&crate::db::object_uploads::UploadControlError::AccountDeleting)
+        );
+
+        delete_test_account(&pool, &account_id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn postgres_lifecycle_pool_saturation_does_not_starve_primary_finalization() {
+        let Some(pool) = postgres_test_pool() else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct-lifecycle-capacity-pg-{suffix}");
+        insert_test_account(&pool, &account_id);
+        let upload_id =
+            seed_stale_pending_upload(&pool, &account_id, &format!("pg-capacity-{suffix}"));
+        let lifecycle_capacity = match &pool {
+            DbPool::Postgres(pools) => pools.lifecycle_pool().max_size(),
+            DbPool::Sqlite(_) => unreachable!("PostgreSQL test helper returned SQLite"),
+        };
+
+        let mut writer_guards = Vec::new();
+        for _ in 0..lifecycle_capacity {
+            writer_guards.push(
+                acquire_account_object_writer(&pool, &account_id)
+                    .await
+                    .expect("fill one lifecycle writer slot"),
+            );
+        }
+
+        let finalization_pool = pool.clone();
+        let finalization_upload_id = upload_id.clone();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || {
+                crate::db::object_uploads::begin_upload_put(
+                    &finalization_pool,
+                    &finalization_upload_id,
+                    1_000_000,
+                )?;
+                crate::db::object_uploads::mark_upload_ready(
+                    &finalization_pool,
+                    &finalization_upload_id,
+                    1_000_001,
+                )?;
+                Result::<()>::Ok(())
+            }),
+        )
+        .await
+        .expect("primary-pool finalization must not wait for lifecycle capacity")
+        .expect("join primary-pool finalization")
+        .expect("finalize upload through the primary pool");
+
+        let (attempting_tx, attempting_rx) = oneshot::channel();
+        let (acquired_tx, mut acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let deletion_pool = pool.clone();
+        let deletion_account_id = account_id.clone();
+        let deletion_task = tokio::spawn(async move {
+            attempting_tx
+                .send(())
+                .expect("signal saturated deletion attempt");
+            let deletion_guard =
+                acquire_account_object_deletion(&deletion_pool, &deletion_account_id)
+                    .await
+                    .expect("acquire deletion after saturated writers drain");
+            acquired_tx
+                .send(())
+                .expect("signal deletion acquisition after saturation");
+            release_rx.await.expect("release saturated deletion guard");
+            drop(deletion_guard);
+        });
+        attempting_rx.await.expect("deletion task started");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut acquired_rx)
+                .await
+                .is_err(),
+            "deletion must wait while every lifecycle slot belongs to an active writer"
+        );
+
+        drop(writer_guards);
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut acquired_rx)
+            .await
+            .expect("deletion should acquire after saturated writers release")
+            .expect("receive saturated deletion acquisition");
+        release_tx
+            .send(())
+            .expect("release deletion after saturation test");
+        deletion_task.await.expect("join saturated deletion task");
+        delete_test_account(&pool, &account_id);
+    }
+
+    #[test]
+    fn postgres_account_object_lock_keys_are_stable_and_account_scoped() {
+        assert_eq!(
+            postgres_account_object_lock_key("acct-one"),
+            postgres_account_object_lock_key("acct-one")
+        );
+        assert_ne!(
+            postgres_account_object_lock_key("acct-one"),
+            postgres_account_object_lock_key("acct-two")
+        );
+    }
+
+    #[test]
+    fn hard_delete_cascades_the_durable_intent() {
+        let pool = test_pool();
+        assert!(matches!(
+            begin_account_deletion(&pool, "acct-delete", 1_000_000)
+                .unwrap()
+                .unwrap(),
+            BeginAccountDeletionResult::Ready(_)
+        ));
+        assert!(account_deletion_intent(&pool, "acct-delete")
+            .unwrap()
+            .is_some());
+
+        assert!(hard_delete_account(&pool, "acct-delete").unwrap());
+        assert!(account_deletion_intent(&pool, "acct-delete")
+            .unwrap()
+            .is_none());
+        assert!(begin_account_deletion(&pool, "acct-delete", 1_000_001)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn upload_ledger_title_uses_server_owned_metadata_with_safe_fallback() {
+        assert_eq!(
+            upload_ledger_title(r#"{"title":"Application receipt bundle"}"#),
+            "Application receipt bundle"
+        );
+        assert_eq!(
+            upload_ledger_title(r#"{"title":"   "}"#),
+            "Uploaded artifact"
+        );
+        assert_eq!(upload_ledger_title("not-json"), "Uploaded artifact");
     }
 }
