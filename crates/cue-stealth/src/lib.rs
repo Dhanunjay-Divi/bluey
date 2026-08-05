@@ -292,6 +292,7 @@ mod tests {
 
     #[test]
     fn apply_disguise_none_does_not_panic() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let req = build_request(DisguiseMode::None, None);
         let result = apply_disguise(&req);
         assert!(result.is_ok());
@@ -341,6 +342,10 @@ mod reassertion_tests {
     #[test]
     fn reassertion_reads_current_mode_not_stale() {
         use std::sync::{Arc, Mutex};
+
+        let _guard = super::tests::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // Shared current mode simulating the DB
         let current = Arc::new(Mutex::new(DisguiseMode::Terminal));
