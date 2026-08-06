@@ -8,10 +8,13 @@ mod processing;
 mod providers;
 
 use crate::{
-    api::jobs_mailbox_oauth::provider_config,
     db::{
         jobs::{self, JobsProviderCredential, JobsProviderSyncState},
         DbPool,
+    },
+    jobs_provider_auth::{
+        normalized_scopes, provider_config, refresh_access_token, ProviderAuthErrorKind,
+        ProviderAuthorizationPurpose, ProviderConfig, RefreshResult,
     },
 };
 use std::time::Duration;
@@ -37,12 +40,16 @@ pub fn spawn_mailbox_sync_worker(pool: DbPool) -> Option<JoinHandle<()>> {
     Some(tokio::spawn(async move {
         let client = match reqwest::Client::builder()
             .timeout(Duration::from_secs(25))
+            .redirect(reqwest::redirect::Policy::none())
             .user_agent("bluey-jobs-mailbox-sync/1")
             .build()
         {
             Ok(client) => client,
-            Err(error) => {
-                tracing::error!(error = %error, "failed to create Jobs mailbox sync client");
+            Err(_) => {
+                tracing::error!(
+                    reason_code = "client_initialization_failed",
+                    "failed to create Jobs mailbox sync client"
+                );
                 return;
             }
         };
@@ -51,7 +58,10 @@ pub fn spawn_mailbox_sync_worker(pool: DbPool) -> Option<JoinHandle<()>> {
         loop {
             interval.tick().await;
             if let Err(error) = run_sync_cycle(&pool, &client, &owner).await {
-                tracing::warn!(error = %error, "Jobs mailbox sync cycle failed");
+                tracing::warn!(
+                    reason_code = sync_failure_reason_code(&error),
+                    "Jobs mailbox sync cycle failed"
+                );
             }
         }
     }))
@@ -85,7 +95,7 @@ async fn run_sync_cycle(
             tracing::warn!(
                 provider = %state.provider,
                 connection_id = %state.connection_id,
-                error = %error,
+                reason_code = sync_failure_reason_code(&error),
                 "Jobs mailbox connection sync failed"
             );
         }
@@ -105,10 +115,10 @@ async fn sync_connection(
     if mailbox.status != "connected" || mailbox.provider != state.provider {
         anyhow::bail!("mailbox connection is not ready")
     }
-    let config = provider_config(&state.provider)
-        .ok_or_else(|| anyhow::anyhow!("mailbox provider is not configured"))?;
     let mut credential = jobs::jobs_provider_credential(pool, account_id, &state.connection_id)?
         .ok_or_else(|| anyhow::anyhow!("mailbox credential not found"))?;
+    let config = provider_config(&state.provider, credential_refresh_purpose(&credential))
+        .ok_or_else(|| anyhow::anyhow!("mailbox provider is not configured"))?;
     refresh_credential_if_needed(pool, client, account_id, &config, &mut credential).await?;
 
     let fetched = providers::fetch_messages(
@@ -152,24 +162,80 @@ async fn refresh_credential_if_needed(
     pool: &DbPool,
     client: &reqwest::Client,
     account_id: &str,
-    config: &crate::api::jobs_mailbox_oauth::ProviderConfig,
+    config: &ProviderConfig,
     credential: &mut JobsProviderCredential,
 ) -> anyhow::Result<()> {
     if credential.expires_at_ms > jobs::now_ms().saturating_add(60_000) {
         return Ok(());
     }
-    let token = providers::refresh_access_token(client, config, &credential.refresh_token).await?;
+    let token = refresh_access_token(client, config, &credential.refresh_token)
+        .await
+        .map_err(|error| match error.kind() {
+            ProviderAuthErrorKind::ReauthorizationRequired => {
+                anyhow::anyhow!("mailbox authorization needs attention")
+            }
+            ProviderAuthErrorKind::Transient => {
+                anyhow::anyhow!("provider token refresh did not complete")
+            }
+        })?;
+    let expected = credential.clone();
+    let access_token = token.access_token.clone();
+    let rotated_refresh_token =
+        (!token.refresh_token.trim().is_empty()).then(|| token.refresh_token.clone());
+    apply_refresh_result(credential, token)?;
+    *credential = jobs::refresh_jobs_provider_credential_cas(
+        pool,
+        account_id,
+        &expected,
+        &access_token,
+        rotated_refresh_token.as_deref(),
+        credential.expires_at_ms,
+    )?;
+    Ok(())
+}
+
+fn credential_refresh_purpose(credential: &JobsProviderCredential) -> ProviderAuthorizationPurpose {
+    if credential.grant_revision > 0
+        && credential.capabilities.iter().any(|capability| {
+            matches!(
+                capability.as_str(),
+                "recruiter_reply" | "interview_calendar"
+            )
+        })
+    {
+        ProviderAuthorizationPurpose::CommunicationWrite
+    } else {
+        ProviderAuthorizationPurpose::MailboxRead
+    }
+}
+
+fn apply_refresh_result(
+    credential: &mut JobsProviderCredential,
+    token: RefreshResult,
+) -> anyhow::Result<()> {
+    if credential.grant_revision > 0 {
+        let expected = jobs::communication_grant_sha256(credential)?;
+        if credential.grant_sha256 != expected {
+            anyhow::bail!("provider grant digest is invalid before token refresh")
+        }
+    }
+    if !token.scopes.is_empty() {
+        let returned = normalized_scopes(token.scopes.iter().map(String::as_str));
+        let existing = normalized_scopes(credential.scopes.iter().map(String::as_str));
+        if returned != existing {
+            anyhow::bail!("provider permissions changed during token refresh")
+        }
+    }
     credential.access_token = token.access_token;
     if !token.refresh_token.trim().is_empty() {
         credential.refresh_token = token.refresh_token;
     }
-    if !token.scopes.is_empty() {
-        credential.scopes = token.scopes;
-    }
     credential.expires_at_ms =
         jobs::now_ms().saturating_add(token.expires_in_seconds.max(60) * 1_000);
     credential.updated_at_ms = jobs::now_ms();
-    jobs::save_jobs_provider_credential(pool, account_id, credential)?;
+    if credential.grant_revision > 0 {
+        credential.grant_sha256 = jobs::communication_grant_sha256(credential)?;
+    }
     Ok(())
 }
 
@@ -198,6 +264,18 @@ fn public_sync_error(error: &anyhow::Error) -> String {
     }
 }
 
+fn sync_failure_reason_code(error: &anyhow::Error) -> &'static str {
+    if authorization_needs_attention(error) {
+        "authorization_required"
+    } else if error.to_string().contains("configured") {
+        "provider_unavailable"
+    } else if error.to_string().contains("response was invalid") {
+        "provider_response_invalid"
+    } else {
+        "retryable_sync_failure"
+    }
+}
+
 fn authorization_needs_attention(error: &anyhow::Error) -> bool {
     let text = error.to_string().to_ascii_lowercase();
     text.contains("401")
@@ -208,7 +286,17 @@ fn authorization_needs_attention(error: &anyhow::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{authorization_needs_attention, env_value_enabled};
+    use super::{
+        apply_refresh_result, authorization_needs_attention, credential_refresh_purpose,
+        env_value_enabled, public_sync_error, sync_failure_reason_code,
+    };
+    use crate::{
+        db::jobs::{self, JobsProviderCredential},
+        jobs_provider_auth::{
+            ProviderAuthorizationPurpose, RefreshResult, GOOGLE_CALENDAR_EVENTS_SCOPE,
+            GOOGLE_GMAIL_READ_SCOPE, GOOGLE_GMAIL_SEND_SCOPE,
+        },
+    };
 
     #[test]
     fn mailbox_sync_requires_explicit_enablement() {
@@ -246,5 +334,111 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[test]
+    fn mailbox_sync_errors_are_publicly_coarsened_without_provider_secrets() {
+        let secret = "https://graph.microsoft.com/delta?$skiptoken=PRIVATE-SENTINEL";
+        let error = anyhow::anyhow!("provider failed at {secret}");
+        let public = public_sync_error(&error);
+        let reason = sync_failure_reason_code(&error);
+        assert!(!public.contains("PRIVATE-SENTINEL"));
+        assert!(!reason.contains("PRIVATE-SENTINEL"));
+        assert_eq!(reason, "retryable_sync_failure");
+    }
+
+    #[test]
+    fn write_grant_survives_token_rotation_without_scope_drift() {
+        let mut credential = JobsProviderCredential {
+            connection_id: "connection-1".to_string(),
+            provider: "gmail".to_string(),
+            provider_subject: "subject-1".to_string(),
+            access_token: "dummy-old-access-token".to_string(),
+            refresh_token: "dummy-old-refresh-token".to_string(),
+            scopes: vec![
+                GOOGLE_GMAIL_READ_SCOPE.to_string(),
+                GOOGLE_GMAIL_SEND_SCOPE.to_string(),
+                GOOGLE_CALENDAR_EVENTS_SCOPE.to_string(),
+            ],
+            capabilities: vec![
+                "status_sync".to_string(),
+                "application_correlation".to_string(),
+                "review_interventions".to_string(),
+                "recruiter_reply".to_string(),
+                "interview_calendar".to_string(),
+            ],
+            grant_revision: 3,
+            grant_sha256: String::new(),
+            expires_at_ms: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        credential.grant_sha256 = jobs::communication_grant_sha256(&credential).unwrap();
+        let original_scopes = credential.scopes.clone();
+        let original_capabilities = credential.capabilities.clone();
+        let original_revision = credential.grant_revision;
+        let original_digest = credential.grant_sha256.clone();
+
+        assert_eq!(
+            credential_refresh_purpose(&credential),
+            ProviderAuthorizationPurpose::CommunicationWrite
+        );
+        apply_refresh_result(
+            &mut credential,
+            RefreshResult {
+                access_token: "dummy-rotated-access-token".to_string(),
+                refresh_token: "dummy-rotated-refresh-token".to_string(),
+                scopes: Vec::new(),
+                expires_in_seconds: 3_600,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(credential.scopes, original_scopes);
+        assert_eq!(credential.capabilities, original_capabilities);
+        assert_eq!(credential.grant_revision, original_revision);
+        assert_eq!(credential.grant_sha256, original_digest);
+        assert_eq!(
+            credential.grant_sha256,
+            jobs::communication_grant_sha256(&credential).unwrap()
+        );
+        assert_eq!(credential.access_token, "dummy-rotated-access-token");
+        assert_eq!(credential.refresh_token, "dummy-rotated-refresh-token");
+    }
+
+    #[test]
+    fn refresh_rejects_silent_write_scope_downgrade() {
+        let mut credential = JobsProviderCredential {
+            connection_id: "connection-2".to_string(),
+            provider: "gmail".to_string(),
+            provider_subject: "subject-2".to_string(),
+            access_token: "dummy-old-access-token".to_string(),
+            refresh_token: "dummy-old-refresh-token".to_string(),
+            scopes: vec![
+                GOOGLE_GMAIL_READ_SCOPE.to_string(),
+                GOOGLE_GMAIL_SEND_SCOPE.to_string(),
+            ],
+            capabilities: vec!["status_sync".to_string(), "recruiter_reply".to_string()],
+            grant_revision: 2,
+            grant_sha256: String::new(),
+            expires_at_ms: 1,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
+        credential.grant_sha256 = jobs::communication_grant_sha256(&credential).unwrap();
+        let error = apply_refresh_result(
+            &mut credential,
+            RefreshResult {
+                access_token: "dummy-new-access-token".to_string(),
+                refresh_token: String::new(),
+                scopes: vec![GOOGLE_GMAIL_READ_SCOPE.to_string()],
+                expires_in_seconds: 3_600,
+            },
+        )
+        .expect_err("a missing Gmail send scope must fail closed");
+        assert!(error
+            .to_string()
+            .contains("permissions changed during token refresh"));
+        assert_eq!(credential.access_token, "dummy-old-access-token");
     }
 }

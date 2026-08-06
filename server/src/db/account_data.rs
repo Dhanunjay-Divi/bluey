@@ -75,13 +75,15 @@ pub enum BeginAccountDeletionResult {
     Ready(AccountDeletionIntent),
     WaitingForUploads(AccountDeletionIntent),
     WaitingForIrreversibleSubmissions { active_submissions: i64 },
+    WaitingForIrreversibleCommunications { active_actions: i64 },
 }
 
 impl BeginAccountDeletionResult {
     pub fn intent(&self) -> Option<&AccountDeletionIntent> {
         match self {
             Self::Ready(intent) | Self::WaitingForUploads(intent) => Some(intent),
-            Self::WaitingForIrreversibleSubmissions { .. } => None,
+            Self::WaitingForIrreversibleSubmissions { .. }
+            | Self::WaitingForIrreversibleCommunications { .. } => None,
         }
     }
 }
@@ -996,6 +998,13 @@ fn begin_account_deletion_sqlite(
         return Ok(None);
     }
 
+    tx.execute(
+        "INSERT OR IGNORE INTO jobs_communication_write_fences (
+            account_id, connection_id, reason, created_at_ms
+         ) VALUES (?1, '', 'account_deletion', ?2)",
+        params![account_id, now_ms],
+    )?;
+
     let active_submissions: i64 = tx.query_row(
         "SELECT COUNT(*) FROM jobs_applications AS application
           WHERE application.account_id = ?1 AND application.state <> 'submitted'
@@ -1017,8 +1026,22 @@ fn begin_account_deletion_sqlite(
         |row| row.get(0),
     )?;
     if active_submissions > 0 {
+        tx.commit()?;
         return Ok(Some(
             BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
+        ));
+    }
+
+    let active_actions: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs_communication_actions
+          WHERE account_id = ?1 AND status IN ('dispatching', 'side_effect_unknown')",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    if active_actions > 0 {
+        tx.commit()?;
+        return Ok(Some(
+            BeginAccountDeletionResult::WaitingForIrreversibleCommunications { active_actions },
         ));
     }
 
@@ -1075,6 +1098,14 @@ fn begin_account_deletion_postgres(
         return Ok(None);
     }
 
+    tx.execute(
+        "INSERT INTO jobs_communication_write_fences (
+            account_id, connection_id, reason, created_at_ms
+         ) VALUES ($1, '', 'account_deletion', $2)
+         ON CONFLICT(account_id, connection_id) DO NOTHING",
+        &[&account_id, &now_ms],
+    )?;
+
     let active_submissions: i64 = tx
         .query_one(
             "SELECT COUNT(*)::bigint FROM jobs_applications AS application
@@ -1097,8 +1128,23 @@ fn begin_account_deletion_postgres(
         )?
         .try_get(0)?;
     if active_submissions > 0 {
+        tx.commit()?;
         return Ok(Some(
             BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
+        ));
+    }
+
+    let active_actions: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+              WHERE account_id = $1 AND status IN ('dispatching', 'side_effect_unknown')",
+            &[&account_id],
+        )?
+        .get(0);
+    if active_actions > 0 {
+        tx.commit()?;
+        return Ok(Some(
+            BeginAccountDeletionResult::WaitingForIrreversibleCommunications { active_actions },
         ));
     }
 
@@ -1380,6 +1426,16 @@ fn hard_delete_account_after_runner_purge_sqlite(
         irreversible_count == 0,
         "runner-purge hard delete refuses unresolved irreversible submissions"
     );
+    let irreversible_communication_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs_communication_actions
+          WHERE account_id = ?1 AND status IN ('dispatching', 'side_effect_unknown')",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(
+        irreversible_communication_count == 0,
+        "runner-purge hard delete refuses unresolved irreversible communications"
+    );
     let purge_is_complete: bool = tx.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -1525,6 +1581,17 @@ fn hard_delete_account_after_runner_purge_postgres(
     anyhow::ensure!(
         irreversible_count == 0,
         "runner-purge hard delete refuses unresolved irreversible submissions"
+    );
+    let irreversible_communication_count: i64 = tx
+        .query_one(
+            "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+              WHERE account_id = $1 AND status IN ('dispatching', 'side_effect_unknown')",
+            &[&account_id],
+        )?
+        .try_get(0)?;
+    anyhow::ensure!(
+        irreversible_communication_count == 0,
+        "runner-purge hard delete refuses unresolved irreversible communications"
     );
     let purge_is_complete: bool = tx
         .query_one(

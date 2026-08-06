@@ -201,6 +201,10 @@ pub fn router() -> Router<AppState> {
             post(super::jobs_mailbox_oauth::start_oauth),
         )
         .route(
+            "/api/jobs/mailbox-connections/:connection_id/communication-authorization/start",
+            post(super::jobs_mailbox_oauth::start_communication_oauth),
+        )
+        .route(
             "/api/jobs/mailbox-connections/:connection_id",
             delete(super::jobs_mailbox::remove_mailbox_connection),
         )

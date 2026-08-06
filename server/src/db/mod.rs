@@ -356,6 +356,8 @@ const SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS: &str = include_str!(
 const SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
     "../../../infra/sqlite/server-runtime/050_jobs_runner_process_runtime_authority.sql"
 );
+const SQLITE_JOBS_COMMUNICATION_EXECUTION: &str =
+    include_str!("../../../infra/sqlite/server-runtime/051_jobs_communication_execution.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1690,6 +1692,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS,
     // 0050 - one-time cloud process runtime grants and immutable lease bindings.
     SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
+    // 0051 - exact reviewed communication dispatch and reconciliation evidence.
+    SQLITE_JOBS_COMMUNICATION_EXECUTION,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1705,6 +1709,74 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "authority_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(&conn, "jobs_communication_actions", "lease_kind", "TEXT")?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "active_attempt_id",
+        "TEXT",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "reconciliation_count",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "action_revision",
+        "INTEGER NOT NULL DEFAULT 1 CHECK (
+            action_revision > 0 AND action_revision <= 9007199254740991
+        )",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "approval_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "approved_authority_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "approved_grant_revision",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_communication_actions",
+        "approved_grant_sha256",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    conn.execute_batch(
+        "CREATE TRIGGER IF NOT EXISTS trg_jobs_communication_action_revision_insert
+         BEFORE INSERT ON jobs_communication_actions
+         WHEN NEW.action_revision <= 0 OR NEW.action_revision > 9007199254740991
+         BEGIN
+           SELECT RAISE(ABORT,
+             'communication action revision is outside the portable range');
+         END;
+
+         CREATE TRIGGER IF NOT EXISTS trg_jobs_communication_action_revision_update
+         BEFORE UPDATE OF action_revision ON jobs_communication_actions
+         WHEN NEW.action_revision <= 0 OR NEW.action_revision > 9007199254740991
+         BEGIN
+           SELECT RAISE(ABORT,
+             'communication action revision is outside the portable range');
+         END;",
+    )?;
     // Keep historical SQLite migrations immutable. Additive columns used by
     // the global-candidate cold-storage lifecycle are applied after replay.
     ensure_column(
@@ -2163,6 +2235,9 @@ pub const JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY_MIGRATION_ID: &str =
 const POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
     "../../../infra/postgres/server-runtime/028_jobs_runner_process_runtime_authority.sql"
 );
+pub const JOBS_COMMUNICATION_EXECUTION_MIGRATION_ID: &str = "029_jobs_communication_execution.sql";
+const POSTGRES_JOBS_COMMUNICATION_EXECUTION: &str =
+    include_str!("../../../infra/postgres/server-runtime/029_jobs_communication_execution.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2263,6 +2338,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
+    ),
+    (
+        JOBS_COMMUNICATION_EXECUTION_MIGRATION_ID,
+        POSTGRES_JOBS_COMMUNICATION_EXECUTION,
     ),
 ];
 

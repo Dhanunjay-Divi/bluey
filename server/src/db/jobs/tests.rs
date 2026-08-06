@@ -12260,11 +12260,24 @@ mod tests {
         let state = JobsOAuthState {
             provider: "gmail".to_string(),
             code_verifier: "pkce-secret-that-must-not-be-visible-at-rest".to_string(),
+            connection_id: None,
+            authorization_purpose: String::new(),
+            requested_scopes: Vec::new(),
+            requested_capabilities: Vec::new(),
+            expected_grant_revision: 0,
             return_path: "/jobs/settings".to_string(),
             expires_at_ms: now + 60_000,
             created_at_ms: now,
         };
         save_jobs_oauth_state(&pool, "acct-jobs", token, &state).unwrap();
+        assert!(save_jobs_oauth_state(&pool, "acct-jobs", token, &state).is_err());
+        assert!(save_jobs_oauth_state(
+            &pool,
+            "acct-jobs",
+            " state-token-with-more-than-thirty-two-random-characters",
+            &state,
+        )
+        .is_err());
         let raw: String = pool
             .get()
             .unwrap()
@@ -12294,6 +12307,114 @@ mod tests {
         assert!(consume_jobs_oauth_state(&pool, expired_token)
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn oauth_state_creation_obeys_the_account_deletion_write_fence() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+        let now = now_ms();
+        assert_account_deletion_fence(save_jobs_oauth_state(
+            &pool,
+            "acct-jobs",
+            "oauth-state-token-that-is-long-enough-for-the-fence-test",
+            &JobsOAuthState {
+                provider: "gmail".to_string(),
+                code_verifier: "oauth-code-verifier".to_string(),
+                connection_id: None,
+                authorization_purpose: "mailbox_read".to_string(),
+                requested_scopes: Vec::new(),
+                requested_capabilities: Vec::new(),
+                expected_grant_revision: 0,
+                return_path: "/jobs/settings".to_string(),
+                expires_at_ms: now + 60_000,
+                created_at_ms: now,
+            },
+        ));
+        let stored: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_oauth_states WHERE account_id = 'acct-jobs'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[test]
+    fn oauth_state_creation_serializes_with_account_deletion() {
+        let pool = test_pool();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let state = JobsOAuthState {
+            provider: "gmail".to_string(),
+            code_verifier: "concurrent-oauth-code-verifier".to_string(),
+            connection_id: None,
+            authorization_purpose: "mailbox_read".to_string(),
+            requested_scopes: Vec::new(),
+            requested_capabilities: Vec::new(),
+            expected_grant_revision: 0,
+            return_path: "/jobs/settings".to_string(),
+            expires_at_ms: now_ms() + 60_000,
+            created_at_ms: now_ms(),
+        };
+        let save_pool = pool.clone();
+        let save_barrier = barrier.clone();
+        let save = std::thread::spawn(move || {
+            save_barrier.wait();
+            save_jobs_oauth_state(
+                &save_pool,
+                "acct-jobs",
+                "concurrent-oauth-state-token-that-is-long-enough",
+                &state,
+            )
+        });
+        let deletion_pool = pool.clone();
+        let deletion_barrier = barrier.clone();
+        let deletion = std::thread::spawn(move || {
+            deletion_barrier.wait();
+            crate::db::account_data::begin_account_deletion(
+                &deletion_pool,
+                "acct-jobs",
+                now_ms(),
+            )
+        });
+        barrier.wait();
+        let saved = save.join().unwrap();
+        assert!(deletion.join().unwrap().unwrap().is_some());
+        if let Err(error) = saved {
+            assert!(matches!(
+                error.downcast_ref::<UploadControlError>(),
+                Some(UploadControlError::AccountDeleting)
+            ));
+        }
+        assert_account_deletion_fence(save_jobs_oauth_state(
+            &pool,
+            "acct-jobs",
+            "post-deletion-oauth-state-token-that-is-long-enough",
+            &JobsOAuthState {
+                provider: "gmail".to_string(),
+                code_verifier: "post-deletion-code-verifier".to_string(),
+                connection_id: None,
+                authorization_purpose: "mailbox_read".to_string(),
+                requested_scopes: Vec::new(),
+                requested_capabilities: Vec::new(),
+                expected_grant_revision: 0,
+                return_path: "/jobs/settings".to_string(),
+                expires_at_ms: now_ms() + 60_000,
+                created_at_ms: now_ms(),
+            },
+        ));
     }
 
     #[test]
@@ -12331,6 +12452,9 @@ mod tests {
             access_token: "dummy-provider-access-token".to_string(),
             refresh_token: "dummy-provider-refresh-token".to_string(),
             scopes: vec!["gmail.readonly".to_string()],
+            capabilities: Vec::new(),
+            grant_revision: 0,
+            grant_sha256: String::new(),
             expires_at_ms: now + 3_600_000,
             created_at_ms: now,
             updated_at_ms: now,
@@ -12366,6 +12490,212 @@ mod tests {
     }
 
     #[test]
+    fn provider_refresh_cas_preserves_the_winning_rotated_refresh_token() {
+        let pool = test_pool();
+        let now = now_ms();
+        let (mailbox, expected) = save_mailbox_connection_with_credential(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            &JobsProviderCredential {
+                connection_id: String::new(),
+                provider: "gmail".to_string(),
+                provider_subject: "google-subject-refresh-cas".to_string(),
+                access_token: "dummy-initial-access-token".to_string(),
+                refresh_token: "dummy-initial-refresh-token".to_string(),
+                scopes: vec!["gmail.readonly".to_string()],
+                capabilities: Vec::new(),
+                grant_revision: 0,
+                grant_sha256: String::new(),
+                expires_at_ms: now + 3_600_000,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .unwrap();
+        let winner = refresh_jobs_provider_credential_cas(
+            &pool,
+            "acct-jobs",
+            &expected,
+            "dummy-winner-access-token",
+            Some("dummy-winner-rotated-refresh-token"),
+            now + 7_200_000,
+        )
+        .unwrap();
+        assert_eq!(winner.refresh_token, "dummy-winner-rotated-refresh-token");
+        assert!(refresh_jobs_provider_credential_cas(
+            &pool,
+            "acct-jobs",
+            &expected,
+            "dummy-stale-access-token",
+            Some("dummy-stale-refresh-token"),
+            now + 7_200_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("lost CAS"));
+        let stored = jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.access_token, "dummy-winner-access-token");
+        assert_eq!(stored.refresh_token, "dummy-winner-rotated-refresh-token");
+        assert_eq!(stored.grant_revision, expected.grant_revision);
+        assert_eq!(stored.grant_sha256, expected.grant_sha256);
+    }
+
+    #[test]
+    fn accepted_provider_token_boundary_remains_refreshable() {
+        let pool = test_pool();
+        let now = now_ms();
+        let token_bytes = crate::jobs_provider_auth::MAX_PROVIDER_TOKEN_BYTES;
+        let initial_access = "a".repeat(token_bytes);
+        let initial_refresh = "b".repeat(token_bytes);
+        let next_access = "c".repeat(token_bytes);
+        let next_refresh = "d".repeat(token_bytes);
+        let (mailbox, expected) = save_mailbox_connection_with_credential(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            &JobsProviderCredential {
+                connection_id: String::new(),
+                provider: "gmail".to_string(),
+                provider_subject: "google-subject-token-boundary".to_string(),
+                access_token: initial_access,
+                refresh_token: initial_refresh,
+                scopes: vec!["gmail.readonly".to_string()],
+                capabilities: Vec::new(),
+                grant_revision: 0,
+                grant_sha256: String::new(),
+                expires_at_ms: now + 3_600_000,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .unwrap();
+
+        let refreshed = refresh_jobs_provider_credential_cas(
+            &pool,
+            "acct-jobs",
+            &expected,
+            &next_access,
+            Some(&next_refresh),
+            now + 7_200_000,
+        )
+        .unwrap();
+        assert_eq!(refreshed.connection_id, mailbox.id);
+        assert_eq!(refreshed.access_token.len(), token_bytes);
+        assert_eq!(refreshed.refresh_token.len(), token_bytes);
+        assert!(refresh_jobs_provider_credential_cas(
+            &pool,
+            "acct-jobs",
+            &refreshed,
+            &"e".repeat(token_bytes + 1),
+            None,
+            now + 10_800_000,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_provider_refresh_cannot_overwrite_a_grant_upgrade() {
+        let pool = test_pool();
+        let now = now_ms();
+        let (mailbox, stale) = save_mailbox_connection_with_credential(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: vec!["recruiter_reply".to_string()],
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            &JobsProviderCredential {
+                connection_id: String::new(),
+                provider: "gmail".to_string(),
+                provider_subject: "google-subject-grant-upgrade".to_string(),
+                access_token: "dummy-grant-one-access-token".to_string(),
+                refresh_token: "dummy-grant-one-refresh-token".to_string(),
+                scopes: vec!["https://www.googleapis.com/auth/gmail.send".to_string()],
+                capabilities: vec!["recruiter_reply".to_string()],
+                grant_revision: 1,
+                grant_sha256: String::new(),
+                expires_at_ms: now + 3_600_000,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+        )
+        .unwrap();
+        let upgraded_mailbox = MailboxConnection {
+            capabilities: vec![
+                "recruiter_reply".to_string(),
+                "interview_calendar".to_string(),
+            ],
+            ..mailbox.clone()
+        };
+        let upgraded_credential = JobsProviderCredential {
+            access_token: "dummy-grant-two-access-token".to_string(),
+            refresh_token: "dummy-grant-two-refresh-token".to_string(),
+            scopes: vec![
+                "https://www.googleapis.com/auth/gmail.send".to_string(),
+                "https://www.googleapis.com/auth/calendar.events".to_string(),
+            ],
+            capabilities: upgraded_mailbox.capabilities.clone(),
+            grant_revision: 2,
+            grant_sha256: String::new(),
+            expires_at_ms: now + 7_200_000,
+            ..stale.clone()
+        };
+        let (_, upgraded) = save_mailbox_connection_with_credential_cas(
+            &pool,
+            "acct-jobs",
+            &upgraded_mailbox,
+            &upgraded_credential,
+            1,
+        )
+        .unwrap();
+        assert_eq!(upgraded.grant_revision, 2);
+        assert!(refresh_jobs_provider_credential_cas(
+            &pool,
+            "acct-jobs",
+            &stale,
+            "stale-refresh-access-token",
+            Some("dummy-stale-refresh-token"),
+            now + 7_200_000,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("lost CAS"));
+        let stored = jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.grant_revision, 2);
+        assert_eq!(stored.grant_sha256, upgraded.grant_sha256);
+        assert_eq!(stored.refresh_token, "dummy-grant-two-refresh-token");
+    }
+
+    #[test]
     fn oauth_mailbox_setup_atomically_initializes_sync_state() {
         let pool = test_pool();
         let now = now_ms();
@@ -12389,6 +12719,9 @@ mod tests {
                 access_token: "dummy-atomic-access-token".to_string(),
                 refresh_token: "dummy-atomic-refresh-token".to_string(),
                 scopes: vec!["gmail.readonly".to_string()],
+                capabilities: Vec::new(),
+                grant_revision: 0,
+                grant_sha256: String::new(),
                 expires_at_ms: now + 3_600_000,
                 created_at_ms: now,
                 updated_at_ms: now,
@@ -12542,6 +12875,14 @@ mod tests {
             .any(|(account_id, state)| {
                 account_id == "acct-jobs" && state.connection_id == mailbox.id
             }));
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'reconnect-other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
         assert!(!mark_mailbox_reauthorization_required(&pool, "acct-other", &mailbox.id).unwrap());
     }
 
@@ -12620,6 +12961,203 @@ mod tests {
         assert!(!raw.contains("recruiter@example.org"));
     }
 
+    #[test]
+    fn provider_message_identity_is_scoped_to_the_exact_mailbox() {
+        let pool = test_pool();
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        let first_mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "first@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-message-scope-first",
+        )
+        .unwrap();
+        let second_mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "second@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-message-scope-second",
+        )
+        .unwrap();
+        let first_message = JobsProviderMessage {
+            id: String::new(),
+            connection_id: first_mailbox.id.clone(),
+            provider: "gmail".to_string(),
+            external_id: "same-provider-object-id".to_string(),
+            sender: "first-recruiter@example.org".to_string(),
+            recipients: vec![first_mailbox.account_label.clone()],
+            subject: "First mailbox".to_string(),
+            body_text: "First mailbox body".to_string(),
+            received_at_ms: now_ms(),
+            application_id: None,
+            processing_status: "received".to_string(),
+            classification: String::new(),
+            confidence: 0.0,
+            metadata: json!({"thread_id": "first-thread"}),
+            processed_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let mut second_message = first_message.clone();
+        second_message.connection_id = second_mailbox.id.clone();
+        second_message.sender = "second-recruiter@example.org".to_string();
+        second_message.recipients = vec![second_mailbox.account_label.clone()];
+        second_message.subject = "Second mailbox".to_string();
+        second_message.metadata = json!({"thread_id": "second-thread"});
+
+        let (first_stored, first_inserted) =
+            save_provider_message(&pool, "acct-jobs", &first_message).unwrap();
+        let (second_stored, second_inserted) =
+            save_provider_message(&pool, "acct-jobs", &second_message).unwrap();
+        assert!(first_inserted);
+        assert!(second_inserted);
+        assert_ne!(first_stored.id, second_stored.id);
+        assert_eq!(first_stored.connection_id, first_mailbox.id);
+        assert_eq!(second_stored.connection_id, second_mailbox.id);
+        assert_eq!(
+            list_provider_messages(&pool, "acct-jobs", Some(&first_mailbox.id), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            list_provider_messages(&pool, "acct-jobs", Some(&second_mailbox.id), 20)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn provider_message_legacy_identity_migrates_without_duplication() {
+        let pool = test_pool();
+        let mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "legacy@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-message-legacy",
+        )
+        .unwrap();
+        let message = JobsProviderMessage {
+            id: String::new(),
+            connection_id: mailbox.id.clone(),
+            provider: "gmail".to_string(),
+            external_id: "legacy-provider-message-id".to_string(),
+            sender: "legacy-recruiter@example.org".to_string(),
+            recipients: vec![mailbox.account_label.clone()],
+            subject: "Legacy identity".to_string(),
+            body_text: "Legacy body".to_string(),
+            received_at_ms: now_ms(),
+            application_id: None,
+            processing_status: "received".to_string(),
+            classification: String::new(),
+            confidence: 0.0,
+            metadata: json!({}),
+            processed_at_ms: None,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        let (stored, inserted) = save_provider_message(&pool, "acct-jobs", &message).unwrap();
+        assert!(inserted);
+        let legacy_hash = private_lookup_hash(
+            "jobs-provider-message:gmail",
+            message.external_id.as_str(),
+        )
+        .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_messages SET provider_message_hash = ?2 WHERE id = ?1",
+                params![stored.id, legacy_hash],
+            )
+            .unwrap();
+
+        let mut enriched_message = message.clone();
+        enriched_message.metadata = json!({
+            "thread_id": "legacy-thread",
+            "rfc_message_id": "<legacy-provider-message-id@example.org>",
+            "reply_target": "legacy-recruiter@example.org",
+        });
+        let (replayed, inserted_again) =
+            save_provider_message(&pool, "acct-jobs", &enriched_message).unwrap();
+        assert!(!inserted_again);
+        assert_eq!(replayed.id, stored.id);
+        assert_eq!(replayed.metadata["thread_id"], "legacy-thread");
+        assert_eq!(
+            replayed.metadata["rfc_message_id"],
+            "<legacy-provider-message-id@example.org>"
+        );
+        assert_eq!(
+            replayed.metadata["reply_target"],
+            "legacy-recruiter@example.org"
+        );
+        let processed = update_provider_message_processing(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            None,
+            "needs_input",
+            "interview",
+            0.9,
+            json!({"correlation_score": 90}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(processed.metadata["thread_id"], "legacy-thread");
+        assert_eq!(
+            processed.metadata["reply_target"],
+            "legacy-recruiter@example.org"
+        );
+        assert_eq!(processed.metadata["correlation_score"], 90);
+        let mut conflicting = enriched_message;
+        conflicting.metadata["thread_id"] = json!("changed-thread");
+        assert!(save_provider_message(&pool, "acct-jobs", &conflicting).is_err());
+        let expected_hash = private_lookup_hash(
+            &format!("jobs-provider-message:gmail:{}", mailbox.id),
+            message.external_id.as_str(),
+        )
+        .unwrap();
+        let (count, migrated_hash): (i64, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), MIN(provider_message_hash)
+                   FROM jobs_provider_messages WHERE account_id = 'acct-jobs'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(migrated_hash, expected_hash);
+    }
+
     fn communication_test_application(pool: &DbPool) -> JobApplication {
         let profile = default_profile("jobs@example.com");
         save_profile(pool, "acct-jobs", &profile).unwrap();
@@ -12653,13 +13191,34 @@ mod tests {
                 status: "connected".to_string(),
                 account_label: "jobs@example.com".to_string(),
                 aliases: Vec::new(),
-                capabilities: vec!["reply".to_string(), "calendar".to_string()],
+                capabilities: vec![
+                    "recruiter_reply".to_string(),
+                    "interview_calendar".to_string(),
+                ],
                 created_at_ms: 0,
                 updated_at_ms: 0,
             },
             "google-subject-communication-action",
         )
         .unwrap();
+        let credential = JobsProviderCredential {
+            connection_id: mailbox.id.clone(),
+            provider: "gmail".to_string(),
+            provider_subject: "google-subject-communication-action".to_string(),
+            access_token: "test-access-token".to_string(),
+            refresh_token: "test-refresh-token".to_string(),
+            scopes: vec![
+                "https://www.googleapis.com/auth/gmail.send".to_string(),
+                "https://www.googleapis.com/auth/calendar.events".to_string(),
+            ],
+            capabilities: mailbox.capabilities.clone(),
+            grant_revision: 1,
+            grant_sha256: String::new(),
+            expires_at_ms: now_ms() + 3_600_000,
+            created_at_ms: now_ms(),
+            updated_at_ms: now_ms(),
+        };
+        save_jobs_provider_credential(pool, "acct-jobs", &credential).unwrap();
         let message = communication_test_source_message(
             pool,
             &application,
@@ -12692,7 +13251,20 @@ mod tests {
                 processing_status: "needs_input".to_string(),
                 classification: "interview".to_string(),
                 confidence: 0.98,
-                metadata: json!({"thread_id": format!("thread-{external_id}")}),
+                metadata: if mailbox.provider == "gmail" {
+                    json!({
+                        "thread_id": format!("thread-{external_id}"),
+                        "rfc_message_id": format!("<{external_id}@example.org>"),
+                        "reply_target": "recruiter@example.org"
+                    })
+                } else {
+                    json!({
+                        "provider_id": format!("provider-{external_id}"),
+                        "conversation_id": format!("conversation-{external_id}"),
+                        "rfc_message_id": format!("<{external_id}@example.org>"),
+                        "reply_target": "recruiter@example.org"
+                    })
+                },
                 processed_at_ms: None,
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -12722,16 +13294,384 @@ mod tests {
                 "body_text": "Tuesday afternoon works for me."
             }),
             payload_sha256: String::new(),
+            authority_sha256: String::new(),
             status: String::new(),
             provider_object_id: String::new(),
             lease_owner: None,
+            lease_kind: None,
             lease_expires_at_ms: None,
+            active_attempt_id: None,
             next_attempt_at_ms: 0,
             attempt_count: 0,
+            reconciliation_count: 0,
+            action_revision: 1,
+            approval_revision: 0,
+            approved_authority_sha256: String::new(),
+            approved_grant_revision: 0,
+            approved_grant_sha256: String::new(),
             approved_at_ms: None,
             dispatched_at_ms: None,
             created_at_ms: 0,
             updated_at_ms: 0,
+        }
+    }
+
+    static COMMUNICATION_FLAG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct CommunicationFlagGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dispatch: Option<std::ffi::OsString>,
+        reconciliation: Option<std::ffi::OsString>,
+    }
+
+    impl CommunicationFlagGuard {
+        fn enabled() -> Self {
+            Self::with_enabled(true)
+        }
+
+        fn disabled() -> Self {
+            Self::with_enabled(false)
+        }
+
+        fn with_enabled(enabled: bool) -> Self {
+            let lock = COMMUNICATION_FLAG_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let guard = Self {
+                _lock: lock,
+                dispatch: std::env::var_os("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED"),
+                reconciliation: std::env::var_os(
+                    "BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED",
+                ),
+            };
+            if enabled {
+                std::env::set_var("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED", "true");
+                std::env::set_var("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED", "true");
+            } else {
+                std::env::remove_var("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED");
+                std::env::remove_var("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED");
+            }
+            guard
+        }
+    }
+
+    impl Drop for CommunicationFlagGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.dispatch.take() {
+                std::env::set_var("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED", value);
+            } else {
+                std::env::remove_var("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED");
+            }
+            if let Some(value) = self.reconciliation.take() {
+                std::env::set_var("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED", value);
+            } else {
+                std::env::remove_var("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED");
+            }
+        }
+    }
+
+    fn communication_lease_access(
+        lease: &JobsCommunicationActionLease,
+        owner_id: &str,
+    ) -> JobsCommunicationLeaseAccess {
+        JobsCommunicationLeaseAccess {
+            account_id: lease.account_id.clone(),
+            action_id: lease.action.id.clone(),
+            attempt_id: lease.attempt_id.clone(),
+            owner_id: owner_id.to_string(),
+            lease_token: lease.lease_token.clone(),
+            fence: lease.fence,
+            authority_sha256: lease.authority_sha256.clone(),
+            approval_revision: lease.approval_revision,
+            grant_revision: lease.grant_revision,
+            grant_sha256: lease.grant_sha256.clone(),
+        }
+    }
+
+    fn approve_communication_action(
+        pool: &DbPool,
+        account_id: &str,
+        action_id: &str,
+    ) -> Result<Option<JobsCommunicationAction>> {
+        let action = super::communication_action(pool, account_id, action_id)?
+            .ok_or_else(|| anyhow::anyhow!("communication action not found"))?;
+        super::approve_communication_action(
+            pool,
+            account_id,
+            action_id,
+            action.action_revision,
+            &action.payload_sha256,
+        )
+    }
+
+    fn cancel_communication_action(
+        pool: &DbPool,
+        account_id: &str,
+        action_id: &str,
+    ) -> Result<Option<JobsCommunicationAction>> {
+        let action = super::communication_action(pool, account_id, action_id)?
+            .ok_or_else(|| anyhow::anyhow!("communication action not found"))?;
+        super::cancel_communication_action(
+            pool,
+            account_id,
+            action_id,
+            action.action_revision,
+            &action.payload_sha256,
+        )
+    }
+
+    fn communication_success_evidence(
+        pool: &DbPool,
+        lease: &JobsCommunicationActionLease,
+        provider_object_id: &str,
+    ) -> Value {
+        let action = &lease.action;
+        let mut evidence = json!({
+            "provider": action.provider,
+            "provider_object_id": provider_object_id,
+            "payload_sha256": action.payload_sha256,
+            "action_id_sha256": hex::encode(Sha256::digest(action.id.as_bytes())),
+            "provider_operation_key_sha256": hex::encode(Sha256::digest(
+                lease.provider_operation_key.as_bytes()
+            )),
+        });
+        match action.provider.as_str() {
+            "gmail" | "outlook_email" => {
+                evidence["operation_message_id"] =
+                    json!(communication_operation_message_id(&lease.provider_operation_key));
+                let source = provider_message(
+                    pool,
+                    &lease.account_id,
+                    &lease.action.connection_id,
+                    lease.action.source_message_id.as_deref().unwrap(),
+                )
+                .unwrap()
+                .unwrap();
+                let (metadata_key, evidence_key) = if action.provider == "gmail" {
+                    ("thread_id", "thread_sha256")
+                } else {
+                    ("conversation_id", "conversation_sha256")
+                };
+                let source_identity = source.metadata[metadata_key].as_str().unwrap();
+                evidence[evidence_key] =
+                    json!(hex::encode(Sha256::digest(source_identity.as_bytes())));
+            }
+            "google_calendar" => {
+                evidence["deterministic_event_id"] =
+                    json!(communication_google_event_id(&lease.provider_operation_key));
+                evidence["private_marker_sha256"] = json!(hex::encode(Sha256::digest(
+                    lease.provider_operation_key.as_bytes()
+                )));
+            }
+            "outlook_calendar" => {
+                evidence["transaction_id"] = json!(communication_microsoft_transaction_id(
+                    &lease.provider_operation_key
+                ));
+                evidence["extended_property_sha256"] = json!(hex::encode(Sha256::digest(
+                    lease.provider_operation_key.as_bytes()
+                )));
+            }
+            _ => {}
+        }
+        evidence
+    }
+
+    fn communication_success_finish(
+        pool: &DbPool,
+        lease: &JobsCommunicationActionLease,
+        owner_id: &str,
+        provider_object_id: &str,
+    ) -> JobsCommunicationActionFinish {
+        JobsCommunicationActionFinish {
+            lease: communication_lease_access(lease, owner_id),
+            outcome: if lease.action.kind == "reply" {
+                "sent".to_string()
+            } else {
+                "calendar_created".to_string()
+            },
+            provider_object_id: provider_object_id.to_string(),
+            evidence: communication_success_evidence(pool, lease, provider_object_id),
+        }
+    }
+
+    fn communication_reconciliation_evidence(
+        lease: &JobsCommunicationActionLease,
+        evidence: Value,
+    ) -> Value {
+        let mut object = evidence.as_object().cloned().unwrap_or_default();
+        object.insert(
+            "provider".to_string(),
+            Value::String(lease.action.provider.clone()),
+        );
+        object.insert(
+            "action_id_sha256".to_string(),
+            Value::String(hex::encode(Sha256::digest(lease.action.id.as_bytes()))),
+        );
+        object.insert(
+            "payload_sha256".to_string(),
+            Value::String(lease.action.payload_sha256.clone()),
+        );
+        object.insert(
+            "provider_operation_key_sha256".to_string(),
+            Value::String(hex::encode(Sha256::digest(
+                lease.provider_operation_key.as_bytes(),
+            ))),
+        );
+        Value::Object(object)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn processed_provider_messages_keep_exact_reply_authority_through_dispatch() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        let application = communication_test_application(&pool);
+        for (connection_provider, action_provider, subject, scopes, metadata) in [
+            (
+                "gmail",
+                "gmail",
+                "google-subject-processed-reply",
+                vec!["https://www.googleapis.com/auth/gmail.send".to_string()],
+                json!({
+                    "thread_id": "processed-gmail-thread",
+                    "rfc_message_id": "<processed-gmail@example.org>",
+                    "reply_target": "gmail-recruiter@example.org",
+                }),
+            ),
+            (
+                "outlook",
+                "outlook_email",
+                "microsoft-subject-processed-reply",
+                vec!["Mail.Send".to_string()],
+                json!({
+                    "provider_id": "processed-outlook-message",
+                    "conversation_id": "processed-outlook-conversation",
+                    "reply_target": "outlook-recruiter@example.org",
+                }),
+            ),
+        ] {
+            let mailbox = save_mailbox_connection(
+                &pool,
+                "acct-jobs",
+                &MailboxConnection {
+                    id: String::new(),
+                    provider: connection_provider.to_string(),
+                    status: "connected".to_string(),
+                    account_label: format!("{connection_provider}@example.com"),
+                    aliases: Vec::new(),
+                    capabilities: vec!["recruiter_reply".to_string()],
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+                subject,
+            )
+            .unwrap();
+            save_jobs_provider_credential(
+                &pool,
+                "acct-jobs",
+                &JobsProviderCredential {
+                    connection_id: mailbox.id.clone(),
+                    provider: connection_provider.to_string(),
+                    provider_subject: subject.to_string(),
+                    access_token: format!("{connection_provider}-processed-access-token"),
+                    refresh_token: format!("{connection_provider}-processed-refresh-token"),
+                    scopes,
+                    capabilities: vec!["recruiter_reply".to_string()],
+                    grant_revision: 1,
+                    grant_sha256: String::new(),
+                    expires_at_ms: now_ms() + 3_600_000,
+                    created_at_ms: now_ms(),
+                    updated_at_ms: now_ms(),
+                },
+            )
+            .unwrap();
+            let reply_target = metadata["reply_target"].as_str().unwrap().to_string();
+            let external_id = if connection_provider == "outlook" {
+                "<processed-outlook@example.org>".to_string()
+            } else {
+                "gmail-processed-message".to_string()
+            };
+            let message = save_provider_message(
+                &pool,
+                "acct-jobs",
+                &JobsProviderMessage {
+                    id: String::new(),
+                    connection_id: mailbox.id.clone(),
+                    provider: connection_provider.to_string(),
+                    external_id,
+                    sender: reply_target.clone(),
+                    recipients: vec![mailbox.account_label.clone()],
+                    subject: "Processed interview reply".to_string(),
+                    body_text: "Please confirm a time.".to_string(),
+                    received_at_ms: now_ms(),
+                    application_id: Some(application.id.clone()),
+                    processing_status: "received".to_string(),
+                    classification: String::new(),
+                    confidence: 0.0,
+                    metadata,
+                    processed_at_ms: None,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .unwrap()
+            .0;
+            let processed = update_provider_message_processing(
+                &pool,
+                "acct-jobs",
+                &message.id,
+                Some(&application.id),
+                "needs_input",
+                "interview",
+                0.95,
+                json!({"correlation_score": 95, "intervention_id": "review-1"}),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(processed.metadata["reply_target"], reply_target);
+            assert_eq!(processed.metadata["correlation_score"], 95);
+
+            let mut action = communication_test_action(
+                &application,
+                &mailbox,
+                &processed,
+                &format!("processed-{action_provider}-reply"),
+            );
+            action.provider = action_provider.to_string();
+            action.payload["to"] = json!(reply_target);
+            let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+            approve_communication_action(&pool, "acct-jobs", &action.id)
+                .unwrap()
+                .unwrap();
+            let lease = claim_communication_action(
+                &pool,
+                &format!("processed-{action_provider}-worker"),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(lease.action.id, action.id);
+            let owner = format!("processed-{action_provider}-worker");
+            mark_communication_action_request_started(
+                &pool,
+                &communication_lease_access(&lease, &owner),
+            )
+            .unwrap();
+            assert!(matches!(
+                finish_communication_action(
+                    &pool,
+                    &communication_success_finish(
+                        &pool,
+                        &lease,
+                        &owner,
+                        &format!("{action_provider}-processed-sent"),
+                    ),
+                )
+                .unwrap()
+                .status
+                .as_str(),
+                "sent"
+            ));
         }
     }
 
@@ -12783,6 +13723,66 @@ mod tests {
     }
 
     #[test]
+    fn communication_payload_hash_matches_shared_portal_vectors() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../jobs/portal/src/fixtures/communication-payload-hash-vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(fixture["schema_version"], 1);
+        let vectors = fixture["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 2);
+        for vector in vectors {
+            let kind = vector["kind"].as_str().unwrap();
+            let payload = &vector["payload"];
+            validate_communication_payload(kind, payload).unwrap();
+            let canonical = serde_json::to_string(&canonical_communication_value(payload)).unwrap();
+            assert_eq!(canonical, vector["canonical_json"].as_str().unwrap());
+            assert_eq!(
+                communication_payload_sha256(payload).unwrap(),
+                vector["sha256"].as_str().unwrap(),
+                "{}",
+                vector["name"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn communication_review_text_rejects_invisible_controls_with_body_allowlist() {
+        let valid_reply = json!({
+            "to": "recruiter@example.org",
+            "subject": "Reviewed subject",
+            "body_text": "Line one\n\tLine two 👩\u{200d}💻 क्\u{200d}ष",
+        });
+        validate_communication_payload("reply", &valid_reply).unwrap();
+
+        for unsafe_character in ['\u{202e}', '\u{2066}', '\u{001b}', '\u{0008}'] {
+            let mut reply = valid_reply.clone();
+            reply["body_text"] = json!(format!("before{unsafe_character}after"));
+            assert!(validate_communication_payload("reply", &reply).is_err());
+        }
+        for unsafe_character in ['\u{202e}', '\u{2066}', '\u{2028}', '\u{2029}'] {
+            let mut reply = valid_reply.clone();
+            reply["subject"] = json!(format!("before{unsafe_character}after"));
+            assert!(validate_communication_payload("reply", &reply).is_err());
+            assert!(normalize_communication_email(&format!(
+                "local{unsafe_character}@example.org"
+            ))
+            .is_err());
+        }
+
+        let mut calendar = json!({
+            "title": "Reviewed interview",
+            "starts_at_ms": 2_000_000_000_123_i64,
+            "ends_at_ms": 2_000_003_600_123_i64,
+            "time_zone": "Europe/Paris",
+            "attendees": ["candidate@example.org"],
+        });
+        calendar["title"] = json!("Interview \u{202e}hidden");
+        assert!(validate_communication_payload("calendar", &calendar).is_err());
+        assert!(serde_json::from_str::<Value>(r#"{"body_text":"\uD800"}"#).is_err());
+    }
+
+    #[test]
     fn communication_replies_require_a_bound_source_message() {
         let pool = test_pool();
         let (application, mailbox, message) =
@@ -12799,7 +13799,37 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn communication_execution_flag_fails_closed_for_readiness_and_writes() {
+        let _flags = CommunicationFlagGuard::disabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "communication-dispatch-disabled",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        let (ready, reason) =
+            communication_action_execution_readiness(&pool, "acct-jobs", &stored).unwrap();
+        assert!(!ready);
+        assert!(reason.contains("not enabled"));
+        assert!(approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap_err()
+            .to_string()
+            .contains("not enabled"));
+        assert!(claim_communication_action(&pool, "disabled-worker")
+            .unwrap_err()
+            .to_string()
+            .contains("not enabled"));
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn approved_communication_actions_wait_for_mailbox_reauthorization() {
+        let _flags = CommunicationFlagGuard::enabled();
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
@@ -12838,6 +13868,172 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn mailbox_reauthorization_refuses_an_unresolved_dispatch() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "reauthorization-during-dispatch",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "mail-worker")
+            .unwrap()
+            .unwrap();
+
+        let error = mark_mailbox_reauthorization_required(&pool, "acct-jobs", &mailbox.id)
+            .expect_err("an unresolved provider attempt must fence mailbox status changes");
+        assert!(error.to_string().contains("communication is unresolved"));
+        assert_eq!(
+            mailbox_connection(&pool, "acct-jobs", &mailbox.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "connected"
+        );
+        assert_eq!(
+            communication_action(&pool, "acct-jobs", &lease.action.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "dispatching"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn unresolved_dispatch_rejects_generic_mailbox_reconnect_and_grant_downgrade() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "generic-reconnect-during-dispatch",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        claim_communication_action(&pool, "generic-reconnect-worker")
+            .unwrap()
+            .unwrap();
+        let current = jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        let downgraded_mailbox = MailboxConnection {
+            capabilities: vec![
+                "status_sync".to_string(),
+                "application_correlation".to_string(),
+                "review_interventions".to_string(),
+            ],
+            ..mailbox.clone()
+        };
+        let downgraded = JobsProviderCredential {
+            access_token: "dummy-downgraded-access-token".to_string(),
+            refresh_token: "dummy-downgraded-refresh-token".to_string(),
+            scopes: vec!["gmail.readonly".to_string()],
+            capabilities: downgraded_mailbox.capabilities.clone(),
+            grant_revision: 0,
+            grant_sha256: String::new(),
+            expires_at_ms: now_ms() + 3_600_000,
+            ..current.clone()
+        };
+        assert!(save_mailbox_connection_with_credential(
+            &pool,
+            "acct-jobs",
+            &downgraded_mailbox,
+            &downgraded,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("communication is unresolved"));
+        assert!(save_jobs_provider_credential(&pool, "acct-jobs", &downgraded)
+            .unwrap_err()
+            .to_string()
+            .contains("communication is unresolved"));
+        let preserved = jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preserved.grant_revision, current.grant_revision);
+        assert_eq!(preserved.grant_sha256, current.grant_sha256);
+        assert_eq!(preserved.refresh_token, current.refresh_token);
+        assert_eq!(
+            mailbox_connection(&pool, "acct-jobs", &mailbox.id)
+                .unwrap()
+                .unwrap()
+                .capabilities,
+            mailbox.capabilities
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mailbox_reauthorization_and_dispatch_claim_have_one_consistent_winner() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "reauthorization-dispatch-race",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let claim_pool = pool.clone();
+        let claim_barrier = barrier.clone();
+        let claim = std::thread::spawn(move || {
+            claim_barrier.wait();
+            claim_communication_action(&claim_pool, "race-mail-worker")
+        });
+        let mark_pool = pool.clone();
+        let mark_barrier = barrier.clone();
+        let connection_id = mailbox.id.clone();
+        let mark = std::thread::spawn(move || {
+            mark_barrier.wait();
+            mark_mailbox_reauthorization_required(&mark_pool, "acct-jobs", &connection_id)
+        });
+        barrier.wait();
+        let claimed = claim.join().unwrap();
+        let marked = mark.join().unwrap();
+        let final_mailbox = mailbox_connection(&pool, "acct-jobs", &mailbox.id)
+            .unwrap()
+            .unwrap();
+        let final_action = communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+
+        match (claimed, marked) {
+            (Ok(Some(_)), Err(error)) => {
+                assert!(error.to_string().contains("communication is unresolved"));
+                assert_eq!(final_mailbox.status, "connected");
+                assert_eq!(final_action.status, "dispatching");
+            }
+            (Ok(None), Ok(true)) => {
+                assert_eq!(final_mailbox.status, "reauthorization_required");
+                assert_eq!(final_action.status, "approved");
+            }
+            (claimed, marked) => {
+                panic!("inconsistent dispatch/reauthorization race: {claimed:?}, {marked:?}")
+            }
+        }
+    }
+
+    #[test]
     fn outlook_email_and_calendar_actions_use_the_outlook_mailbox_connection() {
         let pool = test_pool();
         let application = communication_test_application(&pool);
@@ -12850,11 +14046,33 @@ mod tests {
                 status: "connected".to_string(),
                 account_label: "candidate@outlook.com".to_string(),
                 aliases: Vec::new(),
-                capabilities: vec!["reply".to_string(), "calendar".to_string()],
+                capabilities: vec![
+                    "recruiter_reply".to_string(),
+                    "interview_calendar".to_string(),
+                ],
                 created_at_ms: 0,
                 updated_at_ms: 0,
             },
             "microsoft-subject-communication-action",
+        )
+        .unwrap();
+        save_jobs_provider_credential(
+            &pool,
+            "acct-jobs",
+            &JobsProviderCredential {
+                connection_id: mailbox.id.clone(),
+                provider: "outlook".to_string(),
+                provider_subject: "microsoft-subject-communication-action".to_string(),
+                access_token: "dummy-outlook-access-token".to_string(),
+                refresh_token: "dummy-outlook-refresh-token".to_string(),
+                scopes: vec!["Mail.Send".to_string(), "Calendars.ReadWrite".to_string()],
+                capabilities: mailbox.capabilities.clone(),
+                grant_revision: 1,
+                grant_sha256: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            },
         )
         .unwrap();
         let message = communication_test_source_message(
@@ -12881,16 +14099,66 @@ mod tests {
             "title": "Interview with Acme",
             "starts_at_ms": 2_000_000_000_000_i64,
             "ends_at_ms": 2_000_003_600_000_i64,
+            "time_zone": "America/New_York",
             "attendees": ["candidate@outlook.com", "recruiter@example.org"]
         });
         let (stored_calendar, inserted_calendar) =
             create_communication_action(&pool, "acct-jobs", &calendar).unwrap();
         assert!(inserted_calendar);
         assert_eq!(stored_calendar.provider, "outlook_calendar");
+
+        let reply_to_message = save_provider_message(
+            &pool,
+            "acct-jobs",
+            &JobsProviderMessage {
+                id: String::new(),
+                connection_id: mailbox.id.clone(),
+                provider: "outlook".to_string(),
+                external_id: "<outlook-reply-to@example.org>".to_string(),
+                sender: "sender@example.org".to_string(),
+                recipients: vec![mailbox.account_label.clone()],
+                subject: "Reply-To authority".to_string(),
+                body_text: "Please reply to our recruiting team.".to_string(),
+                received_at_ms: now_ms(),
+                application_id: Some(application.id.clone()),
+                processing_status: "needs_input".to_string(),
+                classification: "interview".to_string(),
+                confidence: 0.99,
+                metadata: json!({
+                    "provider_id": "immutable-outlook-reply-to",
+                    "conversation_id": "outlook-reply-to-conversation",
+                    "rfc_message_id": "<outlook-reply-to@example.org>",
+                    "reply_target": "talent@example.org",
+                }),
+                processed_at_ms: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap()
+        .0;
+        let mut reply_to_action = communication_test_action(
+            &application,
+            &mailbox,
+            &reply_to_message,
+            "outlook-reply-to-authority",
+        );
+        reply_to_action.provider = "outlook_email".to_string();
+        reply_to_action.payload["to"] = json!("talent@example.org");
+        assert!(create_communication_action(&pool, "acct-jobs", &reply_to_action)
+            .unwrap()
+            .1);
+
+        let mut sender_action = reply_to_action;
+        sender_action.idempotency_key = "outlook-sender-is-not-reply-target".to_string();
+        sender_action.payload["to"] = json!("sender@example.org");
+        assert!(create_communication_action(&pool, "acct-jobs", &sender_action).is_err());
     }
 
     #[test]
+    #[serial_test::serial]
     fn communication_actions_require_approval_and_fenced_provider_evidence() {
+        let _flags = CommunicationFlagGuard::enabled();
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
@@ -12913,38 +14181,30 @@ mod tests {
         assert_eq!(lease.action.id, stored.id);
         assert_eq!(lease.action.status, "dispatching");
         assert_eq!(lease.action.attempt_count, 1);
-        assert!(finish_communication_action(
-            &pool,
-            "acct-jobs",
-            &stored.id,
-            "mail-worker",
-            "wrong-token",
-            lease.fence,
-            "sent",
-            Some("gmail-message-1"),
-        )
-        .is_err());
-        assert!(finish_communication_action(
-            &pool,
-            "acct-jobs",
-            &stored.id,
-            "mail-worker",
-            &lease.lease_token,
-            lease.fence,
-            "sent",
-            None,
-        )
-        .is_err());
+        let access = communication_lease_access(&lease, "mail-worker");
+        mark_communication_action_request_started(&pool, &access).unwrap();
+        let mut wrong_token =
+            communication_success_finish(&pool, &lease, "mail-worker", "gmail-message-1");
+        wrong_token.lease.lease_token = "wrong-token".to_string();
+        assert!(finish_communication_action(&pool, &wrong_token).is_err());
+        let missing_object = communication_success_finish(&pool, &lease, "mail-worker", "");
+        assert!(finish_communication_action(&pool, &missing_object).is_err());
+        let mut missing_source_proof =
+            communication_success_finish(&pool, &lease, "mail-worker", "gmail-message-1");
+        missing_source_proof
+            .evidence
+            .as_object_mut()
+            .unwrap()
+            .remove("thread_sha256");
+        assert!(finish_communication_action(&pool, &missing_source_proof).is_err());
+        let mut mismatched_source_proof =
+            communication_success_finish(&pool, &lease, "mail-worker", "gmail-message-1");
+        mismatched_source_proof.evidence["thread_sha256"] = json!("f".repeat(64));
+        assert!(finish_communication_action(&pool, &mismatched_source_proof).is_err());
 
         let completed = finish_communication_action(
             &pool,
-            "acct-jobs",
-            &stored.id,
-            "mail-worker",
-            &lease.lease_token,
-            lease.fence,
-            "sent",
-            Some("gmail-message-1"),
+            &communication_success_finish(&pool, &lease, "mail-worker", "gmail-message-1"),
         )
         .unwrap();
         assert_eq!(completed.status, "sent");
@@ -12964,7 +14224,773 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn communication_request_start_is_singleton_and_replay_exact() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "request-start-singleton",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "request-start-worker")
+            .unwrap()
+            .unwrap();
+        let access = communication_lease_access(&lease, "request-start-worker");
+        mark_communication_action_request_started(&pool, &access).unwrap();
+        mark_communication_action_request_started(&pool, &access).unwrap();
+        let count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                  WHERE attempt_id = ?1 AND event_kind = 'request_started'",
+                params![lease.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_action_attempt_evidence
+                    SET evidence_sha256 = ?2
+                  WHERE attempt_id = ?1 AND event_kind = 'request_started'",
+                params![lease.attempt_id, "f".repeat(64)],
+            )
+            .unwrap();
+        assert!(mark_communication_action_request_started(&pool, &access)
+            .unwrap_err()
+            .to_string()
+            .contains("evidence changed"));
+        let count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                  WHERE attempt_id = ?1 AND event_kind = 'request_started'",
+                params![lease.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_audit_schema_rejects_cross_authority_rows() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let first = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "audit-authority-first",
+        );
+        let (first, _) = create_communication_action(&pool, "acct-jobs", &first).unwrap();
+        let second = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "audit-authority-second",
+        );
+        let (second, _) = create_communication_action(&pool, "acct-jobs", &second).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &first.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "audit-authority-worker")
+            .unwrap()
+            .unwrap();
+        let other_mailbox = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "other-mailbox@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-audit-other-mailbox",
+        )
+        .unwrap();
+        let other_source = communication_test_source_message(
+            &pool,
+            &application,
+            &other_mailbox,
+            "audit-authority-other-source",
+        );
+        let conn = pool.get().unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_communication_actions SET account_id = 'acct-other' WHERE id = ?1",
+                params![second.id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_communication_actions SET connection_id = ?2 WHERE id = ?1",
+                params![second.id, other_mailbox.id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_communication_actions SET source_message_id = ?2 WHERE id = ?1",
+                params![second.id, other_source.id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_communication_actions SET provider = 'google_calendar' WHERE id = ?1",
+                params![second.id],
+            )
+            .is_err());
+        let wrong_connection = conn.execute(
+            "INSERT INTO jobs_communication_action_attempts (
+                id, account_id, action_id, connection_id, provider, dispatch_no, fence,
+                approval_revision, authority_sha256, grant_revision, grant_sha256,
+                provider_operation_key, created_at_ms
+             ) VALUES (?1, 'acct-jobs', ?2, ?3, 'gmail', 99, 99, 1, ?4, 1, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                first.id,
+                other_mailbox.id,
+                first.authority_sha256,
+                lease.grant_sha256,
+                "bluey-cross-connection-operation",
+                now_ms(),
+            ],
+        );
+        assert!(wrong_connection.is_err());
+        let wrong_account = conn.execute(
+            "INSERT INTO jobs_communication_action_attempts (
+                id, account_id, action_id, connection_id, provider, dispatch_no, fence,
+                approval_revision, authority_sha256, grant_revision, grant_sha256,
+                provider_operation_key, created_at_ms
+             ) VALUES (?1, 'acct-other', ?2, ?3, 'gmail', 100, 100, 1, ?4, 1, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                first.id,
+                mailbox.id,
+                first.authority_sha256,
+                lease.grant_sha256,
+                "bluey-cross-account-operation",
+                now_ms(),
+            ],
+        );
+        assert!(wrong_account.is_err());
+        let wrong_provider = conn.execute(
+            "INSERT INTO jobs_communication_action_attempts (
+                id, account_id, action_id, connection_id, provider, dispatch_no, fence,
+                approval_revision, authority_sha256, grant_revision, grant_sha256,
+                provider_operation_key, created_at_ms
+             ) VALUES (?1, 'acct-jobs', ?2, ?3, 'outlook_email', 101, 101, 1, ?4, 1, ?5, ?6, ?7)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                first.id,
+                mailbox.id,
+                first.authority_sha256,
+                lease.grant_sha256,
+                "bluey-cross-provider-operation",
+                now_ms(),
+            ],
+        );
+        assert!(wrong_provider.is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'sent', provider_object_id = ?2
+                  WHERE id = ?1",
+                params![second.id, "provider\u{0085}object"],
+            )
+            .is_err());
+        let cross_action_evidence = conn.execute(
+            "INSERT INTO jobs_communication_action_attempt_evidence (
+                id, account_id, action_id, attempt_id, event_kind, evidence_sha256,
+                evidence_json, recorded_at_ms
+             ) VALUES (?1, 'acct-jobs', ?2, ?3, 'request_started', ?4, 'encrypted', ?5)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                second.id,
+                lease.attempt_id,
+                "a".repeat(64),
+                now_ms(),
+            ],
+        );
+        assert!(cross_action_evidence.is_err());
+        let cross_account_reconciliation = conn.execute(
+            "INSERT INTO jobs_communication_action_reconciliations (
+                id, account_id, action_id, attempt_id, fence, resolution,
+                evidence_sha256, evidence_json, recorded_at_ms
+             ) VALUES (?1, 'acct-other', ?2, ?3, 101, 'inconclusive', ?4, 'encrypted', ?5)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                first.id,
+                lease.attempt_id,
+                "b".repeat(64),
+                now_ms(),
+            ],
+        );
+        assert!(cross_account_reconciliation.is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn account_deletion_fence_stops_new_dispatch_and_allows_exact_finish() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        for idempotency_key in ["account-drain-first", "account-drain-second"] {
+            let action =
+                communication_test_action(&application, &mailbox, &message, idempotency_key);
+            let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+            approve_communication_action(&pool, "acct-jobs", &action.id)
+                .unwrap()
+                .unwrap();
+        }
+        let lease = claim_communication_action(&pool, "account-drain-worker")
+            .unwrap()
+            .unwrap();
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&lease, "account-drain-worker"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            crate::db::account_data::begin_account_deletion(&pool, "acct-jobs", now_ms())
+                .unwrap(),
+            Some(
+                crate::db::account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+                    active_actions: 1
+                }
+            )
+        ));
+        let fence_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_write_fences
+                  WHERE account_id = 'acct-jobs' AND connection_id = ''
+                    AND reason = 'account_deletion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fence_count, 1);
+        assert!(claim_communication_action(&pool, "blocked-account-worker")
+            .unwrap()
+            .is_none());
+
+        let finished = finish_communication_action(
+            &pool,
+            &communication_success_finish(
+                &pool,
+                &lease,
+                "account-drain-worker",
+                "gmail-account-drain-sent",
+            ),
+        )
+        .unwrap();
+        assert_eq!(finished.status, "sent");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn account_deletion_and_request_start_race_preserves_one_serialized_authority() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "account-drain-request-start-race",
+        );
+        let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &action.id)
+            .unwrap()
+            .unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let claim_pool = pool.clone();
+        let claim_barrier = std::sync::Arc::clone(&barrier);
+        let claim = std::thread::spawn(move || {
+            claim_barrier.wait();
+            let lease = claim_communication_action(&claim_pool, "account-drain-race-worker")
+                .ok()
+                .flatten();
+            let started = lease.as_ref().is_some_and(|lease| {
+                mark_communication_action_request_started(
+                    &claim_pool,
+                    &communication_lease_access(lease, "account-drain-race-worker"),
+                )
+                .is_ok()
+            });
+            (lease, started)
+        });
+        let deletion_pool = pool.clone();
+        let deletion_barrier = std::sync::Arc::clone(&barrier);
+        let deletion = std::thread::spawn(move || {
+            deletion_barrier.wait();
+            crate::db::account_data::begin_account_deletion(
+                &deletion_pool,
+                "acct-jobs",
+                now_ms(),
+            )
+        });
+        barrier.wait();
+        let (lease, request_started) = claim.join().unwrap();
+        let deletion = deletion.join().unwrap().unwrap().unwrap();
+
+        let fence_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_write_fences
+                  WHERE account_id = 'acct-jobs' AND connection_id = ''",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fence_count, 1);
+        assert!(claim_communication_action(&pool, "post-race-worker")
+            .unwrap_or(None)
+            .is_none());
+        if lease.is_some() {
+            assert!(matches!(
+                deletion,
+                crate::db::account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+                    active_actions: 1
+                }
+            ));
+        } else {
+            assert!(!request_started);
+            assert!(matches!(
+                deletion,
+                crate::db::account_data::BeginAccountDeletionResult::Ready(_)
+                    | crate::db::account_data::BeginAccountDeletionResult::WaitingForUploads(_)
+            ));
+        }
+        if request_started {
+            let lease = lease.unwrap();
+            assert_eq!(
+                finish_communication_action(
+                    &pool,
+                    &communication_success_finish(
+                        &pool,
+                        &lease,
+                        "account-drain-race-worker",
+                        "gmail-account-drain-race-sent",
+                    ),
+                )
+                .unwrap()
+                .status,
+                "sent"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn mailbox_disconnect_fence_drains_exact_attempt_then_cancels_pending_action() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let mut actions = Vec::new();
+        for idempotency_key in ["mailbox-drain-first", "mailbox-drain-second"] {
+            let action =
+                communication_test_action(&application, &mailbox, &message, idempotency_key);
+            let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+            actions.push(
+                approve_communication_action(&pool, "acct-jobs", &action.id)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let lease = claim_communication_action(&pool, "mailbox-drain-worker")
+            .unwrap()
+            .unwrap();
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&lease, "mailbox-drain-worker"),
+        )
+        .unwrap();
+        let pending = actions
+            .iter()
+            .find(|action| action.id != lease.action.id)
+            .unwrap()
+            .clone();
+
+        assert!(delete_mailbox_connection(&pool, "acct-jobs", &mailbox.id).is_err());
+        let fence_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_write_fences
+                  WHERE account_id = 'acct-jobs' AND connection_id = ?1
+                    AND reason = 'mailbox_disconnect'",
+                params![mailbox.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fence_count, 1);
+        assert!(claim_communication_action(&pool, "blocked-mailbox-worker")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            finish_communication_action(
+                &pool,
+                &communication_success_finish(
+                    &pool,
+                    &lease,
+                    "mailbox-drain-worker",
+                    "gmail-mailbox-drain-sent",
+                ),
+            )
+            .unwrap()
+            .status,
+            "sent"
+        );
+
+        assert!(delete_mailbox_connection(&pool, "acct-jobs", &mailbox.id).unwrap());
+        let cancelled = communication_action(&pool, "acct-jobs", &pending.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.action_revision, pending.action_revision + 1);
+
+        let mut reconnected = mailbox.clone();
+        reconnected.status = "connected".to_string();
+        save_mailbox_connection_with_credential(
+            &pool,
+            "acct-jobs",
+            &reconnected,
+            &JobsProviderCredential {
+                connection_id: mailbox.id.clone(),
+                provider: "gmail".to_string(),
+                provider_subject: "google-subject-communication-action".to_string(),
+                access_token: "dummy-reconnected-access-token".to_string(),
+                refresh_token: "dummy-reconnected-refresh-token".to_string(),
+                scopes: vec!["https://www.googleapis.com/auth/gmail.send".to_string()],
+                capabilities: vec!["recruiter_reply".to_string()],
+                grant_revision: 1,
+                grant_sha256: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        let fence_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_write_fences
+                  WHERE account_id = 'acct-jobs' AND connection_id = ?1",
+                params![mailbox.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fence_count, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_revision_and_timestamp_advance_exactly_across_dispatch() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "revision-monotonic-dispatch",
+        );
+        let (created, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        assert_eq!(created.action_revision, 1);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions SET updated_at_ms = ?2 WHERE id = ?1",
+                params![created.id, created.updated_at_ms + 10_000],
+            )
+            .unwrap();
+        let before_approval = communication_action(&pool, "acct-jobs", &created.id)
+            .unwrap()
+            .unwrap();
+        let approved = approve_communication_action(&pool, "acct-jobs", &created.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(approved.action_revision, 2);
+        assert_eq!(approved.updated_at_ms, before_approval.updated_at_ms + 1);
+        assert_eq!(approved.approved_at_ms, Some(approved.updated_at_ms));
+
+        let lease = claim_communication_action(&pool, "revision-monotonic-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.action.action_revision, 3);
+        assert!(lease.action.updated_at_ms > approved.updated_at_ms);
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&lease, "revision-monotonic-worker"),
+        )
+        .unwrap();
+        let finished = finish_communication_action(
+            &pool,
+            &communication_success_finish(
+                &pool,
+                &lease,
+                "revision-monotonic-worker",
+                "gmail-revision-monotonic-sent",
+            ),
+        )
+        .unwrap();
+        assert_eq!(finished.action_revision, 4);
+        assert!(finished.updated_at_ms > lease.action.updated_at_ms);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_mutations_reject_stale_or_noncanonical_review_snapshots() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "review-snapshot-cas",
+        );
+        let (created, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        assert!(super::approve_communication_action(
+            &pool,
+            "acct-jobs",
+            &created.id,
+            created.action_revision,
+            &created.payload_sha256.to_ascii_uppercase(),
+        )
+        .is_err());
+        let approved = super::approve_communication_action(
+            &pool,
+            "acct-jobs",
+            &created.id,
+            created.action_revision,
+            &created.payload_sha256,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(approved.action_revision, created.action_revision + 1);
+        assert!(super::cancel_communication_action(
+            &pool,
+            "acct-jobs",
+            &created.id,
+            created.action_revision,
+            &created.payload_sha256,
+        )
+        .is_err());
+        let unchanged = communication_action(&pool, "acct-jobs", &created.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "approved");
+        assert_eq!(unchanged.action_revision, approved.action_revision);
+        let cancelled = super::cancel_communication_action(
+            &pool,
+            "acct-jobs",
+            &created.id,
+            approved.action_revision,
+            &approved.payload_sha256,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(cancelled.action_revision, approved.action_revision + 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_revision_exhaustion_fails_closed_without_mutation() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "revision-exhaustion",
+        );
+        let (created, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "UPDATE jobs_communication_actions SET action_revision = ?2 WHERE id = ?1",
+            params![created.id, COMMUNICATION_ACTION_REVISION_MAX],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_communication_actions SET action_revision = ?2 WHERE id = ?1",
+                params![created.id, COMMUNICATION_ACTION_REVISION_MAX + 1],
+            )
+            .is_err());
+        drop(conn);
+        let exhausted = communication_action(&pool, "acct-jobs", &created.id)
+            .unwrap()
+            .unwrap();
+        let (available, reason) =
+            communication_action_execution_readiness(&pool, "acct-jobs", &exhausted).unwrap();
+        assert!(!available);
+        assert!(reason.contains("revision authority"));
+        assert!(super::cancel_communication_action(
+            &pool,
+            "acct-jobs",
+            &created.id,
+            COMMUNICATION_ACTION_REVISION_MAX,
+            &created.payload_sha256,
+        )
+        .is_err());
+        let unchanged = communication_action(&pool, "acct-jobs", &created.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "awaiting_approval");
+        assert_eq!(unchanged.action_revision, COMMUNICATION_ACTION_REVISION_MAX);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parent_cleanup_preserves_unknown_and_failed_audit_until_authorized_account_purge() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "parent-cleanup-audit-retention",
+        );
+        let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &action.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "parent-cleanup-worker")
+            .unwrap()
+            .unwrap();
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&lease, "parent-cleanup-worker"),
+        )
+        .unwrap();
+        let conn = pool.get().unwrap();
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_provider_messages WHERE id = ?1",
+                params![message.id],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO jobs_communication_write_fences (
+                account_id, connection_id, reason, created_at_ms
+             ) VALUES ('acct-jobs', ?1, 'mailbox_disconnect', ?2)",
+            params![mailbox.id, now_ms()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_communication_actions SET lease_expires_at_ms = ?2 WHERE id = ?1",
+            params![action.id, now_ms() - 1],
+        )
+        .unwrap();
+        drop(conn);
+        assert!(claim_communication_action(&pool, "parent-cleanup-expiry")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            communication_action(&pool, "acct-jobs", &action.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "side_effect_unknown"
+        );
+        assert!(pool
+            .get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_provider_messages WHERE id = ?1",
+                params![message.id],
+            )
+            .is_err());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'failed', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL
+                  WHERE id = ?1",
+                params![action.id],
+            )
+            .unwrap();
+        assert!(pool
+            .get()
+            .unwrap()
+            .execute(
+                "DELETE FROM jobs_provider_messages WHERE id = ?1",
+                params![message.id],
+            )
+            .is_err());
+
+        assert!(matches!(
+            crate::db::account_data::begin_account_deletion(&pool, "acct-jobs", now_ms())
+                .unwrap(),
+            Some(crate::db::account_data::BeginAccountDeletionResult::Ready(_))
+                | Some(crate::db::account_data::BeginAccountDeletionResult::WaitingForUploads(_))
+        ));
+        pool.get()
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id = 'acct-jobs'", [])
+            .unwrap();
+        let remaining: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions WHERE id = ?1",
+                params![action.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn expired_communication_dispatch_requires_reconciliation_before_retry() {
+        let _flags = CommunicationFlagGuard::enabled();
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
@@ -12977,6 +15003,11 @@ mod tests {
         let lease = claim_communication_action(&pool, "mail-worker")
             .unwrap()
             .unwrap();
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&lease, "mail-worker"),
+        )
+        .unwrap();
         pool.get()
             .unwrap()
             .execute(
@@ -12994,19 +15025,280 @@ mod tests {
         assert_eq!(unknown.status, "side_effect_unknown");
         assert!(finish_communication_action(
             &pool,
-            "acct-jobs",
-            &stored.id,
-            "mail-worker",
-            &lease.lease_token,
-            lease.fence,
-            "sent",
-            Some("gmail-message-late"),
+            &communication_success_finish(&pool, &lease, "mail-worker", "gmail-message-late"),
         )
-        .is_ok());
+        .is_err());
+        assert_eq!(
+            communication_action(&pool, "acct-jobs", &stored.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "side_effect_unknown"
+        );
     }
 
     #[test]
+    #[serial_test::serial]
+    fn expired_dispatch_transition_obeys_the_account_deletion_fence() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "expired-dispatch-deletion-fence",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        claim_communication_action(&pool, "deletion-race-worker")
+            .unwrap()
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions SET lease_expires_at_ms = ?2
+                  WHERE account_id = 'acct-jobs' AND id = ?1",
+                params![stored.id, now_ms() - 1],
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        assert_account_deletion_fence(claim_communication_action(
+            &pool,
+            "replacement-deletion-race-worker",
+        ));
+        assert_eq!(
+            communication_action(&pool, "acct-jobs", &stored.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "dispatching"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn authoritative_absence_requires_age_and_three_confirmations_for_one_attempt() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "reply-authoritative-absence-threshold",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let dispatch = claim_communication_action(&pool, "absence-dispatch-worker")
+            .unwrap()
+            .unwrap();
+        mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&dispatch, "absence-dispatch-worker"),
+        )
+        .unwrap();
+        let unknown = finish_communication_action(
+            &pool,
+            &JobsCommunicationActionFinish {
+                lease: communication_lease_access(&dispatch, "absence-dispatch-worker"),
+                outcome: "side_effect_unknown".to_string(),
+                provider_object_id: String::new(),
+                evidence: json!({"provider": "gmail", "result": "transport_interrupted"}),
+            },
+        )
+        .unwrap();
+        assert_eq!(unknown.status, "side_effect_unknown");
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions
+                    SET lease_kind = 'dispatch', lease_expires_at_ms = ?2,
+                        next_attempt_at_ms = 0
+                  WHERE account_id = 'acct-jobs' AND id = ?1",
+                params![stored.id, now_ms() + 60_000],
+            )
+            .unwrap();
+        assert!(claim_communication_action_reconciliation(&pool, "absence-reconciler")
+            .unwrap()
+            .is_none());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions SET lease_expires_at_ms = ?2
+                  WHERE account_id = 'acct-jobs' AND id = ?1",
+                params![stored.id, now_ms() - 1],
+            )
+            .unwrap();
+
+        let first_lease = claim_communication_action_reconciliation(&pool, "absence-reconciler")
+            .unwrap()
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions SET lease_expires_at_ms = ?2
+                  WHERE account_id = 'acct-jobs' AND id = ?1",
+                params![stored.id, now_ms() - 1],
+            )
+            .unwrap();
+        assert!(reconcile_communication_action(
+            &pool,
+            &JobsCommunicationActionReconciliation {
+                lease: communication_lease_access(&first_lease, "absence-reconciler"),
+                resolution: "inconclusive".to_string(),
+                provider_object_id: String::new(),
+                evidence: communication_reconciliation_evidence(
+                    &first_lease,
+                    json!({"check": "expired-reconciliation-lease"}),
+                ),
+            },
+        )
+        .is_err());
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions SET lease_expires_at_ms = ?2
+                  WHERE account_id = 'acct-jobs' AND id = ?1",
+                params![stored.id, now_ms() + 60_000],
+            )
+            .unwrap();
+        let mut wrong_binding = communication_reconciliation_evidence(
+            &first_lease,
+            json!({"authoritative_absence": true, "check": "wrong-binding"}),
+        );
+        wrong_binding["payload_sha256"] = json!("0".repeat(64));
+        assert!(reconcile_communication_action(
+            &pool,
+            &JobsCommunicationActionReconciliation {
+                lease: communication_lease_access(&first_lease, "absence-reconciler"),
+                resolution: "confirmed_absent".to_string(),
+                provider_object_id: String::new(),
+                evidence: wrong_binding,
+            },
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exact attempt"));
+        let too_early = JobsCommunicationActionReconciliation {
+            lease: communication_lease_access(&first_lease, "absence-reconciler"),
+            resolution: "confirmed_absent".to_string(),
+            provider_object_id: String::new(),
+            evidence: communication_reconciliation_evidence(
+                &first_lease,
+                json!({"authoritative_absence": true, "check": 0}),
+            ),
+        };
+        assert!(reconcile_communication_action(&pool, &too_early)
+            .unwrap_err()
+            .to_string()
+            .contains("minimum age"));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions
+                    SET dispatched_at_ms = ?2
+                  WHERE account_id = 'acct-jobs' AND id = ?1",
+                params![stored.id, now_ms() - 16 * 60_000],
+            )
+            .unwrap();
+
+        let inconclusive = reconcile_communication_action(
+            &pool,
+            &JobsCommunicationActionReconciliation {
+                lease: communication_lease_access(&first_lease, "absence-reconciler"),
+                resolution: "inconclusive".to_string(),
+                provider_object_id: String::new(),
+                evidence: communication_reconciliation_evidence(
+                    &first_lease,
+                    json!({"check": "identical-inconclusive"}),
+                ),
+            },
+        )
+        .unwrap();
+        assert_eq!(inconclusive.status, "side_effect_unknown");
+
+        let mut last = inconclusive;
+        for resolution in [
+            "confirmed_absent",
+            "inconclusive",
+            "confirmed_absent",
+            "confirmed_absent",
+        ] {
+            pool.get()
+                .unwrap()
+                .execute(
+                    "UPDATE jobs_communication_actions
+                        SET next_attempt_at_ms = 0
+                      WHERE account_id = 'acct-jobs' AND id = ?1",
+                    params![stored.id],
+                )
+                .unwrap();
+            let lease = claim_communication_action_reconciliation(&pool, "absence-reconciler")
+                .unwrap()
+                .unwrap();
+            last = reconcile_communication_action(
+                &pool,
+                &JobsCommunicationActionReconciliation {
+                    lease: communication_lease_access(&lease, "absence-reconciler"),
+                    resolution: resolution.to_string(),
+                    provider_object_id: String::new(),
+                    evidence: communication_reconciliation_evidence(
+                        &lease,
+                        if resolution == "confirmed_absent" {
+                            json!({
+                                "authoritative_absence": true,
+                                "check": "identical-absence"
+                            })
+                        } else {
+                            json!({"check": "identical-inconclusive"})
+                        },
+                    ),
+                },
+            )
+            .unwrap();
+        }
+        assert_eq!(last.status, "needs_input");
+        assert!(last.active_attempt_id.is_none());
+        assert_eq!(last.approved_grant_revision, 0);
+        let (absences, inconclusive): (i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    SUM(CASE WHEN resolution = 'confirmed_absent' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN resolution = 'inconclusive' THEN 1 ELSE 0 END)
+                   FROM jobs_communication_action_reconciliations
+                  WHERE account_id = 'acct-jobs' AND action_id = ?1 AND attempt_id = ?2",
+                params![stored.id, dispatch.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(absences, 3);
+        assert_eq!(inconclusive, 2);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn cancelled_communication_actions_never_dispatch() {
+        let _flags = CommunicationFlagGuard::enabled();
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
@@ -13021,6 +15313,45 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(approve_communication_action(&pool, "acct-jobs", &stored.id).is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_cancellation_obeys_the_account_deletion_fence() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "cancel-deletion-fence",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO account_deletion_intents (
+                    account_id, requested_at_ms, last_checked_at_ms,
+                    fresh_upload_cutoff_ms, fresh_in_flight_puts
+                 ) VALUES ('acct-jobs', 1, 1, 0, 0)",
+                [],
+            )
+            .unwrap();
+
+        assert_account_deletion_fence(cancel_communication_action(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+        ));
+        assert_eq!(
+            communication_action(&pool, "acct-jobs", &stored.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "awaiting_approval"
+        );
     }
 
     #[test]
@@ -13114,7 +15445,11 @@ mod tests {
                 processing_status: "received".to_string(),
                 classification: String::new(),
                 confidence: 0.0,
-                metadata: json!({"conversation_id": "conversation-1"}),
+                metadata: json!({
+                    "provider_id": "outlook-message-recovery",
+                    "conversation_id": "conversation-1",
+                    "reply_target": "recruiter@example.org",
+                }),
                 processed_at_ms: None,
                 created_at_ms: 0,
                 updated_at_ms: 0,
@@ -13158,7 +15493,21 @@ mod tests {
         assert_eq!(updated.processing_status, "processed");
         assert_eq!(updated.classification, "acknowledgment");
         assert_eq!(updated.metadata["correlation"], "unmatched");
+        assert_eq!(updated.metadata["provider_id"], "outlook-message-recovery");
+        assert_eq!(updated.metadata["conversation_id"], "conversation-1");
+        assert_eq!(updated.metadata["reply_target"], "recruiter@example.org");
         assert!(updated.processed_at_ms.is_some());
+        assert!(update_provider_message_processing(
+            &pool,
+            "acct-jobs",
+            &stored.id,
+            None,
+            "processed",
+            "acknowledgment",
+            0.99,
+            json!({"conversation_id": "attacker-controlled"}),
+        )
+        .is_err());
         assert!(
             list_pending_provider_messages(&pool, "acct-jobs", &mailbox.id, 10)
                 .unwrap()

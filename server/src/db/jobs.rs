@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
+use unicode_general_category::{get_general_category, GeneralCategory};
 
 use super::jobs_tailoring::tailor_resume;
 use super::DbPool;
@@ -1323,6 +1324,16 @@ pub struct JobsOAuthState {
     pub provider: String,
     pub code_verifier: String,
     #[serde(default)]
+    pub connection_id: Option<String>,
+    #[serde(default)]
+    pub authorization_purpose: String,
+    #[serde(default)]
+    pub requested_scopes: Vec<String>,
+    #[serde(default)]
+    pub requested_capabilities: Vec<String>,
+    #[serde(default)]
+    pub expected_grant_revision: i64,
+    #[serde(default)]
     pub return_path: String,
     pub expires_at_ms: i64,
     pub created_at_ms: i64,
@@ -1338,6 +1349,12 @@ pub struct JobsProviderCredential {
     pub refresh_token: String,
     #[serde(default)]
     pub scopes: Vec<String>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub grant_revision: i64,
+    #[serde(default)]
+    pub grant_sha256: String,
     pub expires_at_ms: i64,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -1412,6 +1429,8 @@ pub struct JobsCommunicationAction {
     pub payload: Value,
     #[serde(default)]
     pub payload_sha256: String,
+    #[serde(default)]
+    pub authority_sha256: String,
     #[serde(default = "default_pending_status")]
     pub status: String,
     #[serde(default)]
@@ -1419,11 +1438,27 @@ pub struct JobsCommunicationAction {
     #[serde(default)]
     pub lease_owner: Option<String>,
     #[serde(default)]
+    pub lease_kind: Option<String>,
+    #[serde(default)]
     pub lease_expires_at_ms: Option<i64>,
+    #[serde(default)]
+    pub active_attempt_id: Option<String>,
     #[serde(default)]
     pub next_attempt_at_ms: i64,
     #[serde(default)]
     pub attempt_count: i64,
+    #[serde(default)]
+    pub reconciliation_count: i64,
+    #[serde(default = "default_action_revision")]
+    pub action_revision: i64,
+    #[serde(default)]
+    pub approval_revision: i64,
+    #[serde(default)]
+    pub approved_authority_sha256: String,
+    #[serde(default)]
+    pub approved_grant_revision: i64,
+    #[serde(default)]
+    pub approved_grant_sha256: String,
     #[serde(default)]
     pub approved_at_ms: Option<i64>,
     #[serde(default)]
@@ -1434,12 +1469,145 @@ pub struct JobsCommunicationAction {
     pub updated_at_ms: i64,
 }
 
+fn default_action_revision() -> i64 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct JobsCommunicationActionLease {
     pub account_id: String,
     pub action: JobsCommunicationAction,
+    pub attempt_id: String,
+    pub lease_kind: String,
+    pub provider_operation_key: String,
+    pub authority_sha256: String,
+    pub approval_revision: i64,
+    pub grant_revision: i64,
+    pub grant_sha256: String,
     pub lease_token: String,
     pub fence: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct JobsCommunicationLeaseAccess {
+    pub account_id: String,
+    pub action_id: String,
+    pub attempt_id: String,
+    pub owner_id: String,
+    pub lease_token: String,
+    pub fence: i64,
+    pub authority_sha256: String,
+    pub approval_revision: i64,
+    pub grant_revision: i64,
+    pub grant_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationActionFinish {
+    #[serde(flatten)]
+    pub lease: JobsCommunicationLeaseAccess,
+    pub outcome: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationActionReconciliation {
+    #[serde(flatten)]
+    pub lease: JobsCommunicationLeaseAccess,
+    pub resolution: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationAttemptEvidence {
+    pub id: String,
+    pub action_id: String,
+    pub provider: String,
+    pub provider_operation_key: String,
+    pub dispatch_no: i64,
+    pub approval_revision: i64,
+    pub authority_sha256: String,
+    pub grant_revision: i64,
+    pub grant_sha256: String,
+    pub state: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+    pub evidence_sha256: String,
+    pub request_started_at_ms: Option<i64>,
+    pub completed_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobsCommunicationReconciliationEvidence {
+    pub id: String,
+    pub action_id: String,
+    pub attempt_id: String,
+    pub fence: i64,
+    pub resolution: String,
+    #[serde(default)]
+    pub provider_object_id: String,
+    #[serde(default)]
+    pub evidence: Value,
+    pub evidence_sha256: String,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsCommunicationActionExport {
+    pub id: String,
+    pub application_id: String,
+    pub connection_id: String,
+    pub source_message_id: Option<String>,
+    pub kind: String,
+    pub provider: String,
+    pub payload: Value,
+    pub status: String,
+    pub action_revision: i64,
+    pub approval_revision: i64,
+    pub approved_at_ms: Option<i64>,
+    pub dispatched_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsProviderMessageExport {
+    pub id: String,
+    pub connection_id: String,
+    pub provider: String,
+    pub sender: String,
+    pub recipients: Vec<String>,
+    pub subject: String,
+    pub body_text: String,
+    pub received_at_ms: i64,
+    pub application_id: Option<String>,
+    pub processing_status: String,
+    pub classification: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsCommunicationEvidenceExport {
+    pub action_id: String,
+    pub event_kind: String,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JobsCommunicationReconciliationExport {
+    pub action_id: String,
+    pub resolution: String,
+    pub recorded_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1702,6 +1870,10 @@ pub struct JobsAccountExport {
     pub resume_versions: Vec<ResumeVersion>,
     pub attempt_reservations: Vec<AttemptReservation>,
     pub run_events: Vec<RunEvent>,
+    pub provider_messages: Vec<JobsProviderMessageExport>,
+    pub communication_actions: Vec<JobsCommunicationActionExport>,
+    pub communication_evidence: Vec<JobsCommunicationEvidenceExport>,
+    pub communication_reconciliations: Vec<JobsCommunicationReconciliationExport>,
 }
 
 #[derive(Debug, Clone, Serialize)]
