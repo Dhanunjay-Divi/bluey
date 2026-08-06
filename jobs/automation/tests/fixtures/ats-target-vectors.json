@@ -1,0 +1,319 @@
+[
+  {
+    "name": "greenhouse public posting",
+    "url": "https://boards.greenhouse.io/acme/jobs/job-123",
+    "purpose": "submit",
+    "expectedTarget": {
+      "provider": "greenhouse",
+      "host": "boards.greenhouse.io",
+      "tenant": "acme",
+      "job": "job-123",
+      "variant": "greenhouse_public",
+      "providerJobKey": "greenhouse:acme:job-123"
+    },
+    "expectedDetection": "greenhouse",
+    "expectedPolicy": "automate",
+    "expectedSourceId": "ats-greenhouse"
+  },
+  {
+    "name": "greenhouse alternate host with harmless routing metadata",
+    "url": "https://job-boards.greenhouse.io/Acme/jobs/12345/?utm_source=bluey#app",
+    "purpose": "submit",
+    "expectedTarget": {
+      "provider": "greenhouse",
+      "host": "job-boards.greenhouse.io",
+      "tenant": "Acme",
+      "job": "12345",
+      "variant": "greenhouse_public",
+      "providerJobKey": "greenhouse:Acme:12345"
+    },
+    "expectedDetection": "greenhouse",
+    "expectedPolicy": "automate",
+    "expectedSourceId": "ats-greenhouse"
+  },
+  {
+    "name": "greenhouse embedded application",
+    "url": "https://boards.greenhouse.io/embed/job_app?for=acme&token=job_123",
+    "purpose": "submit",
+    "expectedTarget": {
+      "provider": "greenhouse",
+      "host": "boards.greenhouse.io",
+      "tenant": "acme",
+      "job": "job_123",
+      "variant": "greenhouse_embedded",
+      "providerJobKey": "greenhouse:acme:job_123"
+    },
+    "expectedDetection": "greenhouse",
+    "expectedPolicy": "automate",
+    "expectedSourceId": "ats-greenhouse"
+  },
+  {
+    "name": "lever US posting",
+    "url": "https://jobs.lever.co/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": {
+      "provider": "lever",
+      "host": "jobs.lever.co",
+      "tenant": "acme",
+      "job": "posting-123",
+      "variant": "lever_posting",
+      "providerJobKey": "lever:jobs.lever.co:acme:posting-123"
+    },
+    "expectedDetection": "lever",
+    "expectedPolicy": "automate",
+    "expectedSourceId": "ats-lever"
+  },
+  {
+    "name": "lever US application",
+    "url": "https://jobs.lever.co/acme/posting-123/apply",
+    "purpose": "submit",
+    "expectedTarget": {
+      "provider": "lever",
+      "host": "jobs.lever.co",
+      "tenant": "acme",
+      "job": "posting-123",
+      "variant": "lever_application",
+      "providerJobKey": "lever:jobs.lever.co:acme:posting-123"
+    },
+    "expectedDetection": "lever",
+    "expectedPolicy": "automate",
+    "expectedSourceId": "ats-lever"
+  },
+  {
+    "name": "lever EU application",
+    "url": "https://jobs.eu.lever.co/atlas/22222222-2222-4222-8222-222222222222/apply",
+    "purpose": "submit",
+    "expectedTarget": {
+      "provider": "lever",
+      "host": "jobs.eu.lever.co",
+      "tenant": "atlas",
+      "job": "22222222-2222-4222-8222-222222222222",
+      "variant": "lever_application",
+      "providerJobKey": "lever:jobs.eu.lever.co:atlas:22222222-2222-4222-8222-222222222222"
+    },
+    "expectedDetection": "lever",
+    "expectedPolicy": "automate",
+    "expectedSourceId": "ats-lever"
+  },
+  {
+    "name": "greenhouse confirmation is confirmation-only",
+    "url": "https://boards.greenhouse.io/acme/jobs/job-123/confirmation",
+    "purpose": "confirmation",
+    "expectedTarget": {
+      "provider": "greenhouse",
+      "host": "boards.greenhouse.io",
+      "tenant": "acme",
+      "job": "job-123",
+      "variant": "greenhouse_public",
+      "providerJobKey": "greenhouse:acme:job-123"
+    },
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever EU confirmation is confirmation-only",
+    "url": "https://jobs.eu.lever.co/acme/posting-123/confirmation",
+    "purpose": "confirmation",
+    "expectedTarget": {
+      "provider": "lever",
+      "host": "jobs.eu.lever.co",
+      "tenant": "acme",
+      "job": "posting-123",
+      "variant": "lever_application",
+      "providerJobKey": "lever:jobs.eu.lever.co:acme:posting-123"
+    },
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse lookalike suffix",
+    "url": "https://boards.greenhouse.io.attacker.example/acme/jobs/job-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse lookalike subdomain",
+    "url": "https://evil.boards.greenhouse.io/acme/jobs/job-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever lookalike suffix",
+    "url": "https://jobs.lever.co.attacker.example/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever lookalike subdomain",
+    "url": "https://evil.jobs.lever.co/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "bare Workday parent host is not an application target",
+    "url": "https://myworkdayjobs.com/acme/job/123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": "ats-workday"
+  },
+  {
+    "name": "greenhouse HTTP",
+    "url": "http://boards.greenhouse.io/acme/jobs/job-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever HTTP",
+    "url": "http://jobs.eu.lever.co/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse credentials",
+    "url": "https://candidate:secret@boards.greenhouse.io/acme/jobs/job-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever non-default port",
+    "url": "https://jobs.lever.co:8443/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever explicit default port",
+    "url": "https://jobs.eu.lever.co:443/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse board root",
+    "url": "https://boards.greenhouse.io/acme",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever query slash cannot manufacture a path",
+    "url": "https://jobs.lever.co?next=/acme/posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse fragment slash cannot manufacture a confirmation path",
+    "url": "https://boards.greenhouse.io#next=/acme/jobs/job-123/confirmation",
+    "purpose": "confirmation",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse unexpected application suffix",
+    "url": "https://boards.greenhouse.io/acme/jobs/job-123/apply",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse conflicting job query",
+    "url": "https://boards.greenhouse.io/acme/jobs/job-123?gh_jid=other-job",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "greenhouse encoded path identifier",
+    "url": "https://boards.greenhouse.io/acme/jobs/job%2D123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever missing job identifier",
+    "url": "https://jobs.lever.co/acme",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever unexpected path suffix",
+    "url": "https://jobs.eu.lever.co/acme/posting-123/edit",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever repeated path separator",
+    "url": "https://jobs.lever.co/acme//posting-123",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "lever conflicting job query",
+    "url": "https://jobs.lever.co/acme/posting-123?lever_job_id=other-job",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "handoff",
+    "expectedSourceId": null
+  },
+  {
+    "name": "invalid URL",
+    "url": "not a URL",
+    "purpose": "submit",
+    "expectedTarget": null,
+    "expectedDetection": "semantic",
+    "expectedPolicy": "blocked",
+    "expectedSourceId": null
+  }
+]

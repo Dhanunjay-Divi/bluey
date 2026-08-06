@@ -17,6 +17,8 @@ export interface LocalRunCapabilities {
 
 export interface LocalRunReleaseBinding {
   readonly descriptor_sha256: string;
+  readonly automation_bundle_sha256: string;
+  readonly chromium_executable_sha256: string;
   readonly manifest_sha256: string;
   readonly activation_sha256: string;
   readonly artifact_id: string;
@@ -319,9 +321,11 @@ function parseLocalRunReleaseBinding(value: unknown): LocalRunReleaseBinding {
     "architecture",
     "artifact_id",
     "artifact_sha256",
+    "automation_bundle_sha256",
     "build_id",
     "channel",
     "channel_sequence",
+    "chromium_executable_sha256",
     "descriptor_sha256",
     "manifest_sha256",
     "platform",
@@ -367,6 +371,8 @@ function parseLocalRunReleaseBinding(value: unknown): LocalRunReleaseBinding {
   }
   return Object.freeze({
     descriptor_sha256: sha256(release.descriptor_sha256),
+    automation_bundle_sha256: sha256(release.automation_bundle_sha256),
+    chromium_executable_sha256: sha256(release.chromium_executable_sha256),
     manifest_sha256: sha256(release.manifest_sha256),
     activation_sha256: sha256(release.activation_sha256),
     artifact_id: binding(release.artifact_id),
@@ -389,6 +395,8 @@ function releaseBindingsMatch(
   right: LocalRunReleaseBinding,
 ): boolean {
   return left.descriptor_sha256 === right.descriptor_sha256
+    && left.automation_bundle_sha256 === right.automation_bundle_sha256
+    && left.chromium_executable_sha256 === right.chromium_executable_sha256
     && left.manifest_sha256 === right.manifest_sha256
     && left.activation_sha256 === right.activation_sha256
     && left.artifact_id === right.artifact_id

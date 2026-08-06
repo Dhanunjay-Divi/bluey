@@ -33,6 +33,12 @@ describe("Jobs submission policy", () => {
       policy: "automate",
       capability: "beta_review",
     });
+    expect(
+      submissionPolicy("https://jobs.eu.lever.co/acme/1/apply"),
+    ).toMatchObject({
+      policy: "automate",
+      capability: "beta_review",
+    });
     for (const url of [
       "https://acme.wd5.myworkdayjobs.com/en-US/jobs/job/1",
       "https://jobs.ashbyhq.com/acme/1",
@@ -82,6 +88,9 @@ describe("ATS detection", () => {
       "greenhouse",
     );
     expect(detectAts("https://jobs.lever.co/acme/abc")).toBe("lever");
+    expect(detectAts("https://jobs.eu.lever.co/acme/abc/apply")).toBe(
+      "lever",
+    );
     expect(detectAts("https://jobs.ashbyhq.com/acme/abc")).toBe("ashby");
     expect(detectAts("https://jobs.smartrecruiters.com/Acme/1")).toBe(
       "smartrecruiters",

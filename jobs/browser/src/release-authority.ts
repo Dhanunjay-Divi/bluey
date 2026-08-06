@@ -112,6 +112,8 @@ export interface BrowserReleaseArtifact {
   readonly sizeBytes: number;
   readonly sha256: string;
   readonly appContentSha256: string;
+  readonly automationBundleSha256: string;
+  readonly chromiumExecutableSha256: string;
   readonly verificationEvidenceSha256: string;
   readonly nativeSignatureKind: BrowserNativeSignatureKind;
   readonly nativeSignerIdentity: string;
@@ -1229,20 +1231,33 @@ function parseUnsignedReleaseManifest(
   ];
   const descriptorByTarget = new Map<string, string>();
   const appContentByTarget = new Map<string, string>();
+  const automationBundleByTarget = new Map<string, string>();
+  const chromiumExecutableByTarget = new Map<string, string>();
   for (const artifact of artifacts) {
     const target = `${artifact.platform}:${artifact.architecture}`;
     const existingDescriptor = descriptorByTarget.get(target);
     const existingAppContent = appContentByTarget.get(target);
+    const existingAutomationBundle = automationBundleByTarget.get(target);
+    const existingChromiumExecutable = chromiumExecutableByTarget.get(target);
     if (
       (existingDescriptor &&
         existingDescriptor !== artifact.buildDescriptorSha256) ||
       (existingAppContent &&
-        existingAppContent !== artifact.appContentSha256)
+        existingAppContent !== artifact.appContentSha256) ||
+      (existingAutomationBundle &&
+        existingAutomationBundle !== artifact.automationBundleSha256) ||
+      (existingChromiumExecutable &&
+        existingChromiumExecutable !== artifact.chromiumExecutableSha256)
     ) {
       throw new BrowserReleaseAuthorityError("invalid_manifest");
     }
     descriptorByTarget.set(target, artifact.buildDescriptorSha256);
     appContentByTarget.set(target, artifact.appContentSha256);
+    automationBundleByTarget.set(target, artifact.automationBundleSha256);
+    chromiumExecutableByTarget.set(
+      target,
+      artifact.chromiumExecutableSha256,
+    );
   }
   if (
     targetIdentities.some((identity, index) => identity !== expectedTargets[index]) ||
@@ -1251,6 +1266,8 @@ function parseUnsignedReleaseManifest(
     new Set(artifacts.map((artifact) => artifact.sha256)).size !== 5 ||
     descriptorByTarget.size !== 3 ||
     appContentByTarget.size !== 3 ||
+    automationBundleByTarget.size !== 3 ||
+    chromiumExecutableByTarget.size !== 3 ||
     new Set(descriptorByTarget.values()).size !== 3
   ) {
     throw new BrowserReleaseAuthorityError("invalid_manifest");
@@ -1327,7 +1344,9 @@ function parseArtifact(input: unknown): BrowserReleaseArtifact {
       "architecture",
       "appContentSha256",
       "artifactId",
+      "automationBundleSha256",
       "buildDescriptorSha256",
+      "chromiumExecutableSha256",
       "nativeSignatureKind",
       "nativeSignerIdentity",
       "packageKind",
@@ -1354,6 +1373,16 @@ function parseArtifact(input: unknown): BrowserReleaseArtifact {
     sha256: requirePattern(value.sha256, HEX_64, "invalid_manifest"),
     appContentSha256: requirePattern(
       value.appContentSha256,
+      HEX_64,
+      "invalid_manifest",
+    ),
+    automationBundleSha256: requirePattern(
+      value.automationBundleSha256,
+      HEX_64,
+      "invalid_manifest",
+    ),
+    chromiumExecutableSha256: requirePattern(
+      value.chromiumExecutableSha256,
       HEX_64,
       "invalid_manifest",
     ),

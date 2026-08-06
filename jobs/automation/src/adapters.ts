@@ -1,4 +1,5 @@
 import type { ApplicationAdapter, AtsKind } from "./contracts.js";
+import { parseProviderApplicationTarget } from "./ats-target.js";
 
 interface AdapterPattern {
   kind: Exclude<AtsKind, "semantic">;
@@ -12,14 +13,6 @@ export const adapterPatterns: AdapterPattern[] = [
     hosts: [/\.myworkdayjobs\.com$/i, /\.wd\d+\.myworkdayjobs\.com$/i],
   },
   {
-    kind: "greenhouse",
-    hosts: [/^boards\.greenhouse\.io$/i, /^job-boards\.greenhouse\.io$/i],
-  },
-  {
-    kind: "lever",
-    hosts: [/^jobs\.lever\.co$/i],
-  },
-  {
     kind: "ashby",
     hosts: [/^jobs\.ashbyhq\.com$/i],
   },
@@ -30,6 +23,8 @@ export const adapterPatterns: AdapterPattern[] = [
 ];
 
 export function detectAts(rawUrl: string): AtsKind {
+  const providerTarget = parseProviderApplicationTarget(rawUrl);
+  if (providerTarget) return providerTarget.provider;
   let url: URL;
   try {
     url = new URL(rawUrl);
@@ -55,7 +50,8 @@ export class AdapterRegistry {
   }
 
   resolve(rawUrl: string): ApplicationAdapter {
-    const kind = detectAts(rawUrl);
+    const initialTarget = parseProviderApplicationTarget(rawUrl);
+    const kind = initialTarget?.provider ?? detectAts(rawUrl);
     const adapter = this.adapters.get(kind) ?? this.adapters.get("semantic");
     if (!adapter) throw new Error(`No adapter registered for ${kind}`);
     return adapter;

@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type {
+  AtsCertificationSummary,
   AutoSubmitAuthorization,
   DiscoverySource,
   DiscoverySourceHealth,
@@ -21,9 +22,31 @@ import {
   isMatchEligibleForDefaultView,
   isMatchVisibleByState,
   isRecentPosting,
+  jobEligibility,
   postingAgeLabel,
   visibleMatches,
 } from "./MatchesView";
+
+function certificationSummary(
+  capability: NonNullable<JobPosting["eligibility"]>["capability"],
+): AtsCertificationSummary {
+  const certified = capability === "certified";
+  return {
+    provider_label: certified ? "Greenhouse" : "Application system",
+    adapter_version: certified ? "2026.07.1-beta.1" : null,
+    certified_runner_kinds: certified ? ["local"] : [],
+    status: certified ? "active" : "review_only",
+    last_verified_at_ms: certified ? Date.now() - 60_000 : null,
+    expires_at_ms: certified ? Date.now() + 60 * 60_000 : null,
+    reason: certified
+      ? "The current job and Local Browser runner passed server verification."
+      : "Review first is required for this application system.",
+    next_action: certified
+      ? "Review the application kit and choose an available runner."
+      : "Review the application kit before continuing.",
+    canary_available: false,
+  };
+}
 
 function source(
   status: DiscoverySource["status"],
@@ -73,6 +96,7 @@ function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibil
       review_reasons: canPrepare ? [{ code: "beta", message: "Review first is required." }] : [],
       passed_checks: [],
       evaluated_at_ms: 1,
+      ats_certification: certificationSummary(capability),
     },
   };
 }
@@ -274,5 +298,31 @@ describe("Career Track filtering and submission truth", () => {
     );
     expect(canAutoSubmit(certified, runners(true), [authorization()])).toBe(true);
     expect(autoSubmitUnavailableReason(certified, runners(true), [authorization()])).toBeUndefined();
+  });
+
+  it("fails a mixed-version certified response closed when its summary is missing", () => {
+    const certified = match(true, "certified");
+    delete certified.eligibility?.ats_certification;
+
+    expect(jobEligibility(certified).capability).toBe("unknown_review");
+    expect(canAutoSubmit(certified, runners(true), [authorization()])).toBe(false);
+    expect(autoSubmitUnavailableReason(certified, runners(true), [authorization()])).toContain(
+      "certification details are unavailable",
+    );
+  });
+
+  it("does not widen Local Browser certification to an available cloud runner", () => {
+    const cloudOnly = {
+      ...runners(true),
+      local: { ...runners(true).local, available: false },
+      cloud: { ...runners(true).cloud, available: true },
+    };
+
+    expect(canAutoSubmit(match(true, "certified"), cloudOnly, [authorization()])).toBe(false);
+    expect(autoSubmitUnavailableReason(
+      match(true, "certified"),
+      cloudOnly,
+      [authorization()],
+    )).toContain("certification scope");
   });
 });

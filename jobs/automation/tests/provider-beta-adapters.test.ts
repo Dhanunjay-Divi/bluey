@@ -74,6 +74,15 @@ describe("registered provider-specific beta adapters", () => {
     expect(lever).toBeInstanceOf(LeverApplicationStateMachine);
     expect(registry.resolve("https://jobs.eu.lever.co/acme/posting-id/apply"))
       .toBeInstanceOf(LeverApplicationStateMachine);
+    expect(registry.resolve("https://jobs.eu.lever.co/acme/posting-id/confirmation").kind)
+      .toBe("semantic");
+    for (const malformed of [
+      "https://jobs.lever.co:443/acme/posting-id/apply",
+      "https://jobs.lever.co/ignored/../acme/posting-id/apply",
+      "https://jobs.lever.co?next=/acme/posting-id/apply",
+    ]) {
+      expect(registry.resolve(malformed).kind).toBe("semantic");
+    }
     expect(adapters.map((adapter) => adapter.version)).toEqual([
       GREENHOUSE_ADAPTER_PROFILE.version,
       LEVER_ADAPTER_PROFILE.version,
@@ -259,8 +268,10 @@ describe("Greenhouse review-only safety", () => {
       markers: [],
       submitCount: 0,
     });
-    await expect(executeApplication(makeContext(unsupportedPage)))
-      .rejects.toThrow("does not match");
+    await expect(executeApplication(makeContext(unsupportedPage))).resolves.toMatchObject({
+      adapter: "semantic",
+      receipt: { status: "needs_input" },
+    });
     expect(unsupportedPage.submitClicks).toBe(0);
   });
 
@@ -392,8 +403,12 @@ describe("Lever review-only safety", () => {
     expect(closedPage.submitClicks).toBe(0);
 
     const unsupportedPage = new LeverPage({ url: LEVER_NEGATIVE.unsupportedUrl });
-    await expect(executeApplication(makeContext(unsupportedPage, LEVER.answers)))
-      .rejects.toThrow("does not match");
+    await expect(
+      executeApplication(makeContext(unsupportedPage, LEVER.answers)),
+    ).resolves.toMatchObject({
+      adapter: "semantic",
+      receipt: { status: "needs_input" },
+    });
     expect(unsupportedPage.submitClicks).toBe(0);
   });
 
@@ -403,6 +418,10 @@ describe("Lever review-only safety", () => {
       afterSubmitUrl: LEVER_NEGATIVE.unclearConfirmation.url,
     });
     const context = makeContext(page, LEVER.answers);
+    let beforeFinalSubmitCalls = 0;
+    context.beforeFinalSubmit = async () => {
+      beforeFinalSubmitCalls += 1;
+    };
     const registry = createDefaultAdapterRegistry(undefined, {
       lever: { finalReviewApproval: () => true },
     });
@@ -410,7 +429,22 @@ describe("Lever review-only safety", () => {
     const first = await executeApplication(context, registry);
     expect(first.receipt).toMatchObject({ status: "needs_input" });
     expect(first.receipt.confirmationText).toBeUndefined();
-    await expect(executeApplication(context, registry)).rejects.toThrow("does not match");
+    await expect(executeApplication(context, registry)).resolves.toMatchObject({
+      adapter: "lever",
+      receipt: {
+        status: "needs_input",
+        issues: [{
+          field: "submission",
+          message: expect.stringContaining("do not retry automatically"),
+          severity: "blocking",
+        }],
+        intervention: {
+          kind: "browser_takeover",
+          resolution: { resumeAfter: false },
+        },
+      },
+    });
+    expect(beforeFinalSubmitCalls).toBe(1);
     expect(page.submitClicks).toBe(1);
   });
 });

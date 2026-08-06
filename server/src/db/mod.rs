@@ -348,6 +348,14 @@ const SQLITE_JOBS_RUNNER_VOLUME_PURGE: &str =
     include_str!("../../../infra/sqlite/server-runtime/046_jobs_runner_volume_purge.sql");
 const SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY: &str =
     include_str!("../../../infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql");
+const SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/048_jobs_ats_certification_authority.sql");
+const SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/049_jobs_browser_release_runtime_components.sql"
+);
+const SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/050_jobs_runner_process_runtime_authority.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1676,6 +1684,12 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_RUNNER_VOLUME_PURGE,
     // 0047 - signed local Browser release and claim authority.
     SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+    // 0048 - signed, tenant/surface/runtime-scoped ATS certification authority.
+    SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+    // 0049 - exact signed Browser automation and Chromium runtime components.
+    SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS,
+    // 0050 - one-time cloud process runtime grants and immutable lease bindings.
+    SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2135,6 +2149,20 @@ pub const JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID: &str =
     "025_jobs_browser_release_authority.sql";
 const POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY: &str =
     include_str!("../../../infra/postgres/server-runtime/025_jobs_browser_release_authority.sql");
+pub const JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID: &str =
+    "026_jobs_ats_certification_authority.sql";
+const POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/026_jobs_ats_certification_authority.sql");
+pub const JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS_MIGRATION_ID: &str =
+    "027_jobs_browser_release_runtime_components.sql";
+const POSTGRES_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS: &str = include_str!(
+    "../../../infra/postgres/server-runtime/027_jobs_browser_release_runtime_components.sql"
+);
+pub const JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY_MIGRATION_ID: &str =
+    "028_jobs_runner_process_runtime_authority.sql";
+const POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/028_jobs_runner_process_runtime_authority.sql"
+);
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2223,6 +2251,18 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
+    ),
+    (
+        JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
+    ),
+    (
+        JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS_MIGRATION_ID,
+        POSTGRES_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS,
+    ),
+    (
+        JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
     ),
 ];
 
@@ -2361,7 +2401,85 @@ mod blocking_boundary_tests {
 
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
-    use super::{ensure_column, open_pool, run_migrations, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY};
+    use super::{
+        ensure_column, open_pool, run_migrations, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+    };
+
+    #[test]
+    fn ats_certification_authority_starts_empty_with_immutable_history() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY)
+            .unwrap();
+        for table in [
+            "jobs_ats_certification_trust_policies",
+            "jobs_ats_certification_trust_keys",
+            "jobs_ats_certification_trust_head",
+            "jobs_ats_certification_evidence",
+            "jobs_ats_certification_layout_observations",
+            "jobs_ats_certification_manifests",
+            "jobs_ats_certification_manifest_layouts",
+            "jobs_ats_certification_manifest_check_results",
+            "jobs_ats_certification_manifest_evidence",
+            "jobs_ats_certification_runtime_targets",
+            "jobs_ats_certification_activations",
+            "jobs_ats_certification_revocations",
+            "jobs_ats_certification_head_transitions",
+            "jobs_ats_certification_heads",
+            "jobs_ats_certification_quarantine_commands",
+            "jobs_ats_certification_quarantine_heads",
+            "jobs_ats_certification_circuit_events",
+            "jobs_ats_certification_circuit_heads",
+            "jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "jobs_ats_certification_canary_allowlists",
+            "jobs_ats_certification_canary_allowlist_members",
+            "jobs_ats_certification_canary_allowlist_revocations",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing ATS certification table {table}");
+        }
+        let active: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_ats_certification_heads",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active, 0);
+        let trust_heads: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_ats_certification_trust_head",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trust_heads, 0);
+        for table in [
+            "jobs_ats_certification_circuit_heads",
+            "jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "jobs_ats_certification_canary_allowlists",
+            "jobs_ats_certification_canary_allowlist_members",
+            "jobs_ats_certification_canary_allowlist_revocations",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not grant default authority");
+        }
+    }
 
     #[test]
     fn browser_release_authority_uses_immutable_history_and_a_mutable_explicit_head() {
@@ -3263,16 +3381,18 @@ mod sqlite_migration_replay_tests {
 mod postgres_migration_tests {
     use super::{
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
-        JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
-        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, POSTGRES_ACCOUNT_DELETION_INTENTS,
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
+        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
+        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
         POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
         POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_MIGRATIONS,
         POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
-        SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
-        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
-        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+        SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
     };
 
     #[test]
@@ -3725,6 +3845,140 @@ mod postgres_migration_tests {
             7
         );
         assert_eq!(*postgres_sql, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY);
+    }
+
+    #[test]
+    fn ats_certification_authority_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID)
+            .expect("ATS certification authority must migrate before execution admission");
+        assert_eq!(*version, "026_jobs_ats_certification_authority.sql");
+        let required = [
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_trust_policies",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_trust_keys",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_trust_head",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_evidence",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_layout_observations",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifests",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifest_layouts",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifest_check_results",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_manifest_evidence",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_runtime_targets",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_activations",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_revocations",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_head_transitions",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_quarantine_commands",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_quarantine_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_circuit_events",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_circuit_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_allowlists",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_allowlist_members",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_allowlist_revocations",
+            "CREATE TABLE IF NOT EXISTS jobs_application_ats_certification_bindings",
+            "CREATE TABLE IF NOT EXISTS jobs_ats_certification_canary_reservations",
+            "canonical_evidence_base64url",
+            "canonical_manifest_base64url",
+            "canonical_activation_base64url",
+            "canonical_revocation_base64url",
+            "canonical_command_base64url",
+            "trust_policy_sha256",
+            "root_trust_anchor_sha256",
+            "predecessor_policy_sha256",
+            "maximum_clock_skew_ms",
+            "maximum_manifest_size_bytes",
+            "maximum_target_count",
+            "maximum_observation_count",
+            "maximum_evidence_object_count",
+            "adapter_bundle_sha256",
+            "allowed_provider_hosts_json",
+            "final_submit_control_id",
+            "tested_at_ms",
+            "automation_bundle_sha256",
+            "browser_release_manifest_sha256",
+            "runner_build_id",
+            "runner_image_sha256",
+            "target_key",
+            "surface_sha256",
+            "scope_sha256",
+            "account_allowlist_sha256",
+            "canonical_allowlist_base64url",
+            "trg_jobs_ats_certification_canary_allowlists_no_update",
+            "trg_jobs_ats_certification_canary_allowlist_members_no_update",
+            "trg_jobs_ats_certification_canary_allowlist_revocations_no_update",
+            "current_transition_sha256",
+            "predecessor_command_sha256",
+            "event_sha256",
+            "binding_sha256",
+            "layout_observation_sha256",
+            "observed_surface_sha256",
+            "phase_b_request_id",
+            "canary_reservation_sha256",
+            "metering_reservation_sha256",
+            "layout_drift_overflow",
+            "idx_jobs_ats_runtime_layout_quarantine_scope",
+            "trg_jobs_ats_certification_evidence_no_update",
+            "trg_jobs_ats_certification_trust_policies_no_update",
+            "trg_jobs_ats_certification_trust_keys_no_update",
+            "trg_jobs_ats_certification_trust_head_monotonic",
+            "trg_jobs_ats_certification_manifests_no_update",
+            "trg_jobs_ats_certification_activations_no_update",
+            "trg_jobs_ats_certification_revocations_no_delete",
+            "trg_jobs_ats_certification_heads_monotonic",
+            "trg_jobs_ats_certification_quarantine_heads_monotonic",
+            "trg_jobs_ats_certification_circuit_heads_monotonic",
+            "trg_jobs_ats_runtime_layout_quarantine_no_update",
+            "trg_jobs_ats_runtime_layout_quarantine_no_delete",
+            "trg_jobs_application_ats_certification_bindings_transition",
+            "2026.07.1-beta.1",
+            "2026.07.0-beta.1",
+        ];
+        for expected in required {
+            assert!(
+                postgres_sql.contains(expected),
+                "PostgreSQL migration missing {expected}"
+            );
+            assert!(
+                SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY.contains(expected),
+                "SQLite migration missing {expected}"
+            );
+        }
+        assert_eq!(
+            postgres_sql
+                .lines()
+                .filter(|line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_ats_"))
+                .count(),
+            23
+        );
+        assert_eq!(
+            SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY
+                .lines()
+                .filter(|line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_ats_"))
+                .count(),
+            23
+        );
+        assert!(!postgres_sql.contains("INSERT INTO jobs_ats_certification_heads"));
+        assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY
+            .contains("INSERT INTO jobs_ats_certification_heads"));
+        assert!(!postgres_sql.contains("INSERT INTO jobs_ats_certification_trust_head"));
+        assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY
+            .contains("INSERT INTO jobs_ats_certification_trust_head"));
+        for table in [
+            "jobs_ats_certification_circuit_heads",
+            "jobs_ats_certification_runtime_layout_quarantine_evidence",
+            "jobs_ats_certification_canary_allowlists",
+            "jobs_ats_certification_canary_allowlist_members",
+            "jobs_ats_certification_canary_allowlist_revocations",
+            "jobs_application_ats_certification_bindings",
+            "jobs_ats_certification_canary_reservations",
+        ] {
+            let insert = format!("INSERT INTO {table}");
+            assert!(!postgres_sql.contains(&insert));
+            assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY.contains(&insert));
+        }
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY);
     }
 
     #[test]

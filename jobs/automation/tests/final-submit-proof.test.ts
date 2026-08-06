@@ -1,9 +1,12 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import {
   assertFinalSubmitProof,
   createFinalSubmitProof,
+  finalSubmitSurfaceSha256,
   FinalSubmitProofError,
 } from "../src/final-submit-proof.js";
+import type { ApplicationPacket, FinalSubmitProof } from "../src/contracts.js";
 import {
   assertCertifiedProviderNavigationJob,
   certifiedProviderJobKey,
@@ -69,8 +72,59 @@ const LEVER_PART_ORDER = [
   { kind: "file" as const, index: 0 },
   { kind: "file" as const, index: 1 },
 ];
+const SURFACE_VECTORS = (JSON.parse(readFileSync(
+  new URL("./fixtures/final-submit-surface-vectors.json", import.meta.url),
+  "utf8",
+)) as {
+  vectors: Array<{
+    name: string;
+    proof: FinalSubmitProof;
+    expectedSurfaceSha256: string;
+  }>;
+}).vectors;
+
+function autoAdmission(): NonNullable<ApplicationPacket["approvedExecutionAdmission"]> {
+  return {
+    kind: "track_auto_submit",
+    authorization_id: "authorization-604",
+    career_track_id: "track-604",
+    revision_no: 3,
+    authority_fingerprint: "1".repeat(64),
+    ats_certification: {
+      schema_version: 1,
+      provider: "greenhouse",
+      adapter_version: "2026.07.1-beta.1",
+      variant_key: "public",
+      layout_contract_version: 1,
+      surface_sha256: finalSubmitSurfaceSha256({
+        adapter: "greenhouse",
+        adapterVersion: "2026.07.1-beta.1",
+        control: "greenhouse_submit_application",
+        target: GREENHOUSE_TARGET,
+        files: GREENHOUSE_FILES,
+        fields: SUBMIT_FIELDS,
+        partOrder: GREENHOUSE_PART_ORDER,
+      }),
+      manifest_sha256: "2".repeat(64),
+      activation_sha256: "3".repeat(64),
+      activation_generation: 4,
+      target_key_sha256: "5".repeat(64),
+      layout_set_sha256: "6".repeat(64),
+      adapter_bundle_sha256: "7".repeat(64),
+      runner_target_sha256s: ["8".repeat(64), "9".repeat(64)],
+      expires_at_ms: 9_007_199_254_740_000,
+    },
+  };
+}
 
 describe("final submit proof", () => {
+  it.each(SURFACE_VECTORS)(
+    "matches the shared Rust/TypeScript surface vector: $name",
+    (vector) => {
+      expect(finalSubmitSurfaceSha256(vector.proof)).toBe(vector.expectedSurfaceSha256);
+    },
+  );
+
   it("builds the exact Greenhouse wire proof without local document material", () => {
     const proof = createFinalSubmitProof({
       adapter: "greenhouse",
@@ -122,6 +176,99 @@ describe("final submit proof", () => {
       { kind: "resume", versionId: "resume-version-456", sha256: RESUME_SHA },
     ]);
     expect(() => assertFinalSubmitProof(structuredClone(proof))).not.toThrow();
+  });
+
+  it("builds a strict schema-v4 proof only from a frozen certified Auto admission", () => {
+    const providerProof = {
+      adapter: "greenhouse" as const,
+      adapterVersion: "2026.07.1-beta.1",
+      control: "greenhouse_submit_application" as const,
+      target: GREENHOUSE_TARGET,
+      files: GREENHOUSE_FILES,
+      fields: SUBMIT_FIELDS,
+      partOrder: GREENHOUSE_PART_ORDER,
+    };
+    const proof = createFinalSubmitProof(providerProof, {
+      resume: { versionId: "resume-version-604", sha256: RESUME_SHA },
+    }, GREENHOUSE_JOB, autoAdmission());
+
+    expect(proof.schemaVersion).toBe(4);
+    if (proof.schemaVersion !== 4) throw new Error("expected certified proof");
+    expect(proof.certification).toEqual({
+      schemaVersion: 1,
+      provider: "greenhouse",
+      adapterVersion: "2026.07.1-beta.1",
+      manifestSha256: "2".repeat(64),
+      activationSha256: "3".repeat(64),
+      activationGeneration: 4,
+      targetKeySha256: "5".repeat(64),
+      layoutSetSha256: "6".repeat(64),
+      adapterBundleSha256: "7".repeat(64),
+      runnerTargetSha256s: ["8".repeat(64), "9".repeat(64)],
+      expiresAtMs: 9_007_199_254_740_000,
+    });
+    expect(proof.observedSurface).toEqual({
+      schemaVersion: 1,
+      variantKey: "public",
+      layoutContractVersion: 1,
+      surfaceSha256: finalSubmitSurfaceSha256(providerProof),
+    });
+    expect(() => assertFinalSubmitProof(structuredClone(proof))).not.toThrow();
+    expect(JSON.stringify(proof)).not.toMatch(/authorization-604|track-604|candidate value/i);
+  });
+
+  it("rejects missing or mismatched certification on an Auto proof", () => {
+    const providerProof = {
+      adapter: "greenhouse" as const,
+      adapterVersion: "2026.07.1-beta.1",
+      control: "greenhouse_submit_application" as const,
+      target: GREENHOUSE_TARGET,
+      files: GREENHOUSE_FILES,
+      fields: SUBMIT_FIELDS,
+      partOrder: GREENHOUSE_PART_ORDER,
+    };
+    const admission = autoAdmission();
+    if (admission.kind !== "track_auto_submit") throw new Error("expected Auto admission");
+    delete admission.ats_certification;
+    expect(() => createFinalSubmitProof(providerProof, {
+      resume: { versionId: "resume-version-604", sha256: RESUME_SHA },
+    }, GREENHOUSE_JOB, admission)).toThrow(FinalSubmitProofError);
+
+    const wrongProvider = autoAdmission();
+    if (wrongProvider.kind !== "track_auto_submit" || !wrongProvider.ats_certification) {
+      throw new Error("expected certified Auto admission");
+    }
+    wrongProvider.ats_certification.provider = "lever";
+    expect(() => createFinalSubmitProof(providerProof, {
+      resume: { versionId: "resume-version-604", sha256: RESUME_SHA },
+    }, GREENHOUSE_JOB, wrongProvider)).toThrow(FinalSubmitProofError);
+  });
+
+  it.each([
+    ["certification digest", (proof: Record<string, unknown>) => {
+      (proof.certification as Record<string, unknown>).manifestSha256 = "F".repeat(64);
+    }],
+    ["observed surface", (proof: Record<string, unknown>) => {
+      (proof.observedSurface as Record<string, unknown>).surfaceSha256 = "f".repeat(64);
+    }],
+    ["unknown certification field", (proof: Record<string, unknown>) => {
+      (proof.certification as Record<string, unknown>).credential = "forbidden";
+    }],
+  ])("rejects a received schema-v4 proof with a mutated %s", (_label, mutate) => {
+    const proof = createFinalSubmitProof({
+      adapter: "greenhouse",
+      adapterVersion: "2026.07.1-beta.1",
+      control: "greenhouse_submit_application",
+      target: GREENHOUSE_TARGET,
+      files: GREENHOUSE_FILES,
+      fields: SUBMIT_FIELDS,
+      partOrder: GREENHOUSE_PART_ORDER,
+    }, {
+      resume: { versionId: "resume-version-604", sha256: RESUME_SHA },
+    }, GREENHOUSE_JOB, autoAdmission()) as unknown as Record<string, unknown>;
+    mutate(proof);
+
+    expect(() => assertFinalSubmitProof(proof)).toThrow(FinalSubmitProofError);
   });
 
   it.each([

@@ -6,6 +6,7 @@ export const JOBS_PARITY_TABLES = [
   "account_deletion_intents",
   "jobs_browser_account_channel_assignments",
   "jobs_browser_release_activations",
+  "jobs_browser_release_artifact_runtime_components",
   "jobs_browser_release_artifacts",
   "jobs_browser_release_channel_heads",
   "jobs_browser_release_channel_transitions",
@@ -16,11 +17,35 @@ export const JOBS_PARITY_TABLES = [
   "jobs_browser_release_signatures",
   "jobs_browser_release_trust_keys",
   "jobs_browser_release_trust_policies",
+  "jobs_application_ats_certification_bindings",
+  "jobs_ats_certification_activations",
+  "jobs_ats_certification_canary_allowlist_members",
+  "jobs_ats_certification_canary_allowlist_revocations",
+  "jobs_ats_certification_canary_allowlists",
+  "jobs_ats_certification_canary_reservations",
+  "jobs_ats_certification_circuit_events",
+  "jobs_ats_certification_circuit_heads",
+  "jobs_ats_certification_evidence",
+  "jobs_ats_certification_head_transitions",
+  "jobs_ats_certification_heads",
+  "jobs_ats_certification_layout_observations",
+  "jobs_ats_certification_manifest_check_results",
+  "jobs_ats_certification_manifest_evidence",
+  "jobs_ats_certification_manifest_layouts",
+  "jobs_ats_certification_manifests",
+  "jobs_ats_certification_quarantine_commands",
+  "jobs_ats_certification_quarantine_heads",
+  "jobs_ats_certification_revocations",
+  "jobs_ats_certification_runtime_targets",
+  "jobs_ats_certification_trust_head",
+  "jobs_ats_certification_trust_keys",
+  "jobs_ats_certification_trust_policies",
   "jobs_communication_actions",
   "jobs_discovery_memberships",
   "jobs_discovery_runs",
   "jobs_discovery_sources",
   "jobs_execution_leases",
+  "jobs_execution_lease_process_runtime_bindings",
   "jobs_execution_lease_volume_bindings",
   "jobs_local_run_claim_replays",
   "jobs_local_run_release_bindings",
@@ -31,6 +56,9 @@ export const JOBS_PARITY_TABLES = [
   "jobs_runner_purge_requests",
   "jobs_runner_purge_targets",
   "jobs_runner_purge_tombstones",
+  "jobs_runner_process_runtime_bindings",
+  "jobs_runner_process_runtime_grant_revocations",
+  "jobs_runner_process_runtime_grants",
   "jobs_runner_volume_admission_grants",
   "jobs_runner_volume_authority_uses",
   "jobs_runner_volume_destructions",
@@ -53,6 +81,12 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     "jobs_browser_release_activations",
     [
       "idx_jobs_browser_release_activations_channel_history on jobs_browser_release_activations (channel, trust_generation desc, channel_sequence desc, expires_at_ms)",
+    ],
+  ],
+  [
+    "jobs_browser_release_artifact_runtime_components",
+    [
+      "idx_jobs_browser_release_runtime_components_target on jobs_browser_release_artifact_runtime_components (manifest_sha256, platform, architecture, package_kind, build_descriptor_sha256)",
     ],
   ],
   [
@@ -110,6 +144,73 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     ],
   ],
   [
+    "jobs_ats_certification_activations",
+    [
+      "idx_jobs_ats_certification_activations_scope on jobs_ats_certification_activations (scope_sha256, channel, channel_sequence desc, expires_at_ms)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_canary_allowlist_members",
+    [
+      "idx_jobs_ats_certification_canary_allowlist_members_account on jobs_ats_certification_canary_allowlist_members (account_id, allowlist_sha256)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_canary_reservations",
+    [
+      "idx_jobs_ats_certification_canary_capacity on jobs_ats_certification_canary_reservations (activation_sha256, period_key, status, reserved_at_ms)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_evidence",
+    [
+      "idx_jobs_ats_certification_evidence_scope on jobs_ats_certification_evidence (provider, target_key, variant_key, surface_sha256, expires_at_ms)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_heads",
+    [
+      "idx_jobs_ats_certification_heads_activation on jobs_ats_certification_heads (current_activation_sha256, channel)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_layout_observations",
+    [
+      "idx_jobs_ats_certification_layout_observations_target on jobs_ats_certification_layout_observations (provider, target_fingerprint_sha256, page_variant, adapter_version, runner_target_sha256, expires_at_ms)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_manifest_evidence",
+    [
+      "idx_jobs_ats_certification_manifest_evidence_evidence on jobs_ats_certification_manifest_evidence (evidence_sha256, manifest_sha256)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_manifests",
+    [
+      "idx_jobs_ats_certification_manifests_scope on jobs_ats_certification_manifests (scope_sha256, manifest_generation desc, expires_at_ms)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_quarantine_commands",
+    [
+      "idx_jobs_ats_certification_quarantine_commands_scope on jobs_ats_certification_quarantine_commands (scope_kind, scope_id, scope_sha256, command_sequence desc)",
+    ],
+  ],
+  [
+    "jobs_ats_certification_revocations",
+    [
+      "idx_jobs_ats_certification_revocations_generation on jobs_ats_certification_revocations (trust_policy_sha256, revocation_generation desc)",
+      "idx_jobs_ats_certification_revocations_subject on jobs_ats_certification_revocations (subject_kind, subject_id, subject_sha256, effective_at_ms)",
+    ].sort(),
+  ],
+  [
+    "jobs_ats_certification_runtime_targets",
+    [
+      "idx_jobs_ats_certification_runtime_targets_runtime on jobs_ats_certification_runtime_targets (runtime_kind, runtime_id, runtime_sha256)",
+    ],
+  ],
+  [
     "jobs_communication_actions",
     [
       "idx_jobs_communication_actions_account on jobs_communication_actions (account_id, application_id, created_at_ms desc)",
@@ -118,11 +219,15 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
   ],
   [
     "jobs_discovery_memberships",
-    ["idx_jobs_discovery_memberships_job on jobs_discovery_memberships (account_id, job_id)"],
+    [
+      "idx_jobs_discovery_memberships_job on jobs_discovery_memberships (account_id, job_id)",
+    ],
   ],
   [
     "jobs_discovery_runs",
-    ["idx_jobs_discovery_runs_source on jobs_discovery_runs (source_id, started_at_ms desc)"],
+    [
+      "idx_jobs_discovery_runs_source on jobs_discovery_runs (source_id, started_at_ms desc)",
+    ],
   ],
   [
     "jobs_discovery_sources",
@@ -138,6 +243,12 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
       "unique idx_jobs_execution_leases_active_application on jobs_execution_leases (application_id) where phase in ('prepared', 'click_started')",
       "unique idx_jobs_execution_leases_active_profile on jobs_execution_leases (browser_profile_id) where phase in ('prepared', 'click_started')",
     ].sort(),
+  ],
+  [
+    "jobs_execution_lease_process_runtime_bindings",
+    [
+      "idx_jobs_execution_lease_process_runtime_grant on jobs_execution_lease_process_runtime_bindings (runtime_grant_id, run_id, fence)",
+    ],
   ],
   [
     "jobs_execution_lease_volume_bindings",
@@ -194,6 +305,18 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     "jobs_runner_purge_tombstones",
     [
       "idx_jobs_runner_purge_tombstones_request on jobs_runner_purge_tombstones (request_id, completed_at_ms)",
+    ],
+  ],
+  [
+    "jobs_runner_process_runtime_bindings",
+    [
+      "idx_jobs_runner_process_runtime_bindings_process on jobs_runner_process_runtime_bindings (worker_id, volume_id, enrollment_epoch, process_instance_id)",
+    ],
+  ],
+  [
+    "jobs_runner_process_runtime_grants",
+    [
+      "idx_jobs_runner_process_runtime_grants_expiry on jobs_runner_process_runtime_grants (expires_at_ms, expected_worker_id)",
     ],
   ],
   [
@@ -297,6 +420,10 @@ function splitTopLevel(value) {
 function normalizeSql(value) {
   return value
     .replace(/--[^\n]*/g, " ")
+    .replace(
+      /\bglob\s+'([^']*)'/gi,
+      (_, pattern) => `LIKE '${pattern.replaceAll("*", "%")}'`,
+    )
     .replace(/\bsmallint\b/gi, "INTEGER")
     .replace(/\bbigint\b/gi, "INTEGER")
     .replace(/\s+/g, " ")
@@ -307,7 +434,10 @@ function normalizeSql(value) {
 }
 
 function extractTable(sql, tableName) {
-  const expression = new RegExp(`CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${tableName}\\s*\\(`, "i");
+  const expression = new RegExp(
+    `CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${tableName}\\s*\\(`,
+    "i",
+  );
   const match = expression.exec(sql);
   if (!match) return null;
   const openingParen = sql.indexOf("(", match.index);
@@ -321,7 +451,9 @@ function extractIndexes(sql, tableName) {
   for (const match of sql.matchAll(expression)) {
     if (match[3].toLowerCase() !== tableName.toLowerCase()) continue;
     indexes.push(
-      normalizeSql(`${match[1] ? "unique " : ""}${match[2]} on ${match[3]} (${match[4]}) ${match[5] ?? ""}`),
+      normalizeSql(
+        `${match[1] ? "unique " : ""}${match[2]} on ${match[3]} (${match[4]}) ${match[5] ?? ""}`,
+      ),
     );
   }
   return [...new Set(indexes)].sort();
@@ -329,9 +461,11 @@ function extractIndexes(sql, tableName) {
 
 function parityTableNames(sql) {
   const expectedNames = new Set(JOBS_PARITY_TABLES);
-  const names = [...sql.matchAll(
-    /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gi,
-  )]
+  const names = [
+    ...sql.matchAll(
+      /CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/gi,
+    ),
+  ]
     .map((match) => match[1].toLowerCase())
     .filter(
       (tableName) =>
@@ -343,7 +477,8 @@ function parityTableNames(sql) {
 function firstDifference(left, right) {
   const length = Math.max(left.length, right.length);
   for (let index = 0; index < length; index += 1) {
-    if (left[index] !== right[index]) return { index, left: left[index], right: right[index] };
+    if (left[index] !== right[index])
+      return { index, left: left[index], right: right[index] };
   }
   return null;
 }
@@ -355,10 +490,14 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
   const postgresNames = parityTableNames(postgresSource);
 
   if (JSON.stringify(sqliteNames) !== JSON.stringify(expectedNames)) {
-    issues.push(`SQLite parity tables: expected ${expectedNames.join(", ")}; found ${sqliteNames.join(", ") || "none"}`);
+    issues.push(
+      `SQLite parity tables: expected ${expectedNames.join(", ")}; found ${sqliteNames.join(", ") || "none"}`,
+    );
   }
   if (JSON.stringify(postgresNames) !== JSON.stringify(expectedNames)) {
-    issues.push(`Postgres parity tables: expected ${expectedNames.join(", ")}; found ${postgresNames.join(", ") || "none"}`);
+    issues.push(
+      `Postgres parity tables: expected ${expectedNames.join(", ")}; found ${postgresNames.join(", ") || "none"}`,
+    );
   }
 
   for (const tableName of JOBS_PARITY_TABLES) {
@@ -399,7 +538,10 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
 }
 
 function main() {
-  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../..",
+  );
   const sqlitePath = path.join(repoRoot, "server/src/db/mod.rs");
   const sqliteCommunicationPath = path.join(
     repoRoot,
@@ -413,7 +555,10 @@ function main() {
     repoRoot,
     "infra/sqlite/server-runtime/044_jobs_submission_evidence_reservations.sql",
   );
-  const postgresPath = path.join(repoRoot, "infra/postgres/server-runtime/002_jobs.sql");
+  const postgresPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/002_jobs.sql",
+  );
   const postgresCommunicationPath = path.join(
     repoRoot,
     "infra/postgres/server-runtime/019_jobs_communication_actions.sql",
@@ -442,6 +587,30 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/025_jobs_browser_release_authority.sql",
   );
+  const sqliteAtsCertificationAuthorityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/048_jobs_ats_certification_authority.sql",
+  );
+  const postgresAtsCertificationAuthorityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/026_jobs_ats_certification_authority.sql",
+  );
+  const sqliteBrowserRuntimeComponentsPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/049_jobs_browser_release_runtime_components.sql",
+  );
+  const postgresBrowserRuntimeComponentsPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/027_jobs_browser_release_runtime_components.sql",
+  );
+  const sqliteRunnerProcessRuntimePath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/050_jobs_runner_process_runtime_authority.sql",
+  );
+  const postgresRunnerProcessRuntimePath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/028_jobs_runner_process_runtime_authority.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -449,6 +618,9 @@ function main() {
     sqliteEvidenceCapacityPath,
     sqliteRunnerPurgePath,
     sqliteBrowserReleaseAuthorityPath,
+    sqliteAtsCertificationAuthorityPath,
+    sqliteBrowserRuntimeComponentsPath,
+    sqliteRunnerProcessRuntimePath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -459,45 +631,118 @@ function main() {
     postgresEvidenceCapacityPath,
     postgresRunnerPurgePath,
     postgresBrowserReleaseAuthorityPath,
+    postgresAtsCertificationAuthorityPath,
+    postgresBrowserRuntimeComponentsPath,
+    postgresRunnerProcessRuntimePath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
   const issues = compareJobsSchemas(sqliteSource, postgresSource);
 
-  const includePath = 'include_str!("../../../infra/postgres/server-runtime/002_jobs.sql")';
-  if (!sqliteSource.includes(includePath)) issues.push(`server migration runner does not include 002_jobs.sql via ${includePath}`);
-  if (!sqliteSource.includes('&[&"002_jobs.sql"]')) issues.push("server migration runner does not record 002_jobs.sql");
+  const includePath =
+    'include_str!("../../../infra/postgres/server-runtime/002_jobs.sql")';
+  if (!sqliteSource.includes(includePath))
+    issues.push(
+      `server migration runner does not include 002_jobs.sql via ${includePath}`,
+    );
+  if (!sqliteSource.includes('&[&"002_jobs.sql"]'))
+    issues.push("server migration runner does not record 002_jobs.sql");
   const communicationInclude =
     'include_str!("../../../infra/postgres/server-runtime/019_jobs_communication_actions.sql")';
   if (!sqliteSource.includes(communicationInclude)) {
-    issues.push(`server migration runner does not include 019_jobs_communication_actions.sql via ${communicationInclude}`);
+    issues.push(
+      `server migration runner does not include 019_jobs_communication_actions.sql via ${communicationInclude}`,
+    );
   }
   if (!sqliteSource.includes('"019_jobs_communication_actions.sql"')) {
-    issues.push("server migration runner does not record 019_jobs_communication_actions.sql");
+    issues.push(
+      "server migration runner does not record 019_jobs_communication_actions.sql",
+    );
   }
   const runnerPurgeInclude =
     'include_str!("../../../infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql")';
   if (!sqliteSource.includes(runnerPurgeInclude)) {
-    issues.push(`server migration runner does not include 024_jobs_runner_volume_purge.sql via ${runnerPurgeInclude}`);
+    issues.push(
+      `server migration runner does not include 024_jobs_runner_volume_purge.sql via ${runnerPurgeInclude}`,
+    );
   }
   if (!sqliteSource.includes('"024_jobs_runner_volume_purge.sql"')) {
-    issues.push("server migration runner does not record 024_jobs_runner_volume_purge.sql");
+    issues.push(
+      "server migration runner does not record 024_jobs_runner_volume_purge.sql",
+    );
   }
   const sqliteBrowserReleaseAuthorityInclude =
     'include_str!("../../../infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql")';
   if (!sqliteSource.includes(sqliteBrowserReleaseAuthorityInclude)) {
-    issues.push(`server migration runner does not include 047_jobs_browser_release_authority.sql via ${sqliteBrowserReleaseAuthorityInclude}`);
+    issues.push(
+      `server migration runner does not include 047_jobs_browser_release_authority.sql via ${sqliteBrowserReleaseAuthorityInclude}`,
+    );
   }
-  if ((sqliteSource.match(/SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY/g) ?? []).length < 2) {
-    issues.push("server SQLite migration runner does not register 047_jobs_browser_release_authority.sql");
+  if (
+    (sqliteSource.match(/SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY/g) ?? [])
+      .length < 2
+  ) {
+    issues.push(
+      "server SQLite migration runner does not register 047_jobs_browser_release_authority.sql",
+    );
   }
   const browserReleaseAuthorityInclude =
     'include_str!("../../../infra/postgres/server-runtime/025_jobs_browser_release_authority.sql")';
   if (!sqliteSource.includes(browserReleaseAuthorityInclude)) {
-    issues.push(`server migration runner does not include 025_jobs_browser_release_authority.sql via ${browserReleaseAuthorityInclude}`);
+    issues.push(
+      `server migration runner does not include 025_jobs_browser_release_authority.sql via ${browserReleaseAuthorityInclude}`,
+    );
   }
   if (!sqliteSource.includes('"025_jobs_browser_release_authority.sql"')) {
-    issues.push("server migration runner does not record 025_jobs_browser_release_authority.sql");
+    issues.push(
+      "server migration runner does not record 025_jobs_browser_release_authority.sql",
+    );
+  }
+  for (const [dialect, migration, symbol] of [
+    [
+      "SQLite",
+      "048_jobs_ats_certification_authority.sql",
+      "SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY",
+    ],
+    [
+      "SQLite",
+      "049_jobs_browser_release_runtime_components.sql",
+      "SQLITE_JOBS_BROWSER_RELEASE_RUNTIME_COMPONENTS",
+    ],
+    [
+      "SQLite",
+      "050_jobs_runner_process_runtime_authority.sql",
+      "SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY",
+    ],
+  ]) {
+    const migrationPath = `infra/${dialect.toLowerCase()}/server-runtime/${migration}`;
+    if (!sqliteSource.includes(migrationPath)) {
+      issues.push(
+        `server ${dialect} migration runner does not include ${migration} via ${migrationPath}`,
+      );
+    }
+    if ((sqliteSource.match(new RegExp(symbol, "g")) ?? []).length < 2) {
+      issues.push(
+        `server ${dialect} migration runner does not register ${migration}`,
+      );
+    }
+  }
+  for (const migration of [
+    "026_jobs_ats_certification_authority.sql",
+    "027_jobs_browser_release_runtime_components.sql",
+    "028_jobs_runner_process_runtime_authority.sql",
+  ]) {
+    const migrationPath = `infra/postgres/server-runtime/${migration}`;
+    if (!sqliteSource.includes(migrationPath)) {
+      issues.push(
+        `server Postgres migration runner does not include ${migration} via ${migrationPath}`,
+      );
+    }
+    if (!sqliteSource.includes(`"${migration}"`)) {
+      issues.push(
+        `server Postgres migration runner does not record ${migration}`,
+      );
+    }
   }
 
   if (issues.length > 0) {
@@ -507,10 +752,17 @@ function main() {
     return;
   }
   const indexCount = JOBS_PARITY_TABLES.reduce(
-    (count, tableName) => count + extractIndexes(sqliteSource, tableName).length,
+    (count, tableName) =>
+      count + extractIndexes(sqliteSource, tableName).length,
     0,
   );
-  console.log(`Jobs SQLite/Postgres schema parity passed (${JOBS_PARITY_TABLES.length} tables, ${indexCount} indexes).`);
+  console.log(
+    `Jobs SQLite/Postgres schema parity passed (${JOBS_PARITY_TABLES.length} tables, ${indexCount} indexes).`,
+  );
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) main();
+if (
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+)
+  main();

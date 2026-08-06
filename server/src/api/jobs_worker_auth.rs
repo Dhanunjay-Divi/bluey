@@ -23,6 +23,9 @@ const DEFAULT_SIGNED_BODY_BYTES: usize = 4 * 1024 * 1024;
 const DISCOVERY_SIGNED_BODY_BYTES: usize = 32 * 1024 * 1024;
 const BROWSER_PROFILE_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 const RECEIPT_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
+const ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES: usize = 256 * 1024;
+const ATS_LAYOUT_OBSERVATION_PATH: &str =
+    "/api/jobs/internal/ats-certifications/layout-observations";
 
 #[derive(Debug, Clone)]
 pub struct JobsWorkerIdentity {
@@ -197,7 +200,9 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
     if !method.eq_ignore_ascii_case("POST") || !path.starts_with("/api/jobs/internal/") {
         return None;
     }
-    if path.contains("/runner-volumes/") {
+    if path == ATS_LAYOUT_OBSERVATION_PATH {
+        Some("ats-layout-observation")
+    } else if path.contains("/runner-volumes/") {
         Some("runner-volume")
     } else if path.contains("/execution-leases/") {
         Some("execution")
@@ -217,7 +222,9 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
 }
 
 fn signed_body_limit(path: &str) -> usize {
-    if path.ends_with("/receipt") {
+    if path == ATS_LAYOUT_OBSERVATION_PATH {
+        ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES
+    } else if path.ends_with("/receipt") {
         RECEIPT_SIGNED_BODY_BYTES
     } else if path.contains("/execution-leases/") && path.ends_with("/profile/store") {
         BROWSER_PROFILE_SIGNED_BODY_BYTES
@@ -259,6 +266,9 @@ fn unauthorized() -> AuthError {
 
 #[cfg(debug_assertions)]
 fn legacy_debug_token_valid(request: &Request<Body>) -> bool {
+    if request.uri().path() == ATS_LAYOUT_OBSERVATION_PATH {
+        return false;
+    }
     let expected = std::env::var("BLUEY_JOBS_WORKER_TOKEN").unwrap_or_default();
     let supplied = request
         .headers()
@@ -324,6 +334,17 @@ mod tests {
             Some("runner-volume")
         );
         assert_eq!(
+            worker_scope("POST", ATS_LAYOUT_OBSERVATION_PATH),
+            Some("ats-layout-observation")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/ats-certifications/layout-observations/extra"
+            ),
+            None
+        );
+        assert_eq!(
             worker_scope("GET", "/api/jobs/internal/discovery/lease"),
             None
         );
@@ -347,6 +368,10 @@ mod tests {
             signed_body_limit("/api/jobs/internal/discovery/lease"),
             DEFAULT_SIGNED_BODY_BYTES
         );
+        assert_eq!(
+            signed_body_limit(ATS_LAYOUT_OBSERVATION_PATH),
+            ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES
+        );
     }
 
     #[test]
@@ -369,6 +394,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn signed_request_is_bound_to_scope_and_time() {
         std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", KEY);
         let now = 1_750_000_000;
@@ -397,6 +423,48 @@ mod tests {
             "execution",
         );
         assert!(verify_request(&wrong_scope, now).is_err());
+
+        let ats_observation = signed_request(
+            ATS_LAYOUT_OBSERVATION_PATH,
+            now,
+            "abcdef0123456789abcdef0123456792",
+            "ats-layout-observation",
+        );
+        assert_eq!(
+            verify_request(&ats_observation, now)
+                .unwrap()
+                .identity
+                .scope,
+            "ats-layout-observation"
+        );
+
+        let mut wrong_path = signed_request(
+            "/api/jobs/internal/ats-certifications/layout-observations/extra",
+            now,
+            "abcdef0123456789abcdef0123456793",
+            "ats-layout-observation",
+        );
+        *wrong_path.uri_mut() = ATS_LAYOUT_OBSERVATION_PATH.parse().unwrap();
+        assert!(verify_request(&wrong_path, now).is_err());
         std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn ats_observation_rejects_the_legacy_debug_bearer() {
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        let ats_request = Request::post(ATS_LAYOUT_OBSERVATION_PATH)
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!legacy_debug_token_valid(&ats_request));
+
+        let legacy_discovery = Request::post("/api/jobs/internal/discovery/lease")
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(legacy_debug_token_valid(&legacy_discovery));
+        std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
     }
 }

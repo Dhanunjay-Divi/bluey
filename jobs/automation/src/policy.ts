@@ -1,4 +1,5 @@
 import { detectAts } from "./adapters.js";
+import { parseProviderApplicationTarget } from "./ats-target.js";
 import {
   atsCapabilityProfile,
   type SubmissionCapability,
@@ -69,7 +70,10 @@ export function submissionPolicy(rawUrl: string): PolicyDecision {
     };
   }
 
-  const ats = detectAts(rawUrl);
+  const submissionTarget = parseProviderApplicationTarget(rawUrl);
+  const detected = detectAts(rawUrl);
+  const ats = submissionTarget?.provider
+    ?? (detected === "greenhouse" || detected === "lever" ? "semantic" : detected);
   const profile = atsCapabilityProfile(ats);
   return {
     policy: profile.policy,

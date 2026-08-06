@@ -1,5 +1,6 @@
 export * from "./adapters.js";
 export * from "./adapter-capabilities.js";
+export * from "./ats-target.js";
 export * from "./application-communications.js";
 export * from "./answer-memory.js";
 export * from "./challenge-handling.js";

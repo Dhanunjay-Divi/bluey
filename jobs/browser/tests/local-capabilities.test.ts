@@ -103,6 +103,19 @@ describe("local run capabilities", () => {
       parseLocalRunClaim(responseReleaseMismatch, "run-123", NOW_MS),
     ).toThrow(/release bindings/i);
 
+    for (const field of [
+      "automation_bundle_sha256",
+      "chromium_executable_sha256",
+    ] as const) {
+      const runtimeComponentMismatch = claimResponse();
+      runtimeComponentMismatch._blueyCapabilities.submit = capability("submit", {
+        release: localRunReleaseFixture({ [field]: "0".repeat(64) }),
+      });
+      expect(() =>
+        parseLocalRunClaim(runtimeComponentMismatch, "run-123", NOW_MS),
+      ).toThrow(/release bindings/i);
+    }
+
     for (const operation of ["result", "resume", "submit"] as const) {
       const capabilityReleaseMismatch = claimResponse();
       capabilityReleaseMismatch._blueyCapabilities[operation] = capability(operation, {

@@ -3,6 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import type {
   ApplicationEvidence,
+  AtsCertificationSummary,
   JobApplication,
   JobEligibilityDecision,
   RunnerAvailability,
@@ -10,12 +11,34 @@ import type {
 import {
   answerInterventionActionLabel,
   applicationCountFor,
+  applicationEligibility,
   applicationNeedsReview,
   hasVerifiedSubmissionEvidence,
   hasAvailableRunner,
   ReceiptView,
   runnerUnavailableReason,
 } from "./ApplicationsView";
+
+function certificationSummary(
+  capability: JobEligibilityDecision["capability"],
+): AtsCertificationSummary {
+  const certified = capability === "certified";
+  return {
+    provider_label: certified ? "Lever" : "Application system",
+    adapter_version: certified ? "2026.07.0-beta.1" : null,
+    certified_runner_kinds: certified ? ["local"] : [],
+    status: certified ? "active" : "review_only",
+    last_verified_at_ms: certified ? Date.now() - 60_000 : null,
+    expires_at_ms: certified ? Date.now() + 60 * 60_000 : null,
+    reason: certified
+      ? "The current job and Local Browser runner passed server verification."
+      : "Review first is required for this application system.",
+    next_action: certified
+      ? "Review the application kit and choose an available runner."
+      : "Review the application kit before continuing.",
+    canary_available: false,
+  };
+}
 
 const eligibility = (
   capability: JobEligibilityDecision["capability"],
@@ -30,6 +53,7 @@ const eligibility = (
   review_reasons: [],
   passed_checks: [],
   evaluated_at_ms: 1,
+  ats_certification: certificationSummary(capability),
 });
 
 const runners = (available: boolean): RunnerAvailability => ({
@@ -76,6 +100,29 @@ describe("reviewed application runner availability", () => {
 
     expect(runnerUnavailableReason(blocked, runners(false))).toBe(
       "This job is outside your selected locations.",
+    );
+  });
+
+  it("does not queue a certified receipt from an older server without the bounded summary", () => {
+    const application = {
+      id: "application-one",
+      job_id: "job-one",
+      state: "awaiting_review",
+      submission_mode: "auto_submit",
+      match_score: 90,
+      answers: [],
+      cover_letter: "",
+      receipt: { eligibility: { ...eligibility("certified", true), ats_certification: undefined } },
+      created_at_ms: 1,
+      updated_at_ms: 1,
+    } as JobApplication;
+    const decoded = applicationEligibility(application);
+
+    expect(decoded.capability).toBe("unknown_review");
+    expect(decoded.can_auto_submit).toBe(false);
+    expect(hasAvailableRunner(decoded, runners(true))).toBe(false);
+    expect(runnerUnavailableReason(decoded, runners(true))).toContain(
+      "certification details are unavailable",
     );
   });
 });

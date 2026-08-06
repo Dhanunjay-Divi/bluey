@@ -86,6 +86,57 @@
       "checksum": "e1b2e1dc90a86ebee87701c7279baae571ed423485acb85f6fe9b4ec4e816c4e"
     },
     {
+      "name": "certified_track_auto_submit_v3_ascii",
+      "schemaVersion": 3,
+      "admission": {
+        "kind": "track_auto_submit",
+        "authorization_id": "authorization-1",
+        "career_track_id": "track-1",
+        "revision_no": 3,
+        "authority_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ats_certification": {
+          "schema_version": 1,
+          "provider": "greenhouse",
+          "adapter_version": "2026.07.1-beta.1",
+          "variant_key": "greenhouse_public",
+          "layout_contract_version": 1,
+          "surface_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+          "manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "activation_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "activation_generation": 4,
+          "target_key_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "layout_set_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "adapter_bundle_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "runner_target_sha256s": [
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222222222222222222222222222"
+          ],
+          "expires_at_ms": 1800000000000
+        }
+      },
+      "packet": {
+        "applicationId": "application-1",
+        "jobId": "job-1",
+        "resumeVersionId": "resume-1",
+        "answers": {
+          "email": "ada@example.com",
+          "sponsorship": "No"
+        },
+        "verifiedClaimIds": ["claim-2", "claim-1"]
+      },
+      "job": {
+        "externalId": "job-1",
+        "canonicalUrl": "https://jobs.acme.test/job-1",
+        "company": "Acme",
+        "title": "Engineer",
+        "location": "Remote",
+        "workplace": "remote",
+        "description": "Build useful things.",
+        "source": "greenhouse"
+      },
+      "checksum": "ac1a5c73e243a3a3e8d471b0d7dfabef1bae097d276989f8a7b19249af89c375"
+    },
+    {
       "name": "review_v2_unicode_scalar_key_order",
       "schemaVersion": 2,
       "admission": {

@@ -49,6 +49,8 @@ pub struct LocalRunCapabilityClaims {
 #[serde(deny_unknown_fields)]
 pub struct LocalRunReleaseClaims {
     pub descriptor_sha256: String,
+    pub automation_bundle_sha256: String,
+    pub chromium_executable_sha256: String,
     pub manifest_sha256: String,
     pub activation_sha256: String,
     pub artifact_id: String,
@@ -191,6 +193,8 @@ fn validate_release(release: &LocalRunReleaseClaims) -> anyhow::Result<()> {
             && !value.chars().any(char::is_control)
     };
     if !valid_sha256(&release.descriptor_sha256)
+        || !valid_sha256(&release.automation_bundle_sha256)
+        || !valid_sha256(&release.chromium_executable_sha256)
         || !valid_sha256(&release.manifest_sha256)
         || !valid_sha256(&release.activation_sha256)
         || !valid_sha256(&release.artifact_sha256)
@@ -353,6 +357,8 @@ mod tests {
     fn release() -> LocalRunReleaseClaims {
         LocalRunReleaseClaims {
             descriptor_sha256: "a".repeat(64),
+            automation_bundle_sha256: "e".repeat(64),
+            chromium_executable_sha256: "f".repeat(64),
             manifest_sha256: "b".repeat(64),
             activation_sha256: "c".repeat(64),
             artifact_id: "browser-artifact-1".to_string(),

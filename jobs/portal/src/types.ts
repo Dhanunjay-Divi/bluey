@@ -205,6 +205,33 @@ export interface EligibilityReason {
 
 export type SubmissionCapability = "certified" | "beta_review" | "handoff" | "unknown_review" | "blocked";
 
+export type AtsCertificationStatus =
+  | "active"
+  | "review_only"
+  | "expired"
+  | "suspended"
+  | "revoked"
+  | "drifted";
+
+export type AtsCertifiedRunnerKind = "local" | "cloud";
+
+/**
+ * Bounded, display-safe certification state authored by the server. The
+ * portal treats this wire object as untrusted until the strict AC25 decoder
+ * accepts every field and rejects every unknown field.
+ */
+export interface AtsCertificationSummary {
+  provider_label: string;
+  adapter_version: string | null;
+  certified_runner_kinds: AtsCertifiedRunnerKind[];
+  status: AtsCertificationStatus;
+  last_verified_at_ms: number | null;
+  expires_at_ms: number | null;
+  reason: string;
+  next_action: string;
+  canary_available: boolean;
+}
+
 export interface JobEligibilityDecision {
   capability: SubmissionCapability;
   can_prepare: boolean;
@@ -215,6 +242,8 @@ export interface JobEligibilityDecision {
   review_reasons: EligibilityReason[];
   passed_checks: string[];
   evaluated_at_ms: number;
+  /** Parsed before display; `unknown` prevents compile-time trust in API JSON. */
+  ats_certification?: unknown;
 }
 
 export interface ResumeVersion {

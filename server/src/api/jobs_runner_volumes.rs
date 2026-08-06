@@ -20,10 +20,11 @@ use crate::{
     api::{jobs_worker_auth::JobsWorkerIdentity, AppState},
     auth::AuthedAccount,
     db::jobs::{
-        self, EnrollRunnerVolumeRequest, NewRunnerVolumeAdmissionGrant,
-        PollRunnerVolumePurgeCommandsRequest, RecordRunnerLegacyInventoryAuthorityRequest,
-        RecordRunnerVolumeDestructionRequest, RecordRunnerVolumeFleetCutoverRequest,
-        RecordRunnerVolumeResidencyRequest, ResolveRunnerPurgeLegacyRequest, RunnerPurgeAck,
+        self, EnrollRunnerVolumeRequest, NewRunnerProcessRuntimeGrant,
+        NewRunnerVolumeAdmissionGrant, PollRunnerVolumePurgeCommandsRequest,
+        RecordRunnerLegacyInventoryAuthorityRequest, RecordRunnerVolumeDestructionRequest,
+        RecordRunnerVolumeFleetCutoverRequest, RecordRunnerVolumeResidencyRequest,
+        ResolveRunnerPurgeLegacyRequest, RevokeRunnerProcessRuntimeGrantRequest, RunnerPurgeAck,
         RunnerPurgeCommand, RunnerPurgeCommandKeyRing, RunnerPurgeRequestStatus, RunnerPurgeSigner,
         RunnerVolumeAuthorityProof, RunnerVolumeFleetStatus, RunnerVolumeInstanceLease,
         RunnerVolumePurgeError, RunnerVolumeRecord, RunnerVolumeResidencyRecord,
@@ -43,6 +44,7 @@ pub(crate) const RUNNER_VOLUME_AUTHORITY_MAX_CLOCK_SKEW_MS: i64 = 90_000;
 const RUNNER_VOLUME_ENROLLMENT_MAX_AGE_MS: i64 = 300_000;
 const RUNNER_VOLUME_INSTANCE_LEASE_TTL_MS: i64 = 120_000;
 const RUNNER_VOLUME_ADMISSION_GRANT_TTL_MS: i64 = 600_000;
+const RUNNER_PROCESS_RUNTIME_GRANT_TTL_MS: i64 = 600_000;
 const MAX_RUNNER_VOLUME_POLL_COMMANDS: usize = 100;
 const RUNNER_VOLUME_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const MAX_RUNNER_VOLUME_VERIFYING_KEYS: usize = 16;
@@ -203,6 +205,14 @@ pub fn admin_router() -> Router<AppState> {
             post(create_runner_volume_admission_grant),
         )
         .route(
+            "/admin/jobs/runner-volumes/process-runtime-grants",
+            post(create_runner_process_runtime_grant),
+        )
+        .route(
+            "/admin/jobs/runner-volumes/process-runtime-grants/:grant_id/revocations",
+            post(revoke_runner_process_runtime_grant),
+        )
+        .route(
             "/admin/jobs/runner-volumes/:volume_id/epochs/:enrollment_epoch/destructions",
             post(record_runner_volume_destruction),
         )
@@ -305,15 +315,26 @@ struct RunnerVolumeAuthorityHttpRequest {
     proof: RunnerVolumeAuthorityProof,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunnerVolumeInstanceClaimHttpRequest {
+    proof: RunnerVolumeAuthorityProof,
+    runtime_grant: jobs::RunnerProcessRuntimeGrantClaim,
+}
+
 async fn claim_runner_volume_instance(
     State(state): State<AppState>,
     Extension(worker): Extension<JobsWorkerIdentity>,
     Path(volume_id): Path<String>,
-    Json(request): Json<RunnerVolumeAuthorityHttpRequest>,
+    Json(request): Json<RunnerVolumeInstanceClaimHttpRequest>,
 ) -> Result<Json<RunnerVolumeInstanceLease>, ApiError> {
     let _policy = runner_volume_purge_policy().map_err(policy_api_error)?;
     let path = format!("/api/jobs/internal/runner-volumes/{volume_id}/instances/claim");
     let now_ms = server_now_ms();
+    let runtime_sha256 = jobs::runner_process_runtime_sha256(&request.runtime_grant.runtime)
+        .map_err(runner_volume_api_error)?;
+    let runtime_grant_token_sha256 =
+        hex::encode(Sha256::digest(request.runtime_grant.grant_token.as_bytes()));
     let authority = verify_runner_volume_authority(
         &state,
         &worker,
@@ -322,7 +343,14 @@ async fn claim_runner_volume_instance(
         RunnerVolumeAuthorityHttpBinding {
             expected_operation: "instance_claim",
             path: &path,
-            payload_fields: &[],
+            payload_fields: &[
+                ("runtime_grant_id", request.runtime_grant.grant_id.as_str()),
+                (
+                    "runtime_grant_token_sha256",
+                    runtime_grant_token_sha256.as_str(),
+                ),
+                ("runtime_sha256", runtime_sha256.as_str()),
+            ],
             now_ms,
         },
     )?;
@@ -331,11 +359,14 @@ async fn claim_runner_volume_instance(
         .ok_or_else(internal_error)?;
     jobs::claim_runner_volume_instance_authorized(
         &state.pool,
-        &volume_id,
-        request.proof.enrollment_epoch,
-        &request.proof.process_instance_id,
-        now_ms,
-        lease_expires_at_ms,
+        &jobs::RunnerVolumeInstanceLeaseRequest {
+            volume_id: &volume_id,
+            enrollment_epoch: request.proof.enrollment_epoch,
+            process_instance_id: &request.proof.process_instance_id,
+            now_ms,
+            lease_expires_at_ms,
+        },
+        &request.runtime_grant,
         &authority,
     )
     .map(Json)
@@ -719,6 +750,8 @@ pub(crate) struct RunnerVolumeExecutionLeaseClaimPayload<'a> {
     pub(crate) volume_id: &'a str,
     pub(crate) enrollment_epoch: i64,
     pub(crate) process_instance_id: &'a str,
+    pub(crate) runtime_grant_id: &'a str,
+    pub(crate) runtime_sha256: &'a str,
 }
 
 pub(crate) fn runner_volume_execution_lease_claim_payload_sha256(
@@ -737,6 +770,8 @@ pub(crate) fn runner_volume_execution_lease_claim_payload_sha256(
             ("volume_id", payload.volume_id),
             ("enrollment_epoch", enrollment_epoch.as_str()),
             ("process_instance_id", payload.process_instance_id),
+            ("runtime_grant_id", payload.runtime_grant_id),
+            ("runtime_sha256", payload.runtime_sha256),
         ],
     )
 }
@@ -831,6 +866,93 @@ async fn create_runner_volume_admission_grant(
         expires_at_ms,
         created_at_ms,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateRunnerProcessRuntimeGrantHttpRequest {
+    expected_worker_id: String,
+    runtime: jobs::RunnerProcessRuntimeAttestation,
+    authorization_ref: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateRunnerProcessRuntimeGrantHttpResponse {
+    grant_id: String,
+    grant_token: String,
+    expected_worker_id: String,
+    runtime_sha256: String,
+    runtime: jobs::RunnerProcessRuntimeAttestation,
+    authorization_ref: String,
+    expires_at_ms: i64,
+    created_at_ms: i64,
+}
+
+async fn create_runner_process_runtime_grant(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(admin)): Extension<AuthedAccount>,
+    Json(request): Json<CreateRunnerProcessRuntimeGrantHttpRequest>,
+) -> Result<Json<CreateRunnerProcessRuntimeGrantHttpResponse>, ApiError> {
+    let created_at_ms = server_now_ms();
+    let expires_at_ms = created_at_ms
+        .checked_add(RUNNER_PROCESS_RUNTIME_GRANT_TTL_MS)
+        .ok_or_else(internal_error)?;
+    let grant_id = format!("runner-process-runtime-grant-{}", uuid::Uuid::new_v4());
+    let mut token = [0_u8; 32];
+    rand::thread_rng().fill_bytes(&mut token);
+    let grant_token = URL_SAFE_NO_PAD.encode(token);
+    let stored = jobs::create_runner_process_runtime_grant(
+        &state.pool,
+        &NewRunnerProcessRuntimeGrant {
+            grant_id: grant_id.clone(),
+            token: grant_token.clone(),
+            expected_worker_id: request.expected_worker_id.clone(),
+            runtime: request.runtime.clone(),
+            authorization_ref: request.authorization_ref.clone(),
+            created_by: admin.id,
+            expires_at_ms,
+            created_at_ms,
+        },
+    )
+    .map_err(runner_volume_api_error)?;
+    Ok(Json(CreateRunnerProcessRuntimeGrantHttpResponse {
+        grant_id,
+        grant_token,
+        expected_worker_id: request.expected_worker_id,
+        runtime_sha256: stored.runtime_sha256,
+        runtime: request.runtime,
+        authorization_ref: request.authorization_ref,
+        expires_at_ms,
+        created_at_ms,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RevokeRunnerProcessRuntimeGrantHttpRequest {
+    reason: String,
+    authorization_ref: String,
+}
+
+async fn revoke_runner_process_runtime_grant(
+    State(state): State<AppState>,
+    Extension(AuthedAccount(admin)): Extension<AuthedAccount>,
+    Path(grant_id): Path<String>,
+    Json(request): Json<RevokeRunnerProcessRuntimeGrantHttpRequest>,
+) -> Result<Json<jobs::RunnerProcessRuntimeGrantRevocation>, ApiError> {
+    jobs::revoke_runner_process_runtime_grant(
+        &state.pool,
+        &RevokeRunnerProcessRuntimeGrantRequest {
+            grant_id,
+            reason: request.reason,
+            authorization_ref: request.authorization_ref,
+            revoked_by: admin.id,
+            revoked_at_ms: server_now_ms(),
+        },
+    )
+    .map(Json)
+    .map_err(runner_volume_api_error)
 }
 
 #[derive(Debug, Deserialize)]
@@ -1376,6 +1498,8 @@ mod tests {
                 volume_id: "volume-602",
                 enrollment_epoch: 7,
                 process_instance_id: "process-602",
+                runtime_grant_id: "runtime-grant-602",
+                runtime_sha256: "8f5f7e462a8812d73c94fd1b63f2cf601e05070d8416d55abca946765f065b45",
             },
         );
         let canonical = concat!(
@@ -1390,7 +1514,9 @@ mod tests {
             "owner_id=worker-602\n",
             "volume_id=volume-602\n",
             "enrollment_epoch=7\n",
-            "process_instance_id=process-602\n"
+            "process_instance_id=process-602\n",
+            "runtime_grant_id=runtime-grant-602\n",
+            "runtime_sha256=8f5f7e462a8812d73c94fd1b63f2cf601e05070d8416d55abca946765f065b45\n"
         );
         assert_eq!(digest, hex::encode(Sha256::digest(canonical.as_bytes())));
     }

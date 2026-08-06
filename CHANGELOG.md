@@ -7,6 +7,12 @@ under `docs/release/`.
 
 ### Added
 
+- Added a disabled-by-default, root-authorized ATS certification framework for
+  exact Greenhouse and Lever targets, with signed evidence and layout sets,
+  immutable manifests, channel activations, account-scoped canary allowlists,
+  revocation, quarantine, safety circuits, exact local/cloud runtime bindings,
+  atomic preflight and one-use submission authority, and terminal receipt
+  recovery. No provider or production flag is enabled by this source change.
 - Added a disabled-by-default Bluey Browser release authority with root-signed
   trust rotation, threshold-signed immutable manifests, channel activations,
   compare-and-swap rollback, append-only revocation, exact packaged build and
@@ -96,7 +102,33 @@ under `docs/release/`.
 
 ### Fixed
 
-- Bound certified Greenhouse and Lever final submission to the exact approved
+- Preserved exact ATS authority from eligibility through packet approval,
+  irreversible Submit, receipt persistence, and intervention reapproval.
+  Auto-submit packets now freeze schema-three certification, Phase B precedes
+  every durable click marker, receipts must match the immutable terminal server
+  record, and packet revisions atomically invalidate unused preflight authority.
+  The shared queued/running lifecycle accepts either server-authorized runner,
+  while local and cloud execution still require their exact signed release,
+  process-runtime grant, image, Browser, and Chromium claims.
+- Hardened the disabled ATS certification control plane so all thirteen signed
+  revocation scopes form a predecessor-bound monotonic chain; activation and
+  quarantine replays require their immutable predecessors; circuit restoration
+  through `newer_activation` is limited to an exact predecessor activation
+  circuit and requires the applied successor's complete authority to remain
+  current after database serialization; broader circuits require reviewed
+  closure; non-shadow
+  authority requires complete authorized-live and authorized-sandbox evidence
+  for every runtime; and activation-wide total, account, concurrency, and UTC
+  daily canary limits are enforced atomically before any irreversible marker.
+  Canary promotion now commits to that exact canonical evidence manifest, and
+  ambiguous local Phase-B HTTP 5xx responses preserve recovery instead of
+  becoming retryable launch denials.
+- Unified Greenhouse and Lever application-target classification across Jobs
+  policy, adapter resolution, source metadata, and server parsing. Exact Lever
+  EU jobs now reach the review-only provider state machine, while HTTP,
+  credentialed, port-qualified, malformed-path, and spoofed provider URLs fail
+  closed before provider automation.
+- Bound exact-version Greenhouse and Lever final-submit mechanics to the approved
   provider job, submit target, ordered successful controls, and content-addressed
   PDF bytes. A Chromium isolated world and boundary-preserving multipart
   verification now prevent page-script mutation or unrelated post-fill traffic

@@ -322,6 +322,8 @@ fn local_final_submit_proof(fixture: &LocalAuthorityFixture) -> FinalSubmitProof
             version_id: fixture.application.resume_version_id.clone(),
             sha256: "b".repeat(64),
         }],
+        certification: None,
+        observed_surface: None,
     }
 }
 

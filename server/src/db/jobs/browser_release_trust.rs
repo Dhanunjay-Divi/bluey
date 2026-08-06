@@ -23,6 +23,8 @@ pub struct BrowserReleaseArtifactAuthority {
     pub size_bytes: i64,
     pub sha256: String,
     pub app_content_sha256: String,
+    pub automation_bundle_sha256: String,
+    pub chromium_executable_sha256: String,
     pub verification_evidence_sha256: String,
     pub native_signature_kind: String,
     pub native_signer_identity: String,
@@ -567,6 +569,8 @@ fn validate_browser_release_manifest(
     let mut artifact_urls = BTreeSet::new();
     let mut descriptor_by_target = BTreeMap::<String, String>::new();
     let mut app_content_by_target = BTreeMap::<String, String>::new();
+    let mut automation_bundle_by_target = BTreeMap::<String, String>::new();
+    let mut chromium_executable_by_target = BTreeMap::<String, String>::new();
     for artifact in &manifest.artifacts {
         validate_browser_release_artifact(artifact, &manifest.release_id)?;
         targets.push(format!(
@@ -587,8 +591,20 @@ fn validate_browser_release_manifest(
             return Err(BrowserReleaseTrustError::InvalidManifest);
         }
         if app_content_by_target
-            .insert(target, artifact.app_content_sha256.clone())
+            .insert(target.clone(), artifact.app_content_sha256.clone())
             .is_some_and(|previous| previous != artifact.app_content_sha256)
+        {
+            return Err(BrowserReleaseTrustError::InvalidManifest);
+        }
+        if automation_bundle_by_target
+            .insert(target.clone(), artifact.automation_bundle_sha256.clone())
+            .is_some_and(|previous| previous != artifact.automation_bundle_sha256)
+        {
+            return Err(BrowserReleaseTrustError::InvalidManifest);
+        }
+        if chromium_executable_by_target
+            .insert(target, artifact.chromium_executable_sha256.clone())
+            .is_some_and(|previous| previous != artifact.chromium_executable_sha256)
         {
             return Err(BrowserReleaseTrustError::InvalidManifest);
         }
@@ -603,6 +619,9 @@ fn validate_browser_release_manifest(
     let descriptor_digests = descriptor_by_target.values().collect::<BTreeSet<_>>();
     if targets.iter().map(String::as_str).ne(expected)
         || descriptor_by_target.len() != 3
+        || app_content_by_target.len() != 3
+        || automation_bundle_by_target.len() != 3
+        || chromium_executable_by_target.len() != 3
         || descriptor_digests.len() != 3
     {
         return Err(BrowserReleaseTrustError::InvalidManifest);
@@ -632,13 +651,12 @@ fn validate_browser_release_artifact(
         || !package_valid
         || !browser_release_hex64(&artifact.build_descriptor_sha256)
         || !browser_release_immutable_artifact_url(&artifact.url, release_id)
-        || !browser_release_artifact_url_matches_package_kind(
-            &artifact.url,
-            &artifact.package_kind,
-        )
+        || !browser_release_artifact_url_matches_package_kind(&artifact.url, &artifact.package_kind)
         || !browser_release_safe_integer(artifact.size_bytes, true)
         || !browser_release_hex64(&artifact.sha256)
         || !browser_release_hex64(&artifact.app_content_sha256)
+        || !browser_release_hex64(&artifact.automation_bundle_sha256)
+        || !browser_release_hex64(&artifact.chromium_executable_sha256)
         || !browser_release_hex64(&artifact.verification_evidence_sha256)
         || !browser_release_bounded_text(&artifact.native_signer_identity, 3, 256)
     {
@@ -1334,11 +1352,8 @@ mod browser_release_trust_tests {
             .signatures
             .push(BrowserReleaseDetachedSignatureAuthority {
                 key_id: "incident-key-1".to_string(),
-                signature: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
-                    deterministic_signing_key(1)
-                        .sign(&payload)
-                        .to_bytes(),
-                ),
+                signature: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(deterministic_signing_key(1).sign(&payload).to_bytes()),
             });
         (
             revocation_bytes,
@@ -1561,8 +1576,11 @@ mod browser_release_trust_tests {
                 .signatures
                 .push(BrowserReleaseDetachedSignatureAuthority {
                     key_id: key_id.to_string(),
-                    signature: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .encode(deterministic_signing_key(key_index).sign(&payload).to_bytes()),
+                    signature: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+                        deterministic_signing_key(key_index)
+                            .sign(&payload)
+                            .to_bytes(),
+                    ),
                 });
         }
         let signature_bytes = canonical_browser_release_json(&signatures).unwrap();
@@ -1681,9 +1699,22 @@ mod browser_release_trust_tests {
             Err(BrowserReleaseTrustError::InvalidManifest)
         );
 
+        for component in ["automation", "chromium"] {
+            let mut split_runtime = manifest.clone();
+            if component == "automation" {
+                split_runtime.artifacts[1].automation_bundle_sha256 = "e".repeat(64);
+            } else {
+                split_runtime.artifacts[1].chromium_executable_sha256 = "e".repeat(64);
+            }
+            let bytes = canonical_browser_release_json(&split_runtime).unwrap();
+            assert_eq!(
+                parse_canonical_browser_release_manifest(&bytes),
+                Err(BrowserReleaseTrustError::InvalidManifest)
+            );
+        }
+
         let mut duplicate_artifact_url = manifest.clone();
-        duplicate_artifact_url.artifacts[2].url =
-            duplicate_artifact_url.artifacts[0].url.clone();
+        duplicate_artifact_url.artifacts[2].url = duplicate_artifact_url.artifacts[0].url.clone();
         let duplicate_artifact_url_bytes =
             canonical_browser_release_json(&duplicate_artifact_url).unwrap();
         assert_eq!(
@@ -1703,10 +1734,9 @@ mod browser_release_trust_tests {
     #[test]
     fn rust_revocation_verifier_requires_exact_delegated_key_and_rejects_root_authority() {
         let fixture = fixture();
-        let policy = parse_canonical_browser_release_trust_policy(&decode(
-            &fixture.trust_policy.canonical,
-        ))
-        .unwrap();
+        let policy =
+            parse_canonical_browser_release_trust_policy(&decode(&fixture.trust_policy.canonical))
+                .unwrap();
         let issued_at_ms = policy.issued_at_ms + 300_001;
 
         let (delegated, delegated_signatures) =
@@ -1722,11 +1752,8 @@ mod browser_release_trust_tests {
         for (subject_id, subject_key_index) in
             [("unknown-key-1", 2_usize), ("promotion-key-1", 3_usize)]
         {
-            let (invalid, invalid_signatures) = signed_signing_key_revocation(
-                subject_id,
-                subject_key_index,
-                issued_at_ms,
-            );
+            let (invalid, invalid_signatures) =
+                signed_signing_key_revocation(subject_id, subject_key_index, issued_at_ms);
             assert_eq!(
                 verify_browser_release_revocation_authority(
                     &invalid,

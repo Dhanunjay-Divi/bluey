@@ -42,6 +42,7 @@ import {
   canonicalRunnerVolumeAuthorityProof,
   canonicalRunnerVolumeEnrollmentProof,
   runnerVolumeHttpPayloadSha256,
+  runnerProcessRuntimeSha256,
   RunnerVolumeClient,
   type RunnerVolumeAuthorityProof,
   type RunnerVolumeEnrollmentProof,
@@ -84,6 +85,17 @@ const WORKER_SIGNING_KEY =
   "runner-volume-fault-matrix-worker-key-0123456789abcdef";
 const PROVIDER = "local-fault-matrix";
 const RUNNER_BUILD_ID = "runner-602.0";
+const PROCESS_RUNTIME = {
+  runnerImageSha256: "1".repeat(64),
+  runnerBuildId: RUNNER_BUILD_ID,
+  platform: "linux" as const,
+  architecture: "x86_64" as const,
+  automationBundleSha256: "2".repeat(64),
+  playwrightVersion: "1.61.1",
+  chromiumRevision: "chromium-123456",
+  chromiumExecutableSha256: "3".repeat(64),
+};
+const PROCESS_RUNTIME_SHA256 = runnerProcessRuntimeSha256(PROCESS_RUNTIME);
 const SERVER_KEY_ID = "server-key-fault-matrix";
 const ACCOUNT_A_SUBJECT = Buffer.alloc(32, 0xa1).toString("base64url");
 const ACCOUNT_B_SUBJECT = Buffer.alloc(32, 0xb2).toString("base64url");
@@ -422,6 +434,8 @@ interface VolumeFixture {
   readonly processInstanceId: string;
   readonly grantId: string;
   readonly grantToken: string;
+  readonly runtimeGrantId: string;
+  readonly runtimeGrantToken: string;
   readonly providerResourceId: string;
   readonly resourceFingerprint: string;
   readonly accountAProfileScope: string;
@@ -461,6 +475,8 @@ interface StoredVolume {
   storageAttestationRequired: boolean;
   attestationGeneration: number;
   attestationSha256: string;
+  runtimeGrantId: string | null;
+  runtimeSha256: string | null;
 }
 
 interface StoredPurge {
@@ -809,6 +825,8 @@ class LocalRunnerVolumeAuthority {
         attestationGeneration: 0,
         attestationSha256:
           RUNNER_VOLUME_STORAGE_ATTESTATION_GENESIS_SHA256,
+        runtimeGrantId: null,
+        runtimeSha256: null,
       };
       this.#volumes.set(proof.volumeId, stored);
       disposition = "applied";
@@ -825,11 +843,33 @@ class LocalRunnerVolumeAuthority {
     input: unknown,
   ): unknown {
     const request = requireRecord(input);
+    let runtimeGrantId: string | null = null;
+    let runtimeSha256: string | null = null;
+    const payloadExtensions: string[] = [];
+    if (action === "claim") {
+      const runtimeGrant = requireRecord(request.runtimeGrant);
+      if (
+        typeof runtimeGrant.grantId !== "string" ||
+        typeof runtimeGrant.grantToken !== "string" ||
+        JSON.stringify(runtimeGrant.runtime) !== JSON.stringify(PROCESS_RUNTIME)
+      ) {
+        throw new HttpFailure(401, "invalid process runtime grant");
+      }
+      runtimeGrantId = runtimeGrant.grantId;
+      runtimeSha256 = PROCESS_RUNTIME_SHA256;
+      payloadExtensions.push(
+        `runtime_grant_id=${runtimeGrantId}`,
+        `runtime_grant_token_sha256=${createHash("sha256")
+          .update(runtimeGrant.grantToken, "utf8")
+          .digest("hex")}`,
+        `runtime_sha256=${runtimeSha256}`,
+      );
+    }
     const proof = this.verifyAuthorityProof(
       volumeId,
       request.proof,
       action === "claim" ? "instance_claim" : "instance_heartbeat",
-      runnerVolumeHttpPayloadSha256(path, WORKER_ID, []),
+      runnerVolumeHttpPayloadSha256(path, WORKER_ID, payloadExtensions),
     );
     const volume = this.requireVolume(volumeId);
     const nowMs = Date.now();
@@ -853,10 +893,23 @@ class LocalRunnerVolumeAuthority {
         : "applied";
     volume.activeInstanceId = proof.processInstanceId;
     volume.instanceLeaseExpiresAtMs = nowMs + 300_000;
+    if (action === "claim") {
+      if (
+        volume.runtimeGrantId !== null &&
+        (volume.runtimeGrantId !== runtimeGrantId ||
+          volume.runtimeSha256 !== runtimeSha256)
+      ) {
+        throw new HttpFailure(409, "runtime grant mutation");
+      }
+      volume.runtimeGrantId = runtimeGrantId;
+      volume.runtimeSha256 = runtimeSha256;
+    }
     return {
       volumeId,
       enrollmentEpoch: 1,
       processInstanceId: proof.processInstanceId,
+      runtimeGrantId: volume.runtimeGrantId,
+      runtimeSha256: volume.runtimeSha256,
       leaseExpiresAtMs: volume.instanceLeaseExpiresAtMs,
       disposition,
     };
@@ -1244,6 +1297,8 @@ async function createVolumeFixture(
     processInstanceId: createRunnerProcessInstanceId(),
     grantId: grant.grantId,
     grantToken: grant.token,
+    runtimeGrantId: `fault-matrix-runtime-${index}`,
+    runtimeGrantToken: Buffer.alloc(32, index + 64).toString("base64url"),
     providerResourceId: grant.providerResourceId,
     resourceFingerprint: grant.resourceFingerprint,
     accountAProfileScope: index.toString(16).repeat(40),
@@ -1268,6 +1323,11 @@ function createClient(
     legacyArtifactCount: 0,
     runnerBuildId: RUNNER_BUILD_ID,
     processInstanceId: overrides.processInstanceId ?? volume.processInstanceId,
+    processRuntimeGrant: {
+      grantId: volume.runtimeGrantId,
+      grantToken: volume.runtimeGrantToken,
+      runtime: PROCESS_RUNTIME,
+    },
     identity: volume.identity,
     residency: volume.residency,
     subjectStorage: volume.subjectStorage,

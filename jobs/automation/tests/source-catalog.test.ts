@@ -156,6 +156,22 @@ describe("job source catalog", () => {
     });
   });
 
+  it("classifies only exact provider job targets and includes Lever EU", () => {
+    expect(
+      findJobSourceByUrl("https://jobs.eu.lever.co/acme/posting-123/apply")?.id,
+    ).toBe("ats-lever");
+    expect(
+      findJobSourceByUrl("https://boards.greenhouse.io/acme/jobs/job-123")?.id,
+    ).toBe("ats-greenhouse");
+    for (const url of [
+      "http://jobs.eu.lever.co/acme/posting-123/apply",
+      "https://evil.jobs.lever.co/acme/posting-123/apply",
+      "https://boards.greenhouse.io/acme/departments/engineering",
+    ]) {
+      expect(findJobSourceByUrl(url)).toBeUndefined();
+    }
+  });
+
   it("does not label connector metadata as a live shared reader", () => {
     const liveShared = JOB_SOURCE_CATALOG.filter(
       (entry) => entry.discoveryCapability === "shared_ingestion",

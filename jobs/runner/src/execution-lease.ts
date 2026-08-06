@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import {
   assertFinalSubmitProof,
+  type AtsCertifiedReceiptAuthority,
   type FinalSubmitProof,
 } from "@bluey/jobs-automation";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
@@ -45,6 +46,8 @@ export interface ExecutionLeaseRunnerVolume {
   enrollmentEpoch: number;
   processInstanceId: string;
   keyFingerprint: string;
+  runtimeGrantId: string;
+  runtimeSha256: string;
   createExecutionLeaseClaimProof(
     input: RunnerExecutionLeaseClaimProofInput,
   ): RunnerVolumeAuthorityProof;
@@ -115,7 +118,9 @@ interface LeaseGrant {
 
 interface LeaseOperations {
   heartbeat(): Promise<void>;
-  irreversible(proof: FinalSubmitProof): Promise<void>;
+  irreversible(
+    proof: FinalSubmitProof,
+  ): Promise<AtsCertifiedReceiptAuthority | undefined>;
   finish(outcome: ExecutionLeaseFinishOutcome): Promise<void>;
 }
 
@@ -131,6 +136,7 @@ export class ActiveExecutionLease {
   #finishPromise?: Promise<void>;
   #finalSubmitAttempted = false;
   #finalSubmitAuthorized = false;
+  #atsCertifiedReceiptAuthority?: AtsCertifiedReceiptAuthority;
   #activationOutcome?: "activated" | "activation_uncertain";
 
   constructor(
@@ -154,6 +160,12 @@ export class ActiveExecutionLease {
 
   get finalSubmitAuthorized(): boolean {
     return this.#finalSubmitAuthorized;
+  }
+
+  get atsCertifiedReceiptAuthority(): AtsCertifiedReceiptAuthority | undefined {
+    return this.#atsCertifiedReceiptAuthority
+      ? structuredClone(this.#atsCertifiedReceiptAuthority)
+      : undefined;
   }
 
   get finalSubmitActivationOutcome(): "activated" | "activation_uncertain" | undefined {
@@ -188,7 +200,7 @@ export class ActiveExecutionLease {
     }
     // Set this before I/O: a lost success response must permanently consume the local attempt.
     this.#finalSubmitAttempted = true;
-    await this.#operations.irreversible(proof);
+    this.#atsCertifiedReceiptAuthority = await this.#operations.irreversible(proof);
     this.#finalSubmitAuthorized = true;
   }
 
@@ -295,6 +307,8 @@ export class ExecutionLeaseClient {
       volume_id: this.#runnerVolume.volumeId,
       enrollment_epoch: this.#runnerVolume.enrollmentEpoch,
       process_instance_id: this.#runnerVolume.processInstanceId,
+      runtime_grant_id: this.#runnerVolume.runtimeGrantId,
+      runtime_sha256: this.#runnerVolume.runtimeSha256,
       volume_proof: this.#runnerVolume.createExecutionLeaseClaimProof(claimBinding),
     });
     const grant = parseGrant(payload, input.runId, this.#runnerVolume);
@@ -320,7 +334,12 @@ export class ExecutionLeaseClient {
             final_submit_proof: proof,
           },
         );
-        parseLeaseRecord("irreversible", response, input.runId, grant.fence, ["click_started"]);
+        return parseIrreversibleLeaseRecord(
+          response,
+          input,
+          grant.fence,
+          proof,
+        );
       },
       finish: async (outcome) => {
         await this.request("finish", `/api/jobs/internal/execution-leases/${runPath}/finish`, {
@@ -503,6 +522,8 @@ function boundedRunnerVolume(value: ExecutionLeaseRunnerVolume): ExecutionLeaseR
     || value.enrollmentEpoch <= 0
     || !isCanonicalBase64Url(value.processInstanceId, 32)
     || !/^[0-9a-f]{64}$/.test(value.keyFingerprint)
+    || !/^[A-Za-z0-9._:+-]{1,128}$/.test(value.runtimeGrantId)
+    || !/^[0-9a-f]{64}$/.test(value.runtimeSha256)
     || typeof value.createExecutionLeaseClaimProof !== "function") {
     throw new ExecutionLeaseError("configuration", "configuration");
   }
@@ -538,6 +559,8 @@ function parseGrant(
     "phase",
     "process_instance_id",
     "purge_subject",
+    "runtime_grant_id",
+    "runtime_sha256",
     "run_id",
     "volume_id",
     "volume_key_fingerprint",
@@ -558,6 +581,8 @@ function parseGrant(
     || record.volume_id !== expectedVolume.volumeId
     || record.enrollment_epoch !== expectedVolume.enrollmentEpoch
     || record.process_instance_id !== expectedVolume.processInstanceId
+    || record.runtime_grant_id !== expectedVolume.runtimeGrantId
+    || record.runtime_sha256 !== expectedVolume.runtimeSha256
     || record.volume_key_fingerprint !== expectedVolume.keyFingerprint) {
     throw new ExecutionLeaseError("claim", "invalid_response");
   }
@@ -594,6 +619,143 @@ function parseLeaseRecord(
     || !expectedPhases.includes(record.phase)) {
     throw new ExecutionLeaseError(operation, "invalid_response");
   }
+}
+
+const EXECUTION_LEASE_RECORD_KEYS = [
+  "fence",
+  "lease_expires_at_ms",
+  "phase",
+  "run_id",
+] as const;
+
+const ATS_CERTIFIED_RECEIPT_AUTHORITY_KEYS = [
+  "accountId",
+  "activationGeneration",
+  "activationSha256",
+  "adapter",
+  "adapterBundleSha256",
+  "adapterVersion",
+  "applicationAttemptId",
+  "applicationId",
+  "bindingConsumedAtMs",
+  "bindingFence",
+  "bindingSha256",
+  "canaryReservationSha256",
+  "layoutObservationSha256",
+  "layoutSetSha256",
+  "manifestSha256",
+  "meteringReservationSha256",
+  "phaseBRequestId",
+  "provider",
+  "rolloutChannel",
+  "runId",
+  "runnerKind",
+  "runnerTargetSha256",
+  "schemaVersion",
+  "observedSurfaceSha256",
+  "targetKeySha256",
+] as const;
+
+function parseIrreversibleLeaseRecord(
+  value: unknown,
+  input: ExecutionLeaseClaim,
+  expectedFence: number,
+  proof: FinalSubmitProof,
+): AtsCertifiedReceiptAuthority | undefined {
+  parseLeaseRecord(
+    "irreversible",
+    value,
+    input.runId,
+    expectedFence,
+    ["click_started"],
+  );
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  const record = value as Record<string, unknown>;
+  if (proof.schemaVersion === 3) {
+    if (!hasExactKeys(record, EXECUTION_LEASE_RECORD_KEYS)) {
+      throw new ExecutionLeaseError("irreversible", "invalid_response");
+    }
+    return undefined;
+  }
+  if (!hasExactKeys(record, [
+    ...EXECUTION_LEASE_RECORD_KEYS,
+    "atsCertifiedReceiptAuthority",
+  ])) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  return parseAtsCertifiedReceiptAuthority(
+    record.atsCertifiedReceiptAuthority,
+    input,
+    proof,
+  );
+}
+
+function parseAtsCertifiedReceiptAuthority(
+  value: unknown,
+  input: ExecutionLeaseClaim,
+  proof: Extract<FinalSubmitProof, { schemaVersion: 4 }>,
+): AtsCertifiedReceiptAuthority {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  const authority = value as Record<string, unknown>;
+  const certification = proof.certification;
+  if (!hasExactKeys(authority, ATS_CERTIFIED_RECEIPT_AUTHORITY_KEYS)
+    || authority.schemaVersion !== 1
+    || authority.accountId !== input.accountId
+    || authority.applicationId !== input.applicationId
+    || authority.runId !== input.runId
+    || authority.provider !== certification.provider
+    || authority.adapter !== proof.adapter
+    || authority.adapterVersion !== proof.adapterVersion
+    || authority.manifestSha256 !== certification.manifestSha256
+    || authority.activationSha256 !== certification.activationSha256
+    || authority.activationGeneration !== certification.activationGeneration
+    || authority.targetKeySha256 !== certification.targetKeySha256
+    || authority.layoutSetSha256 !== certification.layoutSetSha256
+    || authority.observedSurfaceSha256
+      !== proof.observedSurface.surfaceSha256
+    || authority.adapterBundleSha256 !== certification.adapterBundleSha256
+    || authority.runnerKind !== "cloud"
+    || typeof authority.runnerTargetSha256 !== "string"
+    || !certification.runnerTargetSha256s.includes(authority.runnerTargetSha256)
+    || !positiveSafeInteger(authority.bindingFence)
+    || !positiveSafeInteger(authority.bindingConsumedAtMs)
+    || (authority.bindingConsumedAtMs as number) > certification.expiresAtMs
+    || ![
+      authority.applicationAttemptId,
+      authority.phaseBRequestId,
+    ].every(validAuthorityId)
+    || ![
+      authority.bindingSha256,
+      authority.canaryReservationSha256,
+      authority.layoutObservationSha256,
+      authority.meteringReservationSha256,
+      authority.observedSurfaceSha256,
+    ].every(validSha256)
+    || (authority.rolloutChannel !== "canary"
+      && authority.rolloutChannel !== "general")) {
+    throw new ExecutionLeaseError("irreversible", "invalid_response");
+  }
+  return structuredClone(authority) as unknown as AtsCertifiedReceiptAuthority;
+}
+
+function validAuthorityId(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 1
+    && value.length <= 240
+    && value.trim() === value
+    && !/[\u0000-\u001f\u007f]/u.test(value);
+}
+
+function validSha256(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function positiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
 async function discardBounded(
