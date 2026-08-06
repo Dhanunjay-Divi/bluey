@@ -40,6 +40,13 @@ reviewed redirect URIs, encrypted provider-token storage, and mailbox-worker
 monitoring are configured and verified. The server defaults the read-only
 mailbox worker off when the variable is absent. Connecting an inbox does not
 authorize Bluey to send mail or infer employer outcomes.
+Keep `BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED=0`,
+`BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED=0`, and
+`BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED=0` as independent release
+gates. Read-only inbox consent never implies send or calendar authority. The
+server-owned communication worker keeps decrypted OAuth credentials inside the
+API process and starts no provider write or lookup loop unless its exact flag is
+enabled.
 
 The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
 API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
@@ -64,6 +71,9 @@ BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
 BLUEY_JOBS_MAILBOX_SYNC_ENABLED=0
 # Set to 1 only after the Gmail/Outlook release gates below are complete.
 # BLUEY_JOBS_MAILBOX_SYNC_POLL_SECONDS=30
+BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED=0
 BLUEY_UPSTREAM_SPEND_LIMIT_CENTS=1000
 BLUEY_UPSTREAM_SPEND_WINDOW_HOURS=24
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
@@ -1030,6 +1040,108 @@ source-only wording is:
 
 > Signed ATS certification authority is source-ready; every provider remains
 > Review first pending authorized tenant and runner evidence.
+
+## Reviewed communication release authority
+
+Recruiter replies and interview-calendar actions use an authority boundary that
+is separate from read-only mailbox synchronization. A connected inbox is not
+send authority. The user must inspect the exact immutable draft, and the server
+must verify an explicit provider write grant before approval can become
+dispatchable.
+
+The provider worker runs in-process rather than behind a credential-bearing HTTP
+lease, so OAuth access and refresh tokens never leave the owning server process
+or appear in portal responses. Both `bluey-jobs-api` and `bluey-server` embed the
+worker. The production Jobs routes run under `bluey-jobs-api.service` on port
+8081, which loads `/etc/bluey-api/bluey-jobs.env`; `bluey-api.service` also loads
+that file when `bluey-api-jobs-env.conf` is installed. Before a provider write,
+the worker revalidates the account, application, mailbox connection, exact
+stored reply target and source message where required, payload digest, approval
+revision, granted scope revision, release flag, and fenced attempt. It commits
+an append-only request-start marker before network I/O. Calendar creates use an
+exact IANA time zone and request attendee invitations from the provider.
+
+Keep these gates independent:
+
+```text
+BLUEY_JOBS_COMMUNICATION_OAUTH_WRITE_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED=0
+BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED=0
+```
+
+The dispatch and reconciliation loops are selected at process startup. The
+OAuth write gate is checked on each upgrade and callback request, but a systemd
+environment-file change still does not reach an already running process. After
+an independently approved flag change, restart `bluey-jobs-api.service` and
+every other running worker-capable service that loads `bluey-jobs.env`, including
+`bluey-api.service` when its Jobs environment drop-in is installed. Enabling one
+gate never enables either of the other two.
+
+Do not enable write-scope OAuth until read-only Gmail/Outlook canaries, approved
+Google/Microsoft applications, exact redirect URIs, consent-screen review, token
+rotation/revocation, retention, deletion, and monitoring are complete. Required
+write grants are Gmail send, Google Calendar events, Microsoft Mail.Send, and
+Microsoft Calendars.ReadWrite; capabilities must be derived from the grants the
+provider actually returns.
+
+Do not enable dispatch until fixture and live authorized sandbox matrices prove
+recipient/thread binding, exact provider identity, duplicate prevention,
+disconnect and account-deletion fencing, token expiry/rotation, outage handling,
+and receipt/evidence completeness for all four transports.
+
+Before enabling any communication gate, exercise authenticated list, detail,
+approval, cancellation, and account-export requests with an authorized canary.
+Verify every private communication JSON response sends `Cache-Control: private,
+no-store` and `Pragma: no-cache`, the portal requests use client-side
+`cache: "no-store"`, and no sensitive response is retained in browser or service
+worker caches. The owning customer export intentionally contains the immutable
+reviewed payload; confirm it omits OAuth tokens and grants, provider
+object/thread/conversation IDs, request and idempotency markers, private evidence
+and reconciliation fingerprints, lease or worker identity, and raw provider
+errors. Inspect structured server logs separately and confirm they omit all of
+those fields plus payload text.
+
+Provider timeout, connection loss, 5xx, or malformed success after a possible
+write is `side_effect_unknown`. Never retry it. Reconciliation is a separately
+gated provider lookup that may prove the exact sent message/event, leave the
+result unknown, or prove bounded absence and return the immutable draft to fresh
+user review. A worker cycle claims at most 25 eligible actions, and each action
+has a separate ceiling of 20 reconciliation claims. Exact found or inconclusive
+lookup may run immediately; an authoritative absence counts only after at least
+15 minutes from dispatch, and three counted absences return the action to
+`needs_input`. Persisted unknown observations back off for at least five minutes.
+An inconclusive or conflicting result remains unknown and requires manual
+operator investigation; it never becomes retry authority. Disabling dispatch
+must not convert unknown outcomes into retries.
+
+If account deletion or mailbox disconnect enters communication drain:
+
+1. Treat the persisted drain as a write fence. Do not clear it, reconnect under
+   another identifier, delete the source message, or issue a replacement action.
+2. Allow only exact completion of the already-started attempt and, when its
+   separate flag and provider-read gate are approved, read-only reconciliation.
+3. Preserve the action, attempt, request-start, provider evidence, and encrypted
+   credential boundary while the result remains unknown. Never copy operation
+   keys, provider objects, raw errors, grants, or tokens into tickets or logs.
+4. If exact provider evidence proves success, retain the terminal customer
+   result; if three bounded authoritative absences prove no side effect, cancel
+   the resulting reviewable draft as part of the pending lifecycle rather than
+   approving it again.
+5. If evidence conflicts or stays inconclusive, keep the drain and escalate to
+   the named privacy/incident owner. Retry deletion or disconnect only after the
+   unresolved irreversible authority is terminally settled.
+
+Until the complete Round 605 local matrix and independent review pass, say only:
+
+> Reviewed communication execution authority implementation is in progress;
+> connected inboxes remain read-only and no provider delivery is enabled.
+
+After every source-completable Round 605 gate passes and independent review
+accepts the source, but before authorized provider sandboxes and production
+canaries pass, the strongest honest wording is:
+
+> Reviewed communication execution is source-ready; connected inboxes remain
+> read-only and no reply or calendar action is enabled for provider delivery.
 
 ## External release gates
 
