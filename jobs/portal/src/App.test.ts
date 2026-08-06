@@ -1,18 +1,23 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./api";
 import { previewWorkspace } from "./data/preview";
-import type { CareerProfile, UploadResumeSourceResponse } from "./types";
+import type { CareerProfile, MailboxConnection, UploadResumeSourceResponse } from "./types";
 
 type ResumeUploadRequestId = ReturnType<Crypto["randomUUID"]>;
 
 let ResumeUploadAttemptLineage: typeof import("./App").ResumeUploadAttemptLineage;
 let uploadResumeSourceWithLineage: typeof import("./App").uploadResumeSourceWithLineage;
+let openMailboxCommunicationAuthorization:
+  typeof import("./App").openMailboxCommunicationAuthorization;
 
 beforeAll(async () => {
-  vi.stubGlobal("window", { location: { search: "" } });
+  vi.stubGlobal("window", {
+    location: { search: "", origin: "https://jobs.bluey.example" },
+  });
   const app = await import("./App");
   ResumeUploadAttemptLineage = app.ResumeUploadAttemptLineage;
   uploadResumeSourceWithLineage = app.uploadResumeSourceWithLineage;
+  openMailboxCommunicationAuthorization = app.openMailboxCommunicationAuthorization;
 });
 
 afterAll(() => {
@@ -146,6 +151,97 @@ describe("resume source upload request lineage", () => {
     ]);
   });
 });
+
+describe("mailbox communication authorization", () => {
+  const connection: MailboxConnection = {
+    id: "connection-one",
+    provider: "gmail",
+    status: "connected",
+    account_label: "candidate@gmail.com",
+    aliases: [],
+    capabilities: ["status_sync"],
+    created_at_ms: 1,
+    updated_at_ms: 1,
+  };
+
+  it("never starts or redirects from preview mode", async () => {
+    const start = vi.fn(async () => ({ authorization_url: "https://accounts.example.test" }));
+    const redirect = vi.fn();
+
+    await openMailboxCommunicationAuthorization(
+      true,
+      connection,
+      start,
+      redirect,
+      "https://jobs.bluey.example",
+    );
+
+    expect(start).not.toHaveBeenCalled();
+    expect(redirect).not.toHaveBeenCalled();
+  });
+
+  it("starts the account-bound flow before redirecting outside preview", async () => {
+    const authorizationUrl = googleCommunicationAuthorizationUrl();
+    const start = vi.fn(async () => ({
+      authorization_url: authorizationUrl,
+    }));
+    const redirect = vi.fn();
+
+    await openMailboxCommunicationAuthorization(
+      false,
+      connection,
+      start,
+      redirect,
+      "https://jobs.bluey.example",
+    );
+
+    expect(start).toHaveBeenCalledWith("connection-one");
+    expect(redirect).toHaveBeenCalledWith(authorizationUrl);
+  });
+
+  it("does not redirect when the account-bound authorization URL fails verification", async () => {
+    const start = vi.fn(async () => ({
+      authorization_url: "https://attacker.example/communication-consent",
+    }));
+    const redirect = vi.fn();
+
+    await expect(openMailboxCommunicationAuthorization(
+      false,
+      connection,
+      start,
+      redirect,
+      "https://jobs.bluey.example",
+    )).rejects.toThrow("could not verify");
+
+    expect(start).toHaveBeenCalledWith("connection-one");
+    expect(redirect).not.toHaveBeenCalled();
+  });
+});
+
+function googleCommunicationAuthorizationUrl(): string {
+  const token = "A".repeat(43);
+  const url = new URL("https://accounts.google.com/o/oauth2/v2/auth");
+  url.searchParams.set("client_id", "client.apps.googleusercontent.com");
+  url.searchParams.set(
+    "redirect_uri",
+    "https://jobs.bluey.example/api/jobs/oauth/gmail/callback",
+  );
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", [
+    "openid",
+    "email",
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/calendar.events",
+  ].join(" "));
+  url.searchParams.set("state", token);
+  url.searchParams.set("code_challenge", token);
+  url.searchParams.set("code_challenge_method", "S256");
+  url.searchParams.set("access_type", "offline");
+  url.searchParams.set("include_granted_scopes", "true");
+  url.searchParams.set("prompt", "consent");
+  return url.href;
+}
 
 function responseFor(profile: CareerProfile, requestId: string): UploadResumeSourceResponse {
   return {

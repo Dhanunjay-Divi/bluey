@@ -21,6 +21,7 @@ interface Props {
   workspace: JobsWorkspace;
   onMailboxProviders(): Promise<MailboxProviderAvailability[]>;
   onConnectMailbox(provider: MailboxConnection["provider"]): Promise<void>;
+  onAuthorizeMailboxCommunication(connection: MailboxConnection): Promise<void>;
   onMailboxSyncState(connection: MailboxConnection): Promise<MailboxSyncState>;
   onMailboxMessages(connectionId?: string): Promise<MailboxMessage[]>;
   onSyncMailbox(connection: MailboxConnection): Promise<MailboxSyncState>;
@@ -32,6 +33,7 @@ export function ApplicationInboxSettings({
   workspace,
   onMailboxProviders,
   onConnectMailbox,
+  onAuthorizeMailboxCommunication,
   onMailboxSyncState,
   onMailboxMessages,
   onSyncMailbox,
@@ -45,6 +47,7 @@ export function ApplicationInboxSettings({
   const [messages, setMessages] = useState<MailboxMessage[]>([]);
   const [loading, setLoading] = useState(false);
   const [syncingId, setSyncingId] = useState("");
+  const [authorizingId, setAuthorizingId] = useState("");
 
   const activeConnections = workspace.mailbox_connections.filter(
     (item) => item.status !== "disconnected",
@@ -54,6 +57,7 @@ export function ApplicationInboxSettings({
     let cancelled = false;
     const load = async () => {
       setLoading(true);
+      setProviders(mailboxProvidersAfterLoad(null));
       try {
         const [nextProviders, states, nextMessages] = await Promise.all([
           onMailboxProviders(),
@@ -67,7 +71,7 @@ export function ApplicationInboxSettings({
           activeConnections.length ? onMailboxMessages() : Promise.resolve([]),
         ]);
         if (cancelled) return;
-        setProviders(nextProviders);
+        setProviders(mailboxProvidersAfterLoad(nextProviders));
         setSyncStates(Object.fromEntries(
           states.filter(
             (state): state is readonly [string, MailboxSyncState] => state !== null,
@@ -75,7 +79,10 @@ export function ApplicationInboxSettings({
         ));
         setMessages(nextMessages);
       } catch (requestError) {
-        if (!cancelled) onError(errorMessage(requestError));
+        if (!cancelled) {
+          setProviders(mailboxProvidersAfterLoad(null));
+          onError(errorMessage(requestError));
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -120,10 +127,24 @@ export function ApplicationInboxSettings({
     }
   };
 
+  const authorizeCommunication = async (connection: MailboxConnection) => {
+    if (authorizingId || syncingId) return;
+    setAuthorizingId(connection.id);
+    onError("");
+    try {
+      await onAuthorizeMailboxCommunication(connection);
+    } catch (requestError) {
+      onError(errorMessage(requestError));
+    } finally {
+      setAuthorizingId("");
+    }
+  };
+
   const recentMessages = messages.slice(0, 5);
   const reviewCount = messages.filter(
     (message) => message.processing_status === "needs_input",
   ).length;
+  const calendarActionState = mailboxCalendarActionState(activeConnections, providers);
 
   return <>
     <section className="settings-section" id="application-inbox">
@@ -144,11 +165,21 @@ export function ApplicationInboxSettings({
       </div>
       <div className="connection-usage">
         <span><b>{activeConnections.length}</b> of {workspace.entitlement.connected_inbox_limit} inboxes connected</span>
-        <span>Read-only. Bluey never sends email from a connected inbox.</span>
+        <span>
+          Employer updates stay read-only unless you separately authorize reviewed replies and
+          calendar events.
+        </span>
       </div>
       <div className="integration-list mailbox-connections">
         {activeConnections.map((connection) => {
           const syncState = syncStates[connection.id];
+          const providerAvailability = providers.find(
+            (item) => item.provider === connection.provider,
+          );
+          const communicationAuthorization = mailboxCommunicationAuthorizationState(
+            connection,
+            providerAvailability,
+          );
           return <div key={connection.id}>
             <span className="integration-icon"><Mail /></span>
             <div>
@@ -160,11 +191,30 @@ export function ApplicationInboxSettings({
                   : " · Ready to check"}
                 {syncState?.last_error ? " · Needs attention" : ""}
               </p>
+              {communicationAuthorization === "authorized" && (
+                <small className="mailbox-communication-detail">
+                  Send and calendar-write scopes are authorized. Every exact draft still needs
+                  your review.
+                </small>
+              )}
+              {communicationAuthorization === "available" && (
+                <small className="mailbox-communication-detail">
+                  Optional send and calendar-write scopes are available. Every exact draft still
+                  needs your review.
+                </small>
+              )}
             </div>
             <span className={`integration-state ${connection.status}`}>
               {connection.status === "reauthorization_required" ? "Reconnect" : "Connected"}
             </span>
             <span className="integration-actions">
+              <CommunicationAuthorizationControl
+                connection={connection}
+                availability={providerAvailability}
+                busy={Boolean(authorizingId || syncingId)}
+                authorizing={authorizingId === connection.id}
+                onAuthorize={() => void authorizeCommunication(connection)}
+              />
               {connection.status === "reauthorization_required"
                 ? <button
                   className="button secondary compact"
@@ -226,8 +276,17 @@ export function ApplicationInboxSettings({
 
       <div className="calendar-availability">
         <span className="integration-icon"><CalendarDays /></span>
-        <div><b>Interview calendar</b><p>Calendar connection is not available yet. Inbox tracking works without it.</p></div>
-        <span className="integration-state">Not connected</span>
+        <div>
+          <b>Interview calendar actions</b>
+          <p>{calendarActionDescription(calendarActionState)}</p>
+        </div>
+        <span className={`integration-state ${calendarActionState === "authorized" ? "connected" : ""}`}>
+          {calendarActionState === "authorized"
+            ? "Authorized · review required"
+            : calendarActionState === "available"
+              ? "Authorization available"
+              : "Unavailable"}
+        </span>
       </div>
     </section>
 
@@ -256,6 +315,105 @@ export function ApplicationInboxSettings({
       }}
     />
   </>;
+}
+
+const COMMUNICATION_WRITE_CAPABILITIES = [
+  "recruiter_reply",
+  "interview_calendar",
+] as const;
+
+export type MailboxCommunicationAuthorizationState =
+  | "authorized"
+  | "available"
+  | "unavailable";
+
+export function mailboxCommunicationAuthorizationState(
+  connection: MailboxConnection,
+  availability?: MailboxProviderAvailability,
+): MailboxCommunicationAuthorizationState {
+  if (connection.status !== "connected") return "unavailable";
+  if (COMMUNICATION_WRITE_CAPABILITIES.every(
+    (capability) => connection.capabilities.includes(capability),
+  )) {
+    return "authorized";
+  }
+  return availability?.configured
+    && COMMUNICATION_WRITE_CAPABILITIES.every(
+      (capability) => availability.capabilities.includes(capability),
+    )
+    ? "available"
+    : "unavailable";
+}
+
+export function mailboxCalendarActionState(
+  connections: MailboxConnection[],
+  providers: MailboxProviderAvailability[],
+): MailboxCommunicationAuthorizationState {
+  const states = connections.map((connection) => mailboxCommunicationAuthorizationState(
+    connection,
+    providers.find((provider) => provider.provider === connection.provider),
+  ));
+  if (states.includes("authorized")) return "authorized";
+  if (states.includes("available")) return "available";
+  return "unavailable";
+}
+
+export function mailboxProvidersAfterLoad(
+  result: MailboxProviderAvailability[] | null,
+): MailboxProviderAvailability[] {
+  return result ?? [];
+}
+
+export function CommunicationAuthorizationControl({
+  connection,
+  availability,
+  busy,
+  authorizing,
+  onAuthorize,
+}: {
+  connection: MailboxConnection;
+  availability?: MailboxProviderAvailability;
+  busy: boolean;
+  authorizing: boolean;
+  onAuthorize(): void;
+}) {
+  const state = mailboxCommunicationAuthorizationState(connection, availability);
+  if (state === "authorized") {
+    return (
+      <span
+        className="integration-state connected mailbox-communication-authorized"
+        role="status"
+        title="Send and calendar-write scopes are authorized; every exact draft still requires review."
+      >
+        Replies &amp; calendar authorized
+      </span>
+    );
+  }
+  if (state !== "available") return null;
+  return (
+    <button
+      className="button secondary compact"
+      type="button"
+      aria-label={`Authorize replies and calendar for ${connection.account_label}`}
+      title="Adds send and calendar-write scopes; every exact draft still requires review."
+      disabled={busy}
+      aria-busy={authorizing}
+      onClick={onAuthorize}
+    >
+      {authorizing ? "Opening authorization…" : "Authorize replies & calendar"}
+    </button>
+  );
+}
+
+function calendarActionDescription(state: MailboxCommunicationAuthorizationState): string {
+  if (state === "authorized") {
+    return "A connected account has calendar-write access. Every exact event draft still requires review.";
+  }
+  if (state === "available") {
+    return "A connected account can separately authorize calendar-write access before any "
+      + "reviewed event can be created.";
+  }
+  return "No connected account currently has calendar-write access. Calendar drafts cannot be approved.";
 }
 
 function MailboxDialog({

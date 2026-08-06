@@ -72,6 +72,7 @@ interface Props {
   onDeleteIdentity(identity: ApplicationIdentity): Promise<void>;
   onMailboxProviders(): Promise<MailboxProviderAvailability[]>;
   onConnectMailbox(provider: MailboxConnection["provider"]): Promise<void>;
+  onAuthorizeMailboxCommunication(connection: MailboxConnection): Promise<void>;
   onMailboxSyncState(connection: MailboxConnection): Promise<MailboxSyncState>;
   onMailboxMessages(connectionId?: string): Promise<MailboxMessage[]>;
   onSyncMailbox(connection: MailboxConnection): Promise<MailboxSyncState>;
@@ -95,6 +96,7 @@ export function SettingsView({
   onDeleteIdentity,
   onMailboxProviders,
   onConnectMailbox,
+  onAuthorizeMailboxCommunication,
   onMailboxSyncState,
   onMailboxMessages,
   onSyncMailbox,
@@ -392,6 +394,7 @@ export function SettingsView({
         workspace={workspace}
         onMailboxProviders={onMailboxProviders}
         onConnectMailbox={onConnectMailbox}
+        onAuthorizeMailboxCommunication={onAuthorizeMailboxCommunication}
         onMailboxSyncState={onMailboxSyncState}
         onMailboxMessages={onMailboxMessages}
         onSyncMailbox={onSyncMailbox}
@@ -406,7 +409,14 @@ export function SettingsView({
           <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · local runner beta waitlist" active={workspace.entitlement.plan === "pro"} />
           <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · invited cloud runner beta" active={workspace.entitlement.plan === "cloud"} />
         </div>
-        <p className="plan-footnote">Application emails are included. Connected inboxes use read-only access to match employer updates and never send mail. After the included applications, each additional completed application is {money(workspace.entitlement.overage_cents)} from your shared Bluey balance. Retries and browser handoffs do not count again.</p>
+        <p className="plan-footnote">
+          Application emails are included. Connected inboxes start with read-only employer-update
+          access. Where provider authorization is offered, you can separately add send and
+          calendar-write scopes for reviewed replies and events; every exact draft still requires
+          approval. After the included applications, each additional completed application is
+          {` ${money(workspace.entitlement.overage_cents)} `}
+          from your shared Bluey balance. Retries and browser handoffs do not count again.
+        </p>
       </section>
 
       <ApplicationEmailDialog
