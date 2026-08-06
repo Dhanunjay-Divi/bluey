@@ -21,6 +21,7 @@ import {
   canonicalRunnerVolumeAuthorityProof,
   canonicalRunnerVolumeEnrollmentProof,
   runnerVolumeHttpPayloadSha256,
+  runnerProcessRuntimeSha256,
   RunnerVolumeClient,
   type RunnerVolumeClientError,
 } from "../src/runner-volume-client.js";
@@ -44,7 +45,10 @@ import {
   type RunnerVolumePurgeCommand,
   type UnsignedRunnerVolumePurgeCommand,
 } from "../src/volume-purge.js";
-import { runnerDataRootFromEnv } from "../src/server.js";
+import {
+  runnerDataRootFromEnv,
+  runnerProcessRuntimeGrantFromEnv,
+} from "../src/server.js";
 import type {
   NativeRunnerInventory,
   NativeRunnerInventoryEntry,
@@ -68,6 +72,19 @@ const GRANT_ID = "grant-test-1";
 const GRANT_TOKEN = Buffer.alloc(32, 4).toString("base64url");
 const RESOURCE_FINGERPRINT = "8".repeat(64);
 const RUNNER_BUILD_ID = "runner-602.1";
+const RUNTIME_GRANT_ID = "runtime-grant-test-1";
+const RUNTIME_GRANT_TOKEN = Buffer.alloc(32, 9).toString("base64url");
+const PROCESS_RUNTIME = {
+  runnerImageSha256: "1".repeat(64),
+  runnerBuildId: RUNNER_BUILD_ID,
+  platform: "linux" as const,
+  architecture: "x86_64" as const,
+  automationBundleSha256: "2".repeat(64),
+  playwrightVersion: "1.61.1",
+  chromiumRevision: "chromium-123456",
+  chromiumExecutableSha256: "3".repeat(64),
+};
+const PROCESS_RUNTIME_SHA256 = runnerProcessRuntimeSha256(PROCESS_RUNTIME);
 const PROFILE_SCOPE = "a".repeat(40);
 const SUBJECT = Buffer.alloc(32, 5).toString("base64url");
 
@@ -83,6 +100,18 @@ afterEach(async () => {
 });
 
 describe("runner volume client", () => {
+  it("freezes the process runtime digest across Rust and TypeScript", () => {
+    expect(PROCESS_RUNTIME_SHA256).toBe(
+      "0a6faf7674e8166a8d54d0aea177f73842012dcbd68c15a80fc5ed2571c75dfd",
+    );
+    expect(
+      runnerProcessRuntimeSha256({
+        ...PROCESS_RUNTIME,
+        chromiumRevision: "chromium-mutated",
+      }),
+    ).not.toBe(PROCESS_RUNTIME_SHA256);
+  });
+
   it("requires an explicit runner data root instead of falling back to temporary storage", () => {
     expect(() => runnerDataRootFromEnv({})).toThrow(
       "BLUEY_JOBS_RUNNER_DATA is required",
@@ -90,6 +119,39 @@ describe("runner volume client", () => {
     expect(
       runnerDataRootFromEnv({ BLUEY_JOBS_RUNNER_DATA: "/srv/bluey-runner" }),
     ).toBe("/srv/bluey-runner");
+  });
+
+  it("loads deployment runtime authority separately from the persistent volume", () => {
+    expect(
+      runnerProcessRuntimeGrantFromEnv(
+        RUNNER_BUILD_ID,
+        {
+          BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_ID: RUNTIME_GRANT_ID,
+          BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_TOKEN: RUNTIME_GRANT_TOKEN,
+          BLUEY_JOBS_RUNNER_IMAGE_SHA256: PROCESS_RUNTIME.runnerImageSha256,
+          BLUEY_JOBS_AUTOMATION_BUNDLE_SHA256:
+            PROCESS_RUNTIME.automationBundleSha256,
+          BLUEY_JOBS_PLAYWRIGHT_VERSION: PROCESS_RUNTIME.playwrightVersion,
+          BLUEY_JOBS_CHROMIUM_REVISION: PROCESS_RUNTIME.chromiumRevision,
+          BLUEY_JOBS_CHROMIUM_EXECUTABLE_SHA256:
+            PROCESS_RUNTIME.chromiumExecutableSha256,
+        },
+        "linux",
+        "x64",
+      ),
+    ).toEqual({
+      grantId: RUNTIME_GRANT_ID,
+      grantToken: RUNTIME_GRANT_TOKEN,
+      runtime: PROCESS_RUNTIME,
+    });
+    expect(() =>
+      runnerProcessRuntimeGrantFromEnv(
+        RUNNER_BUILD_ID,
+        {},
+        "linux",
+        "x64",
+      ),
+    ).toThrow("BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_ID is required");
   });
 
   it("rejects a noncanonical runner build before enrollment", async () => {
@@ -128,6 +190,8 @@ describe("runner volume client", () => {
           `volume_id=${fixture.identity.volumeId}`,
           "enrollment_epoch=1",
           `process_instance_id=${fixture.processInstanceId}`,
+          `runtime_grant_id=${RUNTIME_GRANT_ID}`,
+          `runtime_sha256=${PROCESS_RUNTIME_SHA256}`,
         ],
       ),
     );
@@ -182,8 +246,19 @@ describe("runner volume client", () => {
     ).toBe(true);
 
     const claim = calls[1]!.body as Record<string, unknown>;
-    expect(Object.keys(claim)).toEqual(["proof"]);
-    assertAuthorityProof(fixture, calls[1]!, "instance_claim", []);
+    expect(Object.keys(claim).sort()).toEqual(["proof", "runtimeGrant"]);
+    expect(claim.runtimeGrant).toEqual({
+      grantId: RUNTIME_GRANT_ID,
+      grantToken: RUNTIME_GRANT_TOKEN,
+      runtime: PROCESS_RUNTIME,
+    });
+    assertAuthorityProof(fixture, calls[1]!, "instance_claim", [
+      `runtime_grant_id=${RUNTIME_GRANT_ID}`,
+      `runtime_grant_token_sha256=${createHash("sha256")
+        .update(RUNTIME_GRANT_TOKEN, "utf8")
+        .digest("hex")}`,
+      `runtime_sha256=${PROCESS_RUNTIME_SHA256}`,
+    ]);
     const poll = calls[2]!.body as Record<string, unknown>;
     expect(Object.keys(poll).sort()).toEqual([
       "afterCommandId",
@@ -1804,6 +1879,11 @@ function createClient(
     legacyArtifactCount: 0,
     runnerBuildId: RUNNER_BUILD_ID,
     processInstanceId: fixture.processInstanceId,
+    processRuntimeGrant: {
+      grantId: RUNTIME_GRANT_ID,
+      grantToken: RUNTIME_GRANT_TOKEN,
+      runtime: PROCESS_RUNTIME,
+    },
     identity: fixture.identity,
     residency: fixture.residency,
     subjectStorage: fixture.subjectStorage,
@@ -1911,6 +1991,8 @@ function instanceResponse(fixture: Fixture) {
     volumeId: fixture.identity.volumeId,
     enrollmentEpoch: 1,
     processInstanceId: fixture.processInstanceId,
+    runtimeGrantId: RUNTIME_GRANT_ID,
+    runtimeSha256: PROCESS_RUNTIME_SHA256,
     leaseExpiresAtMs: Date.now() + 60_000,
     disposition: "applied",
   };

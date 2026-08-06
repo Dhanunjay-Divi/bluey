@@ -142,6 +142,23 @@ export interface RunnerVolumeAuthorityProof extends UnsignedRunnerVolumeAuthorit
   readonly signature: string;
 }
 
+export interface RunnerProcessRuntimeAttestation {
+  readonly runnerImageSha256: string;
+  readonly runnerBuildId: string;
+  readonly platform: "linux" | "macos" | "windows";
+  readonly architecture: "arm64" | "x86_64";
+  readonly automationBundleSha256: string;
+  readonly playwrightVersion: string;
+  readonly chromiumRevision: string;
+  readonly chromiumExecutableSha256: string;
+}
+
+export interface RunnerProcessRuntimeGrantClaim {
+  readonly grantId: string;
+  readonly grantToken: string;
+  readonly runtime: RunnerProcessRuntimeAttestation;
+}
+
 export interface RunnerVolumeClientOptions {
   readonly origin: string;
   readonly workerSigningKey: string;
@@ -154,6 +171,7 @@ export interface RunnerVolumeClientOptions {
   readonly legacyArtifactCount: number;
   readonly runnerBuildId: string;
   readonly processInstanceId: string;
+  readonly processRuntimeGrant: RunnerProcessRuntimeGrantClaim;
   readonly identity: RunnerVolumeIdentity;
   readonly residency: AccountResidencyIndex;
   readonly subjectStorage: RunnerSubjectStorage;
@@ -224,6 +242,8 @@ interface RunnerVolumeInstanceLease {
   readonly volumeId: string;
   readonly enrollmentEpoch: number;
   readonly processInstanceId: string;
+  readonly runtimeGrantId: string;
+  readonly runtimeSha256: string;
   readonly leaseExpiresAtMs: number;
   readonly disposition: "applied" | "replay";
 }
@@ -273,6 +293,8 @@ export class RunnerVolumeClient {
   readonly #legacyArtifactCount: number;
   readonly #runnerBuildId: string;
   readonly #processInstanceId: string;
+  readonly #processRuntimeGrant: RunnerProcessRuntimeGrantClaim;
+  readonly #processRuntimeSha256: string;
   readonly #identity: RunnerVolumeIdentity;
   readonly #residency: AccountResidencyIndex;
   readonly #subjectStorage: RunnerSubjectStorage;
@@ -336,6 +358,13 @@ export class RunnerVolumeClient {
     }
     decodeCanonicalBase64Url(options.processInstanceId, 32);
     this.#processInstanceId = options.processInstanceId;
+    this.#processRuntimeGrant = boundedProcessRuntimeGrant(
+      options.processRuntimeGrant,
+      this.#runnerBuildId,
+    );
+    this.#processRuntimeSha256 = runnerProcessRuntimeSha256(
+      this.#processRuntimeGrant.runtime,
+    );
     this.#identity = options.identity;
     this.#residency = options.residency;
     this.#subjectStorage = options.subjectStorage;
@@ -403,6 +432,14 @@ export class RunnerVolumeClient {
 
   get processInstanceId(): string {
     return this.#processInstanceId;
+  }
+
+  get runtimeGrantId(): string {
+    return this.#processRuntimeGrant.grantId;
+  }
+
+  get runtimeSha256(): string {
+    return this.#processRuntimeSha256;
   }
 
   get ready(): boolean {
@@ -754,6 +791,8 @@ export class RunnerVolumeClient {
       `volume_id=${this.volumeId}`,
       `enrollment_epoch=${this.enrollmentEpoch}`,
       `process_instance_id=${this.processInstanceId}`,
+      `runtime_grant_id=${this.runtimeGrantId}`,
+      `runtime_sha256=${this.runtimeSha256}`,
     ]);
   }
 
@@ -769,11 +808,26 @@ export class RunnerVolumeClient {
 
   private async claimInstance(): Promise<void> {
     const path = `${API_PREFIX}/${encodeURIComponent(this.volumeId)}/instances/claim`;
-    const proof = this.createAuthorityProof("instance_claim", path, []);
+    const proof = this.createAuthorityProof("instance_claim", path, [
+      `runtime_grant_id=${this.#processRuntimeGrant.grantId}`,
+      `runtime_grant_token_sha256=${createHash("sha256")
+        .update(this.#processRuntimeGrant.grantToken, "utf8")
+        .digest("hex")}`,
+      `runtime_sha256=${this.#processRuntimeSha256}`,
+    ]);
     const lease = parseInstanceLease(
-      await this.request("instance_claim", path, { proof }),
+      await this.request("instance_claim", path, {
+        proof,
+        runtimeGrant: this.#processRuntimeGrant,
+      }),
     );
-    assertInstanceBinding(lease, this.volumeId, this.#processInstanceId);
+    assertInstanceBinding(
+      lease,
+      this.volumeId,
+      this.#processInstanceId,
+      this.runtimeGrantId,
+      this.runtimeSha256,
+    );
   }
 
   private async heartbeat(): Promise<void> {
@@ -782,7 +836,13 @@ export class RunnerVolumeClient {
     const lease = parseInstanceLease(
       await this.request("instance_heartbeat", path, { proof }),
     );
-    assertInstanceBinding(lease, this.volumeId, this.#processInstanceId);
+    assertInstanceBinding(
+      lease,
+      this.volumeId,
+      this.#processInstanceId,
+      this.runtimeGrantId,
+      this.runtimeSha256,
+    );
   }
 
   private async bindResidency(purgeSubject: string): Promise<void> {
@@ -2121,6 +2181,8 @@ function parseInstanceLease(value: unknown): RunnerVolumeInstanceLease {
       "enrollmentEpoch",
       "leaseExpiresAtMs",
       "processInstanceId",
+      "runtimeGrantId",
+      "runtimeSha256",
       "volumeId",
     ],
     "instance_claim",
@@ -2129,6 +2191,10 @@ function parseInstanceLease(value: unknown): RunnerVolumeInstanceLease {
     typeof record.volumeId !== "string" ||
     record.enrollmentEpoch !== ENROLLMENT_EPOCH ||
     typeof record.processInstanceId !== "string" ||
+    typeof record.runtimeGrantId !== "string" ||
+    !SAFE_IDENTIFIER_PATTERN.test(record.runtimeGrantId) ||
+    typeof record.runtimeSha256 !== "string" ||
+    !SHA256_PATTERN.test(record.runtimeSha256) ||
     !Number.isSafeInteger(record.leaseExpiresAtMs) ||
     Number(record.leaseExpiresAtMs) <= Date.now() ||
     (record.disposition !== "applied" && record.disposition !== "replay")
@@ -2295,14 +2361,18 @@ function assertEnrollmentBinding(
 }
 
 function assertInstanceBinding(
-  lease: RunnerVolumeInstanceLease,
-  volumeId: string,
-  processInstanceId: string,
+    lease: RunnerVolumeInstanceLease,
+    volumeId: string,
+    processInstanceId: string,
+    runtimeGrantId: string,
+    runtimeSha256: string,
 ): void {
   if (
     lease.volumeId !== volumeId ||
     lease.enrollmentEpoch !== ENROLLMENT_EPOCH ||
-    lease.processInstanceId !== processInstanceId
+    lease.processInstanceId !== processInstanceId ||
+    lease.runtimeGrantId !== runtimeGrantId ||
+    lease.runtimeSha256 !== runtimeSha256
   ) {
     throw new RunnerVolumeClientError("instance_claim", "invalid_response");
   }
@@ -2378,6 +2448,59 @@ function boundedSigningKey(value: string): string {
   const bytes = Buffer.byteLength(value, "utf8");
   if (bytes < 32 || bytes > 4_096) throw configurationError();
   return value;
+}
+
+function boundedProcessRuntimeGrant(
+  value: RunnerProcessRuntimeGrantClaim,
+  expectedRunnerBuildId: string,
+): RunnerProcessRuntimeGrantClaim {
+  if (!value || typeof value !== "object") throw configurationError();
+  const grantId = safeIdentifier(value.grantId);
+  decodeCanonicalBase64Url(value.grantToken, 32);
+  const runtime = value.runtime;
+  if (
+    !runtime ||
+    typeof runtime !== "object" ||
+    !SHA256_PATTERN.test(runtime.runnerImageSha256) ||
+    safeIdentifier(runtime.runnerBuildId) !== expectedRunnerBuildId ||
+    !["linux", "macos", "windows"].includes(runtime.platform) ||
+    !["arm64", "x86_64"].includes(runtime.architecture) ||
+    !SHA256_PATTERN.test(runtime.automationBundleSha256) ||
+    !SHA256_PATTERN.test(runtime.chromiumExecutableSha256)
+  ) {
+    throw configurationError();
+  }
+  const boundedRuntime = Object.freeze({
+    runnerImageSha256: runtime.runnerImageSha256,
+    runnerBuildId: runtime.runnerBuildId,
+    platform: runtime.platform,
+    architecture: runtime.architecture,
+    automationBundleSha256: runtime.automationBundleSha256,
+    playwrightVersion: boundedText(runtime.playwrightVersion, 80),
+    chromiumRevision: boundedText(runtime.chromiumRevision, 80),
+    chromiumExecutableSha256: runtime.chromiumExecutableSha256,
+  });
+  return Object.freeze({
+    grantId,
+    grantToken: value.grantToken,
+    runtime: boundedRuntime,
+  });
+}
+
+export function runnerProcessRuntimeSha256(
+  runtime: RunnerProcessRuntimeAttestation,
+): string {
+  const canonical =
+    "bluey-jobs-runner-process-runtime-v1\n" +
+    `runner_image_sha256=${runtime.runnerImageSha256}\n` +
+    `runner_build_id=${runtime.runnerBuildId}\n` +
+    `platform=${runtime.platform}\n` +
+    `architecture=${runtime.architecture}\n` +
+    `automation_bundle_sha256=${runtime.automationBundleSha256}\n` +
+    `playwright_version=${runtime.playwrightVersion}\n` +
+    `chromium_revision=${runtime.chromiumRevision}\n` +
+    `chromium_executable_sha256=${runtime.chromiumExecutableSha256}\n`;
+  return createHash("sha256").update(canonical, "utf8").digest("hex");
 }
 
 function boundedText(value: string, maximumBytes: number): string {

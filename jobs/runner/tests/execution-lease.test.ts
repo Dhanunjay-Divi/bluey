@@ -1,17 +1,24 @@
 import { createHash, createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { finalSubmitSurfaceSha256 } from "@bluey/jobs-automation";
 import {
   createExecutionLeaseClientFromEnv,
   ExecutionLeaseClient,
   ExecutionLeaseError,
   runnerOwnerId,
 } from "../src/execution-lease.js";
+import {
+  authorizeCloudFinalSubmitBeforeCheckpoint,
+  hasCloudIrreversibleCheckpointAuthority,
+} from "../src/certified-final-submit.js";
 
 const WORKER_SIGNING_KEY = "worker-signing-key-secret-0123456789abcdef";
 const VOLUME_ID = Buffer.alloc(32, 1).toString("base64url");
 const PROCESS_INSTANCE_ID = Buffer.alloc(32, 2).toString("base64url");
 const PURGE_SUBJECT = Buffer.alloc(32, 3).toString("base64url");
 const VOLUME_KEY_FINGERPRINT = "4".repeat(64);
+const RUNTIME_GRANT_ID = "runner-process-runtime-grant-test";
+const RUNTIME_SHA256 = "7".repeat(64);
 const VOLUME_PROOF = {
   version: 1 as const,
   audience: "bluey-jobs-runner-volume-authority" as const,
@@ -76,6 +83,8 @@ describe("execution lease client", () => {
       volume_id: VOLUME_ID,
       enrollment_epoch: 1,
       process_instance_id: PROCESS_INSTANCE_ID,
+      runtime_grant_id: RUNTIME_GRANT_ID,
+      runtime_sha256: RUNTIME_SHA256,
       volume_proof: VOLUME_PROOF,
     });
     expect(JSON.parse(String(calls[1]?.init?.body))).toMatchObject({
@@ -259,6 +268,172 @@ describe("execution lease client", () => {
     await lease.finish("side_effect_unknown");
   });
 
+  it.each([
+    ["Phase B denial", "denied", "request_failed", 403],
+    ["network error", "network", "request_failed", undefined],
+    ["malformed response", "malformed", "invalid_response", undefined],
+    ["expiry-like denial", "expired", "request_failed", 409],
+    ["timeout", "timeout", "timed_out", undefined],
+  ] as const)(
+    "leaves no irreversible checkpoint or submit activation after %s",
+    async (_label, mode, expectedCode, expectedStatus) => {
+      if (mode === "timeout") vi.useFakeTimers();
+      const order: string[] = [];
+      const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/claim")) return grantResponse();
+        if (url.endsWith("/irreversible")) {
+          order.push("phase_b");
+          if (mode === "network") throw new Error("network unavailable");
+          if (mode === "malformed") {
+            return new Response("{", {
+              status: 200,
+              headers: { "Content-Type": "application/json" },
+            });
+          }
+          if (mode === "timeout") {
+            return new Promise<Response>((_resolve, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(new Error("authorization timed out")),
+                { once: true },
+              );
+            });
+          }
+          return new Response(JSON.stringify({ error: mode }), {
+            status: mode === "expired" ? 409 : 403,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(null, { status: 204 });
+      }) as typeof globalThis.fetch;
+      const lease = await createClient(fetch, { requestTimeoutMs: 100 }).claim(CLAIM);
+      const writeCheckpoint = vi.fn(async () => {
+        order.push("checkpoint");
+      });
+      const activate = vi.fn(() => {
+        order.push("activation");
+      });
+      const failure = authorizeCloudFinalSubmitBeforeCheckpoint(
+        lease,
+        finalSubmitProof(),
+        writeCheckpoint,
+      ).then(() => activate()).catch((error: unknown) => error);
+
+      if (mode === "timeout") await vi.advanceTimersByTimeAsync(100);
+      const error = await failure;
+
+      expect(error).toBeInstanceOf(ExecutionLeaseError);
+      expect(error).toMatchObject({
+        operation: "irreversible",
+        code: expectedCode,
+        ...(expectedStatus === undefined ? {} : { status: expectedStatus }),
+      });
+      expect(order).toEqual(["phase_b"]);
+      expect(writeCheckpoint).not.toHaveBeenCalled();
+      expect(activate).not.toHaveBeenCalled();
+      expect(lease.finalSubmitAttempted).toBe(true);
+      expect(lease.finalSubmitAuthorized).toBe(false);
+      expect(hasCloudIrreversibleCheckpointAuthority(lease)).toBe(false);
+      await lease.stopHeartbeat();
+    },
+  );
+
+  it("writes the irreversible checkpoint only after successful Phase B authorization", async () => {
+    const order: string[] = [];
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) return grantResponse();
+      if (url.endsWith("/irreversible")) {
+        order.push("phase_b");
+        return recordResponse("click_started");
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch).claim(CLAIM);
+    const writeCheckpoint = vi.fn(async () => {
+      expect(lease.finalSubmitAuthorized).toBe(true);
+      order.push("checkpoint");
+    });
+    const activate = vi.fn(() => {
+      order.push("activation");
+    });
+
+    await authorizeCloudFinalSubmitBeforeCheckpoint(
+      lease,
+      finalSubmitProof(),
+      writeCheckpoint,
+    ).then(() => activate());
+
+    expect(order).toEqual(["phase_b", "checkpoint", "activation"]);
+    expect(writeCheckpoint).toHaveBeenCalledOnce();
+    expect(activate).toHaveBeenCalledOnce();
+    expect(hasCloudIrreversibleCheckpointAuthority(lease)).toBe(true);
+    await lease.stopHeartbeat();
+  });
+
+  it("retains exact certified Phase B authority for the immutable receipt", async () => {
+    const authority = certifiedReceiptAuthority();
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) return grantResponse();
+      if (url.endsWith("/irreversible")) {
+        return recordResponse("click_started", {
+          atsCertifiedReceiptAuthority: authority,
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch).claim(CLAIM);
+
+    await lease.beforeFinalSubmit(certifiedFinalSubmitProof());
+
+    expect(lease.finalSubmitAuthorized).toBe(true);
+    expect(lease.atsCertifiedReceiptAuthority).toEqual(authority);
+    const copy = lease.atsCertifiedReceiptAuthority;
+    if (copy) copy.bindingFence = 99;
+    expect(lease.atsCertifiedReceiptAuthority?.bindingFence).toBe(1);
+    await lease.stopHeartbeat();
+  });
+
+  it.each([
+    ["missing", undefined],
+    ["wrong run", { ...certifiedReceiptAuthority(), runId: "run-other" }],
+    ["wrong observed surface", {
+      ...certifiedReceiptAuthority(),
+      observedSurfaceSha256: "b".repeat(64),
+    }],
+    ["invalid signed layout observation", {
+      ...certifiedReceiptAuthority(),
+      layoutObservationSha256: "B".repeat(64),
+    }],
+    ["unknown field", { ...certifiedReceiptAuthority(), extra: true }],
+  ])("rejects %s certified Phase B authority before checkpoint", async (_label, authority) => {
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) return grantResponse();
+      if (url.endsWith("/irreversible")) {
+        return recordResponse("click_started", authority === undefined
+          ? {}
+          : { atsCertifiedReceiptAuthority: authority });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch).claim(CLAIM);
+    const checkpoint = vi.fn(async () => undefined);
+
+    await expect(authorizeCloudFinalSubmitBeforeCheckpoint(
+      lease,
+      certifiedFinalSubmitProof(),
+      checkpoint,
+    )).rejects.toMatchObject({ code: "invalid_response" });
+
+    expect(checkpoint).not.toHaveBeenCalled();
+    expect(lease.finalSubmitAuthorized).toBe(false);
+    expect(lease.atsCertifiedReceiptAuthority).toBeUndefined();
+    await lease.stopHeartbeat();
+  });
+
   it("times out stalled responses and rejects oversized or redirected responses", async () => {
     vi.useFakeTimers();
     const stalledFetch = vi.fn((_input: string | URL | Request, init?: RequestInit) => (
@@ -306,6 +481,8 @@ describe("execution lease client", () => {
     ["enrollment epoch", { enrollment_epoch: 2 }],
     ["process instance", { process_instance_id: Buffer.alloc(32, 8).toString("base64url") }],
     ["key fingerprint", { volume_key_fingerprint: "9".repeat(64) }],
+    ["runtime grant", { runtime_grant_id: "other-runtime-grant" }],
+    ["runtime digest", { runtime_sha256: "9".repeat(64) }],
     ["purge subject", { purge_subject: "not-canonical" }],
   ])("rejects a claim grant with a mismatched %s binding", async (_label, override) => {
     const fetch = vi.fn(async () => grantResponse(override)) as typeof globalThis.fetch;
@@ -463,6 +640,66 @@ function finalSubmitProof() {
   };
 }
 
+function certifiedFinalSubmitProof() {
+  return {
+    ...finalSubmitProof(),
+    schemaVersion: 4 as const,
+    certification: {
+      schemaVersion: 1 as const,
+      provider: "greenhouse" as const,
+      adapterVersion: "2026.07.1-beta.1",
+      manifestSha256: "1".repeat(64),
+      activationSha256: "2".repeat(64),
+      activationGeneration: 2,
+      targetKeySha256: "3".repeat(64),
+      layoutSetSha256: "4".repeat(64),
+      adapterBundleSha256: "5".repeat(64),
+      runnerTargetSha256s: ["6".repeat(64)],
+      expiresAtMs: Date.now() + 60_000,
+    },
+    observedSurface: {
+      schemaVersion: 1 as const,
+      variantKey: "public",
+      layoutContractVersion: 1,
+      surfaceSha256: certifiedObservedSurfaceSha256(),
+    },
+  };
+}
+
+function certifiedReceiptAuthority() {
+  return {
+    schemaVersion: 1 as const,
+    accountId: CLAIM.accountId,
+    applicationId: CLAIM.applicationId,
+    runId: CLAIM.runId,
+    provider: "greenhouse" as const,
+    adapter: "greenhouse" as const,
+    adapterVersion: "2026.07.1-beta.1",
+    manifestSha256: "1".repeat(64),
+    activationSha256: "2".repeat(64),
+    activationGeneration: 2,
+    targetKeySha256: "3".repeat(64),
+    layoutSetSha256: "4".repeat(64),
+    layoutObservationSha256: "7".repeat(64),
+    observedSurfaceSha256: certifiedObservedSurfaceSha256(),
+    adapterBundleSha256: "5".repeat(64),
+    runnerKind: "cloud" as const,
+    runnerTargetSha256: "6".repeat(64),
+    bindingSha256: "8".repeat(64),
+    bindingFence: 1,
+    bindingConsumedAtMs: Date.now(),
+    applicationAttemptId: "attempt-123",
+    phaseBRequestId: "phase-b-request-123",
+    rolloutChannel: "canary" as const,
+    canaryReservationSha256: "9".repeat(64),
+    meteringReservationSha256: "a".repeat(64),
+  };
+}
+
+function certifiedObservedSurfaceSha256(): string {
+  return finalSubmitSurfaceSha256(finalSubmitProof());
+}
+
 function expectSignedWorkerRequest(
   call: { url: string; init?: RequestInit },
   workerId: string,
@@ -507,6 +744,8 @@ function grantResponse(overrides: Record<string, unknown> = {}): Response {
     enrollment_epoch: 1,
     process_instance_id: PROCESS_INSTANCE_ID,
     volume_key_fingerprint: VOLUME_KEY_FINGERPRINT,
+    runtime_grant_id: RUNTIME_GRANT_ID,
+    runtime_sha256: RUNTIME_SHA256,
     ...overrides,
   }), {
     status: 200,
@@ -520,14 +759,23 @@ function runnerVolume() {
     enrollmentEpoch: 1,
     processInstanceId: PROCESS_INSTANCE_ID,
     keyFingerprint: VOLUME_KEY_FINGERPRINT,
+    runtimeGrantId: RUNTIME_GRANT_ID,
+    runtimeSha256: RUNTIME_SHA256,
     createExecutionLeaseClaimProof: () => VOLUME_PROOF,
   };
 }
 
 function recordResponse(
   phase: "prepared" | "click_started" | "released" | "side_effect_unknown" | "submitted",
+  overrides: Record<string, unknown> = {},
 ): Response {
-  return new Response(JSON.stringify({ run_id: "run-123", fence: 7, phase }), {
+  return new Response(JSON.stringify({
+    run_id: "run-123",
+    fence: 7,
+    lease_expires_at_ms: Date.now() + 60_000,
+    phase,
+    ...overrides,
+  }), {
     status: 200,
     headers: { "Content-Type": "application/json" },
   });

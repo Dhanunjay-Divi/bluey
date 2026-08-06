@@ -66,6 +66,35 @@ pub struct FinalSubmitProof {
     pub fields: Vec<FinalSubmitFieldProof>,
     pub part_order: Vec<FinalSubmitPartOrderProof>,
     pub documents: Vec<FinalSubmitDocumentProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certification: Option<AtsFinalSubmitCertificationProof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_surface: Option<AtsFinalSubmitObservedSurfaceProof>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AtsFinalSubmitCertificationProof {
+    pub schema_version: i64,
+    pub provider: String,
+    pub adapter_version: String,
+    pub manifest_sha256: String,
+    pub activation_sha256: String,
+    pub activation_generation: i64,
+    pub target_key_sha256: String,
+    pub layout_set_sha256: String,
+    pub adapter_bundle_sha256: String,
+    pub runner_target_sha256s: Vec<String>,
+    pub expires_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AtsFinalSubmitObservedSurfaceProof {
+    pub schema_version: i64,
+    pub variant_key: String,
+    pub layout_contract_version: i64,
+    pub surface_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -914,6 +943,41 @@ pub struct RoleExperienceEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AtsCertificationSummary {
+    pub provider_label: String,
+    #[serde(default)]
+    pub adapter_version: Option<String>,
+    #[serde(default)]
+    pub certified_runner_kinds: Vec<String>,
+    pub status: String,
+    #[serde(default)]
+    pub last_verified_at_ms: Option<i64>,
+    #[serde(default)]
+    pub expires_at_ms: Option<i64>,
+    pub reason: String,
+    pub next_action: String,
+    pub canary_available: bool,
+}
+
+impl Default for AtsCertificationSummary {
+    fn default() -> Self {
+        Self {
+            provider_label: "Application site".to_string(),
+            adapter_version: None,
+            certified_runner_kinds: Vec::new(),
+            status: "review_only".to_string(),
+            last_verified_at_ms: None,
+            expires_at_ms: None,
+            reason: "No active ATS certification is available for this exact application target."
+                .to_string(),
+            next_action: "Review the packet and complete the provider-specific approval."
+                .to_string(),
+            canary_available: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct JobEligibilityDecision {
     pub capability: String,
     pub can_prepare: bool,
@@ -940,6 +1004,8 @@ pub struct JobEligibilityDecision {
     pub application_identity_id: Option<String>,
     #[serde(default)]
     pub evidence_revision_id: Option<String>,
+    #[serde(default)]
+    pub ats_certification: AtsCertificationSummary,
     pub evaluated_at_ms: i64,
 }
 
@@ -961,6 +1027,7 @@ impl Default for JobEligibilityDecision {
             career_track_id: String::new(),
             application_identity_id: None,
             evidence_revision_id: None,
+            ats_certification: AtsCertificationSummary::default(),
             evaluated_at_ms: 0,
         }
     }
@@ -1546,6 +1613,8 @@ pub struct RunnerVolumeExecutionLeaseGrant {
     pub enrollment_epoch: i64,
     pub process_instance_id: String,
     pub volume_key_fingerprint: String,
+    pub runtime_grant_id: String,
+    pub runtime_sha256: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1940,6 +2009,7 @@ include!("jobs/runner_volume_purge.rs");
 include!("jobs/browser_release_authority.rs");
 include!("jobs/browser_release_trust.rs");
 include!("jobs/browser_release_registry.rs");
+include!("jobs/ats_certification_authority.rs");
 include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
 

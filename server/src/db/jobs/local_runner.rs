@@ -419,6 +419,11 @@ pub fn claim_authorized_local_run_ticket(
 /// Atomically validates the exact local-run authority and reserves protected
 /// evidence headroom immediately before the local browser crosses the
 /// irreversible employer Submit boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalRunSubmitAuthorization {
+    pub ats_certified_receipt_authority: Option<AtsCertifiedReceiptAuthority>,
+}
+
 #[cfg(test)]
 pub(crate) fn local_run_submit_authorized_for_server(
     pool: &DbPool,
@@ -428,7 +433,7 @@ pub(crate) fn local_run_submit_authorized_for_server(
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
 ) -> Result<bool> {
-    local_run_submit_authorized_inner(
+    Ok(local_run_submit_authorization_inner(
         pool,
         run_id,
         ticket_hash,
@@ -436,9 +441,11 @@ pub(crate) fn local_run_submit_authorized_for_server(
         final_submit_proof,
         capacity,
         false,
-    )
+    )?
+    .is_some())
 }
 
+#[cfg(test)]
 pub(crate) fn local_run_submit_authorized_for_distribution(
     pool: &DbPool,
     run_id: &str,
@@ -447,7 +454,26 @@ pub(crate) fn local_run_submit_authorized_for_distribution(
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
 ) -> Result<bool> {
-    local_run_submit_authorized_inner(
+    Ok(local_run_submit_authorization_for_distribution(
+        pool,
+        run_id,
+        ticket_hash,
+        server_release_id,
+        final_submit_proof,
+        capacity,
+    )?
+    .is_some())
+}
+
+pub(crate) fn local_run_submit_authorization_for_distribution(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+    server_release_id: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> Result<Option<LocalRunSubmitAuthorization>> {
+    local_run_submit_authorization_inner(
         pool,
         run_id,
         ticket_hash,
@@ -458,7 +484,7 @@ pub(crate) fn local_run_submit_authorized_for_distribution(
     )
 }
 
-fn local_run_submit_authorized_inner(
+fn local_run_submit_authorization_inner(
     pool: &DbPool,
     run_id: &str,
     ticket_hash: &str,
@@ -466,12 +492,12 @@ fn local_run_submit_authorized_inner(
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
     require_distribution_ready: bool,
-) -> Result<bool> {
+) -> Result<Option<LocalRunSubmitAuthorization>> {
     if capacity.run_id != run_id
         || capacity.runner != "local"
         || !browser_release_safe_id(server_release_id)
     {
-        return Ok(false);
+        return Ok(None);
     }
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
@@ -479,7 +505,7 @@ fn local_run_submit_authorized_inner(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if require_distribution_ready && !sqlite_runner_volume_fleet_distribution_ready(&tx)? {
-                return Ok(false);
+                return Ok(None);
             }
             let ticket = sqlite_local_run_authority(
                 &tx,
@@ -493,11 +519,25 @@ fn local_run_submit_authorized_inner(
                     && ticket.application_id == capacity.application_id
             });
             if !authorized {
-                return Ok(false);
+                return Ok(None);
             }
             if !sqlite_bound_browser_release_submit_allowed(&tx, run_id, server_release_id)? {
-                return Ok(false);
+                return Ok(None);
             }
+            let ats_certified_receipt_authority = match consume_local_ats_certification_sqlite_tx(
+                &tx,
+                final_submit_proof,
+                capacity,
+                now,
+            )? {
+                Some(LocalAtsCertificationConsume::Authorized(authority)) => Some(*authority),
+                Some(LocalAtsCertificationConsume::LayoutDriftQuarantined) => {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                None if final_submit_proof.schema_version == 4 => return Ok(None),
+                None => None,
+            };
             crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(
                 &tx, capacity,
             )?;
@@ -513,7 +553,7 @@ fn local_run_submit_authorized_inner(
                     ExecutionLeaseError::InvalidRequest
                     | ExecutionLeaseError::NotFound
                     | ExecutionLeaseError::Conflict,
-                ) => return Ok(false),
+                ) => return Ok(None),
                 Err(ExecutionLeaseError::Storage(error)) => return Err(error),
             }
             if tx.execute(
@@ -523,18 +563,21 @@ fn local_run_submit_authorized_inner(
                 params![run_id, ticket_hash, now],
             )? != 1
             {
-                return Ok(false);
+                return Ok(None);
             }
             tx.commit()?;
-            Ok(true)
+            Ok(Some(LocalRunSubmitAuthorization {
+                ats_certified_receipt_authority,
+            }))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_postgres_ats_certification(&mut tx)?;
             if require_distribution_ready
                 && !postgres_runner_volume_fleet_distribution_ready(&mut tx)?
             {
-                return Ok(false);
+                return Ok(None);
             }
             let account_id = tx
                 .query_opt(
@@ -544,7 +587,7 @@ fn local_run_submit_authorized_inner(
                 )?
                 .map(|row| row.get::<_, String>(0));
             if account_id.as_deref() != Some(capacity.account_id.as_str()) {
-                return Ok(false);
+                return Ok(None);
             }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx,
@@ -562,12 +605,26 @@ fn local_run_submit_authorized_inner(
                     && ticket.application_id == capacity.application_id
             });
             if !authorized {
-                return Ok(false);
+                return Ok(None);
             }
             postgres_lock_browser_release_registry_shared(&mut tx)?;
             if !postgres_bound_browser_release_submit_allowed(&mut tx, run_id, server_release_id)? {
-                return Ok(false);
+                return Ok(None);
             }
+            let ats_certified_receipt_authority = match consume_local_ats_certification_postgres_tx(
+                &mut tx,
+                final_submit_proof,
+                capacity,
+                now,
+            )? {
+                Some(LocalAtsCertificationConsume::Authorized(authority)) => Some(*authority),
+                Some(LocalAtsCertificationConsume::LayoutDriftQuarantined) => {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                None if final_submit_proof.schema_version == 4 => return Ok(None),
+                None => None,
+            };
             crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(
                 &mut tx, capacity,
             )?;
@@ -583,7 +640,7 @@ fn local_run_submit_authorized_inner(
                     ExecutionLeaseError::InvalidRequest
                     | ExecutionLeaseError::NotFound
                     | ExecutionLeaseError::Conflict,
-                ) => return Ok(false),
+                ) => return Ok(None),
                 Err(ExecutionLeaseError::Storage(error)) => return Err(error),
             }
             if tx.execute(
@@ -593,12 +650,100 @@ fn local_run_submit_authorized_inner(
                 &[&run_id, &ticket_hash, &now],
             )? != 1
             {
-                return Ok(false);
+                return Ok(None);
             }
             tx.commit()?;
-            Ok(true)
+            Ok(Some(LocalRunSubmitAuthorization {
+                ats_certified_receipt_authority,
+            }))
         }
     })
+}
+
+fn local_ats_observed_surface(final_submit_proof: &FinalSubmitProof) -> Option<AtsObservedSurface> {
+    let observed = final_submit_proof.observed_surface.as_ref()?;
+    Some(AtsObservedSurface {
+        variant_key: observed.variant_key.clone(),
+        layout_contract_version: observed.layout_contract_version,
+        surface_sha256: observed.surface_sha256.clone(),
+    })
+}
+
+enum LocalAtsCertificationConsume {
+    Authorized(Box<AtsCertifiedReceiptAuthority>),
+    LayoutDriftQuarantined,
+}
+
+fn consume_local_ats_certification_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now_ms: i64,
+) -> Result<Option<LocalAtsCertificationConsume>> {
+    if final_submit_proof.schema_version != 4 {
+        return Ok(None);
+    }
+    let Some(observed_surface) = local_ats_observed_surface(final_submit_proof) else {
+        return Ok(None);
+    };
+    let request = AtsCertificationPhaseBContextRequest {
+        account_id: capacity.account_id.clone(),
+        application_id: capacity.application_id.clone(),
+        run_id: capacity.run_id.clone(),
+        runner_kind: "local".to_string(),
+        observed_surface,
+        terminal_phase: "consumed".to_string(),
+    };
+    match validate_consume_reserve_ats_application_certification_from_context_sqlite_tx(
+        tx, &request, now_ms,
+    ) {
+        Ok(AtsCertificationPhaseBTransactionOutcome::Authorized(result)) => Ok(Some(
+            LocalAtsCertificationConsume::Authorized(Box::new(
+                result.ats_certified_receipt_authority,
+            )),
+        )),
+        Ok(AtsCertificationPhaseBTransactionOutcome::LayoutDriftQuarantined) => {
+            Ok(Some(LocalAtsCertificationConsume::LayoutDriftQuarantined))
+        }
+        Err(AtsCertificationAuthorityError::Storage(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
+}
+
+fn consume_local_ats_certification_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now_ms: i64,
+) -> Result<Option<LocalAtsCertificationConsume>> {
+    if final_submit_proof.schema_version != 4 {
+        return Ok(None);
+    }
+    let Some(observed_surface) = local_ats_observed_surface(final_submit_proof) else {
+        return Ok(None);
+    };
+    let request = AtsCertificationPhaseBContextRequest {
+        account_id: capacity.account_id.clone(),
+        application_id: capacity.application_id.clone(),
+        run_id: capacity.run_id.clone(),
+        runner_kind: "local".to_string(),
+        observed_surface,
+        terminal_phase: "consumed".to_string(),
+    };
+    match validate_consume_reserve_ats_application_certification_from_context_postgres_tx(
+        tx, &request, now_ms,
+    ) {
+        Ok(AtsCertificationPhaseBTransactionOutcome::Authorized(result)) => Ok(Some(
+            LocalAtsCertificationConsume::Authorized(Box::new(
+                result.ats_certified_receipt_authority,
+            )),
+        )),
+        Ok(AtsCertificationPhaseBTransactionOutcome::LayoutDriftQuarantined) => {
+            Ok(Some(LocalAtsCertificationConsume::LayoutDriftQuarantined))
+        }
+        Err(AtsCertificationAuthorityError::Storage(error)) => Err(error),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]

@@ -59,6 +59,8 @@ pub struct BrowserReleaseClaimBinding {
     pub platform: String,
     pub architecture: String,
     pub build_descriptor_sha256: String,
+    pub automation_bundle_sha256: String,
+    pub chromium_executable_sha256: String,
     pub published_at_ms: i64,
 }
 
@@ -115,9 +117,20 @@ struct BrowserReleaseArtifactRow {
     artifact_filename: String,
     artifact_size_bytes: i64,
     package_kind: String,
+    automation_bundle_sha256: String,
+    chromium_executable_sha256: String,
 }
 
-type BrowserReleaseArtifactContractRow = (String, String, String, String, String, String);
+type BrowserReleaseArtifactContractRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 #[derive(Debug, Clone)]
 struct BrowserPortalArtifactRow {
@@ -132,6 +145,8 @@ struct BrowserPortalArtifactRow {
     artifact_size_bytes: i64,
     artifact_sha256: String,
     app_content_sha256: String,
+    automation_bundle_sha256: String,
+    chromium_executable_sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -369,6 +384,7 @@ where
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
+            lock_postgres_ats_certification(&mut transaction)?;
             let disposition = postgres_claim_local_run_with_browser_release(
                 &mut transaction,
                 run_id,
@@ -406,6 +422,56 @@ fn browser_claim_request_sha256(
         digest.update(b"\0");
     }
     hex::encode(digest.finalize())
+}
+
+fn browser_release_phase_a_context(
+    application: &JobApplication,
+    ticket: &LocalRunTicket,
+    run_id: &str,
+    claim_nonce_sha256: &str,
+    descriptor: &VerifiedBrowserBuildDescriptor,
+    release: &BrowserReleaseClaimBinding,
+) -> Result<Option<AtsCertificationPhaseAContextRequest>> {
+    if application.submission_mode != "auto_submit"
+        || !application_has_frozen_ats_certification(application)
+    {
+        return Ok(None);
+    }
+    let browser_profile_id = ticket
+        .payload
+        .get("browserProfileId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty() && value.len() <= 240)
+        .ok_or_else(|| anyhow::anyhow!("certified local Browser claim has no browser profile"))?;
+    let platform = match release.platform.as_str() {
+        "darwin" => "macos",
+        "windows" => "windows",
+        _ => anyhow::bail!("certified local Browser claim has an invalid platform"),
+    };
+    let architecture = match release.architecture.as_str() {
+        "arm64" => "arm64",
+        "x64" => "x86_64",
+        _ => anyhow::bail!("certified local Browser claim has an invalid architecture"),
+    };
+    Ok(Some(AtsCertificationPhaseAContextRequest {
+        account_id: ticket.account_id.clone(),
+        application_id: ticket.application_id.clone(),
+        run_id: run_id.to_string(),
+        browser_session_id: run_id.to_string(),
+        browser_profile_id: browser_profile_id.to_string(),
+        runtime_attestation: AtsCertificationRuntimeAttestation::Local {
+            platform: platform.to_string(),
+            architecture: architecture.to_string(),
+            browser_release_manifest_sha256: release.manifest_sha256.clone(),
+            browser_artifact_sha256: release.artifact_sha256.clone(),
+            browser_build_descriptor_sha256: release.build_descriptor_sha256.clone(),
+            automation_bundle_sha256: release.automation_bundle_sha256.clone(),
+            playwright_version: descriptor.playwright_version.clone(),
+            chromium_revision: descriptor.chromium_revision.clone(),
+            chromium_executable_sha256: release.chromium_executable_sha256.clone(),
+        },
+        nonce_sha256: claim_nonce_sha256.to_string(),
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -586,6 +652,16 @@ where
     {
         anyhow::bail!("local Browser claim authority changed during commit")
     }
+    if let Some(request) = browser_release_phase_a_context(
+        &application,
+        &ticket,
+        run_id,
+        claim_nonce_sha256,
+        descriptor,
+        &release,
+    )? {
+        create_ats_application_certification_binding_from_context_sqlite_tx(tx, &request, now)?;
+    }
     let event = json!({
         "application_id": ticket.application_id,
         "release": {
@@ -714,12 +790,21 @@ fn sqlite_browser_release_binding(
                 a.artifact_url, a.artifact_filename, a.artifact_size_bytes,
                 b.package_kind, b.release_id, b.build_id, b.app_version,
                 b.protocol_version, b.platform, b.architecture,
-                b.build_descriptor_sha256, m.published_at_ms
+                b.build_descriptor_sha256, runtime.automation_bundle_sha256,
+                runtime.chromium_executable_sha256, m.published_at_ms
            FROM jobs_local_run_release_bindings b
            JOIN jobs_browser_release_manifests m
              ON m.manifest_sha256 = b.manifest_sha256
            JOIN jobs_browser_release_artifacts a
              ON a.manifest_sha256 = b.manifest_sha256 AND a.artifact_id = b.artifact_id
+           JOIN jobs_browser_release_artifact_runtime_components runtime
+             ON runtime.manifest_sha256 = a.manifest_sha256
+            AND runtime.artifact_id = a.artifact_id
+            AND runtime.build_descriptor_sha256 = a.build_descriptor_sha256
+            AND runtime.artifact_sha256 = a.artifact_sha256
+            AND runtime.platform = a.platform
+            AND runtime.architecture = a.architecture
+            AND runtime.package_kind = a.package_kind
           WHERE b.run_id = ?1 AND b.account_id = ?2",
         params![run_id, account_id],
         browser_release_binding_from_sqlite_row,
@@ -759,7 +844,9 @@ fn browser_release_binding_from_sqlite_row(
         platform: row.get(24)?,
         architecture: row.get(25)?,
         build_descriptor_sha256: row.get(26)?,
-        published_at_ms: row.get(27)?,
+        automation_bundle_sha256: row.get(27)?,
+        chromium_executable_sha256: row.get(28)?,
+        published_at_ms: row.get(29)?,
     })
 }
 
@@ -949,6 +1036,16 @@ where
     {
         anyhow::bail!("local Browser claim authority changed during commit")
     }
+    if let Some(request) = browser_release_phase_a_context(
+        &application,
+        &ticket,
+        run_id,
+        claim_nonce_sha256,
+        descriptor,
+        &release,
+    )? {
+        create_ats_application_certification_binding_from_context_postgres_tx(tx, &request, now)?;
+    }
     let event = json!({
         "application_id": ticket.application_id,
         "release": {
@@ -1085,13 +1182,22 @@ fn postgres_browser_release_binding(
                     a.artifact_url, a.artifact_filename, a.artifact_size_bytes,
                     b.package_kind, b.release_id, b.build_id, b.app_version,
                     b.protocol_version, b.platform, b.architecture,
-                    b.build_descriptor_sha256, m.published_at_ms
+                    b.build_descriptor_sha256, runtime.automation_bundle_sha256,
+                    runtime.chromium_executable_sha256, m.published_at_ms
                FROM jobs_local_run_release_bindings b
                JOIN jobs_browser_release_manifests m
                  ON m.manifest_sha256 = b.manifest_sha256
                JOIN jobs_browser_release_artifacts a
                  ON a.manifest_sha256 = b.manifest_sha256
                 AND a.artifact_id = b.artifact_id
+               JOIN jobs_browser_release_artifact_runtime_components runtime
+                 ON runtime.manifest_sha256 = a.manifest_sha256
+                AND runtime.artifact_id = a.artifact_id
+                AND runtime.build_descriptor_sha256 = a.build_descriptor_sha256
+                AND runtime.artifact_sha256 = a.artifact_sha256
+                AND runtime.platform = a.platform
+                AND runtime.architecture = a.architecture
+                AND runtime.package_kind = a.package_kind
               WHERE b.run_id = $1 AND b.account_id = $2",
             &[&run_id, &account_id],
         )?
@@ -1127,7 +1233,9 @@ fn browser_release_binding_from_pg_row(row: postgres::Row) -> BrowserReleaseClai
         platform: row.get(24),
         architecture: row.get(25),
         build_descriptor_sha256: row.get(26),
-        published_at_ms: row.get(27),
+        automation_bundle_sha256: row.get(27),
+        chromium_executable_sha256: row.get(28),
+        published_at_ms: row.get(29),
     }
 }
 
@@ -1330,6 +1438,14 @@ fn sqlite_bound_browser_release_submit_allowed(
               JOIN jobs_browser_release_artifacts a
                 ON a.manifest_sha256 = b.manifest_sha256
                AND a.artifact_id = b.artifact_id
+              JOIN jobs_browser_release_artifact_runtime_components runtime
+                ON runtime.manifest_sha256 = a.manifest_sha256
+               AND runtime.artifact_id = a.artifact_id
+               AND runtime.build_descriptor_sha256 = a.build_descriptor_sha256
+               AND runtime.artifact_sha256 = a.artifact_sha256
+               AND runtime.platform = a.platform
+               AND runtime.architecture = a.architecture
+               AND runtime.package_kind = a.package_kind
               JOIN jobs_browser_release_manifests m
                 ON m.manifest_sha256 = b.manifest_sha256
               JOIN jobs_browser_release_activations act
@@ -1441,6 +1557,14 @@ fn postgres_bound_browser_release_submit_allowed(
                   JOIN jobs_browser_release_artifacts a
                     ON a.manifest_sha256 = b.manifest_sha256
                    AND a.artifact_id = b.artifact_id
+                  JOIN jobs_browser_release_artifact_runtime_components runtime
+                    ON runtime.manifest_sha256 = a.manifest_sha256
+                   AND runtime.artifact_id = a.artifact_id
+                   AND runtime.build_descriptor_sha256 = a.build_descriptor_sha256
+                   AND runtime.artifact_sha256 = a.artifact_sha256
+                   AND runtime.platform = a.platform
+                   AND runtime.architecture = a.architecture
+                   AND runtime.package_kind = a.package_kind
                   JOIN jobs_browser_release_manifests m
                     ON m.manifest_sha256 = b.manifest_sha256
                   JOIN jobs_browser_release_activations act
@@ -1763,19 +1887,29 @@ fn sqlite_local_browser_release_availability(
     let Some(manifest) = manifest else {
         return Ok(browser_release_unavailable());
     };
-    if manifest.authorization_signature_set_sha256
-        != activation.manifest_signature_set_sha256
-    {
+    if manifest.authorization_signature_set_sha256 != activation.manifest_signature_set_sha256 {
         return Ok(browser_release_unavailable());
     }
     let mut statement = connection.prepare(
-        "SELECT artifact_id, platform, architecture, package_kind,
-                build_descriptor_sha256, build_descriptor_signing_key_id,
-                artifact_url, artifact_filename, artifact_size_bytes, artifact_sha256,
-                app_content_sha256
-           FROM jobs_browser_release_artifacts
-          WHERE manifest_sha256 = ?1
-          ORDER BY platform, architecture, package_kind, artifact_id",
+        "SELECT artifact.artifact_id, artifact.platform, artifact.architecture,
+                artifact.package_kind, artifact.build_descriptor_sha256,
+                artifact.build_descriptor_signing_key_id, artifact.artifact_url,
+                artifact.artifact_filename, artifact.artifact_size_bytes,
+                artifact.artifact_sha256, artifact.app_content_sha256,
+                runtime.automation_bundle_sha256,
+                runtime.chromium_executable_sha256
+           FROM jobs_browser_release_artifacts artifact
+           JOIN jobs_browser_release_artifact_runtime_components runtime
+             ON runtime.manifest_sha256 = artifact.manifest_sha256
+            AND runtime.artifact_id = artifact.artifact_id
+            AND runtime.build_descriptor_sha256 = artifact.build_descriptor_sha256
+            AND runtime.artifact_sha256 = artifact.artifact_sha256
+            AND runtime.platform = artifact.platform
+            AND runtime.architecture = artifact.architecture
+            AND runtime.package_kind = artifact.package_kind
+          WHERE artifact.manifest_sha256 = ?1
+          ORDER BY artifact.platform, artifact.architecture,
+                   artifact.package_kind, artifact.artifact_id",
     )?;
     let artifacts = statement
         .query_map(params![activation.manifest_sha256], |row| {
@@ -1791,6 +1925,8 @@ fn sqlite_local_browser_release_availability(
                 artifact_size_bytes: row.get(8)?,
                 artifact_sha256: row.get(9)?,
                 app_content_sha256: row.get(10)?,
+                automation_bundle_sha256: row.get(11)?,
+                chromium_executable_sha256: row.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1811,9 +1947,7 @@ fn sqlite_local_browser_release_availability(
                 activation
                     .activation_authorization_signature_set_sha256
                     .clone(),
-                activation
-                    .policy_authorization_signature_set_sha256
-                    .clone(),
+                activation.policy_authorization_signature_set_sha256.clone(),
             ],
             &artifacts,
         )?
@@ -1916,20 +2050,30 @@ fn postgres_local_browser_release_availability(
     let published_at_ms: i64 = manifest.get(6);
     let artifact_count: i64 = manifest.get(7);
     let manifest_authorization_signature_set_sha256: String = manifest.get(8);
-    if manifest_authorization_signature_set_sha256
-        != activation.manifest_signature_set_sha256
-    {
+    if manifest_authorization_signature_set_sha256 != activation.manifest_signature_set_sha256 {
         return Ok(browser_release_unavailable());
     }
     let artifacts = connection
         .query(
-            "SELECT artifact_id, platform, architecture, package_kind,
-                    build_descriptor_sha256, build_descriptor_signing_key_id,
-                    artifact_url, artifact_filename, artifact_size_bytes, artifact_sha256,
-                    app_content_sha256
-               FROM jobs_browser_release_artifacts
-              WHERE manifest_sha256 = $1
-              ORDER BY platform, architecture, package_kind, artifact_id",
+            "SELECT artifact.artifact_id, artifact.platform, artifact.architecture,
+                    artifact.package_kind, artifact.build_descriptor_sha256,
+                    artifact.build_descriptor_signing_key_id, artifact.artifact_url,
+                    artifact.artifact_filename, artifact.artifact_size_bytes,
+                    artifact.artifact_sha256, artifact.app_content_sha256,
+                    runtime.automation_bundle_sha256,
+                    runtime.chromium_executable_sha256
+               FROM jobs_browser_release_artifacts artifact
+               JOIN jobs_browser_release_artifact_runtime_components runtime
+                 ON runtime.manifest_sha256 = artifact.manifest_sha256
+                AND runtime.artifact_id = artifact.artifact_id
+                AND runtime.build_descriptor_sha256 = artifact.build_descriptor_sha256
+                AND runtime.artifact_sha256 = artifact.artifact_sha256
+                AND runtime.platform = artifact.platform
+                AND runtime.architecture = artifact.architecture
+                AND runtime.package_kind = artifact.package_kind
+              WHERE artifact.manifest_sha256 = $1
+              ORDER BY artifact.platform, artifact.architecture,
+                       artifact.package_kind, artifact.artifact_id",
             &[&activation.manifest_sha256],
         )?
         .into_iter()
@@ -1945,6 +2089,8 @@ fn postgres_local_browser_release_availability(
             artifact_size_bytes: row.get(8),
             artifact_sha256: row.get(9),
             app_content_sha256: row.get(10),
+            automation_bundle_sha256: row.get(11),
+            chromium_executable_sha256: row.get(12),
         })
         .collect::<Vec<_>>();
     if artifacts.len() as i64 != artifact_count
@@ -1960,9 +2106,7 @@ fn postgres_local_browser_release_availability(
                 activation
                     .activation_authorization_signature_set_sha256
                     .clone(),
-                activation
-                    .policy_authorization_signature_set_sha256
-                    .clone(),
+                activation.policy_authorization_signature_set_sha256.clone(),
             ],
             &artifacts,
         )?
@@ -2011,7 +2155,9 @@ fn browser_portal_artifacts_match_policy(
             )
             && reqwest::Url::parse(&artifact.artifact_url).is_ok_and(|url| {
                 url.origin().ascii_serialization() == artifact_origin
-                    && url.path_segments().and_then(|mut segments| segments.next_back())
+                    && url
+                        .path_segments()
+                        .and_then(|mut segments| segments.next_back())
                         == Some(artifact.artifact_filename.as_str())
             })
     })
@@ -2027,6 +2173,8 @@ fn browser_portal_artifact_set_complete(artifacts: &[BrowserPortalArtifactRow]) 
                 artifact.package_kind.clone(),
                 artifact.build_descriptor_sha256.clone(),
                 artifact.app_content_sha256.clone(),
+                artifact.automation_bundle_sha256.clone(),
+                artifact.chromium_executable_sha256.clone(),
                 artifact.artifact_url.clone(),
             )
         })
@@ -2037,13 +2185,13 @@ fn browser_portal_artifact_set_complete(artifacts: &[BrowserPortalArtifactRow]) 
 fn browser_artifact_contract_complete(actual: &[BrowserReleaseArtifactContractRow]) -> bool {
     let identities = actual
         .iter()
-        .map(|(platform, architecture, package_kind, _, _, _)| {
+        .map(|(platform, architecture, package_kind, _, _, _, _, _)| {
             format!("{platform}/{architecture}/{package_kind}")
         })
         .collect::<BTreeSet<_>>();
     let descriptors = actual.iter().fold(
         BTreeMap::<String, BTreeSet<String>>::new(),
-        |mut grouped, (platform, architecture, _, descriptor_sha256, _, _)| {
+        |mut grouped, (platform, architecture, _, descriptor_sha256, _, _, _, _)| {
             grouped
                 .entry(format!("{platform}/{architecture}"))
                 .or_default()
@@ -2057,11 +2205,11 @@ fn browser_artifact_contract_complete(actual: &[BrowserReleaseArtifactContractRo
         .collect::<BTreeSet<_>>();
     let artifact_urls = actual
         .iter()
-        .map(|(_, _, _, _, _, artifact_url)| artifact_url)
+        .map(|(_, _, _, _, _, _, _, artifact_url)| artifact_url)
         .collect::<BTreeSet<_>>();
     let app_content = actual.iter().fold(
         BTreeMap::<String, BTreeSet<String>>::new(),
-        |mut grouped, (platform, architecture, _, _, app_content_sha256, _)| {
+        |mut grouped, (platform, architecture, _, _, app_content_sha256, _, _, _)| {
             grouped
                 .entry(format!("{platform}/{architecture}"))
                 .or_default()
@@ -2069,22 +2217,61 @@ fn browser_artifact_contract_complete(actual: &[BrowserReleaseArtifactContractRo
             grouped
         },
     );
+    let automation_bundles = actual.iter().fold(
+        BTreeMap::<String, BTreeSet<String>>::new(),
+        |mut grouped, (platform, architecture, _, _, _, automation_sha256, _, _)| {
+            grouped
+                .entry(format!("{platform}/{architecture}"))
+                .or_default()
+                .insert(automation_sha256.clone());
+            grouped
+        },
+    );
+    let chromium_executables = actual.iter().fold(
+        BTreeMap::<String, BTreeSet<String>>::new(),
+        |mut grouped, (platform, architecture, _, _, _, _, chromium_sha256, _)| {
+            grouped
+                .entry(format!("{platform}/{architecture}"))
+                .or_default()
+                .insert(chromium_sha256.clone());
+            grouped
+        },
+    );
     identities.len() == actual.len()
         && artifact_urls.len() == actual.len()
         && actual.iter().all(
-            |(_, _, package_kind, descriptor_sha256, app_content_sha256, artifact_url)| {
-                [descriptor_sha256, app_content_sha256].iter().all(|digest| {
+            |(
+                _,
+                _,
+                package_kind,
+                descriptor_sha256,
+                app_content_sha256,
+                automation_bundle_sha256,
+                chromium_executable_sha256,
+                artifact_url,
+            )| {
+                [
+                    descriptor_sha256,
+                    app_content_sha256,
+                    automation_bundle_sha256,
+                    chromium_executable_sha256,
+                ]
+                .iter()
+                .all(|digest| {
                     digest.len() == 64
                         && **digest == digest.to_ascii_lowercase()
                         && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-                }) && browser_release_artifact_url_matches_package_kind(
-                    artifact_url,
-                    package_kind,
-                )
+                }) && browser_release_artifact_url_matches_package_kind(artifact_url, package_kind)
             },
         )
         && app_content.len() == 3
         && app_content.values().all(|values| values.len() == 1)
+        && automation_bundles.len() == 3
+        && automation_bundles.values().all(|values| values.len() == 1)
+        && chromium_executables.len() == 3
+        && chromium_executables
+            .values()
+            .all(|values| values.len() == 1)
         && descriptors.len() == 3
         && descriptors.values().all(|values| values.len() == 1)
         && descriptor_digests.len() == 3
@@ -2475,14 +2662,26 @@ fn sqlite_browser_release_for_claim_tx(
     let package_kind = browser_installer_package_kind(&descriptor.platform);
     let artifact = tx
         .query_row(
-            "SELECT artifact_id, artifact_sha256, artifact_url, artifact_filename,
-                    artifact_size_bytes, package_kind
-               FROM jobs_browser_release_artifacts
-              WHERE manifest_sha256 = ?1 AND platform = ?2 AND architecture = ?3
-                AND package_kind = ?4 AND build_descriptor_sha256 = ?5
-                AND build_descriptor_base64url = ?6
-                AND build_descriptor_signature_base64url = ?7
-                AND build_descriptor_signing_key_id = ?8",
+            "SELECT artifact.artifact_id, artifact.artifact_sha256,
+                    artifact.artifact_url, artifact.artifact_filename,
+                    artifact.artifact_size_bytes, artifact.package_kind,
+                    runtime.automation_bundle_sha256,
+                    runtime.chromium_executable_sha256
+               FROM jobs_browser_release_artifacts artifact
+               JOIN jobs_browser_release_artifact_runtime_components runtime
+                 ON runtime.manifest_sha256 = artifact.manifest_sha256
+                AND runtime.artifact_id = artifact.artifact_id
+                AND runtime.build_descriptor_sha256 = artifact.build_descriptor_sha256
+                AND runtime.artifact_sha256 = artifact.artifact_sha256
+                AND runtime.platform = artifact.platform
+                AND runtime.architecture = artifact.architecture
+                AND runtime.package_kind = artifact.package_kind
+              WHERE artifact.manifest_sha256 = ?1 AND artifact.platform = ?2
+                AND artifact.architecture = ?3 AND artifact.package_kind = ?4
+                AND artifact.build_descriptor_sha256 = ?5
+                AND artifact.build_descriptor_base64url = ?6
+                AND artifact.build_descriptor_signature_base64url = ?7
+                AND artifact.build_descriptor_signing_key_id = ?8",
             params![
                 activation.manifest_sha256,
                 descriptor.platform,
@@ -2501,6 +2700,8 @@ fn sqlite_browser_release_for_claim_tx(
                     artifact_filename: row.get(3)?,
                     artifact_size_bytes: row.get(4)?,
                     package_kind: row.get(5)?,
+                    automation_bundle_sha256: row.get(6)?,
+                    chromium_executable_sha256: row.get(7)?,
                 })
             },
         )
@@ -2514,11 +2715,21 @@ fn sqlite_browser_release_for_claim_tx(
         |row| row.get(0),
     )?;
     let mut target_statement = tx.prepare(
-        "SELECT platform, architecture, package_kind, build_descriptor_sha256,
-                app_content_sha256, artifact_url
-           FROM jobs_browser_release_artifacts
-          WHERE manifest_sha256 = ?1
-          ORDER BY platform, architecture, package_kind",
+        "SELECT artifact.platform, artifact.architecture, artifact.package_kind,
+                artifact.build_descriptor_sha256, artifact.app_content_sha256,
+                runtime.automation_bundle_sha256,
+                runtime.chromium_executable_sha256, artifact.artifact_url
+           FROM jobs_browser_release_artifacts artifact
+           JOIN jobs_browser_release_artifact_runtime_components runtime
+             ON runtime.manifest_sha256 = artifact.manifest_sha256
+            AND runtime.artifact_id = artifact.artifact_id
+            AND runtime.build_descriptor_sha256 = artifact.build_descriptor_sha256
+            AND runtime.artifact_sha256 = artifact.artifact_sha256
+            AND runtime.platform = artifact.platform
+            AND runtime.architecture = artifact.architecture
+            AND runtime.package_kind = artifact.package_kind
+          WHERE artifact.manifest_sha256 = ?1
+          ORDER BY artifact.platform, artifact.architecture, artifact.package_kind",
     )?;
     let artifact_targets = target_statement
         .query_map(params![activation.manifest_sha256], |row| {
@@ -2529,6 +2740,8 @@ fn sqlite_browser_release_for_claim_tx(
                 row.get::<_, String>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, String>(7)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2669,14 +2882,26 @@ fn postgres_browser_release_for_claim_tx(
     }
     let package_kind = browser_installer_package_kind(&descriptor.platform);
     let artifact = tx.query_opt(
-        "SELECT artifact_id, artifact_sha256, artifact_url, artifact_filename,
-                artifact_size_bytes, package_kind
-           FROM jobs_browser_release_artifacts
-          WHERE manifest_sha256 = $1 AND platform = $2 AND architecture = $3
-            AND package_kind = $4 AND build_descriptor_sha256 = $5
-            AND build_descriptor_base64url = $6
-            AND build_descriptor_signature_base64url = $7
-            AND build_descriptor_signing_key_id = $8",
+        "SELECT artifact.artifact_id, artifact.artifact_sha256,
+                artifact.artifact_url, artifact.artifact_filename,
+                artifact.artifact_size_bytes, artifact.package_kind,
+                runtime.automation_bundle_sha256,
+                runtime.chromium_executable_sha256
+           FROM jobs_browser_release_artifacts artifact
+           JOIN jobs_browser_release_artifact_runtime_components runtime
+             ON runtime.manifest_sha256 = artifact.manifest_sha256
+            AND runtime.artifact_id = artifact.artifact_id
+            AND runtime.build_descriptor_sha256 = artifact.build_descriptor_sha256
+            AND runtime.artifact_sha256 = artifact.artifact_sha256
+            AND runtime.platform = artifact.platform
+            AND runtime.architecture = artifact.architecture
+            AND runtime.package_kind = artifact.package_kind
+          WHERE artifact.manifest_sha256 = $1 AND artifact.platform = $2
+            AND artifact.architecture = $3 AND artifact.package_kind = $4
+            AND artifact.build_descriptor_sha256 = $5
+            AND artifact.build_descriptor_base64url = $6
+            AND artifact.build_descriptor_signature_base64url = $7
+            AND artifact.build_descriptor_signing_key_id = $8",
         &[
             &activation.manifest_sha256,
             &descriptor.platform,
@@ -2698,6 +2923,8 @@ fn postgres_browser_release_for_claim_tx(
         artifact_filename: artifact.get(3),
         artifact_size_bytes: artifact.get(4),
         package_kind: artifact.get(5),
+        automation_bundle_sha256: artifact.get(6),
+        chromium_executable_sha256: artifact.get(7),
     };
     let actual_artifact_count: i64 = tx
         .query_one(
@@ -2707,11 +2934,22 @@ fn postgres_browser_release_for_claim_tx(
         .get(0);
     let artifact_targets = tx
         .query(
-            "SELECT platform, architecture, package_kind, build_descriptor_sha256,
-                    app_content_sha256, artifact_url
-               FROM jobs_browser_release_artifacts
-              WHERE manifest_sha256 = $1
-              ORDER BY platform, architecture, package_kind",
+            "SELECT artifact.platform, artifact.architecture,
+                    artifact.package_kind, artifact.build_descriptor_sha256,
+                    artifact.app_content_sha256, runtime.automation_bundle_sha256,
+                    runtime.chromium_executable_sha256, artifact.artifact_url
+               FROM jobs_browser_release_artifacts artifact
+               JOIN jobs_browser_release_artifact_runtime_components runtime
+                 ON runtime.manifest_sha256 = artifact.manifest_sha256
+                AND runtime.artifact_id = artifact.artifact_id
+                AND runtime.build_descriptor_sha256 = artifact.build_descriptor_sha256
+                AND runtime.artifact_sha256 = artifact.artifact_sha256
+                AND runtime.platform = artifact.platform
+                AND runtime.architecture = artifact.architecture
+                AND runtime.package_kind = artifact.package_kind
+              WHERE artifact.manifest_sha256 = $1
+              ORDER BY artifact.platform, artifact.architecture,
+                       artifact.package_kind",
             &[&activation.manifest_sha256],
         )?
         .into_iter()
@@ -2723,6 +2961,8 @@ fn postgres_browser_release_for_claim_tx(
                 row.get::<_, String>(3),
                 row.get::<_, String>(4),
                 row.get::<_, String>(5),
+                row.get::<_, String>(6),
+                row.get::<_, String>(7),
             )
         })
         .collect::<Vec<_>>();
@@ -2783,11 +3023,10 @@ fn browser_release_claim_artifact_set_matches_policy(
     artifact_origin: &str,
 ) -> bool {
     browser_artifact_contract_complete(artifacts)
-        && artifacts.iter().all(|(_, _, _, _, _, artifact_url)| {
+        && artifacts.iter().all(|(_, _, _, _, _, _, _, artifact_url)| {
             browser_release_immutable_artifact_url(artifact_url, release_id)
-                && reqwest::Url::parse(artifact_url).is_ok_and(|url| {
-                    url.origin().ascii_serialization() == artifact_origin
-                })
+                && reqwest::Url::parse(artifact_url)
+                    .is_ok_and(|url| url.origin().ascii_serialization() == artifact_origin)
         })
 }
 
@@ -2991,6 +3230,8 @@ fn browser_release_claim_binding(
         platform: descriptor.platform.clone(),
         architecture: descriptor.architecture.clone(),
         build_descriptor_sha256: descriptor.descriptor_sha256.clone(),
+        automation_bundle_sha256: artifact.automation_bundle_sha256,
+        chromium_executable_sha256: artifact.chromium_executable_sha256,
         published_at_ms: manifest.published_at_ms,
     }
 }
@@ -3022,9 +3263,11 @@ pub fn browser_release_binding_sha256(binding: &BrowserReleaseClaimBinding) -> S
         binding.architecture.clone(),
         binding.package_kind.clone(),
         binding.build_descriptor_sha256.clone(),
+        binding.automation_bundle_sha256.clone(),
+        binding.chromium_executable_sha256.clone(),
     ];
     let mut digest = Sha256::new();
-    digest.update(b"bluey-jobs-local-run-release-binding-v2\0");
+    digest.update(b"bluey-jobs-local-run-release-binding-v3\0");
     for field in fields {
         digest.update(field.as_bytes());
         digest.update(b"\0");

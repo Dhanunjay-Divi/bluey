@@ -43,12 +43,12 @@ export function approvedExecutionChecksum(
       job,
     }));
   }
-  if (schemaVersion !== 2) {
+  if (schemaVersion !== 2 && schemaVersion !== 3) {
     throw new ApprovedExecutionIntegrityError("Unsupported approved execution checksum version");
   }
-  assertApprovedExecutionAdmission(admission);
+  assertApprovedExecutionAdmission(admission, schemaVersion);
   return sha256Hex(canonicalJson({
-    schema_version: 2,
+    schema_version: schemaVersion,
     admission,
     packet: packetWithoutChecksum,
     job,
@@ -152,7 +152,7 @@ function hasUnpairedSurrogate(value: string): boolean {
   return false;
 }
 
-function assertApprovedExecutionAdmission(value: unknown): void {
+function assertApprovedExecutionAdmission(value: unknown, schemaVersion: 2 | 3): void {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ApprovedExecutionIntegrityError("Approved execution admission is missing");
   }
@@ -163,22 +163,77 @@ function assertApprovedExecutionAdmission(value: unknown): void {
     }
     return;
   }
-  if (admission.kind !== "track_auto_submit"
-    || !sameKeys(admission, [
+  const expectedKeys = [
+      ...(schemaVersion === 3 ? ["ats_certification"] : []),
       "authority_fingerprint",
       "authorization_id",
       "career_track_id",
       "kind",
       "revision_no",
-    ])
+    ];
+  if (admission.kind !== "track_auto_submit"
+    || !sameKeys(admission, expectedKeys)
     || !validAdmissionId(admission.authorization_id)
     || !validAdmissionId(admission.career_track_id)
     || !Number.isSafeInteger(admission.revision_no)
     || (admission.revision_no as number) <= 0
     || typeof admission.authority_fingerprint !== "string"
-    || !CHECKSUM_PATTERN.test(admission.authority_fingerprint)) {
+    || !CHECKSUM_PATTERN.test(admission.authority_fingerprint)
+    || (schemaVersion === 3
+      && !validAtsCertificationAdmission(admission.ats_certification))) {
     throw new ApprovedExecutionIntegrityError("Auto-submit admission is invalid");
   }
+}
+
+function validAtsCertificationAdmission(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const certification = value as Record<string, unknown>;
+  if (!sameKeys(certification, [
+    "activation_generation",
+    "activation_sha256",
+    "adapter_bundle_sha256",
+    "adapter_version",
+    "expires_at_ms",
+    "layout_contract_version",
+    "layout_set_sha256",
+    "manifest_sha256",
+    "provider",
+    "runner_target_sha256s",
+    "schema_version",
+    "surface_sha256",
+    "target_key_sha256",
+    "variant_key",
+  ])
+    || certification.schema_version !== 1
+    || (certification.provider !== "greenhouse" && certification.provider !== "lever")
+    || !validAdmissionId(certification.adapter_version)
+    || !validAdmissionId(certification.variant_key)
+    || !Number.isSafeInteger(certification.layout_contract_version)
+    || (certification.layout_contract_version as number) <= 0
+    || !Number.isSafeInteger(certification.activation_generation)
+    || (certification.activation_generation as number) <= 0
+    || !Number.isSafeInteger(certification.expires_at_ms)
+    || (certification.expires_at_ms as number) <= 0
+    || !Array.isArray(certification.runner_target_sha256s)
+    || certification.runner_target_sha256s.length < 1
+    || certification.runner_target_sha256s.length > 2) {
+    return false;
+  }
+  const digests = [
+    certification.manifest_sha256,
+    certification.activation_sha256,
+    certification.target_key_sha256,
+    certification.layout_set_sha256,
+    certification.surface_sha256,
+    certification.adapter_bundle_sha256,
+    ...certification.runner_target_sha256s,
+  ];
+  if (!digests.every((digest) => typeof digest === "string" && CHECKSUM_PATTERN.test(digest))) {
+    return false;
+  }
+  return certification.runner_target_sha256s.every((digest, index, values) => (
+    index === 0 || values[index - 1] < digest
+  ));
 }
 
 function sameKeys(value: Record<string, unknown>, expected: string[]): boolean {

@@ -12,6 +12,23 @@ struct StoredExecutionLease {
     lease_expires_at_ms: i64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct IrreversibleExecutionLeaseRecord {
+    #[serde(flatten)]
+    pub lease: ExecutionLeaseRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ats_certified_receipt_authority: Option<AtsCertifiedReceiptAuthority>,
+}
+
+impl std::ops::Deref for IrreversibleExecutionLeaseRecord {
+    type Target = ExecutionLeaseRecord;
+
+    fn deref(&self) -> &Self::Target {
+        &self.lease
+    }
+}
+
 pub fn execution_browser_profile_id(account_id: &str, identity_id: &str) -> String {
     format!(
         "{}:{}",
@@ -50,6 +67,81 @@ fn validate_execution_access(
     Ok(())
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalSubmitSurfaceCanonical<'a> {
+    adapter: &'a str,
+    adapter_version: &'a str,
+    control: &'a str,
+    fields: Vec<FinalSubmitSurfaceField<'a>>,
+    files: Vec<FinalSubmitSurfaceField<'a>>,
+    form: FinalSubmitSurfaceForm<'a>,
+    part_order: Vec<FinalSubmitSurfacePart<'a>>,
+    schema_version: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalSubmitSurfaceField<'a> {
+    field_name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FinalSubmitSurfaceForm<'a> {
+    enctype: &'a str,
+    form_identity_sha256: String,
+    form_target: &'a str,
+    method: &'a str,
+}
+
+#[derive(Serialize)]
+struct FinalSubmitSurfacePart<'a> {
+    index: i64,
+    kind: &'a str,
+}
+
+fn final_submit_surface_sha256(proof: &FinalSubmitProof) -> ExecutionLeaseResult<String> {
+    let canonical = FinalSubmitSurfaceCanonical {
+        adapter: &proof.adapter,
+        adapter_version: &proof.adapter_version,
+        control: &proof.control,
+        fields: proof
+            .fields
+            .iter()
+            .map(|field| FinalSubmitSurfaceField {
+                field_name: &field.field_name,
+            })
+            .collect(),
+        files: proof
+            .files
+            .iter()
+            .map(|file| FinalSubmitSurfaceField {
+                field_name: &file.field_name,
+            })
+            .collect(),
+        form: FinalSubmitSurfaceForm {
+            enctype: &proof.target.enctype,
+            form_identity_sha256: hex::encode(Sha256::digest(
+                proof.target.form_identity.as_bytes(),
+            )),
+            form_target: &proof.target.form_target,
+            method: &proof.target.method,
+        },
+        part_order: proof
+            .part_order
+            .iter()
+            .map(|part| FinalSubmitSurfacePart {
+                index: part.index,
+                kind: &part.kind,
+            })
+            .collect(),
+        schema_version: 1,
+    };
+    let bytes = serde_json::to_vec(&canonical).map_err(|_| ExecutionLeaseError::InvalidRequest)?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
 fn validate_final_submit_proof(
     account_id: &str,
     application: &JobApplication,
@@ -84,7 +176,13 @@ fn validate_final_submit_proof(
     let page_job_key = final_submit_provider_job_key(expected_provider.0, &proof.job.page_url)?;
     let action_job_key =
         final_submit_provider_job_key(expected_provider.0, &proof.target.action_url)?;
-    if proof.schema_version != 3
+    let certified = proof.schema_version == 4;
+    let frozen_certified = application_has_frozen_ats_certification(application);
+    if !((proof.schema_version == 3
+        && proof.certification.is_none()
+        && proof.observed_surface.is_none())
+        || (certified && proof.certification.is_some() && proof.observed_surface.is_some()))
+        || frozen_certified != certified
         || proof.adapter != expected_provider.0
         || proof.adapter_version != expected_provider.1
         || proof.control != expected_provider.2
@@ -105,6 +203,9 @@ fn validate_final_submit_proof(
         || !valid_final_submit_part_order(proof)
     {
         return Err(ExecutionLeaseError::InvalidRequest);
+    }
+    if certified {
+        validate_certified_final_submit_binding(application, proof, expected_provider.0)?;
     }
     let resume_version_id = approved
         .packet
@@ -202,6 +303,125 @@ fn validate_final_submit_proof(
     Ok(())
 }
 
+pub fn application_has_frozen_ats_certification(application: &JobApplication) -> bool {
+    application
+        .receipt
+        .pointer("/approved_execution/schema_version")
+        .and_then(Value::as_i64)
+        == Some(3)
+        && application
+            .receipt
+            .pointer("/approved_execution/admission/kind")
+            .and_then(Value::as_str)
+            == Some("track_auto_submit")
+        && application
+            .receipt
+            .pointer("/approved_execution/admission/ats_certification")
+            .is_some_and(Value::is_object)
+}
+
+fn validate_certified_final_submit_binding(
+    application: &JobApplication,
+    proof: &FinalSubmitProof,
+    expected_provider: &str,
+) -> ExecutionLeaseResult<()> {
+    let certification = proof
+        .certification
+        .as_ref()
+        .ok_or(ExecutionLeaseError::InvalidRequest)?;
+    let observed_surface = proof
+        .observed_surface
+        .as_ref()
+        .ok_or(ExecutionLeaseError::InvalidRequest)?;
+    if certification.schema_version != 1
+        || certification.provider != expected_provider
+        || certification.adapter_version != proof.adapter_version
+        || certification.activation_generation <= 0
+        || certification.expires_at_ms <= now_ms()
+        || observed_surface.schema_version != 1
+        || !validate_execution_binding(&observed_surface.variant_key, 120)
+        || observed_surface.layout_contract_version <= 0
+        || !valid_final_submit_sha256(&observed_surface.surface_sha256)
+        || final_submit_surface_sha256(proof)? != observed_surface.surface_sha256
+        || certification.runner_target_sha256s.is_empty()
+        || certification.runner_target_sha256s.len() > 2
+    {
+        return Err(ExecutionLeaseError::InvalidRequest);
+    }
+    for digest in [
+        certification.manifest_sha256.as_str(),
+        certification.activation_sha256.as_str(),
+        certification.target_key_sha256.as_str(),
+        certification.layout_set_sha256.as_str(),
+        certification.adapter_bundle_sha256.as_str(),
+    ] {
+        if !valid_final_submit_sha256(digest) {
+            return Err(ExecutionLeaseError::InvalidRequest);
+        }
+    }
+    let mut previous: Option<&str> = None;
+    for digest in &certification.runner_target_sha256s {
+        if !valid_final_submit_sha256(digest)
+            || previous.is_some_and(|previous| previous >= digest.as_str())
+        {
+            return Err(ExecutionLeaseError::InvalidRequest);
+        }
+        previous = Some(digest);
+    }
+
+    let admission = application
+        .receipt
+        .pointer("/approved_execution/admission/ats_certification")
+        .and_then(Value::as_object)
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    let exact = admission.get("schema_version").and_then(Value::as_i64)
+        == Some(certification.schema_version)
+        && admission.get("provider").and_then(Value::as_str)
+            == Some(certification.provider.as_str())
+        && admission.get("adapter_version").and_then(Value::as_str)
+            == Some(certification.adapter_version.as_str())
+        && admission.get("manifest_sha256").and_then(Value::as_str)
+            == Some(certification.manifest_sha256.as_str())
+        && admission.get("activation_sha256").and_then(Value::as_str)
+            == Some(certification.activation_sha256.as_str())
+        && admission
+            .get("activation_generation")
+            .and_then(Value::as_i64)
+            == Some(certification.activation_generation)
+        && admission.get("target_key_sha256").and_then(Value::as_str)
+            == Some(certification.target_key_sha256.as_str())
+        && admission.get("layout_set_sha256").and_then(Value::as_str)
+            == Some(certification.layout_set_sha256.as_str())
+        && admission.get("variant_key").and_then(Value::as_str)
+            == Some(observed_surface.variant_key.as_str())
+        && admission
+            .get("layout_contract_version")
+            .and_then(Value::as_i64)
+            == Some(observed_surface.layout_contract_version)
+        && admission.get("surface_sha256").and_then(Value::as_str)
+            == Some(observed_surface.surface_sha256.as_str())
+        && admission
+            .get("adapter_bundle_sha256")
+            .and_then(Value::as_str)
+            == Some(certification.adapter_bundle_sha256.as_str())
+        && admission
+            .get("runner_target_sha256s")
+            .and_then(Value::as_array)
+            .is_some_and(|values| {
+                values.len() == certification.runner_target_sha256s.len()
+                    && values
+                        .iter()
+                        .zip(&certification.runner_target_sha256s)
+                        .all(|(actual, expected)| actual.as_str() == Some(expected.as_str()))
+            })
+        && admission.get("expires_at_ms").and_then(Value::as_i64)
+            == Some(certification.expires_at_ms);
+    if !exact {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
 fn final_submit_file_kind_and_hash(name: &str) -> Option<(&'static str, &str)> {
     let stem = name.strip_suffix(".pdf")?;
     let (kind, sha256) = if let Some(sha256) = stem.strip_prefix("resume-") {
@@ -255,12 +475,6 @@ fn valid_final_submit_part_order(proof: &FinalSubmitProof) -> bool {
     seen_fields.into_iter().all(|seen| seen) && seen_files.into_iter().all(|seen| seen)
 }
 
-#[derive(Clone, Copy)]
-enum FinalSubmitProviderJobKeyPurpose {
-    Submit,
-    Confirmation,
-}
-
 pub(crate) fn final_submit_provider_job_key(
     provider: &str,
     raw_url: &str,
@@ -268,10 +482,11 @@ pub(crate) fn final_submit_provider_job_key(
     final_submit_provider_job_key_for_purpose(
         provider,
         raw_url,
-        FinalSubmitProviderJobKeyPurpose::Submit,
+        crate::jobs_ats_target::ProviderApplicationTargetPurpose::Submit,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn final_submit_confirmation_provider_job_key(
     provider: &str,
     raw_url: &str,
@@ -279,21 +494,20 @@ pub(crate) fn final_submit_confirmation_provider_job_key(
     final_submit_provider_job_key_for_purpose(
         provider,
         raw_url,
-        FinalSubmitProviderJobKeyPurpose::Confirmation,
+        crate::jobs_ats_target::ProviderApplicationTargetPurpose::Confirmation,
     )
 }
 
 fn final_submit_provider_job_key_for_purpose(
     provider: &str,
     raw_url: &str,
-    purpose: FinalSubmitProviderJobKeyPurpose,
+    purpose: crate::jobs_ats_target::ProviderApplicationTargetPurpose,
 ) -> ExecutionLeaseResult<String> {
-    let url = final_submit_provider_url(raw_url)?;
-    match provider {
-        "greenhouse" => greenhouse_final_submit_job_key(&url, purpose),
-        "lever" => lever_final_submit_job_key(&url, purpose),
-        _ => Err(ExecutionLeaseError::InvalidRequest),
-    }
+    let target = crate::jobs_ats_target::parse_provider_application_target(raw_url, purpose)
+        .ok_or(ExecutionLeaseError::InvalidRequest)?;
+    (target.provider == provider)
+        .then_some(target.provider_job_key)
+        .ok_or(ExecutionLeaseError::InvalidRequest)
 }
 
 fn final_submit_provider_url(raw_url: &str) -> ExecutionLeaseResult<reqwest::Url> {
@@ -318,153 +532,6 @@ fn same_final_submit_origin(left: &reqwest::Url, right: &reqwest::Url) -> bool {
             .map(str::to_ascii_lowercase)
             .eq(&right.host_str().map(str::to_ascii_lowercase))
         && left.port_or_known_default() == right.port_or_known_default()
-}
-
-fn greenhouse_final_submit_job_key(
-    url: &reqwest::Url,
-    purpose: FinalSubmitProviderJobKeyPurpose,
-) -> ExecutionLeaseResult<String> {
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if !matches!(
-        host.as_str(),
-        "boards.greenhouse.io" | "job-boards.greenhouse.io"
-    ) {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    }
-    let segments = url
-        .path_segments()
-        .map(|segments| {
-            segments
-                .filter(|segment| !segment.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let job_indexes = segments
-        .iter()
-        .enumerate()
-        .filter_map(|(index, segment)| segment.eq_ignore_ascii_case("jobs").then_some(index))
-        .collect::<Vec<_>>();
-    if job_indexes.len() > 1 {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    }
-    let job_index = job_indexes.first().copied();
-    let valid_path = match (purpose, job_index) {
-        (FinalSubmitProviderJobKeyPurpose::Submit, Some(1)) => segments.len() == 3,
-        (FinalSubmitProviderJobKeyPurpose::Submit, None) => {
-            segments.len() == 2
-                && segments[0].eq_ignore_ascii_case("embed")
-                && segments[1].eq_ignore_ascii_case("job_app")
-        }
-        (FinalSubmitProviderJobKeyPurpose::Confirmation, Some(1)) => {
-            segments.len() == 4 && segments[3].eq_ignore_ascii_case("confirmation")
-        }
-        _ => false,
-    };
-    if !valid_path {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    }
-    let path_tenant = job_index
-        .and_then(|index| index.checked_sub(1))
-        .and_then(|index| segments.get(index))
-        .map(|value| (*value).to_string());
-    let path_job = job_index
-        .and_then(|index| segments.get(index + 1))
-        .map(|value| (*value).to_string());
-    let tenant = one_provider_job_identifier(
-        routing_query_values(url, &["for"])
-            .into_iter()
-            .chain(path_tenant),
-    )?;
-    let job = one_provider_job_identifier(
-        routing_query_values(
-            url,
-            &[
-                "gh_jid",
-                "token",
-                "job_id",
-                "jobid",
-                "posting_id",
-                "postingid",
-            ],
-        )
-        .into_iter()
-        .chain(path_job),
-    )?;
-    Ok(format!("greenhouse:{tenant}:{job}"))
-}
-
-fn lever_final_submit_job_key(
-    url: &reqwest::Url,
-    purpose: FinalSubmitProviderJobKeyPurpose,
-) -> ExecutionLeaseResult<String> {
-    let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-    if !matches!(host.as_str(), "jobs.lever.co" | "jobs.eu.lever.co") {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    }
-    let segments = url
-        .path_segments()
-        .map(|segments| {
-            segments
-                .filter(|segment| !segment.is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let valid_path = match purpose {
-        FinalSubmitProviderJobKeyPurpose::Submit => {
-            segments.len() == 2
-                || (segments.len() == 3 && segments[2].eq_ignore_ascii_case("apply"))
-        }
-        FinalSubmitProviderJobKeyPurpose::Confirmation => {
-            segments.len() == 3 && segments[2].eq_ignore_ascii_case("confirmation")
-        }
-    };
-    if !valid_path
-        || !valid_provider_job_identifier(segments[0])
-        || !valid_provider_job_identifier(segments[1])
-    {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    }
-    let job = one_provider_job_identifier(
-        routing_query_values(
-            url,
-            &["posting_id", "postingid", "job_id", "jobid", "lever_job_id"],
-        )
-        .into_iter()
-        .chain(std::iter::once(segments[1].to_string())),
-    )?;
-    Ok(format!("lever:{host}:{}:{job}", segments[0]))
-}
-
-fn routing_query_values(url: &reqwest::Url, aliases: &[&str]) -> Vec<String> {
-    url.query_pairs()
-        .filter(|(key, _)| aliases.iter().any(|alias| key.eq_ignore_ascii_case(alias)))
-        .map(|(_, value)| value.into_owned())
-        .collect()
-}
-
-fn one_provider_job_identifier(
-    values: impl Iterator<Item = String>,
-) -> ExecutionLeaseResult<String> {
-    let values = values.collect::<Vec<_>>();
-    let Some(first) = values.first() else {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    };
-    if !valid_provider_job_identifier(first)
-        || values
-            .iter()
-            .any(|value| !valid_provider_job_identifier(value) || value != first)
-    {
-        return Err(ExecutionLeaseError::InvalidRequest);
-    }
-    Ok(first.clone())
-}
-
-fn valid_provider_job_identifier(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 160
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn bind_final_submit_proof_sqlite_tx(
@@ -930,6 +997,132 @@ fn postgres_bind_cloud_attempt(
     Ok(())
 }
 
+fn sqlite_application_requires_ats_phase_a(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> ExecutionLeaseResult<bool> {
+    let (job_id, application_json): (String, String) = tx
+        .query_row(
+            "SELECT job_id, application_json FROM jobs_applications
+              WHERE account_id = ?1 AND id = ?2",
+            params![account_id, application_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(ExecutionLeaseError::NotFound)?;
+    let application = parse_application_json(
+        application_json,
+        application_id,
+        &job_id,
+        "ATS Phase A cloud application",
+    )?;
+    Ok(application.submission_mode == "auto_submit"
+        && application_has_frozen_ats_certification(&application))
+}
+
+fn postgres_application_requires_ats_phase_a(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> ExecutionLeaseResult<bool> {
+    let row = tx
+        .query_opt(
+            "SELECT job_id, application_json FROM jobs_applications
+              WHERE account_id = $1 AND id = $2 FOR UPDATE",
+            &[&account_id, &application_id],
+        )?
+        .ok_or(ExecutionLeaseError::NotFound)?;
+    let job_id: String = row.get(0);
+    let application = parse_application_json(
+        row.get(1),
+        application_id,
+        &job_id,
+        "ATS Phase A cloud application",
+    )?;
+    Ok(application.submission_mode == "auto_submit"
+        && application_has_frozen_ats_certification(&application))
+}
+
+fn cloud_ats_runtime_attestation(
+    trusted: &TrustedRunnerProcessRuntimeAttestation,
+) -> AtsCertificationRuntimeAttestation {
+    AtsCertificationRuntimeAttestation::Cloud {
+        platform: trusted.runtime.platform.clone(),
+        architecture: trusted.runtime.architecture.clone(),
+        runner_build_id: trusted.runtime.runner_build_id.clone(),
+        runner_image_sha256: trusted.runtime.runner_image_sha256.clone(),
+        automation_bundle_sha256: trusted.runtime.automation_bundle_sha256.clone(),
+        playwright_version: trusted.runtime.playwright_version.clone(),
+        chromium_revision: trusted.runtime.chromium_revision.clone(),
+        chromium_executable_sha256: trusted.runtime.chromium_executable_sha256.clone(),
+    }
+}
+
+struct CloudAtsPhaseAContext<'a> {
+    account_id: &'a str,
+    application_id: &'a str,
+    run_id: &'a str,
+    browser_profile_id: &'a str,
+    trusted_runtime: Option<&'a TrustedRunnerProcessRuntimeAttestation>,
+    nonce_sha256: &'a str,
+    now_ms: i64,
+}
+
+fn create_cloud_ats_phase_a_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    context: &CloudAtsPhaseAContext<'_>,
+) -> ExecutionLeaseResult<()> {
+    if !sqlite_application_requires_ats_phase_a(tx, context.account_id, context.application_id)? {
+        return Ok(());
+    }
+    let trusted_runtime = context
+        .trusted_runtime
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    create_ats_application_certification_binding_from_context_sqlite_tx(
+        tx,
+        &AtsCertificationPhaseAContextRequest {
+            account_id: context.account_id.to_string(),
+            application_id: context.application_id.to_string(),
+            run_id: context.run_id.to_string(),
+            browser_session_id: context.run_id.to_string(),
+            browser_profile_id: context.browser_profile_id.to_string(),
+            runtime_attestation: cloud_ats_runtime_attestation(trusted_runtime),
+            nonce_sha256: context.nonce_sha256.to_string(),
+        },
+        context.now_ms,
+    )
+    .map(|_| ())
+    .map_err(execution_lease_from_ats_certification_error)
+}
+
+fn create_cloud_ats_phase_a_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    context: &CloudAtsPhaseAContext<'_>,
+) -> ExecutionLeaseResult<()> {
+    if !postgres_application_requires_ats_phase_a(tx, context.account_id, context.application_id)? {
+        return Ok(());
+    }
+    let trusted_runtime = context
+        .trusted_runtime
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    create_ats_application_certification_binding_from_context_postgres_tx(
+        tx,
+        &AtsCertificationPhaseAContextRequest {
+            account_id: context.account_id.to_string(),
+            application_id: context.application_id.to_string(),
+            run_id: context.run_id.to_string(),
+            browser_session_id: context.run_id.to_string(),
+            browser_profile_id: context.browser_profile_id.to_string(),
+            runtime_attestation: cloud_ats_runtime_attestation(trusted_runtime),
+            nonce_sha256: context.nonce_sha256.to_string(),
+        },
+        context.now_ms,
+    )
+    .map(|_| ())
+    .map_err(execution_lease_from_ats_certification_error)
+}
+
 #[cfg(debug_assertions)]
 pub fn claim_execution_lease(
     pool: &DbPool,
@@ -948,8 +1141,9 @@ pub fn claim_execution_lease(
         owner_id,
         None,
         None,
+        None,
     )
-    .map(|(lease, _)| lease)
+    .map(|(lease, _, _)| lease)
 }
 
 #[cfg(debug_assertions)]
@@ -962,7 +1156,7 @@ pub fn claim_execution_lease_for_runner_volume(
     owner_id: &str,
     volume_binding: &BindRunnerVolumeResidencyRequest,
 ) -> ExecutionLeaseResult<RunnerVolumeExecutionLeaseGrant> {
-    let (lease, binding) = claim_execution_lease_inner(
+    let (lease, binding, _) = claim_execution_lease_inner(
         pool,
         account_id,
         application_id,
@@ -970,6 +1164,7 @@ pub fn claim_execution_lease_for_runner_volume(
         supplied_browser_profile_id,
         owner_id,
         Some(volume_binding),
+        None,
         None,
     )?;
     let binding = binding.ok_or(ExecutionLeaseError::Conflict)?;
@@ -980,6 +1175,8 @@ pub fn claim_execution_lease_for_runner_volume(
         enrollment_epoch: binding.enrollment_epoch,
         process_instance_id: binding.process_instance_id,
         volume_key_fingerprint: binding.volume_key_fingerprint,
+        runtime_grant_id: String::new(),
+        runtime_sha256: String::new(),
     })
 }
 
@@ -992,9 +1189,11 @@ pub fn claim_execution_lease_for_runner_volume_authorized(
     supplied_browser_profile_id: &str,
     owner_id: &str,
     volume_binding: &BindRunnerVolumeResidencyRequest,
+    expected_runtime_grant_id: &str,
+    expected_runtime_sha256: &str,
     volume_authority: &VerifiedRunnerVolumeAuthority,
 ) -> ExecutionLeaseResult<RunnerVolumeExecutionLeaseGrant> {
-    let (lease, binding) = claim_execution_lease_inner(
+    let (lease, binding, runtime) = claim_execution_lease_inner(
         pool,
         account_id,
         application_id,
@@ -1002,9 +1201,11 @@ pub fn claim_execution_lease_for_runner_volume_authorized(
         supplied_browser_profile_id,
         owner_id,
         Some(volume_binding),
+        Some((expected_runtime_grant_id, expected_runtime_sha256)),
         Some(volume_authority),
     )?;
     let binding = binding.ok_or(ExecutionLeaseError::Conflict)?;
+    let runtime = runtime.ok_or(ExecutionLeaseError::Conflict)?;
     Ok(RunnerVolumeExecutionLeaseGrant {
         lease,
         purge_subject: binding.purge_subject,
@@ -1012,6 +1213,8 @@ pub fn claim_execution_lease_for_runner_volume_authorized(
         enrollment_epoch: binding.enrollment_epoch,
         process_instance_id: binding.process_instance_id,
         volume_key_fingerprint: binding.volume_key_fingerprint,
+        runtime_grant_id: runtime.runtime_grant_id,
+        runtime_sha256: runtime.runtime_sha256,
     })
 }
 
@@ -1024,8 +1227,13 @@ fn claim_execution_lease_inner(
     supplied_browser_profile_id: &str,
     owner_id: &str,
     volume_binding: Option<&BindRunnerVolumeResidencyRequest>,
+    expected_runtime: Option<(&str, &str)>,
     volume_authority: Option<&VerifiedRunnerVolumeAuthority>,
-) -> ExecutionLeaseResult<(ExecutionLeaseGrant, Option<RunnerVolumeResidencyBinding>)> {
+) -> ExecutionLeaseResult<(
+    ExecutionLeaseGrant,
+    Option<RunnerVolumeResidencyBinding>,
+    Option<TrustedRunnerProcessRuntimeAttestation>,
+)> {
     if !validate_execution_binding(account_id, 240)
         || !validate_execution_binding(application_id, 240)
         || !validate_execution_binding(run_id, 240)
@@ -1033,6 +1241,8 @@ fn claim_execution_lease_inner(
         || !validate_execution_binding(owner_id, 240)
         || volume_binding
             .is_some_and(|binding| binding.account_id != account_id || binding.run_id != run_id)
+        || (volume_authority.is_some() && expected_runtime.is_none())
+        || (expected_runtime.is_some() && volume_binding.is_none())
     {
         return Err(ExecutionLeaseError::InvalidRequest);
     }
@@ -1051,6 +1261,27 @@ fn claim_execution_lease_inner(
                     prepare_runner_volume_lease_binding_sqlite_tx(&tx, binding, subject)
                         .map_err(execution_lease_from_runner_volume_error)?,
                 ),
+                (None, None) => None,
+                _ => return Err(ExecutionLeaseError::Conflict),
+            };
+            let trusted_runtime = match (volume_binding, expected_runtime) {
+                (Some(binding), Some((expected_grant_id, expected_runtime_sha256))) => {
+                    let runtime = require_runner_process_runtime_sqlite_tx(
+                        &tx,
+                        &binding.worker_id,
+                        &binding.volume_id,
+                        binding.enrollment_epoch,
+                        &binding.process_instance_id,
+                    )
+                    .map_err(execution_lease_from_runner_volume_error)?;
+                    if runtime.runtime_grant_id != expected_grant_id
+                        || runtime.runtime_sha256 != expected_runtime_sha256
+                    {
+                        return Err(ExecutionLeaseError::Conflict);
+                    }
+                    Some(runtime)
+                }
+                (Some(_), None) if cfg!(debug_assertions) && volume_authority.is_none() => None,
                 (None, None) => None,
                 _ => return Err(ExecutionLeaseError::Conflict),
             };
@@ -1075,6 +1306,18 @@ fn claim_execution_lease_inner(
                 return Err(ExecutionLeaseError::Conflict);
             }
             sqlite_bind_cloud_attempt(&tx, account_id, application_id, now)?;
+            create_cloud_ats_phase_a_sqlite_tx(
+                &tx,
+                &CloudAtsPhaseAContext {
+                    account_id,
+                    application_id,
+                    run_id,
+                    browser_profile_id: &browser_profile_id,
+                    trusted_runtime: trusted_runtime.as_ref(),
+                    nonce_sha256: &lease_token_sha256,
+                    now_ms: now,
+                },
+            )?;
             let existing = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1168,6 +1411,10 @@ fn claim_execution_lease_inner(
                 (None, None) => None,
                 _ => return Err(ExecutionLeaseError::Conflict),
             };
+            if let Some(runtime) = trusted_runtime.as_ref() {
+                bind_execution_lease_process_runtime_sqlite_tx(&tx, run_id, fence, runtime, now)
+                    .map_err(execution_lease_from_runner_volume_error)?;
+            }
             tx.commit()?;
             Ok((
                 ExecutionLeaseGrant {
@@ -1178,16 +1425,40 @@ fn claim_execution_lease_inner(
                     phase: "prepared".to_string(),
                 },
                 bound_volume,
+                trusted_runtime,
             ))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_postgres_ats_certification(&mut tx)
+                .map_err(execution_lease_from_ats_certification_error)?;
             let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
                 (Some(binding), Some(subject)) => Some(
                     prepare_runner_volume_lease_binding_postgres_tx(&mut tx, binding, subject)
                         .map_err(execution_lease_from_runner_volume_error)?,
                 ),
+                (None, None) => None,
+                _ => return Err(ExecutionLeaseError::Conflict),
+            };
+            let trusted_runtime = match (volume_binding, expected_runtime) {
+                (Some(binding), Some((expected_grant_id, expected_runtime_sha256))) => {
+                    let runtime = require_runner_process_runtime_postgres_tx(
+                        &mut tx,
+                        &binding.worker_id,
+                        &binding.volume_id,
+                        binding.enrollment_epoch,
+                        &binding.process_instance_id,
+                    )
+                    .map_err(execution_lease_from_runner_volume_error)?;
+                    if runtime.runtime_grant_id != expected_grant_id
+                        || runtime.runtime_sha256 != expected_runtime_sha256
+                    {
+                        return Err(ExecutionLeaseError::Conflict);
+                    }
+                    Some(runtime)
+                }
+                (Some(_), None) if cfg!(debug_assertions) && volume_authority.is_none() => None,
                 (None, None) => None,
                 _ => return Err(ExecutionLeaseError::Conflict),
             };
@@ -1212,6 +1483,18 @@ fn claim_execution_lease_inner(
                 return Err(ExecutionLeaseError::Conflict);
             }
             postgres_bind_cloud_attempt(&mut tx, account_id, application_id, now)?;
+            create_cloud_ats_phase_a_postgres_tx(
+                &mut tx,
+                &CloudAtsPhaseAContext {
+                    account_id,
+                    application_id,
+                    run_id,
+                    browser_profile_id: &browser_profile_id,
+                    trusted_runtime: trusted_runtime.as_ref(),
+                    nonce_sha256: &lease_token_sha256,
+                    now_ms: now,
+                },
+            )?;
             let existing = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1307,6 +1590,12 @@ fn claim_execution_lease_inner(
                 (None, None) => None,
                 _ => return Err(ExecutionLeaseError::Conflict),
             };
+            if let Some(runtime) = trusted_runtime.as_ref() {
+                bind_execution_lease_process_runtime_postgres_tx(
+                    &mut tx, run_id, fence, runtime, now,
+                )
+                .map_err(execution_lease_from_runner_volume_error)?;
+            }
             tx.commit()?;
             Ok((
                 ExecutionLeaseGrant {
@@ -1317,6 +1606,7 @@ fn claim_execution_lease_inner(
                     phase: "prepared".to_string(),
                 },
                 bound_volume,
+                trusted_runtime,
             ))
         }
     })
@@ -1330,6 +1620,15 @@ fn execution_lease_from_runner_volume_error(error: RunnerVolumePurgeError) -> Ex
         | RunnerVolumePurgeError::Unauthorized
         | RunnerVolumePurgeError::NotReady => ExecutionLeaseError::Conflict,
         RunnerVolumePurgeError::Storage(error) => ExecutionLeaseError::Storage(error),
+    }
+}
+
+fn execution_lease_from_ats_certification_error(
+    error: AtsCertificationAuthorityError,
+) -> ExecutionLeaseError {
+    match error {
+        AtsCertificationAuthorityError::Storage(error) => ExecutionLeaseError::Storage(error),
+        _ => ExecutionLeaseError::Conflict,
     }
 }
 
@@ -1719,6 +2018,180 @@ fn apply_submission_evidence_capacity_outcome_postgres_tx(
     Ok(())
 }
 
+fn irreversible_execution_lease_record(
+    run_id: &str,
+    fence: i64,
+    lease_expires_at_ms: i64,
+    ats_certified_receipt_authority: Option<AtsCertifiedReceiptAuthority>,
+) -> IrreversibleExecutionLeaseRecord {
+    IrreversibleExecutionLeaseRecord {
+        lease: ExecutionLeaseRecord {
+            run_id: run_id.to_string(),
+            fence,
+            lease_expires_at_ms,
+            phase: "click_started".to_string(),
+        },
+        ats_certified_receipt_authority,
+    }
+}
+
+fn require_exact_stored_final_submit_proof_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    proof: &FinalSubmitProof,
+) -> ExecutionLeaseResult<()> {
+    let (job_id, application_json): (String, String) = tx
+        .query_row(
+            "SELECT job_id, application_json FROM jobs_applications
+              WHERE account_id = ?1 AND id = ?2",
+            params![account_id, application_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or(ExecutionLeaseError::NotFound)?;
+    let application = parse_application_json(
+        application_json,
+        application_id,
+        &job_id,
+        "irreversible ATS recovery application",
+    )?;
+    let presented = serde_json::to_value(proof).map_err(anyhow::Error::from)?;
+    if application.receipt.get(FINAL_SUBMIT_PROOF_KEY) != Some(&presented) {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
+fn require_exact_stored_final_submit_proof_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    proof: &FinalSubmitProof,
+) -> ExecutionLeaseResult<()> {
+    let row = tx
+        .query_opt(
+            "SELECT job_id, application_json FROM jobs_applications
+              WHERE account_id = $1 AND id = $2 FOR UPDATE",
+            &[&account_id, &application_id],
+        )?
+        .ok_or(ExecutionLeaseError::NotFound)?;
+    let job_id: String = row.get(0);
+    let application = parse_application_json(
+        row.get(1),
+        application_id,
+        &job_id,
+        "irreversible ATS recovery application",
+    )?;
+    let presented = serde_json::to_value(proof).map_err(anyhow::Error::from)?;
+    if application.receipt.get(FINAL_SUBMIT_PROOF_KEY) != Some(&presented) {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
+fn ats_phase_b_context(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    proof: &FinalSubmitProof,
+) -> ExecutionLeaseResult<Option<AtsCertificationPhaseBContextRequest>> {
+    if proof.schema_version != 4 {
+        return Ok(None);
+    }
+    let observed = proof
+        .observed_surface
+        .as_ref()
+        .ok_or(ExecutionLeaseError::InvalidRequest)?;
+    Ok(Some(AtsCertificationPhaseBContextRequest {
+        account_id: account_id.to_string(),
+        application_id: application_id.to_string(),
+        run_id: run_id.to_string(),
+        runner_kind: "cloud".to_string(),
+        observed_surface: AtsObservedSurface {
+            variant_key: observed.variant_key.clone(),
+            layout_contract_version: observed.layout_contract_version,
+            surface_sha256: observed.surface_sha256.clone(),
+        },
+        terminal_phase: "consumed".to_string(),
+    }))
+}
+
+fn recover_terminal_ats_authority_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> ExecutionLeaseResult<AtsCertifiedReceiptAuthority> {
+    let mut stmt = tx.prepare(
+        "SELECT binding_id, attempt_id, nonce_sha256
+           FROM jobs_application_ats_certification_bindings
+          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+            AND phase IN ('consumed', 'side_effect_unknown') LIMIT 2",
+    )?;
+    let rows = stmt
+        .query_map(params![account_id, application_id, run_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if rows.len() != 1 {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    let (binding_id, application_attempt_id, nonce_sha256) = rows
+        .into_iter()
+        .next()
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    recover_ats_application_certification_sqlite_tx(
+        tx,
+        &AtsCertificationRecoveryRequest {
+            binding_id,
+            account_id: account_id.to_string(),
+            application_id: application_id.to_string(),
+            run_id: run_id.to_string(),
+            application_attempt_id,
+            nonce_sha256,
+        },
+    )
+    .map(|result| result.ats_certified_receipt_authority)
+    .map_err(execution_lease_from_ats_certification_error)
+}
+
+fn recover_terminal_ats_authority_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> ExecutionLeaseResult<AtsCertifiedReceiptAuthority> {
+    let rows = tx.query(
+        "SELECT binding_id, attempt_id, nonce_sha256
+           FROM jobs_application_ats_certification_bindings
+          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+            AND phase IN ('consumed', 'side_effect_unknown') LIMIT 2 FOR UPDATE",
+        &[&account_id, &application_id, &run_id],
+    )?;
+    if rows.len() != 1 {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    let row = &rows[0];
+    recover_ats_application_certification_postgres_tx(
+        tx,
+        &AtsCertificationRecoveryRequest {
+            binding_id: row.get(0),
+            account_id: account_id.to_string(),
+            application_id: application_id.to_string(),
+            run_id: run_id.to_string(),
+            application_attempt_id: row.get(1),
+            nonce_sha256: row.get(2),
+        },
+    )
+    .map(|result| result.ats_certified_receipt_authority)
+    .map_err(execution_lease_from_ats_certification_error)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn start_irreversible_submission(
     pool: &DbPool,
@@ -1729,7 +2202,7 @@ pub fn start_irreversible_submission(
     fence: i64,
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
-) -> ExecutionLeaseResult<ExecutionLeaseRecord> {
+) -> ExecutionLeaseResult<IrreversibleExecutionLeaseRecord> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
     let now = now_ms();
     validate_submission_evidence_capacity_binding(
@@ -1743,14 +2216,9 @@ pub fn start_irreversible_submission(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            require_current_runner_volume_binding_sqlite_for_operation(
-                &tx, account_id, run_id, now,
-            )?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
-            let browser_profile_id =
-                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
             let lease = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1762,14 +2230,69 @@ pub fn start_irreversible_submission(
                 )
                 .optional()?
                 .ok_or(ExecutionLeaseError::NotFound)?;
-            if lease.browser_profile_id != browser_profile_id
-                || lease.fence != fence
+            if lease.fence != fence
                 || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
-                || lease.phase != "prepared"
-                || lease.lease_expires_at_ms <= now
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            if lease.phase == "click_started" {
+                if final_submit_proof.schema_version != 4 {
+                    return Err(ExecutionLeaseError::Conflict);
+                }
+                require_exact_stored_final_submit_proof_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                    final_submit_proof,
+                )?;
+                let authority = recover_terminal_ats_authority_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                )?;
+                let record = irreversible_execution_lease_record(
+                    run_id,
+                    fence,
+                    lease.lease_expires_at_ms,
+                    Some(authority),
+                );
+                tx.commit()?;
+                return Ok(record);
+            }
+            if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            let browser_profile_id =
+                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
+            if lease.browser_profile_id != browser_profile_id {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let ats_certified_receipt_authority = match ats_phase_b_context(
+                account_id,
+                application_id,
+                run_id,
+                final_submit_proof,
+            )? {
+                Some(request) => match
+                    validate_consume_reserve_ats_application_certification_from_context_sqlite_tx(
+                        &tx, &request, now,
+                    )
+                    .map_err(execution_lease_from_ats_certification_error)?
+                {
+                    AtsCertificationPhaseBTransactionOutcome::Authorized(result) => {
+                        Some(result.ats_certified_receipt_authority)
+                    }
+                    AtsCertificationPhaseBTransactionOutcome::LayoutDriftQuarantined => {
+                        tx.commit()?;
+                        return Err(ExecutionLeaseError::Conflict);
+                    }
+                },
+                None => None,
+            };
             bind_final_submit_proof_sqlite_tx(
                 &tx,
                 account_id,
@@ -1800,24 +2323,21 @@ pub fn start_irreversible_submission(
             }
             let lease_expires_at_ms = lease.lease_expires_at_ms;
             tx.commit()?;
-            Ok(ExecutionLeaseRecord {
-                run_id: run_id.to_string(),
+            Ok(irreversible_execution_lease_record(
+                run_id,
                 fence,
                 lease_expires_at_ms,
-                phase: "click_started".to_string(),
-            })
+                ats_certified_receipt_authority,
+            ))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            require_current_runner_volume_binding_postgres_for_operation(
-                &mut tx, account_id, run_id, now,
-            )?;
+            lock_postgres_ats_certification(&mut tx)
+                .map_err(execution_lease_from_ats_certification_error)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
-            let browser_profile_id =
-                postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
             let lease = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1829,14 +2349,69 @@ pub fn start_irreversible_submission(
                 )?
                 .map(execution_lease_from_pg_row)
                 .ok_or(ExecutionLeaseError::NotFound)?;
-            if lease.browser_profile_id != browser_profile_id
-                || lease.fence != fence
+            if lease.fence != fence
                 || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
-                || lease.phase != "prepared"
-                || lease.lease_expires_at_ms <= now
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            if lease.phase == "click_started" {
+                if final_submit_proof.schema_version != 4 {
+                    return Err(ExecutionLeaseError::Conflict);
+                }
+                require_exact_stored_final_submit_proof_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    final_submit_proof,
+                )?;
+                let authority = recover_terminal_ats_authority_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                )?;
+                let record = irreversible_execution_lease_record(
+                    run_id,
+                    fence,
+                    lease.lease_expires_at_ms,
+                    Some(authority),
+                );
+                tx.commit()?;
+                return Ok(record);
+            }
+            if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            let browser_profile_id =
+                postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
+            if lease.browser_profile_id != browser_profile_id {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let ats_certified_receipt_authority = match ats_phase_b_context(
+                account_id,
+                application_id,
+                run_id,
+                final_submit_proof,
+            )? {
+                Some(request) => match
+                    validate_consume_reserve_ats_application_certification_from_context_postgres_tx(
+                        &mut tx, &request, now,
+                    )
+                    .map_err(execution_lease_from_ats_certification_error)?
+                {
+                    AtsCertificationPhaseBTransactionOutcome::Authorized(result) => {
+                        Some(result.ats_certified_receipt_authority)
+                    }
+                    AtsCertificationPhaseBTransactionOutcome::LayoutDriftQuarantined => {
+                        tx.commit()?;
+                        return Err(ExecutionLeaseError::Conflict);
+                    }
+                },
+                None => None,
+            };
             bind_final_submit_proof_postgres_tx(
                 &mut tx,
                 account_id,
@@ -1867,12 +2442,12 @@ pub fn start_irreversible_submission(
             }
             let lease_expires_at_ms = lease.lease_expires_at_ms;
             tx.commit()?;
-            Ok(ExecutionLeaseRecord {
-                run_id: run_id.to_string(),
+            Ok(irreversible_execution_lease_record(
+                run_id,
                 fence,
                 lease_expires_at_ms,
-                phase: "click_started".to_string(),
-            })
+                ats_certified_receipt_authority,
+            ))
         }
     })
 }
@@ -2408,10 +2983,10 @@ pub fn execution_receipt_authority(
                   FOR UPDATE",
                 &[&account_id, &application_id, &run_id],
             )?;
-            let (capacity_runner, capacity_state, capacity_expires_at_ms) = capacity.map_or(
-                (None, None, None),
-                |row| (Some(row.get(0)), Some(row.get(1)), Some(row.get(2))),
-            );
+            let (capacity_runner, capacity_state, capacity_expires_at_ms) = capacity
+                .map_or((None, None, None), |row| {
+                    (Some(row.get(0)), Some(row.get(1)), Some(row.get(2)))
+                });
             let authority = validate_execution_receipt_authority(
                 lease,
                 finished_at_ms,

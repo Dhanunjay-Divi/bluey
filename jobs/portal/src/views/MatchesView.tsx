@@ -37,7 +37,9 @@ import type {
 import { relativeTime, titleCase } from "../lib/format";
 import { Dialog } from "../components/Dialog";
 import { DiscoverySourceDialog } from "../components/DiscoverySourceDialog";
+import { AtsCertificationSummaryCard } from "../components/AtsCertificationSummary";
 import { effectiveSubmissionMode } from "../lib/application-flow";
+import { portalEligibilityDecision } from "../lib/ats-certification";
 import { isJobPassed, matchPassReasons } from "../lib/candidate-events";
 import {
   clearMatchViewFilters,
@@ -394,6 +396,7 @@ export function MatchesView({
               {jobEligibility(selected).hard_failures.length > 0 && <ul className="eligibility-reasons blocked">{jobEligibility(selected).hard_failures.map((reason) => <li key={reason.code}>{reason.message}</li>)}</ul>}
               {jobEligibility(selected).review_reasons.length > 0 && <ul className="eligibility-reasons review">{jobEligibility(selected).review_reasons.map((reason) => <li key={reason.code}>{reason.message}</li>)}</ul>}
             </section>
+            <AtsCertificationSummaryCard eligibility={selected.eligibility} />
             <div className="detail-columns">
               <section><h3>Why it matched</h3><ul className="check-list">{selected.matched_reasons.map((reason) => <li key={reason}><Check size={15} />{reason}</li>)}</ul>{selected.missing_requirements.length > 0 && <><h3>Check before applying</h3><ul className="watch-list">{selected.missing_requirements.map((reason) => <li key={reason}>{reason}</li>)}</ul></>}</section>
               <section>
@@ -537,23 +540,13 @@ export function discoverySourceAction(state: DiscoverySourceHealth): string {
   return "No action needed.";
 }
 
-function jobEligibility(job: JobPosting) {
-  return job.eligibility || {
-    capability: "unknown_review" as const,
-    can_prepare: false,
-    can_auto_submit: false,
-    can_queue_local: false,
-    can_queue_cloud: false,
-    hard_failures: [],
-    review_reasons: [{ code: "eligibility_pending", message: "Bluey will verify your rules before preparation." }],
-    passed_checks: [],
-    evaluated_at_ms: 0,
-  };
+export function jobEligibility(job: JobPosting) {
+  return portalEligibilityDecision(job.eligibility);
 }
 
 export function isMatchEligibleForDefaultView(job: JobPosting): boolean {
   if (isCandidateLead(job)) return true;
-  return job.eligibility ? job.eligibility.can_prepare : true;
+  return job.eligibility ? jobEligibility(job).can_prepare : true;
 }
 
 export function isCandidateLead(job: Pick<JobPosting, "source" | "availability_status" | "last_verified_at_ms">): boolean {
@@ -605,7 +598,11 @@ export function canAutoSubmit(
   runners: RunnerAvailability,
   authorizations: AutoSubmitAuthorization[],
 ): boolean {
-  return jobEligibility(job).can_auto_submit
+  const eligibility = jobEligibility(job);
+  const certifiedRunnerAvailable = (eligibility.can_queue_local && runners.local.available)
+    || (eligibility.can_queue_cloud && runners.cloud.available);
+  return eligibility.can_auto_submit
+    && certifiedRunnerAvailable
     && runners.auto_submit_available
     && hasActiveAutoSubmitAuthorization(job, authorizations);
 }
@@ -619,7 +616,11 @@ export function autoSubmitUnavailableReason(
   if (eligibility.hard_failures.length > 0) return "Resolve the Career Track rules above before Auto-submit can be considered.";
   if (eligibility.capability === "beta_review") return "Review first is required while this application system is in beta.";
   if (eligibility.capability === "handoff") return "This site uses a user-controlled handoff after Bluey prepares the application kit.";
-  if (eligibility.capability === "unknown_review") return "Review first is required because this application system is not certified.";
+  if (eligibility.capability === "unknown_review") {
+    return eligibility.review_reasons.find(
+      (reason) => reason.code === "ats_certification_unavailable",
+    )?.message || "Review first is required because this application system is not certified.";
+  }
   if (eligibility.capability === "blocked") return "This listing cannot use a Bluey runner.";
   if (!eligibility.can_auto_submit) return "Auto-submit is available only after every server rule and application-system check passes.";
   const authorization = authorizations.find(
@@ -632,6 +633,12 @@ export function autoSubmitUnavailableReason(
     return "Enable Auto-submit for this Career Track in Settings first.";
   }
   if (runners && !runners.auto_submit_available) return runners.auto_submit_reason;
+  const certifiedRunnerAvailable = runners
+    && ((eligibility.can_queue_local && runners.local.available)
+      || (eligibility.can_queue_cloud && runners.cloud.available));
+  if (runners && !certifiedRunnerAvailable) {
+    return "No currently available runner is included in this job's certification scope.";
+  }
   if (eligibility.can_auto_submit) return undefined;
   return "Auto-submit is available only after every server rule and application-system check passes.";
 }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  AtsCertificationSummary,
   BrowserSession,
   Intervention,
   JobApplication,
@@ -61,7 +62,21 @@ const browserSession: BrowserSession = {
   updated_at_ms: 1,
 };
 
-const job = (canAutoSubmit: boolean): JobPosting => ({
+const NOW_MS = Date.now();
+
+const activeCertification = (): AtsCertificationSummary => ({
+  provider_label: "Greenhouse",
+  adapter_version: "2026.07.1-beta.1",
+  certified_runner_kinds: ["local"],
+  status: "active",
+  last_verified_at_ms: NOW_MS - 60_000,
+  expires_at_ms: NOW_MS + 60 * 60_000,
+  reason: "Server verification is current for this job and runner.",
+  next_action: "Review the application kit and choose Local Browser.",
+  canary_available: true,
+});
+
+const job = (canAutoSubmit: boolean, summary: unknown = activeCertification()): JobPosting => ({
   id: "job-1",
   canonical_key: "job-1",
   source: "greenhouse",
@@ -90,7 +105,8 @@ const job = (canAutoSubmit: boolean): JobPosting => ({
     hard_failures: [],
     review_reasons: [],
     passed_checks: [],
-    evaluated_at_ms: 1,
+    evaluated_at_ms: NOW_MS,
+    ats_certification: canAutoSubmit ? summary : undefined,
   },
 });
 
@@ -104,10 +120,22 @@ describe("application workflow boundaries", () => {
   });
 
   it("downgrades Auto-submit unless both the job and a runner are authorized", () => {
+    const missingSummary = job(true);
+    delete missingSummary.eligibility?.ats_certification;
+    const cloudOnly = {
+      ...runners(true),
+      local: { ...runners(true).local, available: false },
+      cloud: { ...runners(true).cloud, available: true },
+    };
+
     expect(effectiveSubmissionMode(job(false), "auto_submit", runners(true), true)).toBe("review_first");
     expect(effectiveSubmissionMode(job(true), "auto_submit", runners(false), true)).toBe("review_first");
     expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), false)).toBe("review_first");
     expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), true)).toBe("auto_submit");
+    expect(effectiveSubmissionMode(missingSummary, "auto_submit", runners(true), true))
+      .toBe("review_first");
+    expect(effectiveSubmissionMode(job(true), "auto_submit", cloudOnly, true))
+      .toBe("review_first");
   });
 
   it("returns answer-bearing applications to review without resuming the browser", () => {

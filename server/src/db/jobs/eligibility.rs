@@ -323,6 +323,11 @@ fn apply_discovery_authorities(
     );
 }
 
+struct ApplicationFinalizationAuthorities<'a> {
+    discovery: &'a [JobDiscoveryAuthority],
+    ats: Option<&'a AtsCertificationPostingResolution>,
+}
+
 fn enforce_application_finalization_eligibility(
     application: &JobApplication,
     posting: &JobPosting,
@@ -330,7 +335,7 @@ fn enforce_application_finalization_eligibility(
     preferences: &JobPreferences,
     track: Option<&CareerTrack>,
     reservations: &[AttemptReservation],
-    authorities: &[JobDiscoveryAuthority],
+    authorities: ApplicationFinalizationAuthorities<'_>,
 ) -> Result<()> {
     let mut decision = build_job_eligibility(
         posting,
@@ -341,7 +346,10 @@ fn enforce_application_finalization_eligibility(
         Some(application.id.as_str()),
         track,
     );
-    apply_discovery_authorities(authorities, &mut decision);
+    apply_discovery_authorities(authorities.discovery, &mut decision);
+    if let Some(resolution) = authorities.ats {
+        apply_ats_certification_resolution(posting, &mut decision, resolution);
+    }
     if !decision.can_prepare {
         anyhow::bail!("job eligibility changed while the application packet was generated")
     }
@@ -378,7 +386,159 @@ pub fn evaluate_job_eligibility(
         track,
     );
     apply_discovery_authority(pool, account_id, posting, &mut decision)?;
+    apply_current_ats_certification(pool, account_id, posting, &mut decision)?;
     Ok(decision)
+}
+
+fn apply_current_ats_certification(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    decision: &mut JobEligibilityDecision,
+) -> Result<()> {
+    match resolve_ats_certification_for_posting(
+        pool,
+        account_id,
+        posting,
+        None,
+        decision.evaluated_at_ms,
+    ) {
+        Ok(resolution) => {
+            apply_ats_certification_resolution(posting, decision, &resolution);
+            Ok(())
+        }
+        Err(AtsCertificationAuthorityError::Storage(error)) => Err(error),
+        Err(_) => Ok(()),
+    }
+}
+
+fn apply_ats_certification_resolution(
+    posting: &JobPosting,
+    decision: &mut JobEligibilityDecision,
+    resolution: &AtsCertificationPostingResolution,
+) {
+    apply_ats_certification_status(
+        posting,
+        decision,
+        &resolution.status,
+        resolution.active_binding.is_some(),
+    );
+}
+
+fn apply_ats_certification_status(
+    posting: &JobPosting,
+    decision: &mut JobEligibilityDecision,
+    status: &AtsCertificationTargetStatusProjection,
+    has_active_binding: bool,
+) {
+    if status.status != "active" || !has_active_binding {
+        let effective_status = if status.status == "active" {
+            "drifted"
+        } else {
+            &status.status
+        };
+        decision.ats_certification.status = effective_status.to_string();
+        decision.ats_certification.certified_runner_kinds.clear();
+        decision.ats_certification.canary_available = false;
+        decision.ats_certification.last_verified_at_ms = status.last_verified_at_ms;
+        decision.ats_certification.expires_at_ms = status.expires_at_ms;
+        let (reason, next_action) = inactive_ats_certification_copy(effective_status);
+        decision.ats_certification.reason = reason.to_string();
+        decision.ats_certification.next_action = next_action.to_string();
+        return;
+    }
+
+    let mut runner_kinds = status
+        .runner_kinds
+        .iter()
+        .filter(|runner| matches!(runner.as_str(), "local" | "cloud"))
+        .cloned()
+        .collect::<Vec<_>>();
+    runner_kinds.sort();
+    runner_kinds.dedup();
+    if runner_kinds.is_empty()
+        || status.adapter_version.is_none()
+        || status.last_verified_at_ms.is_none()
+        || status.expires_at_ms.is_none()
+    {
+        decision.can_auto_submit = false;
+        decision.can_queue_local = false;
+        decision.can_queue_cloud = false;
+        decision.ats_certification.status = "drifted".to_string();
+        decision.ats_certification.certified_runner_kinds.clear();
+        decision.ats_certification.canary_available = false;
+        let (reason, next_action) = inactive_ats_certification_copy("drifted");
+        decision.ats_certification.reason = reason.to_string();
+        decision.ats_certification.next_action = next_action.to_string();
+        return;
+    }
+
+    let local_was_queueable = decision.can_queue_local;
+    let cloud_was_queueable = decision.can_queue_cloud;
+    decision.capability = "certified".to_string();
+    decision
+        .review_reasons
+        .retain(|reason| reason.code != "ats_review_required");
+    if !decision
+        .passed_checks
+        .iter()
+        .any(|check| check == "ats_certified")
+    {
+        decision.passed_checks.push("ats_certified".to_string());
+    }
+    decision.can_queue_local =
+        local_was_queueable && runner_kinds.iter().any(|runner| runner == "local");
+    decision.can_queue_cloud =
+        cloud_was_queueable && runner_kinds.iter().any(|runner| runner == "cloud");
+    decision.can_auto_submit = (decision.can_queue_local || decision.can_queue_cloud)
+        && decision.hard_failures.is_empty()
+        && decision.review_reasons.is_empty()
+        && posting.missing_requirements.is_empty();
+    decision.ats_certification = AtsCertificationSummary {
+        provider_label: ats_provider_label(&status.provider).to_string(),
+        adapter_version: status.adapter_version.clone(),
+        certified_runner_kinds: runner_kinds,
+        status: "active".to_string(),
+        last_verified_at_ms: status.last_verified_at_ms,
+        expires_at_ms: status.expires_at_ms,
+        reason: "This exact provider target has current server-owned certification.".to_string(),
+        next_action: "Bluey will recheck the exact certification immediately before Submit."
+            .to_string(),
+        canary_available: status.canary_available,
+    };
+}
+
+fn ats_provider_label(provider: &str) -> &'static str {
+    match provider {
+        "greenhouse" => "Greenhouse",
+        "lever" => "Lever",
+        _ => "Application site",
+    }
+}
+
+fn inactive_ats_certification_copy(status: &str) -> (&'static str, &'static str) {
+    match status {
+        "expired" => (
+            "The server-owned certification window for this exact provider target has expired.",
+            "Review the packet while a new certification window is approved.",
+        ),
+        "suspended" => (
+            "Automated submission is paused by a server safety circuit.",
+            "Use Review first until the safety circuit is reviewed and closed.",
+        ),
+        "revoked" => (
+            "Automated submission authority for this exact provider target was revoked.",
+            "Use Review first until newer signed authority is approved.",
+        ),
+        "drifted" => (
+            "The current provider layout or runner no longer matches certified evidence.",
+            "Use Review first while Bluey verifies the changed provider surface.",
+        ),
+        _ => (
+            "This exact provider target has no active ATS certification.",
+            "Review the packet and approve the provider-specific final step.",
+        ),
+    }
 }
 
 fn build_job_eligibility(
@@ -767,6 +927,7 @@ fn build_job_eligibility(
         && review_reasons.is_empty()
         && posting.missing_requirements.is_empty()
         && posting.match_score >= profile.auto_submit_threshold.clamp(60, 100);
+    let ats_certification = review_ats_certification_summary(posting, &capability);
 
     JobEligibilityDecision {
         capability,
@@ -784,6 +945,7 @@ fn build_job_eligibility(
         career_track_id: track.map(|value| value.id.clone()).unwrap_or_default(),
         application_identity_id: track.and_then(|value| value.application_identity_id.clone()),
         evidence_revision_id: None,
+        ats_certification,
         evaluated_at_ms: now,
     }
 }
@@ -799,7 +961,8 @@ fn push_reason(reasons: &mut Vec<EligibilityReason>, code: &str, message: &str) 
 }
 
 fn submission_capability(posting: &JobPosting) -> String {
-    let Ok(url) = reqwest::Url::parse(posting.canonical_url.trim()) else {
+    let raw_url = posting.canonical_url.trim();
+    let Ok(url) = reqwest::Url::parse(raw_url) else {
         return "blocked".to_string();
     };
     if !matches!(url.scheme(), "http" | "https") {
@@ -815,13 +978,62 @@ fn submission_capability(posting: &JobPosting) -> String {
     if host_matches_domain(&host, "linkedin.com") || host_matches_domain(&host, "indeed.com") {
         return "handoff".to_string();
     }
-    if matches!(
-        host.as_str(),
-        "boards.greenhouse.io" | "job-boards.greenhouse.io" | "jobs.lever.co" | "jobs.eu.lever.co"
-    ) {
+    if crate::jobs_ats_target::parse_provider_application_target(
+        raw_url,
+        crate::jobs_ats_target::ProviderApplicationTargetPurpose::Submit,
+    )
+    .is_some()
+    {
         return "beta_review".to_string();
     }
     "unknown_review".to_string()
+}
+
+fn review_ats_certification_summary(
+    posting: &JobPosting,
+    capability: &str,
+) -> AtsCertificationSummary {
+    let target = crate::jobs_ats_target::parse_provider_application_target(
+        posting.canonical_url.trim(),
+        crate::jobs_ats_target::ProviderApplicationTargetPurpose::Submit,
+    );
+    let (provider_label, adapter_version) = match target.as_ref().map(|target| target.provider) {
+        Some("greenhouse") => (
+            "Greenhouse".to_string(),
+            Some("2026.07.1-beta.1".to_string()),
+        ),
+        Some("lever") => ("Lever".to_string(), Some("2026.07.0-beta.1".to_string())),
+        _ => ("Application site".to_string(), None),
+    };
+    let (reason, next_action) = match capability {
+        "beta_review" => (
+            "This exact provider target has no active ATS certification.".to_string(),
+            "Review the packet and approve the provider-specific final step.".to_string(),
+        ),
+        "handoff" => (
+            "This provider requires a user-controlled handoff.".to_string(),
+            "Review the packet and complete submission on the provider site.".to_string(),
+        ),
+        "blocked" => (
+            "This application URL is not a valid runner target.".to_string(),
+            "Replace the job link with the current original employer application URL.".to_string(),
+        ),
+        _ => (
+            "No provider-specific runner certification is available for this target.".to_string(),
+            "Review the packet and use the supported review or takeover path.".to_string(),
+        ),
+    };
+    AtsCertificationSummary {
+        provider_label,
+        adapter_version,
+        certified_runner_kinds: Vec::new(),
+        status: "review_only".to_string(),
+        last_verified_at_ms: None,
+        expires_at_ms: None,
+        reason,
+        next_action,
+        canary_available: false,
+    }
 }
 
 fn host_matches_domain(host: &str, domain: &str) -> bool {

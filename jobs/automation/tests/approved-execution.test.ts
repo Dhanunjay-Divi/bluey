@@ -12,7 +12,7 @@ import {
 
 interface ApprovedExecutionVector {
   name: string;
-  schemaVersion: 1 | 2;
+  schemaVersion: 1 | 2 | 3;
   admission?: ApplicationPacket["approvedExecutionAdmission"];
   packet: Omit<
     ApplicationPacket,
@@ -68,6 +68,43 @@ function approvedPacketV2(
   return packet;
 }
 
+function approvedPacketV3(): ApplicationPacket {
+  const packet: ApplicationPacket = {
+    applicationId: "application-1",
+    jobId: "job-1",
+    resumeVersionId: "resume-1",
+    approvedPacketChecksum: "",
+    approvedExecutionSchemaVersion: 3,
+    approvedExecutionAdmission: {
+      kind: "track_auto_submit",
+      authorization_id: "authorization-1",
+      career_track_id: "track-1",
+      revision_no: 3,
+      authority_fingerprint: "a".repeat(64),
+      ats_certification: {
+        schema_version: 1,
+        provider: "greenhouse",
+        adapter_version: "2026.07.1-beta.1",
+        variant_key: "public",
+        layout_contract_version: 1,
+        surface_sha256: "3".repeat(64),
+        manifest_sha256: "b".repeat(64),
+        activation_sha256: "c".repeat(64),
+        activation_generation: 4,
+        target_key_sha256: "d".repeat(64),
+        layout_set_sha256: "e".repeat(64),
+        adapter_bundle_sha256: "f".repeat(64),
+        runner_target_sha256s: ["1".repeat(64), "2".repeat(64)],
+        expires_at_ms: 1_800_000_000_000,
+      },
+    },
+    answers: { email: "ada@example.com", sponsorship: "No" },
+    verifiedClaimIds: ["claim-2", "claim-1"],
+  };
+  packet.approvedPacketChecksum = approvedExecutionChecksum(packet, job);
+  return packet;
+}
+
 describe("approved execution snapshots", () => {
   it.each(vectors)("matches the shared Rust/TypeScript vector: $name", (vector) => {
     const packet: ApplicationPacket = {
@@ -110,6 +147,27 @@ describe("approved execution snapshots", () => {
       "e1b2e1dc90a86ebee87701c7279baae571ed423485acb85f6fe9b4ec4e816c4e",
     );
     expect(assertApprovedExecutionChecksum(packet, job)).toBe(packet.approvedPacketChecksum);
+  });
+
+  it("binds schema-v3 Track Auto-submit to exact ATS certification authority", () => {
+    const packet = approvedPacketV3();
+    expect(assertApprovedExecutionChecksum(packet, job)).toBe(packet.approvedPacketChecksum);
+
+    const changedActivation = structuredClone(packet);
+    const admission = changedActivation.approvedExecutionAdmission;
+    if (admission?.kind === "track_auto_submit" && admission.ats_certification) {
+      admission.ats_certification.activation_sha256 = "9".repeat(64);
+    }
+    expect(() => assertApprovedExecutionChecksum(changedActivation, job))
+      .toThrow(ApprovedExecutionIntegrityError);
+  });
+
+  it("rejects schema-v3 Auto-submit without exact ATS certification authority", () => {
+    const packet = approvedPacketV3();
+    const admission = packet.approvedExecutionAdmission;
+    if (admission?.kind === "track_auto_submit") delete admission.ats_certification;
+    expect(() => approvedExecutionChecksum(packet, job))
+      .toThrow(ApprovedExecutionIntegrityError);
   });
 
   it("freezes a detached approval while runtime materialization stays separate", () => {

@@ -190,6 +190,12 @@ describe("Bluey Browser release authority", () => {
     expect(artifacts[2]?.appContentSha256).toBe(
       artifacts[3]?.appContentSha256,
     );
+    expect(artifacts[0]?.automationBundleSha256).toBe(
+      artifacts[1]?.automationBundleSha256,
+    );
+    expect(artifacts[0]?.chromiumExecutableSha256).toBe(
+      artifacts[1]?.chromiumExecutableSha256,
+    );
 
     expect(() =>
       authority.parseBrowserReleaseManifest({
@@ -197,6 +203,21 @@ describe("Bluey Browser release authority", () => {
         artifacts: artifacts.slice(0, 4),
       }),
     ).toThrowError(/manifest/i);
+    for (const field of [
+      "automationBundleSha256",
+      "chromiumExecutableSha256",
+    ] as const) {
+      expect(() =>
+        authority.parseBrowserReleaseManifest({
+          ...fixture.manifest,
+          artifacts: artifacts.map((artifact, index) =>
+            index === 1
+              ? { ...artifact, [field]: "f".repeat(64) }
+              : artifact,
+          ),
+        }),
+      ).toThrowError(/manifest/i);
+    }
     expect(() =>
       authority.parseBrowserReleaseManifest({
         ...fixture.manifest,
@@ -981,6 +1002,9 @@ function artifact(
   const appContentHashCharacter = platform === "darwin"
     ? architecture === "arm64" ? "1" : "2"
     : "3";
+  const componentHashIndex = platform === "darwin"
+    ? architecture === "arm64" ? 0 : 1
+    : 2;
   const extension = packageKind === "darwin-dmg"
     ? "dmg"
     : packageKind === "darwin-zip"
@@ -996,6 +1020,8 @@ function artifact(
     sizeBytes: 128_000_000 + hashCharacter.charCodeAt(0),
     sha256: hashCharacter.repeat(64),
     appContentSha256: appContentHashCharacter.repeat(64),
+    automationBundleSha256: "456"[componentHashIndex]!.repeat(64),
+    chromiumExecutableSha256: "789"[componentHashIndex]!.repeat(64),
     verificationEvidenceSha256: "6789f"[hashIndex]!.repeat(64),
     nativeSignatureKind:
       platform === "darwin" ? "apple-developer-id" : "microsoft-authenticode",

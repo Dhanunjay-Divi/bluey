@@ -1,4 +1,5 @@
 import { AdapterRegistry } from "./adapters.js";
+import { parseProviderApplicationTarget } from "./ats-target.js";
 import {
   adapterCanFinalize,
   atsCapabilityProfile,
@@ -34,6 +35,7 @@ const ADAPTER_CONTEXTS = new WeakMap<
   AdapterContext,
   WeakMap<ApplicationAdapter, AdapterContext>
 >();
+const BOUND_PROVIDER_ADAPTERS = new WeakMap<AdapterContext, ApplicationAdapter>();
 
 class ProviderFirstAdapterRegistry extends AdapterRegistry {
   constructor(
@@ -43,15 +45,10 @@ class ProviderFirstAdapterRegistry extends AdapterRegistry {
   }
 
   override resolve(rawUrl: string): ApplicationAdapter {
-    let url: URL;
-    try {
-      url = new URL(rawUrl);
-    } catch {
-      return super.resolve(rawUrl);
-    }
-    const provider = this.providerAdapters.find((adapter) =>
-      adapter.detect(url),
-    );
+    const target = parseProviderApplicationTarget(rawUrl);
+    const provider = target
+      ? this.providerAdapters.find((adapter) => adapter.kind === target.provider)
+      : undefined;
     if (provider) return provider;
     return super.resolve(rawUrl);
   }
@@ -81,7 +78,11 @@ export async function executeApplication(
   registry = createDefaultAdapterRegistry(),
 ): Promise<ExecutionResult> {
   assertRunnablePacket(context.packet);
-  const adapter = registry.resolve(context.page.url());
+  const boundProvider = BOUND_PROVIDER_ADAPTERS.get(context);
+  const adapter = boundProvider ?? registry.resolve(context.page.url());
+  if (!boundProvider && (adapter.kind === "greenhouse" || adapter.kind === "lever")) {
+    BOUND_PROVIDER_ADAPTERS.set(context, adapter);
+  }
   const capability = atsCapabilityProfile(adapter.kind);
   const adapterContext = submitContextForAdapter(context, adapter);
   await context.log("adapter_selected", {

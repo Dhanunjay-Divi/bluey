@@ -32,6 +32,10 @@ import {
 } from "@bluey/jobs-automation";
 import { installBrowserNetworkGuard } from "./browser-network-guard.js";
 import {
+  authorizeCloudFinalSubmitBeforeCheckpoint,
+  hasCloudIrreversibleCheckpointAuthority,
+} from "./certified-final-submit.js";
+import {
   createBrowserProfileSnapshotClientFromEnv,
   type BrowserProfileSnapshotClient,
   type BrowserProfileSnapshotLeaseContext,
@@ -81,7 +85,7 @@ import {
   ProfileRecoveryBlockedError,
   ProfileRecoveryIsolation,
 } from "./recovery-isolation.js";
-import { providerRegistryForResumeAction } from "./resume-policy.js";
+import { providerRegistryForExecution } from "./resume-policy.js";
 import {
   durableResultScope,
   readManagedResult,
@@ -291,7 +295,7 @@ const runnerServer = createServer(async (request, response) => {
             run(input, paths, activeLease, requestId, checkpointCreatedAtMs),
           async (activeLease) => {
             const managedPaths = trackedManagedProfilePaths(activeLease);
-            if (activeLease.finalSubmitAttempted) {
+            if (hasCloudIrreversibleCheckpointAuthority(activeLease)) {
               if (!managedPaths) throw new ProfileRecoveryBlockedError();
               await markCloudCheckpointUnknown(
                 input,
@@ -603,7 +607,7 @@ const runnerServer = createServer(async (request, response) => {
             );
           } catch (error) {
             if (error instanceof LeasedRunError) throw error;
-            if (active.lease.finalSubmitAttempted) {
+            if (hasCloudIrreversibleCheckpointAuthority(active.lease)) {
               await markCloudCheckpointUnknown(
                 active.input,
                 active.paths,
@@ -700,6 +704,7 @@ async function startRunner(): Promise<void> {
   );
   const legacyStorage = await scanLegacyRunnerStorage(nativeStorageRoot);
   const processInstanceId = createRunnerProcessInstanceId();
+  const runnerBuildId = requiredRunnerEnv("BLUEY_JOBS_RUNNER_BUILD_ID");
   runnerVolumeClient = new RunnerVolumeClient({
     origin: requiredRunnerEnv("BLUEY_JOBS_API_ORIGIN"),
     workerSigningKey: requiredRunnerEnv("BLUEY_JOBS_WORKER_SIGNING_KEY"),
@@ -716,8 +721,9 @@ async function startRunner(): Promise<void> {
       "BLUEY_JOBS_RUNNER_RESOURCE_FINGERPRINT",
     ),
     legacyArtifactCount: legacyStorage.legacyArtifactCount,
-    runnerBuildId: requiredRunnerEnv("BLUEY_JOBS_RUNNER_BUILD_ID"),
+    runnerBuildId,
     processInstanceId,
+    processRuntimeGrant: runnerProcessRuntimeGrantFromEnv(runnerBuildId),
     identity,
     residency: accountResidency,
     subjectStorage,
@@ -752,6 +758,8 @@ async function startRunner(): Promise<void> {
     enrollmentEpoch: runnerVolumeClient.enrollmentEpoch,
     processInstanceId,
     keyFingerprint: identity.publicKeyFingerprint,
+    runtimeGrantId: runnerVolumeClient.runtimeGrantId,
+    runtimeSha256: runnerVolumeClient.runtimeSha256,
     createExecutionLeaseClaimProof: (input) =>
       runnerVolumeClient.createExecutionLeaseClaimProof(input),
   });
@@ -1552,19 +1560,23 @@ async function executeRun(
           approvedCanonicalUrl: input.job.canonicalUrl,
           pageUrl: browserPage.url(),
         },
+        runtimePacket.approvedExecutionAdmission,
       );
-      await writeCloudCheckpoint({
-        input,
-        paths,
-        events,
+      await authorizeCloudFinalSubmitBeforeCheckpoint(
         lease,
-        requestId,
-        checkpointCreatedAtMs,
-        phase: "final_submit_started",
-        status: "side_effect_unknown",
-        browserUrl: browserPage.url(),
-      });
-      await lease.beforeFinalSubmit(finalSubmitProof);
+        finalSubmitProof,
+        () => writeCloudCheckpoint({
+          input,
+          paths,
+          events,
+          lease,
+          requestId,
+          checkpointCreatedAtMs,
+          phase: "final_submit_started",
+          status: "side_effect_unknown",
+          browserUrl: browserPage.url(),
+        }),
+      );
     },
     afterFinalSubmit: async (outcome: "activated" | "activation_uncertain") => {
       await lease.afterFinalSubmit(outcome);
@@ -1584,7 +1596,7 @@ async function executeRun(
       });
     },
   } as const;
-  const providerRegistry = providerRegistryForResumeAction(resumeAction);
+  const providerRegistry = providerRegistryForExecution(runtimePacket, resumeAction);
   const execution = providerRegistry
     ? await executeApplication(adapterContext, providerRegistry)
     : await executeApplication(adapterContext);
@@ -1646,6 +1658,7 @@ async function executeRun(
       storageKey: documents.coverLetter.path,
       sha256: documents.coverLetter.sha256,
     });
+  const atsCertifiedReceiptAuthority = lease.atsCertifiedReceiptAuthority;
   const receipt = createApplicationReceipt({
     receiptId: `receipt-${input.runId}`,
     accountId: input.accountId,
@@ -1662,6 +1675,9 @@ async function executeRun(
     result: execution.receipt,
     finalUrl: page.url(),
     screenshotKeys: [screenshotPath],
+    ...(atsCertifiedReceiptAuthority
+      ? { atsCertifiedReceiptAuthority }
+      : {}),
   });
   const receiptPath = await writeManagedReceiptArtifact(
     paths,
@@ -2802,6 +2818,54 @@ export function runnerDataRootFromEnv(
   const value = env.BLUEY_JOBS_RUNNER_DATA?.trim();
   if (!value) throw new Error("BLUEY_JOBS_RUNNER_DATA is required");
   return value;
+}
+
+export function runnerProcessRuntimeGrantFromEnv(
+  runnerBuildId: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  architecture: string = process.arch,
+) {
+  const required = (name: string): string => {
+    const value = env[name]?.trim();
+    if (!value) throw new Error(`${name} is required`);
+    return value;
+  };
+  const runtimePlatform =
+    platform === "linux"
+      ? "linux"
+      : platform === "darwin"
+        ? "macos"
+        : platform === "win32"
+          ? "windows"
+          : undefined;
+  const runtimeArchitecture =
+    architecture === "arm64"
+      ? "arm64"
+      : architecture === "x64"
+        ? "x86_64"
+        : undefined;
+  if (!runtimePlatform || !runtimeArchitecture) {
+    throw new Error("Unsupported runner runtime platform");
+  }
+  return {
+    grantId: required("BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_ID"),
+    grantToken: required("BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_TOKEN"),
+    runtime: {
+      runnerImageSha256: required("BLUEY_JOBS_RUNNER_IMAGE_SHA256"),
+      runnerBuildId,
+      platform: runtimePlatform,
+      architecture: runtimeArchitecture,
+      automationBundleSha256: required(
+        "BLUEY_JOBS_AUTOMATION_BUNDLE_SHA256",
+      ),
+      playwrightVersion: required("BLUEY_JOBS_PLAYWRIGHT_VERSION"),
+      chromiumRevision: required("BLUEY_JOBS_CHROMIUM_REVISION"),
+      chromiumExecutableSha256: required(
+        "BLUEY_JOBS_CHROMIUM_EXECUTABLE_SHA256",
+      ),
+    },
+  } as const;
 }
 
 function requiredRunnerEnv(name: string): string {

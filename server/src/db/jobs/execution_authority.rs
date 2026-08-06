@@ -153,6 +153,17 @@ fn current_execution_authorized_sqlite(
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let ats_certification = match resolve_ats_certification_for_posting_sqlite_tx(
+        tx,
+        account_id,
+        &posting,
+        None,
+        now_ms(),
+    ) {
+        Ok(resolution) => Some(resolution),
+        Err(AtsCertificationAuthorityError::Storage(error)) => return Err(error),
+        Err(_) => None,
+    };
 
     let authorized = current_execution_authority_matches(
         account_id,
@@ -166,6 +177,7 @@ fn current_execution_authorized_sqlite(
         &preferences,
         &reservations,
         &authorities,
+        ats_certification.as_ref(),
         runner,
     )? && stored_execution_evidence_matches_sqlite(tx, account_id, application)?;
     Ok(authorized)
@@ -296,6 +308,17 @@ fn current_execution_authorized_postgres(
             last_seen_run_id: row.get(6),
         })
         .collect::<Vec<_>>();
+    let ats_certification = match resolve_ats_certification_for_posting_postgres_tx(
+        tx,
+        account_id,
+        &posting,
+        None,
+        now_ms(),
+    ) {
+        Ok(resolution) => Some(resolution),
+        Err(AtsCertificationAuthorityError::Storage(error)) => return Err(error),
+        Err(_) => None,
+    };
 
     let authorized = current_execution_authority_matches(
         account_id,
@@ -309,6 +332,7 @@ fn current_execution_authorized_postgres(
         &preferences,
         &reservations,
         &authorities,
+        ats_certification.as_ref(),
         runner,
     )? && stored_execution_evidence_matches_postgres(tx, account_id, application)?;
     Ok(authorized)
@@ -327,6 +351,7 @@ fn current_execution_authority_matches(
     preferences: &JobPreferences,
     reservations: &[AttemptReservation],
     authorities: &[JobDiscoveryAuthority],
+    ats_certification: Option<&AtsCertificationPostingResolution>,
     runner: ExecutionAuthorityRunner,
 ) -> Result<bool> {
     let frozen_track = frozen_receipt_string(application, "/career_track_id");
@@ -358,6 +383,9 @@ fn current_execution_authority_matches(
         Some(track),
     );
     apply_discovery_authorities(authorities, &mut decision);
+    if let Some(resolution) = ats_certification {
+        apply_ats_certification_resolution(posting, &mut decision, resolution);
+    }
     let runner_authorized = match runner {
         ExecutionAuthorityRunner::Local => decision.can_queue_local,
         ExecutionAuthorityRunner::Cloud => decision.can_queue_cloud,

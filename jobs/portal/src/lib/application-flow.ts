@@ -6,6 +6,7 @@ import type {
   RunnerAvailability,
   SubmissionMode,
 } from "../types";
+import { portalEligibilityDecision } from "./ats-certification";
 
 export function runnerEligibleApplications(applications: JobApplication[]): JobApplication[] {
   return applications.filter((application) => application.state === "queued");
@@ -70,8 +71,12 @@ export function effectiveSubmissionMode(
   runners: RunnerAvailability,
   trackAuthorized: boolean,
 ): SubmissionMode {
+  const eligibility = portalEligibilityDecision(job.eligibility);
+  const certifiedRunnerAvailable = (eligibility.can_queue_local && runners.local.available)
+    || (eligibility.can_queue_cloud && runners.cloud.available);
   return requested === "auto_submit"
-    && job.eligibility?.can_auto_submit === true
+    && eligibility.can_auto_submit
+    && certifiedRunnerAvailable
     && runners.auto_submit_available
     && trackAuthorized
     ? "auto_submit"

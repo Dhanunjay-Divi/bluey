@@ -93,6 +93,13 @@ BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner
 BLUEY_JOBS_RUNNER_BUILD_ID=runner-602.1
 BLUEY_JOBS_RUNNER_ADMISSION_GRANT_ID=<one-time per-volume grant ID>
 BLUEY_JOBS_RUNNER_ADMISSION_GRANT_TOKEN=<one-time per-volume grant token>
+BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_ID=<one-time per-process runtime grant ID>
+BLUEY_JOBS_RUNNER_PROCESS_RUNTIME_GRANT_TOKEN=<one-time per-process runtime grant token>
+BLUEY_JOBS_RUNNER_IMAGE_SHA256=<final 64-character OCI image SHA-256>
+BLUEY_JOBS_AUTOMATION_BUNDLE_SHA256=<64-character automation bundle SHA-256>
+BLUEY_JOBS_PLAYWRIGHT_VERSION=<exact Playwright version>
+BLUEY_JOBS_CHROMIUM_REVISION=<exact Chromium revision>
+BLUEY_JOBS_CHROMIUM_EXECUTABLE_SHA256=<64-character Chromium executable SHA-256>
 BLUEY_JOBS_RUNNER_PROVIDER=<provider ID>
 BLUEY_JOBS_RUNNER_PROVIDER_RESOURCE_ID=<managed volume resource ID>
 BLUEY_JOBS_RUNNER_RESOURCE_FINGERPRINT=<64 lowercase hex characters>
@@ -119,6 +126,16 @@ exact worker ID, provider resource ID, and resource fingerprint; mount the
 returned ID and token into one runner and start it before the ten-minute expiry.
 The grant is single-use. Use `ops/bluey-jobs-runner.env.example` as the
 per-volume template, not the shared API environment.
+
+Create the separate process-runtime grant through
+`POST /admin/jobs/runner-volumes/process-runtime-grants` only after deployment
+has resolved the final OCI image digest, runner build, platform/architecture,
+automation bundle, Playwright and Chromium revisions, and Chromium executable
+digest. Deliver its returned ID and one-time token to exactly one new process.
+The signed volume instance claim atomically consumes it; neither fleet HMAC,
+the volume key, nor lease JSON may self-assert a runtime. Cancel an unused or
+leaked grant through the authenticated `.../:grant_id/revocations` route before
+its ten-minute expiry.
 
 Do not enable either Browser distribution flag merely because enrollment
 succeeds. The fleet status, zero legacy inventory authority, current signed
@@ -683,6 +700,336 @@ authorization rechecks the current assignment, activation compatibility, and
 revocation state without weakening result/resume or trusted-receipt recovery.
 The desktop claims and reports the run through `BLUEY_JOBS_API_ORIGIN`;
 production must keep that origin on HTTPS.
+
+## ATS certification authority
+
+Run the `bluey-ops` preflight before importing or changing any ATS
+certification authority. Discovery coverage, review-fill coverage, ATS
+certification, Career Track Auto authorization, and Browser distribution are
+independent gates. A provider URL, source catalog entry, adapter result,
+synthetic fixture, portal label, or successful reviewed submission never grants
+`certified` by itself.
+
+The safe default is zero active certification. A fresh migration must create no
+active head, seed no tenant, and grant no unattended capability. Greenhouse and
+Lever remain `beta_review`; Workday, Ashby, and SmartRecruiters remain
+review-fill only; semantic and protected portals remain Review, Takeover, or
+Handoff. An absent root anchor, incomplete authority, expired record, unknown
+layout, open circuit, stale compare-and-swap, or runtime mismatch preserves that
+default.
+
+Keep all four independent production gates at `0` throughout local source work,
+schema rehearsal, signed-authority import rehearsal, and shadow observation:
+
+```text
+BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
+BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_MAILBOX_SYNC_ENABLED=0
+```
+
+An imported or applied ATS activation cannot override either Browser
+distribution flag. Conversely, an available Browser cannot manufacture an ATS
+certification.
+
+### Certification preflight
+
+Before any authority import or movement:
+
+1. Resolve the exact reviewed source commit and confirm the worktree is clean.
+2. Verify the paired SQLite/PostgreSQL ATS-certification migration and schema
+   parity from that commit. An older Jobs binary must not run against a newer
+   authority schema.
+3. Confirm a new database contains zero certification heads, zero canary
+   reservations, and zero application certification bindings.
+4. Resolve the exact provider, tenant, variant, surface digest, adapter version
+   and bundle digest, layout-contract digest, suite version, and runner target.
+   The target comes from canonical job and original-source authority, never an
+   operator-supplied arbitrary URL.
+5. For a local target, resolve the exact active Browser release manifest,
+   platform/architecture artifact, build descriptor, Playwright version, and
+   Chromium revision. For cloud, resolve the immutable runner image digest,
+   runner build ID, automation bundle, Playwright version, and Chromium
+   revision.
+6. Verify every referenced evidence object by complete immutable read-back,
+   exact byte size, SHA-256, media type, provenance, authorization reference,
+   sanitizer version, capture time, and expiry.
+7. Confirm signed layout observations contain no candidate values, labels with
+   candidate data, page text, HTML, screenshots, documents, cookies, tokens,
+   OTPs, credentials, full query strings, or selectors containing user data.
+8. Confirm manifest, evidence, activation, revocation, and layout-observation
+   signing roles use disjoint approved public keys and required independent
+   thresholds.
+9. Confirm the approved canary account set, eligible plan, daily submission
+   cap, concurrency cap, named support owner, incident owner, and rollback
+   authority are recorded outside the repository.
+10. Read current target status, quarantine/circuit status, head revision,
+    transition digest, expiry, and revocation state before attempting a change.
+
+The API host receives only the independently approved public ATS-certification
+root anchor, for example through
+`BLUEY_JOBS_ATS_CERTIFICATION_ROOT_TRUST_ANCHOR_JSON`. Manifest, evidence,
+activation, revocation, and layout-observation private keys must not enter the
+repository, Jobs API environment, Browser package, runner image, database, CI
+artifact, or workflow output. If the deployed implementation does not recognize
+and validate the exact root-anchor setting, stop; an environment variable alone
+is not authority.
+
+### Shadow observations and zero-authority rehearsal
+
+`LayoutObservationV1` is a signed, PII-free structural record. It binds one
+provider-target fingerprint, adapter version, exact runner target, page variant,
+control shapes, effective submit target, unique submit-control identity,
+challenge categories, observation time, expiry, and predecessor digest.
+
+Evidence-object source kind is classified explicitly:
+
+- `synthetic` exercises fixtures, parity vectors, validators, drift handling,
+  and failure paths;
+- `fault_injection` proves crash, replay, ambiguity, and circuit behavior in an
+  authorized non-production environment;
+- `authorized_sandbox` proves the exact approved sandbox target; and
+- `authorized_canary` proves a separately authorized live test vacancy.
+
+The separately signed layout-observation class is exactly `synthetic`,
+`authorized_sandbox`, or `authorized_live`. A non-shadow activation requires a
+complete authorized-sandbox and authorized-live check/result and layout pair for
+every exact runtime target. Fault-injection objects do not become a production
+layout class.
+
+Synthetic and fault-injection evidence are shadow-only. They may support an
+`observe_only` shadow manifest and activation, but they cannot authorize a
+canary or general unattended head. A source test that accepts a synthetic
+manifest proves only that the authority validator works.
+
+Import observations before the manifest that names them. A byte-identical
+replay must return the same digest. A conflicting replay, PII-bearing record,
+unapproved evidence class, wrong target, wrong runner, expired observation, or
+predecessor conflict stops the ceremony and creates no authority.
+
+### Signed import and activation ceremony
+
+Administrative import and movement requests use strict JSON with unknown
+fields rejected. Use the exact routes implemented by the reviewed Jobs API;
+the intended registry shape is:
+
+| Route | Request authority | Purpose |
+|-------|-------------------|---------|
+| `POST /admin/jobs/ats-certifications/trust-policies` | canonical root-authorized trust policy and signature set | Import or byte-replay public signing policy. |
+| `POST /admin/jobs/ats-certifications/layout-observations` | canonical `LayoutObservationV1` and independent signature set | Import one PII-free exact structural observation. |
+| `POST /admin/jobs/ats-certifications/manifests` | aggregate of a canonical independently signed `ManifestV1` plus independently signed immutable evidence envelopes | Atomically import one exact provider/target/adapter/layout/runner candidate and its evidence metadata. |
+| `POST /admin/jobs/ats-certifications/activations` | canonical `ActivationV1` and independent promotion signature set | Import a shadow, canary, or general activation without moving a head. |
+| `POST /admin/jobs/ats-certifications/activations/apply` | activation digest, expected head revision, expected transition digest | Compare-and-swap one exact scope/channel head. |
+| `POST /admin/jobs/ats-certifications/canary-allowlists` | exact bounded account set, validity window, and approval reference | Import or byte-replay the server-owned allowlist referenced by a canary activation. |
+| `POST /admin/jobs/ats-certifications/canary-allowlists/revoke` | exact allowlist digest and revocation reference | Irreversibly stop new authority from that canary account set. |
+| `POST /admin/jobs/ats-certifications/circuits` | exact scope, transition, trigger, and authority reference | Open, hold, or reviewed-close a circuit. |
+| `POST /admin/jobs/ats-certifications/revocations` | canonical `RevocationV1` and independent incident signature set | Append an irreversible revocation. |
+| `GET /admin/jobs/ats-certifications/targets/:target_key/status` | none beyond administrator authentication | Read current head, manifest, expiry, revocation, quarantine, circuit, and rollout state. |
+
+If the reviewed release exposes different route names or request fields, update
+this runbook and its contract tests before operating it. Never infer a route or
+send signed authority to an unreviewed endpoint.
+
+Use this order:
+
+1. Configure and verify the independently approved public root anchor.
+2. Import or byte-replay the current trust policy; verify its digest, sequence,
+   predecessor, time window, disjoint key roles, and thresholds.
+3. Import every signed PII-free layout observation and verify its exact
+   provider-target, adapter, runner, evidence class, sanitizer, and expiry.
+4. Import the immutable evidence metadata only after full object read-back
+   matches the recorded bytes, size, and SHA-256.
+5. Import `ManifestV1`. Verify the exact tenant, variant, surface, scope,
+   adapter version and bundle, layout set, suite and stable check IDs, source
+   commit, maximum capability, evidence set, and runtime targets.
+6. Before importing a canary activation, import and read back its exact bounded
+   allowlist. Verify the digest, members, validity window, approval reference,
+   and absence of revocation; a client-supplied account list is not authority.
+7. Import `ActivationV1` with a separate promotion signature. Verify the
+   manifest digest, scope, channel, capability ceiling, sequence, time window,
+   account allowlist digest, activation-wide total/distinct-account/concurrency
+   caps, and server-owned UTC daily side-effect cap. For a canary, the
+   `canaryEvidenceManifestSha256` field is not a second artifact: it must equal
+   the exact canonical `ManifestV1` digest that already binds the independently
+   signed evidence/layout objects and complete suite results.
+8. Read target status. Do not rely on the import response as current-head
+   evidence.
+9. Apply the activation using that exact `headRevision` and
+   `transitionSha256`. A stale revision, sequence regression, wrong predecessor,
+   expired object, open circuit, quarantine, revocation, incomplete evidence,
+   synthetic evidence in a non-shadow channel, or runtime mismatch stops the
+   compare-and-swap.
+10. Read status again and verify the expected manifest, activation, channel,
+   capability, validity, runner targets, transition, and head revision.
+11. Re-read customer-facing availability. With both Browser distribution flags
+    still `0`, it must remain unavailable even when a signed certification head
+    is valid.
+
+Use `shadow` first. Move to `canary` only with authorized sandbox/live evidence,
+an exact account allowlist digest, a positive submission cap, a named support
+owner, and separately approved runner distribution. `general` requires the full
+external matrix, independent production canary evidence, reviewed launch
+thresholds, and an explicit production approval. No source-complete Round 604
+checkout may perform that movement by assumption.
+
+### Two-phase irreversible-submit boundary
+
+Certification is checked twice and bound once. It is not a reusable bearer
+permission.
+
+Phase A is server-side preflight and single-use binding. Before a certified Auto
+run becomes employer-facing, the server atomically rechecks the exact job and
+original-source evidence, eligibility and hard filters, confirmed claims,
+current Track Auto authorization, verified identity, source resume, approved
+packet checksum, attempt and allowance, runner distribution, release/image,
+current activation head, manifest, target, adapter, layout set, expiry,
+revocations, quarantine, circuit, and rollout scope. It freezes those digests
+with the application, run, attempt, browser session/profile, random nonce hash,
+expiry, and fence. One attempt may hold only one live binding.
+
+Phase B begins immediately before the durable irreversible marker. The runner
+presents only its operation-scoped single-use capability, exact provider proof,
+and current PII-free layout digest. One transaction locks and rechecks the
+application, attempt, local ticket or cloud lease, binding, activation head,
+revocations, circuit, target, adapter, layout, runner, Track authority, packet,
+documents, discovery evidence, and eligibility. It then reserves exact canary
+capacity, consumes the binding, and advances the fence once.
+
+Only a successful Phase B response permits the runner to write its durable
+marker and activate the one provider-scoped submit control. A bounded 4xx
+authorization denial writes no marker or click. HTTP 5xx, transport loss,
+timeout, malformed success, or any response that may conceal a committed Phase
+B transaction is terminal `side_effect_unknown` and is never retried.
+
+Review-first and `beta_review` paths keep explicit packet and provider-final
+approval. An active signed provider-target certification does not force a
+Review Career Track into Auto. Only a current `track_auto_submit` admission plus
+an exact active certification and distributed runner may omit per-application
+final approval. Any changed answer, document, identity, resume, Track policy,
+packet, layout, or build invalidates the preflight binding before the marker.
+
+### Quarantine, circuits, and revocation
+
+An unexpected layout, target mismatch, evidence failure, confirmation
+ambiguity, false-state risk, repeated side-effect uncertainty, or configured
+error threshold opens the narrowest safe circuit and blocks new preflight and
+Phase B authority. Record every quarantine/circuit command and transition
+append-only. A successful later run does not auto-close a circuit or delete a
+quarantine record.
+
+Incident order:
+
+1. Open or hold the exact provider, tenant, surface, adapter, activation, or
+   runtime circuit.
+2. Verify new preflights and Phase B requests fail before the marker.
+3. Preserve active browser, result, receipt, evidence, binding, canary
+   reservation, and reconciliation records.
+4. Read the affected head and exact frozen bindings before importing incident
+   authority.
+5. Import and verify the independently signed append-only `RevocationV1`.
+6. Read target and customer-facing status again; new unattended authority must
+   be unavailable.
+7. Reconcile every run already at or beyond the irreversible marker through its
+   frozen recovery authority.
+
+Revocation, expiry, head replacement, or circuit opening after the marker must
+not deny the exact trusted result or receipt. It blocks new side effects while
+allowing only:
+
+- replay of the exact bound trusted result and immutable evidence;
+- completion of a valid provider-confirmed submitted receipt;
+- recovery-only result/resume capabilities that cannot reach Submit; or
+- the existing owner-confirmed-not-submitted reconciliation path.
+
+Never revoke by deleting rows, rewriting canonical bytes, moving a head
+backward, restoring an older database, or rejecting recovery until an operator
+is tempted to retry. Submitted state remains irreversible. Provider, target,
+adapter, and runtime circuits require reviewed release. Only an exact predecessor
+activation circuit may close through an applied newer activation whose complete
+trust, manifest, runtime, revocation, quarantine, and canary authority remains
+current after the database authority lock is acquired. A backdated event cannot
+restore stale authority. Changed layout, adapter, Browser release, cloud image,
+Chromium build, or suite requires new signed evidence and a new manifest.
+
+### Monitoring and canary stop conditions
+
+Monitor and alert by provider, tenant/surface, adapter version and bundle,
+manifest, activation, channel, and runner target:
+
+- certification preflight allows and typed denials;
+- layout-observation age, mismatch, and quarantine rate;
+- form fill/read-back and exact document-upload failures;
+- challenge and intervention rates by type;
+- Phase B authorization, canary reservation, and fence conflicts;
+- submit activations, explicit confirmations, and negative-result vetoes;
+- `side_effect_unknown` count, age, and reconciliation outcome;
+- complete receipt/evidence acceptance and rejection;
+- duplicate-prevention conflicts and workflow replay;
+- activation-wide canary total, distinct-account, live-concurrency, and UTC-day
+  side-effect reservation use;
+- circuit state and transition age;
+- authority, observation, manifest, and activation expiry; and
+- current revocations and affected in-flight recovery bindings.
+
+Stop the canary and open the circuit on any hard-filter violation, unsupported
+candidate claim, duplicate submit activation, false Submitted state,
+incomplete/mismatched receipt, PII-bearing observation or telemetry, unexpected
+layout, unexplained evidence loss, or recovery path that attempts another
+click. Do not average zero-tolerance failures into a success rate.
+
+Before expanding an approved canary, confirm the policy-defined success,
+intervention, recovery, and latency thresholds; zero unresolved
+`side_effect_unknown` outside the bounded reconciliation window; complete
+typed receipts; healthy source and runner state; allowance correctness; and
+available support capacity. Expansion always uses a separately reviewed signed
+activation and compare-and-swap transition.
+
+### External certification gates and launch truth
+
+Source-complete evidence may prove the registry, canonical validation, target
+matching, shadow observations, lifecycle, two-phase fence, quarantine, circuit,
+and recovery behavior. It cannot prove a real provider tenant or production
+runner.
+
+Before any Greenhouse or Lever target is activated beyond shadow, require:
+
+- independently managed signing roles and approved public root anchor;
+- two or three owner-authorized sandbox/live test vacancies for that exact
+  provider target and layout variants;
+- every required stable suite check, including custom/dynamic fields, exact PDF
+  upload/read-back, sensitive/legal handling, CAPTCHA/2FA/assessment pause,
+  unique submit control, positive and negative confirmation, crash-after-click,
+  duplicate delivery, drift, privacy, and complete receipt evidence;
+- an exact local signed Browser release with immutable public read-back and
+  physical platform canaries, or an exact cloud image/Chromium build with
+  authenticated Temporal, PostgreSQL, R2/S3, network, takeover, crash, and
+  capacity canaries;
+- approved canary accounts and plan, activation-wide distinct-account and total
+  caps, UTC daily side-effect cap, live-concurrency cap, support owner, incident
+  owner, and rollback authority;
+- provider/data-rights approval where required; and
+- an explicit production change authorizing the selected Browser distribution
+  flag.
+
+Workday, Ashby, and SmartRecruiters cannot receive unattended activation until
+their own provider-specific state machines and the same complete external
+matrix pass. Semantic, unknown, and protected portals cannot inherit another
+provider's certification.
+
+Do not write or approve launch claims that say an ATS is certified, unattended
+submission is available, a canary passed, or a runner launched from migrations,
+fixtures, synthetic/fault evidence, signed-object parser tests, imported shadow
+authority, or a source-complete review. Until the Round 604 verification matrix
+is fully green, say only:
+
+> Signed ATS certification authority implementation is in progress; every
+> provider remains Review first.
+
+After every source-completable Round 604 gate is proven, the strongest honest
+source-only wording is:
+
+> Signed ATS certification authority is source-ready; every provider remains
+> Review first pending authorized tenant and runner evidence.
 
 ## External release gates
 

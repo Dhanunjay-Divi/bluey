@@ -35,6 +35,7 @@ import { Onboarding } from "./components/Onboarding";
 import { LoadError, LoadingScreen } from "./components/PageState";
 import { previewPosting, previewResume } from "./lib/preview-application";
 import { runnerAvailabilityOrLocked } from "./lib/runner-access";
+import { portalEligibilityDecision } from "./lib/ats-certification";
 import {
   applicationAfterInterventionResolution,
   browserSessionAfterInterventionResolution,
@@ -456,13 +457,14 @@ export default function App() {
       if (!workspace) return;
       if (isPreview) {
         const resume = previewResume(workspace, job, `resume-${job.id}-${Date.now()}`, mode, account?.email || "");
-        const autoSubmitEligible = submissionMode === "auto_submit" && job.eligibility?.can_auto_submit === true;
+        const autoSubmitEligible = submissionMode === "auto_submit"
+          && portalEligibilityDecision(job.eligibility).can_auto_submit;
         const application: JobApplication = {
           id: `application-${job.id}`,
           job_id: job.id,
           resume_version_id: resume.id,
           state: autoSubmitEligible ? "queued" : "awaiting_review",
-          submission_mode: submissionMode === "auto_submit" ? "auto_submit" : "review_first",
+          submission_mode: autoSubmitEligible ? "auto_submit" : "review_first",
           match_score: job.match_score,
           answers: [],
           cover_letter: "",

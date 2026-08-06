@@ -9,6 +9,8 @@ export function localRunReleaseFixture(
 ): LocalRunReleaseBinding {
   return {
     descriptor_sha256: "a".repeat(64),
+    automation_bundle_sha256: "e".repeat(64),
+    chromium_executable_sha256: "f".repeat(64),
     manifest_sha256: "b".repeat(64),
     activation_sha256: "c".repeat(64),
     artifact_id: "browser-artifact-603-1-darwin-arm64",

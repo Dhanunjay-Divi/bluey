@@ -18,6 +18,7 @@ pub mod admin;
 pub mod auth_routes;
 pub mod billing;
 pub mod jobs;
+pub mod jobs_ats_certifications;
 pub mod jobs_browser_releases;
 mod jobs_communication_actions;
 mod jobs_import;
@@ -182,6 +183,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .merge(
             jobs::worker_router()
+                .merge(jobs_ats_certifications::worker_router())
                 .merge(jobs_runner_volumes::worker_router())
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
@@ -213,6 +215,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             get(admin::support_account),
         )
         .merge(jobs::admin_router())
+        .merge(jobs_ats_certifications::admin_router())
         .merge(jobs_browser_releases::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
@@ -421,6 +424,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         ));
 
     let jobs_admin = jobs::admin_router()
+        .merge(jobs_ats_certifications::admin_router())
         .merge(jobs_browser_releases::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin))
@@ -436,6 +440,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         ))
         .merge(
             jobs::worker_router()
+                .merge(jobs_ats_certifications::worker_router())
                 .merge(jobs_runner_volumes::worker_router())
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),

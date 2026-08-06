@@ -425,6 +425,8 @@ struct StoredBrowserReleaseArtifact {
     artifact_size_bytes: i64,
     artifact_sha256: String,
     app_content_sha256: String,
+    automation_bundle_sha256: String,
+    chromium_executable_sha256: String,
     verification_evidence_sha256: String,
     native_signature_kind: String,
     native_signer_identity: String,
@@ -1767,6 +1769,8 @@ fn expected_browser_release_artifacts(
                 artifact_size_bytes: artifact.size_bytes,
                 artifact_sha256: artifact.sha256.clone(),
                 app_content_sha256: artifact.app_content_sha256.clone(),
+                automation_bundle_sha256: artifact.automation_bundle_sha256.clone(),
+                chromium_executable_sha256: artifact.chromium_executable_sha256.clone(),
                 verification_evidence_sha256: artifact.verification_evidence_sha256.clone(),
                 native_signature_kind: artifact.native_signature_kind.clone(),
                 native_signer_identity: artifact.native_signer_identity.clone(),
@@ -1794,9 +1798,11 @@ fn sqlite_stored_browser_release_artifact(
         artifact_size_bytes: row.get(10)?,
         artifact_sha256: row.get(11)?,
         app_content_sha256: row.get(12)?,
-        verification_evidence_sha256: row.get(13)?,
-        native_signature_kind: row.get(14)?,
-        native_signer_identity: row.get(15)?,
+        automation_bundle_sha256: row.get(13)?,
+        chromium_executable_sha256: row.get(14)?,
+        verification_evidence_sha256: row.get(15)?,
+        native_signature_kind: row.get(16)?,
+        native_signer_identity: row.get(17)?,
     })
 }
 
@@ -1815,9 +1821,11 @@ fn postgres_stored_browser_release_artifact(row: postgres::Row) -> StoredBrowser
         artifact_size_bytes: row.get(10),
         artifact_sha256: row.get(11),
         app_content_sha256: row.get(12),
-        verification_evidence_sha256: row.get(13),
-        native_signature_kind: row.get(14),
-        native_signer_identity: row.get(15),
+        automation_bundle_sha256: row.get(13),
+        chromium_executable_sha256: row.get(14),
+        verification_evidence_sha256: row.get(15),
+        native_signature_kind: row.get(16),
+        native_signer_identity: row.get(17),
     }
 }
 
@@ -1827,16 +1835,31 @@ fn require_exact_sqlite_browser_release_artifacts(
 ) -> Result<(), BrowserReleaseRegistryError> {
     let mut statement = transaction
         .prepare(
-            r#"SELECT artifact_id, platform, architecture, package_kind,
-                      build_descriptor_sha256, build_descriptor_base64url,
-                      build_descriptor_signature_base64url,
-                      build_descriptor_signing_key_id, artifact_url,
-                      artifact_filename, artifact_size_bytes, artifact_sha256,
-                      app_content_sha256, verification_evidence_sha256,
-                      native_signature_kind, native_signer_identity
-                 FROM jobs_browser_release_artifacts
-                WHERE manifest_sha256 = ?1
-                ORDER BY artifact_id"#,
+            r#"SELECT artifact.artifact_id, artifact.platform,
+                      artifact.architecture, artifact.package_kind,
+                      artifact.build_descriptor_sha256,
+                      artifact.build_descriptor_base64url,
+                      artifact.build_descriptor_signature_base64url,
+                      artifact.build_descriptor_signing_key_id,
+                      artifact.artifact_url, artifact.artifact_filename,
+                      artifact.artifact_size_bytes, artifact.artifact_sha256,
+                      artifact.app_content_sha256,
+                      runtime.automation_bundle_sha256,
+                      runtime.chromium_executable_sha256,
+                      artifact.verification_evidence_sha256,
+                      artifact.native_signature_kind, artifact.native_signer_identity
+                 FROM jobs_browser_release_artifacts artifact
+                 JOIN jobs_browser_release_artifact_runtime_components runtime
+                   ON runtime.manifest_sha256 = artifact.manifest_sha256
+                  AND runtime.artifact_id = artifact.artifact_id
+                  AND runtime.build_descriptor_sha256 =
+                      artifact.build_descriptor_sha256
+                  AND runtime.artifact_sha256 = artifact.artifact_sha256
+                  AND runtime.platform = artifact.platform
+                  AND runtime.architecture = artifact.architecture
+                  AND runtime.package_kind = artifact.package_kind
+                WHERE artifact.manifest_sha256 = ?1
+                ORDER BY artifact.artifact_id"#,
         )
         .map_err(browser_release_registry_storage)?;
     let stored = statement
@@ -1860,16 +1883,31 @@ fn require_exact_postgres_browser_release_artifacts(
 ) -> Result<(), BrowserReleaseRegistryError> {
     let stored = transaction
         .query(
-            r#"SELECT artifact_id, platform, architecture, package_kind,
-                      build_descriptor_sha256, build_descriptor_base64url,
-                      build_descriptor_signature_base64url,
-                      build_descriptor_signing_key_id, artifact_url,
-                      artifact_filename, artifact_size_bytes, artifact_sha256,
-                      app_content_sha256, verification_evidence_sha256,
-                      native_signature_kind, native_signer_identity
-                 FROM jobs_browser_release_artifacts
-                WHERE manifest_sha256 = $1
-                ORDER BY artifact_id"#,
+            r#"SELECT artifact.artifact_id, artifact.platform,
+                      artifact.architecture, artifact.package_kind,
+                      artifact.build_descriptor_sha256,
+                      artifact.build_descriptor_base64url,
+                      artifact.build_descriptor_signature_base64url,
+                      artifact.build_descriptor_signing_key_id,
+                      artifact.artifact_url, artifact.artifact_filename,
+                      artifact.artifact_size_bytes, artifact.artifact_sha256,
+                      artifact.app_content_sha256,
+                      runtime.automation_bundle_sha256,
+                      runtime.chromium_executable_sha256,
+                      artifact.verification_evidence_sha256,
+                      artifact.native_signature_kind, artifact.native_signer_identity
+                 FROM jobs_browser_release_artifacts artifact
+                 JOIN jobs_browser_release_artifact_runtime_components runtime
+                   ON runtime.manifest_sha256 = artifact.manifest_sha256
+                  AND runtime.artifact_id = artifact.artifact_id
+                  AND runtime.build_descriptor_sha256 =
+                      artifact.build_descriptor_sha256
+                  AND runtime.artifact_sha256 = artifact.artifact_sha256
+                  AND runtime.platform = artifact.platform
+                  AND runtime.architecture = artifact.architecture
+                  AND runtime.package_kind = artifact.package_kind
+                WHERE artifact.manifest_sha256 = $1
+                ORDER BY artifact.artifact_id"#,
             &[&verified.manifest_sha256],
         )
         .map_err(browser_release_registry_storage)?
@@ -2081,6 +2119,27 @@ fn insert_sqlite_browser_release_manifest(
                 ],
             )
             .map_err(browser_release_registry_storage)?;
+        transaction
+            .execute(
+                "INSERT INTO jobs_browser_release_artifact_runtime_components ( \
+                   manifest_sha256, artifact_id, build_descriptor_sha256, \
+                   artifact_sha256, platform, architecture, package_kind, \
+                   automation_bundle_sha256, chromium_executable_sha256, recorded_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                params![
+                    verified.manifest_sha256,
+                    artifact.artifact_id,
+                    descriptor.descriptor_sha256,
+                    artifact.sha256,
+                    artifact.platform,
+                    artifact.architecture,
+                    artifact.package_kind,
+                    artifact.automation_bundle_sha256,
+                    artifact.chromium_executable_sha256,
+                    recorded_at_ms,
+                ],
+            )
+            .map_err(browser_release_registry_storage)?;
     }
     Ok(())
 }
@@ -2163,6 +2222,27 @@ fn insert_postgres_browser_release_manifest(
                     &artifact.verification_evidence_sha256,
                     &artifact.native_signature_kind,
                     &artifact.native_signer_identity,
+                    &recorded_at_ms,
+                ],
+            )
+            .map_err(browser_release_registry_storage)?;
+        transaction
+            .execute(
+                "INSERT INTO jobs_browser_release_artifact_runtime_components ( \
+                   manifest_sha256, artifact_id, build_descriptor_sha256, \
+                   artifact_sha256, platform, architecture, package_kind, \
+                   automation_bundle_sha256, chromium_executable_sha256, recorded_at_ms \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[
+                    &verified.manifest_sha256,
+                    &artifact.artifact_id,
+                    &descriptor.descriptor_sha256,
+                    &artifact.sha256,
+                    &artifact.platform,
+                    &artifact.architecture,
+                    &artifact.package_kind,
+                    &artifact.automation_bundle_sha256,
+                    &artifact.chromium_executable_sha256,
                     &recorded_at_ms,
                 ],
             )
@@ -3587,11 +3667,24 @@ fn sqlite_browser_release_artifact_set_complete(
 ) -> Result<bool, BrowserReleaseRegistryError> {
     let mut statement = transaction
         .prepare(
-            r#"SELECT platform, architecture, package_kind,
-                      build_descriptor_sha256, app_content_sha256, artifact_url
-                 FROM jobs_browser_release_artifacts
-                WHERE manifest_sha256 = ?1
-                ORDER BY platform, architecture, package_kind"#,
+            r#"SELECT artifact.platform, artifact.architecture,
+                      artifact.package_kind, artifact.build_descriptor_sha256,
+                      artifact.app_content_sha256,
+                      runtime.automation_bundle_sha256,
+                      runtime.chromium_executable_sha256, artifact.artifact_url
+                 FROM jobs_browser_release_artifacts artifact
+                 JOIN jobs_browser_release_artifact_runtime_components runtime
+                   ON runtime.manifest_sha256 = artifact.manifest_sha256
+                  AND runtime.artifact_id = artifact.artifact_id
+                  AND runtime.build_descriptor_sha256 =
+                      artifact.build_descriptor_sha256
+                  AND runtime.artifact_sha256 = artifact.artifact_sha256
+                  AND runtime.platform = artifact.platform
+                  AND runtime.architecture = artifact.architecture
+                  AND runtime.package_kind = artifact.package_kind
+                WHERE artifact.manifest_sha256 = ?1
+                ORDER BY artifact.platform, artifact.architecture,
+                         artifact.package_kind"#,
         )
         .map_err(browser_release_registry_storage)?;
     let artifacts = statement
@@ -3603,6 +3696,8 @@ fn sqlite_browser_release_artifact_set_complete(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
             ))
         })
         .map_err(browser_release_registry_storage)?
@@ -3617,11 +3712,24 @@ fn postgres_browser_release_artifact_set_complete(
 ) -> Result<bool, BrowserReleaseRegistryError> {
     let artifacts = transaction
         .query(
-            r#"SELECT platform, architecture, package_kind,
-                      build_descriptor_sha256, app_content_sha256, artifact_url
-                 FROM jobs_browser_release_artifacts
-                WHERE manifest_sha256 = $1
-                ORDER BY platform, architecture, package_kind"#,
+            r#"SELECT artifact.platform, artifact.architecture,
+                      artifact.package_kind, artifact.build_descriptor_sha256,
+                      artifact.app_content_sha256,
+                      runtime.automation_bundle_sha256,
+                      runtime.chromium_executable_sha256, artifact.artifact_url
+                 FROM jobs_browser_release_artifacts artifact
+                 JOIN jobs_browser_release_artifact_runtime_components runtime
+                   ON runtime.manifest_sha256 = artifact.manifest_sha256
+                  AND runtime.artifact_id = artifact.artifact_id
+                  AND runtime.build_descriptor_sha256 =
+                      artifact.build_descriptor_sha256
+                  AND runtime.artifact_sha256 = artifact.artifact_sha256
+                  AND runtime.platform = artifact.platform
+                  AND runtime.architecture = artifact.architecture
+                  AND runtime.package_kind = artifact.package_kind
+                WHERE artifact.manifest_sha256 = $1
+                ORDER BY artifact.platform, artifact.architecture,
+                         artifact.package_kind"#,
             &[&manifest_sha256],
         )
         .map_err(browser_release_registry_storage)?
@@ -3634,6 +3742,8 @@ fn postgres_browser_release_artifact_set_complete(
                 row.get(3),
                 row.get(4),
                 row.get(5),
+                row.get(6),
+                row.get(7),
             )
         })
         .collect::<Vec<_>>();
@@ -5830,12 +5940,7 @@ mod browser_release_registry_tests {
     }
 
     fn signer_revocation_envelope() -> BrowserReleaseAuthorityEnvelope {
-        signing_key_revocation_envelope(
-            "browser-revocation-signing-key-1",
-            2,
-            "promotion-key-1",
-            2,
-        )
+        signing_key_revocation_envelope("browser-revocation-signing-key-1", 2, "promotion-key-1", 2)
     }
 
     fn rollback_replay_envelope(
@@ -6585,7 +6690,9 @@ mod browser_release_registry_tests {
                 r#"DROP TRIGGER trg_jobs_browser_release_signatures_no_update;
                    DROP TRIGGER trg_jobs_browser_release_signatures_no_delete;
                    DROP TRIGGER trg_jobs_browser_release_artifacts_no_update;
-                   DROP TRIGGER trg_jobs_browser_release_artifacts_no_delete;"#,
+                   DROP TRIGGER trg_jobs_browser_release_artifacts_no_delete;
+                   DROP TRIGGER trg_jobs_browser_release_runtime_components_no_update;
+                   DROP TRIGGER trg_jobs_browser_release_runtime_components_no_delete;"#,
             )
             .expect("disable immutable-row triggers to simulate storage corruption");
         let (signature_key_id, signature_base64url): (String, String) = connection
@@ -6656,6 +6763,84 @@ mod browser_release_registry_tests {
                 params![artifact_filename, artifact_id],
             )
             .expect("restore stored manifest artifact");
+        let (automation_bundle_sha256, chromium_executable_sha256): (String, String) = connection
+            .query_row(
+                "SELECT automation_bundle_sha256, chromium_executable_sha256 \
+                       FROM jobs_browser_release_artifact_runtime_components \
+                      WHERE manifest_sha256 = ?1 AND artifact_id = ?2",
+                params![manifest.authority_sha256, artifact_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("load stored Browser runtime components");
+        connection
+            .execute(
+                "UPDATE jobs_browser_release_artifact_runtime_components \
+                    SET automation_bundle_sha256 = ?1 \
+                  WHERE manifest_sha256 = ?2 AND artifact_id = ?3",
+                params!["0".repeat(64), manifest.authority_sha256, artifact_id],
+            )
+            .expect("corrupt stored automation bundle projection");
+        let changed_runtime =
+            import_browser_release_manifest(&pool, &manifest_request, "admin-registry-b")
+                .expect_err("reject manifest replay with changed runtime components");
+        assert!(matches!(
+            changed_runtime,
+            BrowserReleaseRegistryError::IdentityConflict
+        ));
+        connection
+            .execute(
+                "UPDATE jobs_browser_release_artifact_runtime_components \
+                    SET automation_bundle_sha256 = ?1, chromium_executable_sha256 = ?2 \
+                  WHERE manifest_sha256 = ?3 AND artifact_id = ?4",
+                params![
+                    automation_bundle_sha256,
+                    chromium_executable_sha256,
+                    manifest.authority_sha256,
+                    artifact_id,
+                ],
+            )
+            .expect("restore stored Browser runtime components");
+        connection
+            .execute(
+                "UPDATE jobs_browser_release_artifact_runtime_components \
+                    SET chromium_executable_sha256 = ?1 \
+                  WHERE manifest_sha256 = ?2 AND artifact_id = ?3",
+                params!["0".repeat(64), manifest.authority_sha256, artifact_id],
+            )
+            .expect("corrupt stored Chromium executable projection");
+        let changed_chromium =
+            import_browser_release_manifest(&pool, &manifest_request, "admin-registry-b")
+                .expect_err("reject manifest replay with changed Chromium components");
+        assert!(matches!(
+            changed_chromium,
+            BrowserReleaseRegistryError::IdentityConflict
+        ));
+        connection
+            .execute(
+                "UPDATE jobs_browser_release_artifact_runtime_components \
+                    SET chromium_executable_sha256 = ?1 \
+                  WHERE manifest_sha256 = ?2 AND artifact_id = ?3",
+                params![
+                    chromium_executable_sha256,
+                    manifest.authority_sha256,
+                    artifact_id,
+                ],
+            )
+            .expect("restore stored Chromium executable projection");
+        connection
+            .execute(
+                "DELETE FROM jobs_browser_release_artifact_runtime_components \
+                  WHERE manifest_sha256 = ?1 AND artifact_id = ?2",
+                params![manifest.authority_sha256, artifact_id],
+            )
+            .expect("remove stored Browser runtime components");
+        let missing_runtime =
+            import_browser_release_manifest(&pool, &manifest_request, "admin-registry-b")
+                .expect_err("reject manifest replay with missing runtime components");
+        assert!(matches!(
+            missing_runtime,
+            BrowserReleaseRegistryError::IdentityConflict
+        ));
         connection
             .execute(
                 "DELETE FROM jobs_browser_release_artifacts WHERE artifact_id = ?1",
@@ -6878,11 +7063,8 @@ mod browser_release_registry_tests {
             .expect("count persisted revocations");
         assert_eq!(revocation_count, 1);
 
-        let successor = successor_policy_envelope(
-            &policy,
-            &predecessor.authority_sha256,
-            "https://bluey.sh",
-        );
+        let successor =
+            successor_policy_envelope(&policy, &predecessor.authority_sha256, "https://bluey.sh");
         let recovered =
             import_browser_release_trust_policy(&pool, &successor, "admin-registry-rotation")
                 .expect("predecessor roots remain able to authorize the successor policy");
@@ -6914,8 +7096,7 @@ mod browser_release_registry_tests {
             ),
         ];
         let root_digest = browser_release_signing_key_digest(&root_public_key).unwrap();
-        let delegated_digest =
-            browser_release_signing_key_digest(&delegated_public_key).unwrap();
+        let delegated_digest = browser_release_signing_key_digest(&delegated_public_key).unwrap();
         assert!(!browser_release_delegated_signing_key_subject_matches(
             &keys,
             "root-key-1",
@@ -6982,12 +7163,9 @@ mod browser_release_registry_tests {
             canonical_base64url: fixture.activation.canonical.clone(),
             signature_set_base64url: fixture.activation.signature_set.clone(),
         };
-        let predecessor = import_browser_release_activation(
-            &pool,
-            &predecessor_envelope,
-            "admin-registry-a",
-        )
-        .expect("import predecessor activation");
+        let predecessor =
+            import_browser_release_activation(&pool, &predecessor_envelope, "admin-registry-a")
+                .expect("import predecessor activation");
         let apply_request = ApplyBrowserReleaseActivationRequest {
             activation_sha256: predecessor.authority_sha256.clone(),
             expected_head_revision: 0,
@@ -7007,9 +7185,8 @@ mod browser_release_registry_tests {
                 .expect("exact activation import replay survives origin rotation")
                 .replayed
         );
-        let replayed =
-            apply_browser_release_activation(&pool, &apply_request, "admin-registry-b")
-                .expect("exact activation apply replay survives origin rotation");
+        let replayed = apply_browser_release_activation(&pool, &apply_request, "admin-registry-b")
+            .expect("exact activation apply replay survives origin rotation");
         assert_eq!(replayed.head_revision, 1);
 
         let successor_envelope = successor_activation_envelope(&fixture);
@@ -7242,10 +7419,9 @@ mod browser_release_registry_tests {
             "admin-registry-a",
         )
         .expect("import fixture trust policy");
-        let manifest = parse_canonical_browser_release_manifest(&decode_fixture(
-            &fixture.manifest.canonical,
-        ))
-        .expect("parse fixture manifest");
+        let manifest =
+            parse_canonical_browser_release_manifest(&decode_fixture(&fixture.manifest.canonical))
+                .expect("parse fixture manifest");
 
         let mut wrong_extension = manifest.clone();
         wrong_extension.artifacts[0].url = wrong_extension.artifacts[0]
@@ -7253,12 +7429,24 @@ mod browser_release_registry_tests {
             .replace("darwin-arm64-dmg.dmg", "darwin-arm64-dmg.zip");
         let mut split_macos_app = manifest.clone();
         split_macos_app.artifacts[1].app_content_sha256 = "f".repeat(64);
+        let mut split_automation_bundle = manifest.clone();
+        split_automation_bundle.artifacts[1].automation_bundle_sha256 = "e".repeat(64);
+        let mut split_chromium_executable = manifest.clone();
+        split_chromium_executable.artifacts[1].chromium_executable_sha256 = "d".repeat(64);
         let mut duplicate_url = manifest;
         duplicate_url.artifacts[2].url = duplicate_url.artifacts[0].url.clone();
 
         for (invalid, signature_set_id) in [
             (wrong_extension, "invalid-manifest-extension-signatures"),
             (split_macos_app, "invalid-manifest-app-content-signatures"),
+            (
+                split_automation_bundle,
+                "invalid-manifest-automation-bundle-signatures",
+            ),
+            (
+                split_chromium_executable,
+                "invalid-manifest-chromium-executable-signatures",
+            ),
             (duplicate_url, "invalid-manifest-duplicate-url-signatures"),
         ] {
             assert!(matches!(

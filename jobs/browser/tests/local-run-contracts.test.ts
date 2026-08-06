@@ -28,6 +28,29 @@ describe("local run approved job navigation", () => {
     expect(() => validateStartRunRequest({ ...request, packet, job }))
       .toThrow(expect.objectContaining({ code: "launch_mismatch" }));
   });
+
+  it("admits exact Lever EU navigation and rejects raw-target syntax drift", () => {
+    const job: NormalizedJob = {
+      ...fixture().job!,
+      externalId: "posting-eu",
+      canonicalUrl: "https://jobs.eu.lever.co/acme/posting-eu",
+      source: "lever",
+    };
+    const request = {
+      ...fixture(),
+      url: "https://jobs.eu.lever.co/acme/posting-eu/apply",
+      packet: packetFor(job),
+      job,
+    };
+    expect(() => validateStartRunRequest(request)).not.toThrow();
+    for (const url of [
+      "https://jobs.eu.lever.co:443/acme/posting-eu/apply",
+      "https://jobs.eu.lever.co?next=/acme/posting-eu/apply",
+    ]) {
+      expect(() => validateStartRunRequest({ ...request, url }))
+        .toThrow(expect.objectContaining({ code: "launch_mismatch" }));
+    }
+  });
 });
 
 function fixture(): StartRunRequest {

@@ -219,6 +219,32 @@ test("release URLs are canonical, policy-origin bound, and never use mutable rel
       ]),
     /conflicting packaged app content/i,
   );
+  for (const field of [
+    "automationBundleSha256",
+    "chromiumExecutableSha256",
+  ]) {
+    assert.throws(
+      () =>
+        validateManifestTargetContentBindings([
+          {
+            platform: "darwin",
+            architecture: "arm64",
+            appContentSha256: "1".repeat(64),
+            automationBundleSha256: "3".repeat(64),
+            chromiumExecutableSha256: "4".repeat(64),
+          },
+          {
+            platform: "darwin",
+            architecture: "arm64",
+            appContentSha256: "1".repeat(64),
+            automationBundleSha256: "3".repeat(64),
+            chromiumExecutableSha256: "4".repeat(64),
+            [field]: "5".repeat(64),
+          },
+        ]),
+      /runtime components/i,
+    );
+  }
   assert.throws(
     () =>
       requireExactTargetArtifactContracts(
@@ -502,6 +528,24 @@ test("trusted app.asar inspection opens exact runtime files and rejects mutation
   const contract = await inspectPackagedAppAsar(valid);
   assert.ok(contract.entryCount >= 10);
   assert.match(contract.entriesSha256, /^[0-9a-f]{64}$/);
+  assert.match(contract.automationBundleSha256, /^[0-9a-f]{64}$/);
+  assert.notEqual(contract.automationBundleSha256, contract.automationMainSha256);
+  const changedAutomation = join(root, "changed-automation.asar");
+  await writeTestAppAsar(
+    join(root, "changed-automation-source"),
+    changedAutomation,
+    async (source) => {
+      await writeFile(
+        join(source, "node_modules", "@bluey", "jobs-automation", "dist", "index.js"),
+        "export const changedRuntime = true;\n",
+      );
+    },
+  );
+  const changedContract = await inspectPackagedAppAsar(changedAutomation);
+  assert.notEqual(
+    changedContract.automationBundleSha256,
+    contract.automationBundleSha256,
+  );
   assert.deepEqual(
     canonicalAsarHeaderPaths({
       files: { dist: { files: { "main.js": { size: 1, offset: "0" } } } },
@@ -743,9 +787,24 @@ test("candidate, threshold authorization, and stable activation bind stored byte
     candidate.manifest.artifacts.every(
       (artifact) =>
         artifact.appContentSha256 !== artifact.sha256 &&
+        artifact.automationBundleSha256 !== artifact.sha256 &&
+        artifact.chromiumExecutableSha256 !== artifact.sha256 &&
         artifact.verificationEvidenceSha256 !== artifact.sha256,
     ),
   );
+  for (const artifact of candidate.manifest.artifacts) {
+    const target = `${artifact.platform}-${artifact.architecture}`;
+    const part = candidate.parts.find((entry) => entry.record.target === target);
+    assert.ok(part);
+    assert.equal(
+      artifact.automationBundleSha256,
+      part.record.automationBundleSha256,
+    );
+    assert.equal(
+      artifact.chromiumExecutableSha256,
+      part.record.chromiumExecutableSha256,
+    );
+  }
 
   const manifestSignatures = createSignatureSet({
     signatureSetId: "manifest-signatures-603-1",

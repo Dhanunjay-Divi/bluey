@@ -32,6 +32,7 @@ import {
 } from "../effective-submit-target.js";
 import { ExactSubmitEvidenceError } from "../trusted-submit.js";
 import { hasNegativeSubmissionOutcome } from "../submission-confirmation.js";
+import { parseProviderApplicationTarget } from "../ats-target.js";
 
 export const LEVER_ADAPTER_VERSION = "2026.07.0-beta.1";
 
@@ -106,7 +107,6 @@ interface LocatedControl {
   problem?: "missing" | "ambiguous";
 }
 
-const LEVER_HOSTS = new Set(["jobs.lever.co", "jobs.eu.lever.co"]);
 const APPLICATION_FORM = "#application-form";
 
 const APPLY_SELECTORS = [
@@ -251,7 +251,10 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
   constructor(private readonly options: LeverAdapterOptions = {}) {}
 
   detect(url: URL): boolean {
-    return url.protocol === "https:" && LEVER_HOSTS.has(url.hostname.toLowerCase());
+    return (
+      parseProviderApplicationTarget(url.href)
+      ?? parseProviderApplicationTarget(url.href, "confirmation")
+    )?.provider === "lever";
   }
 
   async normalize(page: BrowserPage): Promise<NormalizedJob> {
@@ -288,7 +291,20 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
   }
 
   async prepare(context: AdapterContext): Promise<void> {
+    const recoveryOnly = this.sessions.get(context)?.submitClicked === true;
     const session = this.startSession(context);
+    if (recoveryOnly) {
+      session.pageKind = await recognizePage(context.page, this.detect.bind(this));
+      session.prepared = true;
+      await this.transition(
+        context,
+        session,
+        "detect",
+        session.pageKind === "unsupported" ? "unsupported" : "recognized",
+      );
+      await this.transition(context, session, "prepare", "completed");
+      return;
+    }
     await context.page.installExactSubmitGuard("lever", context.approvedCanonicalUrl);
     assertApprovedProviderJobOrConfirmation(
       "lever",
@@ -402,6 +418,10 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
 
   async fill(context: AdapterContext): Promise<void> {
     const session = await this.ensureSession(context);
+    if (session.submitClicked) {
+      await this.transition(context, session, "fill", "completed");
+      return;
+    }
     await context.page.installExactSubmitGuard("lever", context.approvedCanonicalUrl);
     const challenge = await detectChallenge(context.page);
     if (challenge) {
@@ -489,6 +509,11 @@ export class LeverApplicationStateMachine implements ApplicationAdapter {
 
   async validate(context: AdapterContext): Promise<ValidationIssue[]> {
     const session = await this.ensureSession(context);
+    if (session.submitClicked) {
+      session.validationIssues = [];
+      await this.transition(context, session, "validate", "completed");
+      return [];
+    }
     const challenge = await detectChallenge(context.page);
     if (challenge) {
       session.challenge = challenge;

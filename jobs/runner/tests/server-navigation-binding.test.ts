@@ -15,6 +15,25 @@ describe("cloud run certified navigation binding", () => {
     })).not.toThrow();
   });
 
+  it("admits exact Lever EU navigation and rejects raw-target syntax drift", () => {
+    const leverJob: NormalizedJob = {
+      ...job(),
+      externalId: "posting-eu",
+      canonicalUrl: "https://jobs.eu.lever.co/acme/posting-eu",
+      source: "lever",
+    };
+    expect(() => assertCloudRunCertifiedNavigation({
+      url: "https://jobs.eu.lever.co/acme/posting-eu/apply",
+      job: leverJob,
+    })).not.toThrow();
+    for (const url of [
+      "https://jobs.eu.lever.co:443/acme/posting-eu/apply",
+      "https://jobs.eu.lever.co?next=/acme/posting-eu/apply",
+    ]) {
+      expect(() => assertCloudRunCertifiedNavigation({ url, job: leverJob })).toThrow();
+    }
+  });
+
   it.each([
     ["same-host cross-job", "https://boards.greenhouse.io/acme/jobs/456", "greenhouse"],
     ["provider mismatch", "https://jobs.lever.co/acme/123/apply", "greenhouse"],

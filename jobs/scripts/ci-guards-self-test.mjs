@@ -12,7 +12,10 @@ import {
 } from "./check-provenance-licenses.mjs";
 import { classifyTrackedPath, scanTextForSecrets } from "./privacy-gate.mjs";
 
-const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const repoRoot = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  "../..",
+);
 
 function runnerVolumeParitySchema(integerType) {
   const migrationPath =
@@ -30,23 +33,58 @@ function browserReleaseAuthorityParitySchema(integerType) {
   return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
 }
 
+function atsCertificationParitySchema(integerType) {
+  const migrations =
+    integerType === "INTEGER"
+      ? [
+          "infra/sqlite/server-runtime/048_jobs_ats_certification_authority.sql",
+          "infra/sqlite/server-runtime/049_jobs_browser_release_runtime_components.sql",
+          "infra/sqlite/server-runtime/050_jobs_runner_process_runtime_authority.sql",
+        ]
+      : [
+          "infra/postgres/server-runtime/026_jobs_ats_certification_authority.sql",
+          "infra/postgres/server-runtime/027_jobs_browser_release_runtime_components.sql",
+          "infra/postgres/server-runtime/028_jobs_runner_process_runtime_authority.sql",
+        ];
+  return migrations
+    .map((migrationPath) =>
+      fs.readFileSync(path.join(repoRoot, migrationPath), "utf8"),
+    )
+    .join("\n");
+}
+
 function testPrivacyPaths() {
   const rejected = [
     ["jobs/candidates/alice/resume.pdf", "candidate or user data directory"],
-    ["jobs/data/candidate-data/profile.json", "candidate or user data directory"],
-    ["jobs/browser/profiles/1234567890abcdef12345678/Default/Cookies", "generated browser profile"],
-    ["jobs/runner/snapshots/1234567890abcdef1234567890abcdef12345678.tar.gz.enc", "generated browser profile"],
+    [
+      "jobs/data/candidate-data/profile.json",
+      "candidate or user data directory",
+    ],
+    [
+      "jobs/browser/profiles/1234567890abcdef12345678/Default/Cookies",
+      "generated browser profile",
+    ],
+    [
+      "jobs/runner/snapshots/1234567890abcdef1234567890abcdef12345678.tar.gz.enc",
+      "generated browser profile",
+    ],
     ["jobs/runner/receipts/run-42.json", "receipt or screenshot artifact"],
     ["jobs/runner/screenshot-run-42.png", "receipt or screenshot artifact"],
     ["jobs/users/alice/profile.json", "candidate or user data directory"],
     ["jobs/users.csv", "candidate or user data file"],
-    ["jobs/automation/tests/fixtures/dummy-token.json", "credential-shaped fixture file"],
+    [
+      "jobs/automation/tests/fixtures/dummy-token.json",
+      "credential-shaped fixture file",
+    ],
     [".env.local", "credential-bearing file path"],
     ["local/service-account.json", "credential-bearing file path"],
     ["release/jobs-export.zip", "archive artifact"],
   ];
   for (const [filePath, expectedFinding] of rejected) {
-    assert(classifyTrackedPath(filePath).includes(expectedFinding), `${filePath} should be rejected as ${expectedFinding}`);
+    assert(
+      classifyTrackedPath(filePath).includes(expectedFinding),
+      `${filePath} should be rejected as ${expectedFinding}`,
+    );
   }
 
   const permitted = [
@@ -60,7 +98,11 @@ function testPrivacyPaths() {
     "jobs/runner/tests/fixtures/synthetic-receipt.json",
   ];
   for (const filePath of permitted) {
-    assert.deepEqual(classifyTrackedPath(filePath), [], `${filePath} should be permitted`);
+    assert.deepEqual(
+      classifyTrackedPath(filePath),
+      [],
+      `${filePath} should be permitted`,
+    );
   }
 }
 
@@ -68,7 +110,10 @@ function testSecretScanning() {
   const awsKey = ["AKIA", "7QWERTYUIOP9ZXCV"].join("");
   const privateKey = ["-----BEGIN", "PRIVATE KEY-----"].join(" ");
   const stripeKey = ["sk_live_", "51QwertyUiopAsdfGhjkLzxc"].join("");
-  const anthropicKey = ["sk-ant-api03-", "QwertyUiopAsdfGhjkLzxcVbnm123456"].join("");
+  const anthropicKey = [
+    "sk-ant-api03-",
+    "QwertyUiopAsdfGhjkLzxcVbnm123456",
+  ].join("");
   const findings = scanTextForSecrets(
     "config/production.env",
     [
@@ -105,7 +150,10 @@ function testSecretScanning() {
     `token=${canonicalJwt}`,
     "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
   ].join("\n");
-  assert.deepEqual(scanTextForSecrets("tests/fixtures/synthetic-auth.txt", placeholders), []);
+  assert.deepEqual(
+    scanTextForSecrets("tests/fixtures/synthetic-auth.txt", placeholders),
+    [],
+  );
 }
 
 function jobsParitySchema(integerType) {
@@ -248,6 +296,7 @@ function jobsParitySchema(integerType) {
       ON jobs_communication_actions(status, next_attempt_at_ms, lease_expires_at_ms);
     ${runnerVolumeParitySchema(integerType)}
     ${browserReleaseAuthorityParitySchema(integerType)}
+    ${atsCertificationParitySchema(integerType)}
   `;
 }
 
@@ -255,6 +304,26 @@ function testSchemaParity() {
   const sqlite = jobsParitySchema("INTEGER");
   const postgres = jobsParitySchema("BIGINT");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+
+  const missingAtsBindingTable = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_application_ats_certification_bindings \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingAtsBindingTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingProcessRuntimeIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_runner_process_runtime_bindings_process[\s\S]*?\n\s*\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingProcessRuntimeIndex).some((issue) =>
+      issue.includes("jobs_runner_process_runtime_bindings index"),
+    ),
+  );
 
   const missingRunnerVolumeTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS jobs_runner_volumes \([\s\S]*?\n\);/,
@@ -287,7 +356,9 @@ function testSchemaParity() {
   );
   assert(
     compareJobsSchemas(sqlite, missingBrowserActivationIndex).some((issue) =>
-      issue.includes("Postgres jobs_browser_release_activations required index"),
+      issue.includes(
+        "Postgres jobs_browser_release_activations required index",
+      ),
     ),
   );
 
@@ -307,7 +378,9 @@ function testSchemaParity() {
   );
   assert(
     compareJobsSchemas(sqlite, weakenedBrowserRevocationIndex).some((issue) =>
-      issue.includes("Postgres jobs_browser_release_revocations required index"),
+      issue.includes(
+        "Postgres jobs_browser_release_revocations required index",
+      ),
     ),
   );
 
@@ -336,8 +409,11 @@ function testSchemaParity() {
     "",
   );
   assert(
-    compareJobsSchemas(missingBrowserSignatureSetIndex, postgres).some((issue) =>
-      issue.includes("SQLite jobs_browser_release_signature_sets required index"),
+    compareJobsSchemas(missingBrowserSignatureSetIndex, postgres).some(
+      (issue) =>
+        issue.includes(
+          "SQLite jobs_browser_release_signature_sets required index",
+        ),
     ),
   );
 
@@ -380,14 +456,20 @@ function testSchemaParity() {
     /CREATE TABLE IF NOT EXISTS jobs_execution_leases \([\s\S]*?\n    \);/,
     "",
   );
-  assert(compareJobsSchemas(missingLeaseTable, postgres).some((issue) => issue.includes("SQLite parity tables")));
+  assert(
+    compareJobsSchemas(missingLeaseTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
 
   const missingLocalResumeTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS jobs_local_run_resume_actions \([\s\S]*?\n    \);/,
     "",
   );
   assert(
-    compareJobsSchemas(missingLocalResumeTable, postgres).some((issue) => issue.includes("SQLite parity tables")),
+    compareJobsSchemas(missingLocalResumeTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
   );
 
   const missingCommunicationTable = sqlite.replace(
@@ -400,8 +482,15 @@ function testSchemaParity() {
     ),
   );
 
-  const missingColumn = postgres.replace("      started_at_ms BIGINT NOT NULL\n", "");
-  assert(compareJobsSchemas(sqlite, missingColumn).some((issue) => issue.includes("jobs_discovery_runs definition")));
+  const missingColumn = postgres.replace(
+    "      started_at_ms BIGINT NOT NULL\n",
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingColumn).some((issue) =>
+      issue.includes("jobs_discovery_runs definition"),
+    ),
+  );
 
   const changedResumeActionConstraint = postgres.replace(
     "      action TEXT NOT NULL CHECK(action = 'approve_submission'),",
@@ -417,7 +506,11 @@ function testSchemaParity() {
     /CREATE INDEX IF NOT EXISTS idx_jobs_discovery_memberships_job[\s\S]*?job_id\);/,
     "",
   );
-  assert(compareJobsSchemas(sqlite, missingDiscoveryIndex).some((issue) => issue.includes("jobs_discovery_memberships index")));
+  assert(
+    compareJobsSchemas(sqlite, missingDiscoveryIndex).some((issue) =>
+      issue.includes("jobs_discovery_memberships index"),
+    ),
+  );
 
   const missingBindingIndex = postgres.replace(
     /CREATE INDEX IF NOT EXISTS idx_jobs_execution_leases_binding[\s\S]*?run_id\);/,
@@ -434,8 +527,8 @@ function testSchemaParity() {
     "",
   );
   assert(
-    compareJobsSchemas(sqliteWithoutBinding, missingBindingIndex).some((issue) =>
-      issue.includes("required index"),
+    compareJobsSchemas(sqliteWithoutBinding, missingBindingIndex).some(
+      (issue) => issue.includes("required index"),
     ),
   );
 
@@ -504,8 +597,11 @@ function testSchemaParity() {
     "",
   );
   assert(
-    compareJobsSchemas(sqlite, missingEvidenceCapacityAccountIndex).some((issue) =>
-      issue.includes("Postgres jobs_submission_evidence_capacity required index"),
+    compareJobsSchemas(sqlite, missingEvidenceCapacityAccountIndex).some(
+      (issue) =>
+        issue.includes(
+          "Postgres jobs_submission_evidence_capacity required index",
+        ),
     ),
   );
 
@@ -514,13 +610,20 @@ function testSchemaParity() {
     "WHERE state IN ('active', 'committed');",
   );
   assert(
-    compareJobsSchemas(sqlite, weakenedEvidenceCapacityPredicate).some((issue) =>
-      issue.includes("Postgres jobs_submission_evidence_capacity required index"),
+    compareJobsSchemas(sqlite, weakenedEvidenceCapacityPredicate).some(
+      (issue) =>
+        issue.includes(
+          "Postgres jobs_submission_evidence_capacity required index",
+        ),
     ),
   );
 
   const uncoveredDiscoveryTable = `${postgres}\nCREATE TABLE IF NOT EXISTS jobs_discovery_unchecked (id TEXT PRIMARY KEY);`;
-  assert(compareJobsSchemas(sqlite, uncoveredDiscoveryTable).some((issue) => issue.includes("Postgres parity tables")));
+  assert(
+    compareJobsSchemas(sqlite, uncoveredDiscoveryTable).some((issue) =>
+      issue.includes("Postgres parity tables"),
+    ),
+  );
 }
 
 function testLicenseInventory() {
@@ -530,7 +633,8 @@ function testLicenseInventory() {
       "": { name: "example" },
       "node_modules/good-package": {
         version: "1.2.3",
-        resolved: "https://registry.npmjs.org/good-package/-/good-package-1.2.3.tgz",
+        resolved:
+          "https://registry.npmjs.org/good-package/-/good-package-1.2.3.tgz",
         integrity: "sha512-example",
         license: "MIT",
       },
@@ -552,14 +656,38 @@ function testLicenseInventory() {
     resolved: "https://registry.npmjs.org/no-license/-/no-license-1.0.0.tgz",
     integrity: "sha512-example",
   };
-  assert(inventoryPackageLock(missingLicense).issues.some((issue) => issue.includes("missing audited license metadata")));
+  assert(
+    inventoryPackageLock(missingLicense).issues.some((issue) =>
+      issue.includes("missing audited license metadata"),
+    ),
+  );
 
   const rootManifest = { workspaces: ["worker"] };
-  const workspaces = new Map([["worker", { name: "worker", version: "1.0.0", dependencies: { dep: "^1.0.0" } }]]);
-  const workspaceLock = { packages: { worker: { name: "worker", version: "1.0.0", dependencies: { dep: "^1.0.0" } } } };
-  assert.deepEqual(validateWorkspaceLock(rootManifest, workspaces, workspaceLock), []);
+  const workspaces = new Map([
+    [
+      "worker",
+      { name: "worker", version: "1.0.0", dependencies: { dep: "^1.0.0" } },
+    ],
+  ]);
+  const workspaceLock = {
+    packages: {
+      worker: {
+        name: "worker",
+        version: "1.0.0",
+        dependencies: { dep: "^1.0.0" },
+      },
+    },
+  };
+  assert.deepEqual(
+    validateWorkspaceLock(rootManifest, workspaces, workspaceLock),
+    [],
+  );
   workspaceLock.packages.worker.dependencies.dep = "^2.0.0";
-  assert(validateWorkspaceLock(rootManifest, workspaces, workspaceLock).some((issue) => issue.includes("dependencies")));
+  assert(
+    validateWorkspaceLock(rootManifest, workspaces, workspaceLock).some(
+      (issue) => issue.includes("dependencies"),
+    ),
+  );
 }
 
 function testProvenance() {
@@ -576,11 +704,26 @@ function testProvenance() {
 `;
   const notices = "- example-source, Copyright (c) Example\n\n## MIT License\n";
   assert.equal(parseProvenanceRows(provenance).length, 1);
-  assert.deepEqual(validateProvenance(provenance, notices, (filePath) => filePath === "src/parser.ts").issues, []);
+  assert.deepEqual(
+    validateProvenance(
+      provenance,
+      notices,
+      (filePath) => filePath === "src/parser.ts",
+    ).issues,
+    [],
+  );
 
   const badCommit = provenance.replace("abcdef123456", "main");
-  assert(validateProvenance(badCommit, notices, () => true).issues.some((issue) => issue.includes("12 lowercase hex")));
-  assert(validateProvenance(provenance, "## MIT License\n", () => true).issues.some((issue) => issue.includes("missing from")));
+  assert(
+    validateProvenance(badCommit, notices, () => true).issues.some((issue) =>
+      issue.includes("12 lowercase hex"),
+    ),
+  );
+  assert(
+    validateProvenance(provenance, "## MIT License\n", () => true).issues.some(
+      (issue) => issue.includes("missing from"),
+    ),
+  );
 }
 
 testPrivacyPaths();
@@ -589,4 +732,6 @@ testSchemaParity();
 testLicenseInventory();
 testProvenance();
 
-console.log("Jobs CI guard self-tests passed (privacy, schema parity, lock inventory, and provenance).");
+console.log(
+  "Jobs CI guard self-tests passed (privacy, schema parity, lock inventory, and provenance).",
+);

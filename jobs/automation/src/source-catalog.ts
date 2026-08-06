@@ -1,4 +1,5 @@
 import type { SubmissionCapability } from "./adapter-capabilities.js";
+import { parseProviderApplicationTarget } from "./ats-target.js";
 
 export type JobSourceKind =
   | "public_ats"
@@ -87,7 +88,7 @@ export const JOB_SOURCE_CATALOG: readonly JobSourceCatalogEntry[] = [
     "public_ats",
     "scheduled_public_feed",
     "beta_review",
-    ["jobs.lever.co"],
+    ["jobs.lever.co", "jobs.eu.lever.co"],
   ),
   source(
     "ats-ashby",
@@ -423,6 +424,13 @@ export function findJobSourceByUrl(
   } catch {
     return undefined;
   }
+  const providerTarget = parseProviderApplicationTarget(rawUrl);
+  if (providerTarget) {
+    const id = providerTarget.provider === "greenhouse"
+      ? "ats-greenhouse"
+      : "ats-lever";
+    return JOB_SOURCE_CATALOG.find((entry) => entry.id === id);
+  }
   const host = normalizeDomain(url.hostname);
   const path = url.pathname.toLowerCase().replace(/^\/+|\/+$/g, "");
   const pathSpecific = JOB_SOURCE_CATALOG.find(
@@ -445,6 +453,8 @@ export function findJobSourceByUrl(
     entry.domains.some(
       (domain) =>
         (host === domain || host.endsWith(`.${domain}`)) &&
+        entry.id !== "ats-greenhouse" &&
+        entry.id !== "ats-lever" &&
         entry.kind !== "public_curated_feed" &&
         entry.kind !== "global_candidate_feed",
     ),

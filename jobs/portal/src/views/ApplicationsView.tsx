@@ -27,7 +27,9 @@ import type { ApplicationEvidence, CandidateEventInput, Intervention, JobApplica
 import { jobsApi } from "../api";
 import { relativeTime, titleCase } from "../lib/format";
 import { ConfirmDialog, Dialog } from "../components/Dialog";
+import { AtsCertificationSummaryCard } from "../components/AtsCertificationSummary";
 import { InterviewPrepDialog } from "../components/InterviewPrepDialog";
+import { portalEligibilityDecision } from "../lib/ats-certification";
 import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
@@ -432,14 +434,17 @@ function ApplicationKitSummary({ application, job, resume }: { application: JobA
     : {};
   const meteringStatus = String(metering.status || "");
   return (
-    <div className="kit-summary">
-      <div><b>Resume</b><span>{resume ? `v${resume.version_no} · ${titleCase(resume.mode)}` : "Loading version"}</span></div>
-      <div><b>Email</b><span>{email}</span></div>
-      <div><b>Answers</b><span>{application.answers.length ? `${application.answers.length} final answer${application.answers.length === 1 ? "" : "s"}` : "No answers required yet"}</span></div>
-      <div><b>Cover letter</b><span>{application.cover_letter?.trim() ? "Included" : "Not included"}</span></div>
-      <div><b>Site</b><span>{capability}</span></div>
-      <div><b>Metering</b><span>{meteringStatus === "counts_when_approved_or_downloaded" || application.state === "awaiting_review" ? "Counts when approved or downloaded" : application.state === "submitted" ? "Counted once" : "Counted once for this job"}</span></div>
-    </div>
+    <>
+      <div className="kit-summary">
+        <div><b>Resume</b><span>{resume ? `v${resume.version_no} · ${titleCase(resume.mode)}` : "Loading version"}</span></div>
+        <div><b>Email</b><span>{email}</span></div>
+        <div><b>Answers</b><span>{application.answers.length ? `${application.answers.length} final answer${application.answers.length === 1 ? "" : "s"}` : "No answers required yet"}</span></div>
+        <div><b>Cover letter</b><span>{application.cover_letter?.trim() ? "Included" : "Not included"}</span></div>
+        <div><b>Site</b><span>{capability}</span></div>
+        <div><b>Metering</b><span>{meteringStatus === "counts_when_approved_or_downloaded" || application.state === "awaiting_review" ? "Counts when approved or downloaded" : application.state === "submitted" ? "Counted once" : "Counted once for this job"}</span></div>
+      </div>
+      <AtsCertificationSummaryCard eligibility={applicationEligibilityAuthority(application, job)} />
+    </>
   );
 }
 
@@ -507,52 +512,52 @@ function DiffList({ resume }: { resume?: ResumeVersion }) {
   );
 }
 
-function applicationEligibility(application: JobApplication, job?: JobPosting): JobEligibilityDecision {
+export function applicationEligibility(
+  application: JobApplication,
+  job?: JobPosting,
+): JobEligibilityDecision {
+  return portalEligibilityDecision(applicationEligibilityAuthority(application, job), true);
+}
+
+function applicationEligibilityAuthority(application: JobApplication, job?: JobPosting): unknown {
   const stored = application.receipt.eligibility;
-  if (stored && typeof stored === "object") return stored as unknown as JobEligibilityDecision;
+  if (stored && typeof stored === "object") return stored;
   if (job?.eligibility) return job.eligibility;
-  return {
-    capability: "unknown_review",
-    can_prepare: true,
-    can_auto_submit: false,
-    can_queue_local: false,
-    can_queue_cloud: false,
-    hard_failures: [],
-    review_reasons: [{ code: "eligibility_pending", message: "Bluey will verify this site and your rules before queueing." }],
-    passed_checks: [],
-    evaluated_at_ms: 0,
-  };
+  return undefined;
 }
 
 export function hasAvailableRunner(
   eligibility: JobEligibilityDecision,
   runners: RunnerAvailability,
 ): boolean {
-  return (eligibility.can_queue_local && runners.local.available)
-    || (eligibility.can_queue_cloud && runners.cloud.available);
+  const safeEligibility = portalEligibilityDecision(eligibility, true);
+  return (safeEligibility.can_queue_local && runners.local.available)
+    || (safeEligibility.can_queue_cloud && runners.cloud.available);
 }
 
 export function runnerUnavailableReason(
   eligibility: JobEligibilityDecision,
   runners: RunnerAvailability,
 ): string {
-  if (eligibility.hard_failures.length > 0) {
-    return eligibility.hard_failures[0].message;
+  const safeEligibility = portalEligibilityDecision(eligibility, true);
+  if (safeEligibility.hard_failures.length > 0) {
+    return safeEligibility.hard_failures[0].message;
   }
-  if (eligibility.capability === "beta_review") {
+  if (safeEligibility.capability === "beta_review") {
     return "This application system is still in beta. Review the kit and continue on the job site.";
   }
-  if (eligibility.capability === "handoff") {
+  if (safeEligibility.capability === "handoff") {
     return "This site requires a user-controlled handoff after Bluey prepares the application kit.";
   }
-  if (eligibility.capability === "unknown_review") {
-    return "This application system is not certified for a Bluey runner. Review the kit and continue on the job site.";
+  if (safeEligibility.capability === "unknown_review") {
+    return safeEligibility.review_reasons[0]?.message
+      || "This application system is not certified for a Bluey runner. Review the kit and continue on the job site.";
   }
-  if (eligibility.capability === "blocked") {
+  if (safeEligibility.capability === "blocked") {
     return "This listing cannot use a Bluey runner.";
   }
-  if (!eligibility.can_queue_local && !eligibility.can_queue_cloud) {
-    return eligibility.review_reasons[0]?.message
+  if (!safeEligibility.can_queue_local && !safeEligibility.can_queue_cloud) {
+    return safeEligibility.review_reasons[0]?.message
       || "This application must stay in review until the current eligibility checks pass.";
   }
   return runners.auto_submit_reason;

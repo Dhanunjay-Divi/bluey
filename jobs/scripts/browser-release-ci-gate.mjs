@@ -71,6 +71,8 @@ export const BROWSER_PRODUCTION_CANARY_CHECK_IDS = Object.freeze([
 
 const TARGET_NAMES = Object.freeze(Object.keys(BROWSER_RELEASE_TARGETS));
 const CONTENT_AUDIENCE = "bluey-jobs-browser-app-content-inventory-v1";
+const AUTOMATION_BUNDLE_AUDIENCE =
+  "bluey-jobs-browser-automation-bundle-v1";
 const NATIVE_AUDIENCE = "bluey-jobs-browser-native-verification-v1";
 const PACKAGE_SEAL_AUDIENCE = "bluey-jobs-browser-package-seal-v1";
 const EVIDENCE_AUDIENCE = "bluey-jobs-browser-verification-evidence-v1";
@@ -109,6 +111,7 @@ const MAX_TRANSCRIPT_BYTES = 1024 * 1024;
 const MAX_INVENTORY_ENTRIES = 40_000;
 const MAX_ASAR_ENTRIES = 40_000;
 const MAX_ASAR_REQUIRED_FILE_BYTES = 16 * 1024 * 1024;
+const MAX_AUTOMATION_BUNDLE_BYTES = 128 * 1024 * 1024;
 const REQUIRED_ASAR_FILES = Object.freeze([
   "dist/app-lifecycle.js",
   "dist/main.js",
@@ -366,11 +369,46 @@ export async function inspectPackagedAppAsar(appAsarPath) {
   ) {
     throw new BrowserReleaseGateError("The packaged app.asar runtime contract is invalid");
   }
+  const automationPrefix = "node_modules/@bluey/jobs-automation/";
+  let automationBundleBytes = 0;
+  const automationBundleEntries = [...filePaths]
+    .filter((path) => path.startsWith(automationPrefix))
+    .sort()
+    .map((path) => {
+      const contents = extractFile(archivePath, path, false);
+      const expectedSize = fileStats.get(path)?.size;
+      automationBundleBytes += contents.length;
+      if (
+        contents.length < 1 ||
+        contents.length !== expectedSize ||
+        automationBundleBytes > MAX_AUTOMATION_BUNDLE_BYTES
+      ) {
+        throw new BrowserReleaseGateError(
+          "The packaged automation bundle is invalid",
+        );
+      }
+      return Object.freeze({
+        path: path.slice(automationPrefix.length),
+        sizeBytes: contents.length,
+        sha256: sha256(contents),
+      });
+    });
+  if (automationBundleEntries.length < 2) {
+    throw new BrowserReleaseGateError(
+      "The packaged automation bundle is incomplete",
+    );
+  }
+  const automationBundleSha256 = sha256(canonicalJsonBytes({
+    version: 1,
+    audience: AUTOMATION_BUNDLE_AUDIENCE,
+    entries: automationBundleEntries,
+  }));
   return Object.freeze({
     entryCount: paths.length,
     entriesSha256: sha256(canonicalJsonBytes(paths)),
     browserMainSha256: sha256(browserMain),
     automationMainSha256: sha256(automationMain),
+    automationBundleSha256,
     protocolRegistrationSha256: sha256(browserLifecycle),
   });
 }
@@ -595,6 +633,7 @@ export async function createAppContentInventory({
     appAsarEntriesSha256: asarContract.entriesSha256,
     browserMainSha256: asarContract.browserMainSha256,
     automationMainSha256: asarContract.automationMainSha256,
+    automationBundleSha256: asarContract.automationBundleSha256,
     chromiumRevision: authority.descriptor.chromiumRevision,
     chromiumExecutablePath: chromium.path,
     chromiumExecutableSha256: chromium.sha256,
@@ -827,6 +866,7 @@ export async function collectCandidateTarget({
     packageSealSha256: sealed.packageSealSha256,
     appContentSha256: sha256(inventoryBytes.bytes),
     appAsarSha256: inventory.appAsarSha256,
+    automationBundleSha256: inventory.automationBundleSha256,
     chromiumRevision: inventory.chromiumRevision,
     chromiumExecutableSha256: inventory.chromiumExecutableSha256,
     artifacts: Object.freeze(
@@ -855,6 +895,8 @@ export async function collectCandidateTarget({
     descriptorSha256: authority.descriptorSha256,
     packageSealSha256: sealed.packageSealSha256,
     appContentSha256: evidence.appContentSha256,
+    automationBundleSha256: evidence.automationBundleSha256,
+    chromiumExecutableSha256: evidence.chromiumExecutableSha256,
     verificationEvidenceSha256,
     nativeSignatureKind: target.nativeSignatureKind,
     nativeSignerIdentity: native.signerIdentity,
@@ -992,6 +1034,8 @@ export async function assembleCandidateSet({
           sizeBytes: artifact.sizeBytes,
           sha256: artifact.sha256,
           appContentSha256: part.record.appContentSha256,
+          automationBundleSha256: part.record.automationBundleSha256,
+          chromiumExecutableSha256: part.record.chromiumExecutableSha256,
           verificationEvidenceSha256: part.record.verificationEvidenceSha256,
           nativeSignatureKind: part.record.nativeSignatureKind,
           nativeSignerIdentity: part.record.nativeSignerIdentity,
@@ -1236,6 +1280,8 @@ export async function validateCandidateSet({
         sizeBytes: artifact.sizeBytes,
         sha256: artifact.sha256,
         appContentSha256: part.record.appContentSha256,
+        automationBundleSha256: part.record.automationBundleSha256,
+        chromiumExecutableSha256: part.record.chromiumExecutableSha256,
         verificationEvidenceSha256: part.record.verificationEvidenceSha256,
         nativeSignatureKind: part.record.nativeSignatureKind,
         nativeSignerIdentity: part.record.nativeSignerIdentity,
@@ -2121,7 +2167,11 @@ async function validateCandidatePart(directory) {
   validateContentInventory(inventoryBytes.value, target, record.descriptorSha256);
   if (
     inventoryBytes.value.packageSealSha256 !== record.packageSealSha256 ||
-    sha256(inventoryBytes.bytes) !== record.appContentSha256
+    sha256(inventoryBytes.bytes) !== record.appContentSha256 ||
+    inventoryBytes.value.automationBundleSha256 !==
+      record.automationBundleSha256 ||
+    inventoryBytes.value.chromiumExecutableSha256 !==
+      record.chromiumExecutableSha256
   ) {
     throw new BrowserReleaseGateError("The candidate app-content inventory changed");
   }
@@ -2169,9 +2219,11 @@ function validateTargetRecord(record) {
     "appVersion",
     "architecture",
     "artifacts",
+    "automationBundleSha256",
     "audience",
     "buildId",
     "chromiumRevision",
+    "chromiumExecutableSha256",
     "descriptorSha256",
     "electronVersion",
     "nativeSignatureKind",
@@ -2208,6 +2260,8 @@ function validateTargetRecord(record) {
     "descriptorSha256",
     "packageSealSha256",
     "appContentSha256",
+    "automationBundleSha256",
+    "chromiumExecutableSha256",
     "verificationEvidenceSha256",
   ]) {
     requirePattern(record[field], HEX_64, `Invalid ${field}`);
@@ -2250,6 +2304,7 @@ function validateContentInventory(inventory, target, descriptorSha256) {
     "appId",
     "architecture",
     "automationMainSha256",
+    "automationBundleSha256",
     "audience",
     "browserMainSha256",
     "chromiumExecutablePath",
@@ -2295,6 +2350,11 @@ function validateContentInventory(inventory, target, descriptorSha256) {
     inventory.automationMainSha256,
     HEX_64,
     "Invalid automation main digest",
+  );
+  requirePattern(
+    inventory.automationBundleSha256,
+    HEX_64,
+    "Invalid automation bundle digest",
   );
   requirePattern(
     inventory.protocolRegistrationSha256,
@@ -2414,6 +2474,7 @@ function validateVerificationEvidence(evidence, record, native) {
     "appAsarSha256",
     "appContentSha256",
     "artifacts",
+    "automationBundleSha256",
     "audience",
     "chromiumExecutableSha256",
     "chromiumRevision",
@@ -2432,11 +2493,19 @@ function validateVerificationEvidence(evidence, record, native) {
     evidence.descriptorSha256 !== record.descriptorSha256 ||
     evidence.packageSealSha256 !== record.packageSealSha256 ||
     evidence.appContentSha256 !== record.appContentSha256 ||
+    evidence.automationBundleSha256 !== record.automationBundleSha256 ||
+    evidence.chromiumExecutableSha256 !== record.chromiumExecutableSha256 ||
+    evidence.chromiumRevision !== record.chromiumRevision ||
     canonicalString(evidence.nativeVerification) !== canonicalString(native)
   ) {
     throw new BrowserReleaseGateError("Invalid target verification evidence");
   }
   requirePattern(evidence.appAsarSha256, HEX_64, "Invalid evidence app.asar digest");
+  requirePattern(
+    evidence.automationBundleSha256,
+    HEX_64,
+    "Invalid evidence automation bundle digest",
+  );
   requirePattern(
     evidence.chromiumExecutableSha256,
     HEX_64,
@@ -2927,7 +2996,9 @@ function parseManifestArtifact(input) {
     "appContentSha256",
     "architecture",
     "artifactId",
+    "automationBundleSha256",
     "buildDescriptorSha256",
+    "chromiumExecutableSha256",
     "nativeSignatureKind",
     "nativeSignerIdentity",
     "packageKind",
@@ -2967,6 +3038,16 @@ function parseManifestArtifact(input) {
       input.appContentSha256,
       HEX_64,
       "Invalid app-content digest",
+    ),
+    automationBundleSha256: requirePattern(
+      input.automationBundleSha256,
+      HEX_64,
+      "Invalid automation-bundle digest",
+    ),
+    chromiumExecutableSha256: requirePattern(
+      input.chromiumExecutableSha256,
+      HEX_64,
+      "Invalid Chromium-executable digest",
     ),
     verificationEvidenceSha256: requirePattern(
       input.verificationEvidenceSha256,
@@ -3715,16 +3796,21 @@ export function requireArtifactPackageUrl(
 }
 
 export function validateManifestTargetContentBindings(artifacts) {
-  const contentByTarget = new Map();
+  const bindingsByTarget = new Map();
   for (const artifact of artifacts) {
     const target = `${artifact.platform}:${artifact.architecture}`;
-    const prior = contentByTarget.get(target);
-    if (prior !== undefined && prior !== artifact.appContentSha256) {
+    const binding = [
+      artifact.appContentSha256,
+      artifact.automationBundleSha256,
+      artifact.chromiumExecutableSha256,
+    ].join(":");
+    const prior = bindingsByTarget.get(target);
+    if (prior !== undefined && prior !== binding) {
       throw new BrowserReleaseGateError(
-        "One native target has conflicting packaged app content",
+        "One native target has conflicting packaged app content or runtime components",
       );
     }
-    contentByTarget.set(target, artifact.appContentSha256);
+    bindingsByTarget.set(target, binding);
   }
   return true;
 }

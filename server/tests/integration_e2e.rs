@@ -269,6 +269,37 @@ fn signed_worker_json_request(
     request
 }
 
+fn ats_certification_mutation_count(pool: &DbPool) -> i64 {
+    pool.get()
+        .unwrap()
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM jobs_ats_certification_trust_policies) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_trust_keys) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_trust_head) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_layout_observations) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_evidence) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_manifests) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_manifest_layouts) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_manifest_check_results) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_manifest_evidence) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_runtime_targets) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_activations) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_head_transitions) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_heads) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_revocations) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_quarantine_commands) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_quarantine_heads) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_circuit_events) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_circuit_heads) +
+                (SELECT COUNT(*) FROM jobs_application_ats_certification_bindings) +
+                (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn runner_volume_http_payload_sha256(
     path: &str,
     worker_id: &str,
@@ -294,6 +325,33 @@ struct SignedRunnerVolumeFixture {
     process_instance_id: String,
     key_fingerprint: String,
     resource_fingerprint: String,
+}
+
+struct SignedRunnerProcessRuntimeFixture {
+    grant: jobs::RunnerProcessRuntimeGrantClaim,
+    runtime_sha256: String,
+}
+
+fn runner_volume_instance_claim_payload_sha256(
+    path: &str,
+    worker_id: &str,
+    runtime_grant: &jobs::RunnerProcessRuntimeGrantClaim,
+    runtime_sha256: &str,
+) -> String {
+    let runtime_grant_token_sha256 =
+        hex::encode(Sha256::digest(runtime_grant.grant_token.as_bytes()));
+    runner_volume_http_payload_sha256(
+        path,
+        worker_id,
+        &[
+            ("runtime_grant_id", runtime_grant.grant_id.as_str()),
+            (
+                "runtime_grant_token_sha256",
+                runtime_grant_token_sha256.as_str(),
+            ),
+            ("runtime_sha256", runtime_sha256),
+        ],
+    )
 }
 
 fn enroll_unattested_offline_runner_volume(
@@ -786,6 +844,8 @@ fn execution_claim_payload_sha256(
     volume_id: &str,
     enrollment_epoch: i64,
     process_instance_id: &str,
+    runtime_grant_id: &str,
+    runtime_sha256: &str,
 ) -> String {
     let enrollment_epoch = enrollment_epoch.to_string();
     runner_volume_http_payload_sha256(
@@ -800,6 +860,8 @@ fn execution_claim_payload_sha256(
             ("volume_id", volume_id),
             ("enrollment_epoch", &enrollment_epoch),
             ("process_instance_id", process_instance_id),
+            ("runtime_grant_id", runtime_grant_id),
+            ("runtime_sha256", runtime_sha256),
         ],
     )
 }
@@ -807,6 +869,7 @@ fn execution_claim_payload_sha256(
 #[allow(clippy::too_many_arguments)]
 fn signed_execution_claim_body(
     fixture: &SignedRunnerVolumeFixture,
+    runtime: &SignedRunnerProcessRuntimeFixture,
     signing_key: &Ed25519SigningKey,
     worker_id: &str,
     account_id: &str,
@@ -827,6 +890,8 @@ fn signed_execution_claim_body(
         &fixture.volume_id,
         fixture.enrollment_epoch,
         &fixture.process_instance_id,
+        &runtime.grant.grant_id,
+        &runtime.runtime_sha256,
     );
     let volume_proof = jobs::sign_runner_volume_authority_proof(
         signing_key,
@@ -850,6 +915,8 @@ fn signed_execution_claim_body(
         "volume_id": fixture.volume_id,
         "enrollment_epoch": fixture.enrollment_epoch,
         "process_instance_id": fixture.process_instance_id,
+        "runtime_grant_id": runtime.grant.grant_id,
+        "runtime_sha256": runtime.runtime_sha256,
         "volume_proof": volume_proof
     })
 }
@@ -858,7 +925,7 @@ async fn setup_signed_runner_volume(
     harness: &Harness,
     worker_signing_key: &str,
     worker_timestamp: u64,
-) -> SignedRunnerVolumeFixture {
+) -> (SignedRunnerVolumeFixture, SignedRunnerProcessRuntimeFixture) {
     const WORKER_ID: &str = "signed-execution-worker";
     let signing_key = Ed25519SigningKey::from_bytes(&[61_u8; 32]);
     let public_key_base64url = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -934,6 +1001,41 @@ async fn setup_signed_runner_volume(
     assert_eq!(enrolled["volumeId"], volume_id);
     assert_eq!(enrolled["status"], "reconciling");
 
+    let runtime_grant = jobs::RunnerProcessRuntimeGrantClaim {
+        grant_id: "runner-process-runtime-grant-http-604".to_string(),
+        grant_token: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([64_u8; 32]),
+        runtime: jobs::RunnerProcessRuntimeAttestation {
+            runner_image_sha256: hex::encode(Sha256::digest(b"phase-604-http-runner-image")),
+            runner_build_id: "runner-604-integration".to_string(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: hex::encode(Sha256::digest(
+                b"phase-604-http-automation-bundle",
+            )),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "123456".to_string(),
+            chromium_executable_sha256: hex::encode(Sha256::digest(
+                b"phase-604-http-chromium-executable",
+            )),
+        },
+    };
+    let stored_runtime_grant = jobs::create_runner_process_runtime_grant(
+        &harness.pool,
+        &jobs::NewRunnerProcessRuntimeGrant {
+            grant_id: runtime_grant.grant_id.clone(),
+            token: runtime_grant.grant_token.clone(),
+            expected_worker_id: WORKER_ID.to_string(),
+            runtime: runtime_grant.runtime.clone(),
+            authorization_ref: "phase-604-http-runtime-admission".to_string(),
+            created_by: "phase-604-integration-admin".to_string(),
+            expires_at_ms: now_ms + 600_000,
+            created_at_ms: now_ms,
+        },
+    )
+    .unwrap();
+    let runtime_sha256 = jobs::runner_process_runtime_sha256(&runtime_grant.runtime).unwrap();
+    assert_eq!(stored_runtime_grant.runtime_sha256, runtime_sha256);
+
     let fixture = SignedRunnerVolumeFixture {
         signing_key,
         worker_id: WORKER_ID.to_string(),
@@ -942,6 +1044,10 @@ async fn setup_signed_runner_volume(
         process_instance_id,
         key_fingerprint,
         resource_fingerprint,
+    };
+    let runtime_fixture = SignedRunnerProcessRuntimeFixture {
+        grant: runtime_grant,
+        runtime_sha256,
     };
     let instance_path = format!(
         "/api/jobs/internal/runner-volumes/{}/instances/claim",
@@ -952,7 +1058,12 @@ async fn setup_signed_runner_volume(
         "instance_claim",
         "runner-volume-instance-claim-0001",
         chrono::Utc::now().timestamp_millis(),
-        runner_volume_http_payload_sha256(&instance_path, WORKER_ID, &[]),
+        runner_volume_instance_claim_payload_sha256(
+            &instance_path,
+            WORKER_ID,
+            &runtime_fixture.grant,
+            &runtime_fixture.runtime_sha256,
+        ),
     );
     let instance = harness
         .router
@@ -963,7 +1074,10 @@ async fn setup_signed_runner_volume(
             WORKER_ID,
             worker_timestamp,
             "runner-volume-instance-http-0001",
-            &json!({ "proof": instance_proof }),
+            &json!({
+            "proof": instance_proof,
+            "runtimeGrant": runtime_fixture.grant,
+            }),
             worker_signing_key,
         ))
         .await
@@ -983,6 +1097,14 @@ async fn setup_signed_runner_volume(
     assert_eq!(
         instance_lease["processInstanceId"],
         fixture.process_instance_id
+    );
+    assert_eq!(
+        instance_lease["runtimeGrantId"],
+        runtime_fixture.grant.grant_id
+    );
+    assert_eq!(
+        instance_lease["runtimeSha256"],
+        runtime_fixture.runtime_sha256
     );
 
     let poll_path = format!(
@@ -1181,7 +1303,7 @@ async fn setup_signed_runner_volume(
         Some(fleet.enrollment_generation)
     );
 
-    fixture
+    (fixture, runtime_fixture)
 }
 
 fn pcm16_mono_wav(seconds: u32) -> Vec<u8> {
@@ -1291,6 +1413,382 @@ async fn jobs_worker_signatures_reject_replay_expiry_and_body_tampering() {
         .unwrap();
     assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
     std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
+}
+
+#[tokio::test]
+#[serial]
+async fn ats_certification_routes_isolate_admins_workers_paths_and_bodies() {
+    const SIGNING_KEY: &str = "0123456789abcdef0123456789abcdef";
+    const WORKER_PATH: &str = "/api/jobs/internal/ats-certifications/layout-observations";
+    const ADMIN_LAYOUT_PATH: &str = "/admin/jobs/ats-certifications/layout-observations";
+    const ADMIN_MANIFEST_PATH: &str = "/admin/jobs/ats-certifications/manifests";
+    std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", SIGNING_KEY);
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+    let harness = boot_harness_with_upstream_and_admin_emails(
+        UpstreamKeys::default(),
+        vec!["ats-admin@bluey.sh".to_string()],
+    )
+    .await;
+    let admin_access = signup_and_login(&harness, "ats-admin@bluey.sh", "valid-password-123").await;
+    let customer_access =
+        signup_and_login(&harness, "ats-customer@bluey.sh", "valid-password-123").await;
+    assert_eq!(ats_certification_mutation_count(&harness.pool), 0);
+
+    let unsigned_envelope = json!({
+        "canonicalBase64url": "AA",
+        "authorizationBase64url": "AA",
+    });
+    let unsigned_bytes = serde_json::to_vec(&unsigned_envelope).unwrap();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    for (index, router) in [harness.router.clone(), harness.jobs_router.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        let nonce = format!("abcdef0123456789abcdef01234568{index:02}");
+        let accepted_transport = router
+            .clone()
+            .oneshot(signed_worker_json_request(
+                WORKER_PATH,
+                "ats-layout-observation",
+                "ats-integration-worker",
+                now_secs,
+                &nonce,
+                &unsigned_envelope,
+                SIGNING_KEY,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted_transport.status(), StatusCode::NOT_FOUND);
+        let accepted_body = axum::body::to_bytes(accepted_transport.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(accepted_body.to_vec()).unwrap(),
+            "The ATS certification authority was not found."
+        );
+
+        let replayed = router
+            .clone()
+            .oneshot(signed_worker_json_request(
+                WORKER_PATH,
+                "ats-layout-observation",
+                "ats-integration-worker",
+                now_secs,
+                &nonce,
+                &unsigned_envelope,
+                SIGNING_KEY,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let tampered = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: WORKER_PATH,
+            scope: "ats-layout-observation",
+            worker_id: "ats-integration-worker",
+            timestamp: now_secs,
+            nonce: "abcdef0123456789abcdef0123456810",
+            signed_body: &unsigned_bytes,
+            actual_body: br#"{"canonicalBase64url":"forged"}"#,
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(tampered.status(), StatusCode::UNAUTHORIZED);
+
+    let mut wrong_path = signed_worker_request(SignedWorkerRequest {
+        path: "/api/jobs/internal/ats-certifications/layout-observations/extra",
+        scope: "ats-layout-observation",
+        worker_id: "ats-integration-worker",
+        timestamp: now_secs,
+        nonce: "abcdef0123456789abcdef0123456811",
+        signed_body: &unsigned_bytes,
+        actual_body: &unsigned_bytes,
+        signing_key: SIGNING_KEY,
+    });
+    *wrong_path.uri_mut() = WORKER_PATH.parse().unwrap();
+    let wrong_path = harness
+        .jobs_router
+        .clone()
+        .oneshot(wrong_path)
+        .await
+        .unwrap();
+    assert_eq!(wrong_path.status(), StatusCode::UNAUTHORIZED);
+
+    let wrong_scope = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            WORKER_PATH,
+            "discovery",
+            "ats-integration-worker",
+            now_secs,
+            "abcdef0123456789abcdef0123456812",
+            &unsigned_envelope,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(wrong_scope.status(), StatusCode::UNAUTHORIZED);
+
+    let unknown_field = json!({
+        "canonicalBase64url": "AA",
+        "authorizationBase64url": "AA",
+        "accountId": "must-not-be-accepted",
+    });
+    let unknown_field = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            WORKER_PATH,
+            "ats-layout-observation",
+            "ats-integration-worker",
+            now_secs,
+            "abcdef0123456789abcdef0123456813",
+            &unknown_field,
+            SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let oversized_body = vec![b'x'; 256 * 1024 + 1];
+    let oversized = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: WORKER_PATH,
+            scope: "ats-layout-observation",
+            worker_id: "ats-integration-worker",
+            timestamp: now_secs,
+            nonce: "abcdef0123456789abcdef0123456814",
+            signed_body: &oversized_body,
+            actual_body: &oversized_body,
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), StatusCode::UNAUTHORIZED);
+
+    for authorization in [
+        format!("Bearer {customer_access}"),
+        format!("Bearer {admin_access}"),
+        "Bearer legacy-debug-token".to_string(),
+    ] {
+        let response = harness
+            .jobs_router
+            .clone()
+            .oneshot(
+                Request::post(WORKER_PATH)
+                    .header("authorization", authorization)
+                    .header("content-type", "application/json")
+                    .body(Body::from(unsigned_bytes.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    let customer_admin_write = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(ADMIN_MANIFEST_PATH)
+                .header("authorization", format!("Bearer {customer_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(unsigned_bytes.clone()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(customer_admin_write.status(), StatusCode::FORBIDDEN);
+
+    let worker_admin_write = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_request(SignedWorkerRequest {
+            path: ADMIN_LAYOUT_PATH,
+            scope: "ats-layout-observation",
+            worker_id: "ats-integration-worker",
+            timestamp: now_secs,
+            nonce: "abcdef0123456789abcdef0123456815",
+            signed_body: &unsigned_bytes,
+            actual_body: &unsigned_bytes,
+            signing_key: SIGNING_KEY,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(worker_admin_write.status(), StatusCode::UNAUTHORIZED);
+
+    let aggregate = json!({
+        "manifest": unsigned_envelope,
+        "evidence": [],
+    });
+    for router in [harness.router.clone(), harness.jobs_router.clone()] {
+        let admin_manifest = router
+            .oneshot(
+                Request::post(ADMIN_MANIFEST_PATH)
+                    .header("authorization", format!("Bearer {admin_access}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&aggregate).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_manifest.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(admin_manifest.into_body(), 4 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(body.to_vec()).unwrap(),
+            "The ATS certification authority was not found."
+        );
+    }
+
+    let aggregate_unknown_field = json!({
+        "manifest": {
+            "canonicalBase64url": "AA",
+            "authorizationBase64url": "AA",
+            "accountId": "must-not-be-accepted",
+        },
+        "evidence": [],
+    });
+    let aggregate_unknown_field = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(ADMIN_MANIFEST_PATH)
+                .header("authorization", format!("Bearer {admin_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&aggregate_unknown_field).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        aggregate_unknown_field.status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let oversized_admin_body = vec![b'x'; 256 * 1024 + 1];
+    let oversized_admin = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(ADMIN_MANIFEST_PATH)
+                .header("authorization", format!("Bearer {admin_access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(oversized_admin_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(oversized_admin.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let now_ms = (now_secs as i64) * 1_000;
+    let target_status_path = format!(
+        "/admin/jobs/ats-certifications/targets/greenhouse:acme:123/status?\
+         canonicalUrl=https%3A%2F%2Fboards.greenhouse.io%2Facme%2Fjobs%2F123&\
+         discoveryProvider=greenhouse&discoveryTargetKey=greenhouse%3Aacme%3A123&\
+         discoveryObservedAtMs={now_ms}&originalSourceProvider=greenhouse&\
+         originalSourceTargetKey=greenhouse%3Aacme%3A123&\
+         originalSourceObservedAtMs={now_ms}&channel=general"
+    )
+    .replace(' ', "");
+    for router in [harness.router.clone(), harness.jobs_router.clone()] {
+        let customer_status = router
+            .clone()
+            .oneshot(
+                Request::get(&target_status_path)
+                    .header("authorization", format!("Bearer {customer_access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(customer_status.status(), StatusCode::FORBIDDEN);
+
+        let admin_status = router
+            .clone()
+            .oneshot(
+                Request::get(&target_status_path)
+                    .header("authorization", format!("Bearer {admin_access}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admin_status.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(admin_status.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status["schemaVersion"], 1);
+        assert_eq!(status["provider"], "greenhouse");
+        assert_eq!(status["status"], "review_only");
+        assert_eq!(status["canaryAvailable"], false);
+        assert!(status["targetKeySha256"].as_str().unwrap().len() == 64);
+        assert!(status.get("targetKey").is_none());
+        assert!(status.get("accountId").is_none());
+        assert!(status.get("evidenceSha256s").is_none());
+    }
+
+    let unknown_query = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(format!("{target_status_path}&accountId=forbidden"))
+                .header("authorization", format!("Bearer {admin_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unknown_query.status(), StatusCode::BAD_REQUEST);
+
+    let path_mismatch = target_status_path.replace(
+        "targets/greenhouse:acme:123/status",
+        "targets/greenhouse:other:123/status",
+    );
+    let path_mismatch = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get(path_mismatch)
+                .header("authorization", format!("Bearer {admin_access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(path_mismatch.status(), StatusCode::NOT_FOUND);
+
+    assert_eq!(ats_certification_mutation_count(&harness.pool), 0);
+    let ats_audit_count: i64 = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM ops_audit_events
+              WHERE event_type LIKE 'jobs_ats_certification_%'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ats_audit_count, 0);
+    std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
 }
 
 #[tokio::test]
@@ -3424,6 +3922,8 @@ fn final_submit_proof(
             version_id: application.resume_version_id,
             sha256: resume_sha256,
         }],
+        certification: None,
+        observed_surface: None,
     }
 }
 
@@ -3476,7 +3976,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let volume = setup_signed_runner_volume(&harness, SIGNING_KEY, now).await;
+    let (volume, runtime) = setup_signed_runner_volume(&harness, SIGNING_KEY, now).await;
     let clone_instance_id = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([65_u8; 32]);
     let instance_path = format!(
         "/api/jobs/internal/runner-volumes/{}/instances/claim",
@@ -3491,10 +3991,11 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
             enrollment_epoch: volume.enrollment_epoch,
             process_instance_id: clone_instance_id,
             issued_at_ms: chrono::Utc::now().timestamp_millis(),
-            payload_sha256: runner_volume_http_payload_sha256(
+            payload_sha256: runner_volume_instance_claim_payload_sha256(
                 &instance_path,
                 &volume.worker_id,
-                &[],
+                &runtime.grant,
+                &runtime.runtime_sha256,
             ),
         },
     )
@@ -3508,7 +4009,10 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
             &volume.worker_id,
             now,
             "runner-volume-clone-claim-http-0001",
-            &json!({ "proof": clone_proof }),
+            &json!({
+                "proof": clone_proof,
+                "runtimeGrant": runtime.grant,
+            }),
             SIGNING_KEY,
         ))
         .await
@@ -3516,6 +4020,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     assert_eq!(concurrent_clone.status(), StatusCode::CONFLICT);
     let claim_body = signed_execution_claim_body(
         &volume,
+        &runtime,
         &volume.signing_key,
         &volume.worker_id,
         &account_id,
@@ -3554,6 +4059,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
 
     let owner_mismatch_body = signed_execution_claim_body(
         &volume,
+        &runtime,
         &volume.signing_key,
         &volume.worker_id,
         &account_id,
@@ -3606,6 +4112,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     let forged_volume_key = Ed25519SigningKey::from_bytes(&[91_u8; 32]);
     let fleet_hmac_only_body = signed_execution_claim_body(
         &volume,
+        &runtime,
         &forged_volume_key,
         &volume.worker_id,
         &account_id,
@@ -3633,6 +4140,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
 
     let forged_profile_body = signed_execution_claim_body(
         &volume,
+        &runtime,
         &volume.signing_key,
         &volume.worker_id,
         &account_id,
@@ -3660,6 +4168,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
 
     let invalid_claim_body = signed_execution_claim_body(
         &volume,
+        &runtime,
         &volume.signing_key,
         &volume.worker_id,
         &account_id,
@@ -3687,6 +4196,7 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
 
     let missing_binding_body = signed_execution_claim_body(
         &volume,
+        &runtime,
         &volume.signing_key,
         &volume.worker_id,
         &account_id,
@@ -3768,6 +4278,8 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
             "process_instance_id",
             "purge_subject",
             "run_id",
+            "runtime_grant_id",
+            "runtime_sha256",
             "volume_id",
             "volume_key_fingerprint",
         ]
@@ -3781,6 +4293,8 @@ async fn jobs_execution_lease_routes_require_worker_auth_and_fence_submit() {
     assert_eq!(lease["enrollment_epoch"], volume.enrollment_epoch);
     assert_eq!(lease["process_instance_id"], volume.process_instance_id);
     assert_eq!(lease["volume_key_fingerprint"], volume.key_fingerprint);
+    assert_eq!(lease["runtime_grant_id"], runtime.grant.grant_id);
+    assert_eq!(lease["runtime_sha256"], runtime.runtime_sha256);
     let purge_subject = lease["purge_subject"].as_str().unwrap().to_string();
     let lease_token = lease["lease_token"].as_str().unwrap();
     let fence = lease["fence"].as_i64().unwrap();

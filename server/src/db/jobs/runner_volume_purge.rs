@@ -31,14 +31,14 @@ pub const EMPTY_RUNNER_STORAGE_ATTESTATION_SET_SHA256: &str =
 
 const RUNNER_PURGE_COMMAND_DOMAIN: &str = "bluey-jobs-runner-volume-purge-command-v2";
 const RUNNER_PURGE_ACK_DOMAIN: &str = "bluey-jobs-runner-volume-purge-ack-v2";
-const RUNNER_STORAGE_ATTESTATION_DOMAIN: &str =
-    "bluey-jobs-runner-volume-storage-attestation-v1";
+const RUNNER_STORAGE_ATTESTATION_DOMAIN: &str = "bluey-jobs-runner-volume-storage-attestation-v1";
 const RUNNER_STORAGE_ATTESTATION_SET_DOMAIN: &str =
     "bluey-jobs-runner-volume-storage-attestation-set-v1";
 const RUNNER_PURGE_STORAGE_EVIDENCE_DOMAIN: &str = "bluey-jobs-runner-purge-storage-evidence-v2";
 const RUNNER_PURGE_TARGET_INVENTORY_DOMAIN: &str = "bluey-jobs-runner-purge-target-inventory-v2";
 const RUNNER_VOLUME_ENROLLMENT_DOMAIN: &str = "bluey-jobs-runner-volume-enrollment-v1";
 const RUNNER_VOLUME_AUTHORITY_DOMAIN: &str = "bluey-jobs-runner-volume-authority-v1";
+const RUNNER_PROCESS_RUNTIME_DOMAIN: &str = "bluey-jobs-runner-process-runtime-v1";
 const RUNNER_LEGACY_INVENTORY_AUTHORITY_DOMAIN: &str =
     "bluey-jobs-runner-legacy-inventory-authority-v1";
 const RUNNER_LEGACY_INVENTORY_ID_DOMAIN: &str =
@@ -981,8 +981,7 @@ impl RunnerVolumeStorageAttestation {
                 .subject_storage_complete_root_entry_count,
             subject_storage_complete_root_file_bytes: input
                 .subject_storage_complete_root_file_bytes,
-            subject_storage_complete_root_sha256: input
-                .subject_storage_complete_root_sha256,
+            subject_storage_complete_root_sha256: input.subject_storage_complete_root_sha256,
             locator_count: input.locator_count,
             resident_locator_count: input.resident_locator_count,
             locator_set_sha256: input.locator_set_sha256,
@@ -1046,8 +1045,7 @@ impl RunnerVolumeStorageAttestation {
         }
         require_sha256(&self.predecessor_attestation_sha256)?;
         if (self.predecessor_attestation_generation == 0)
-            != (self.predecessor_attestation_sha256
-                == GENESIS_RUNNER_STORAGE_ATTESTATION_SHA256)
+            != (self.predecessor_attestation_sha256 == GENESIS_RUNNER_STORAGE_ATTESTATION_SHA256)
         {
             return Err(RunnerVolumePurgeError::InvalidRequest);
         }
@@ -1804,8 +1802,158 @@ pub struct RunnerVolumeInstanceLease {
     pub volume_id: String,
     pub enrollment_epoch: i64,
     pub process_instance_id: String,
+    pub runtime_grant_id: Option<String>,
+    pub runtime_sha256: Option<String>,
     pub lease_expires_at_ms: i64,
     pub disposition: RunnerVolumeWriteDisposition,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RunnerVolumeInstanceLeaseRequest<'a> {
+    pub volume_id: &'a str,
+    pub enrollment_epoch: i64,
+    pub process_instance_id: &'a str,
+    pub now_ms: i64,
+    pub lease_expires_at_ms: i64,
+}
+
+/// Exact cloud process runtime measured by the runner and approved separately
+/// by deployment. This is cooperative software attestation; authority comes
+/// from the one-time server grant and the immutable server-side binding, not
+/// from values echoed in a lease response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnerProcessRuntimeAttestation {
+    pub runner_image_sha256: String,
+    pub runner_build_id: String,
+    pub platform: String,
+    pub architecture: String,
+    pub automation_bundle_sha256: String,
+    pub playwright_version: String,
+    pub chromium_revision: String,
+    pub chromium_executable_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NewRunnerProcessRuntimeGrant {
+    pub grant_id: String,
+    /// High-entropy one-time deployment bearer. Only its SHA-256 is stored.
+    pub token: String,
+    pub expected_worker_id: String,
+    pub runtime: RunnerProcessRuntimeAttestation,
+    pub authorization_ref: String,
+    pub created_by: String,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnerProcessRuntimeGrant {
+    pub grant_id: String,
+    pub token_sha256: String,
+    pub expected_worker_id: String,
+    pub runtime_sha256: String,
+    pub runtime: RunnerProcessRuntimeAttestation,
+    pub authorization_ref: String,
+    pub created_by: String,
+    pub expires_at_ms: i64,
+    pub created_at_ms: i64,
+    pub disposition: RunnerVolumeWriteDisposition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RevokeRunnerProcessRuntimeGrantRequest {
+    pub grant_id: String,
+    pub reason: String,
+    pub authorization_ref: String,
+    pub revoked_by: String,
+    pub revoked_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnerProcessRuntimeGrantRevocation {
+    pub grant_id: String,
+    pub reason: String,
+    pub authorization_ref: String,
+    pub revoked_by: String,
+    pub revoked_at_ms: i64,
+    pub disposition: RunnerVolumeWriteDisposition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunnerProcessRuntimeGrantClaim {
+    pub grant_id: String,
+    pub grant_token: String,
+    pub runtime: RunnerProcessRuntimeAttestation,
+}
+
+/// Runtime identity loaded from immutable server records. Callers must use
+/// this value (or reload it transactionally), never request or lease JSON, for
+/// ATS Phase A and other irreversible cloud authority checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrustedRunnerProcessRuntimeAttestation {
+    pub runtime_grant_id: String,
+    pub worker_id: String,
+    pub volume_id: String,
+    pub enrollment_epoch: i64,
+    pub process_instance_id: String,
+    pub runtime_sha256: String,
+    pub runtime: RunnerProcessRuntimeAttestation,
+    pub bound_at_ms: i64,
+}
+
+fn validate_runner_process_runtime(
+    runtime: &RunnerProcessRuntimeAttestation,
+) -> RunnerVolumePurgeResult<()> {
+    require_sha256(&runtime.runner_image_sha256)?;
+    require_runner_identifier(&runtime.runner_build_id)?;
+    if !matches!(runtime.platform.as_str(), "linux" | "macos" | "windows")
+        || !matches!(runtime.architecture.as_str(), "arm64" | "x86_64")
+    {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    require_sha256(&runtime.automation_bundle_sha256)?;
+    require_nonempty_text(&runtime.playwright_version, 80)?;
+    require_nonempty_text(&runtime.chromium_revision, 80)?;
+    require_sha256(&runtime.chromium_executable_sha256)?;
+    Ok(())
+}
+
+pub fn runner_process_runtime_sha256(
+    runtime: &RunnerProcessRuntimeAttestation,
+) -> RunnerVolumePurgeResult<String> {
+    validate_runner_process_runtime(runtime)?;
+    Ok(hex::encode(Sha256::digest(
+        format!(
+            concat!(
+                "{}\n",
+                "runner_image_sha256={}\n",
+                "runner_build_id={}\n",
+                "platform={}\n",
+                "architecture={}\n",
+                "automation_bundle_sha256={}\n",
+                "playwright_version={}\n",
+                "chromium_revision={}\n",
+                "chromium_executable_sha256={}\n"
+            ),
+            RUNNER_PROCESS_RUNTIME_DOMAIN,
+            runtime.runner_image_sha256,
+            runtime.runner_build_id,
+            runtime.platform,
+            runtime.architecture,
+            runtime.automation_bundle_sha256,
+            runtime.playwright_version,
+            runtime.chromium_revision,
+            runtime.chromium_executable_sha256,
+        )
+        .as_bytes(),
+    )))
 }
 
 fn validate_admission_grant(
@@ -2005,6 +2153,948 @@ pub fn create_runner_volume_admission_grant(
             created.disposition = RunnerVolumeWriteDisposition::Applied;
             tx.commit()?;
             Ok(created)
+        }
+    })
+}
+
+const PROCESS_RUNTIME_GRANT_COLUMNS: &str =
+    "grant_id, token_sha256, expected_worker_id, runtime_sha256, runner_image_sha256, \
+     runner_build_id, platform, architecture, automation_bundle_sha256, \
+     playwright_version, chromium_revision, chromium_executable_sha256, \
+     authorization_ref, created_by, expires_at_ms, created_at_ms";
+
+fn process_runtime_grant_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RunnerProcessRuntimeGrant> {
+    Ok(RunnerProcessRuntimeGrant {
+        grant_id: row.get(0)?,
+        token_sha256: row.get(1)?,
+        expected_worker_id: row.get(2)?,
+        runtime_sha256: row.get(3)?,
+        runtime: RunnerProcessRuntimeAttestation {
+            runner_image_sha256: row.get(4)?,
+            runner_build_id: row.get(5)?,
+            platform: row.get(6)?,
+            architecture: row.get(7)?,
+            automation_bundle_sha256: row.get(8)?,
+            playwright_version: row.get(9)?,
+            chromium_revision: row.get(10)?,
+            chromium_executable_sha256: row.get(11)?,
+        },
+        authorization_ref: row.get(12)?,
+        created_by: row.get(13)?,
+        expires_at_ms: row.get(14)?,
+        created_at_ms: row.get(15)?,
+        disposition: RunnerVolumeWriteDisposition::Replay,
+    })
+}
+
+fn process_runtime_grant_from_pg_row(row: postgres::Row) -> RunnerProcessRuntimeGrant {
+    RunnerProcessRuntimeGrant {
+        grant_id: row.get(0),
+        token_sha256: row.get(1),
+        expected_worker_id: row.get(2),
+        runtime_sha256: row.get(3),
+        runtime: RunnerProcessRuntimeAttestation {
+            runner_image_sha256: row.get(4),
+            runner_build_id: row.get(5),
+            platform: row.get(6),
+            architecture: row.get(7),
+            automation_bundle_sha256: row.get(8),
+            playwright_version: row.get(9),
+            chromium_revision: row.get(10),
+            chromium_executable_sha256: row.get(11),
+        },
+        authorization_ref: row.get(12),
+        created_by: row.get(13),
+        expires_at_ms: row.get(14),
+        created_at_ms: row.get(15),
+        disposition: RunnerVolumeWriteDisposition::Replay,
+    }
+}
+
+fn validate_new_runner_process_runtime_grant(
+    input: &NewRunnerProcessRuntimeGrant,
+) -> RunnerVolumePurgeResult<(String, String)> {
+    require_runner_identifier(&input.grant_id)?;
+    let token = decode_base64url_exact(&input.token, 32)?;
+    require_runner_identifier(&input.expected_worker_id)?;
+    let runtime_sha256 = runner_process_runtime_sha256(&input.runtime)?;
+    require_nonempty_text(&input.authorization_ref, 1_024)?;
+    require_nonempty_text(&input.created_by, 240)?;
+    if input.created_at_ms < 0 || input.expires_at_ms <= input.created_at_ms {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    Ok((hex::encode(Sha256::digest(token)), runtime_sha256))
+}
+
+fn exact_process_runtime_grant(
+    stored: &RunnerProcessRuntimeGrant,
+    input: &NewRunnerProcessRuntimeGrant,
+    token_sha256: &str,
+    runtime_sha256: &str,
+) -> bool {
+    stored.grant_id == input.grant_id
+        && stored
+            .token_sha256
+            .as_bytes()
+            .ct_eq(token_sha256.as_bytes())
+            .unwrap_u8()
+            == 1
+        && stored.expected_worker_id == input.expected_worker_id
+        && stored.runtime_sha256 == runtime_sha256
+        && stored.runtime == input.runtime
+        && stored.authorization_ref == input.authorization_ref
+        && stored.created_by == input.created_by
+        && stored.expires_at_ms == input.expires_at_ms
+        && stored.created_at_ms == input.created_at_ms
+}
+
+/// Persist one immutable deployment approval for an exact cloud process
+/// runtime. The raw bearer is returned only by the administrative API caller;
+/// this database helper stores its digest.
+pub fn create_runner_process_runtime_grant(
+    pool: &DbPool,
+    input: &NewRunnerProcessRuntimeGrant,
+) -> RunnerVolumePurgeResult<RunnerProcessRuntimeGrant> {
+    let (token_sha256, runtime_sha256) = validate_new_runner_process_runtime_grant(input)?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let select = format!(
+                "SELECT {PROCESS_RUNTIME_GRANT_COLUMNS} \
+                   FROM jobs_runner_process_runtime_grants WHERE grant_id = ?1"
+            );
+            if let Some(stored) = tx
+                .query_row(
+                    &select,
+                    params![input.grant_id],
+                    process_runtime_grant_from_sqlite_row,
+                )
+                .optional()?
+            {
+                if !exact_process_runtime_grant(&stored, input, &token_sha256, &runtime_sha256) {
+                    return Err(RunnerVolumePurgeError::Conflict);
+                }
+                tx.commit()?;
+                return Ok(stored);
+            }
+            tx.execute(
+                "INSERT INTO jobs_runner_process_runtime_grants ( \
+                    grant_id, token_sha256, expected_worker_id, runtime_sha256, \
+                    runner_image_sha256, runner_build_id, platform, architecture, \
+                    automation_bundle_sha256, playwright_version, chromium_revision, \
+                    chromium_executable_sha256, authorization_ref, created_by, \
+                    expires_at_ms, created_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                           ?13, ?14, ?15, ?16)",
+                params![
+                    input.grant_id,
+                    token_sha256,
+                    input.expected_worker_id,
+                    runtime_sha256,
+                    input.runtime.runner_image_sha256,
+                    input.runtime.runner_build_id,
+                    input.runtime.platform,
+                    input.runtime.architecture,
+                    input.runtime.automation_bundle_sha256,
+                    input.runtime.playwright_version,
+                    input.runtime.chromium_revision,
+                    input.runtime.chromium_executable_sha256,
+                    input.authorization_ref,
+                    input.created_by,
+                    input.expires_at_ms,
+                    input.created_at_ms,
+                ],
+            )?;
+            let mut created = tx.query_row(
+                &select,
+                params![input.grant_id],
+                process_runtime_grant_from_sqlite_row,
+            )?;
+            created.disposition = RunnerVolumeWriteDisposition::Applied;
+            tx.commit()?;
+            Ok(created)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let select = format!(
+                "SELECT {PROCESS_RUNTIME_GRANT_COLUMNS} \
+                   FROM jobs_runner_process_runtime_grants WHERE grant_id = $1 FOR UPDATE"
+            );
+            if let Some(row) = tx.query_opt(&select, &[&input.grant_id])? {
+                let stored = process_runtime_grant_from_pg_row(row);
+                if !exact_process_runtime_grant(&stored, input, &token_sha256, &runtime_sha256) {
+                    return Err(RunnerVolumePurgeError::Conflict);
+                }
+                tx.commit()?;
+                return Ok(stored);
+            }
+            tx.execute(
+                "INSERT INTO jobs_runner_process_runtime_grants ( \
+                    grant_id, token_sha256, expected_worker_id, runtime_sha256, \
+                    runner_image_sha256, runner_build_id, platform, architecture, \
+                    automation_bundle_sha256, playwright_version, chromium_revision, \
+                    chromium_executable_sha256, authorization_ref, created_by, \
+                    expires_at_ms, created_at_ms \
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+                           $13, $14, $15, $16)",
+                &[
+                    &input.grant_id,
+                    &token_sha256,
+                    &input.expected_worker_id,
+                    &runtime_sha256,
+                    &input.runtime.runner_image_sha256,
+                    &input.runtime.runner_build_id,
+                    &input.runtime.platform,
+                    &input.runtime.architecture,
+                    &input.runtime.automation_bundle_sha256,
+                    &input.runtime.playwright_version,
+                    &input.runtime.chromium_revision,
+                    &input.runtime.chromium_executable_sha256,
+                    &input.authorization_ref,
+                    &input.created_by,
+                    &input.expires_at_ms,
+                    &input.created_at_ms,
+                ],
+            )?;
+            let mut created =
+                process_runtime_grant_from_pg_row(tx.query_one(&select, &[&input.grant_id])?);
+            created.disposition = RunnerVolumeWriteDisposition::Applied;
+            tx.commit()?;
+            Ok(created)
+        }
+    })
+}
+
+fn validate_runner_process_runtime_grant_revocation(
+    input: &RevokeRunnerProcessRuntimeGrantRequest,
+) -> RunnerVolumePurgeResult<()> {
+    require_runner_identifier(&input.grant_id)?;
+    require_nonempty_text(&input.reason, 240)?;
+    require_nonempty_text(&input.authorization_ref, 1_024)?;
+    require_nonempty_text(&input.revoked_by, 240)?;
+    if input.revoked_at_ms < 0 {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    Ok(())
+}
+
+fn exact_runner_process_runtime_revocation(
+    stored: &RunnerProcessRuntimeGrantRevocation,
+    input: &RevokeRunnerProcessRuntimeGrantRequest,
+) -> bool {
+    stored.grant_id == input.grant_id
+        && stored.reason == input.reason
+        && stored.authorization_ref == input.authorization_ref
+        && stored.revoked_by == input.revoked_by
+}
+
+/// Append-only cancellation for an unused deployment grant. Consumption and
+/// cancellation serialize on the grant row, so exactly one can win. A bound
+/// process is never retroactively erased because recovery must retain its exact
+/// historical runtime evidence.
+pub fn revoke_runner_process_runtime_grant(
+    pool: &DbPool,
+    input: &RevokeRunnerProcessRuntimeGrantRequest,
+) -> RunnerVolumePurgeResult<RunnerProcessRuntimeGrantRevocation> {
+    validate_runner_process_runtime_grant_revocation(input)?;
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let grant_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs_runner_process_runtime_grants \
+                  WHERE grant_id = ?1)",
+                params![input.grant_id],
+                |row| row.get(0),
+            )?;
+            if !grant_exists {
+                return Err(RunnerVolumePurgeError::NotFound);
+            }
+            let stored = tx
+                .query_row(
+                    "SELECT grant_id, reason, authorization_ref, revoked_by, revoked_at_ms \
+                       FROM jobs_runner_process_runtime_grant_revocations \
+                      WHERE grant_id = ?1",
+                    params![input.grant_id],
+                    |row| {
+                        Ok(RunnerProcessRuntimeGrantRevocation {
+                            grant_id: row.get(0)?,
+                            reason: row.get(1)?,
+                            authorization_ref: row.get(2)?,
+                            revoked_by: row.get(3)?,
+                            revoked_at_ms: row.get(4)?,
+                            disposition: RunnerVolumeWriteDisposition::Replay,
+                        })
+                    },
+                )
+                .optional()?;
+            if let Some(stored) = stored {
+                if !exact_runner_process_runtime_revocation(&stored, input) {
+                    return Err(RunnerVolumePurgeError::Conflict);
+                }
+                tx.commit()?;
+                return Ok(stored);
+            }
+            let consumed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs_runner_process_runtime_bindings \
+                  WHERE grant_id = ?1)",
+                params![input.grant_id],
+                |row| row.get(0),
+            )?;
+            if consumed {
+                return Err(RunnerVolumePurgeError::Conflict);
+            }
+            tx.execute(
+                "INSERT INTO jobs_runner_process_runtime_grant_revocations ( \
+                    grant_id, reason, authorization_ref, revoked_by, revoked_at_ms \
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    input.grant_id,
+                    input.reason,
+                    input.authorization_ref,
+                    input.revoked_by,
+                    input.revoked_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(RunnerProcessRuntimeGrantRevocation {
+                grant_id: input.grant_id.clone(),
+                reason: input.reason.clone(),
+                authorization_ref: input.authorization_ref.clone(),
+                revoked_by: input.revoked_by.clone(),
+                revoked_at_ms: input.revoked_at_ms,
+                disposition: RunnerVolumeWriteDisposition::Applied,
+            })
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            if tx
+                .query_opt(
+                    "SELECT 1 FROM jobs_runner_process_runtime_grants \
+                      WHERE grant_id = $1 FOR UPDATE",
+                    &[&input.grant_id],
+                )?
+                .is_none()
+            {
+                return Err(RunnerVolumePurgeError::NotFound);
+            }
+            if let Some(row) = tx.query_opt(
+                "SELECT grant_id, reason, authorization_ref, revoked_by, revoked_at_ms \
+                   FROM jobs_runner_process_runtime_grant_revocations \
+                  WHERE grant_id = $1",
+                &[&input.grant_id],
+            )? {
+                let stored = RunnerProcessRuntimeGrantRevocation {
+                    grant_id: row.get(0),
+                    reason: row.get(1),
+                    authorization_ref: row.get(2),
+                    revoked_by: row.get(3),
+                    revoked_at_ms: row.get(4),
+                    disposition: RunnerVolumeWriteDisposition::Replay,
+                };
+                if !exact_runner_process_runtime_revocation(&stored, input) {
+                    return Err(RunnerVolumePurgeError::Conflict);
+                }
+                tx.commit()?;
+                return Ok(stored);
+            }
+            if tx
+                .query_opt(
+                    "SELECT 1 FROM jobs_runner_process_runtime_bindings \
+                      WHERE grant_id = $1 FOR UPDATE",
+                    &[&input.grant_id],
+                )?
+                .is_some()
+            {
+                return Err(RunnerVolumePurgeError::Conflict);
+            }
+            tx.execute(
+                "INSERT INTO jobs_runner_process_runtime_grant_revocations ( \
+                    grant_id, reason, authorization_ref, revoked_by, revoked_at_ms \
+                 ) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &input.grant_id,
+                    &input.reason,
+                    &input.authorization_ref,
+                    &input.revoked_by,
+                    &input.revoked_at_ms,
+                ],
+            )?;
+            tx.commit()?;
+            Ok(RunnerProcessRuntimeGrantRevocation {
+                grant_id: input.grant_id.clone(),
+                reason: input.reason.clone(),
+                authorization_ref: input.authorization_ref.clone(),
+                revoked_by: input.revoked_by.clone(),
+                revoked_at_ms: input.revoked_at_ms,
+                disposition: RunnerVolumeWriteDisposition::Applied,
+            })
+        }
+    })
+}
+
+fn trusted_process_runtime_from_sqlite_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TrustedRunnerProcessRuntimeAttestation> {
+    Ok(TrustedRunnerProcessRuntimeAttestation {
+        runtime_grant_id: row.get(0)?,
+        worker_id: row.get(1)?,
+        volume_id: row.get(2)?,
+        enrollment_epoch: row.get(3)?,
+        process_instance_id: row.get(4)?,
+        runtime_sha256: row.get(5)?,
+        runtime: RunnerProcessRuntimeAttestation {
+            runner_image_sha256: row.get(6)?,
+            runner_build_id: row.get(7)?,
+            platform: row.get(8)?,
+            architecture: row.get(9)?,
+            automation_bundle_sha256: row.get(10)?,
+            playwright_version: row.get(11)?,
+            chromium_revision: row.get(12)?,
+            chromium_executable_sha256: row.get(13)?,
+        },
+        bound_at_ms: row.get(14)?,
+    })
+}
+
+fn trusted_process_runtime_from_pg_row(
+    row: postgres::Row,
+) -> TrustedRunnerProcessRuntimeAttestation {
+    TrustedRunnerProcessRuntimeAttestation {
+        runtime_grant_id: row.get(0),
+        worker_id: row.get(1),
+        volume_id: row.get(2),
+        enrollment_epoch: row.get(3),
+        process_instance_id: row.get(4),
+        runtime_sha256: row.get(5),
+        runtime: RunnerProcessRuntimeAttestation {
+            runner_image_sha256: row.get(6),
+            runner_build_id: row.get(7),
+            platform: row.get(8),
+            architecture: row.get(9),
+            automation_bundle_sha256: row.get(10),
+            playwright_version: row.get(11),
+            chromium_revision: row.get(12),
+            chromium_executable_sha256: row.get(13),
+        },
+        bound_at_ms: row.get(14),
+    }
+}
+
+const TRUSTED_PROCESS_RUNTIME_COLUMNS: &str =
+    "b.grant_id, b.worker_id, b.volume_id, b.enrollment_epoch, \
+     b.process_instance_id, b.runtime_sha256, g.runner_image_sha256, \
+     g.runner_build_id, g.platform, g.architecture, g.automation_bundle_sha256, \
+     g.playwright_version, g.chromium_revision, g.chromium_executable_sha256, \
+     b.bound_at_ms";
+
+fn validate_trusted_process_runtime(
+    trusted: &TrustedRunnerProcessRuntimeAttestation,
+) -> RunnerVolumePurgeResult<()> {
+    require_runner_identifier(&trusted.runtime_grant_id)?;
+    require_runner_identifier(&trusted.worker_id)?;
+    require_base64url(&trusted.volume_id, 32)?;
+    require_base64url(&trusted.process_instance_id, 32)?;
+    if trusted.enrollment_epoch <= 0 || trusted.bound_at_ms < 0 {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    let recomputed = runner_process_runtime_sha256(&trusted.runtime)?;
+    if trusted.runtime_sha256 != recomputed {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    Ok(())
+}
+
+fn validate_runner_process_runtime_claim(
+    claim: &RunnerProcessRuntimeGrantClaim,
+) -> RunnerVolumePurgeResult<(String, String)> {
+    require_runner_identifier(&claim.grant_id)?;
+    let token = decode_base64url_exact(&claim.grant_token, 32)?;
+    let runtime_sha256 = runner_process_runtime_sha256(&claim.runtime)?;
+    Ok((hex::encode(Sha256::digest(token)), runtime_sha256))
+}
+
+fn runtime_grant_authorizes_claim(
+    grant: &RunnerProcessRuntimeGrant,
+    claim: &RunnerProcessRuntimeGrantClaim,
+    expected_worker_id: &str,
+    token_sha256: &str,
+    runtime_sha256: &str,
+) -> bool {
+    grant.grant_id == claim.grant_id
+        && grant.expected_worker_id == expected_worker_id
+        && grant.runtime_sha256 == runtime_sha256
+        && grant.runtime == claim.runtime
+        && grant
+            .token_sha256
+            .as_bytes()
+            .ct_eq(token_sha256.as_bytes())
+            .unwrap_u8()
+            == 1
+}
+
+fn exact_trusted_process_binding(
+    trusted: &TrustedRunnerProcessRuntimeAttestation,
+    grant_id: &str,
+    worker_id: &str,
+    volume_id: &str,
+    enrollment_epoch: i64,
+    process_instance_id: &str,
+    runtime_sha256: &str,
+) -> bool {
+    trusted.runtime_grant_id == grant_id
+        && trusted.worker_id == worker_id
+        && trusted.volume_id == volume_id
+        && trusted.enrollment_epoch == enrollment_epoch
+        && trusted.process_instance_id == process_instance_id
+        && trusted.runtime_sha256 == runtime_sha256
+}
+
+fn bind_runner_process_runtime_sqlite_tx(
+    tx: &RunnerSqliteTransaction<'_>,
+    claim: &RunnerProcessRuntimeGrantClaim,
+    worker_id: &str,
+    volume_id: &str,
+    enrollment_epoch: i64,
+    process_instance_id: &str,
+    now_ms: i64,
+) -> RunnerVolumePurgeResult<TrustedRunnerProcessRuntimeAttestation> {
+    let (token_sha256, runtime_sha256) = validate_runner_process_runtime_claim(claim)?;
+    require_runner_identifier(worker_id)?;
+    require_base64url(volume_id, 32)?;
+    require_base64url(process_instance_id, 32)?;
+    if enrollment_epoch <= 0 || now_ms < 0 {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    let grant_select = format!(
+        "SELECT {PROCESS_RUNTIME_GRANT_COLUMNS} \
+           FROM jobs_runner_process_runtime_grants WHERE grant_id = ?1"
+    );
+    let grant = tx
+        .query_row(
+            &grant_select,
+            params![claim.grant_id],
+            process_runtime_grant_from_sqlite_row,
+        )
+        .optional()?
+        .ok_or(RunnerVolumePurgeError::Unauthorized)?;
+    if !runtime_grant_authorizes_claim(&grant, claim, worker_id, &token_sha256, &runtime_sha256) {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    let binding_select = format!(
+        "SELECT {TRUSTED_PROCESS_RUNTIME_COLUMNS} \
+           FROM jobs_runner_process_runtime_bindings b \
+           JOIN jobs_runner_process_runtime_grants g ON g.grant_id = b.grant_id \
+          WHERE b.grant_id = ?1"
+    );
+    if let Some(trusted) = tx
+        .query_row(
+            &binding_select,
+            params![claim.grant_id],
+            trusted_process_runtime_from_sqlite_row,
+        )
+        .optional()?
+    {
+        validate_trusted_process_runtime(&trusted)?;
+        if !exact_trusted_process_binding(
+            &trusted,
+            &claim.grant_id,
+            worker_id,
+            volume_id,
+            enrollment_epoch,
+            process_instance_id,
+            &runtime_sha256,
+        ) {
+            return Err(RunnerVolumePurgeError::Unauthorized);
+        }
+        return Ok(trusted);
+    }
+    let revoked: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 \
+           FROM jobs_runner_process_runtime_grant_revocations WHERE grant_id = ?1)",
+        params![claim.grant_id],
+        |row| row.get(0),
+    )?;
+    if revoked {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    if now_ms < grant.created_at_ms || now_ms > grant.expires_at_ms {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    if tx.execute(
+        "INSERT OR IGNORE INTO jobs_runner_process_runtime_bindings ( \
+            grant_id, worker_id, volume_id, enrollment_epoch, process_instance_id, \
+            runtime_sha256, bound_at_ms \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            claim.grant_id,
+            worker_id,
+            volume_id,
+            enrollment_epoch,
+            process_instance_id,
+            runtime_sha256,
+            now_ms,
+        ],
+    )? != 1
+    {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    let trusted = tx.query_row(
+        &binding_select,
+        params![claim.grant_id],
+        trusted_process_runtime_from_sqlite_row,
+    )?;
+    validate_trusted_process_runtime(&trusted)?;
+    Ok(trusted)
+}
+
+fn bind_runner_process_runtime_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    claim: &RunnerProcessRuntimeGrantClaim,
+    worker_id: &str,
+    volume_id: &str,
+    enrollment_epoch: i64,
+    process_instance_id: &str,
+    now_ms: i64,
+) -> RunnerVolumePurgeResult<TrustedRunnerProcessRuntimeAttestation> {
+    let (token_sha256, runtime_sha256) = validate_runner_process_runtime_claim(claim)?;
+    require_runner_identifier(worker_id)?;
+    require_base64url(volume_id, 32)?;
+    require_base64url(process_instance_id, 32)?;
+    if enrollment_epoch <= 0 || now_ms < 0 {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    let grant_select = format!(
+        "SELECT {PROCESS_RUNTIME_GRANT_COLUMNS} \
+           FROM jobs_runner_process_runtime_grants WHERE grant_id = $1 FOR UPDATE"
+    );
+    let grant = tx
+        .query_opt(&grant_select, &[&claim.grant_id])?
+        .map(process_runtime_grant_from_pg_row)
+        .ok_or(RunnerVolumePurgeError::Unauthorized)?;
+    if !runtime_grant_authorizes_claim(&grant, claim, worker_id, &token_sha256, &runtime_sha256) {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    let binding_select = format!(
+        "SELECT {TRUSTED_PROCESS_RUNTIME_COLUMNS} \
+           FROM jobs_runner_process_runtime_bindings b \
+           JOIN jobs_runner_process_runtime_grants g ON g.grant_id = b.grant_id \
+          WHERE b.grant_id = $1 FOR UPDATE OF b"
+    );
+    if let Some(row) = tx.query_opt(&binding_select, &[&claim.grant_id])? {
+        let trusted = trusted_process_runtime_from_pg_row(row);
+        validate_trusted_process_runtime(&trusted)?;
+        if !exact_trusted_process_binding(
+            &trusted,
+            &claim.grant_id,
+            worker_id,
+            volume_id,
+            enrollment_epoch,
+            process_instance_id,
+            &runtime_sha256,
+        ) {
+            return Err(RunnerVolumePurgeError::Unauthorized);
+        }
+        return Ok(trusted);
+    }
+    if tx
+        .query_opt(
+            "SELECT 1 FROM jobs_runner_process_runtime_grant_revocations \
+              WHERE grant_id = $1 FOR UPDATE",
+            &[&claim.grant_id],
+        )?
+        .is_some()
+    {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    if now_ms < grant.created_at_ms || now_ms > grant.expires_at_ms {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    if tx.execute(
+        "INSERT INTO jobs_runner_process_runtime_bindings ( \
+            grant_id, worker_id, volume_id, enrollment_epoch, process_instance_id, \
+            runtime_sha256, bound_at_ms \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT DO NOTHING",
+        &[
+            &claim.grant_id,
+            &worker_id,
+            &volume_id,
+            &enrollment_epoch,
+            &process_instance_id,
+            &runtime_sha256,
+            &now_ms,
+        ],
+    )? != 1
+    {
+        return Err(RunnerVolumePurgeError::Unauthorized);
+    }
+    let trusted =
+        trusted_process_runtime_from_pg_row(tx.query_one(&binding_select, &[&claim.grant_id])?);
+    validate_trusted_process_runtime(&trusted)?;
+    Ok(trusted)
+}
+
+pub(crate) fn require_runner_process_runtime_sqlite_tx(
+    tx: &RunnerSqliteTransaction<'_>,
+    worker_id: &str,
+    volume_id: &str,
+    enrollment_epoch: i64,
+    process_instance_id: &str,
+) -> RunnerVolumePurgeResult<TrustedRunnerProcessRuntimeAttestation> {
+    let select = format!(
+        "SELECT {TRUSTED_PROCESS_RUNTIME_COLUMNS} \
+           FROM jobs_runner_process_runtime_bindings b \
+           JOIN jobs_runner_process_runtime_grants g ON g.grant_id = b.grant_id \
+          WHERE b.worker_id = ?1 AND b.volume_id = ?2 AND b.enrollment_epoch = ?3 \
+            AND b.process_instance_id = ?4"
+    );
+    let trusted = tx
+        .query_row(
+            &select,
+            params![worker_id, volume_id, enrollment_epoch, process_instance_id],
+            trusted_process_runtime_from_sqlite_row,
+        )
+        .optional()?
+        .ok_or(RunnerVolumePurgeError::NotReady)?;
+    validate_trusted_process_runtime(&trusted)?;
+    Ok(trusted)
+}
+
+pub(crate) fn require_runner_process_runtime_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    worker_id: &str,
+    volume_id: &str,
+    enrollment_epoch: i64,
+    process_instance_id: &str,
+) -> RunnerVolumePurgeResult<TrustedRunnerProcessRuntimeAttestation> {
+    let select = format!(
+        "SELECT {TRUSTED_PROCESS_RUNTIME_COLUMNS} \
+           FROM jobs_runner_process_runtime_bindings b \
+           JOIN jobs_runner_process_runtime_grants g ON g.grant_id = b.grant_id \
+          WHERE b.worker_id = $1 AND b.volume_id = $2 AND b.enrollment_epoch = $3 \
+            AND b.process_instance_id = $4 FOR UPDATE OF b"
+    );
+    let trusted = tx
+        .query_opt(
+            &select,
+            &[
+                &worker_id,
+                &volume_id,
+                &enrollment_epoch,
+                &process_instance_id,
+            ],
+        )?
+        .map(trusted_process_runtime_from_pg_row)
+        .ok_or(RunnerVolumePurgeError::NotReady)?;
+    validate_trusted_process_runtime(&trusted)?;
+    Ok(trusted)
+}
+
+pub(crate) fn bind_execution_lease_process_runtime_sqlite_tx(
+    tx: &RunnerSqliteTransaction<'_>,
+    run_id: &str,
+    fence: i64,
+    trusted: &TrustedRunnerProcessRuntimeAttestation,
+    bound_at_ms: i64,
+) -> RunnerVolumePurgeResult<()> {
+    require_nonempty_text(run_id, 240)?;
+    validate_trusted_process_runtime(trusted)?;
+    if fence <= 0 || bound_at_ms < trusted.bound_at_ms {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    let existing = tx
+        .query_row(
+            "SELECT runtime_grant_id, worker_id, volume_id, enrollment_epoch, \
+                    process_instance_id, runtime_sha256, bound_at_ms \
+               FROM jobs_execution_lease_process_runtime_bindings \
+              WHERE run_id = ?1 AND fence = ?2",
+            params![run_id, fence],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some(existing) = existing {
+        if existing
+            != (
+                trusted.runtime_grant_id.clone(),
+                trusted.worker_id.clone(),
+                trusted.volume_id.clone(),
+                trusted.enrollment_epoch,
+                trusted.process_instance_id.clone(),
+                trusted.runtime_sha256.clone(),
+                bound_at_ms,
+            )
+        {
+            return Err(RunnerVolumePurgeError::Conflict);
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO jobs_execution_lease_process_runtime_bindings ( \
+            run_id, fence, runtime_grant_id, worker_id, volume_id, enrollment_epoch, \
+            process_instance_id, runtime_sha256, bound_at_ms \
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            run_id,
+            fence,
+            trusted.runtime_grant_id,
+            trusted.worker_id,
+            trusted.volume_id,
+            trusted.enrollment_epoch,
+            trusted.process_instance_id,
+            trusted.runtime_sha256,
+            bound_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn bind_execution_lease_process_runtime_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    fence: i64,
+    trusted: &TrustedRunnerProcessRuntimeAttestation,
+    bound_at_ms: i64,
+) -> RunnerVolumePurgeResult<()> {
+    require_nonempty_text(run_id, 240)?;
+    validate_trusted_process_runtime(trusted)?;
+    if fence <= 0 || bound_at_ms < trusted.bound_at_ms {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    if let Some(row) = tx.query_opt(
+        "SELECT runtime_grant_id, worker_id, volume_id, enrollment_epoch, \
+                process_instance_id, runtime_sha256, bound_at_ms \
+           FROM jobs_execution_lease_process_runtime_bindings \
+          WHERE run_id = $1 AND fence = $2 FOR UPDATE",
+        &[&run_id, &fence],
+    )? {
+        let existing: (String, String, String, i64, String, String, i64) = (
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            row.get(5),
+            row.get(6),
+        );
+        if existing
+            != (
+                trusted.runtime_grant_id.clone(),
+                trusted.worker_id.clone(),
+                trusted.volume_id.clone(),
+                trusted.enrollment_epoch,
+                trusted.process_instance_id.clone(),
+                trusted.runtime_sha256.clone(),
+                bound_at_ms,
+            )
+        {
+            return Err(RunnerVolumePurgeError::Conflict);
+        }
+        return Ok(());
+    }
+    tx.execute(
+        "INSERT INTO jobs_execution_lease_process_runtime_bindings ( \
+            run_id, fence, runtime_grant_id, worker_id, volume_id, enrollment_epoch, \
+            process_instance_id, runtime_sha256, bound_at_ms \
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+        &[
+            &run_id,
+            &fence,
+            &trusted.runtime_grant_id,
+            &trusted.worker_id,
+            &trusted.volume_id,
+            &trusted.enrollment_epoch,
+            &trusted.process_instance_id,
+            &trusted.runtime_sha256,
+            &bound_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Load current cloud runtime authority by execution fence. The returned
+/// attestation is reconstructed from immutable server tables and is therefore
+/// suitable for later ATS Phase A comparison. Lease/request JSON is never an
+/// input to the runtime fields.
+pub fn load_trusted_runner_process_runtime_attestation_for_execution(
+    pool: &DbPool,
+    run_id: &str,
+    fence: i64,
+    now_ms: i64,
+) -> RunnerVolumePurgeResult<TrustedRunnerProcessRuntimeAttestation> {
+    require_nonempty_text(run_id, 240)?;
+    if fence <= 0 || now_ms < 0 {
+        return Err(RunnerVolumePurgeError::InvalidRequest);
+    }
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let select = format!(
+                "SELECT {TRUSTED_PROCESS_RUNTIME_COLUMNS} \
+                   FROM jobs_execution_lease_process_runtime_bindings e \
+                   JOIN jobs_runner_process_runtime_bindings b \
+                     ON b.grant_id = e.runtime_grant_id \
+                    AND b.worker_id = e.worker_id AND b.volume_id = e.volume_id \
+                    AND b.enrollment_epoch = e.enrollment_epoch \
+                    AND b.process_instance_id = e.process_instance_id \
+                    AND b.runtime_sha256 = e.runtime_sha256 \
+                   JOIN jobs_runner_process_runtime_grants g ON g.grant_id = b.grant_id \
+                   JOIN jobs_execution_leases l ON l.run_id = e.run_id AND l.fence = e.fence \
+                  WHERE e.run_id = ?1 AND e.fence = ?2 \
+                    AND l.phase IN ('prepared', 'click_started') \
+                    AND l.lease_expires_at_ms > ?3"
+            );
+            let trusted = conn
+                .query_row(
+                    &select,
+                    params![run_id, fence, now_ms],
+                    trusted_process_runtime_from_sqlite_row,
+                )
+                .optional()?
+                .ok_or(RunnerVolumePurgeError::NotReady)?;
+            validate_trusted_process_runtime(&trusted)?;
+            Ok(trusted)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let select = format!(
+                "SELECT {TRUSTED_PROCESS_RUNTIME_COLUMNS} \
+                   FROM jobs_execution_lease_process_runtime_bindings e \
+                   JOIN jobs_runner_process_runtime_bindings b \
+                     ON b.grant_id = e.runtime_grant_id \
+                    AND b.worker_id = e.worker_id AND b.volume_id = e.volume_id \
+                    AND b.enrollment_epoch = e.enrollment_epoch \
+                    AND b.process_instance_id = e.process_instance_id \
+                    AND b.runtime_sha256 = e.runtime_sha256 \
+                   JOIN jobs_runner_process_runtime_grants g ON g.grant_id = b.grant_id \
+                   JOIN jobs_execution_leases l ON l.run_id = e.run_id AND l.fence = e.fence \
+                  WHERE e.run_id = $1 AND e.fence = $2 \
+                    AND l.phase IN ('prepared', 'click_started') \
+                    AND l.lease_expires_at_ms > $3 FOR UPDATE OF e, b, l"
+            );
+            let trusted = tx
+                .query_opt(&select, &[&run_id, &fence, &now_ms])?
+                .map(trusted_process_runtime_from_pg_row)
+                .ok_or(RunnerVolumePurgeError::NotReady)?;
+            validate_trusted_process_runtime(&trusted)?;
+            tx.commit()?;
+            Ok(trusted)
         }
     })
 }
@@ -2489,7 +3579,8 @@ fn validate_legacy_inventory_transition(
         "reconciling"
             if matches!(current.state.as_str(), "unknown" | "ready")
                 || (current.state == "reconciling"
-                    && predecessor.is_some_and(|authority| authority.authority_state == "ready")) =>
+                    && predecessor
+                        .is_some_and(|authority| authority.authority_state == "ready")) =>
         {
             Ok(())
         }
@@ -3152,10 +4243,7 @@ pub fn record_runner_volume_storage_attestation(
     }
     // Verify before opening the write transaction. The current key binding is
     // checked again under the fleet/volume locks below.
-    verify_runner_volume_storage_attestation(
-        attestation,
-        &authority.volume.public_key_base64url,
-    )?;
+    verify_runner_volume_storage_attestation(attestation, &authority.volume.public_key_base64url)?;
     let attestation_sha256 = attestation.attestation_sha256()?;
     let canonical_unsigned_sha256 = attestation.canonical_unsigned_sha256()?;
     let canonical_json = serde_json::to_string(attestation).map_err(anyhow::Error::from)?;
@@ -3289,10 +4377,7 @@ fn record_runner_volume_storage_attestation_sqlite(
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
-        .unwrap_or((
-            0,
-            GENESIS_RUNNER_STORAGE_ATTESTATION_SHA256.to_string(),
-        ));
+        .unwrap_or((0, GENESIS_RUNNER_STORAGE_ATTESTATION_SHA256.to_string()));
     if predecessor.0 != attestation.predecessor_attestation_generation
         || predecessor.1 != attestation.predecessor_attestation_sha256
     {
@@ -3553,10 +4638,7 @@ fn record_runner_volume_storage_attestation_postgres(
             &[&attestation.volume_id, &attestation.enrollment_epoch],
         )?
         .map(|row| (row.get::<_, i64>(0), row.get::<_, String>(1)))
-        .unwrap_or((
-            0,
-            GENESIS_RUNNER_STORAGE_ATTESTATION_SHA256.to_string(),
-        ));
+        .unwrap_or((0, GENESIS_RUNNER_STORAGE_ATTESTATION_SHA256.to_string()));
     if predecessor.0 != attestation.predecessor_attestation_generation
         || predecessor.1 != attestation.predecessor_attestation_sha256
     {
@@ -4328,85 +5410,51 @@ pub fn claim_runner_volume_instance(
     now_ms: i64,
     lease_expires_at_ms: i64,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
-    claim_runner_volume_instance_inner(
-        pool,
+    let request = RunnerVolumeInstanceLeaseRequest {
         volume_id,
         enrollment_epoch,
         process_instance_id,
         now_ms,
         lease_expires_at_ms,
-        None,
-    )
+    };
+    claim_runner_volume_instance_inner(pool, &request, None, None)
 }
 
 pub fn claim_runner_volume_instance_authorized(
     pool: &DbPool,
-    volume_id: &str,
-    enrollment_epoch: i64,
-    process_instance_id: &str,
-    now_ms: i64,
-    lease_expires_at_ms: i64,
+    request: &RunnerVolumeInstanceLeaseRequest<'_>,
+    runtime_claim: &RunnerProcessRuntimeGrantClaim,
     authority: &VerifiedRunnerVolumeAuthority,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
-    claim_runner_volume_instance_inner(
-        pool,
-        volume_id,
-        enrollment_epoch,
-        process_instance_id,
-        now_ms,
-        lease_expires_at_ms,
-        Some(authority),
-    )
+    claim_runner_volume_instance_inner(pool, request, Some(runtime_claim), Some(authority))
 }
 
 fn claim_runner_volume_instance_inner(
     pool: &DbPool,
-    volume_id: &str,
-    enrollment_epoch: i64,
-    process_instance_id: &str,
-    now_ms: i64,
-    lease_expires_at_ms: i64,
+    request: &RunnerVolumeInstanceLeaseRequest<'_>,
+    runtime_claim: Option<&RunnerProcessRuntimeGrantClaim>,
     authority: Option<&VerifiedRunnerVolumeAuthority>,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
-    validate_instance_lease_request(
-        volume_id,
-        enrollment_epoch,
-        process_instance_id,
-        now_ms,
-        lease_expires_at_ms,
-    )?;
+    validate_instance_lease_request(request)?;
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => claim_runner_volume_instance_sqlite(
-            pool,
-            volume_id,
-            enrollment_epoch,
-            process_instance_id,
-            now_ms,
-            lease_expires_at_ms,
-            authority,
-        ),
-        DbPool::Postgres(_) => claim_runner_volume_instance_postgres(
-            pool,
-            volume_id,
-            enrollment_epoch,
-            process_instance_id,
-            now_ms,
-            lease_expires_at_ms,
-            authority,
-        ),
+        DbPool::Sqlite(_) => {
+            claim_runner_volume_instance_sqlite(pool, request, runtime_claim, authority)
+        }
+        DbPool::Postgres(_) => {
+            claim_runner_volume_instance_postgres(pool, request, runtime_claim, authority)
+        }
     })
 }
 
 fn validate_instance_lease_request(
-    volume_id: &str,
-    enrollment_epoch: i64,
-    process_instance_id: &str,
-    now_ms: i64,
-    lease_expires_at_ms: i64,
+    request: &RunnerVolumeInstanceLeaseRequest<'_>,
 ) -> RunnerVolumePurgeResult<()> {
-    require_base64url(volume_id, 32)?;
-    require_base64url(process_instance_id, 32)?;
-    if enrollment_epoch <= 0 || now_ms < 0 || lease_expires_at_ms <= now_ms {
+    require_base64url(request.volume_id, 32)?;
+    require_base64url(request.process_instance_id, 32)?;
+    if request.enrollment_epoch <= 0
+        || request.now_ms < 0
+        || request.lease_expires_at_ms <= request.now_ms
+    {
         return Err(RunnerVolumePurgeError::InvalidRequest);
     }
     Ok(())
@@ -4414,26 +5462,33 @@ fn validate_instance_lease_request(
 
 fn claim_runner_volume_instance_sqlite(
     pool: &DbPool,
-    volume_id: &str,
-    enrollment_epoch: i64,
-    process_instance_id: &str,
-    now_ms: i64,
-    lease_expires_at_ms: i64,
+    request: &RunnerVolumeInstanceLeaseRequest<'_>,
+    runtime_claim: Option<&RunnerProcessRuntimeGrantClaim>,
     authority: Option<&VerifiedRunnerVolumeAuthority>,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
     let mut conn = pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (current_epoch, status, active_instance, active_expiry): (
+    let (worker_id, current_epoch, status, active_instance, active_expiry): (
+        String,
         i64,
         String,
         Option<String>,
         Option<i64>,
     ) = tx
         .query_row(
-            "SELECT current_epoch, status, active_instance_id, instance_lease_expires_at_ms \
+            "SELECT worker_id, current_epoch, status, active_instance_id, \
+                    instance_lease_expires_at_ms \
                FROM jobs_runner_volumes WHERE volume_id = ?1",
-            params![volume_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            params![request.volume_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()?
         .ok_or(RunnerVolumePurgeError::NotFound)?;
@@ -4442,28 +5497,40 @@ fn claim_runner_volume_instance_sqlite(
         &status,
         active_instance.as_deref(),
         active_expiry,
-        enrollment_epoch,
-        process_instance_id,
-        now_ms,
+        request.enrollment_epoch,
+        request.process_instance_id,
+        request.now_ms,
     )?;
+    let trusted_runtime = match runtime_claim {
+        Some(claim) => Some(bind_runner_process_runtime_sqlite_tx(
+            &tx,
+            claim,
+            &worker_id,
+            request.volume_id,
+            request.enrollment_epoch,
+            request.process_instance_id,
+            request.now_ms,
+        )?),
+        None => None,
+    };
     if let Some(authority) = authority {
         consume_runner_volume_authority_sqlite_tx(
             &tx,
             authority,
             "instance_claim",
-            volume_id,
-            enrollment_epoch,
-            process_instance_id,
-            now_ms,
+            request.volume_id,
+            request.enrollment_epoch,
+            request.process_instance_id,
+            request.now_ms,
         )?;
     }
-    let disposition = if active_instance.as_deref() == Some(process_instance_id) {
+    let disposition = if active_instance.as_deref() == Some(request.process_instance_id) {
         RunnerVolumeWriteDisposition::Replay
     } else {
         RunnerVolumeWriteDisposition::Applied
     };
     if disposition == RunnerVolumeWriteDisposition::Applied {
-        invalidate_sqlite_runner_fleet_cutover(&tx, now_ms)?;
+        invalidate_sqlite_runner_fleet_cutover(&tx, request.now_ms)?;
     }
     if tx.execute(
         "UPDATE jobs_runner_volumes \
@@ -4472,11 +5539,11 @@ fn claim_runner_volume_instance_sqlite(
                 last_seen_at_ms = ?4, updated_at_ms = ?4 \
           WHERE volume_id = ?1 AND current_epoch = ?5",
         params![
-            volume_id,
-            process_instance_id,
-            lease_expires_at_ms,
-            now_ms,
-            enrollment_epoch,
+            request.volume_id,
+            request.process_instance_id,
+            request.lease_expires_at_ms,
+            request.now_ms,
+            request.enrollment_epoch,
         ],
     )? != 1
     {
@@ -4484,63 +5551,78 @@ fn claim_runner_volume_instance_sqlite(
     }
     tx.commit()?;
     Ok(RunnerVolumeInstanceLease {
-        volume_id: volume_id.to_string(),
-        enrollment_epoch,
-        process_instance_id: process_instance_id.to_string(),
-        lease_expires_at_ms,
+        volume_id: request.volume_id.to_string(),
+        enrollment_epoch: request.enrollment_epoch,
+        process_instance_id: request.process_instance_id.to_string(),
+        runtime_grant_id: trusted_runtime
+            .as_ref()
+            .map(|runtime| runtime.runtime_grant_id.clone()),
+        runtime_sha256: trusted_runtime.map(|runtime| runtime.runtime_sha256),
+        lease_expires_at_ms: request.lease_expires_at_ms,
         disposition,
     })
 }
 
 fn claim_runner_volume_instance_postgres(
     pool: &DbPool,
-    volume_id: &str,
-    enrollment_epoch: i64,
-    process_instance_id: &str,
-    now_ms: i64,
-    lease_expires_at_ms: i64,
+    request: &RunnerVolumeInstanceLeaseRequest<'_>,
+    runtime_claim: Option<&RunnerProcessRuntimeGrantClaim>,
     authority: Option<&VerifiedRunnerVolumeAuthority>,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
     let mut conn = pool.get_pg()?;
     let mut tx = conn.transaction()?;
     let row = tx
         .query_opt(
-            "SELECT current_epoch, status, active_instance_id, instance_lease_expires_at_ms \
+            "SELECT worker_id, current_epoch, status, active_instance_id, \
+                    instance_lease_expires_at_ms \
                FROM jobs_runner_volumes WHERE volume_id = $1 FOR UPDATE",
-            &[&volume_id],
+            &[&request.volume_id],
         )?
         .ok_or(RunnerVolumePurgeError::NotFound)?;
-    let current_epoch: i64 = row.get(0);
-    let status: String = row.get(1);
-    let active_instance: Option<String> = row.get(2);
-    let active_expiry: Option<i64> = row.get(3);
+    let worker_id: String = row.get(0);
+    let current_epoch: i64 = row.get(1);
+    let status: String = row.get(2);
+    let active_instance: Option<String> = row.get(3);
+    let active_expiry: Option<i64> = row.get(4);
     validate_instance_claim_state(
         current_epoch,
         &status,
         active_instance.as_deref(),
         active_expiry,
-        enrollment_epoch,
-        process_instance_id,
-        now_ms,
+        request.enrollment_epoch,
+        request.process_instance_id,
+        request.now_ms,
     )?;
+    let trusted_runtime = match runtime_claim {
+        Some(claim) => Some(bind_runner_process_runtime_postgres_tx(
+            &mut tx,
+            claim,
+            &worker_id,
+            request.volume_id,
+            request.enrollment_epoch,
+            request.process_instance_id,
+            request.now_ms,
+        )?),
+        None => None,
+    };
     if let Some(authority) = authority {
         consume_runner_volume_authority_postgres_tx(
             &mut tx,
             authority,
             "instance_claim",
-            volume_id,
-            enrollment_epoch,
-            process_instance_id,
-            now_ms,
+            request.volume_id,
+            request.enrollment_epoch,
+            request.process_instance_id,
+            request.now_ms,
         )?;
     }
-    let disposition = if active_instance.as_deref() == Some(process_instance_id) {
+    let disposition = if active_instance.as_deref() == Some(request.process_instance_id) {
         RunnerVolumeWriteDisposition::Replay
     } else {
         RunnerVolumeWriteDisposition::Applied
     };
     if disposition == RunnerVolumeWriteDisposition::Applied {
-        invalidate_postgres_runner_fleet_cutover(&mut tx, now_ms)?;
+        invalidate_postgres_runner_fleet_cutover(&mut tx, request.now_ms)?;
     }
     if tx.execute(
         "UPDATE jobs_runner_volumes \
@@ -4549,11 +5631,11 @@ fn claim_runner_volume_instance_postgres(
                 last_seen_at_ms = $4, updated_at_ms = $4 \
           WHERE volume_id = $1 AND current_epoch = $5",
         &[
-            &volume_id,
-            &process_instance_id,
-            &lease_expires_at_ms,
-            &now_ms,
-            &enrollment_epoch,
+            &request.volume_id,
+            &request.process_instance_id,
+            &request.lease_expires_at_ms,
+            &request.now_ms,
+            &request.enrollment_epoch,
         ],
     )? != 1
     {
@@ -4561,10 +5643,14 @@ fn claim_runner_volume_instance_postgres(
     }
     tx.commit()?;
     Ok(RunnerVolumeInstanceLease {
-        volume_id: volume_id.to_string(),
-        enrollment_epoch,
-        process_instance_id: process_instance_id.to_string(),
-        lease_expires_at_ms,
+        volume_id: request.volume_id.to_string(),
+        enrollment_epoch: request.enrollment_epoch,
+        process_instance_id: request.process_instance_id.to_string(),
+        runtime_grant_id: trusted_runtime
+            .as_ref()
+            .map(|runtime| runtime.runtime_grant_id.clone()),
+        runtime_sha256: trusted_runtime.map(|runtime| runtime.runtime_sha256),
+        lease_expires_at_ms: request.lease_expires_at_ms,
         disposition,
     })
 }
@@ -4598,15 +5684,14 @@ pub fn heartbeat_runner_volume_instance(
     now_ms: i64,
     lease_expires_at_ms: i64,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
-    heartbeat_runner_volume_instance_inner(
-        pool,
+    let request = RunnerVolumeInstanceLeaseRequest {
         volume_id,
         enrollment_epoch,
         process_instance_id,
         now_ms,
         lease_expires_at_ms,
-        None,
-    )
+    };
+    heartbeat_runner_volume_instance_inner(pool, &request, false, None)
 }
 
 pub fn heartbeat_runner_volume_instance_authorized(
@@ -4618,46 +5703,63 @@ pub fn heartbeat_runner_volume_instance_authorized(
     lease_expires_at_ms: i64,
     authority: &VerifiedRunnerVolumeAuthority,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
-    heartbeat_runner_volume_instance_inner(
-        pool,
+    let request = RunnerVolumeInstanceLeaseRequest {
         volume_id,
         enrollment_epoch,
         process_instance_id,
         now_ms,
         lease_expires_at_ms,
-        Some(authority),
-    )
+    };
+    heartbeat_runner_volume_instance_inner(pool, &request, true, Some(authority))
 }
 
 fn heartbeat_runner_volume_instance_inner(
     pool: &DbPool,
-    volume_id: &str,
-    enrollment_epoch: i64,
-    process_instance_id: &str,
-    now_ms: i64,
-    lease_expires_at_ms: i64,
+    request: &RunnerVolumeInstanceLeaseRequest<'_>,
+    require_runtime: bool,
     authority: Option<&VerifiedRunnerVolumeAuthority>,
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
-    validate_instance_lease_request(
-        volume_id,
-        enrollment_epoch,
-        process_instance_id,
-        now_ms,
-        lease_expires_at_ms,
-    )?;
+    validate_instance_lease_request(request)?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let worker_id = tx
+                .query_row(
+                    "SELECT worker_id FROM jobs_runner_volumes \
+                      WHERE volume_id = ?1 AND current_epoch = ?2 \
+                        AND active_instance_id = ?3 AND instance_lease_expires_at_ms > ?4 \
+                        AND status <> 'destroyed'",
+                    params![
+                        request.volume_id,
+                        request.enrollment_epoch,
+                        request.process_instance_id,
+                        request.now_ms
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or(RunnerVolumePurgeError::Conflict)?;
+            let trusted_runtime = if require_runtime {
+                Some(require_runner_process_runtime_sqlite_tx(
+                    &tx,
+                    &worker_id,
+                    request.volume_id,
+                    request.enrollment_epoch,
+                    request.process_instance_id,
+                )?)
+            } else {
+                None
+            };
             if let Some(authority) = authority {
                 consume_runner_volume_authority_sqlite_tx(
                     &tx,
                     authority,
                     "instance_heartbeat",
-                    volume_id,
-                    enrollment_epoch,
-                    process_instance_id,
-                    now_ms,
+                    request.volume_id,
+                    request.enrollment_epoch,
+                    request.process_instance_id,
+                    request.now_ms,
                 )?;
             }
             let matched = tx.execute(
@@ -4668,11 +5770,11 @@ fn heartbeat_runner_volume_instance_inner(
                     AND active_instance_id = ?3 AND instance_lease_expires_at_ms > ?5 \
                     AND status <> 'destroyed'",
                 params![
-                    volume_id,
-                    enrollment_epoch,
-                    process_instance_id,
-                    lease_expires_at_ms,
-                    now_ms,
+                    request.volume_id,
+                    request.enrollment_epoch,
+                    request.process_instance_id,
+                    request.lease_expires_at_ms,
+                    request.now_ms,
                 ],
             )?;
             if matched != 1 {
@@ -4680,25 +5782,55 @@ fn heartbeat_runner_volume_instance_inner(
             }
             tx.commit()?;
             Ok(RunnerVolumeInstanceLease {
-                volume_id: volume_id.to_string(),
-                enrollment_epoch,
-                process_instance_id: process_instance_id.to_string(),
-                lease_expires_at_ms,
+                volume_id: request.volume_id.to_string(),
+                enrollment_epoch: request.enrollment_epoch,
+                process_instance_id: request.process_instance_id.to_string(),
+                runtime_grant_id: trusted_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.runtime_grant_id.clone()),
+                runtime_sha256: trusted_runtime.map(|runtime| runtime.runtime_sha256),
+                lease_expires_at_ms: request.lease_expires_at_ms,
                 disposition: RunnerVolumeWriteDisposition::Applied,
             })
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let worker_id = tx
+                .query_opt(
+                    "SELECT worker_id FROM jobs_runner_volumes \
+                      WHERE volume_id = $1 AND current_epoch = $2 \
+                        AND active_instance_id = $3 AND instance_lease_expires_at_ms > $4 \
+                        AND status <> 'destroyed' FOR UPDATE",
+                    &[
+                        &request.volume_id,
+                        &request.enrollment_epoch,
+                        &request.process_instance_id,
+                        &request.now_ms,
+                    ],
+                )?
+                .map(|row| row.get::<_, String>(0))
+                .ok_or(RunnerVolumePurgeError::Conflict)?;
+            let trusted_runtime = if require_runtime {
+                Some(require_runner_process_runtime_postgres_tx(
+                    &mut tx,
+                    &worker_id,
+                    request.volume_id,
+                    request.enrollment_epoch,
+                    request.process_instance_id,
+                )?)
+            } else {
+                None
+            };
             if let Some(authority) = authority {
                 consume_runner_volume_authority_postgres_tx(
                     &mut tx,
                     authority,
                     "instance_heartbeat",
-                    volume_id,
-                    enrollment_epoch,
-                    process_instance_id,
-                    now_ms,
+                    request.volume_id,
+                    request.enrollment_epoch,
+                    request.process_instance_id,
+                    request.now_ms,
                 )?;
             }
             let matched = tx.execute(
@@ -4709,11 +5841,11 @@ fn heartbeat_runner_volume_instance_inner(
                     AND active_instance_id = $3 AND instance_lease_expires_at_ms > $5 \
                     AND status <> 'destroyed'",
                 &[
-                    &volume_id,
-                    &enrollment_epoch,
-                    &process_instance_id,
-                    &lease_expires_at_ms,
-                    &now_ms,
+                    &request.volume_id,
+                    &request.enrollment_epoch,
+                    &request.process_instance_id,
+                    &request.lease_expires_at_ms,
+                    &request.now_ms,
                 ],
             )?;
             if matched != 1 {
@@ -4721,10 +5853,14 @@ fn heartbeat_runner_volume_instance_inner(
             }
             tx.commit()?;
             Ok(RunnerVolumeInstanceLease {
-                volume_id: volume_id.to_string(),
-                enrollment_epoch,
-                process_instance_id: process_instance_id.to_string(),
-                lease_expires_at_ms,
+                volume_id: request.volume_id.to_string(),
+                enrollment_epoch: request.enrollment_epoch,
+                process_instance_id: request.process_instance_id.to_string(),
+                runtime_grant_id: trusted_runtime
+                    .as_ref()
+                    .map(|runtime| runtime.runtime_grant_id.clone()),
+                runtime_sha256: trusted_runtime.map(|runtime| runtime.runtime_sha256),
+                lease_expires_at_ms: request.lease_expires_at_ms,
                 disposition: RunnerVolumeWriteDisposition::Applied,
             })
         }
@@ -6879,9 +8015,8 @@ fn load_sqlite_pending_volume_commands(
     let mut commands = Vec::new();
     for row in rows {
         let (command_id, json, sha256, key_id, signature) = row?;
-        let command = parse_stored_runner_purge_command(
-            &json, &sha256, &key_id, &signature, key_ring,
-        )?;
+        let command =
+            parse_stored_runner_purge_command(&json, &sha256, &key_id, &signature, key_ring)?;
         if command.command_id != command_id {
             return Err(RunnerVolumePurgeError::Conflict);
         }
@@ -10807,12 +11942,176 @@ fn insert_sqlite_standalone_residency(
 }
 
 #[cfg(test)]
-mod runner_volume_purge_tests {
+pub(super) mod runner_volume_purge_tests {
     use super::*;
     use crate::db;
     use std::path::PathBuf;
 
     const TEST_RUNNER_BUILD: &str = "runner-602";
+
+    pub(super) struct InstalledCertifiedCloudRuntimeFixture {
+        pub(super) runtime_target: AtsCertificationRuntimeTarget,
+        pub(super) binding_request: BindRunnerVolumeResidencyRequest,
+        pub(super) runtime_grant_id: String,
+        pub(super) runtime_sha256: String,
+        pub(super) verified_authority: VerifiedRunnerVolumeAuthority,
+    }
+
+    #[test]
+    fn runner_process_runtime_digest_matches_runner_canonical_vector() {
+        let runtime = RunnerProcessRuntimeAttestation {
+            runner_image_sha256: "1".repeat(64),
+            runner_build_id: "runner-602.1".to_string(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: "2".repeat(64),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "chromium-123456".to_string(),
+            chromium_executable_sha256: "3".repeat(64),
+        };
+        assert_eq!(
+            runner_process_runtime_sha256(&runtime).expect("hash process runtime"),
+            "0a6faf7674e8166a8d54d0aea177f73842012dcbd68c15a80fc5ed2571c75dfd"
+        );
+    }
+
+    #[test]
+    fn runtime_grant_revocation_blocks_unbound_claim_and_cannot_erase_bound_runtime() {
+        let database = TestDatabase::new(&[]);
+        let runtime = RunnerProcessRuntimeAttestation {
+            runner_image_sha256: sha256("runtime-revocation-image"),
+            runner_build_id: "runner-604.1".to_string(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: sha256("runtime-revocation-bundle"),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "123456".to_string(),
+            chromium_executable_sha256: sha256("runtime-revocation-chromium"),
+        };
+
+        let revoked_volume = fixed_volume(&database.pool, 91, "runtime-revoked", 10);
+        let revoked_token = encode_base64url(&[92_u8; 32]);
+        let revoked_grant_id = "runtime-grant-revoked";
+        create_runner_process_runtime_grant(
+            &database.pool,
+            &NewRunnerProcessRuntimeGrant {
+                grant_id: revoked_grant_id.to_string(),
+                token: revoked_token.clone(),
+                expected_worker_id: "worker-runtime-revoked".to_string(),
+                runtime: runtime.clone(),
+                authorization_ref: "deployment-runtime-revoked".to_string(),
+                created_by: "test-operator".to_string(),
+                expires_at_ms: 1_000,
+                created_at_ms: 10,
+            },
+        )
+        .expect("create revocable runtime grant");
+        let revocation = RevokeRunnerProcessRuntimeGrantRequest {
+            grant_id: revoked_grant_id.to_string(),
+            reason: "image withdrawn before process claim".to_string(),
+            authorization_ref: "incident-runtime-revoked".to_string(),
+            revoked_by: "test-operator".to_string(),
+            revoked_at_ms: 11,
+        };
+        let applied = revoke_runner_process_runtime_grant(&database.pool, &revocation)
+            .expect("revoke unused runtime grant");
+        assert_eq!(applied.disposition, RunnerVolumeWriteDisposition::Applied);
+        let replay = revoke_runner_process_runtime_grant(&database.pool, &revocation)
+            .expect("replay exact runtime revocation");
+        assert_eq!(replay.disposition, RunnerVolumeWriteDisposition::Replay);
+        let revoked_claim = RunnerProcessRuntimeGrantClaim {
+            grant_id: revoked_grant_id.to_string(),
+            grant_token: revoked_token,
+            runtime: runtime.clone(),
+        };
+        let revoked_request = RunnerVolumeInstanceLeaseRequest {
+            volume_id: &revoked_volume.volume_id,
+            enrollment_epoch: 1,
+            process_instance_id: &revoked_volume.process_instance_id,
+            now_ms: 12,
+            lease_expires_at_ms: 500,
+        };
+        assert!(matches!(
+            claim_runner_volume_instance_inner(
+                &database.pool,
+                &revoked_request,
+                Some(&revoked_claim),
+                None,
+            ),
+            Err(RunnerVolumePurgeError::Unauthorized)
+        ));
+
+        let bound_volume = fixed_volume(&database.pool, 93, "runtime-bound", 20);
+        let bound_token = encode_base64url(&[94_u8; 32]);
+        let bound_grant_id = "runtime-grant-bound";
+        let bound_grant = create_runner_process_runtime_grant(
+            &database.pool,
+            &NewRunnerProcessRuntimeGrant {
+                grant_id: bound_grant_id.to_string(),
+                token: bound_token.clone(),
+                expected_worker_id: "worker-runtime-bound".to_string(),
+                runtime: runtime.clone(),
+                authorization_ref: "deployment-runtime-bound".to_string(),
+                created_by: "test-operator".to_string(),
+                expires_at_ms: 1_000,
+                created_at_ms: 20,
+            },
+        )
+        .expect("create bindable runtime grant");
+        let bound_claim = RunnerProcessRuntimeGrantClaim {
+            grant_id: bound_grant_id.to_string(),
+            grant_token: bound_token,
+            runtime,
+        };
+        let bound_request = RunnerVolumeInstanceLeaseRequest {
+            volume_id: &bound_volume.volume_id,
+            enrollment_epoch: 1,
+            process_instance_id: &bound_volume.process_instance_id,
+            now_ms: 21,
+            lease_expires_at_ms: 500,
+        };
+        let bound = claim_runner_volume_instance_inner(
+            &database.pool,
+            &bound_request,
+            Some(&bound_claim),
+            None,
+        )
+        .expect("bind approved runtime to process");
+        assert_eq!(bound.runtime_grant_id.as_deref(), Some(bound_grant_id));
+        assert_eq!(
+            bound.runtime_sha256.as_deref(),
+            Some(bound_grant.runtime_sha256.as_str())
+        );
+        let bound_revocation = RevokeRunnerProcessRuntimeGrantRequest {
+            grant_id: bound_grant_id.to_string(),
+            reason: "attempt to erase bound runtime".to_string(),
+            authorization_ref: "incident-runtime-bound".to_string(),
+            revoked_by: "test-operator".to_string(),
+            revoked_at_ms: 22,
+        };
+        assert!(matches!(
+            revoke_runner_process_runtime_grant(&database.pool, &bound_revocation),
+            Err(RunnerVolumePurgeError::Conflict)
+        ));
+        let mut conn = database
+            .pool
+            .get()
+            .expect("open trusted runtime transaction");
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .expect("begin trusted runtime transaction");
+        let trusted = require_runner_process_runtime_sqlite_tx(
+            &tx,
+            "worker-runtime-bound",
+            &bound_volume.volume_id,
+            1,
+            &bound_volume.process_instance_id,
+        )
+        .expect("bound runtime remains immutable recovery evidence");
+        assert_eq!(trusted.runtime_grant_id, bound_grant_id);
+        assert_eq!(trusted.runtime_sha256, bound_grant.runtime_sha256);
+        tx.commit().expect("commit trusted runtime verification");
+    }
 
     struct TestDatabase {
         pool: DbPool,
@@ -11165,8 +12464,7 @@ mod runner_volume_purge_tests {
                 enrollment_epoch: 1,
                 enrollment_generation: current.enrollment_generation,
                 process_instance_id: volume.process_instance_id.clone(),
-                predecessor_attestation_generation: predecessor
-                    .predecessor_attestation_generation,
+                predecessor_attestation_generation: predecessor.predecessor_attestation_generation,
                 predecessor_attestation_sha256: predecessor.predecessor_attestation_sha256,
                 required_tombstone_generation: current.required_tombstone_generation,
                 reconciled_tombstone_generation: current.reconciled_tombstone_generation,
@@ -11183,8 +12481,8 @@ mod runner_volume_purge_tests {
                 subject_storage_scope_count: 0,
                 subject_storage_complete_root_entry_count: 0,
                 subject_storage_complete_root_file_bytes: "0".to_string(),
-                subject_storage_complete_root_sha256:
-                    EMPTY_RUNNER_SUBJECT_STORAGE_INVENTORY_SHA256.to_string(),
+                subject_storage_complete_root_sha256: EMPTY_RUNNER_SUBJECT_STORAGE_INVENTORY_SHA256
+                    .to_string(),
                 locator_count: 0,
                 resident_locator_count: 0,
                 locator_set_sha256: EMPTY_RUNNER_INVENTORY_SHA256.to_string(),
@@ -11556,9 +12854,7 @@ mod runner_volume_purge_tests {
             expected_legacy_reconciliation_generation: status.legacy_reconciliation_generation,
             expected_storage_attestation_generation: status.storage_attestation_generation,
             expected_storage_attestation_count: status.storage_attestation_count,
-            expected_storage_attestation_set_sha256: status
-                .storage_attestation_set_sha256
-                .clone(),
+            expected_storage_attestation_set_sha256: status.storage_attestation_set_sha256.clone(),
             expected_legacy_inventory_generation: status.legacy_inventory_generation,
             expected_legacy_inventory_reconciliation_id: status
                 .legacy_inventory_reconciliation_id
@@ -11592,6 +12888,271 @@ mod runner_volume_purge_tests {
         request.cutover_state = "ready".to_string();
         request.now_ms = at_ms.saturating_add(1);
         record_runner_volume_fleet_cutover(pool, &request).expect("mark current fleet ready");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn install_certified_cloud_runtime_fixture(
+        pool: &DbPool,
+        account_id: &str,
+        application_id: &str,
+        run_id: &str,
+        browser_profile_id: &str,
+        owner_id: &str,
+        runtime: RunnerProcessRuntimeAttestation,
+        now_ms: i64,
+    ) -> RunnerVolumePurgeResult<InstalledCertifiedCloudRuntimeFixture> {
+        for value in [account_id, application_id, run_id, owner_id] {
+            require_nonempty_text(value, 240)?;
+        }
+        require_nonempty_text(browser_profile_id, 160)?;
+        let claim_now_ms = now_ms
+            .checked_sub(4)
+            .ok_or(RunnerVolumePurgeError::InvalidRequest)?;
+        let runtime_expires_at_ms = now_ms
+            .checked_add(900_000)
+            .ok_or(RunnerVolumePurgeError::InvalidRequest)?;
+        let runtime_sha256 = runner_process_runtime_sha256(&runtime)?;
+        let fixture_context = format!(
+            concat!(
+                "certified-cloud-runtime-fixture-v1\n",
+                "account_id={}\n",
+                "application_id={}\n",
+                "run_id={}\n",
+                "browser_profile_id={}\n",
+                "owner_id={}\n",
+                "runtime_sha256={}\n"
+            ),
+            account_id, application_id, run_id, browser_profile_id, owner_id, runtime_sha256,
+        );
+        let fixture_sha256 = sha256(fixture_context.as_bytes());
+        let fixture_label = format!("certified-cloud-{}", &fixture_sha256[..16]);
+        let seed_byte = Sha256::digest(fixture_context.as_bytes())[0];
+        let volume = fixed_volume(pool, seed_byte, &fixture_label, 10);
+        let worker_id = format!("worker-{fixture_label}");
+
+        let runtime_grant_id = format!("runtime-grant-{fixture_label}");
+        let runtime_token = encode_base64url(&[seed_byte.wrapping_add(101); 32]);
+        let runtime_grant = create_runner_process_runtime_grant(
+            pool,
+            &NewRunnerProcessRuntimeGrant {
+                grant_id: runtime_grant_id.clone(),
+                token: runtime_token.clone(),
+                expected_worker_id: worker_id.clone(),
+                runtime: runtime.clone(),
+                authorization_ref: format!("deployment-{fixture_label}"),
+                created_by: "test-operator".to_string(),
+                expires_at_ms: runtime_expires_at_ms,
+                created_at_ms: claim_now_ms.saturating_sub(1),
+            },
+        )?;
+        if runtime_grant.runtime_sha256 != runtime_sha256 {
+            return Err(RunnerVolumePurgeError::Conflict);
+        }
+
+        let instance_claim_path = format!(
+            "/api/jobs/internal/runner-volumes/{}/instances/claim",
+            volume.volume_id
+        );
+        let runtime_grant_token_sha256 = hex::encode(Sha256::digest(runtime_token.as_bytes()));
+        let instance_claim_payload_sha256 =
+            crate::api::jobs_runner_volumes::runner_volume_http_payload_sha256(
+                &instance_claim_path,
+                &worker_id,
+                &[
+                    ("runtime_grant_id", runtime_grant_id.as_str()),
+                    (
+                        "runtime_grant_token_sha256",
+                        runtime_grant_token_sha256.as_str(),
+                    ),
+                    ("runtime_sha256", runtime_sha256.as_str()),
+                ],
+            );
+        let instance_claim_proof = sign_runner_volume_authority_proof(
+            &volume.signing_key,
+            NewRunnerVolumeAuthorityProof {
+                operation: "instance_claim".to_string(),
+                request_id: format!("instance-claim-{fixture_label}"),
+                volume_id: volume.volume_id.clone(),
+                enrollment_epoch: 1,
+                process_instance_id: volume.process_instance_id.clone(),
+                issued_at_ms: claim_now_ms,
+                payload_sha256: instance_claim_payload_sha256.clone(),
+            },
+        )?;
+        let instance_claim_authority = verify_runner_volume_authority_proof(
+            pool,
+            &instance_claim_proof,
+            "instance_claim",
+            &instance_claim_payload_sha256,
+            claim_now_ms,
+            90_000,
+        )?;
+        let instance_lease = claim_runner_volume_instance_authorized(
+            pool,
+            &RunnerVolumeInstanceLeaseRequest {
+                volume_id: &volume.volume_id,
+                enrollment_epoch: 1,
+                process_instance_id: &volume.process_instance_id,
+                now_ms: claim_now_ms,
+                lease_expires_at_ms: runtime_expires_at_ms,
+            },
+            &RunnerProcessRuntimeGrantClaim {
+                grant_id: runtime_grant_id.clone(),
+                grant_token: runtime_token,
+                runtime: runtime.clone(),
+            },
+            &instance_claim_authority,
+        )?;
+        if instance_lease.runtime_grant_id.as_deref() != Some(runtime_grant_id.as_str())
+            || instance_lease.runtime_sha256.as_deref() != Some(runtime_sha256.as_str())
+        {
+            return Err(RunnerVolumePurgeError::Conflict);
+        }
+
+        let attested_at_ms = claim_now_ms.saturating_add(1);
+        attest_fixed_volume(pool, &volume, attested_at_ms);
+        activate_reconciled_runner_volume(
+            pool,
+            &volume.volume_id,
+            1,
+            &volume.process_instance_id,
+            attested_at_ms,
+        )?;
+        mark_current_fleet_ready(pool, &fixture_label, claim_now_ms.saturating_add(2));
+
+        let binding_request = BindRunnerVolumeResidencyRequest {
+            account_id: account_id.to_string(),
+            run_id: run_id.to_string(),
+            worker_id,
+            volume_id: volume.volume_id.clone(),
+            enrollment_epoch: 1,
+            process_instance_id: volume.process_instance_id.clone(),
+            now_ms,
+        };
+        let execution_claim_payload_sha256 =
+            crate::api::jobs_runner_volumes::runner_volume_execution_lease_claim_payload_sha256(
+                &crate::api::jobs_runner_volumes::RunnerVolumeExecutionLeaseClaimPayload {
+                    worker_id: &binding_request.worker_id,
+                    account_id,
+                    application_id,
+                    run_id,
+                    browser_profile_id,
+                    owner_id,
+                    volume_id: &binding_request.volume_id,
+                    enrollment_epoch: binding_request.enrollment_epoch,
+                    process_instance_id: &binding_request.process_instance_id,
+                    runtime_grant_id: &runtime_grant_id,
+                    runtime_sha256: &runtime_sha256,
+                },
+            );
+        let execution_claim_proof = sign_runner_volume_authority_proof(
+            &volume.signing_key,
+            NewRunnerVolumeAuthorityProof {
+                operation: "execution_lease_claim".to_string(),
+                request_id: format!("execution-lease-claim-{fixture_label}"),
+                volume_id: volume.volume_id,
+                enrollment_epoch: 1,
+                process_instance_id: volume.process_instance_id,
+                issued_at_ms: now_ms,
+                payload_sha256: execution_claim_payload_sha256.clone(),
+            },
+        )?;
+        let verified_authority = verify_runner_volume_authority_proof(
+            pool,
+            &execution_claim_proof,
+            "execution_lease_claim",
+            &execution_claim_payload_sha256,
+            now_ms,
+            90_000,
+        )?;
+
+        let runtime_target = AtsCertificationRuntimeTarget {
+            runtime_kind: "cloud".to_string(),
+            runtime_id: format!("cloud:{}", runtime.runner_build_id),
+            runtime_sha256: runtime_sha256.clone(),
+            platform: runtime.platform,
+            architecture: runtime.architecture,
+            automation_bundle_sha256: runtime.automation_bundle_sha256,
+            browser_release_manifest_sha256: None,
+            browser_artifact_sha256: None,
+            browser_build_descriptor_sha256: None,
+            runner_build_id: Some(runtime.runner_build_id),
+            runner_image_sha256: Some(runtime.runner_image_sha256),
+            playwright_version: runtime.playwright_version,
+            chromium_revision: runtime.chromium_revision,
+            chromium_executable_sha256: runtime.chromium_executable_sha256,
+        };
+        validate_ats_runtime_target(&runtime_target)
+            .map_err(|_| RunnerVolumePurgeError::InvalidRequest)?;
+        Ok(InstalledCertifiedCloudRuntimeFixture {
+            runtime_target,
+            binding_request,
+            runtime_grant_id,
+            runtime_sha256,
+            verified_authority,
+        })
+    }
+
+    #[test]
+    fn certified_cloud_runtime_fixture_authorizes_exact_execution_lease_claim() {
+        let database = TestDatabase::new(&["acct-certified-cloud"]);
+        let (application_id, run_id, browser_profile_id) = runner_execution_lease_fixture(
+            &database.pool,
+            "acct-certified-cloud",
+            "runner-purge-0@example.test",
+            "certified-cloud-runtime",
+        );
+        let owner_id = "round604-certified-cloud-owner";
+        let now = now_ms();
+        let runtime = RunnerProcessRuntimeAttestation {
+            runner_image_sha256: sha256("certified-cloud-image"),
+            runner_build_id: "runner-604.1".to_string(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: sha256("certified-cloud-automation"),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "123456".to_string(),
+            chromium_executable_sha256: sha256("certified-cloud-chromium"),
+        };
+        let installed = install_certified_cloud_runtime_fixture(
+            &database.pool,
+            "acct-certified-cloud",
+            &application_id,
+            &run_id,
+            &browser_profile_id,
+            owner_id,
+            runtime.clone(),
+            now,
+        )
+        .expect("install exact certified cloud runtime fixture");
+        assert_eq!(installed.runtime_target.runtime_kind, "cloud");
+        assert_eq!(
+            installed.runtime_target.runner_image_sha256.as_deref(),
+            Some(runtime.runner_image_sha256.as_str())
+        );
+        assert_eq!(
+            installed.runtime_target.runtime_sha256,
+            installed.runtime_sha256
+        );
+        assert_eq!(installed.binding_request.account_id, "acct-certified-cloud");
+        assert_eq!(installed.binding_request.run_id, run_id);
+
+        let grant = claim_execution_lease_for_runner_volume_authorized(
+            &database.pool,
+            "acct-certified-cloud",
+            &application_id,
+            &run_id,
+            &browser_profile_id,
+            owner_id,
+            &installed.binding_request,
+            &installed.runtime_grant_id,
+            &installed.runtime_sha256,
+            &installed.verified_authority,
+        )
+        .expect("claim lease through exact runtime and volume authority");
+        assert_eq!(grant.runtime_grant_id, installed.runtime_grant_id);
+        assert_eq!(grant.runtime_sha256, installed.runtime_sha256);
+        assert_eq!(grant.volume_id, installed.binding_request.volume_id);
     }
 
     fn prepare(
@@ -12250,7 +13811,8 @@ mod runner_volume_purge_tests {
     fn node_and_rust_storage_attestation_vector_matches() {
         let signing_key = Ed25519SigningKey::from_bytes(&[0x0b_u8; 32]);
         let public_key = encode_base64url(signing_key.verifying_key().as_bytes());
-        let volume_id = runner_volume_id_from_public_key(&public_key).expect("derive vector volume");
+        let volume_id =
+            runner_volume_id_from_public_key(&public_key).expect("derive vector volume");
         let volume_key_fingerprint =
             runner_volume_key_fingerprint(&public_key).expect("fingerprint vector key");
         let attestation = sign_runner_volume_storage_attestation(
@@ -12376,10 +13938,13 @@ mod runner_volume_purge_tests {
         )
         .expect("replay exact storage attestation with fresh authority");
         assert_eq!(replayed.disposition, RunnerVolumeWriteDisposition::Replay);
-        assert_eq!(replayed, RunnerVolumeStorageAttestationOutcome {
-            disposition: RunnerVolumeWriteDisposition::Replay,
-            ..applied.clone()
-        });
+        assert_eq!(
+            replayed,
+            RunnerVolumeStorageAttestationOutcome {
+                disposition: RunnerVolumeWriteDisposition::Replay,
+                ..applied.clone()
+            }
+        );
         assert!(matches!(
             record_runner_volume_storage_attestation(
                 &database.pool,
@@ -12391,11 +13956,9 @@ mod runner_volume_purge_tests {
             Err(RunnerVolumePurgeError::Unauthorized)
         ));
 
-        let conflicting = resign_fixed_storage_attestation(
-            &volume,
-            first.clone(),
-            |attestation| attestation.observed_at_ms = 12,
-        );
+        let conflicting = resign_fixed_storage_attestation(&volume, first.clone(), |attestation| {
+            attestation.observed_at_ms = 12
+        });
         let conflicting_authority = fixed_storage_attestation_authority(
             &database.pool,
             &volume,
@@ -12415,14 +13978,11 @@ mod runner_volume_purge_tests {
         ));
 
         let second = signed_fixed_storage_attestation(&database.pool, &volume, 14);
-        let stale_second = resign_fixed_storage_attestation(
-            &volume,
-            second.clone(),
-            |attestation| {
+        let stale_second =
+            resign_fixed_storage_attestation(&volume, second.clone(), |attestation| {
                 attestation.attestation_id = "storage-attestation-stale-predecessor".to_string();
                 attestation.observed_at_ms = 15;
-            },
-        );
+            });
         let second_authority = fixed_storage_attestation_authority(
             &database.pool,
             &volume,
@@ -12629,25 +14189,28 @@ mod runner_volume_purge_tests {
         let ack = signed_ack(&original, command_for(&prepared, &original), 11);
         acknowledge_runner_volume_purge(&database.pool, &key_ring, &ack, 11)
             .expect("acknowledge enrollment-race purge");
-        let completed = complete_runner_volume_purge(&database.pool, &prepared.status.request_id, 12)
-            .expect("complete enrollment-race purge");
+        let completed =
+            complete_runner_volume_purge(&database.pool, &prepared.status.request_id, 12)
+                .expect("complete enrollment-race purge");
         assert_eq!(completed.status.state, "complete");
 
         let newcomer = fixed_volume(&database.pool, 76, "enrollment-race-new", 13);
-        let fleet = runner_volume_fleet_status(&database.pool)
-            .expect("load fleet after racing enrollment");
+        let fleet =
+            runner_volume_fleet_status(&database.pool).expect("load fleet after racing enrollment");
         assert_eq!(fleet.legacy_inventory_state, "reconciling");
         assert!(lookup_runner_volume(&database.pool, &newcomer.volume_id)
             .expect("load racing enrollment")
             .expect("racing enrollment exists")
             .active_instance_id
             .is_none());
-        assert!(crate::db::account_data::hard_delete_account_after_runner_purge(
-            &database.pool,
-            "acct-enrollment-race",
-            &prepared.status.request_id,
-        )
-        .is_err());
+        assert!(
+            crate::db::account_data::hard_delete_account_after_runner_purge(
+                &database.pool,
+                "acct-enrollment-race",
+                &prepared.status.request_id,
+            )
+            .is_err()
+        );
         assert_eq!(
             runner_volume_purge_status(&database.pool, &prepared.status.request_id)
                 .expect("retain completed frozen request")
@@ -12929,6 +14492,36 @@ mod runner_volume_purge_tests {
     fn signed_volume_authority_request_ids_are_consumed_once_per_epoch() {
         let database = TestDatabase::new(&[]);
         let volume = fixed_volume(&database.pool, 30, "authority-replay", 10);
+        let runtime = RunnerProcessRuntimeAttestation {
+            runner_image_sha256: sha256("authority-runtime-image"),
+            runner_build_id: TEST_RUNNER_BUILD.to_string(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: sha256("authority-runtime-bundle"),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "123456".to_string(),
+            chromium_executable_sha256: sha256("authority-runtime-chromium"),
+        };
+        let runtime_token = encode_base64url(&[91_u8; 32]);
+        create_runner_process_runtime_grant(
+            &database.pool,
+            &NewRunnerProcessRuntimeGrant {
+                grant_id: "runtime-grant-authority-replay".to_string(),
+                token: runtime_token.clone(),
+                expected_worker_id: "worker-authority-replay".to_string(),
+                runtime: runtime.clone(),
+                authorization_ref: "deployment-authority-replay".to_string(),
+                created_by: "test-operator".to_string(),
+                expires_at_ms: 1_000,
+                created_at_ms: 10,
+            },
+        )
+        .expect("create process runtime grant");
+        let runtime_claim = RunnerProcessRuntimeGrantClaim {
+            grant_id: "runtime-grant-authority-replay".to_string(),
+            grant_token: runtime_token,
+            runtime,
+        };
         let claim_payload_sha256 = sha256(b"authority-claim-payload");
         let claim_proof = sign_runner_volume_authority_proof(
             &volume.signing_key,
@@ -12954,22 +14547,28 @@ mod runner_volume_purge_tests {
         .expect("verify instance claim authority");
         claim_runner_volume_instance_authorized(
             &database.pool,
-            &volume.volume_id,
-            1,
-            &volume.process_instance_id,
-            11,
-            100,
+            &RunnerVolumeInstanceLeaseRequest {
+                volume_id: &volume.volume_id,
+                enrollment_epoch: 1,
+                process_instance_id: &volume.process_instance_id,
+                now_ms: 11,
+                lease_expires_at_ms: 100,
+            },
+            &runtime_claim,
             &claim_authority,
         )
         .expect("consume instance claim authority");
         assert!(matches!(
             claim_runner_volume_instance_authorized(
                 &database.pool,
-                &volume.volume_id,
-                1,
-                &volume.process_instance_id,
-                12,
-                101,
+                &RunnerVolumeInstanceLeaseRequest {
+                    volume_id: &volume.volume_id,
+                    enrollment_epoch: 1,
+                    process_instance_id: &volume.process_instance_id,
+                    now_ms: 12,
+                    lease_expires_at_ms: 101,
+                },
+                &runtime_claim,
                 &claim_authority,
             ),
             Err(RunnerVolumePurgeError::Unauthorized)
@@ -13106,9 +14705,7 @@ mod runner_volume_purge_tests {
             expected_legacy_reconciliation_generation: before.legacy_reconciliation_generation,
             expected_storage_attestation_generation: before.storage_attestation_generation,
             expected_storage_attestation_count: before.storage_attestation_count,
-            expected_storage_attestation_set_sha256: before
-                .storage_attestation_set_sha256
-                .clone(),
+            expected_storage_attestation_set_sha256: before.storage_attestation_set_sha256.clone(),
             expected_legacy_inventory_generation: before.legacy_inventory_generation,
             expected_legacy_inventory_reconciliation_id: before
                 .legacy_inventory_reconciliation_id
@@ -13756,8 +15353,7 @@ mod runner_volume_purge_tests {
                 request_id: "request-ack".to_string(),
                 account_id: "acct-ack".to_string(),
                 minimum_runner_build_id: TEST_RUNNER_BUILD.to_string(),
-                expected_legacy_inventory_generation: successor_fleet
-                    .legacy_inventory_generation,
+                expected_legacy_inventory_generation: successor_fleet.legacy_inventory_generation,
                 expected_legacy_inventory_reconciliation_id: successor_fleet
                     .legacy_inventory_reconciliation_id
                     .expect("ACK successor reconciliation id"),
@@ -13912,8 +15508,7 @@ mod runner_volume_purge_tests {
                 request_id: "request-order-a".to_string(),
                 account_id: "acct-order-a".to_string(),
                 minimum_runner_build_id: TEST_RUNNER_BUILD.to_string(),
-                expected_legacy_inventory_generation: successor_fleet
-                    .legacy_inventory_generation,
+                expected_legacy_inventory_generation: successor_fleet.legacy_inventory_generation,
                 expected_legacy_inventory_reconciliation_id: successor_fleet
                     .legacy_inventory_reconciliation_id
                     .expect("request-A successor reconciliation id"),
@@ -13927,7 +15522,10 @@ mod runner_volume_purge_tests {
             },
         )
         .expect("prepare request-A successor after request-B completion");
-        assert_ne!(purge_a_successor.status.request_id, purge_a.status.request_id);
+        assert_ne!(
+            purge_a_successor.status.request_id,
+            purge_a.status.request_id
+        );
         assert_eq!(
             runner_volume_purge_status(&database.pool, &purge_a.status.request_id)
                 .expect("load stale-authority request A")
@@ -13939,12 +15537,9 @@ mod runner_volume_purge_tests {
             acknowledge_runner_volume_purge(&database.pool, &key_ring, &ack, 70)
                 .expect("acknowledge reauthorized purge A target");
         }
-        let complete_a = complete_runner_volume_purge(
-            &database.pool,
-            &purge_a_successor.status.request_id,
-            80,
-        )
-        .expect("complete reauthorized purge A later");
+        let complete_a =
+            complete_runner_volume_purge(&database.pool, &purge_a_successor.status.request_id, 80)
+                .expect("complete reauthorized purge A later");
         assert_eq!(complete_a.tombstone_generation, 2);
 
         // A volume enrolled after both completions must receive retained
@@ -14019,10 +15614,7 @@ mod runner_volume_purge_tests {
             retained_page_two.commands[0].clone(),
         ];
         assert_eq!(retained[0].request_id, purge_b.status.request_id);
-        assert_eq!(
-            retained[1].request_id,
-            purge_a_successor.status.request_id
-        );
+        assert_eq!(retained[1].request_id, purge_a_successor.status.request_id);
         assert_eq!(
             (
                 retained[0].legacy_inventory_authority_generation,

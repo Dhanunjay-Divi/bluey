@@ -22,6 +22,7 @@ import {
 } from "./irreversible-submit.js";
 import {
   authorizedFinalSubmitHooks,
+  certifiedAutoProviderApproval,
 } from "./authorized-final-submit.js";
 import {
   classifyLocalFailure,
@@ -147,6 +148,10 @@ async function executeLocalRequestSingleFlight(
   if (!request.job) throw new LocalBrowserError("run_request_invalid");
   const approved = createApprovedExecutionSnapshot(request.packet, request.job);
   const approvedJob = approved.approvedJob;
+  const certifiedProviderApproval = certifiedAutoProviderApproval(
+    approved.approvedPacket,
+    approvedJob,
+  );
   request = Object.freeze({
     ...request,
     packet: approved.approvedPacket,
@@ -258,9 +263,8 @@ async function executeLocalRequestSingleFlight(
   );
   const finalSubmitHooks = {
     async beforeFinalSubmit(proof: ProviderFinalSubmitProof) {
-      // The exclusive marker is durable before server click authority can be
-      // granted. A crash before the encrypted checkpoint update still fails
-      // closed during startup reconciliation.
+      // The server consumes the one-use pre-click authority first. Only its
+      // successful response permits the durable local marker to be written.
       await durableHooks.beforeFinalSubmit(proof);
       await checkpointActiveLocalRun(request.runId, "final_submit_started", "side_effect_unknown");
     },
@@ -309,10 +313,14 @@ async function executeLocalRequestSingleFlight(
       beforeFinalSubmit: finalSubmitHooks.beforeFinalSubmit,
       afterFinalSubmit: finalSubmitHooks.afterFinalSubmit,
     };
-    execution = approvedProviderReview
+    const providerApproval = approvedProviderReview ?? certifiedProviderApproval;
+    execution = providerApproval
       ? await executeApplication(
           adapterContext,
-          createDefaultAdapterRegistry(undefined, providerOptionsForApprovedReview(approvedProviderReview)),
+          createDefaultAdapterRegistry(
+            undefined,
+            providerOptionsForApprovedReview(providerApproval),
+          ),
         )
       : await executeApplication(adapterContext);
   }
@@ -355,6 +363,8 @@ async function executeLocalRequestSingleFlight(
   const screenshotBytes = Buffer.from(await browserPage.screenshot({ fullPage: true }));
   await writeFile(screenshotPath, screenshotBytes, { mode: 0o600 });
   execution.receipt.screenshotPath = screenshotPath;
+  const atsCertifiedReceiptAuthority =
+    durableHooks.atsCertifiedReceiptAuthority();
   const bundle = createApplicationReceipt({
     receiptId: `receipt-${request.runId}`,
     runId: request.runId,
@@ -389,6 +399,7 @@ async function executeLocalRequestSingleFlight(
     })),
     finalUrl: page.url(),
     screenshotKeys: [screenshotPath],
+    ...(atsCertifiedReceiptAuthority ? { atsCertifiedReceiptAuthority } : {}),
   });
   const receiptPath = join(runDirectory, "receipt.json");
   await writeFile(receiptPath, `${JSON.stringify(bundle, null, 2)}\n`, { mode: 0o600 });

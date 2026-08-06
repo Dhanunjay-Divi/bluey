@@ -319,6 +319,24 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .eligibility-panel p { color: var(--accent); font-size: 9px; font-weight: 850; }
 .eligibility-panel h3 { font-size: 14px; }
 .eligibility-panel span { color: var(--text-soft); font-size: 10px; line-height: 1.45; }
+.ats-certification-summary { margin: 14px 20px; padding: 14px; display: grid; gap: 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--surface-2); }
+.ats-certification-summary.status-active { border-color: color-mix(in srgb, var(--success) 40%, var(--border)); }
+.ats-certification-summary.status-expired,
+.ats-certification-summary.status-suspended,
+.ats-certification-summary.status-revoked,
+.ats-certification-summary.status-drifted { border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.ats-certification-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
+.ats-certification-heading > div { display: grid; gap: 2px; }
+.ats-certification-heading p { color: var(--accent); font-size: 9px; font-weight: 850; }
+.ats-certification-heading h4 { font-size: 14px; }
+.ats-certification-status { padding: 4px 7px; border: 1px solid var(--border-strong); border-radius: 999px; color: var(--text-soft); font-size: 9px; font-weight: 850; text-transform: uppercase; }
+.ats-certification-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 7px; }
+.ats-certification-grid > div { min-width: 0; padding: 8px 9px; display: grid; gap: 3px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.ats-certification-grid dt { color: var(--muted); font-size: 8px; font-weight: 850; text-transform: uppercase; }
+.ats-certification-grid dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--text-soft); font-size: 10px; font-weight: 750; }
+.ats-certification-guidance { display: grid; gap: 4px; color: var(--text-soft); font-size: 10px; line-height: 1.45; }
+.ats-certification-guidance b { color: var(--text); }
+.ats-certification-fallback { color: var(--warning); font-size: 9px; font-weight: 800; }
 .eligibility-reasons { margin: 0; padding: 0; display: grid; gap: 5px; align-content: start; list-style: none; color: var(--text-soft); font-size: 10px; }
 .eligibility-reasons li { padding-left: 10px; border-left: 2px solid var(--amber); line-height: 1.4; }
 .eligibility-reasons.blocked li { border-left-color: var(--red); }
@@ -389,6 +407,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .kit-summary > div { min-height: 48px; padding: 9px 10px; display: grid; gap: 3px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
 .kit-summary b { color: var(--muted); font-size: 9px; font-weight: 850; text-transform: uppercase; }
 .kit-summary span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-soft); font-size: 11px; font-weight: 750; }
+.review-panel > .ats-certification-summary { margin: 0 0 18px; }
 .diff-empty { margin: 16px 0; padding: 12px; border: 1px dashed var(--border); border-radius: 7px; color: var(--muted); font-size: 11px; }
 .kit-section-empty, .kit-detail-section { margin: 14px 0; padding: 11px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
 .kit-section-empty { display: grid; gap: 3px; }
@@ -1207,6 +1226,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .dialog-form, .job-detail-summary, .detail-columns > section, .review-panel { padding: 15px; }
   .detail-columns { grid-template-columns: 1fr; }
   .eligibility-panel { grid-template-columns: 1fr; padding: 14px 15px; }
+  .ats-certification-summary { margin: 12px 15px; }
+  .review-panel > .ats-certification-summary { margin: 0 0 18px; }
+  .ats-certification-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .detail-columns > section { min-height: auto; border-right: 0; border-bottom: 1px solid var(--border); }
   .dialog-actions { padding: 12px 15px; flex-wrap: wrap; }
   .dialog-actions.spread { align-items: stretch; flex-direction: column; }

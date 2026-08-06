@@ -457,6 +457,37 @@ pub fn resolve_intervention_answer_for_review(
             )?;
 
             if let Some(run_id) = previous_run_id.as_deref() {
+                let ats_binding = tx
+                    .query_row(
+                        "SELECT binding_id, attempt_id, nonce_sha256
+                           FROM jobs_application_ats_certification_bindings
+                          WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3",
+                        params![account_id, application_id, run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some((binding_id, application_attempt_id, nonce_sha256)) = ats_binding {
+                    invalidate_ats_application_certification_binding_sqlite_tx(
+                        &tx,
+                        &AtsCertificationBindingInvalidationRequest {
+                            binding_id,
+                            account_id: account_id.to_string(),
+                            application_id: application_id.clone(),
+                            run_id: run_id.to_string(),
+                            application_attempt_id,
+                            nonce_sha256,
+                            expected_fence: 0,
+                            invalidation_kind: "packet_changed".to_string(),
+                        },
+                        now,
+                    )?;
+                }
                 if lease_phase.as_deref() == Some("prepared")
                     && tx.execute(
                         "UPDATE jobs_execution_leases
@@ -536,9 +567,22 @@ pub fn resolve_intervention_answer_for_review(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_postgres_ats_certification(&mut tx)?;
+
+            // Discover the scope without row locks, then acquire every row in
+            // the same order as certified pre-click authorization: cloud
+            // lease, local ticket, ATS binding, and application. The ATS
+            // advisory lock keeps the binding set stable while the scope is
+            // discovered. Every authoritative value is re-read under its row
+            // lock before mutation.
             let row = tx.query_opt(
-                "SELECT application_id, intervention_json FROM jobs_interventions
-                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                "SELECT intervention.application_id, application.job_id,
+                        application.application_json
+                   FROM jobs_interventions intervention
+                   LEFT JOIN jobs_applications application
+                     ON application.account_id = intervention.account_id
+                    AND application.id = intervention.application_id
+                  WHERE intervention.account_id = $1 AND intervention.id = $2",
                 &[&account_id, &intervention_id],
             )?;
             let Some(row) = row else {
@@ -547,27 +591,23 @@ pub fn resolve_intervention_answer_for_review(
             let application_id: Option<String> = row.get(0);
             let application_id = application_id
                 .ok_or_else(|| anyhow::anyhow!("intervention is not attached to an application"))?;
-            let mut intervention: Intervention = parse_json(row.get(1), "intervention")?;
-            intervention.id = intervention_id.to_string();
-            intervention.application_id = Some(application_id.clone());
-            let row = tx.query_opt(
-                "SELECT job_id, application_json FROM jobs_applications
-                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
-                &[&account_id, &application_id],
-            )?;
-            let Some(row) = row else {
+            let job_id: Option<String> = row.get(1);
+            let application_json: Option<String> = row.get(2);
+            let (Some(job_id), Some(application_json)) = (job_id, application_json) else {
                 anyhow::bail!("application not found")
             };
-            let job_id: String = row.get(0);
-            let application =
-                parse_application_json(row.get(1), &application_id, &job_id, "job application")?;
-            let (revision, previous_run_id) =
-                prepare_intervention_answer_revision(intervention, application, answer, now)?;
+            let discovered_application = parse_application_json(
+                application_json,
+                &application_id,
+                &job_id,
+                "job application",
+            )?;
+            let discovered_run_id = discovered_application.run_id.clone();
 
-            let mut browser_session: Option<BrowserSession> = None;
             let mut lease_phase: Option<String> = None;
             let mut local_ticket_status: Option<String> = None;
-            if let Some(run_id) = previous_run_id.as_deref() {
+            let mut ats_binding: Option<(String, String, String)> = None;
+            if let Some(run_id) = discovered_run_id.as_deref() {
                 lease_phase = tx
                     .query_opt(
                         "SELECT phase FROM jobs_execution_leases
@@ -584,21 +624,87 @@ pub fn resolve_intervention_answer_for_review(
                         &[&account_id, &application_id, &run_id],
                     )?
                     .map(|row| row.get::<_, String>(0));
-                browser_session = tx
+                ats_binding = tx
                     .query_opt(
-                        "SELECT session_json FROM jobs_browser_sessions
-                          WHERE account_id = $1 AND id = $2 FOR UPDATE",
-                        &[&account_id, &run_id],
+                        "SELECT binding_id, attempt_id, nonce_sha256
+                           FROM jobs_application_ats_certification_bindings
+                          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                          FOR UPDATE",
+                        &[&account_id, &application_id, &run_id],
                     )?
-                    .map(|row| parse_json(row.get(0), "browser session"))
-                    .transpose()?;
+                    .map(|row| (row.get(0), row.get(1), row.get(2)));
             }
+
+            let row = tx.query_opt(
+                "SELECT job_id, application_json FROM jobs_applications
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &application_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("application not found")
+            };
+            let job_id: String = row.get(0);
+            let application =
+                parse_application_json(row.get(1), &application_id, &job_id, "job application")?;
+            if application.run_id.as_deref() != discovered_run_id.as_deref() {
+                anyhow::bail!("application execution authority changed")
+            }
+
+            let row = tx.query_opt(
+                "SELECT application_id, intervention_json FROM jobs_interventions
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &intervention_id],
+            )?;
+            let Some(row) = row else {
+                anyhow::bail!("intervention not found")
+            };
+            if row.get::<_, Option<String>>(0).as_deref() != Some(application_id.as_str()) {
+                anyhow::bail!("intervention is not attached to this application")
+            }
+            let mut intervention: Intervention = parse_json(row.get(1), "intervention")?;
+            intervention.id = intervention_id.to_string();
+            intervention.application_id = Some(application_id.clone());
+            let (revision, previous_run_id) =
+                prepare_intervention_answer_revision(intervention, application, answer, now)?;
+            if previous_run_id.as_deref() != discovered_run_id.as_deref() {
+                anyhow::bail!("application execution authority changed")
+            }
+
+            let browser_session: Option<BrowserSession> = if let Some(run_id) =
+                previous_run_id.as_deref()
+            {
+                tx.query_opt(
+                    "SELECT session_json FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &run_id],
+                )?
+                .map(|row| parse_json(row.get(0), "browser session"))
+                .transpose()?
+            } else {
+                None
+            };
             reject_irreversible_answer_revision(
                 lease_phase.as_deref(),
                 local_ticket_status.as_deref(),
             )?;
 
             if let Some(run_id) = previous_run_id.as_deref() {
+                if let Some((binding_id, application_attempt_id, nonce_sha256)) = ats_binding {
+                    invalidate_ats_application_certification_binding_postgres_tx(
+                        &mut tx,
+                        &AtsCertificationBindingInvalidationRequest {
+                            binding_id,
+                            account_id: account_id.to_string(),
+                            application_id: application_id.clone(),
+                            run_id: run_id.to_string(),
+                            application_attempt_id,
+                            nonce_sha256,
+                            expected_fence: 0,
+                            invalidation_kind: "packet_changed".to_string(),
+                        },
+                        now,
+                    )?;
+                }
                 if lease_phase.as_deref() == Some("prepared")
                     && tx.execute(
                         "UPDATE jobs_execution_leases
@@ -1900,8 +2006,8 @@ fn approved_submission_checksum(
             "packet": packet,
             "job": job,
         }),
-        (2, Some(admission)) => json!({
-            "schema_version": 2,
+        (schema_version @ (2 | 3), Some(admission)) => json!({
+            "schema_version": schema_version,
             "admission": admission,
             "packet": packet,
             "job": job,
@@ -1932,14 +2038,35 @@ fn validate_approved_submission_admission(
         .unwrap_or_default();
     if application.submission_mode == "auto_submit" {
         let complete = kind == "track_auto_submit"
+            && approved_submission_object_has_keys(
+                admission,
+                if schema_version == 3 {
+                    &[
+                        "ats_certification",
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                } else {
+                    &[
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                },
+            )
             && admission
                 .get("authorization_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(valid_approved_submission_identifier)
             && admission
                 .get("career_track_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(valid_approved_submission_identifier)
             && admission
                 .get("revision_no")
                 .and_then(Value::as_i64)
@@ -1947,16 +2074,135 @@ fn validate_approved_submission_admission(
             && admission
                 .get("authority_fingerprint")
                 .and_then(Value::as_str)
-                .is_some_and(|value| {
-                    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
-                });
+                .is_some_and(valid_approved_submission_sha256)
+            && (schema_version != 3
+                || admission
+                    .get("ats_certification")
+                    .is_some_and(valid_approved_submission_ats_certification));
         if !complete {
             anyhow::bail!("approved Auto-submit admission is incomplete")
         }
-    } else if kind != "review_approval" {
+    } else if kind != "review_approval"
+        || !approved_submission_object_has_keys(admission, &["kind"])
+    {
         anyhow::bail!("approved execution does not contain review authority")
     }
     Ok(())
+}
+
+fn valid_approved_submission_ats_certification(value: &Value) -> bool {
+    let Some(certification) = value.as_object() else {
+        return false;
+    };
+    if !approved_submission_object_has_keys(
+        certification,
+        &[
+            "activation_generation",
+            "activation_sha256",
+            "adapter_bundle_sha256",
+            "adapter_version",
+            "expires_at_ms",
+            "layout_contract_version",
+            "layout_set_sha256",
+            "manifest_sha256",
+            "provider",
+            "runner_target_sha256s",
+            "schema_version",
+            "surface_sha256",
+            "target_key_sha256",
+            "variant_key",
+        ],
+    ) || certification.get("schema_version").and_then(Value::as_i64) != Some(1)
+    {
+        return false;
+    }
+    let provider = certification
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let adapter_version = certification
+        .get("adapter_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        (provider, adapter_version),
+        ("greenhouse", "2026.07.1-beta.1") | ("lever", "2026.07.0-beta.1")
+    ) || certification
+        .get("variant_key")
+        .and_then(Value::as_str)
+        .is_none_or(|value| !valid_approved_submission_identifier(value))
+        || certification
+            .get("layout_contract_version")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("activation_generation")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("expires_at_ms")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+    {
+        return false;
+    }
+    for key in [
+        "activation_sha256",
+        "adapter_bundle_sha256",
+        "layout_set_sha256",
+        "manifest_sha256",
+        "surface_sha256",
+        "target_key_sha256",
+    ] {
+        if !certification
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(valid_approved_submission_sha256)
+        {
+            return false;
+        }
+    }
+    let Some(targets) = certification
+        .get("runner_target_sha256s")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if targets.is_empty() || targets.len() > 2 {
+        return false;
+    }
+    let mut previous: Option<&str> = None;
+    for target in targets {
+        let Some(target) = target.as_str().filter(|value| {
+            valid_approved_submission_sha256(value)
+                && previous.is_none_or(|previous| previous < *value)
+        }) else {
+            return false;
+        };
+        previous = Some(target);
+    }
+    true
+}
+
+fn approved_submission_object_has_keys(
+    value: &serde_json::Map<String, Value>,
+    expected: &[&str],
+) -> bool {
+    value.len() == expected.len() && expected.iter().all(|key| value.contains_key(*key))
+}
+
+fn valid_approved_submission_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_approved_submission_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn validate_canonical_claim_ids(value: Option<&Value>) -> Result<()> {
@@ -1990,7 +2236,7 @@ fn approved_submission_snapshot<'a>(
         .get("schema_version")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    if !matches!(schema_version, 1 | 2) {
+    if !matches!(schema_version, 1..=3) {
         anyhow::bail!("approved execution schema is unsupported")
     }
     let packet = approved
@@ -2012,7 +2258,7 @@ fn approved_submission_snapshot<'a>(
         schema_version,
         packet,
         job,
-        (schema_version == 2).then_some(
+        matches!(schema_version, 2 | 3).then_some(
             admission.ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?,
         ),
     )?;
@@ -2230,8 +2476,7 @@ fn validate_submission_execution_authority_sqlite_tx(
         let Some((stored_ticket_hash, status, expires_at_ms)) = stored else {
             anyhow::bail!("final receipt local execution authority is missing")
         };
-        let active = (matches!(status.as_str(), "claimed" | "needs_input")
-            && expires_at_ms > now)
+        let active = (matches!(status.as_str(), "claimed" | "needs_input") && expires_at_ms > now)
             || (matches!(status.as_str(), "click_started" | "side_effect_unknown")
                 && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
         if execution
@@ -2306,8 +2551,7 @@ fn validate_submission_execution_authority_postgres_tx(
         let stored_ticket_hash: String = stored.try_get(0)?;
         let status: String = stored.try_get(1)?;
         let expires_at_ms: i64 = stored.try_get(2)?;
-        let active = (matches!(status.as_str(), "claimed" | "needs_input")
-            && expires_at_ms > now)
+        let active = (matches!(status.as_str(), "claimed" | "needs_input") && expires_at_ms > now)
             || (matches!(status.as_str(), "click_started" | "side_effect_unknown")
                 && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
         if execution

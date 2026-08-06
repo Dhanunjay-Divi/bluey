@@ -32,6 +32,7 @@ import {
 } from "../effective-submit-target.js";
 import { ExactSubmitEvidenceError } from "../trusted-submit.js";
 import { hasNegativeSubmissionOutcome } from "../submission-confirmation.js";
+import { parseProviderApplicationTarget } from "../ats-target.js";
 
 export const GREENHOUSE_ADAPTER_PROFILE = Object.freeze({
   kind: "greenhouse",
@@ -99,8 +100,6 @@ interface FieldRule {
   key: string;
   aliases: string[];
 }
-
-const OFFICIAL_HOSTS = new Set(["boards.greenhouse.io", "job-boards.greenhouse.io"]);
 
 const APPLY_SELECTORS = [
   "#apply_button",
@@ -234,20 +233,15 @@ const CHALLENGES: Array<{
   },
 ];
 
-export function detectGreenhouseUrl(rawUrl: URL | string): GreenhouseDetection | undefined {
-  let url: URL;
-  try {
-    url = typeof rawUrl === "string" ? new URL(rawUrl) : rawUrl;
-  } catch {
-    return undefined;
-  }
-  if (url.protocol !== "https:" || !OFFICIAL_HOSTS.has(url.hostname.toLowerCase())) return undefined;
-
-  const embedded = /^\/embed\/(?:job_app|job_board)\b/i.test(url.pathname);
+export function detectGreenhouseUrl(rawUrl: string): GreenhouseDetection | undefined {
+  const target = parseProviderApplicationTarget(rawUrl)
+    ?? parseProviderApplicationTarget(rawUrl, "confirmation");
+  if (!target || target.provider !== "greenhouse") return undefined;
+  const embedded = target.variant === "greenhouse_embedded";
   return {
     variant: embedded ? "embedded" : "public",
     source: "official_url",
-    tenant: tenantFromUrl(url, embedded),
+    tenant: target.tenant,
   };
 }
 
@@ -815,7 +809,7 @@ export class GreenhouseAdapter implements ApplicationAdapter {
   constructor(private readonly options: GreenhouseAdapterOptions = {}) {}
 
   detect(url: URL): boolean {
-    return detectGreenhouseUrl(url) !== undefined;
+    return detectGreenhouseUrl(url.href) !== undefined;
   }
 
   async normalize(page: BrowserPage): Promise<NormalizedJob> {
@@ -870,14 +864,6 @@ export class GreenhouseAdapter implements ApplicationAdapter {
 
 export function createGreenhouseAdapter(options: GreenhouseAdapterOptions = {}): GreenhouseAdapter {
   return new GreenhouseAdapter(options);
-}
-
-function tenantFromUrl(url: URL, embedded: boolean): string | undefined {
-  const queryTenant = url.searchParams.get("for");
-  if (queryTenant) return queryTenant;
-  if (embedded) return undefined;
-  const [first] = url.pathname.split("/").filter(Boolean);
-  return first && first !== "jobs" ? first : undefined;
 }
 
 function safeUrl(value: string): URL | undefined {

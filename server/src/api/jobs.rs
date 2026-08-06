@@ -35,6 +35,7 @@ use crate::{
             ObjectKind, StorageScope, UploadControlError,
         },
     },
+    jobs_ats_target::{parse_provider_application_target, ProviderApplicationTargetPurpose},
     object_storage::{sha256_hex, ObjectStorage},
 };
 
@@ -2733,6 +2734,15 @@ fn freeze_approved_execution(
 ) -> Result<JobApplication, ApiError> {
     let (identity_id, identity_email) = approved_application_identity(application)?;
     if application.receipt.get("approved_execution").is_some() {
+        if application.submission_mode == "auto_submit"
+            && !jobs::application_has_frozen_ats_certification(application)
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                "This Auto-submit packet predates exact ATS certification. Prepare and approve it again."
+                    .to_string(),
+            ));
+        }
         let (packet, job, _) = approved_execution_snapshot(application)?;
         validate_approved_execution_matches(
             application,
@@ -2772,7 +2782,8 @@ fn freeze_approved_execution(
         "source": ats_kind(&posting.canonical_url),
         "compensation": posting.compensation,
     });
-    let admission = if application.submission_mode == "auto_submit" {
+    let approved_at_ms = jobs::now_ms();
+    let (schema_version, admission) = if application.submission_mode == "auto_submit" {
         let authorization = jobs::require_valid_auto_submit_authorization(
             &state.pool,
             account_id,
@@ -2780,22 +2791,64 @@ fn freeze_approved_execution(
             &posting.track_id,
         )
         .map_err(domain_error)?;
-        json!({
-            "kind": "track_auto_submit",
-            "authorization_id": authorization.id,
-            "career_track_id": authorization.career_track_id,
-            "revision_no": authorization.revision_no,
-            "authority_fingerprint": authorization.authority_fingerprint,
-        })
+        let resolution = jobs::resolve_ats_certification_for_posting(
+            &state.pool,
+            account_id,
+            posting,
+            None,
+            approved_at_ms,
+        )
+        .map_err(|error| match error {
+            jobs::AtsCertificationAuthorityError::Storage(error) => internal(error),
+            _ => (
+                StatusCode::CONFLICT,
+                "This exact ATS target does not have current server-owned certification. Review the packet or try again after certification is restored."
+                    .to_string(),
+            ),
+        })?;
+        let binding = resolution
+            .active_binding
+            .as_ref()
+            .filter(|_| resolution.status.status == "active")
+            .ok_or_else(|| {
+                (
+                    StatusCode::CONFLICT,
+                    "This exact ATS target does not have current server-owned certification. Review the packet or try again after certification is restored."
+                        .to_string(),
+                )
+            })?;
+        let ats_certification = jobs::ats_frozen_certification_admission_projection(binding)
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "This exact ATS certification cannot be frozen into the approved packet. Review the packet or prepare it again."
+                        .to_string(),
+                )
+            })?;
+        (
+            3,
+            json!({
+                "kind": "track_auto_submit",
+                "authorization_id": authorization.id,
+                "career_track_id": authorization.career_track_id,
+                "revision_no": authorization.revision_no,
+                "authority_fingerprint": authorization.authority_fingerprint,
+                "ats_certification": ats_certification,
+            }),
+        )
     } else {
-        json!({
-            "kind": "review_approval",
-        })
+        (
+            2,
+            json!({
+                "kind": "review_approval",
+            }),
+        )
     };
-    let checksum = approved_execution_checksum_v2(&packet, &job, &admission)?;
+    let checksum =
+        approved_execution_checksum_with_admission(schema_version, &packet, &job, &admission)?;
     let approved_execution = json!({
-        "schema_version": 2,
-        "approved_at_ms": jobs::now_ms(),
+        "schema_version": schema_version,
+        "approved_at_ms": approved_at_ms,
         "checksum": checksum,
         "admission": admission,
         "packet": packet,
@@ -2829,7 +2882,7 @@ fn approved_execution_snapshot(
         .get("schema_version")
         .and_then(Value::as_i64)
         .unwrap_or_default();
-    if !matches!(schema_version, 1 | 2) {
+    if !matches!(schema_version, 1..=3) {
         return Err((
             StatusCode::CONFLICT,
             "This approved packet uses an unsupported version. Prepare it again.".to_string(),
@@ -2872,8 +2925,8 @@ fn approved_execution_snapshot(
                 StatusCode::CONFLICT,
                 "The application approval proof is incomplete. Prepare it again.".to_string(),
             ))?;
-        validate_approved_execution_admission(application, admission)?;
-        approved_execution_checksum_v2(&packet, &job, admission)?
+        validate_approved_execution_admission(application, schema_version, admission)?;
+        approved_execution_checksum_with_admission(schema_version, &packet, &job, admission)?
     };
     if checksum.len() != 64 || expected_checksum != checksum {
         return Err((
@@ -2900,7 +2953,7 @@ fn attach_approved_execution_transport(
     let schema_version = approved
         .get("schema_version")
         .and_then(Value::as_i64)
-        .filter(|value| matches!(*value, 1 | 2))
+        .filter(|value| matches!(*value, 1..=3))
         .ok_or((
             StatusCode::CONFLICT,
             "This approved packet uses an unsupported version. Prepare it again.".to_string(),
@@ -2917,7 +2970,7 @@ fn attach_approved_execution_transport(
         "approvedExecutionSchemaVersion".to_string(),
         Value::Number(schema_version.into()),
     );
-    if schema_version == 2 {
+    if matches!(schema_version, 2 | 3) {
         fields.insert(
             "approvedExecutionAdmission".to_string(),
             approved
@@ -2943,13 +2996,29 @@ fn approved_execution_checksum(packet: &Value, job: &Value) -> Result<String, Ap
     Ok(hex::encode(Sha256::digest(bytes)))
 }
 
+#[cfg(test)]
 fn approved_execution_checksum_v2(
     packet: &Value,
     job: &Value,
     admission: &Value,
 ) -> Result<String, ApiError> {
+    approved_execution_checksum_with_admission(2, packet, job, admission)
+}
+
+fn approved_execution_checksum_with_admission(
+    schema_version: i64,
+    packet: &Value,
+    job: &Value,
+    admission: &Value,
+) -> Result<String, ApiError> {
+    if !matches!(schema_version, 2 | 3) {
+        return Err((
+            StatusCode::CONFLICT,
+            "This approved packet uses an unsupported version. Prepare it again.".to_string(),
+        ));
+    }
     let canonical = canonical_json_value(&json!({
-        "schema_version": 2,
+        "schema_version": schema_version,
         "admission": admission,
         "packet": packet,
         "job": job,
@@ -2960,22 +3029,50 @@ fn approved_execution_checksum_v2(
 
 fn validate_approved_execution_admission(
     application: &JobApplication,
+    schema_version: i64,
     admission: &Value,
 ) -> Result<(), ApiError> {
+    let Some(admission) = admission.as_object() else {
+        return Err((
+            StatusCode::CONFLICT,
+            "The application approval proof is incomplete. Prepare it again.".to_string(),
+        ));
+    };
     let kind = admission
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or_default();
     if application.submission_mode == "auto_submit" {
         let complete = kind == "track_auto_submit"
+            && approved_execution_object_has_keys(
+                admission,
+                if schema_version == 3 {
+                    &[
+                        "ats_certification",
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                } else {
+                    &[
+                        "authority_fingerprint",
+                        "authorization_id",
+                        "career_track_id",
+                        "kind",
+                        "revision_no",
+                    ]
+                },
+            )
             && admission
                 .get("authorization_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(valid_approved_execution_identifier)
             && admission
                 .get("career_track_id")
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.trim().is_empty())
+                .is_some_and(valid_approved_execution_identifier)
             && admission
                 .get("revision_no")
                 .and_then(Value::as_i64)
@@ -2983,7 +3080,11 @@ fn validate_approved_execution_admission(
             && admission
                 .get("authority_fingerprint")
                 .and_then(Value::as_str)
-                .is_some_and(|value| value.len() == 64);
+                .is_some_and(valid_approved_execution_sha256)
+            && (schema_version != 3
+                || admission
+                    .get("ats_certification")
+                    .is_some_and(valid_ats_certification_admission));
         if !complete {
             return Err((
                 StatusCode::CONFLICT,
@@ -2991,13 +3092,129 @@ fn validate_approved_execution_admission(
                     .to_string(),
             ));
         }
-    } else if kind != "review_approval" {
+    } else if kind != "review_approval" || !approved_execution_object_has_keys(admission, &["kind"])
+    {
         return Err((
             StatusCode::CONFLICT,
             "Approve this exact application packet before starting a browser runner.".to_string(),
         ));
     }
     Ok(())
+}
+
+fn valid_ats_certification_admission(value: &Value) -> bool {
+    let Some(certification) = value.as_object() else {
+        return false;
+    };
+    if !approved_execution_object_has_keys(
+        certification,
+        &[
+            "activation_generation",
+            "activation_sha256",
+            "adapter_bundle_sha256",
+            "adapter_version",
+            "expires_at_ms",
+            "layout_contract_version",
+            "layout_set_sha256",
+            "manifest_sha256",
+            "provider",
+            "runner_target_sha256s",
+            "schema_version",
+            "surface_sha256",
+            "target_key_sha256",
+            "variant_key",
+        ],
+    ) || certification.get("schema_version").and_then(Value::as_i64) != Some(1)
+    {
+        return false;
+    }
+    let provider = certification
+        .get("provider")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let adapter_version = certification
+        .get("adapter_version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !matches!(
+        (provider, adapter_version),
+        ("greenhouse", "2026.07.1-beta.1") | ("lever", "2026.07.0-beta.1")
+    ) || certification
+        .get("variant_key")
+        .and_then(Value::as_str)
+        .is_none_or(|value| !valid_approved_execution_identifier(value))
+        || certification
+            .get("layout_contract_version")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("activation_generation")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+        || certification
+            .get("expires_at_ms")
+            .and_then(Value::as_i64)
+            .is_none_or(|value| value <= 0)
+    {
+        return false;
+    }
+    for key in [
+        "activation_sha256",
+        "adapter_bundle_sha256",
+        "layout_set_sha256",
+        "manifest_sha256",
+        "surface_sha256",
+        "target_key_sha256",
+    ] {
+        if !certification
+            .get(key)
+            .and_then(Value::as_str)
+            .is_some_and(valid_approved_execution_sha256)
+        {
+            return false;
+        }
+    }
+    let Some(targets) = certification
+        .get("runner_target_sha256s")
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    if targets.is_empty() || targets.len() > 2 {
+        return false;
+    }
+    let mut previous: Option<&str> = None;
+    for target in targets {
+        let Some(target) = target.as_str().filter(|value| {
+            valid_approved_execution_sha256(value)
+                && previous.is_none_or(|previous| previous < *value)
+        }) else {
+            return false;
+        };
+        previous = Some(target);
+    }
+    true
+}
+
+fn approved_execution_object_has_keys(
+    value: &serde_json::Map<String, Value>,
+    expected: &[&str],
+) -> bool {
+    value.len() == expected.len() && expected.iter().all(|key| value.contains_key(*key))
+}
+
+fn valid_approved_execution_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 240
+        && value.trim() == value
+        && !value.bytes().any(|byte| byte.is_ascii_control())
+}
+
+fn valid_approved_execution_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn canonical_json_value(value: &Value) -> Result<Value, ApiError> {
@@ -4140,6 +4357,8 @@ fn local_capability_release(
         activation_sha256: binding.activation_sha256.clone(),
         artifact_id: binding.artifact_id.clone(),
         artifact_sha256: binding.artifact_sha256.clone(),
+        automation_bundle_sha256: binding.automation_bundle_sha256.clone(),
+        chromium_executable_sha256: binding.chromium_executable_sha256.clone(),
         release_id: binding.release_id.clone(),
         build_id: binding.build_id.clone(),
         app_version: binding.app_version.clone(),
@@ -4178,6 +4397,7 @@ async fn authorize_local_run_submit(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
     if matches!(ats_kind(&posting.canonical_url), "greenhouse" | "lever")
+        && !jobs::application_has_frozen_ats_certification(&application)
         && !jobs::local_submission_approval_consumed(
             &state.pool,
             &ticket.account_id,
@@ -4199,7 +4419,7 @@ async fn authorize_local_run_submit(
     )?;
     let now_ms = capacity.now_ms;
     let server_release_id = browser_server_release_id()?;
-    let authorized = jobs::local_run_submit_authorized_for_distribution(
+    let authorization = jobs::local_run_submit_authorization_for_distribution(
         &state.pool,
         &run_id,
         &ticket.ticket_hash,
@@ -4214,12 +4434,20 @@ async fn authorize_local_run_submit(
             internal(error)
         }
     })?;
-    if !authorized {
+    let Some(authorization) = authorization else {
         return Err((
             StatusCode::CONFLICT,
             "This application is no longer authorized to submit. Return to Bluey Jobs to review it."
                 .to_string(),
         ));
+    };
+    if let Some(authority) = authorization.ats_certified_receipt_authority {
+        let authorized_at_ms = authority.binding_consumed_at_ms;
+        return Ok(Json(json!({
+            "authorized": true,
+            "authorizedAtMs": authorized_at_ms,
+            "atsCertifiedReceiptAuthority": authority,
+        })));
     }
     Ok(Json(json!({
         "authorized": true,
@@ -4438,6 +4666,7 @@ async fn save_local_run_result(
                 .map_err(internal)?
                 .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
             if matches!(ats_kind(&posting.canonical_url), "greenhouse" | "lever")
+                && !jobs::application_has_frozen_ats_certification(&application)
                 && !jobs::local_submission_approval_consumed(
                     &state.pool,
                     &ticket.account_id,
@@ -4793,6 +5022,8 @@ struct WorkerExecutionLeaseClaimRequest {
     volume_id: String,
     enrollment_epoch: i64,
     process_instance_id: String,
+    runtime_grant_id: String,
+    runtime_sha256: String,
     volume_proof: jobs::RunnerVolumeAuthorityProof,
 }
 
@@ -4920,6 +5151,8 @@ async fn worker_claim_execution_lease(
                 volume_id: &req.volume_id,
                 enrollment_epoch: req.enrollment_epoch,
                 process_instance_id: &req.process_instance_id,
+                runtime_grant_id: &req.runtime_grant_id,
+                runtime_sha256: &req.runtime_sha256,
             },
         );
     let authority = jobs::verify_runner_volume_authority_proof(
@@ -4954,6 +5187,8 @@ async fn worker_claim_execution_lease(
         &req.browser_profile_id,
         owner_id,
         &binding,
+        &req.runtime_grant_id,
+        &req.runtime_sha256,
         &authority,
     )
     .map(Json)
@@ -4981,7 +5216,7 @@ async fn worker_start_irreversible_submission(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     Json(req): Json<WorkerIrreversibleExecutionRequest>,
-) -> Result<Json<jobs::ExecutionLeaseRecord>, ApiError> {
+) -> Result<Json<jobs::IrreversibleExecutionLeaseRecord>, ApiError> {
     if req.action != "submit" {
         return bad_request("Invalid irreversible execution action.");
     }
@@ -5818,8 +6053,13 @@ async fn persist_submission_receipt(
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
     let receipt_id = required_receipt_string(&receipt, "receiptId")?;
-    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(1) {
+    let certified_execution = jobs::application_has_frozen_ats_certification(&application);
+    let expected_receipt_schema = if certified_execution { 2 } else { 1 };
+    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(expected_receipt_schema) {
         return bad_request("Unsupported submission receipt version.");
+    }
+    if !certified_execution && receipt.get("atsCertifiedReceiptAuthority").is_some() {
+        return bad_request("Review submission receipts cannot carry certified authority.");
     }
     if receipt.get("accountId").and_then(Value::as_str) != Some(account_id) {
         return bad_request("Receipt does not match this account.");
@@ -5833,6 +6073,17 @@ async fn persist_submission_receipt(
     let run_id = required_receipt_string(&receipt, "runId")?;
     if application.run_id.as_deref() != Some(run_id.as_str()) {
         return bad_request("Receipt does not match this browser run.");
+    }
+    if certified_execution {
+        validate_receipt_ats_certification_authority(
+            &state.pool,
+            &application,
+            &receipt,
+            account_id,
+            application_id,
+            &run_id,
+            expected_runner,
+        )?;
     }
     let result = receipt.get("result").and_then(Value::as_object).ok_or((
         StatusCode::BAD_REQUEST,
@@ -6375,7 +6626,12 @@ fn validate_provider_submission_proof(
                     "The pre-click provider target proof is missing or invalid.".to_string(),
                 )
             })?;
-    if final_submit_proof.schema_version != 3
+    let expected_proof_schema = if jobs::application_has_frozen_ats_certification(application) {
+        4
+    } else {
+        3
+    };
+    if final_submit_proof.schema_version != expected_proof_schema
         || final_submit_proof.adapter != adapter
         || final_submit_proof.job.approved_canonical_url != frozen_url
         || target_job_key != approved_job_key
@@ -6433,26 +6689,16 @@ fn validate_provider_submission_proof(
             StatusCode::BAD_REQUEST,
             "A submitted receipt needs the final employer URL.".to_string(),
         ))?;
-    let confirmation_url_parsed = reqwest::Url::parse(confirmation_url).map_err(|_| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Invalid confirmation URL.".to_string(),
-        )
-    })?;
-    let confirmation_job_key =
-        jobs::final_submit_confirmation_provider_job_key(adapter, confirmation_url).map_err(
-            |_| {
-                (
-                    StatusCode::BAD_REQUEST,
-                    "Receipt confirmation is not bound to the approved provider job.".to_string(),
-                )
-            },
-        )?;
-    if confirmation_url_parsed.scheme() != "https"
-        || ats_kind(confirmation_url) != adapter
-        || final_url != confirmation_url
-        || confirmation_job_key != approved_job_key
-    {
+    let confirmation_target = parse_provider_application_target(
+        confirmation_url,
+        ProviderApplicationTargetPurpose::Confirmation,
+    )
+    .filter(|target| target.provider == adapter)
+    .ok_or((
+        StatusCode::BAD_REQUEST,
+        "Receipt confirmation is not bound to the approved provider job.".to_string(),
+    ))?;
+    if final_url != confirmation_url || confirmation_target.provider_job_key != approved_job_key {
         return bad_request("Receipt confirmation is not bound to the approved provider page.");
     }
     let generated_at = receipt
@@ -6621,6 +6867,114 @@ fn validate_receipt_final_submit_proof(
         }
     }
     Ok(())
+}
+
+fn validate_receipt_ats_certification_authority(
+    pool: &crate::db::DbPool,
+    application: &JobApplication,
+    receipt: &Value,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    expected_runner: &str,
+) -> Result<jobs::AtsCertifiedReceiptAuthority, ApiError> {
+    let authority = receipt
+        .get("atsCertifiedReceiptAuthority")
+        .cloned()
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Certified submission receipt authority is missing.".to_string(),
+        ))?;
+    let authority = serde_json::from_value::<jobs::AtsCertifiedReceiptAuthority>(authority)
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Certified submission receipt authority is invalid.".to_string(),
+            )
+        })?;
+    let proof = jobs::stored_final_submit_proof(application).map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            "The certified pre-click authority is missing or invalid.".to_string(),
+        )
+    })?;
+    let certification = proof.certification.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "The certified pre-click authority is missing or invalid.".to_string(),
+    ))?;
+    let observed_surface = proof.observed_surface.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "The certified layout authority is missing or invalid.".to_string(),
+    ))?;
+    let generated_at_ms = receipt
+        .get("generatedAt")
+        .and_then(Value::as_str)
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.timestamp_millis())
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Certified submission receipt time is invalid.".to_string(),
+        ))?;
+    let ids_are_valid = [
+        authority.application_attempt_id.as_str(),
+        authority.phase_b_request_id.as_str(),
+    ]
+    .into_iter()
+    .all(valid_approved_execution_identifier);
+    let digests_are_valid = [
+        authority.binding_sha256.as_str(),
+        authority.canary_reservation_sha256.as_str(),
+        authority.layout_observation_sha256.as_str(),
+        authority.metering_reservation_sha256.as_str(),
+        authority.observed_surface_sha256.as_str(),
+    ]
+    .into_iter()
+    .all(valid_approved_execution_sha256);
+    let exact = authority.schema_version == 1
+        && authority.account_id == account_id
+        && authority.application_id == application_id
+        && authority.run_id == run_id
+        && authority.provider == proof.adapter
+        && authority.adapter == proof.adapter
+        && authority.adapter_version == proof.adapter_version
+        && authority.manifest_sha256 == certification.manifest_sha256
+        && authority.activation_sha256 == certification.activation_sha256
+        && authority.activation_generation == certification.activation_generation
+        && authority.target_key_sha256 == certification.target_key_sha256
+        && authority.layout_set_sha256 == certification.layout_set_sha256
+        && authority.observed_surface_sha256 == observed_surface.surface_sha256
+        && authority.adapter_bundle_sha256 == certification.adapter_bundle_sha256
+        && authority.runner_kind == expected_runner
+        && certification
+            .runner_target_sha256s
+            .contains(&authority.runner_target_sha256)
+        && authority.binding_fence > 0
+        && authority.binding_consumed_at_ms > 0
+        && authority.binding_consumed_at_ms <= generated_at_ms
+        && authority.binding_consumed_at_ms <= certification.expires_at_ms
+        && matches!(authority.rollout_channel.as_str(), "canary" | "general")
+        && ids_are_valid
+        && digests_are_valid;
+    if !exact {
+        return bad_request(
+            "Certified submission receipt authority does not match the frozen execution.",
+        );
+    }
+    jobs::lookup_ats_certification_terminal_receipt_authority(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        &authority,
+    )
+    .map_err(|error| match error {
+        jobs::AtsCertificationAuthorityError::Storage(error) => internal(error),
+        _ => (
+            StatusCode::CONFLICT,
+            "Certified submission receipt authority is not the exact terminal server record."
+                .to_string(),
+        ),
+    })
 }
 
 fn has_explicit_submission_confirmation(value: &str) -> bool {
@@ -7150,6 +7504,14 @@ async fn upload_immutable_receipt_bundle(
     receipt: &mut Value,
     uploaded: &mut UploadedReceiptEvidence,
 ) -> Result<(), ApiError> {
+    let receipt_schema_version = receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Application receipt schema is invalid.".to_string(),
+        ))?;
     let bundle_id = request_fingerprint.to_string();
     let encoded = serde_json::to_vec(&json!({
         "schemaVersion": 1,
@@ -7219,7 +7581,7 @@ async fn upload_immutable_receipt_bundle(
                 sha256,
                 media_type: "application/json",
                 size_bytes: encoded.len(),
-                schema_version: 1,
+                schema_version: receipt_schema_version,
             })
             .map_err(|error| internal(error.into()))?,
         );
@@ -7776,6 +8138,14 @@ fn validate_receipt_bundle(
     verified_objects: &BTreeMap<String, String>,
     require_receipt_object: bool,
 ) -> Result<(), ApiError> {
+    let receipt_schema_version = receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or((
+            StatusCode::BAD_REQUEST,
+            "Application receipt schema is invalid.".to_string(),
+        ))?;
     let (approved_packet, approved_job, approved_checksum) =
         approved_execution_snapshot(application)?;
     validate_frozen_approved_execution_matches(
@@ -7859,7 +8229,8 @@ fn validate_receipt_bundle(
                 "Receipt bundle checksum is invalid.".to_string(),
             ))?;
         if receipt_object.get("mediaType").and_then(Value::as_str) != Some("application/json")
-            || receipt_object.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+            || receipt_object.get("schemaVersion").and_then(Value::as_i64)
+                != Some(receipt_schema_version)
             || receipt_object
                 .get("sizeBytes")
                 .and_then(Value::as_u64)
@@ -7889,6 +8260,29 @@ fn validate_receipt_bundle(
         return bad_request(
             "Receipt answers do not match the exact application packet that was approved.",
         );
+    }
+    let receipt_admission = packet.get("approvedExecutionAdmission");
+    let receipt_admission_schema = packet
+        .get("approvedExecutionSchemaVersion")
+        .and_then(Value::as_i64);
+    if receipt_schema_version == 2 {
+        let frozen_admission = application
+            .receipt
+            .pointer("/approved_execution/admission")
+            .ok_or((
+                StatusCode::CONFLICT,
+                "The certified frozen admission is missing.".to_string(),
+            ))?;
+        if !jobs::application_has_frozen_ats_certification(application)
+            || receipt_admission_schema != Some(3)
+            || receipt_admission != Some(frozen_admission)
+        {
+            return bad_request(
+                "Receipt certification admission does not match the frozen execution.",
+            );
+        }
+    } else if receipt_admission_schema.is_some() || receipt_admission.is_some() {
+        return bad_request("Review submission receipt contains certified admission fields.");
     }
     if receipt.get("job") != Some(&approved_job) {
         return bad_request("Receipt job snapshot does not match the exact approved posting.");
@@ -8211,16 +8605,17 @@ fn add_answer(answers: &mut BTreeMap<String, String>, key: &str, value: &str) {
 }
 
 fn ats_kind(raw_url: &str) -> &'static str {
+    if let Some(target) =
+        parse_provider_application_target(raw_url, ProviderApplicationTargetPurpose::Submit)
+    {
+        return target.provider;
+    }
     let host = reqwest::Url::parse(raw_url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_ascii_lowercase))
         .unwrap_or_default();
-    if host.contains("myworkdayjobs.com") {
+    if host.ends_with(".myworkdayjobs.com") {
         "workday"
-    } else if host == "boards.greenhouse.io" || host == "job-boards.greenhouse.io" {
-        "greenhouse"
-    } else if host == "jobs.lever.co" || host == "jobs.eu.lever.co" {
-        "lever"
     } else if host == "jobs.ashbyhq.com" {
         "ashby"
     } else if host == "jobs.smartrecruiters.com" || host.ends_with(".smartrecruiters.com") {
@@ -8435,6 +8830,32 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+
+    #[test]
+    fn ats_kind_matches_shared_exact_target_vectors() {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../jobs/automation/tests/fixtures/ats-target-vectors.json"
+        ))
+        .unwrap();
+        for vector in vectors.as_array().unwrap() {
+            let name = vector["name"].as_str().unwrap();
+            let url = vector["url"].as_str().unwrap();
+            let expected = vector["expectedDetection"].as_str().unwrap();
+            assert_eq!(ats_kind(url), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn ats_kind_rejects_workday_lookalikes() {
+        assert_eq!(
+            ats_kind("https://myworkdayjobs.com/acme/job/123"),
+            "semantic"
+        );
+        assert_eq!(
+            ats_kind("https://myworkdayjobs.com.attacker.example/acme/job/123"),
+            "semantic"
+        );
+    }
 
     #[test]
     fn execution_lease_owner_is_bound_to_authenticated_worker() {
@@ -9275,6 +9696,7 @@ mod tests {
             }]
         });
         let mut receipt = json!({
+            "schemaVersion": 1,
             "applicationIdentityId": identity_id,
             "browserProfileId": browser_profile_id(account_id, identity_id),
             "adapter": "greenhouse",
@@ -9606,7 +10028,8 @@ mod tests {
             let checksum = if schema_version == 1 {
                 approved_execution_checksum(&vector["packet"], &vector["job"]).unwrap()
             } else {
-                approved_execution_checksum_v2(
+                approved_execution_checksum_with_admission(
+                    schema_version,
                     &vector["packet"],
                     &vector["job"],
                     &vector["admission"],
@@ -9660,6 +10083,65 @@ mod tests {
             runtime_packet["approvedExecutionAdmission"],
             json!({ "kind": "review_approval" })
         );
+    }
+
+    #[test]
+    fn certified_auto_packet_requires_and_transports_exact_schema_three_admission() {
+        let (mut application, _, _, _, _) = strict_receipt_fixture();
+        application.submission_mode = "auto_submit".to_string();
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let job = application.receipt["approved_execution"]["job"].clone();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "auto-auth-604",
+            "career_track_id": "track-test",
+            "revision_no": 4,
+            "authority_fingerprint": "1".repeat(64),
+            "ats_certification": {
+                "schema_version": 1,
+                "provider": "greenhouse",
+                "adapter_version": "2026.07.1-beta.1",
+                "manifest_sha256": "2".repeat(64),
+                "activation_sha256": "3".repeat(64),
+                "activation_generation": 5,
+                "target_key_sha256": "6".repeat(64),
+                "layout_set_sha256": "7".repeat(64),
+                "variant_key": "greenhouse_public",
+                "layout_contract_version": 1,
+                "surface_sha256": "4".repeat(64),
+                "adapter_bundle_sha256": "8".repeat(64),
+                "runner_target_sha256s": ["9".repeat(64)],
+                "expires_at_ms": 9_007_199_254_740_000_i64,
+            }
+        });
+        let checksum =
+            approved_execution_checksum_with_admission(3, &packet, &job, &admission).unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 3,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        });
+
+        approved_execution_snapshot(&application).unwrap();
+        let mut runtime_packet = application.receipt["approved_execution"]["packet"].clone();
+        attach_approved_execution_transport(&application, &mut runtime_packet, checksum).unwrap();
+        assert_eq!(runtime_packet["approvedExecutionSchemaVersion"], json!(3));
+        assert_eq!(
+            runtime_packet
+                .pointer("/approvedExecutionAdmission/ats_certification/manifest_sha256")
+                .and_then(Value::as_str)
+                .unwrap(),
+            "2".repeat(64)
+        );
+
+        application.receipt["approved_execution"]["admission"]["ats_certification"]
+            ["manifest_sha256"] = json!("a".repeat(64));
+        let error = approved_execution_snapshot(&application).unwrap_err();
+        assert_eq!(error.0, StatusCode::CONFLICT);
+        assert!(error.1.contains("changed after review"));
     }
 
     #[test]
@@ -10803,5 +11285,459 @@ mod tests {
         .unwrap_err();
         assert_eq!(authority_error.0, StatusCode::BAD_REQUEST);
         assert!(authority_error.1.contains("submission authority"));
+    }
+
+    struct CertifiedReceiptValidationFixture {
+        pool: crate::db::DbPool,
+        application: JobApplication,
+        resume: ResumeVersion,
+        receipt: Value,
+        verified_objects: BTreeMap<String, String>,
+    }
+
+    fn certified_receipt_validation_fixture() -> CertifiedReceiptValidationFixture {
+        const SURFACE_SHA256: &str =
+            "a88a8916beb511abb11af4acd27242723f8387ea8bebf639dde83a5629f92a68";
+        let (mut application, _, resume, mut receipt, verified_objects) = strict_receipt_fixture();
+        let account_id = "acct-test";
+        let application_id = application.id.clone();
+        let run_id = application.run_id.clone().unwrap();
+        let target_key = "greenhouse:acme:123";
+        let target_key_sha256 = sha256_hex(target_key.as_bytes());
+        let manifest_sha256 = "2".repeat(64);
+        let activation_sha256 = "3".repeat(64);
+        let layout_observation_sha256 = "4".repeat(64);
+        let layout_set_sha256 = "7".repeat(64);
+        let adapter_bundle_sha256 = "8".repeat(64);
+        let runner_target_sha256 = "9".repeat(64);
+        let metering_reservation_sha256 = "c".repeat(64);
+        let now = chrono::Utc::now();
+        let now_ms = now.timestamp_millis();
+        let consumed_at_ms = now_ms - 1_000;
+        let expires_at_ms = now_ms + 60 * 60 * 1_000;
+        let generated_at = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        application.submission_mode = "auto_submit".to_string();
+        let approved_packet = application.receipt["approved_execution"]["packet"].clone();
+        let approved_job = application.receipt["approved_execution"]["job"].clone();
+        let certification_admission =
+            serde_json::to_value(jobs::AtsFrozenCertificationAdmissionProjection {
+                schema_version: 1,
+                provider: "greenhouse".to_string(),
+                adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+                manifest_sha256: manifest_sha256.clone(),
+                activation_sha256: activation_sha256.clone(),
+                activation_generation: 5,
+                target_key_sha256: target_key_sha256.clone(),
+                layout_set_sha256: layout_set_sha256.clone(),
+                variant_key: "greenhouse_public".to_string(),
+                layout_contract_version: 1,
+                surface_sha256: SURFACE_SHA256.to_string(),
+                adapter_bundle_sha256: adapter_bundle_sha256.clone(),
+                runner_target_sha256s: vec![runner_target_sha256.clone()],
+                expires_at_ms,
+            })
+            .unwrap();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "auto-auth-604",
+            "career_track_id": "track-test",
+            "revision_no": 4,
+            "authority_fingerprint": "1".repeat(64),
+            "ats_certification": certification_admission,
+        });
+        let approved_checksum = approved_execution_checksum_with_admission(
+            3,
+            &approved_packet,
+            &approved_job,
+            &admission,
+        )
+        .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": 3,
+            "approved_at_ms": now_ms - 5_000,
+            "checksum": approved_checksum,
+            "admission": admission,
+            "packet": approved_packet,
+            "job": approved_job,
+        });
+        let final_submit_proof = jobs::FinalSubmitProof {
+            schema_version: 4,
+            adapter: "greenhouse".to_string(),
+            adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+            control: "greenhouse_submit_application".to_string(),
+            job: jobs::FinalSubmitJobProof {
+                approved_canonical_url: "https://boards.greenhouse.io/acme/jobs/123".to_string(),
+                page_url: "https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123"
+                    .to_string(),
+            },
+            target: jobs::FinalSubmitTargetProof {
+                action_url: "https://job-boards.greenhouse.io/embed/job_app?for=acme&token=123"
+                    .to_string(),
+                method: "post".to_string(),
+                enctype: "multipart/form-data".to_string(),
+                form_target: "_self".to_string(),
+                provider_job_key: target_key.to_string(),
+                form_identity: r#"[0,"application_form","","application-form","","123"]"#
+                    .to_string(),
+            },
+            files: vec![jobs::FinalSubmitFileProof {
+                field_name: "resume".to_string(),
+                name: format!("resume-{}.pdf", "a".repeat(64)),
+                byte_length: 50,
+                sha256: "a".repeat(64),
+            }],
+            fields: vec![jobs::FinalSubmitFieldProof {
+                field_name: "job_id".to_string(),
+                value_byte_length: 3,
+                value_sha256: "d".repeat(64),
+            }],
+            part_order: vec![
+                jobs::FinalSubmitPartOrderProof {
+                    kind: "field".to_string(),
+                    index: 0,
+                },
+                jobs::FinalSubmitPartOrderProof {
+                    kind: "file".to_string(),
+                    index: 0,
+                },
+            ],
+            documents: vec![jobs::FinalSubmitDocumentProof {
+                kind: "resume".to_string(),
+                version_id: Some("resume-test".to_string()),
+                sha256: "a".repeat(64),
+            }],
+            certification: Some(jobs::AtsFinalSubmitCertificationProof {
+                schema_version: 1,
+                provider: "greenhouse".to_string(),
+                adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+                manifest_sha256: manifest_sha256.clone(),
+                activation_sha256: activation_sha256.clone(),
+                activation_generation: 5,
+                target_key_sha256: target_key_sha256.clone(),
+                layout_set_sha256: layout_set_sha256.clone(),
+                adapter_bundle_sha256: adapter_bundle_sha256.clone(),
+                runner_target_sha256s: vec![runner_target_sha256.clone()],
+                expires_at_ms,
+            }),
+            observed_surface: Some(jobs::AtsFinalSubmitObservedSurfaceProof {
+                schema_version: 1,
+                variant_key: "greenhouse_public".to_string(),
+                layout_contract_version: 1,
+                surface_sha256: SURFACE_SHA256.to_string(),
+            }),
+        };
+        application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY] =
+            serde_json::to_value(final_submit_proof).unwrap();
+
+        let binding_id = "binding-api-receipt-604";
+        let application_attempt_id = "attempt-604";
+        let nonce_sha256 = "6".repeat(64);
+        let runtime = jobs::AtsCertificationRuntimeTarget {
+            runtime_kind: "cloud".to_string(),
+            runtime_id: "runner-test".to_string(),
+            runtime_sha256: runner_target_sha256.clone(),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: "d".repeat(64),
+            browser_release_manifest_sha256: None,
+            browser_artifact_sha256: None,
+            browser_build_descriptor_sha256: None,
+            runner_build_id: Some("runner-build-604".to_string()),
+            runner_image_sha256: Some("e".repeat(64)),
+            playwright_version: "1.55.0".to_string(),
+            chromium_revision: "1234567".to_string(),
+            chromium_executable_sha256: "f".repeat(64),
+        };
+        let target_evidence = jobs::AtsCertificationFreshTargetEvidence {
+            canonical_url: "https://boards.greenhouse.io/acme/jobs/123".to_string(),
+            discovery_provider: "greenhouse".to_string(),
+            discovery_target_key: target_key.to_string(),
+            discovery_observed_at_ms: now_ms - 10_000,
+            original_source_provider: "greenhouse".to_string(),
+            original_source_target_key: target_key.to_string(),
+            original_source_observed_at_ms: now_ms - 10_000,
+        };
+        let certification_binding = jobs::AtsCertificationBinding {
+            binding_version: 1,
+            trust_policy_sha256: "0".repeat(64),
+            provider: "greenhouse".to_string(),
+            target_key: target_key.to_string(),
+            allowed_provider_hosts: vec![
+                "boards.greenhouse.io".to_string(),
+                "job-boards.greenhouse.io".to_string(),
+            ],
+            variant_key: "greenhouse_public".to_string(),
+            surface_sha256: SURFACE_SHA256.to_string(),
+            scope_sha256: "1".repeat(64),
+            manifest_sha256: manifest_sha256.clone(),
+            certification_id: "certification-604".to_string(),
+            manifest_generation: 4,
+            activation_sha256: activation_sha256.clone(),
+            activation_id: "activation-604".to_string(),
+            activation_generation: 5,
+            channel: "canary".to_string(),
+            channel_sequence: 5,
+            channel_head_revision: 5,
+            channel_transition_sha256: "b".repeat(64),
+            capability: "unattended_submit".to_string(),
+            account_allowlist_sha256: Some("a".repeat(64)),
+            canary_max_submissions: 10,
+            canary_account_cap: 2,
+            canary_concurrency_cap: 1,
+            canary_daily_side_effect_cap: 2,
+            adapter_version: GREENHOUSE_SUBMISSION_ADAPTER_VERSION.to_string(),
+            final_submit_control_id: "greenhouse_submit_application".to_string(),
+            adapter_bundle_sha256: adapter_bundle_sha256.clone(),
+            source_commit: "c".repeat(40),
+            layout_contract_version: 1,
+            layout_contract_sha256: "5".repeat(64),
+            layout_set_sha256: layout_set_sha256.clone(),
+            layout_observation_sha256s: vec![layout_observation_sha256.clone()],
+            evidence_sha256s: vec!["a".repeat(64)],
+            runtime_targets: vec![runtime.clone()],
+            selected_runtime: Some(runtime),
+            not_before_ms: now_ms - 60_000,
+            expires_at_ms,
+            last_verified_at_ms: now_ms - 5_000,
+        };
+        let binding_authority = jobs::AtsApplicationCertificationBindingAuthority {
+            schema_version: 1,
+            binding_id: binding_id.to_string(),
+            account_id: account_id.to_string(),
+            application_id: application_id.clone(),
+            run_id: run_id.clone(),
+            application_attempt_id: application_attempt_id.to_string(),
+            browser_session_id: run_id.clone(),
+            browser_profile_id: receipt["browserProfileId"].as_str().unwrap().to_string(),
+            packet_checksum_sha256: approved_checksum.clone(),
+            auto_authorization_id: "auto-auth-604".to_string(),
+            auto_authorization_revision: 4,
+            auto_authorization_fingerprint_sha256: "1".repeat(64),
+            target_evidence,
+            nonce_sha256: nonce_sha256.clone(),
+            certification: certification_binding,
+            requested_expires_at_ms: expires_at_ms,
+            created_at_ms: now_ms - 2_000,
+            expires_at_ms,
+        };
+        let mut canonical_binding = serde_json::to_vec(&binding_authority).unwrap();
+        canonical_binding.push(b'\n');
+        let binding_sha256 = hex::encode(Sha256::digest(&canonical_binding));
+        let frozen_certification_base64url =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&canonical_binding);
+
+        let path = std::env::temp_dir().join(format!(
+            "bluey-jobs-certified-receipt-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).unwrap();
+        crate::db::run_migrations(&pool).unwrap();
+        let connection = pool.get().unwrap();
+        // Seed the exact terminal output of Phase B without rebuilding the
+        // separately tested signed import lifecycle. The receipt validator
+        // still decodes and hashes the canonical frozen binding from storage.
+        connection
+            .pragma_update(None, "foreign_keys", false)
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_application_ats_certification_bindings (
+                   binding_id, binding_sha256, account_id, application_id, run_id, attempt_id,
+                   browser_session_id, browser_profile_id, packet_checksum_sha256,
+                   auto_authorization_id, auto_authorization_revision,
+                   auto_authorization_fingerprint_sha256, provider, target_key,
+                   manifest_sha256, activation_sha256, layout_set_sha256,
+                   adapter_bundle_sha256, runner_target_sha256, platform, architecture,
+                   automation_bundle_sha256, browser_release_manifest_sha256,
+                   browser_artifact_sha256, browser_build_descriptor_sha256, runner_build_id,
+                   runner_image_sha256, browser_runtime_sha256, chromium_executable_sha256,
+                   nonce_sha256, frozen_certification_base64url, layout_observation_sha256,
+                   observed_surface_sha256, phase_b_request_id, phase_b_request_sha256,
+                   canary_reservation_sha256, metering_reservation_sha256, expires_at_ms,
+                   phase, fence, created_at_ms, consumed_at_ms, invalidation_kind,
+                   invalidated_at_ms
+                 ) VALUES (
+                   ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                   ?16, ?17, ?18, ?19, ?20, ?21, ?22, NULL, NULL, NULL, ?23, ?24, ?25,
+                   ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, 'consumed', 1,
+                   ?36, ?37, NULL, NULL
+                 )",
+                rusqlite::params![
+                    binding_id,
+                    binding_sha256,
+                    account_id,
+                    application_id,
+                    run_id,
+                    application_attempt_id,
+                    run_id,
+                    binding_authority.browser_profile_id,
+                    approved_checksum,
+                    "auto-auth-604",
+                    4,
+                    "1".repeat(64),
+                    "greenhouse",
+                    target_key,
+                    manifest_sha256,
+                    activation_sha256,
+                    layout_set_sha256,
+                    adapter_bundle_sha256,
+                    runner_target_sha256,
+                    "linux",
+                    "x86_64",
+                    "d".repeat(64),
+                    "runner-build-604",
+                    "e".repeat(64),
+                    runner_target_sha256,
+                    "f".repeat(64),
+                    nonce_sha256,
+                    frozen_certification_base64url,
+                    layout_observation_sha256,
+                    SURFACE_SHA256,
+                    "phase-b-request-604",
+                    "a".repeat(64),
+                    "b".repeat(64),
+                    metering_reservation_sha256,
+                    expires_at_ms,
+                    now_ms - 2_000,
+                    consumed_at_ms,
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .unwrap();
+        drop(connection);
+
+        let recovered = jobs::recover_ats_application_certification(
+            &pool,
+            &jobs::AtsCertificationRecoveryRequest {
+                binding_id: binding_id.to_string(),
+                account_id: account_id.to_string(),
+                application_id: application_id.clone(),
+                run_id: run_id.clone(),
+                application_attempt_id: application_attempt_id.to_string(),
+                nonce_sha256,
+            },
+        )
+        .unwrap();
+        receipt["schemaVersion"] = json!(2);
+        receipt["receiptId"] = json!("receipt-certified-604");
+        receipt["accountId"] = json!(account_id);
+        receipt["applicationId"] = json!(application_id);
+        receipt["runId"] = json!(run_id);
+        receipt["runner"] = json!("cloud");
+        receipt["generatedAt"] = json!(generated_at);
+        receipt["finalUrl"] = json!("https://boards.greenhouse.io/acme/jobs/123/confirmation");
+        receipt["result"] = json!({
+            "status": "submitted",
+            "issues": [],
+            "submitHttpStatus": 302,
+            "confirmationText": "Thank you for applying. Your application was received.",
+            "confirmationUrl": "https://boards.greenhouse.io/acme/jobs/123/confirmation",
+            "submittedAt": generated_at,
+        });
+        receipt["events"] = json!([{
+            "type": "greenhouse_state_transition",
+            "occurredAt": generated_at,
+            "detail": {
+                "state": "receipt",
+                "status": "submitted",
+                "capability": "beta_review",
+            },
+        }]);
+        receipt["atsCertifiedReceiptAuthority"] =
+            serde_json::to_value(&recovered.ats_certified_receipt_authority).unwrap();
+        receipt["packet"]["approvedPacketChecksum"] = json!(approved_checksum);
+        receipt["packet"]["approvedExecutionSchemaVersion"] = json!(3);
+        receipt["packet"]["approvedExecutionAdmission"] = admission;
+        receipt["receiptObject"]["schemaVersion"] = json!(2);
+        receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"] =
+            application.receipt.clone();
+
+        CertifiedReceiptValidationFixture {
+            pool,
+            application,
+            resume,
+            receipt,
+            verified_objects,
+        }
+    }
+
+    fn validate_complete_certified_receipt(
+        fixture: &CertifiedReceiptValidationFixture,
+        receipt: &Value,
+    ) -> Result<jobs::AtsCertifiedReceiptAuthority, ApiError> {
+        let authority = validate_receipt_ats_certification_authority(
+            &fixture.pool,
+            &fixture.application,
+            receipt,
+            "acct-test",
+            "app-test",
+            "run-test",
+            "cloud",
+        )?;
+        let claim_ids = frozen_submission_claim_ids(&fixture.application)?;
+        validate_receipt_verified_claim_ids(receipt, &claim_ids)?;
+        validate_provider_submission_proof(&fixture.application, receipt)?;
+        validate_receipt_final_submit_proof(&fixture.application, receipt)?;
+        validate_receipt_bundle(
+            "acct-test",
+            &fixture.application,
+            &fixture.resume,
+            receipt,
+            &fixture.verified_objects,
+            true,
+        )?;
+        Ok(authority)
+    }
+
+    #[test]
+    fn schema_four_certified_receipt_requires_exact_terminal_and_evidence_authority() {
+        let fixture = certified_receipt_validation_fixture();
+        let proof = jobs::stored_final_submit_proof(&fixture.application).unwrap();
+        assert_eq!(proof.schema_version, 4);
+        assert_eq!(fixture.receipt["schemaVersion"], json!(2));
+        let exact = validate_complete_certified_receipt(&fixture, &fixture.receipt).unwrap();
+        assert_eq!(
+            serde_json::to_value(exact).unwrap(),
+            fixture.receipt["atsCertifiedReceiptAuthority"]
+        );
+
+        let mut wrong_document = fixture.receipt.clone();
+        wrong_document["documents"][0]["sha256"] = json!("f".repeat(64));
+        let document_error =
+            validate_complete_certified_receipt(&fixture, &wrong_document).unwrap_err();
+        assert_eq!(document_error.0, StatusCode::BAD_REQUEST);
+        assert!(document_error.1.contains("pre-click proof"));
+
+        let mut wrong_screenshot = fixture.receipt.clone();
+        wrong_screenshot["screenshotKeys"][0] =
+            json!("accounts/acct-test/jobs/app-test/different-confirmation.png");
+        let screenshot_error =
+            validate_complete_certified_receipt(&fixture, &wrong_screenshot).unwrap_err();
+        assert_eq!(screenshot_error.0, StatusCode::BAD_REQUEST);
+        assert!(screenshot_error.1.contains("manifest"));
+
+        let mut wrong_confirmation = fixture.receipt.clone();
+        wrong_confirmation["result"]["confirmationUrl"] =
+            json!("https://boards.greenhouse.io/acme/jobs/other/confirmation");
+        let confirmation_error =
+            validate_complete_certified_receipt(&fixture, &wrong_confirmation).unwrap_err();
+        assert_eq!(confirmation_error.0, StatusCode::BAD_REQUEST);
+        assert!(confirmation_error.1.contains("approved provider"));
+
+        for (field, value) in [
+            ("applicationAttemptId", json!("attempt-other")),
+            ("meteringReservationSha256", json!("e".repeat(64))),
+        ] {
+            let mut mismatch = fixture.receipt.clone();
+            mismatch["atsCertifiedReceiptAuthority"][field] = value;
+            let terminal_error =
+                validate_complete_certified_receipt(&fixture, &mismatch).unwrap_err();
+            assert_eq!(terminal_error.0, StatusCode::CONFLICT, "{field}");
+            assert!(terminal_error.1.contains("exact terminal server record"));
+        }
     }
 }

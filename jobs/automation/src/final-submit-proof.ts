@@ -1,5 +1,9 @@
+import { createHash } from "node:crypto";
 import { adapterCanFinalize } from "./adapter-capabilities.js";
 import type {
+  ApplicationPacket,
+  AtsCertificationAdmission,
+  AtsFinalSubmitCertificationProof,
   CertifiedFinalSubmitAdapter,
   ExactSubmitFieldEvidence,
   ExactSubmitFileEvidence,
@@ -49,6 +53,7 @@ export function createFinalSubmitProof(
   providerProof: ProviderFinalSubmitProof,
   materialized: MaterializedFinalSubmitDocuments,
   job: FinalSubmitJobProof,
+  admission?: ApplicationPacket["approvedExecutionAdmission"],
 ): FinalSubmitProof {
   assertProviderFinalSubmitProof(providerProof);
   assertFinalSubmitJobProof(providerProof.adapter, job);
@@ -79,7 +84,7 @@ export function createFinalSubmitProof(
   documents.sort((left, right) => left.kind < right.kind ? -1 : left.kind > right.kind ? 1 : 0);
   assertFilesMatchDocuments(providerProof.files, documents);
 
-  return {
+  const reviewedProof = {
     schemaVersion: 3,
     adapter: providerProof.adapter,
     adapterVersion: providerProof.adapterVersion,
@@ -90,6 +95,21 @@ export function createFinalSubmitProof(
     partOrder: providerProof.partOrder.map((entry) => ({ ...entry })),
     job: { ...job },
     documents,
+  } as const;
+  if (admission?.kind !== "track_auto_submit") return reviewedProof;
+  const admissionCertification = admission.ats_certification;
+  const certification = finalSubmitCertification(admissionCertification, providerProof);
+  if (!admissionCertification) throw new FinalSubmitProofError();
+  return {
+    ...reviewedProof,
+    schemaVersion: 4,
+    certification,
+    observedSurface: {
+      schemaVersion: 1,
+      variantKey: admissionCertification.variant_key,
+      layoutContractVersion: admissionCertification.layout_contract_version,
+      surfaceSha256: finalSubmitSurfaceSha256(providerProof),
+    },
   };
 }
 
@@ -98,8 +118,9 @@ export function assertFinalSubmitProof(value: unknown): asserts value is FinalSu
     throw new FinalSubmitProofError();
   }
   const proof = value as Record<string, unknown>;
-  if (Object.keys(proof).length !== 10
-    || proof.schemaVersion !== 3
+  const certified = proof.schemaVersion === 4;
+  if (Object.keys(proof).length !== (certified ? 12 : 10)
+    || (proof.schemaVersion !== 3 && !certified)
     || !Array.isArray(proof.documents)) {
     throw new FinalSubmitProofError();
   }
@@ -143,6 +164,147 @@ export function assertFinalSubmitProof(value: unknown): asserts value is FinalSu
     proof.files as ExactSubmitFileEvidence[],
     proof.documents as FinalSubmitDocumentProof[],
   );
+  if (certified) {
+    const observedSurface = proof.observedSurface as Record<string, unknown> | undefined;
+    if (!observedSurface
+      || typeof observedSurface !== "object"
+      || Array.isArray(observedSurface)
+      || !sameKeys(observedSurface, [
+        "layoutContractVersion",
+        "schemaVersion",
+        "surfaceSha256",
+        "variantKey",
+      ])
+      || observedSurface.schemaVersion !== 1
+      || !validVersionId(observedSurface.variantKey)
+      || !Number.isSafeInteger(observedSurface.layoutContractVersion)
+      || (observedSurface.layoutContractVersion as number) <= 0
+      || !validSha256(observedSurface.surfaceSha256)
+      || observedSurface.surfaceSha256
+        !== finalSubmitSurfaceSha256(proof as unknown as ProviderFinalSubmitProof)) {
+      throw new FinalSubmitProofError();
+    }
+    const certification = finalSubmitCertification(
+      wireCertificationToAdmission(proof.certification, observedSurface),
+      proof as unknown as ProviderFinalSubmitProof,
+    );
+    if (JSON.stringify(certification) !== JSON.stringify(proof.certification)) {
+      throw new FinalSubmitProofError();
+    }
+  }
+}
+
+export function finalSubmitSurfaceSha256(
+  proof: ProviderFinalSubmitProof,
+): string {
+  assertProviderFinalSubmitProof(proof);
+  const canonical = {
+    adapter: proof.adapter,
+    adapterVersion: proof.adapterVersion,
+    control: proof.control,
+    fields: proof.fields.map((field) => ({ fieldName: field.fieldName })),
+    files: proof.files.map((file) => ({ fieldName: file.fieldName })),
+    form: {
+      enctype: proof.target.enctype,
+      formIdentitySha256: createHash("sha256").update(proof.target.formIdentity).digest("hex"),
+      formTarget: proof.target.formTarget,
+      method: proof.target.method,
+    },
+    partOrder: proof.partOrder.map((entry) => ({
+      index: entry.index,
+      kind: entry.kind,
+    })),
+    schemaVersion: 1,
+  };
+  return createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
+function finalSubmitCertification(
+  value: AtsCertificationAdmission | undefined,
+  providerProof: ProviderFinalSubmitProof,
+): AtsFinalSubmitCertificationProof {
+  if (!value
+    || value.schema_version !== 1
+    || value.provider !== providerProof.adapter
+    || value.adapter_version !== providerProof.adapterVersion
+    || !validVersionId(value.variant_key)
+    || !Number.isSafeInteger(value.layout_contract_version)
+    || value.layout_contract_version <= 0
+    || !validSha256(value.surface_sha256)
+    || value.surface_sha256 !== finalSubmitSurfaceSha256(providerProof)
+    || !Number.isSafeInteger(value.activation_generation)
+    || value.activation_generation <= 0
+    || !Number.isSafeInteger(value.expires_at_ms)
+    || value.expires_at_ms <= 0
+    || !Array.isArray(value.runner_target_sha256s)
+    || value.runner_target_sha256s.length < 1
+    || value.runner_target_sha256s.length > 2) {
+    throw new FinalSubmitProofError();
+  }
+  const digests = [
+    value.manifest_sha256,
+    value.activation_sha256,
+    value.target_key_sha256,
+    value.layout_set_sha256,
+    value.adapter_bundle_sha256,
+    ...value.runner_target_sha256s,
+  ];
+  if (!digests.every(validSha256)
+    || value.runner_target_sha256s.some((digest, index, values) => (
+      index > 0 && values[index - 1] >= digest
+    ))) {
+    throw new FinalSubmitProofError();
+  }
+  return {
+    schemaVersion: 1,
+    provider: value.provider,
+    adapterVersion: value.adapter_version,
+    manifestSha256: value.manifest_sha256,
+    activationSha256: value.activation_sha256,
+    activationGeneration: value.activation_generation,
+    targetKeySha256: value.target_key_sha256,
+    layoutSetSha256: value.layout_set_sha256,
+    adapterBundleSha256: value.adapter_bundle_sha256,
+    runnerTargetSha256s: [...value.runner_target_sha256s],
+    expiresAtMs: value.expires_at_ms,
+  };
+}
+
+function wireCertificationToAdmission(
+  value: unknown,
+  observedSurface: Record<string, unknown>,
+): AtsCertificationAdmission | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const certification = value as Record<string, unknown>;
+  if (!sameKeys(certification, [
+    "activationGeneration",
+    "activationSha256",
+    "adapterBundleSha256",
+    "adapterVersion",
+    "expiresAtMs",
+    "layoutSetSha256",
+    "manifestSha256",
+    "provider",
+    "runnerTargetSha256s",
+    "schemaVersion",
+    "targetKeySha256",
+  ])) return undefined;
+  return {
+    schema_version: certification.schemaVersion as 1,
+    provider: certification.provider as CertifiedFinalSubmitAdapter,
+    adapter_version: certification.adapterVersion as string,
+    variant_key: observedSurface.variantKey as string,
+    layout_contract_version: observedSurface.layoutContractVersion as number,
+    surface_sha256: observedSurface.surfaceSha256 as string,
+    manifest_sha256: certification.manifestSha256 as string,
+    activation_sha256: certification.activationSha256 as string,
+    activation_generation: certification.activationGeneration as number,
+    target_key_sha256: certification.targetKeySha256 as string,
+    layout_set_sha256: certification.layoutSetSha256 as string,
+    adapter_bundle_sha256: certification.adapterBundleSha256 as string,
+    runner_target_sha256s: certification.runnerTargetSha256s as string[],
+    expires_at_ms: certification.expiresAtMs as number,
+  };
 }
 
 function assertFinalSubmitJobProof(

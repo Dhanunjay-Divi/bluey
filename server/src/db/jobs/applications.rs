@@ -803,6 +803,17 @@ fn commit_prepared_application(
                     })
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
+            let ats_certification = match resolve_ats_certification_for_posting_sqlite_tx(
+                &tx,
+                account_id,
+                &current_posting,
+                None,
+                now_ms(),
+            ) {
+                Ok(resolution) => Some(resolution),
+                Err(AtsCertificationAuthorityError::Storage(error)) => return Err(error),
+                Err(_) => None,
+            };
             enforce_application_finalization_eligibility(
                 application,
                 &current_posting,
@@ -810,7 +821,10 @@ fn commit_prepared_application(
                 &preferences,
                 current_track.as_ref(),
                 &reservations,
-                &authorities,
+                ApplicationFinalizationAuthorities {
+                    discovery: &authorities,
+                    ats: ats_certification.as_ref(),
+                },
             )?;
             let current_track = current_track
                 .as_ref()
@@ -1120,6 +1134,17 @@ fn commit_prepared_application(
                     last_seen_run_id: row.get(6),
                 })
                 .collect::<Vec<_>>();
+            let ats_certification = match resolve_ats_certification_for_posting_postgres_tx(
+                &mut tx,
+                account_id,
+                &current_posting,
+                None,
+                now_ms(),
+            ) {
+                Ok(resolution) => Some(resolution),
+                Err(AtsCertificationAuthorityError::Storage(error)) => return Err(error),
+                Err(_) => None,
+            };
             enforce_application_finalization_eligibility(
                 application,
                 &current_posting,
@@ -1127,7 +1152,10 @@ fn commit_prepared_application(
                 &preferences,
                 current_track.as_ref(),
                 &reservations,
-                &authorities,
+                ApplicationFinalizationAuthorities {
+                    discovery: &authorities,
+                    ats: ats_certification.as_ref(),
+                },
             )?;
             let current_track = current_track
                 .as_ref()
@@ -1501,7 +1529,7 @@ pub fn update_application(
             .ok_or_else(|| anyhow::anyhow!("job not found"))?;
         let eligibility =
             evaluate_job_eligibility(pool, account_id, &posting, true, Some(&application.id))?;
-        if !eligibility.can_queue_local {
+        if !eligibility.can_queue_local && !eligibility.can_queue_cloud {
             anyhow::bail!(eligibility_error_message(&eligibility))
         }
         if let Some(receipt) = application.receipt.as_object_mut() {

@@ -118,7 +118,7 @@ export interface ApplicationPacket {
   applicationIdentityId?: string;
   applicationEmail?: string;
   browserProfileId?: string;
-  approvedExecutionSchemaVersion?: 1 | 2;
+  approvedExecutionSchemaVersion?: 1 | 2 | 3;
   approvedExecutionAdmission?:
     | { kind: "review_approval" }
     | {
@@ -127,7 +127,30 @@ export interface ApplicationPacket {
         career_track_id: string;
         revision_no: number;
         authority_fingerprint: string;
+        ats_certification?: AtsCertificationAdmission;
       };
+}
+
+/**
+ * Server-derived ATS authority frozen into an approved schema-v3 Auto-submit
+ * admission. These are opaque content identities, not reusable credentials;
+ * the runner must still obtain and consume a short-lived pre-click binding.
+ */
+export interface AtsCertificationAdmission {
+  schema_version: 1;
+  provider: CertifiedFinalSubmitAdapter;
+  adapter_version: string;
+  variant_key: string;
+  layout_contract_version: number;
+  surface_sha256: string;
+  manifest_sha256: string;
+  activation_sha256: string;
+  activation_generation: number;
+  target_key_sha256: string;
+  layout_set_sha256: string;
+  adapter_bundle_sha256: string;
+  runner_target_sha256s: string[];
+  expires_at_ms: number;
 }
 
 export interface InterventionRequest {
@@ -247,11 +270,42 @@ export interface FinalSubmitJobProof {
   pageUrl: string;
 }
 
-export interface FinalSubmitProof extends ProviderFinalSubmitProof {
+export interface ReviewedFinalSubmitProof extends ProviderFinalSubmitProof {
   schemaVersion: 3;
   job: FinalSubmitJobProof;
   documents: FinalSubmitDocumentProof[];
 }
+
+export interface AtsFinalSubmitCertificationProof {
+  schemaVersion: 1;
+  provider: CertifiedFinalSubmitAdapter;
+  adapterVersion: string;
+  manifestSha256: string;
+  activationSha256: string;
+  activationGeneration: number;
+  targetKeySha256: string;
+  layoutSetSha256: string;
+  adapterBundleSha256: string;
+  runnerTargetSha256s: string[];
+  expiresAtMs: number;
+}
+
+export interface AtsFinalSubmitObservedSurfaceProof {
+  schemaVersion: 1;
+  variantKey: string;
+  layoutContractVersion: number;
+  surfaceSha256: string;
+}
+
+export interface CertifiedFinalSubmitProof extends ProviderFinalSubmitProof {
+  schemaVersion: 4;
+  job: FinalSubmitJobProof;
+  documents: FinalSubmitDocumentProof[];
+  certification: AtsFinalSubmitCertificationProof;
+  observedSurface: AtsFinalSubmitObservedSurfaceProof;
+}
+
+export type FinalSubmitProof = ReviewedFinalSubmitProof | CertifiedFinalSubmitProof;
 
 export interface AdapterContext {
   runner: RunnerKind;
