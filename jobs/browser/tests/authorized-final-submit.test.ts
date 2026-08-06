@@ -14,6 +14,11 @@ import {
 } from "../src/authorized-final-submit.js";
 import { finalSubmitMarkerExists } from "../src/irreversible-submit.js";
 import type { LocalRunDelivery } from "../src/local-run-contracts.js";
+import {
+  localRunCapabilitiesFixture,
+  localRunCapabilityFixture,
+  localRunReleaseFixture,
+} from "./fixtures/local-run-capability.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -33,6 +38,37 @@ describe("authorized final submit", () => {
       runDirectory,
       requestBindings(),
       delivery(Date.now() - 1),
+      await materializedDocuments(runDirectory),
+      currentPageUrl(),
+      fetchMock,
+    );
+
+    await expect(hooks.beforeFinalSubmit(providerProof())).rejects.toMatchObject({
+      code: "launch_expired",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(finalSubmitMarkerExists(runDirectory)).resolves.toBe(false);
+  });
+
+  it("rejects a checkpoint release rebind before live submit authorization", async () => {
+    const runDirectory = await temporaryRunDirectory();
+    const expiresAtMs = Date.now() + 60_000;
+    const fetchMock = vi.fn<FinalSubmitFetch>();
+    const original = delivery(expiresAtMs);
+    const hooks = authorizedFinalSubmitHooks(
+      runDirectory,
+      requestBindings(),
+      {
+        ...original,
+        capabilities: {
+          ...original.capabilities,
+          release: localRunReleaseFixture({
+            activation_sha256: "e".repeat(64),
+            activation_generation: 2,
+            channel_sequence: 2,
+          }),
+        },
+      },
       await materializedDocuments(runDirectory),
       currentPageUrl(),
       fetchMock,
@@ -476,29 +512,12 @@ function applicationPacket(job: NormalizedJob) {
 function delivery(expiresAtMs: number): LocalRunDelivery {
   return {
     apiOrigin: "https://bluey.sh",
-    capabilities: {
-      runId: "run-123",
-      expiresAtMs,
-      result: capability("result", expiresAtMs),
-      resume: capability("resume", expiresAtMs),
-      submit: capability("submit", expiresAtMs),
-    },
+    capabilities: localRunCapabilitiesFixture(expiresAtMs),
   };
 }
 
 function capability(operation: "result" | "resume" | "submit", expiresAtMs: number): string {
-  const payload = Buffer.from(JSON.stringify({
-    version: 1,
-    audience: "bluey-jobs-local-run",
-    account_id: "account-123",
-    application_id: "application-123",
-    run_id: "run-123",
-    browser_profile_id: "profile-123",
-    operation,
-    expires_at_ms: expiresAtMs,
-    nonce: "n".repeat(32),
-  })).toString("base64url");
-  return `${payload}.${"a".repeat(64)}`;
+  return localRunCapabilityFixture(operation, expiresAtMs);
 }
 
 async function temporaryRunDirectory(): Promise<string> {

@@ -707,6 +707,86 @@ export const previewWorkspace: JobsWorkspace = {
       distribution_enabled: true,
       reason: "Bluey Browser is available on this account.",
       next_action: "Approve a packet, then run it on this computer.",
+      release: {
+        status: "available",
+        reason: "The active beta release is available for this account.",
+        channel: "beta",
+        release_id: "browser-release-preview-603",
+        artifact_origin: "https://artifacts.bluey.sh",
+        manifest_sha256: "6c".repeat(32),
+        release_sequence: 1,
+        build_id: "browser-603.1",
+        app_version: "0.1.0",
+        protocol_version: 1,
+        released_at_ms: now - 86_400_000,
+        artifacts: [
+          {
+            platform: "macos",
+            architecture: "arm64",
+            package_kind: "dmg",
+            role: "installer",
+            file_name: "Bluey-Browser-0.1.0-mac-arm64.dmg",
+            url:
+              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
+              "Bluey-Browser-0.1.0-mac-arm64.dmg",
+            size_bytes: 184_320_000,
+            sha256: "72".repeat(32),
+            descriptor_sha256: "8d".repeat(32),
+          },
+          {
+            platform: "macos",
+            architecture: "arm64",
+            package_kind: "zip",
+            role: "updater",
+            file_name: "Bluey-Browser-0.1.0-mac-arm64.zip",
+            url:
+              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
+              "Bluey-Browser-0.1.0-mac-arm64.zip",
+            size_bytes: 183_910_400,
+            sha256: "73".repeat(32),
+            descriptor_sha256: "8d".repeat(32),
+          },
+          {
+            platform: "macos",
+            architecture: "x64",
+            package_kind: "dmg",
+            role: "installer",
+            file_name: "Bluey-Browser-0.1.0-mac-x64.dmg",
+            url:
+              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
+              "Bluey-Browser-0.1.0-mac-x64.dmg",
+            size_bytes: 187_432_960,
+            sha256: "93".repeat(32),
+            descriptor_sha256: "af".repeat(32),
+          },
+          {
+            platform: "macos",
+            architecture: "x64",
+            package_kind: "zip",
+            role: "updater",
+            file_name: "Bluey-Browser-0.1.0-mac-x64.zip",
+            url:
+              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
+              "Bluey-Browser-0.1.0-mac-x64.zip",
+            size_bytes: 187_023_360,
+            sha256: "94".repeat(32),
+            descriptor_sha256: "af".repeat(32),
+          },
+          {
+            platform: "windows",
+            architecture: "x64",
+            package_kind: "exe",
+            role: "installer",
+            file_name: "Bluey-Browser-0.1.0-win-x64.exe",
+            url:
+              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
+              "Bluey-Browser-0.1.0-win-x64.exe",
+            size_bytes: 191_102_976,
+            sha256: "b4".repeat(32),
+            descriptor_sha256: "d1".repeat(32),
+          },
+        ],
+      },
     },
     cloud: {
       status: "available",
@@ -861,6 +941,10 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
             "Bluey Browser is included in your plan but has not been enabled for this release.",
           next_action:
             "Use Review first; Bluey will prepare the exact resume and answers for handoff.",
+          release: {
+            status: "disabled",
+            reason: "Bluey Browser distribution is disabled for this release.",
+          },
         },
         cloud: {
           status: "upgrade_required",

@@ -5,10 +5,19 @@ directories:
   output: release
 files:
   - dist/**
-  - assets/**
+  - assets/icon-128.png
+  - assets/icon-512.png
+  - assets/trayTemplate.png
+  - assets/trayTemplate@2x.png
   - package.json
+  - "!**/*.map"
+  - "!**/.env{,.*}"
+  - "!**/{__tests__,fixtures,test,tests}{,/**}"
+  - "!**/*.{spec,test}.{cjs,js,mjs}"
+  - "!**/fixtures.{cjs,js,mjs}"
   - "!node_modules/@bluey/jobs-automation/src{,/**}"
   - "!node_modules/@bluey/jobs-automation/tests{,/**}"
+  - "!node_modules/@bluey/jobs-automation/dist/**/*.d.ts"
   - "!node_modules/@bluey/jobs-automation/tsconfig.json"
   - "!node_modules/@bluey/jobs-automation/vitest.config.ts"
 extraResources:
@@ -16,7 +25,16 @@ extraResources:
     to: playwright
     filter:
       - "**/*"
+  - from: release-authority
+    to: release
+    filter:
+      - "build-descriptor.txt"
+      - "build-descriptor.sig"
+      - "build-public-keys.json"
 asar: true
+npmRebuild: false
+nodeGypRebuild: false
+buildDependenciesFromSource: false
 asarUnpack:
   - "**/node_modules/playwright*/**"
 protocols:
@@ -26,20 +44,18 @@ protocols:
 mac:
   icon: assets/icon.icns
   category: public.app-category.productivity
+  forceCodeSigning: true
+  notarize: true
   target:
-    - dmg
-    - zip
+    - target: dmg
+    - target: zip
   hardenedRuntime: true
   gatekeeperAssess: false
 win:
   icon: assets/icon.ico
+  forceCodeSigning: true
   target:
-    - nsis
+    - target: nsis
 nsis:
   oneClick: false
   allowToChangeInstallationDirectory: true
-linux:
-  icon: assets/icon-512-linux.png
-  category: Office
-  target:
-    - AppImage

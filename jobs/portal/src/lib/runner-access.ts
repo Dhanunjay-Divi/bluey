@@ -48,7 +48,27 @@ export interface RunnerAccessCopy {
   action: string;
 }
 
-export function localRunnerAccessCopy(access: RunnerChannelAvailability): RunnerAccessCopy {
+export interface LocalBrowserReleaseCopyState {
+  available: boolean;
+  reason: string;
+}
+
+export function localRunnerAccessCopy(
+  access: RunnerChannelAvailability,
+  release?: LocalBrowserReleaseCopyState,
+): RunnerAccessCopy {
+  if (access.available && release && !release.available) {
+    return {
+      badge: "Browser unavailable",
+      description: release.reason,
+      points: [
+        "No download is shown without an exact active release",
+        "Review tailored packets in the portal now",
+        "No local run starts until Browser availability is confirmed",
+      ],
+      action: "Review applications",
+    };
+  }
   if (access.available) {
     return {
       badge: "Enabled",

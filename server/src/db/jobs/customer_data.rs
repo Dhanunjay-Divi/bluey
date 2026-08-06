@@ -2230,9 +2230,9 @@ fn validate_submission_execution_authority_sqlite_tx(
         let Some((stored_ticket_hash, status, expires_at_ms)) = stored else {
             anyhow::bail!("final receipt local execution authority is missing")
         };
-        let active = (matches!(status.as_str(), "claimed" | "needs_input" | "click_started")
+        let active = (matches!(status.as_str(), "claimed" | "needs_input")
             && expires_at_ms > now)
-            || (status == "side_effect_unknown"
+            || (matches!(status.as_str(), "click_started" | "side_effect_unknown")
                 && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
         if execution
             .get("ticketHash")
@@ -2306,9 +2306,9 @@ fn validate_submission_execution_authority_postgres_tx(
         let stored_ticket_hash: String = stored.try_get(0)?;
         let status: String = stored.try_get(1)?;
         let expires_at_ms: i64 = stored.try_get(2)?;
-        let active = (matches!(status.as_str(), "claimed" | "needs_input" | "click_started")
+        let active = (matches!(status.as_str(), "claimed" | "needs_input")
             && expires_at_ms > now)
-            || (status == "side_effect_unknown"
+            || (matches!(status.as_str(), "click_started" | "side_effect_unknown")
                 && expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now);
         if execution
             .get("ticketHash")
@@ -2518,8 +2518,8 @@ pub fn finalize_submission(
                     AND ticket_hash = ?4
                     AND (
                         (expires_at_ms > ?5
-                            AND status IN ('claimed', 'needs_input', 'click_started'))
-                        OR (status = 'side_effect_unknown'
+                            AND status IN ('claimed', 'needs_input'))
+                        OR (status IN ('click_started', 'side_effect_unknown')
                             AND expires_at_ms + ?6 > ?5)
                     )",
                 params![
@@ -2700,8 +2700,8 @@ pub fn finalize_submission(
                     AND ticket_hash = $4
                     AND (
                         (expires_at_ms > $5
-                            AND status IN ('claimed', 'needs_input', 'click_started'))
-                        OR (status = 'side_effect_unknown'
+                            AND status IN ('claimed', 'needs_input'))
+                        OR (status IN ('click_started', 'side_effect_unknown')
                             AND expires_at_ms + $6 > $5)
                     )",
                 &[

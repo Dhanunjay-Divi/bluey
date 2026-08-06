@@ -661,6 +661,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .launch-steps p { display: grid; gap: 3px; }
 .launch-steps b { font-size: 11px; }
 .launch-steps small { color: var(--muted); font-size: 10px; }
+.browser-architecture-choice { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+.browser-architecture-choice .button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .cloud-queue-list { padding: 18px 20px; display: grid; gap: 8px; }
 .cloud-queue-list > button { min-height: 60px; padding: 9px; display: grid; grid-template-columns: 36px minmax(0, 1fr) 24px; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); text-align: left; }
 .cloud-queue-list > button > span { min-width: 0; display: grid; gap: 3px; }

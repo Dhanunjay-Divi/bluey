@@ -11,6 +11,10 @@ import {
   LocalCheckpointStore,
   type LocalRunCheckpoint,
 } from "../src/local-checkpoint-store.js";
+import {
+  legacyLocalRunCapabilitiesFixture,
+  localRunReleaseFixture,
+} from "./fixtures/local-run-capability.js";
 
 const temporaryDirectories: string[] = [];
 const execFileAsync = promisify(execFile);
@@ -102,12 +106,15 @@ describe("encrypted local browser checkpoints", () => {
     const root = await temporaryDirectory();
     const store = await LocalCheckpointStore.open(root);
     const checkpoint = fixture();
-    delete checkpoint.delivery.capabilities.submit;
+    checkpoint.delivery.capabilities = legacyLocalRunCapabilitiesFixture(
+      checkpoint.expiresAtMs,
+    );
     const scope = store.scopeFor(checkpoint.request);
     await store.write(checkpoint);
 
     const restored = await store.read(scope);
-    expect(restored?.delivery.capabilities.submit).toBeUndefined();
+    expect(restored?.delivery.capabilities.release).toBeUndefined();
+    expect(restored?.delivery.capabilities.submit).toBeDefined();
     expect(() => scopedLocalRunAuthorization(
       restored!.delivery.capabilities,
       "submit",
@@ -226,6 +233,7 @@ function fixture(requestOverrides: Record<string, unknown> = {}): LocalRunCheckp
         submit: "scoped-submit-capability",
         expiresAtMs,
         runId: String(requestOverrides.runId || "run-123"),
+        release: localRunReleaseFixture(),
       },
     },
     browser: { url: "https://jobs.example.test/apply/review" },

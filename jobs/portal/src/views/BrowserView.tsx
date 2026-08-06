@@ -16,13 +16,47 @@ import {
   ShieldCheck,
   WifiOff,
 } from "lucide-react";
-import type { Intervention, JobApplication, JobsWorkspace } from "../types";
+import type {
+  Intervention,
+  JobApplication,
+  JobsWorkspace,
+  LocalBrowserReleaseArchitecture,
+  RunnerChannelAvailability,
+} from "../types";
 import { isFinalSubmissionReview, runnerEligibleApplications } from "../lib/application-flow";
-import { relativeTime, titleCase } from "../lib/format";
+import {
+  detectLocalBrowserTarget,
+  exactByteSize,
+  localBrowserReleaseAuthorized,
+  localBrowserReleasePresentation,
+  selectMacBrowserArchitecture,
+  targetLabel,
+  type LocalBrowserClientTarget,
+} from "../lib/browser-release";
+import { titleCase } from "../lib/format";
 import { cloudRunnerAccessCopy, localRunnerAccessCopy } from "../lib/runner-access";
 import { Dialog } from "../components/Dialog";
 
-export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSession, onResolveIntervention }: { workspace: JobsWorkspace; onQueueLocal(application: JobApplication): Promise<void>; onQueueCloud(application: JobApplication): Promise<void>; onUpdateSession(session: JobsWorkspace["browser_sessions"][number], status: string): Promise<void>; onResolveIntervention(intervention: Intervention, action: string): Promise<void> }) {
+interface BrowserViewProps {
+  workspace: JobsWorkspace;
+  browserTarget?: LocalBrowserClientTarget;
+  onQueueLocal(application: JobApplication): Promise<void>;
+  onQueueCloud(application: JobApplication): Promise<void>;
+  onUpdateSession(
+    session: JobsWorkspace["browser_sessions"][number],
+    status: string,
+  ): Promise<void>;
+  onResolveIntervention(intervention: Intervention, action: string): Promise<void>;
+}
+
+export function BrowserView({
+  workspace,
+  browserTarget,
+  onQueueLocal,
+  onQueueCloud,
+  onUpdateSession,
+  onResolveIntervention,
+}: BrowserViewProps) {
   const [installOpen, setInstallOpen] = useState(false);
   const [localOpen, setLocalOpen] = useState(false);
   const [cloudOpen, setCloudOpen] = useState(false);
@@ -41,7 +75,15 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   const queuedApplications = runnerEligibleApplications(workspace.applications);
   const localAccess = workspace.runner_availability.local;
   const cloudAccess = workspace.runner_availability.cloud;
-  const localCopy = localRunnerAccessCopy(localAccess);
+  const localTarget = browserTarget ?? detectLocalBrowserTarget();
+  const localRelease = localBrowserReleasePresentation(localAccess, localTarget);
+  const localReleaseAvailable = localBrowserReleaseAuthorized(localAccess, localTarget);
+  const localCopy = localRunnerAccessCopy(localAccess, {
+    available: localReleaseAvailable,
+    reason: localReleaseAvailable || localRelease.status === "available"
+      ? localAccess.reason
+      : localRelease.message,
+  });
   const cloudCopy = cloudRunnerAccessCopy(cloudAccess);
 
   const updateActiveSession = async () => {
@@ -71,6 +113,14 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
   };
 
   const queue = async (application: JobApplication, runner: "local" | "cloud") => {
+    if (runner === "local" && !localReleaseAvailable) {
+      setLocalError(
+        localRelease.status === "hidden"
+          ? localRelease.message
+          : "Bluey Browser is not available for this computer.",
+      );
+      return;
+    }
     setQueueing(application.id);
     setLocalError("");
     try {
@@ -123,10 +173,45 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       )}
 
       <section className="runner-grid">
-        <article className={`runner-option ${localAccess.available ? "enabled" : "locked"}`}>
+        <article className={`runner-option ${localReleaseAvailable ? "enabled" : "locked"}`}>
           <div className="runner-icon"><Laptop /></div>
-          <div className="runner-copy"><p>LOCAL</p><h2>Bluey Browser</h2><span>{localCopy.description}</span><ul>{localCopy.points.map((point) => <li key={point}><Check size={14} />{point}</li>)}</ul></div>
-          <div className="runner-action"><b>{localCopy.badge}</b>{localAccess.available ? <><button className="button primary" onClick={() => setLocalOpen(true)}>{localCopy.action}<ArrowRight size={16} /></button><button className="button secondary compact" onClick={() => setInstallOpen(true)}>Set up browser</button></> : <a className="button secondary" href={localAccess.status === "upgrade_required" ? "/jobs/settings#plans" : "/jobs/applications"}>{localCopy.action}<ArrowRight size={16} /></a>}</div>
+          <div className="runner-copy">
+            <p>LOCAL</p>
+            <h2>Bluey Browser</h2>
+            <span>{localCopy.description}</span>
+            <ul>
+              {localCopy.points.map((point) => (
+                <li key={point}><Check size={14} />{point}</li>
+              ))}
+            </ul>
+          </div>
+          <div className="runner-action">
+            <b>{localCopy.badge}</b>
+            {localReleaseAvailable ? (
+              <>
+                <button className="button primary" onClick={() => setLocalOpen(true)}>
+                  {localCopy.action}<ArrowRight size={16} />
+                </button>
+                <button
+                  className="button secondary compact"
+                  onClick={() => setInstallOpen(true)}
+                >
+                  Set up browser
+                </button>
+              </>
+            ) : (
+              <a
+                className="button secondary"
+                href={
+                  localAccess.status === "upgrade_required"
+                    ? "/jobs/settings#plans"
+                    : "/jobs/applications"
+                }
+              >
+                {localCopy.action}<ArrowRight size={16} />
+              </a>
+            )}
+          </div>
         </article>
         <article className={`runner-option ${cloudAccess.available ? "enabled" : "locked"}`}>
           <div className="runner-icon cloud"><Cloud /></div>
@@ -142,8 +227,11 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
       </section>
 
       <Dialog open={installOpen} title="Open Bluey Browser" description="A separate application profile keeps job-site sessions away from your everyday browser." onClose={() => setInstallOpen(false)}>
-        <div className="launch-steps"><div><span>1</span><p><b>Install Bluey Browser</b><small>Available after local runner beta access is enabled for your account.</small></p><a className="button secondary compact" href="/download">Download<ExternalLink size={14} /></a></div><div><span>2</span><p><b>Sign in with Bluey</b><small>The browser links to this Jobs workspace and stores its profile locally.</small></p></div><div><span>3</span><p><b>Start from Applications</b><small>Review an application, then choose the local runner.</small></p></div></div>
-        <div className="dialog-actions"><button className="button secondary" onClick={() => setInstallOpen(false)}>Close</button><a className="button primary" href="bluey-jobs://open"><Chrome size={16} />Open Bluey Browser</a></div>
+        <BrowserInstallContent
+          access={localAccess}
+          target={localTarget}
+          onClose={() => setInstallOpen(false)}
+        />
       </Dialog>
 
       <Dialog open={cloudOpen} title="Queue a cloud application" description="Cloud runs start only after a packet is approved or marked Auto-submit eligible." onClose={() => setCloudOpen(false)}>
@@ -165,6 +253,119 @@ export function BrowserView({ workspace, onQueueLocal, onQueueCloud, onUpdateSes
         <div className="dialog-actions"><button className="button secondary" disabled={resolving} onClick={() => setApprovalOpen(false)}>Cancel</button><button className="button primary" disabled={!reviewConfirmed || resolving || !intervention} onClick={() => { if (intervention) void resolve(intervention, "approve_submission", true); }}><ShieldCheck size={16} />{resolving ? "Submitting..." : "Approve and submit"}</button></div>
       </Dialog>
     </div>
+  );
+}
+
+interface BrowserInstallContentProps {
+  access: RunnerChannelAvailability;
+  target: LocalBrowserClientTarget;
+  onClose(): void;
+}
+
+export function BrowserInstallContent({
+  access,
+  target,
+  onClose,
+}: BrowserInstallContentProps) {
+  const [selectedMacArchitecture, setSelectedMacArchitecture] =
+    useState<LocalBrowserReleaseArchitecture | null>(null);
+  const needsMacArchitectureChoice =
+    target.platform === "macos" && target.architecture === "unknown";
+  const selectedTarget: LocalBrowserClientTarget =
+    needsMacArchitectureChoice && selectedMacArchitecture
+      ? selectMacBrowserArchitecture(target, selectedMacArchitecture)
+      : target;
+  const presentation = localBrowserReleasePresentation(access, selectedTarget);
+
+  return (
+    <>
+      <div className="launch-steps" data-release-status={presentation.status}>
+        <div>
+          <span>1</span>
+          <p>
+            <b>Install Bluey Browser</b>
+            {presentation.status === "available" ? (
+              <>
+                <small>
+                  Version: {presentation.release.app_version} · Channel: {presentation.release.channel}
+                </small>
+                <small>
+                  {presentation.artifact.file_name} · {exactByteSize(presentation.artifact.size_bytes)}
+                </small>
+                <small>SHA-256: {presentation.artifact.sha256}</small>
+              </>
+            ) : (
+              <small role="status">{presentation.message}</small>
+            )}
+            {needsMacArchitectureChoice && (
+              <small>
+                Check About This Mac: Apple silicon says M1 or newer; Intel models say Intel.
+              </small>
+            )}
+          </p>
+          {needsMacArchitectureChoice && (
+            <div
+              aria-label="Choose your Mac processor"
+              className="browser-architecture-choice"
+              role="group"
+            >
+              <button
+                aria-pressed={selectedMacArchitecture === "arm64"}
+                className="button secondary compact"
+                data-browser-architecture="arm64"
+                type="button"
+                onClick={() => setSelectedMacArchitecture("arm64")}
+              >
+                Apple silicon
+              </button>
+              <button
+                aria-pressed={selectedMacArchitecture === "x64"}
+                className="button secondary compact"
+                data-browser-architecture="x64"
+                type="button"
+                onClick={() => setSelectedMacArchitecture("x64")}
+              >
+                Intel Mac
+              </button>
+            </div>
+          )}
+          {presentation.status === "available" && (
+            <a
+              className="button secondary compact"
+              data-browser-download="exact-release-artifact"
+              download={presentation.artifact.file_name}
+              href={presentation.artifact.url}
+            >
+              Download for {targetLabel(selectedTarget)}
+              <ExternalLink size={14} />
+            </a>
+          )}
+        </div>
+        <div>
+          <span>2</span>
+          <p>
+            <b>Sign in with Bluey</b>
+            <small>The browser links to this Jobs workspace and stores its profile locally.</small>
+          </p>
+        </div>
+        <div>
+          <span>3</span>
+          <p>
+            <b>Start from Applications</b>
+            <small>Review an application, then choose the local runner.</small>
+          </p>
+        </div>
+      </div>
+      <div className="dialog-actions">
+        <button className="button secondary" onClick={onClose}>Close</button>
+        {presentation.status === "available" && (
+          <a className="button primary" href="bluey-jobs://open">
+            <Chrome size={16} />
+            Open Bluey Browser
+          </a>
+        )}
+      </div>
+    </>
   );
 }
 

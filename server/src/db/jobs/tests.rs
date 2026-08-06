@@ -340,6 +340,143 @@ mod tests {
     }
 
     #[test]
+    fn postgres_browser_release_readers_lock_registry_before_authority_checks() {
+        let claim_source = include_str!("browser_release_authority.rs");
+        let claim = claim_source
+            .split("fn postgres_claim_local_run_with_browser_release")
+            .nth(1)
+            .expect("PostgreSQL Browser claim implementation")
+            .split("fn postgres_lock_browser_release_registry_shared")
+            .next()
+            .expect("bounded PostgreSQL Browser claim implementation");
+        let ticket = claim
+            .find("postgres_local_run_authority")
+            .expect("ticket authority before registry lock");
+        let reservation = claim
+            .find("reservation_status")
+            .expect("reservation authority before registry lock");
+        let shared_lock = claim
+            .find("postgres_lock_browser_release_registry_shared(tx)")
+            .expect("shared registry lock");
+        let release = claim
+            .find("postgres_browser_release_for_claim_tx")
+            .expect("release authority after registry lock");
+        assert!(ticket < reservation && reservation < shared_lock && shared_lock < release);
+
+        let submit_source = include_str!("local_runner.rs");
+        let submit = submit_source
+            .split("pub fn claim_authorized_local_run_ticket")
+            .nth(1)
+            .expect("pre-click submit implementation")
+            .split("fn sqlite_local_run_authority")
+            .next()
+            .expect("bounded pre-click submit implementation");
+        let ticket = submit
+            .find("postgres_local_run_authority")
+            .expect("ticket authority before registry lock");
+        let shared_lock = submit
+            .find("postgres_lock_browser_release_registry_shared(&mut tx)")
+            .expect("shared registry lock");
+        let release = submit
+            .find("postgres_bound_browser_release_submit_allowed")
+            .expect("bound release authority after registry lock");
+        let capacity = submit
+            .find("reserve_submission_evidence_capacity_postgres_tx")
+            .expect("capacity reservation after release authority");
+        assert!(ticket < shared_lock && shared_lock < release && release < capacity);
+
+        let availability = claim_source
+            .split("pub fn local_browser_release_availability")
+            .nth(1)
+            .expect("Browser release availability implementation")
+            .split("fn sqlite_local_browser_release_availability")
+            .next()
+            .expect("bounded Browser release availability implementation");
+        assert!(availability.contains("transaction_with_behavior(TransactionBehavior::Immediate)",));
+        let shared_lock = availability
+            .find("postgres_lock_browser_release_registry_shared(&mut transaction)")
+            .expect("availability shared registry lock");
+        let release = availability
+            .find("postgres_local_browser_release_availability(")
+            .expect("availability query after registry lock");
+        assert!(shared_lock < release);
+    }
+
+    #[test]
+    fn browser_release_origin_and_artifact_contract_have_sqlite_postgres_source_parity() {
+        let authority = include_str!("browser_release_authority.rs");
+        for (start, end, contract, origin) in [
+            (
+                "fn sqlite_local_browser_release_availability",
+                "fn postgres_local_browser_release_availability",
+                "browser_portal_artifact_set_complete",
+                "browser_portal_policy_artifact_origin",
+            ),
+            (
+                "fn postgres_local_browser_release_availability",
+                "fn browser_portal_policy_artifact_origin",
+                "browser_portal_artifact_set_complete",
+                "browser_portal_policy_artifact_origin",
+            ),
+            (
+                "fn sqlite_browser_release_for_claim_tx",
+                "fn postgres_browser_release_for_claim_tx",
+                "browser_release_claim_artifact_set_matches_policy",
+                "browser_release_claim_policy_artifact_origin",
+            ),
+            (
+                "fn postgres_browser_release_for_claim_tx",
+                "fn browser_activation_accepts_server",
+                "browser_release_claim_artifact_set_matches_policy",
+                "browser_release_claim_policy_artifact_origin",
+            ),
+        ] {
+            let operation = authority
+                .split(start)
+                .nth(1)
+                .expect("Browser release authority implementation")
+                .split(end)
+                .next()
+                .expect("bounded Browser release authority implementation");
+            assert!(operation.contains("app_content_sha256"));
+            assert!(operation.contains(contract));
+            assert!(operation.contains(origin));
+        }
+
+        let registry = include_str!("browser_release_registry.rs");
+        for (start, end) in [
+            (
+                "fn sqlite_browser_release_artifact_set_complete",
+                "fn postgres_browser_release_artifact_set_complete",
+            ),
+            (
+                "fn postgres_browser_release_artifact_set_complete",
+                "fn sqlite_browser_release_channel_status_tx",
+            ),
+        ] {
+            let operation = registry
+                .split(start)
+                .nth(1)
+                .expect("Browser registry artifact implementation")
+                .split(end)
+                .next()
+                .expect("bounded Browser registry artifact implementation");
+            assert!(operation.contains("app_content_sha256"));
+            assert!(operation.contains("artifact_url"));
+            assert!(operation.contains("browser_artifact_contract_complete"));
+        }
+        assert_eq!(
+            registry
+                .matches(
+                    "require_stored_browser_release_manifest_artifact_origin(&manifest, &policy)?",
+                )
+                .count(),
+            4,
+            "fresh SQLite/PostgreSQL activation import/apply paths must share the origin gate",
+        );
+    }
+
+    #[test]
     fn sponsorship_detection_never_treats_explicit_rejections_as_offers() {
         let mut posting = test_posting("https://jobs.example.com/role", now_ms(), now_ms());
         for rejection in [
@@ -2649,7 +2786,7 @@ mod tests {
         }
     }
 
-    fn local_run_authority_fixture(
+    fn local_run_authority_fixture_unbound(
         pool: &DbPool,
         suffix: &str,
     ) -> (JobApplication, String, String, String) {
@@ -2794,11 +2931,904 @@ mod tests {
         (application, run_id, ticket_hash, identity_id)
     }
 
+    fn local_run_authority_fixture(
+        pool: &DbPool,
+        suffix: &str,
+    ) -> (JobApplication, String, String, String) {
+        let fixture = local_run_authority_fixture_unbound(pool, suffix);
+        seed_test_local_browser_release_binding(pool, &fixture.0.id, &fixture.1);
+        fixture
+    }
+
+    #[derive(Debug, Clone)]
+    struct TestBrowserReleaseAuthority {
+        manifest_sha256: String,
+        artifact_sha256: String,
+        descriptor_sha256: String,
+        activation_sha256: String,
+        manifest_signature_set_sha256: String,
+        activation_signature_set_sha256: String,
+        policy_sha256: String,
+        policy_signature_set_sha256: String,
+        transition_sha256: String,
+        assignment_sha256: String,
+        signature: String,
+    }
+
+    fn test_browser_release_policy_fixture() -> (String, String) {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../../../jobs/browser/fixtures/release-authority-v1.json"
+        ))
+        .expect("parse shared Browser release fixture");
+        let canonical = fixture
+            .pointer("/trustPolicy/canonical")
+            .and_then(Value::as_str)
+            .expect("shared Browser release policy canonical bytes");
+        let sha256 = fixture
+            .pointer("/trustPolicy/sha256")
+            .and_then(Value::as_str)
+            .expect("shared Browser release policy digest");
+        (canonical.to_string(), sha256.to_string())
+    }
+
+    fn test_browser_release_authority_ids() -> TestBrowserReleaseAuthority {
+        let (_, policy_sha256) = test_browser_release_policy_fixture();
+        TestBrowserReleaseAuthority {
+            manifest_sha256: "1".repeat(64),
+            artifact_sha256: "2".repeat(64),
+            descriptor_sha256: "3".repeat(64),
+            activation_sha256: "4".repeat(64),
+            manifest_signature_set_sha256: "5".repeat(64),
+            activation_signature_set_sha256: "b".repeat(64),
+            policy_sha256,
+            policy_signature_set_sha256: "a".repeat(64),
+            transition_sha256: "c".repeat(64),
+            assignment_sha256: "6".repeat(64),
+            signature: "A".repeat(86),
+        }
+    }
+
+    fn seed_test_browser_release_authority_rows(pool: &DbPool) -> TestBrowserReleaseAuthority {
+        let authority = test_browser_release_authority_ids();
+        let (canonical_policy_base64url, _) = test_browser_release_policy_fixture();
+        let connection = pool.get().unwrap();
+
+        for (
+            signature_set_id,
+            signature_set_sha256,
+            role,
+            target_audience,
+            target_sha256,
+            signer_key_id,
+        ) in [
+            (
+                "test-policy-signatures",
+                authority.policy_signature_set_sha256.as_str(),
+                "root",
+                "bluey-jobs-browser-release-trust-policy-v1",
+                authority.policy_sha256.as_str(),
+                "test-root-key",
+            ),
+            (
+                "test-manifest-signatures",
+                authority.manifest_signature_set_sha256.as_str(),
+                "release",
+                "bluey-jobs-browser-release-manifest-v1",
+                authority.manifest_sha256.as_str(),
+                "test-build-key",
+            ),
+            (
+                "test-activation-signatures",
+                authority.activation_signature_set_sha256.as_str(),
+                "promotion",
+                "bluey-jobs-browser-release-activation-v1",
+                authority.activation_sha256.as_str(),
+                "test-promotion-key",
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO jobs_browser_release_signature_sets (
+                        signature_set_sha256, signature_set_id, trust_generation,
+                        role, target_audience, target_sha256, signed_at_ms,
+                        signature_count, canonical_signature_set_base64url,
+                        recorded_by, recorded_at_ms
+                     ) VALUES (
+                        ?1, ?2, 1, ?3, ?4, ?5, 1, 1, 'dGVzdA',
+                        'test-suite', 1
+                     )",
+                    params![
+                        signature_set_sha256,
+                        signature_set_id,
+                        role,
+                        target_audience,
+                        target_sha256,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO jobs_browser_release_signatures (
+                        signature_set_sha256, key_id, signature_base64url
+                     ) VALUES (?1, ?2, ?3)",
+                    params![signature_set_sha256, signer_key_id, authority.signature],
+                )
+                .unwrap();
+        }
+
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_release_trust_policies (
+                    policy_sha256, policy_id, trust_generation,
+                    predecessor_policy_sha256, predecessor_trust_generation,
+                    root_threshold, release_threshold, promotion_threshold,
+                    incident_threshold, key_count, canonical_policy_base64url,
+                    authorization_signature_set_sha256, issued_at_ms,
+                    valid_from_ms, expires_at_ms, recorded_by, recorded_at_ms
+                 ) VALUES (
+                    ?1, 'test-policy', 1, NULL, 0, 1, 1, 1, 1, 4,
+                    ?2, ?3, 1, 0, 9007199254740991, 'test-suite', 1
+                 )",
+                params![
+                    authority.policy_sha256,
+                    canonical_policy_base64url,
+                    authority.policy_signature_set_sha256
+                ],
+            )
+            .unwrap();
+        for (key_id, role) in [
+            ("test-root-key", "root"),
+            ("test-build-key", "release"),
+            ("test-promotion-key", "promotion"),
+            ("test-incident-key", "incident"),
+        ] {
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO jobs_browser_release_trust_keys (
+                        policy_sha256, trust_generation, key_id, role,
+                        public_key_base64url, state, valid_from_ms, valid_until_ms,
+                        minimum_trust_generation, maximum_trust_generation
+                     ) VALUES (
+                        ?1, 1, ?2, ?3, ?4, 'active', 0, 9007199254740991,
+                        1, 9007199254740991
+                     )",
+                    params![authority.policy_sha256, key_id, role, "A".repeat(43)],
+                )
+                .unwrap();
+        }
+
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_release_manifests (
+                    manifest_sha256, manifest_id, manifest_generation, release_id,
+                    release_sequence, build_id, app_version, protocol_version,
+                    source_commit, electron_version, playwright_version,
+                    chromium_revision, release_notes_url, artifact_count,
+                    canonical_manifest_base64url,
+                    authorization_signature_set_sha256, published_at_ms,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (
+                    ?1, 'test-manifest', 1, 'test-release', 1, 'browser-1.0',
+                    '1.0.0', 1, ?2, '43.1.0', '1.61.1', '1228',
+                    'https://bluey.sh/jobs/browser/releases/test-release/RELEASE.md',
+                    5, 'dGVzdA', ?3, 1, 'test-suite', 1
+                 )",
+                params![
+                    authority.manifest_sha256,
+                    "a".repeat(40),
+                    authority.manifest_signature_set_sha256,
+                ],
+            )
+            .unwrap();
+        seed_test_additional_browser_release_artifacts(
+            &connection,
+            &authority.manifest_sha256,
+            &authority.signature,
+        );
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_release_artifacts (
+                    artifact_id, manifest_sha256, platform, architecture,
+                    package_kind, build_descriptor_sha256,
+                    build_descriptor_base64url,
+                    build_descriptor_signature_base64url,
+                    build_descriptor_signing_key_id, artifact_url,
+                    artifact_filename, artifact_size_bytes, artifact_sha256,
+                    app_content_sha256, verification_evidence_sha256,
+                    native_signature_kind, native_signer_identity, recorded_at_ms
+                 ) VALUES (
+                    'test-artifact', ?1, 'darwin', 'arm64', 'darwin-dmg', ?2,
+                    'dGVzdA', ?3, 'test-build-key',
+                    'https://bluey.sh/jobs/browser/releases/test-release/Bluey-Browser.dmg',
+                    'Bluey-Browser.dmg', 1, ?4, ?5, ?6,
+                    'apple-developer-id', 'TESTTEAM', 1
+                 )",
+                params![
+                    authority.manifest_sha256,
+                    authority.descriptor_sha256,
+                    authority.signature,
+                    authority.artifact_sha256,
+                    "8".repeat(64),
+                    "9".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_release_activations (
+                    activation_sha256, activation_id, activation_generation,
+                    trust_generation, channel, channel_sequence, manifest_sha256,
+                    manifest_signature_set_sha256,
+                    authorization_signature_set_sha256,
+                    accepted_server_release_ids_json, canary_evidence_sha256,
+                    canonical_activation_base64url, issued_at_ms, expires_at_ms,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (
+                    ?1, 'test-activation', 1, 1, 'beta', 1, ?2, ?3, ?4,
+                    '[\"test-server\"]', ?5, 'dGVzdA', 1,
+                    9007199254740991, 'test-suite', 1
+                 )",
+                params![
+                    authority.activation_sha256,
+                    authority.manifest_sha256,
+                    authority.manifest_signature_set_sha256,
+                    authority.activation_signature_set_sha256,
+                    "c".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_release_channel_transitions (
+                    transition_sha256, channel, head_revision,
+                    previous_head_revision, previous_transition_sha256,
+                    previous_activation_sha256, previous_manifest_sha256,
+                    previous_trust_generation, previous_channel_sequence,
+                    next_activation_sha256, next_manifest_sha256,
+                    next_trust_generation, next_channel_sequence,
+                    transition_kind, authority_sha256,
+                    rollback_authority_sha256, recorded_by, recorded_at_ms
+                 ) VALUES (
+                    ?1, 'beta', 1, 0, NULL, NULL, NULL, NULL, NULL,
+                    ?2, ?3, 1, 1, 'activation', ?2, NULL, 'test-suite', 1
+                 )",
+                params![
+                    authority.transition_sha256,
+                    authority.activation_sha256,
+                    authority.manifest_sha256,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_release_channel_heads (
+                    channel, head_revision, current_transition_sha256,
+                    current_activation_sha256, current_manifest_sha256,
+                    current_trust_generation, current_channel_sequence,
+                    updated_at_ms
+                 ) VALUES ('beta', 1, ?1, ?2, ?3, 1, 1, 1)",
+                params![
+                    authority.transition_sha256,
+                    authority.activation_sha256,
+                    authority.manifest_sha256,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO jobs_browser_account_channel_assignments (
+                    assignment_sha256, account_id, assignment_generation,
+                    predecessor_assignment_sha256, predecessor_generation, channel,
+                    reason_ref, assigned_by, assigned_at_ms
+                 ) VALUES (?1, 'acct-jobs', 1, NULL, 0, 'beta',
+                    'test-fixture', 'test-suite', 1)",
+                params![authority.assignment_sha256],
+            )
+            .unwrap();
+        authority
+    }
+
+    fn rotate_test_browser_release_artifact_origin(pool: &DbPool, artifact_origin: &str) {
+        let authority = test_browser_release_authority_ids();
+        let (canonical_policy_base64url, _) = test_browser_release_policy_fixture();
+        let canonical_policy = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(canonical_policy_base64url)
+            .expect("decode test Browser policy");
+        let mut policy = parse_canonical_browser_release_trust_policy(&canonical_policy)
+            .expect("parse test Browser policy");
+        policy.policy_id = "test-policy-origin-2".to_string();
+        policy.trust_generation = 2;
+        policy.predecessor_policy_sha256 = Some(authority.policy_sha256.clone());
+        policy.artifact_origin = artifact_origin.to_string();
+        policy.issued_at_ms += 1;
+        let canonical = canonical_browser_release_json(&policy).expect("canonical origin policy");
+        let policy_sha256 = browser_release_authority_sha256(&canonical);
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(canonical);
+        let root_threshold = policy
+            .roles
+            .iter()
+            .find(|role| role.role == "root")
+            .expect("root role")
+            .threshold;
+        let release_threshold = policy
+            .roles
+            .iter()
+            .find(|role| role.role == "release")
+            .expect("release role")
+            .threshold;
+        let promotion_threshold = policy
+            .roles
+            .iter()
+            .find(|role| role.role == "promotion")
+            .expect("promotion role")
+            .threshold;
+        let incident_threshold = policy
+            .roles
+            .iter()
+            .find(|role| role.role == "incident")
+            .expect("incident role")
+            .threshold;
+        let connection = pool.get().expect("get test origin rotation connection");
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_trust_policies (
+                    policy_sha256, policy_id, trust_generation,
+                    predecessor_policy_sha256, predecessor_trust_generation,
+                    root_threshold, release_threshold, promotion_threshold,
+                    incident_threshold, key_count, canonical_policy_base64url,
+                    authorization_signature_set_sha256, issued_at_ms,
+                    valid_from_ms, expires_at_ms, recorded_by, recorded_at_ms
+                 ) VALUES (?1, ?2, 2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                           ?11, ?12, ?13, 'test-suite', ?14)",
+                params![
+                    policy_sha256,
+                    policy.policy_id,
+                    authority.policy_sha256,
+                    root_threshold,
+                    release_threshold,
+                    promotion_threshold,
+                    incident_threshold,
+                    i64::try_from(policy.keys.len()).unwrap(),
+                    encoded,
+                    authority.policy_signature_set_sha256,
+                    policy.issued_at_ms,
+                    policy.valid_from_ms,
+                    policy.expires_at_ms,
+                    now_ms(),
+                ],
+            )
+            .expect("insert current origin policy");
+        for key in &policy.keys {
+            connection
+                .execute(
+                    "INSERT INTO jobs_browser_release_trust_keys (
+                        policy_sha256, trust_generation, key_id, role,
+                        public_key_base64url, state, valid_from_ms, valid_until_ms,
+                        minimum_trust_generation, maximum_trust_generation
+                     ) VALUES (?1, 2, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![
+                        policy_sha256,
+                        key.key_id,
+                        key.role,
+                        key.public_key,
+                        key.state,
+                        key.valid_from_ms,
+                        key.valid_until_ms,
+                        key.minimum_trust_generation,
+                        key.maximum_trust_generation,
+                    ],
+                )
+                .expect("insert current origin policy key");
+        }
+
+        let activation_sha256 = hex::encode(Sha256::digest(b"test-origin-activation-2"));
+        let transition_sha256 = hex::encode(Sha256::digest(b"test-origin-transition-2"));
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_activations (
+                    activation_sha256, activation_id, activation_generation,
+                    trust_generation, channel, channel_sequence, manifest_sha256,
+                    manifest_signature_set_sha256,
+                    authorization_signature_set_sha256,
+                    accepted_server_release_ids_json, canary_evidence_sha256,
+                    canonical_activation_base64url, issued_at_ms, expires_at_ms,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (?1, 'test-origin-activation-2', 2, 2, 'beta', 2, ?2,
+                           ?3, ?4, '[\"test-server\"]', ?5, 'dGVzdA', ?6,
+                           9007199254740991, 'test-suite', ?7)",
+                params![
+                    activation_sha256,
+                    authority.manifest_sha256,
+                    authority.manifest_signature_set_sha256,
+                    authority.activation_signature_set_sha256,
+                    "d".repeat(64),
+                    policy.issued_at_ms,
+                    now_ms(),
+                ],
+            )
+            .expect("insert current origin activation");
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_channel_transitions (
+                    transition_sha256, channel, head_revision,
+                    previous_head_revision, previous_transition_sha256,
+                    previous_activation_sha256, previous_manifest_sha256,
+                    previous_trust_generation, previous_channel_sequence,
+                    next_activation_sha256, next_manifest_sha256,
+                    next_trust_generation, next_channel_sequence,
+                    transition_kind, authority_sha256, rollback_authority_sha256,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (?1, 'beta', 2, 1, ?2, ?3, ?4, 1, 1, ?5, ?4, 2, 2,
+                           'activation', ?5, NULL, 'test-suite', ?6)",
+                params![
+                    transition_sha256,
+                    authority.transition_sha256,
+                    authority.activation_sha256,
+                    authority.manifest_sha256,
+                    activation_sha256,
+                    now_ms(),
+                ],
+            )
+            .expect("insert current origin transition");
+        connection
+            .execute(
+                "UPDATE jobs_browser_release_channel_heads
+                    SET head_revision = 2, current_transition_sha256 = ?1,
+                        current_activation_sha256 = ?2, current_trust_generation = 2,
+                        current_channel_sequence = 2, updated_at_ms = ?3
+                  WHERE channel = 'beta' AND head_revision = 1",
+                params![transition_sha256, activation_sha256, now_ms()],
+            )
+            .expect("advance current origin head");
+    }
+
+    fn advance_test_browser_release_channel_head(pool: &DbPool) {
+        let authority = test_browser_release_authority_ids();
+        let next_activation_sha256 = hex::encode(Sha256::digest(b"test-next-activation"));
+        let next_signature_set_sha256 =
+            hex::encode(Sha256::digest(b"test-next-activation-signatures"));
+        let next_transition_sha256 = hex::encode(Sha256::digest(b"test-next-transition"));
+        let connection = pool.get().unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_signature_sets (
+                    signature_set_sha256, signature_set_id, trust_generation,
+                    role, target_audience, target_sha256, signed_at_ms,
+                    signature_count, canonical_signature_set_base64url,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (?1, 'test-next-activation-signatures', 1,
+                    'promotion', 'bluey-jobs-browser-release-activation-v1',
+                    ?2, 2, 1, 'dGVzdA', 'test-suite', 2)",
+                params![next_signature_set_sha256, next_activation_sha256],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_signatures (
+                    signature_set_sha256, key_id, signature_base64url
+                 ) VALUES (?1, 'test-promotion-key', ?2)",
+                params![next_signature_set_sha256, authority.signature],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_activations (
+                    activation_sha256, activation_id, activation_generation,
+                    trust_generation, channel, channel_sequence, manifest_sha256,
+                    manifest_signature_set_sha256,
+                    authorization_signature_set_sha256,
+                    accepted_server_release_ids_json, canary_evidence_sha256,
+                    canonical_activation_base64url, issued_at_ms, expires_at_ms,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (?1, 'test-next-activation', 2, 1, 'beta', 2,
+                    ?2, ?3, ?4, '[\"test-server\"]', ?5, 'dGVzdA', 2,
+                    9007199254740991, 'test-suite', 2)",
+                params![
+                    next_activation_sha256,
+                    authority.manifest_sha256,
+                    authority.manifest_signature_set_sha256,
+                    next_signature_set_sha256,
+                    "d".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_channel_transitions (
+                    transition_sha256, channel, head_revision,
+                    previous_head_revision, previous_transition_sha256,
+                    previous_activation_sha256, previous_manifest_sha256,
+                    previous_trust_generation, previous_channel_sequence,
+                    next_activation_sha256, next_manifest_sha256,
+                    next_trust_generation, next_channel_sequence,
+                    transition_kind, authority_sha256,
+                    rollback_authority_sha256, recorded_by, recorded_at_ms
+                 ) VALUES (?1, 'beta', 2, 1, ?2, ?3, ?4, 1, 1,
+                    ?5, ?4, 1, 2, 'activation', ?5, NULL, 'test-suite', 2)",
+                params![
+                    next_transition_sha256,
+                    authority.transition_sha256,
+                    authority.activation_sha256,
+                    authority.manifest_sha256,
+                    next_activation_sha256,
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE jobs_browser_release_channel_heads
+                        SET head_revision = 2, current_transition_sha256 = ?1,
+                            current_activation_sha256 = ?2,
+                            current_manifest_sha256 = ?3,
+                            current_trust_generation = 1,
+                            current_channel_sequence = 2, updated_at_ms = 2
+                      WHERE channel = 'beta' AND head_revision = 1
+                        AND current_transition_sha256 = ?4
+                        AND current_activation_sha256 = ?5
+                        AND current_manifest_sha256 = ?3",
+                    params![
+                        next_transition_sha256,
+                        next_activation_sha256,
+                        authority.manifest_sha256,
+                        authority.transition_sha256,
+                        authority.activation_sha256,
+                    ],
+                )
+                .unwrap(),
+            1,
+            "test channel-head transition must win its exact compare-and-swap"
+        );
+    }
+
+    fn advance_test_browser_account_assignment(pool: &DbPool) {
+        let authority = test_browser_release_authority_ids();
+        let next_assignment_sha256 =
+            hex::encode(Sha256::digest(b"test-browser-account-assignment-2"));
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_browser_account_channel_assignments (
+                    assignment_sha256, account_id, assignment_generation,
+                    predecessor_assignment_sha256, predecessor_generation, channel,
+                    reason_ref, assigned_by, assigned_at_ms
+                 ) VALUES (?1, 'acct-jobs', 2, ?2, 1, 'beta',
+                    'test-reassignment', 'test-suite', 2)",
+                params![next_assignment_sha256, authority.assignment_sha256],
+            )
+            .unwrap();
+    }
+
+    fn seed_test_local_browser_release_binding(pool: &DbPool, application_id: &str, run_id: &str) {
+        let authority = seed_test_browser_release_authority_rows(pool);
+        let binding_sha256 = hex::encode(Sha256::digest(
+            format!("test-local-release-binding:{run_id}").as_bytes(),
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_local_run_release_bindings (
+                    run_id, account_id, application_id, binding_sha256,
+                    account_channel_assignment_sha256,
+                    account_channel_assignment_generation, channel,
+                    channel_head_revision, channel_transition_sha256,
+                    activation_sha256, activation_generation, trust_generation,
+                    trust_policy_sha256, channel_sequence,
+                    manifest_signature_set_sha256,
+                    activation_authorization_signature_set_sha256,
+                    manifest_sha256, artifact_id, release_id, build_id,
+                    app_version, protocol_version, platform, architecture,
+                    package_kind, build_descriptor_sha256, artifact_sha256,
+                    bound_at_ms
+                 ) VALUES (
+                    ?1, 'acct-jobs', ?2, ?3, ?4, 1, 'beta', 1, ?5, ?6,
+                    1, 1, ?7, 1, ?8, ?9, ?10, 'test-artifact',
+                    'test-release', 'browser-1.0', '1.0.0', 1, 'darwin',
+                    'arm64', 'darwin-dmg', ?11, ?12, 1
+                 )",
+                params![
+                    run_id,
+                    application_id,
+                    binding_sha256,
+                    authority.assignment_sha256,
+                    authority.transition_sha256,
+                    authority.activation_sha256,
+                    authority.policy_sha256,
+                    authority.manifest_signature_set_sha256,
+                    authority.activation_signature_set_sha256,
+                    authority.manifest_sha256,
+                    authority.descriptor_sha256,
+                    authority.artifact_sha256,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn seed_test_local_browser_release_authority(pool: &DbPool) -> VerifiedBrowserBuildDescriptor {
+        seed_test_browser_release_authority_rows(pool);
+        test_browser_release_descriptor()
+    }
+
+    fn test_browser_release_descriptor() -> VerifiedBrowserBuildDescriptor {
+        VerifiedBrowserBuildDescriptor {
+            release_id: "test-release".to_string(),
+            build_id: "browser-1.0".to_string(),
+            app_version: "1.0.0".to_string(),
+            app_id: "sh.bluey.jobs.browser".to_string(),
+            protocol_version: 1,
+            source_commit: "a".repeat(40),
+            platform: "darwin".to_string(),
+            architecture: "arm64".to_string(),
+            electron_version: "43.1.0".to_string(),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "1228".to_string(),
+            issued_at_ms: 1,
+            signing_key_id: "test-build-key".to_string(),
+            descriptor_base64url: "dGVzdA".to_string(),
+            signature_base64url: "A".repeat(86),
+            descriptor_sha256: "3".repeat(64),
+        }
+    }
+
+    #[test]
+    fn browser_build_descriptor_rejects_reserved_release_ids_case_insensitively() {
+        for release_id in [
+            "beta", "CURRENT", "Download", "internal", "LATEST", "Stable",
+        ] {
+            let descriptor = format!(
+                concat!(
+                    "version=1\n",
+                    "audience=bluey-jobs-browser-build-v1\n",
+                    "release_id={}\n",
+                    "build_id=browser-1.0\n",
+                    "app_version=1.0.0\n",
+                    "app_id=sh.bluey.jobs.browser\n",
+                    "protocol_version=1\n",
+                    "source_commit={}\n",
+                    "platform=darwin\n",
+                    "architecture=arm64\n",
+                    "electron_version=43.1.0\n",
+                    "playwright_version=1.61.1\n",
+                    "chromium_revision=1228\n",
+                    "issued_at_ms=1\n",
+                    "signing_key_id=test-build-key\n"
+                ),
+                release_id,
+                "a".repeat(40),
+            );
+            assert_eq!(
+                parse_browser_build_descriptor_bytes(descriptor.as_bytes()),
+                Err(BrowserReleaseAuthorityError::InvalidBuildProof),
+                "reserved release ID {release_id} must not be mutable authority"
+            );
+        }
+
+        let oversized_revision = format!(
+            concat!(
+                "version=1\n",
+                "audience=bluey-jobs-browser-build-v1\n",
+                "release_id=test-release\n",
+                "build_id=browser-1.0\n",
+                "app_version=1.0.0\n",
+                "app_id=sh.bluey.jobs.browser\n",
+                "protocol_version=1\n",
+                "source_commit={}\n",
+                "platform=darwin\n",
+                "architecture=arm64\n",
+                "electron_version=43.1.0\n",
+                "playwright_version=1.61.1\n",
+                "chromium_revision=12345678901234\n",
+                "issued_at_ms=1\n",
+                "signing_key_id=test-build-key\n"
+            ),
+            "a".repeat(40),
+        );
+        assert_eq!(
+            parse_browser_build_descriptor_bytes(oversized_revision.as_bytes()),
+            Err(BrowserReleaseAuthorityError::InvalidBuildProof),
+            "Chromium revisions longer than 13 decimal digits must be rejected"
+        );
+    }
+
+    fn seed_test_additional_browser_release_artifacts(
+        connection: &rusqlite::Connection,
+        manifest_sha256: &str,
+        signature: &str,
+    ) {
+        for (
+            artifact_id,
+            platform,
+            architecture,
+            package_kind,
+            descriptor_sha256,
+            file_name,
+            artifact_sha256,
+            native_signature_kind,
+            signer_identity,
+        ) in [
+            (
+                "test-artifact-darwin-arm64-zip",
+                "darwin",
+                "arm64",
+                "darwin-zip",
+                "3".repeat(64),
+                "Bluey-Browser-arm64.zip",
+                "d".repeat(64),
+                "apple-developer-id",
+                "TESTTEAM",
+            ),
+            (
+                "test-artifact-darwin-x64-dmg",
+                "darwin",
+                "x64",
+                "darwin-dmg",
+                "4".repeat(64),
+                "Bluey-Browser-x64.dmg",
+                "e".repeat(64),
+                "apple-developer-id",
+                "TESTTEAM",
+            ),
+            (
+                "test-artifact-darwin-x64-zip",
+                "darwin",
+                "x64",
+                "darwin-zip",
+                "4".repeat(64),
+                "Bluey-Browser-x64.zip",
+                "f".repeat(64),
+                "apple-developer-id",
+                "TESTTEAM",
+            ),
+            (
+                "test-artifact-windows-x64-nsis",
+                "windows",
+                "x64",
+                "windows-nsis",
+                "5".repeat(64),
+                "Bluey-Browser-x64.exe",
+                "0".repeat(64),
+                "microsoft-authenticode",
+                "TEST PUBLISHER",
+            ),
+        ] {
+            let artifact_url =
+                format!("https://bluey.sh/jobs/browser/releases/test-release/{file_name}");
+            connection
+                .execute(
+                    "INSERT OR IGNORE INTO jobs_browser_release_artifacts (
+                        artifact_id, manifest_sha256, platform, architecture,
+                        package_kind, build_descriptor_sha256,
+                        build_descriptor_base64url,
+                        build_descriptor_signature_base64url,
+                        build_descriptor_signing_key_id, artifact_url,
+                        artifact_filename, artifact_size_bytes, artifact_sha256,
+                        app_content_sha256, verification_evidence_sha256,
+                        native_signature_kind, native_signer_identity, recorded_at_ms
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, 'dGVzdA', ?7,
+                        'test-build-key', ?8, ?9, 1, ?10, ?11, ?12, ?13, ?14, 1
+                     )",
+                    params![
+                        artifact_id,
+                        manifest_sha256,
+                        platform,
+                        architecture,
+                        package_kind,
+                        descriptor_sha256,
+                        signature,
+                        artifact_url,
+                        file_name,
+                        artifact_sha256,
+                        "8".repeat(64),
+                        "9".repeat(64),
+                        native_signature_kind,
+                        signer_identity,
+                    ],
+                )
+                .unwrap();
+        }
+    }
+
+    fn seed_test_browser_release_revocation(
+        pool: &DbPool,
+        revocation_sha256: &str,
+        revocation_id: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        subject_sha256: &str,
+    ) {
+        let signature_set_sha256 = hex::encode(Sha256::digest(
+            format!("test-revocation-signatures:{revocation_id}").as_bytes(),
+        ));
+        let signature_set_id = format!("{revocation_id}-signatures");
+        let connection = pool.get().unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_signature_sets (
+                    signature_set_sha256, signature_set_id, trust_generation,
+                    role, target_audience, target_sha256, signed_at_ms,
+                    signature_count, canonical_signature_set_base64url,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (?1, ?2, 1, 'incident',
+                    'bluey-jobs-browser-release-revocation-v1', ?3, 2, 1,
+                    'dGVzdA', 'test-suite', 2)",
+                params![signature_set_sha256, signature_set_id, revocation_sha256],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_signatures (
+                    signature_set_sha256, key_id, signature_base64url
+                 ) VALUES (?1, 'test-incident-key', ?2)",
+                params![signature_set_sha256, "A".repeat(86)],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO jobs_browser_release_revocations (
+                    revocation_sha256, revocation_id, revocation_generation,
+                    trust_generation, subject_kind, subject_id, subject_sha256,
+                    reason_ref, canonical_revocation_base64url,
+                    authorization_signature_set_sha256, issued_at_ms,
+                    recorded_by, recorded_at_ms
+                 ) VALUES (?1, ?2, 1, 1, ?3, ?4, ?5, 'incident-test',
+                    'dGVzdA', ?6, 2, 'test-suite', 2)",
+                params![
+                    revocation_sha256,
+                    revocation_id,
+                    subject_kind,
+                    subject_id,
+                    subject_sha256,
+                    signature_set_sha256,
+                ],
+            )
+            .unwrap();
+    }
+
+    fn local_claim_state(
+        pool: &DbPool,
+        application_id: &str,
+        run_id: &str,
+    ) -> (String, String, String, String, i64, i64) {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, application.state, reservation.status,
+                        session.status,
+                        (SELECT COUNT(*) FROM jobs_run_events event
+                          WHERE event.run_id = ticket.id
+                            AND event.event_type = 'local_browser_claimed'),
+                        (SELECT COUNT(*) FROM jobs_local_run_release_bindings binding
+                          WHERE binding.run_id = ticket.id)
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_applications application
+                     ON application.id = ticket.application_id
+                   JOIN jobs_attempt_reservations reservation
+                     ON reservation.application_id = ticket.application_id
+                    AND reservation.account_id = ticket.account_id
+                   JOIN jobs_browser_sessions session ON session.id = ticket.id
+                  WHERE ticket.id = ?1 AND ticket.application_id = ?2",
+                params![run_id, application_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    }
+
     fn local_click_started_fixture(
         pool: &DbPool,
         suffix: &str,
     ) -> (JobApplication, String, String) {
         let (application, run_id, ticket_hash, _) = local_run_authority_fixture(pool, suffix);
+        reserve_application_attempt(pool, "acct-jobs", &application.id, "local").unwrap();
         assert!(
             claim_authorized_local_run_ticket(pool, &run_id, &ticket_hash)
                 .unwrap()
@@ -11742,6 +12772,716 @@ mod tests {
     }
 
     #[test]
+    fn channel_head_change_after_claim_fences_submit_but_preserves_binding_and_replay() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-head-change");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        let nonce = "a".repeat(64);
+        let first = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |ticket, release| {
+                Ok(json!({
+                    "runId": ticket.id,
+                    "bindingSha256": browser_release_binding_sha256(release),
+                }))
+            },
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(first) = first else {
+            panic!("initial Browser release claim did not succeed")
+        };
+        let frozen_binding = first.release.clone();
+        let frozen_receipt = browser_release_receipt_authority(&frozen_binding);
+        assert!(browser_release_receipt_authority_valid(&frozen_receipt));
+
+        advance_test_browser_release_channel_head(&pool);
+        assert_eq!(
+            get_local_run_browser_release_binding(&pool, "acct-jobs", &run_id)
+                .unwrap()
+                .as_ref(),
+            Some(&frozen_binding),
+            "the append-only run binding must survive a later channel transition"
+        );
+        let replay = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| anyhow::bail!("an exact replay must not issue fresh capabilities"),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(replay) = replay else {
+            panic!("exact claim replay was invalidated by a channel transition")
+        };
+        assert!(replay.replayed);
+        assert_eq!(
+            replay.response_json.as_bytes(),
+            first.response_json.as_bytes()
+        );
+        assert_eq!(replay.release, frozen_binding);
+        assert!(browser_release_receipt_authority_valid(&frozen_receipt));
+
+        let running = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        let (head_revision, binding_count, replay_count): (i64, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT head.head_revision,
+                        (SELECT COUNT(*) FROM jobs_local_run_release_bindings
+                          WHERE run_id = ?1),
+                        (SELECT COUNT(*) FROM jobs_local_run_claim_replays
+                          WHERE run_id = ?1)
+                   FROM jobs_browser_release_channel_heads head
+                  WHERE head.channel = 'beta'",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((head_revision, binding_count, replay_count), (2, 1, 1));
+    }
+
+    #[test]
+    fn account_channel_reassignment_after_claim_fences_submit() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-assignment-change");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &run_id,
+                &ticket_hash,
+                &"a".repeat(64),
+                &descriptor,
+                "test-server",
+                |ticket, _| Ok(json!({ "runId": ticket.id })),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::Success(_)
+        ));
+
+        advance_test_browser_account_assignment(&pool);
+        let running = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        assert_eq!(
+            local_claim_state(&pool, &application.id, &run_id).0,
+            "claimed"
+        );
+    }
+
+    #[test]
+    fn co_descriptor_artifact_revocation_fences_darwin_claim_and_submit() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-sibling-revoked-existing");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &run_id,
+                &ticket_hash,
+                &"a".repeat(64),
+                &descriptor,
+                "test-server",
+                |ticket, _| Ok(json!({ "runId": ticket.id })),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::Success(_)
+        ));
+
+        seed_test_browser_release_revocation(
+            &pool,
+            &hex::encode(Sha256::digest(b"test-darwin-zip-revocation")),
+            "test-darwin-zip-revocation",
+            "artifact",
+            "test-artifact-darwin-arm64-zip",
+            &"d".repeat(64),
+        );
+        let running = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        assert_eq!(
+            local_claim_state(&pool, &application.id, &run_id).0,
+            "claimed"
+        );
+
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "released").unwrap();
+        let (new_application, new_run_id, new_ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-sibling-revoked-new");
+        reserve_application_attempt(&pool, "acct-jobs", &new_application.id, "local").unwrap();
+        let before = local_claim_state(&pool, &new_application.id, &new_run_id);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &new_run_id,
+                &new_ticket_hash,
+                &"b".repeat(64),
+                &descriptor,
+                "test-server",
+                |_, _| Ok(json!({ "unexpected": true })),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::ReleaseUnavailable
+        ));
+        assert_eq!(
+            local_claim_state(&pool, &new_application.id, &new_run_id),
+            before
+        );
+    }
+
+    #[test]
+    fn exact_release_revocation_blocks_portal_claim_and_preclick_but_not_receipt_shape() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-revoked-existing");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        let first = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &"a".repeat(64),
+            &descriptor,
+            "test-server",
+            |ticket, _| Ok(json!({ "runId": ticket.id })),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(first) = first else {
+            panic!("initial Browser release claim did not succeed")
+        };
+        let frozen_receipt = browser_release_receipt_authority(&first.release);
+        assert!(browser_release_receipt_authority_valid(&frozen_receipt));
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Available { .. }
+        ));
+
+        let release_sha256 = hex::encode(Sha256::digest(b"test-release"));
+        seed_test_browser_release_revocation(
+            &pool,
+            &hex::encode(Sha256::digest(b"test-release-revocation")),
+            "test-release-revocation",
+            "release",
+            "test-release",
+            &release_sha256,
+        );
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+        assert!(browser_release_receipt_authority_valid(&frozen_receipt));
+
+        let running = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+
+        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "released").unwrap();
+
+        let (new_application, new_run_id, new_ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-revoked-new");
+        reserve_application_attempt(&pool, "acct-jobs", &new_application.id, "local").unwrap();
+        let before = local_claim_state(&pool, &new_application.id, &new_run_id);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &new_run_id,
+                &new_ticket_hash,
+                &"b".repeat(64),
+                &descriptor,
+                "test-server",
+                |_, _| Ok(json!({ "unexpected": true })),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::ReleaseUnavailable
+        ));
+        assert_eq!(
+            local_claim_state(&pool, &new_application.id, &new_run_id),
+            before
+        );
+        assert!(browser_release_receipt_authority_valid(&frozen_receipt));
+    }
+
+    #[test]
+    fn local_release_claim_is_atomic_exactly_replayable_and_revocation_fences_submit() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "release-claim-atomic");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = test_browser_release_descriptor();
+        let nonce = "a".repeat(64);
+        let queued = local_claim_state(&pool, &application.id, &run_id);
+
+        let distribution_unavailable = claim_local_run_with_browser_release_for_distribution(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| Ok(json!({ "claim": "accepted" })),
+        )
+        .unwrap();
+        assert!(matches!(
+            distribution_unavailable,
+            BrowserLocalRunClaimDisposition::DistributionUnavailable
+        ));
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
+
+        let unavailable = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| Ok(json!({ "claim": "accepted" })),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &unavailable,
+                BrowserLocalRunClaimDisposition::ReleaseUnavailable
+            ),
+            "unexpected claim disposition: {unavailable:?}; initial state: {queued:?}"
+        );
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
+
+        seed_test_local_browser_release_authority(&pool);
+        let mut wrong_protocol = descriptor.clone();
+        wrong_protocol.protocol_version = 2;
+        let unavailable = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &wrong_protocol,
+            "test-server",
+            |_, _| Ok(json!({ "claim": "accepted" })),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &unavailable,
+                BrowserLocalRunClaimDisposition::ReleaseUnavailable
+            ),
+            "unexpected wrong-protocol disposition: {unavailable:?}"
+        );
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
+
+        let issue_failure = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| anyhow::bail!("simulated capability issuance failure"),
+        );
+        assert!(issue_failure.is_err());
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), queued);
+
+        let first = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |ticket, release| {
+                Ok(json!({
+                    "runId": ticket.id,
+                    "descriptorSha256": release.build_descriptor_sha256,
+                    "nonceBoundCapability": "capability-with-random-nonce",
+                }))
+            },
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(first) = first else {
+            panic!("valid Browser release claim did not succeed")
+        };
+        assert!(!first.replayed);
+        assert_eq!(
+            local_claim_state(&pool, &application.id, &run_id),
+            (
+                "claimed".to_string(),
+                "running".to_string(),
+                "running".to_string(),
+                "running".to_string(),
+                1,
+                1,
+            )
+        );
+
+        let replay = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| anyhow::bail!("replay must not issue new capabilities"),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(replay) = replay else {
+            panic!("exact Browser release claim replay did not succeed")
+        };
+        assert!(replay.replayed);
+        assert_eq!(
+            replay.response_json.as_bytes(),
+            first.response_json.as_bytes()
+        );
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id).4, 1);
+
+        let hidden_replay = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            "wrong-ticket-hash",
+            &"b".repeat(64),
+            &descriptor,
+            "test-server",
+            |_, _| Ok(json!({ "claim": "different" })),
+        )
+        .unwrap();
+        assert!(matches!(
+            hidden_replay,
+            BrowserLocalRunClaimDisposition::Rejected
+        ));
+
+        let conflict = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &"b".repeat(64),
+            &descriptor,
+            "test-server",
+            |_, _| Ok(json!({ "claim": "different" })),
+        )
+        .unwrap();
+        assert!(matches!(
+            conflict,
+            BrowserLocalRunClaimDisposition::ConflictingReplay
+        ));
+
+        let running = get_application(&pool, "acct-jobs", &application.id)
+            .unwrap()
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        assert!(!local_run_submit_authorized_for_distribution(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert!(!local_run_submit_authorized_for_server(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "different-server",
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+
+        seed_test_browser_release_revocation(
+            &pool,
+            &"d".repeat(64),
+            "test-artifact-revocation",
+            "artifact",
+            "test-artifact",
+            &"2".repeat(64),
+        );
+        assert!(!local_run_submit_authorized(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &test_final_submit_proof(&running),
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+        assert_eq!(
+            local_claim_state(&pool, &application.id, &run_id).0,
+            "claimed"
+        );
+    }
+
+    #[test]
+    fn local_browser_release_metadata_requires_complete_non_revoked_artifact_set() {
+        let pool = test_pool();
+        seed_test_local_browser_release_authority(&pool);
+        assert!(matches!(
+            local_browser_release_availability_for_distribution(&pool, "acct-jobs", "test-server",)
+                .unwrap(),
+            LocalBrowserReleaseAvailability::Disabled { .. }
+        ));
+        let availability =
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap();
+        let serialized = serde_json::to_value(&availability).unwrap();
+        assert_eq!(serialized["release_id"], "test-release");
+        assert_eq!(serialized["artifact_origin"], "https://bluey.sh");
+        assert!(serialized.get("releaseId").is_none());
+        assert!(serialized.get("artifactOrigin").is_none());
+        let LocalBrowserReleaseAvailability::Available {
+            channel,
+            release_id,
+            artifact_origin,
+            manifest_sha256,
+            artifacts,
+            ..
+        } = availability
+        else {
+            panic!("complete Browser release was not available")
+        };
+        assert_eq!(channel, "beta");
+        assert_eq!(release_id, "test-release");
+        assert_eq!(artifact_origin, "https://bluey.sh");
+        assert_eq!(manifest_sha256, "1".repeat(64));
+        assert_eq!(artifacts.len(), 5);
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.role == "installer")
+                .count(),
+            3
+        );
+        assert!(artifacts.iter().all(|artifact| {
+            artifact
+                .url
+                .starts_with("https://bluey.sh/jobs/browser/releases/test-release/")
+                && !artifact.url.contains("/download")
+        }));
+        let connection = pool.get().unwrap();
+        connection
+            .execute_batch("DROP TRIGGER trg_jobs_browser_release_artifacts_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE jobs_browser_release_artifacts
+                    SET artifact_url = replace(artifact_url, 'https://bluey.sh',
+                                               'https://artifacts.example')
+                  WHERE artifact_id = 'test-artifact'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts
+                    SET artifact_url = replace(artifact_url, 'https://artifacts.example',
+                                               'https://bluey.sh')
+                  WHERE artifact_id = 'test-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Available { .. }
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts
+                    SET artifact_url = replace(artifact_url, '.dmg', '.zip'),
+                        artifact_filename = replace(artifact_filename, '.dmg', '.zip')
+                  WHERE artifact_id = 'test-artifact'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts
+                    SET artifact_url = replace(artifact_url, '.zip', '.dmg'),
+                        artifact_filename = replace(artifact_filename, '.zip', '.dmg')
+                  WHERE artifact_id = 'test-artifact'",
+                [],
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts SET app_content_sha256 = ?1
+                  WHERE artifact_id = 'test-artifact-darwin-arm64-zip'",
+                params!["7".repeat(64)],
+            )
+            .unwrap();
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts SET app_content_sha256 = ?1
+                  WHERE artifact_id = 'test-artifact-darwin-arm64-zip'",
+                params!["8".repeat(64)],
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts
+                    SET artifact_url =
+                          'https://bluey.sh/jobs/browser/releases/test-release/Bluey-Browser.dmg',
+                        artifact_filename = 'Bluey-Browser.dmg'
+                  WHERE artifact_id = 'test-artifact-darwin-x64-dmg'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_browser_release_artifacts
+                    SET artifact_url =
+                          'https://bluey.sh/jobs/browser/releases/test-release/Bluey-Browser-x64.dmg',
+                        artifact_filename = 'Bluey-Browser-x64.dmg'
+                  WHERE artifact_id = 'test-artifact-darwin-x64-dmg'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Available { .. }
+        ));
+        seed_test_browser_release_revocation(
+            &pool,
+            &"d".repeat(64),
+            "test-manifest-revocation",
+            "manifest",
+            "test-manifest",
+            &"1".repeat(64),
+        );
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn current_policy_artifact_origin_fences_availability_and_new_claims_atomically() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "current-artifact-origin");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        rotate_test_browser_release_artifact_origin(&pool, "https://artifacts.example");
+
+        assert!(matches!(
+            local_browser_release_availability(&pool, "acct-jobs", "test-server").unwrap(),
+            LocalBrowserReleaseAvailability::Unavailable { .. }
+        ));
+        let before = local_claim_state(&pool, &application.id, &run_id);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &run_id,
+                &ticket_hash,
+                &"a".repeat(64),
+                &descriptor,
+                "test-server",
+                |_, _| Ok(json!({ "unexpected": true })),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::ReleaseUnavailable
+        ));
+        assert_eq!(local_claim_state(&pool, &application.id, &run_id), before);
+    }
+
+    #[test]
     fn local_run_authority_rechecks_entitlement_and_verified_identity_before_submit() {
         let pool = test_pool();
         let (application, run_id, ticket_hash, identity_id) =
@@ -11871,6 +13611,66 @@ mod tests {
                 .unwrap();
             assert_eq!(serde_json::to_value(stored).unwrap(), application_before);
         }
+    }
+
+    #[test]
+    fn expired_click_started_result_enters_side_effect_unknown_within_grace() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash) =
+            local_click_started_fixture(&pool, "expired-click-reconciliation");
+        let expired_at_ms = now_ms().saturating_sub(1);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_local_run_tickets SET expires_at_ms = ?2 WHERE id = ?1",
+                params![run_id, expired_at_ms],
+            )
+            .unwrap();
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run_id)
+            .unwrap();
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        let finalized = finalize_local_side_effect_unknown(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &capacity,
+            json!({
+                "status": "side_effect_unknown",
+                "issues": [{
+                    "field": "submission",
+                    "message": "The Browser restarted after Submit without an employer response."
+                }]
+            }),
+            &session,
+        )
+        .unwrap();
+        assert_eq!(finalized.state, "side_effect_unknown");
+        let (ticket_status, attempt_status, session_status): (String, String, String) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status, attempt.status, session.status
+                   FROM jobs_local_run_tickets ticket
+                   JOIN jobs_attempt_reservations attempt
+                     ON attempt.account_id = ticket.account_id
+                    AND attempt.application_id = ticket.application_id
+                   JOIN jobs_browser_sessions session
+                     ON session.account_id = ticket.account_id
+                    AND session.id = ticket.id
+                  WHERE ticket.id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "side_effect_unknown");
+        assert_eq!(attempt_status, "side_effect_unknown");
+        assert_eq!(session_status, "needs_input");
     }
 
     #[test]

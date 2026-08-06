@@ -18,6 +18,7 @@ pub mod admin;
 pub mod auth_routes;
 pub mod billing;
 pub mod jobs;
+pub mod jobs_browser_releases;
 mod jobs_communication_actions;
 mod jobs_import;
 pub mod jobs_interview_prep;
@@ -212,6 +213,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             get(admin::support_account),
         )
         .merge(jobs::admin_router())
+        .merge(jobs_browser_releases::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
@@ -418,7 +420,9 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
             auth::require_auth,
         ));
 
-    let runner_volume_admin = jobs_runner_volumes::admin_router()
+    let jobs_admin = jobs::admin_router()
+        .merge(jobs_browser_releases::admin_router())
+        .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -444,7 +448,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
                 crate::rate_limit::limit_jobs_local_runner,
             )),
         )
-        .merge(runner_volume_admin)
+        .merge(jobs_admin)
         .merge(protected)
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)

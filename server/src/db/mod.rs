@@ -346,6 +346,8 @@ const SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
 );
 const SQLITE_JOBS_RUNNER_VOLUME_PURGE: &str =
     include_str!("../../../infra/sqlite/server-runtime/046_jobs_runner_volume_purge.sql");
+const SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1672,6 +1674,8 @@ const MIGRATIONS: &[&str] = &[
     // 0046 - signed managed-runner volume identity, purge fan-out, and
     // pseudonymous restore tombstones.
     SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+    // 0047 - signed local Browser release and claim authority.
+    SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2127,6 +2131,10 @@ const POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL: &str = include_str!(
 pub const JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID: &str = "024_jobs_runner_volume_purge.sql";
 const POSTGRES_JOBS_RUNNER_VOLUME_PURGE: &str =
     include_str!("../../../infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql");
+pub const JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID: &str =
+    "025_jobs_browser_release_authority.sql";
+const POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/025_jobs_browser_release_authority.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2211,6 +2219,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
         POSTGRES_JOBS_RUNNER_VOLUME_PURGE,
+    ),
+    (
+        JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
     ),
 ];
 
@@ -2349,7 +2361,129 @@ mod blocking_boundary_tests {
 
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
-    use super::{ensure_column, open_pool, run_migrations};
+    use super::{ensure_column, open_pool, run_migrations, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY};
+
+    #[test]
+    fn browser_release_authority_uses_immutable_history_and_a_mutable_explicit_head() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute_batch(SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY)
+            .unwrap();
+
+        for table in [
+            "jobs_browser_release_signature_sets",
+            "jobs_browser_release_signatures",
+            "jobs_browser_release_trust_policies",
+            "jobs_browser_release_trust_keys",
+            "jobs_browser_release_manifests",
+            "jobs_browser_release_artifacts",
+            "jobs_browser_release_activations",
+            "jobs_browser_release_rollbacks",
+            "jobs_browser_release_revocations",
+            "jobs_browser_release_channel_transitions",
+            "jobs_browser_release_channel_heads",
+            "jobs_browser_account_channel_assignments",
+            "jobs_local_run_release_bindings",
+            "jobs_local_run_claim_replays",
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master \
+                      WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing Browser release table {table}");
+        }
+
+        let signature_set_sha256 = "a".repeat(64);
+        conn.execute(
+            "INSERT INTO jobs_browser_release_signature_sets (\
+               signature_set_sha256, signature_set_id, trust_generation, role,\
+               target_audience, target_sha256, signed_at_ms, signature_count,\
+               canonical_signature_set_base64url, recorded_by, recorded_at_ms\
+             ) VALUES (?1, 'signature-set-test', 1, 'release',\
+               'bluey-jobs-browser-release-manifest-v1', ?2, 1, 1, 'YQ',\
+               'migration-test', 1)",
+            rusqlite::params![signature_set_sha256, "b".repeat(64)],
+        )
+        .unwrap();
+        let immutable = conn
+            .execute(
+                "UPDATE jobs_browser_release_signature_sets SET recorded_at_ms = 2 \
+                  WHERE signature_set_sha256 = ?1",
+                rusqlite::params![signature_set_sha256],
+            )
+            .unwrap_err();
+        assert!(
+            format!("{immutable:?}").contains("signature set is immutable"),
+            "unexpected immutable-row error: {immutable:?}"
+        );
+
+        let subject_sha256 = "f".repeat(64);
+        let insert_revocation = |revocation_sha256: &str,
+                                 revocation_id: &str,
+                                 revocation_generation: i64,
+                                 subject_id: &str| {
+            conn.execute(
+                "INSERT INTO jobs_browser_release_revocations (\
+                       revocation_sha256, revocation_id, revocation_generation,\
+                       trust_generation, subject_kind, subject_id, subject_sha256,\
+                       reason_ref, canonical_revocation_base64url,\
+                       authorization_signature_set_sha256, issued_at_ms, recorded_by,\
+                       recorded_at_ms\
+                     ) VALUES (?1, ?2, ?3, 1, 'artifact', ?4, ?5,\
+                       'migration-test', 'YQ', ?6, 1, 'migration-test', 1)",
+                rusqlite::params![
+                    revocation_sha256,
+                    revocation_id,
+                    revocation_generation,
+                    subject_id,
+                    subject_sha256,
+                    signature_set_sha256,
+                ],
+            )
+        };
+        insert_revocation(&"1".repeat(64), "revocation-a", 1, "artifact-a").unwrap();
+        insert_revocation(&"2".repeat(64), "revocation-b", 2, "artifact-b").unwrap();
+        let duplicate_exact_subject =
+            insert_revocation(&"3".repeat(64), "revocation-c", 3, "artifact-a").unwrap_err();
+        assert!(
+            format!("{duplicate_exact_subject:?}").contains("UNIQUE constraint failed"),
+            "unexpected exact-subject uniqueness error: {duplicate_exact_subject:?}"
+        );
+
+        conn.execute(
+            "INSERT INTO jobs_browser_release_channel_heads (\
+               channel, head_revision, current_transition_sha256,\
+               current_activation_sha256, current_manifest_sha256,\
+               current_trust_generation, current_channel_sequence, updated_at_ms\
+             ) VALUES ('internal', 1, ?1, ?2, ?3, 1, 1, 1)",
+            rusqlite::params!["c".repeat(64), "d".repeat(64), "e".repeat(64)],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_browser_release_channel_heads SET updated_at_ms = 2 \
+                  WHERE channel = 'internal' AND head_revision = 1",
+                [],
+            )
+            .unwrap(),
+            1,
+            "the explicit channel head must be CAS-mutable"
+        );
+        let undeletable = conn
+            .execute(
+                "DELETE FROM jobs_browser_release_channel_heads WHERE channel = 'internal'",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            format!("{undeletable:?}").contains("channel head cannot be deleted"),
+            "unexpected channel-head deletion error: {undeletable:?}"
+        );
+    }
 
     #[test]
     fn global_ingestion_quarantine_columns_upgrade_in_place() {
@@ -3129,15 +3263,16 @@ mod sqlite_migration_replay_tests {
 mod postgres_migration_tests {
     use super::{
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
-        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
-        POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
-        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, POSTGRES_ACCOUNT_DELETION_INTENTS,
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
         POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_MIGRATIONS,
         POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
         SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
-        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
-        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
     };
 
     #[test]
@@ -3480,6 +3615,116 @@ mod postgres_migration_tests {
             maximum_browser_profile_logical_id_bytes <= 384,
             "the maximum accepted browser-profile candidate identity must fit the ledger"
         );
+    }
+
+    #[test]
+    fn browser_release_authority_is_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID)
+            .expect("Browser release authority must exist before local tickets can be claimed");
+
+        assert_eq!(*version, "025_jobs_browser_release_authority.sql");
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_signature_sets",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_signatures",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_trust_policies",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_trust_keys",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_manifests",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_artifacts",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_activations",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_rollbacks",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_revocations",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_channel_transitions",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_release_channel_heads",
+            "CREATE TABLE IF NOT EXISTS jobs_browser_account_channel_assignments",
+            "CREATE TABLE IF NOT EXISTS jobs_local_run_release_bindings",
+            "CREATE TABLE IF NOT EXISTS jobs_local_run_claim_replays",
+            "canonical_signature_set_base64url",
+            "canonical_policy_base64url",
+            "authorization_signature_set_sha256",
+            "target_audience",
+            "root_threshold",
+            "release_threshold",
+            "promotion_threshold",
+            "incident_threshold",
+            "app_version",
+            "artifact_filename",
+            "manifest_signature_set_sha256",
+            "activation_authorization_signature_set_sha256",
+            "trust_policy_sha256",
+            "channel_head_revision",
+            "channel_transition_sha256",
+            "transition_kind",
+            "rollback_authority_sha256",
+            "current_transition_sha256",
+            "recorded_by",
+            "UNIQUE(subject_kind, subject_id, subject_sha256)",
+            "subject_kind, subject_id, subject_sha256,",
+            "account_channel_assignment_sha256",
+            "build_descriptor_sha256",
+            "claim_nonce_sha256",
+            "claim_request_sha256",
+            "claim_response_sha256",
+            "claim_response_secret",
+            "trg_jobs_browser_release_rollbacks_no_update",
+            "trg_jobs_browser_release_rollbacks_no_delete",
+            "trg_jobs_browser_release_revocations_no_update",
+            "trg_jobs_browser_release_revocations_no_delete",
+            "trg_jobs_browser_release_signature_sets_no_update",
+            "trg_jobs_browser_release_signature_sets_no_delete",
+            "trg_jobs_browser_release_trust_policies_no_update",
+            "trg_jobs_browser_release_trust_policies_no_delete",
+            "trg_jobs_browser_release_channel_transitions_no_update",
+            "trg_jobs_browser_release_channel_transitions_no_delete",
+            "trg_jobs_browser_release_channel_heads_no_delete",
+            "trg_jobs_local_run_release_bindings_no_update",
+            "trg_jobs_local_run_claim_replays_no_update",
+            "Imported activations and rollback targets remain inert",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL Browser release migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY.contains(required),
+                "SQLite Browser release migration missing {required}"
+            );
+        }
+        assert!(postgres_sql
+            .contains("artifact_count               BIGINT NOT NULL CHECK(artifact_count = 5)"));
+        assert!(SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY
+            .contains("artifact_count               INTEGER NOT NULL CHECK(artifact_count = 5)"));
+        for exact_subject in [
+            "'signing-key'",
+            "'build-descriptor'",
+            "'manifest'",
+            "'release'",
+            "'artifact'",
+        ] {
+            assert!(postgres_sql.contains(exact_subject));
+            assert!(SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY.contains(exact_subject));
+        }
+        assert!(!postgres_sql.contains("'artifact', 'activation'"));
+        assert!(!postgres_sql.contains("accepted_server_release_ids_sha256"));
+        assert!(!postgres_sql.contains("artifact_set_sha256"));
+        assert!(!postgres_sql.contains("idx_jobs_browser_release_activations_current"));
+        assert!(!postgres_sql.contains("trg_jobs_browser_release_channel_heads_no_update"));
+        assert_eq!(
+            postgres_sql
+                .lines()
+                .filter(|line| line.trim_start().starts_with("recorded_by "))
+                .count(),
+            7
+        );
+        assert_eq!(
+            SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY
+                .lines()
+                .filter(|line| line.trim_start().starts_with("recorded_by "))
+                .count(),
+            7
+        );
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY);
     }
 
     #[test]

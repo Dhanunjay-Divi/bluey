@@ -14,6 +14,10 @@ import {
 import { acquireFinalSubmitAuthority } from "../src/irreversible-submit.js";
 import { LocalCheckpointStore, type LocalRunCheckpoint } from "../src/local-checkpoint-store.js";
 import { localRunDirectory, type StartRunRequest } from "../src/local-run-contracts.js";
+import {
+  legacyLocalRunCapabilitiesFixture,
+  localRunCapabilitiesFixture,
+} from "./fixtures/local-run-capability.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -28,6 +32,40 @@ afterEach(async () => {
 });
 
 describe("local checkpoint reconciliation", () => {
+  it("reconciles an encrypted pre-authority v1 crash checkpoint within the late window", async () => {
+    const root = await temporaryDirectory();
+    const store = await LocalCheckpointStore.open(root);
+    const checkpoint = fixture();
+    const expiredAtMs = Date.now() - 1_000;
+    checkpoint.expiresAtMs = expiredAtMs;
+    checkpoint.delivery.capabilities = legacyLocalRunCapabilitiesFixture(expiredAtMs);
+    await store.write(checkpoint);
+    const contextFor = vi.fn();
+    const unknown = vi.fn();
+    const fetchMock = vi.fn(async () => applicationResponse(checkpoint, "side_effect_unknown"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const reopened = await LocalCheckpointStore.open(root);
+    await reconcileLocalRunCheckpoints({
+      store: reopened,
+      userDataDirectory: root,
+      activeRuns: new Map(),
+      contextFor,
+      onRecovered: vi.fn(),
+      onUnknown: unknown,
+    });
+
+    expect(contextFor).not.toHaveBeenCalled();
+    expect(unknown).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as {
+      capability: string;
+    };
+    expect(body.capability).toBe(checkpoint.delivery.capabilities.result);
+    expect(JSON.parse(Buffer.from(body.capability.split(".")[0]!, "base64url").toString("utf8")))
+      .toMatchObject({ version: 1, operation: "result", run_id: checkpoint.request.runId });
+  });
+
   it("reports an interrupted final submit as unknown and never restores or retries it", async () => {
     const root = await temporaryDirectory();
     const store = await LocalCheckpointStore.open(root);
@@ -344,33 +382,12 @@ function fixture(): LocalRunCheckpoint<StartRunRequest> {
     request,
     delivery: {
       apiOrigin: "https://bluey.example.test",
-      capabilities: {
-        result: capability("result", expiresAtMs),
-        resume: capability("resume", expiresAtMs),
-        submit: capability("submit", expiresAtMs),
-        expiresAtMs,
-        runId: "run-123",
-      },
+      capabilities: localRunCapabilitiesFixture(expiresAtMs),
     },
     browser: { url: request.url },
     workflow: { status: "side_effect_unknown" },
     events: [],
   };
-}
-
-function capability(operation: "result" | "resume" | "submit", expiresAtMs: number): string {
-  const claims = {
-    version: 1,
-    audience: "bluey-jobs-local-run",
-    account_id: "account-123",
-    application_id: "application-123",
-    run_id: "run-123",
-    browser_profile_id: "profile-123",
-    operation,
-    expires_at_ms: expiresAtMs,
-    nonce: `${operation}-`.padEnd(32, "n"),
-  };
-  return `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${"a".repeat(64)}`;
 }
 
 async function temporaryDirectory(): Promise<string> {

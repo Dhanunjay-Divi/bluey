@@ -436,9 +436,8 @@ fn distribution_flag_enabled(name: &str) -> bool {
 }
 
 fn jobs_local_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
-    cfg!(debug_assertions)
-        || (distribution_flag_enabled("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
-            && runner_volume_fleet_distribution_ready(pool))
+    distribution_flag_enabled("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED")
+        && runner_volume_fleet_distribution_ready(pool)
 }
 
 fn jobs_cloud_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
@@ -489,6 +488,7 @@ fn runner_channel_availability(
             distribution_enabled,
             reason,
             next_action,
+            release: None,
         };
     }
     if !distribution_enabled {
@@ -508,6 +508,7 @@ fn runner_channel_availability(
             next_action:
                 "Use Review first; Bluey will prepare the exact resume and answers for handoff."
                     .to_string(),
+            release: None,
         };
     }
     let (reason, next_action) = if runner == "local" {
@@ -528,6 +529,7 @@ fn runner_channel_availability(
         distribution_enabled: true,
         reason,
         next_action,
+        release: None,
     }
 }
 
@@ -549,7 +551,20 @@ fn build_runner_availability(
         cloud_distribution_enabled,
     );
     let auto_submit_available = local.available || cloud.available;
-    let auto_submit_reason = if local.available && cloud.available {
+    let auto_submit_reason = runner_auto_submit_reason(&local, &cloud);
+    RunnerAvailability {
+        local,
+        cloud,
+        auto_submit_available,
+        auto_submit_reason,
+    }
+}
+
+fn runner_auto_submit_reason(
+    local: &RunnerChannelAvailability,
+    cloud: &RunnerChannelAvailability,
+) -> String {
+    if local.available && cloud.available {
         "Auto-submit can use either Bluey Browser or the background runner.".to_string()
     } else if local.available {
         "Auto-submit can use Bluey Browser while this computer is running.".to_string()
@@ -560,13 +575,57 @@ fn build_runner_availability(
     } else {
         "Auto-submit requires a Jobs plan with runner access. Review first remains available."
             .to_string()
-    };
-    RunnerAvailability {
-        local,
-        cloud,
-        auto_submit_available,
-        auto_submit_reason,
     }
+}
+
+fn account_runner_availability(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    entitlement: &JobsEntitlement,
+) -> Result<RunnerAvailability, ApiError> {
+    let local_distribution_enabled = jobs_local_browser_distribution_enabled(pool);
+    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled(pool);
+    let mut availability = build_runner_availability(
+        entitlement,
+        local_distribution_enabled,
+        cloud_distribution_enabled,
+    );
+    if entitlement.local_browser {
+        let release = if !local_distribution_enabled {
+            jobs::LocalBrowserReleaseAvailability::Disabled {
+                reason: "Bluey Browser distribution is disabled for this release.".to_string(),
+            }
+        } else if let Ok(server_release_id) = browser_server_release_id() {
+            jobs::local_browser_release_availability_for_distribution(
+                pool,
+                account_id,
+                &server_release_id,
+            )
+            .map_err(internal)?
+        } else {
+            jobs::LocalBrowserReleaseAvailability::Unavailable {
+                reason: "Bluey Browser release verification is unavailable.".to_string(),
+            }
+        };
+        if !release.is_available() {
+            availability.local.available = false;
+            availability.local.status = "invited_beta".to_string();
+            availability.local.reason = match &release {
+                jobs::LocalBrowserReleaseAvailability::Available { reason, .. }
+                | jobs::LocalBrowserReleaseAvailability::Disabled { reason }
+                | jobs::LocalBrowserReleaseAvailability::Unassigned { reason }
+                | jobs::LocalBrowserReleaseAvailability::Unavailable { reason } => reason.clone(),
+            };
+            availability.local.next_action =
+                "Use Review first; no local run or installer is authorized.".to_string();
+        }
+        availability.local.release = Some(release);
+        availability.auto_submit_available =
+            availability.local.available || availability.cloud.available;
+        availability.auto_submit_reason =
+            runner_auto_submit_reason(&availability.local, &availability.cloud);
+    }
+    Ok(availability)
 }
 
 fn auto_submit_request_error(
@@ -688,17 +747,12 @@ pub async fn workspace(
             ),
         }
     }
-    let local_distribution_enabled = jobs_local_browser_distribution_enabled(&state.pool);
-    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled(&state.pool);
-    workspace.runner_availability = build_runner_availability(
-        &workspace.entitlement,
-        local_distribution_enabled,
-        cloud_distribution_enabled,
-    );
+    workspace.runner_availability =
+        account_runner_availability(&state.pool, &account.id, &workspace.entitlement)?;
     apply_jobs_distribution_gates(
         &mut workspace.entitlement,
-        local_distribution_enabled,
-        cloud_distribution_enabled,
+        workspace.runner_availability.local.available,
+        workspace.runner_availability.cloud.available,
     );
     Ok(Json(workspace))
 }
@@ -1490,11 +1544,7 @@ pub async fn prepare_application(
                 "Auto-submit is unavailable because Bluey could not verify the current application-system and Career Track decision.".to_string(),
             ))?;
         let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-        let runners = build_runner_availability(
-            &entitlement,
-            jobs_local_browser_distribution_enabled(&state.pool),
-            jobs_cloud_browser_distribution_enabled(&state.pool),
-        );
+        let runners = account_runner_availability(&state.pool, &account.id, &entitlement)?;
         if let Some(error) = auto_submit_request_error(&eligibility, &runners) {
             return Err(error);
         }
@@ -2370,11 +2420,7 @@ pub async fn queue_application_run(
         ));
     }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    let runners = build_runner_availability(
-        &entitlement,
-        jobs_local_browser_distribution_enabled(&state.pool),
-        jobs_cloud_browser_distribution_enabled(&state.pool),
-    );
+    let runners = account_runner_availability(&state.pool, &account.id, &entitlement)?;
     let channel = if req.runner == "local" {
         &runners.local
     } else {
@@ -3101,11 +3147,7 @@ pub async fn save_browser_session(
         }
     }
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
-    let runners = build_runner_availability(
-        &entitlement,
-        jobs_local_browser_distribution_enabled(&state.pool),
-        jobs_cloud_browser_distribution_enabled(&state.pool),
-    );
+    let runners = account_runner_availability(&state.pool, &account.id, &entitlement)?;
     let channel = if session.runner == "local" {
         &runners.local
     } else {
@@ -3891,8 +3933,11 @@ pub async fn run_events(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct LocalRunClaimRequest {
     ticket: String,
+    claim_nonce: String,
+    build_proof: jobs::BrowserBuildProof,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3929,124 +3974,183 @@ async fn claim_local_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunClaimRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     if !jobs_local_browser_distribution_enabled(&state.pool) {
         return Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "Bluey Browser local runs are currently paused.".to_string(),
         ));
     }
-    let hash = local_run_ticket_hash(&req.ticket)?;
-    let ticket = jobs::claim_authorized_local_run_ticket(&state.pool, &run_id, &hash)
-        .map_err(internal)?
-        .ok_or((
-            StatusCode::NOT_FOUND,
-            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
-        ))?;
-    jobs::update_application(
-        &state.pool,
-        &ticket.account_id,
-        &ticket.application_id,
-        "running",
-        None,
-    )
-    .map_err(domain_error)?
-    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-    if !jobs::update_attempt_reservation_status(
-        &state.pool,
-        &ticket.account_id,
-        &ticket.application_id,
-        "running",
-    )
-    .map_err(internal)?
+    if req.claim_nonce.len() != 64
+        || req.claim_nonce != req.claim_nonce.to_ascii_lowercase()
+        || !req.claim_nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || req.claim_nonce != local_browser_claim_nonce(&run_id, &req.ticket, &req.build_proof)
     {
         return Err((
-            StatusCode::CONFLICT,
-            "This application no longer has an active attempt reservation.".to_string(),
+            StatusCode::BAD_REQUEST,
+            "Invalid Browser claim nonce.".to_string(),
         ));
     }
-    update_worker_browser_session(
-        &state,
-        &ticket.account_id,
-        &ticket.application_id,
-        "running",
-    )?;
-    jobs::save_run_event(
+    let descriptor =
+        jobs::parse_browser_build_proof_for_claim(&req.build_proof).map_err(|error| {
+            tracing::warn!(error = %error, "rejected invalid Bluey Browser build proof");
+            (
+                StatusCode::UPGRADE_REQUIRED,
+                "Install an authorized Bluey Browser release and try again.".to_string(),
+            )
+        })?;
+    let hash = local_run_ticket_hash(&req.ticket)?;
+    let server_release_id = browser_server_release_id()?;
+    let disposition = jobs::claim_local_run_with_browser_release_for_distribution(
         &state.pool,
-        &ticket.account_id,
-        &ticket.id,
-        "local_browser_claimed",
-        json!({ "application_id": ticket.application_id }),
+        &run_id,
+        &hash,
+        &req.claim_nonce,
+        &descriptor,
+        &server_release_id,
+        |ticket, binding| {
+            let browser_profile_id = ticket
+                .payload
+                .get("browserProfileId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("local Browser claim has no browser profile"))?;
+            let release = local_capability_release(binding);
+            let result_capability = super::jobs_local_capability::issue(
+                &ticket.account_id,
+                &ticket.application_id,
+                &run_id,
+                browser_profile_id,
+                "result",
+                ticket.expires_at_ms,
+                &release,
+            )?;
+            let resume_capability = super::jobs_local_capability::issue(
+                &ticket.account_id,
+                &ticket.application_id,
+                &run_id,
+                browser_profile_id,
+                "resume",
+                ticket.expires_at_ms,
+                &release,
+            )?;
+            let submit_capability = super::jobs_local_capability::issue(
+                &ticket.account_id,
+                &ticket.application_id,
+                &run_id,
+                browser_profile_id,
+                "submit",
+                ticket.expires_at_ms,
+                &release,
+            )?;
+            let mut payload = ticket
+                .payload
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("local Browser claim payload is invalid"))?;
+            payload.insert(
+                "_blueyCapabilities".to_string(),
+                json!({
+                    "result": result_capability,
+                    "resume": resume_capability,
+                    "submit": submit_capability,
+                    "expiresAtMs": ticket.expires_at_ms,
+                }),
+            );
+            payload.insert("_blueyRelease".to_string(), serde_json::to_value(release)?);
+            Ok(Value::Object(payload))
+        },
     )
     .map_err(internal)?;
-    let browser_profile_id = ticket
-        .payload
-        .get("browserProfileId")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or((
+    match disposition {
+        jobs::BrowserLocalRunClaimDisposition::Success(success) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(Body::from(success.response_json))
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Bluey Browser could not start securely. Try again.".to_string(),
+                )
+            }),
+        jobs::BrowserLocalRunClaimDisposition::ReleaseUnavailable => Err((
+            StatusCode::UPGRADE_REQUIRED,
+            "Install the active Bluey Browser release for this account and try again.".to_string(),
+        )),
+        jobs::BrowserLocalRunClaimDisposition::DistributionUnavailable => Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser local runs are currently paused.".to_string(),
+        )),
+        jobs::BrowserLocalRunClaimDisposition::ConflictingReplay => Err((
             StatusCode::CONFLICT,
-            "This Bluey Browser launch is missing its browser profile.".to_string(),
-        ))?;
-    let result_capability = super::jobs_local_capability::issue(
-        &ticket.account_id,
-        &ticket.application_id,
-        &run_id,
-        browser_profile_id,
-        "result",
-        ticket.expires_at_ms,
-    )
-    .map_err(|error| {
-        tracing::error!(error = %error, "could not issue local result capability");
+            "This Browser launch was already claimed by a different request.".to_string(),
+        )),
+        jobs::BrowserLocalRunClaimDisposition::Rejected => Err((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        )),
+    }
+}
+
+fn local_browser_claim_nonce(
+    run_id: &str,
+    ticket: &str,
+    proof: &jobs::BrowserBuildProof,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bluey-jobs-browser-claim-v1\0");
+    digest.update(run_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(ticket.as_bytes());
+    digest.update(b"\0");
+    digest.update(proof.descriptor.as_bytes());
+    digest.update(b"\0");
+    digest.update(proof.signature.as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn browser_server_release_id() -> Result<String, ApiError> {
+    let value = std::env::var("BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID").map_err(|_| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser could not start securely. Try again.".to_string(),
+            "Bluey Browser release verification is unavailable.".to_string(),
         )
     })?;
-    let resume_capability = super::jobs_local_capability::issue(
-        &ticket.account_id,
-        &ticket.application_id,
-        &run_id,
-        browser_profile_id,
-        "resume",
-        ticket.expires_at_ms,
-    )
-    .map_err(|error| {
-        tracing::error!(error = %error, "could not issue local resume capability");
-        (
+    if value.len() < 3
+        || value.len() > 128
+        || value.trim() != value
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err((
             StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser could not start securely. Try again.".to_string(),
-        )
-    })?;
-    let submit_capability = super::jobs_local_capability::issue(
-        &ticket.account_id,
-        &ticket.application_id,
-        &run_id,
-        browser_profile_id,
-        "submit",
-        ticket.expires_at_ms,
-    )
-    .map_err(|error| {
-        tracing::error!(error = %error, "could not issue local submit capability");
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser could not start securely. Try again.".to_string(),
-        )
-    })?;
-    let mut payload = ticket.payload.as_object().cloned().ok_or((
-        StatusCode::CONFLICT,
-        "This Bluey Browser launch is invalid.".to_string(),
-    ))?;
-    payload.insert(
-        "_blueyCapabilities".to_string(),
-        json!({
-            "result": result_capability,
-            "resume": resume_capability,
-            "submit": submit_capability,
-            "expiresAtMs": ticket.expires_at_ms,
-        }),
-    );
-    Ok(Json(Value::Object(payload)))
+            "Bluey Browser release verification is unavailable.".to_string(),
+        ));
+    }
+    Ok(value)
+}
+
+fn local_capability_release(
+    binding: &jobs::BrowserReleaseClaimBinding,
+) -> super::jobs_local_capability::LocalRunReleaseClaims {
+    super::jobs_local_capability::LocalRunReleaseClaims {
+        descriptor_sha256: binding.build_descriptor_sha256.clone(),
+        manifest_sha256: binding.manifest_sha256.clone(),
+        activation_sha256: binding.activation_sha256.clone(),
+        artifact_id: binding.artifact_id.clone(),
+        artifact_sha256: binding.artifact_sha256.clone(),
+        release_id: binding.release_id.clone(),
+        build_id: binding.build_id.clone(),
+        app_version: binding.app_version.clone(),
+        protocol_version: binding.protocol_version,
+        platform: binding.platform.clone(),
+        architecture: binding.architecture.clone(),
+        channel: binding.channel.clone(),
+        trust_generation: binding.trust_generation,
+        activation_generation: binding.activation_generation,
+        channel_sequence: binding.channel_sequence,
+    }
 }
 
 async fn authorize_local_run_submit(
@@ -4066,8 +4170,9 @@ async fn authorize_local_run_submit(
         &req.capability,
         &req.ticket,
         "submit",
-        false,
-    )?;
+        None,
+    )?
+    .ticket;
     let (application, _) = local_result_binding(&state, &ticket, &run_id)?;
     let posting = jobs::get_posting(&state.pool, &ticket.account_id, &application.job_id)
         .map_err(internal)?
@@ -4093,10 +4198,12 @@ async fn authorize_local_run_submit(
         &run_id,
     )?;
     let now_ms = capacity.now_ms;
-    let authorized = jobs::local_run_submit_authorized(
+    let server_release_id = browser_server_release_id()?;
+    let authorized = jobs::local_run_submit_authorized_for_distribution(
         &state.pool,
         &run_id,
         &ticket.ticket_hash,
+        &server_release_id,
         &req.final_submit_proof,
         &capacity,
     )
@@ -4157,8 +4264,9 @@ async fn consume_local_run_resume(
         &req.capability,
         &req.ticket,
         "resume",
-        false,
-    )?;
+        None,
+    )?
+    .ticket;
     let action = jobs::consume_local_run_resume_action(&state.pool, &run_id, &ticket.ticket_hash)
         .map_err(internal)?
         .ok_or((
@@ -4215,17 +4323,16 @@ async fn save_local_run_result(
             return Ok(Json(application));
         }
     }
-    let ticket = authorize_local_run_operation(
+    let authorization = authorize_local_run_operation(
         &state,
         &run_id,
         &req.capability,
         &req.ticket,
         "result",
-        matches!(
-            reported_status.as_str(),
-            "submitted" | "side_effect_unknown"
-        ),
+        Some(reported_status.as_str()),
     )?;
+    let capability_version = authorization.capability_version;
+    let ticket = authorization.ticket;
     let mut status = reported_status;
     if ticket.status == "click_started" && matches!(status.as_str(), "failed" | "needs_input") {
         status = "side_effect_unknown".to_string();
@@ -4242,7 +4349,10 @@ async fn save_local_run_result(
     }
     if ticket.expires_at_ms <= jobs::now_ms()
         && !((matches!(status.as_str(), "submitted" | "side_effect_unknown"))
-            && matches!(ticket.status.as_str(), "side_effect_unknown" | "complete")
+            && matches!(
+                ticket.status.as_str(),
+                "click_started" | "side_effect_unknown" | "complete"
+            )
             && ticket
                 .expires_at_ms
                 .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
@@ -4356,6 +4466,7 @@ async fn save_local_run_result(
                 None,
                 Some(&ticket.ticket_hash),
                 Some(&result_capability),
+                capability_version,
             )
             .await?;
             application
@@ -4483,6 +4594,7 @@ async fn replay_submitted_local_run_result(
         None,
         None,
         Some(&result_capability),
+        None,
     )
     .await
     .map(Some)
@@ -4533,15 +4645,30 @@ fn local_result_binding(
     Ok((application, session))
 }
 
+struct AuthorizedLocalRunOperation {
+    ticket: jobs::LocalRunTicket,
+    capability_version: Option<u8>,
+}
+
 fn authorize_local_run_operation(
     state: &AppState,
     run_id: &str,
     capability: &str,
     _legacy_ticket: &str,
     operation: &str,
-    allow_late_reconciliation: bool,
-) -> Result<jobs::LocalRunTicket, ApiError> {
+    reconciliation_status: Option<&str>,
+) -> Result<AuthorizedLocalRunOperation, ApiError> {
     let now = jobs::now_ms();
+    let allow_late_reconciliation = operation == "result"
+        && matches!(
+            reconciliation_status,
+            Some("submitted" | "side_effect_unknown")
+        );
+    let allow_expired_click_started = operation == "result"
+        && matches!(
+            reconciliation_status,
+            Some("submitted" | "side_effect_unknown")
+        );
     #[cfg(debug_assertions)]
     if capability.is_empty() && !_legacy_ticket.is_empty() {
         let hash = local_run_ticket_hash(_legacy_ticket)?;
@@ -4551,6 +4678,12 @@ fn authorize_local_run_operation(
                 StatusCode::NOT_FOUND,
                 "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
             ))?;
+        if !legacy_local_run_capability_status_allowed(&ticket.status, operation) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+            ));
+        }
         if ticket.expires_at_ms <= now
             && !(allow_late_reconciliation
                 && matches!(ticket.status.as_str(), "side_effect_unknown" | "complete")
@@ -4564,7 +4697,10 @@ fn authorize_local_run_operation(
                 "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
             ));
         }
-        return Ok(ticket);
+        return Ok(AuthorizedLocalRunOperation {
+            ticket,
+            capability_version: None,
+        });
     }
 
     let claims = if allow_late_reconciliation {
@@ -4593,9 +4729,17 @@ fn authorize_local_run_operation(
             StatusCode::NOT_FOUND,
             "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
         ))?;
+    if claims.version == 1 && !legacy_local_run_capability_status_allowed(&ticket.status, operation)
+    {
+        return Err((
+            StatusCode::NOT_FOUND,
+            "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
+        ));
+    }
     if ticket.expires_at_ms <= now
         && !(allow_late_reconciliation
-            && matches!(ticket.status.as_str(), "side_effect_unknown" | "complete")
+            && (matches!(ticket.status.as_str(), "side_effect_unknown" | "complete")
+                || (allow_expired_click_started && ticket.status == "click_started"))
             && ticket
                 .expires_at_ms
                 .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
@@ -4606,7 +4750,26 @@ fn authorize_local_run_operation(
             "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
         ));
     }
-    Ok(ticket)
+    Ok(AuthorizedLocalRunOperation {
+        ticket,
+        capability_version: Some(claims.version),
+    })
+}
+
+fn legacy_local_run_capability_status_allowed(ticket_status: &str, operation: &str) -> bool {
+    match operation {
+        "result" => matches!(
+            ticket_status,
+            "claimed"
+                | "needs_input"
+                | "click_started"
+                | "side_effect_unknown"
+                | "complete"
+                | "failed"
+        ),
+        "resume" => matches!(ticket_status, "needs_input" | "claimed"),
+        _ => false,
+    }
 }
 
 fn local_run_ticket_hash(ticket: &str) -> Result<String, ApiError> {
@@ -5620,6 +5783,7 @@ async fn worker_receipt(
         }),
         None,
         None,
+        None,
     )
     .await
     .map(Json)
@@ -5641,6 +5805,7 @@ async fn persist_submission_receipt(
     cloud_access: Option<CloudReceiptAccess>,
     local_ticket_hash: Option<&str>,
     local_result_capability: Option<&str>,
+    local_capability_version: Option<u8>,
 ) -> Result<JobApplication, ApiError> {
     if receipt.get(SUBMISSION_FINGERPRINT_KEY).is_some()
         || receipt.get(jobs::SERVER_SUBMISSION_AUTHORITY_KEY).is_some()
@@ -5756,8 +5921,9 @@ async fn persist_submission_receipt(
         cloud_access,
         local_ticket_hash,
         local_result_capability,
+        local_capability_version,
     ) {
-        ("cloud", Some(access), None, None) => {
+        ("cloud", Some(access), None, None, None) => {
             let authority = jobs::execution_receipt_authority(
                 &state.pool,
                 account_id,
@@ -5775,18 +5941,36 @@ async fn persist_submission_receipt(
                 "phase": authority.phase,
             })
         }
-        ("local", None, Some(ticket_hash), Some(result_capability)) => {
+        ("local", None, Some(ticket_hash), Some(result_capability), Some(capability_version)) => {
             let result_capability_sha256 =
                 jobs::local_result_replay_credential_sha256(result_capability).ok_or((
                     StatusCode::BAD_REQUEST,
                     "Submission receipt runner authority is invalid.".to_string(),
                 ))?;
-            json!({
+            let mut authority = json!({
                 "kind": "local_run_ticket",
                 "ticketHash": ticket_hash,
                 "runId": run_id,
                 "resultCapabilitySha256": result_capability_sha256,
-            })
+            });
+            match capability_version {
+                super::jobs_local_capability::LEGACY_TOKEN_VERSION => {}
+                super::jobs_local_capability::TOKEN_VERSION => {
+                    let release = jobs::get_local_run_browser_release_binding(
+                        &state.pool,
+                        account_id,
+                        &run_id,
+                    )
+                    .map_err(internal)?
+                    .ok_or((
+                        StatusCode::CONFLICT,
+                        "This local Browser run has no immutable release binding.".to_string(),
+                    ))?;
+                    authority["browserRelease"] = jobs::browser_release_receipt_authority(&release);
+                }
+                _ => return bad_request("Submission receipt runner authority is invalid."),
+            }
+            authority
         }
         _ => {
             return bad_request("Submission receipt runner authority is invalid.");
@@ -8451,6 +8635,41 @@ mod tests {
         assert!(availability.auto_submit_available);
     }
 
+    #[test]
+    fn runner_availability_serializes_signed_release_origin_in_snake_case() {
+        let mut entitlement = test_entitlement(5);
+        entitlement.plan = "pro".to_string();
+        entitlement.local_browser = true;
+        let mut availability = build_runner_availability(&entitlement, true, false);
+        availability.local.release = Some(jobs::LocalBrowserReleaseAvailability::Available {
+            reason: "The active beta release is available for this account.".to_string(),
+            channel: "beta".to_string(),
+            release_id: "browser-release-603-1".to_string(),
+            artifact_origin: "https://bluey.sh".to_string(),
+            manifest_sha256: "a".repeat(64),
+            release_sequence: 1,
+            build_id: "browser-603.1".to_string(),
+            app_version: "0.1.5".to_string(),
+            protocol_version: 1,
+            released_at_ms: 1,
+            artifacts: Vec::new(),
+        });
+
+        let serialized = serde_json::to_value(availability).unwrap();
+        assert_eq!(
+            serialized.pointer("/local/release/release_id"),
+            Some(&json!("browser-release-603-1"))
+        );
+        assert_eq!(
+            serialized.pointer("/local/release/artifact_origin"),
+            Some(&json!("https://bluey.sh"))
+        );
+        assert!(serialized.pointer("/local/release/releaseId").is_none());
+        assert!(serialized
+            .pointer("/local/release/artifactOrigin")
+            .is_none());
+    }
+
     fn test_eligibility(capability: &str, can_auto_submit: bool) -> JobEligibilityDecision {
         JobEligibilityDecision {
             capability: capability.to_string(),
@@ -9756,6 +9975,34 @@ mod tests {
                     "ticketHash": "b".repeat(64),
                     "runId": "run-test",
                     "resultCapabilitySha256": replay_hash,
+                    "browserRelease": {
+                        "schemaVersion": 2,
+                        "bindingSha256": "1".repeat(64),
+                        "assignmentSha256": "2".repeat(64),
+                        "assignmentGeneration": 1,
+                        "channel": "beta",
+                        "channelHeadRevision": 1,
+                        "channelTransitionSha256": "3".repeat(64),
+                        "activationSha256": "4".repeat(64),
+                        "activationGeneration": 1,
+                        "trustGeneration": 1,
+                        "trustPolicySha256": "5".repeat(64),
+                        "channelSequence": 1,
+                        "manifestSignatureSetSha256": "6".repeat(64),
+                        "activationAuthorizationSignatureSetSha256": "7".repeat(64),
+                        "manifestSha256": "8".repeat(64),
+                        "releaseSequence": 1,
+                        "artifactId": "artifact-test",
+                        "artifactSha256": "9".repeat(64),
+                        "releaseId": "release-test",
+                        "buildId": "browser-1.0",
+                        "appVersion": "1.0.0",
+                        "protocolVersion": 1,
+                        "platform": "darwin",
+                        "architecture": "arm64",
+                        "packageKind": "darwin-dmg",
+                        "descriptorSha256": "a".repeat(64),
+                    },
                 }
             }
         });
@@ -9775,6 +10022,29 @@ mod tests {
             "different-run",
             &result_capability,
         ));
+
+        let execution = application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]
+            ["executionAuthority"]
+            .as_object_mut()
+            .unwrap();
+        execution.remove("browserRelease");
+        assert_eq!(execution.len(), 4);
+        assert!(jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &result_capability,
+        ));
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]
+            ["unexpected"] = json!(true);
+        assert!(!jobs::submitted_local_receipt_replay_authorized(
+            &application,
+            "run-test",
+            &result_capability,
+        ));
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]
+            .as_object_mut()
+            .unwrap()
+            .remove("unexpected");
 
         application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["executionAuthority"]
             .as_object_mut()

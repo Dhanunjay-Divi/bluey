@@ -1,0 +1,946 @@
+name: Bluey Browser Release Authority Gate
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/jobs-browser-release.yml"
+      - "jobs/browser/electron-builder.yml"
+      - "jobs/browser/package.json"
+      - "jobs/browser/scripts/package-release.mjs"
+      - "jobs/browser/scripts/release-package-contract.mjs"
+      - "jobs/browser/src/release-authority.ts"
+      - "jobs/scripts/browser-release-ci-gate.mjs"
+      - "jobs/scripts/browser-release-ci-gate.test.mjs"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Validate the contract, build one candidate, or promote stored bytes
+        required: true
+        default: contract
+        type: choice
+        options:
+          - contract
+          - candidate
+          - authorize
+          - promote
+      source_commit:
+        description: Exact clean commit to package for a candidate
+        required: false
+        type: string
+      release_id:
+        description: Immutable Browser release identity
+        required: false
+        type: string
+      build_id:
+        description: Browser build identity (browser-N.N)
+        required: false
+        type: string
+      build_signing_key_id:
+        description: Approved build-descriptor signing key identity
+        required: false
+        type: string
+      protocol_version:
+        description: Positive local Browser protocol version
+        required: false
+        type: string
+      build_issued_at_ms:
+        description: Fixed build-descriptor issuance time in Unix milliseconds
+        required: false
+        type: string
+      manifest_id:
+        description: Immutable release-manifest identity
+        required: false
+        type: string
+      manifest_generation:
+        description: Positive release-manifest generation
+        required: false
+        type: string
+      release_sequence:
+        description: Positive monotonic release sequence
+        required: false
+        type: string
+      published_at_ms:
+        description: Fixed release-manifest publication time in Unix milliseconds
+        required: false
+        type: string
+      release_notes_url:
+        description: Immutable HTTPS notes URL beneath this release identity
+        required: false
+        type: string
+      artifact_base_url:
+        description: Immutable HTTPS artifact directory beneath this release identity
+        required: false
+        type: string
+      candidate_run_id:
+        description: Prior run containing the immutable unsigned candidate
+        required: false
+        type: string
+      candidate_artifact_name:
+        description: Exact immutable unsigned-candidate artifact name
+        required: false
+        type: string
+      candidate_source_commit:
+        description: Exact source commit recorded by candidate and authorization
+        required: false
+        type: string
+      candidate_release_id:
+        description: Exact release identity recorded by candidate and authorization
+        required: false
+        type: string
+      candidate_manifest_sha256:
+        description: Exact canonical unsigned manifest digest
+        required: false
+        type: string
+      candidate_trust_policy_sha256:
+        description: Exact approved trust-policy digest stored with the candidate
+        required: false
+        type: string
+      manifest_signature_set_base64:
+        description: Offline-produced canonical detached release signature set
+        required: false
+        type: string
+      manifest_signature_set_sha256:
+        description: Exact detached release signature-set digest
+        required: false
+        type: string
+      authorized_run_id:
+        description: Prior run containing the immutable threshold-authorized candidate
+        required: false
+        type: string
+      authorized_artifact_name:
+        description: Exact immutable threshold-authorization artifact name
+        required: false
+        type: string
+      activation_base64:
+        description: Canonical promotion-time activation over the stored manifest authority
+        required: false
+        type: string
+      activation_sha256:
+        description: Exact canonical activation digest
+        required: false
+        type: string
+      activation_signature_set_base64:
+        description: Offline-produced canonical detached promotion signature set
+        required: false
+        type: string
+      activation_signature_set_sha256:
+        description: Exact detached activation signature-set digest
+        required: false
+        type: string
+      canary_evidence_base64:
+        description: Canonical canary evidence binding all five native packages
+        required: false
+        type: string
+      require_production_ready:
+        description: Reject promotion unless protected production evidence was recorded
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: bluey-browser-release-${{ inputs.operation || 'contract' }}-${{ inputs.release_id || inputs.candidate_release_id || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  contract:
+    if: github.event_name == 'pull_request' || inputs.operation == 'contract'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the workflow source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Select Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Install explicit release-contract dependencies without scripts
+        run: npm ci --ignore-scripts --prefix jobs
+
+      - name: Exercise the release gate
+        run: node --test jobs/scripts/browser-release-ci-gate.test.mjs
+
+      - name: Validate this workflow's fail-closed contract
+        run: >-
+          node jobs/scripts/browser-release-ci-gate.mjs workflow
+          --file .github/workflows/jobs-browser-release.yml
+
+  prepare-candidate:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate' && github.ref_name == github.event.repository.default_branch
+    name: Prepare candidate ${{ matrix.target }} without credentials
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: windows-x64
+            runner: windows-latest
+    env:
+      BLUEY_BROWSER_SOURCE_COMMIT: ${{ inputs.source_commit }}
+    steps:
+      - name: Check out the exact candidate source for credential-free preparation
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate-source
+
+      - name: Select Node.js for credential-free preparation
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: candidate-source/jobs/package-lock.json
+
+      - name: Require an exact clean source and native preparation host
+        shell: bash
+        working-directory: candidate-source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$BLUEY_BROWSER_SOURCE_COMMIT"
+          git merge-base --is-ancestor \
+            "$BLUEY_BROWSER_SOURCE_COMMIT" \
+            "origin/${{ github.event.repository.default_branch }}"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+          TARGET="${{ matrix.target }}" node -e "const expected=process.env.TARGET==='darwin-arm64'?['darwin','arm64']:process.env.TARGET==='darwin-x64'?['darwin','x64']:['win32','x64'];if(process.platform!==expected[0]||process.arch!==expected[1])throw new Error('release target and native runner do not match')"
+
+      - name: Install and build candidate bytes without release credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci --prefix candidate-source/jobs
+          npm run --prefix candidate-source/jobs build --workspace @bluey/jobs-automation
+          npm run --prefix candidate-source/jobs/browser build
+          npm run --prefix candidate-source/jobs/browser prepare:chromium -- \
+            "${{ matrix.target }}"
+          test -z "$(git -C candidate-source status --porcelain=v1 --untracked-files=all)"
+          tar -C candidate-source/jobs -cf \
+            "$RUNNER_TEMP/bluey-browser-prepared-${{ matrix.target }}.tar" \
+            automation/dist browser/dist browser/browser-bundle
+
+      - name: Upload only the prepared candidate bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bluey-browser-prepared-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bluey-browser-prepared-${{ matrix.target }}.tar
+          compression-level: 0
+          if-no-files-found: error
+          include-hidden-files: false
+          overwrite: false
+          retention-days: 1
+
+  candidate-targets:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate' && github.ref_name == github.event.repository.default_branch
+    needs: prepare-candidate
+    name: Candidate ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    environment: bluey-browser-release-signing
+    timeout-minutes: 90
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: darwin-arm64
+            runner: macos-14
+          - target: darwin-x64
+            runner: macos-15-intel
+          - target: windows-x64
+            runner: windows-latest
+    env:
+      BLUEY_BROWSER_RELEASE_ID: ${{ inputs.release_id }}
+      BLUEY_BROWSER_BUILD_ID: ${{ inputs.build_id }}
+      BLUEY_BROWSER_SOURCE_COMMIT: ${{ inputs.source_commit }}
+      BLUEY_BROWSER_BUILD_SIGNING_KEY_ID: ${{ inputs.build_signing_key_id }}
+      BLUEY_BROWSER_PROTOCOL_VERSION: ${{ inputs.protocol_version }}
+      BLUEY_BROWSER_BUILD_ISSUED_AT_MS: ${{ inputs.build_issued_at_ms }}
+    steps:
+      - name: Check out the exact candidate source without executing it
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ inputs.source_commit }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate-source
+
+      - name: Check out trusted release tooling on the isolated signing runner
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+          path: trusted-release-tools
+
+      - name: Select Node.js for isolated trusted packaging
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: trusted-release-tools/jobs/package-lock.json
+
+      - name: Download the prepared bytes from the credential-free job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bluey-browser-prepared-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bluey-browser-prepared
+
+      - name: Materialize prepared bytes and install dependencies without scripts or secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          prepared_archive="$RUNNER_TEMP/bluey-browser-prepared/bluey-browser-prepared-${{ matrix.target }}.tar"
+          test -f "$prepared_archive"
+          npm ci --prefix trusted-release-tools/jobs
+          extracted_jobs="$(node trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs extract-prepared \
+            --archive "$prepared_archive" \
+            --out-parent "$RUNNER_TEMP")"
+          test -d "$extracted_jobs"
+          SOURCE="$extracted_jobs" DESTINATION="$GITHUB_WORKSPACE/candidate-source/jobs" node -e "const fs=require('node:fs'),path=require('node:path');for(const item of ['automation/dist','browser/dist','browser/browser-bundle']){const from=path.join(process.env.SOURCE,item),to=path.join(process.env.DESTINATION,item);fs.rmSync(to,{recursive:true,force:true});fs.mkdirSync(path.dirname(to),{recursive:true});fs.cpSync(from,to,{recursive:true,errorOnExist:true,force:false})}"
+          npm ci --ignore-scripts --prefix candidate-source/jobs
+          npm run --prefix trusted-release-tools/jobs build --workspace @bluey/jobs-automation
+          npm run --prefix trusted-release-tools/jobs/browser build
+          node --input-type=module -e "const contract=await import('./trusted-release-tools/jobs/browser/scripts/release-package-contract.mjs');await contract.validatePreparedPackagingTree('./candidate-source/jobs/browser');await contract.validatePreparedSourceAgainstTrusted('./candidate-source/jobs/browser','./trusted-release-tools/jobs/browser')"
+          node trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs workflow \
+            --file trusted-release-tools/.github/workflows/jobs-browser-release.yml
+          test "$(git -C candidate-source rev-parse HEAD)" = "$BLUEY_BROWSER_SOURCE_COMMIT"
+          test -z "$(git -C candidate-source status --porcelain=v1 --untracked-files=all)"
+
+      - name: Package with trusted tooling and step-scoped signing authority
+        shell: bash
+        env:
+          APPLE_API_KEY_BASE64: ${{ startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_APPLE_API_KEY_BASE64 || '' }}
+          APPLE_API_KEY_ID: ${{ startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_APPLE_API_KEY_ID || '' }}
+          APPLE_API_ISSUER: ${{ startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_APPLE_API_ISSUER || '' }}
+          BLUEY_BROWSER_BUILD_PRIVATE_KEY_PKCS8_BASE64: ${{ secrets.BLUEY_BROWSER_BUILD_PRIVATE_KEY_PKCS8_BASE64 }}
+          BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_BASE64: ${{ secrets.BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_BASE64 }}
+          BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_SHA256: ${{ secrets.BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_SHA256 }}
+          BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY: ${{ (startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_MACOS_SIGNER_IDENTITY) || (matrix.target == 'windows-x64' && secrets.BLUEY_BROWSER_WINDOWS_SIGNER_IDENTITY) || '' }}
+          CSC_KEY_PASSWORD: ${{ startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_MACOS_CSC_KEY_PASSWORD || '' }}
+          CSC_LINK: ${{ startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_MACOS_CSC_LINK || '' }}
+          WIN_CSC_KEY_PASSWORD: ${{ matrix.target == 'windows-x64' && secrets.BLUEY_BROWSER_WINDOWS_CSC_KEY_PASSWORD || '' }}
+          WIN_CSC_LINK: ${{ matrix.target == 'windows-x64' && secrets.BLUEY_BROWSER_WINDOWS_CSC_LINK || '' }}
+        run: |
+          set -euo pipefail
+          build_private_key="$RUNNER_TEMP/bluey-browser-build-private-key.pem"
+          build_keyring="$RUNNER_TEMP/bluey-browser-build-public-keys.json"
+          apple_api_key="$RUNNER_TEMP/AuthKey_BlueyBrowser.p8"
+          cleanup_credentials() {
+            rm -f "$build_private_key" "$build_keyring" "$apple_api_key"
+          }
+          trap cleanup_credentials EXIT
+          test -n "$BLUEY_BROWSER_BUILD_PRIVATE_KEY_PKCS8_BASE64"
+          test -n "$BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_BASE64"
+          BUILD_SECRET="$BLUEY_BROWSER_BUILD_PRIVATE_KEY_PKCS8_BASE64" \
+            OUT="$build_private_key" node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.BUILD_SECRET,'base64'),{flag:'wx',mode:0o600})"
+          KEYRING="$BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_BASE64" \
+            OUT="$build_keyring" node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.KEYRING,'base64'),{flag:'wx',mode:0o600})"
+          export BLUEY_BROWSER_BUILD_PRIVATE_KEY_FILE="$build_private_key"
+          export BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_FILE="$build_keyring"
+          if [[ "${{ matrix.target }}" == darwin-* ]]; then
+            test -n "$APPLE_API_KEY_BASE64"
+            APPLE_KEY="$APPLE_API_KEY_BASE64" OUT="$apple_api_key" \
+              node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.APPLE_KEY,'base64'),{flag:'wx',mode:0o600})"
+            export APPLE_API_KEY="$apple_api_key"
+          fi
+          node trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs credentials \
+            --target "${{ matrix.target }}"
+          node trusted-release-tools/jobs/browser/scripts/package-release.mjs \
+            "${{ matrix.target }}" \
+            --prepared-source-root "$GITHUB_WORKSPACE/candidate-source/jobs/browser"
+
+      - name: Seal and hash the exact package bytes immediately
+        id: seal
+        shell: bash
+        run: |
+          set -euo pipefail
+          seal_directory="$RUNNER_TEMP/bluey-browser-package-seal"
+          seal_sha256="$(node trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs seal \
+            --target "${{ matrix.target }}" \
+            --release-dir candidate-source/jobs/browser/release \
+            --authority-dir candidate-source/jobs/browser/release-authority \
+            --source-commit "$BLUEY_BROWSER_SOURCE_COMMIT" \
+            --out "$seal_directory")"
+          test -n "$seal_sha256"
+          echo "directory=$seal_directory" >> "$GITHUB_OUTPUT"
+          echo "sha256=$seal_sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Verify macOS signing, notarization, and staples
+        if: startsWith(matrix.target, 'darwin-')
+        id: native-macos
+        shell: zsh {0}
+        env:
+          BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY: ${{ secrets.BLUEY_BROWSER_MACOS_SIGNER_IDENTITY }}
+          PACKAGE_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}
+          SEAL_DIRECTORY: ${{ steps.seal.outputs.directory }}
+        run: |
+          set -euo pipefail
+          setopt null_glob
+          target="${{ matrix.target }}"
+          architecture="${target#darwin-}"
+          trusted_gate="$GITHUB_WORKSPACE/trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs"
+          [[ "$(node "$trusted_gate" validate-seal --target "$target" --seal-dir "$SEAL_DIRECTORY" --source-commit "$BLUEY_BROWSER_SOURCE_COMMIT")" == "$PACKAGE_SEAL_SHA256" ]]
+          archives=($SEAL_DIRECTORY/artifacts/Bluey-Browser-*-mac-${architecture}.zip(N.))
+          images=($SEAL_DIRECTORY/artifacts/Bluey-Browser-*-mac-${architecture}.dmg(N.))
+          (( ${#archives} == 1 && ${#images} == 1 ))
+          extract_root="$RUNNER_TEMP/bluey-browser-native-app"
+          mkdir -m 700 "$extract_root"
+          ditto -x -k "$archives[1]" "$extract_root"
+          applications=("$extract_root"/*.app(N/))
+          (( ${#applications} == 1 ))
+          application="$applications[1]"
+          bundle_metadata_raw="$RUNNER_TEMP/archive-bundle-metadata.json"
+          bundle_contract="$RUNNER_TEMP/archive-bundle-contract.json"
+          plutil -convert json -o "$bundle_metadata_raw" \
+            "$application/Contents/Info.plist"
+          PLIST_INPUT="$bundle_metadata_raw" CONTRACT_OUTPUT="$bundle_contract" node -e "const fs=require('node:fs');const value=JSON.parse(fs.readFileSync(process.env.PLIST_INPUT,'utf8'));const types=value.CFBundleURLTypes;if(value.CFBundleIdentifier!=='sh.bluey.jobs.browser'||value.CFBundleName!=='Bluey Browser'||value.CFBundleDisplayName!=='Bluey Browser'||!Array.isArray(types)||types.length!==1||types[0].CFBundleURLName!=='Bluey Jobs'||!Array.isArray(types[0].CFBundleURLSchemes)||types[0].CFBundleURLSchemes.length!==1||types[0].CFBundleURLSchemes[0]!=='bluey-jobs')throw new Error('signed macOS bundle metadata contract mismatch');const contract={appId:value.CFBundleIdentifier,productName:value.CFBundleName,displayName:value.CFBundleDisplayName,protocolName:types[0].CFBundleURLName,protocolScheme:types[0].CFBundleURLSchemes[0]};fs.writeFileSync(process.env.CONTRACT_OUTPUT,JSON.stringify(contract)+'\n',{flag:'wx',mode:0o444})"
+          bundle_contract_sha256="$(shasum -a 256 "$bundle_contract" | awk '{print $1}')"
+          transcript="$RUNNER_TEMP/native-verification-transcript.txt"
+          print -r -- "package_seal_sha256=$PACKAGE_SEAL_SHA256" > "$transcript"
+          {
+            codesign --verify --deep --strict --verbose=4 "$application"
+            spctl --assess --type execute --verbose=4 "$application"
+            xcrun stapler validate "$application"
+            hdiutil verify "$images[1]"
+            codesign --verify --strict --verbose=4 "$images[1]"
+            spctl --assess --type open --context context:primary-signature --verbose=4 "$images[1]"
+            xcrun stapler validate "$images[1]"
+          } 2>&1 | tee -a "$transcript"
+          {
+            print -r -- "macos_application_codesign_verified=true"
+            print -r -- "macos_application_gatekeeper_verified=true"
+            print -r -- "macos_application_staple_verified=true"
+            print -r -- "macos_dmg_integrity_verified=true"
+            print -r -- "macos_dmg_codesign_verified=true"
+            print -r -- "macos_dmg_gatekeeper_verified=true"
+            print -r -- "macos_dmg_staple_verified=true"
+            print -r -- "macos_notarization_verified=true"
+          } >> "$transcript"
+          signer="$(codesign --display --verbose=4 "$application" 2>&1 | sed -n 's/^Authority=//p' | head -n 1)"
+          [[ "$signer" == "$BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY" ]]
+          {
+            print -r -- "macos_bundle_identity_verified=true"
+            print -r -- "macos_protocol_registration_verified=true"
+            print -r -- "macos_bundle_contract_sha256=$bundle_contract_sha256"
+          } >> "$transcript"
+          resources="$(node "$trusted_gate" locate-resources --target "$target" --release-dir "$extract_root")"
+          verifier_version="$(xcodebuild -version | tr '\n' ' ' | sed 's/ *$//')"
+          {
+            print -r -- "signer_identity=$signer"
+            print -r -- "transcript_path=$transcript"
+            print -r -- "verifier_version=$verifier_version"
+            print -r -- "resources_directory=$resources"
+            print -r -- "disk_image_path=$images[1]"
+            print -r -- "bundle_contract_sha256=$bundle_contract_sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify Windows Authenticode signer and timestamp
+        if: matrix.target == 'windows-x64'
+        id: native-windows
+        shell: pwsh
+        env:
+          BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY: ${{ secrets.BLUEY_BROWSER_WINDOWS_SIGNER_IDENTITY }}
+          PACKAGE_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}
+          SEAL_DIRECTORY: ${{ steps.seal.outputs.directory }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $trustedGate = Join-Path $env:GITHUB_WORKSPACE "trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs"
+          $validatedSeal = (& node $trustedGate validate-seal --target "${{ matrix.target }}" --seal-dir $env:SEAL_DIRECTORY --source-commit $env:BLUEY_BROWSER_SOURCE_COMMIT).Trim()
+          if ($LASTEXITCODE -ne 0 -or $validatedSeal -cne $env:PACKAGE_SEAL_SHA256) {
+            throw "The sealed Windows package bytes changed before verification"
+          }
+          $artifacts = Join-Path $env:SEAL_DIRECTORY "artifacts"
+          $installers = @(Get-ChildItem -LiteralPath $artifacts -File -Filter "Bluey-Browser-*-win-x64.exe")
+          if ($installers.Count -ne 1) { throw "Expected exactly one Windows x64 installer" }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installers[0].FullName
+          if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "The Windows installer Authenticode signature is not valid"
+          }
+          if ($null -eq $signature.SignerCertificate) { throw "Missing Authenticode signer" }
+          if ($null -eq $signature.TimeStamperCertificate) { throw "Missing Authenticode timestamp" }
+          $signer = $signature.SignerCertificate.Subject.Trim()
+          if ([string]::IsNullOrWhiteSpace($signer)) { throw "Missing signer identity" }
+          if ($signer -cne $env:BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY) {
+            throw "The Authenticode signer does not match the approved identity"
+          }
+          $transcript = Join-Path $env:RUNNER_TEMP "native-verification-transcript.txt"
+          [IO.File]::WriteAllText(
+            $transcript,
+            "package_seal_sha256=$($env:PACKAGE_SEAL_SHA256)`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          @(
+            "outer_installer_authenticode_verified=true"
+            "outer_installer_timestamp_verified=true"
+            "outer_installer_signer_identity=$signer"
+          ) | Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $signature | Format-List * | Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $sevenZip = (Get-Command 7z.exe -ErrorAction Stop).Source
+          $sevenZipInfo = @(& $sevenZip i 2>&1)
+          if ($LASTEXITCODE -ne 0) { throw "Failed to inspect the 7-Zip verifier" }
+          $sevenZipVersion = ($sevenZipInfo |
+            Where-Object { -not [string]::IsNullOrWhiteSpace("$_") } |
+            Select-Object -First 1).ToString().Trim()
+          if ([string]::IsNullOrWhiteSpace($sevenZipVersion)) {
+            throw "Missing 7-Zip verifier version"
+          }
+          "seven_zip_version=$sevenZipVersion" |
+            Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $payloadRoot = Join-Path $env:RUNNER_TEMP "bluey-browser-installer-payload"
+          $unpackedRoot = Join-Path $env:RUNNER_TEMP "bluey-browser-installer-unpacked"
+          New-Item -ItemType Directory -Path $payloadRoot, $unpackedRoot -ErrorAction Stop | Out-Null
+          $installerPath = $installers[0].FullName
+          & $sevenZip x "-o$payloadRoot" -y -- $installerPath
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract the signed NSIS installer" }
+          "nsis_installer_extracted=true" |
+            Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $appArchives = @(Get-ChildItem -LiteralPath $payloadRoot -Recurse -File -Filter "app-64.7z")
+          if ($appArchives.Count -ne 1) { throw "Expected exactly one NSIS app-64.7z payload" }
+          $appArchivePath = $appArchives[0].FullName
+          & $sevenZip x "-o$unpackedRoot" -y -- $appArchivePath
+          if ($LASTEXITCODE -ne 0) { throw "Failed to extract the signed NSIS app payload" }
+          "nsis_app_archive_extracted=true" |
+            Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $appExecutables = @(Get-ChildItem -LiteralPath $unpackedRoot -File |
+            Where-Object { $_.Name -ceq "Bluey Browser.exe" })
+          if ($appExecutables.Count -ne 1) {
+            throw "Expected exactly one Bluey Browser.exe at the extracted app root"
+          }
+          $appSignature = Get-AuthenticodeSignature -LiteralPath $appExecutables[0].FullName
+          if ($appSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+            throw "The extracted Browser Authenticode signature is not valid"
+          }
+          if ($null -eq $appSignature.SignerCertificate) {
+            throw "Missing extracted Browser Authenticode signer"
+          }
+          if ($null -eq $appSignature.TimeStamperCertificate) {
+            throw "Missing extracted Browser Authenticode timestamp"
+          }
+          $appSigner = $appSignature.SignerCertificate.Subject.Trim()
+          if ($appSigner -cne $env:BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY) {
+            throw "The extracted Browser signer does not match the approved identity"
+          }
+          @(
+            "payload_application_authenticode_verified=true"
+            "payload_application_timestamp_verified=true"
+            "payload_application_signer_identity=$appSigner"
+          ) | Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $appSignature | Format-List * |
+            Out-File -LiteralPath $transcript -Append -Encoding utf8
+          $resources = (& node $trustedGate locate-resources `
+            --target "${{ matrix.target }}" `
+            --release-dir $unpackedRoot).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($resources)) {
+            throw "Failed to locate resources in the signed NSIS app payload"
+          }
+          "signer_identity=$signer" >> $env:GITHUB_OUTPUT
+          "transcript_path=$transcript" >> $env:GITHUB_OUTPUT
+          "verifier_version=PowerShell-$($PSVersionTable.PSVersion)" >> $env:GITHUB_OUTPUT
+          "resources_directory=$resources" >> $env:GITHUB_OUTPUT
+
+      - name: Inventory the exact signed application content
+        id: resources
+        shell: bash
+        env:
+          BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY: ${{ startsWith(matrix.target, 'darwin-') && secrets.BLUEY_BROWSER_MACOS_SIGNER_IDENTITY || '' }}
+          MAC_BUNDLE_CONTRACT_SHA256: ${{ steps.native-macos.outputs.bundle_contract_sha256 }}
+          MAC_DISK_IMAGE_PATH: ${{ steps.native-macos.outputs.disk_image_path }}
+          MAC_RESOURCES_DIRECTORY: ${{ steps.native-macos.outputs.resources_directory }}
+          TRANSCRIPT_PATH: ${{ steps.native-macos.outputs.transcript_path || steps.native-windows.outputs.transcript_path }}
+          WINDOWS_RESOURCES_DIRECTORY: ${{ steps.native-windows.outputs.resources_directory }}
+          PACKAGE_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}
+          SEAL_DIRECTORY: ${{ steps.seal.outputs.directory }}
+        run: |
+          set -euo pipefail
+          target="${{ matrix.target }}"
+          trusted_gate="$GITHUB_WORKSPACE/trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs"
+          [[ "$(node "$trusted_gate" validate-seal --target "$target" --seal-dir "$SEAL_DIRECTORY" --source-commit "$BLUEY_BROWSER_SOURCE_COMMIT")" == "$PACKAGE_SEAL_SHA256" ]]
+          resources="$MAC_RESOURCES_DIRECTORY"
+          if [[ "$target" == windows-x64 ]]; then
+            resources="$WINDOWS_RESOURCES_DIRECTORY"
+          fi
+          test -n "$resources"
+          echo "directory=$resources" >> "$GITHUB_OUTPUT"
+          node "$trusted_gate" inventory \
+            --target "$target" \
+            --resources-dir "$resources" \
+            --authority-dir "$SEAL_DIRECTORY" \
+            --package-seal-sha256 "$PACKAGE_SEAL_SHA256" \
+            --out "$RUNNER_TEMP/app-content-inventory.json"
+          if [[ "$target" == darwin-* ]]; then
+            test -n "$MAC_DISK_IMAGE_PATH"
+            mount_root="$RUNNER_TEMP/bluey-browser-dmg-mount"
+            mkdir -m 700 "$mount_root"
+            hdiutil attach -readonly -nobrowse -noautoopen \
+              -mountpoint "$mount_root" "$MAC_DISK_IMAGE_PATH"
+            cleanup_mount() {
+              hdiutil detach "$mount_root" >/dev/null || true
+            }
+            trap cleanup_mount EXIT
+            shopt -s nullglob
+            applications=("$mount_root"/*.app)
+            [[ ${#applications[@]} -eq 1 ]]
+            dmg_metadata_raw="$RUNNER_TEMP/dmg-bundle-metadata.json"
+            dmg_bundle_contract="$RUNNER_TEMP/dmg-bundle-contract.json"
+            plutil -convert json -o "$dmg_metadata_raw" \
+              "${applications[0]}/Contents/Info.plist"
+            PLIST_INPUT="$dmg_metadata_raw" CONTRACT_OUTPUT="$dmg_bundle_contract" node -e "const fs=require('node:fs');const value=JSON.parse(fs.readFileSync(process.env.PLIST_INPUT,'utf8'));const types=value.CFBundleURLTypes;if(value.CFBundleIdentifier!=='sh.bluey.jobs.browser'||value.CFBundleName!=='Bluey Browser'||value.CFBundleDisplayName!=='Bluey Browser'||!Array.isArray(types)||types.length!==1||types[0].CFBundleURLName!=='Bluey Jobs'||!Array.isArray(types[0].CFBundleURLSchemes)||types[0].CFBundleURLSchemes.length!==1||types[0].CFBundleURLSchemes[0]!=='bluey-jobs')throw new Error('signed DMG bundle metadata contract mismatch');const contract={appId:value.CFBundleIdentifier,productName:value.CFBundleName,displayName:value.CFBundleDisplayName,protocolName:types[0].CFBundleURLName,protocolScheme:types[0].CFBundleURLSchemes[0]};fs.writeFileSync(process.env.CONTRACT_OUTPUT,JSON.stringify(contract)+'\n',{flag:'wx',mode:0o444})"
+            [[ "$(shasum -a 256 "$dmg_bundle_contract" | awk '{print $1}')" == "$MAC_BUNDLE_CONTRACT_SHA256" ]]
+            {
+              codesign --verify --deep --strict --verbose=4 "${applications[0]}"
+              spctl --assess --type execute --verbose=4 "${applications[0]}"
+              xcrun stapler validate "${applications[0]}"
+            } 2>&1 | tee -a "$TRANSCRIPT_PATH"
+            for marker in \
+              dmg_mounted_application_codesign_verified=true \
+              dmg_mounted_application_gatekeeper_verified=true \
+              dmg_mounted_application_staple_verified=true; do
+              MARKER="$marker" \
+                node -e "require('node:fs').appendFileSync(process.env.TRANSCRIPT_PATH,process.env.MARKER+'\\n')"
+            done
+            dmg_signer="$(codesign --display --verbose=4 "${applications[0]}" 2>&1 | sed -n 's/^Authority=//p' | head -n 1)"
+            [[ "$dmg_signer" == "$BLUEY_BROWSER_EXPECTED_NATIVE_SIGNER_IDENTITY" ]]
+            node "$trusted_gate" inventory \
+              --target "$target" \
+              --resources-dir "${applications[0]}/Contents/Resources" \
+              --authority-dir "$SEAL_DIRECTORY" \
+              --package-seal-sha256 "$PACKAGE_SEAL_SHA256" \
+              --out "$RUNNER_TEMP/dmg-app-content-inventory.json"
+            cmp -s \
+              "$RUNNER_TEMP/app-content-inventory.json" \
+              "$RUNNER_TEMP/dmg-app-content-inventory.json"
+            MARKER='dmg_app_content_matches_archive=true' \
+              node -e "require('node:fs').appendFileSync(process.env.TRANSCRIPT_PATH,process.env.MARKER+'\\n')"
+            MARKER='dmg_bundle_metadata_matches_archive=true' \
+              node -e "require('node:fs').appendFileSync(process.env.TRANSCRIPT_PATH,process.env.MARKER+'\\n')"
+          else
+            MARKER='installer_payload_inventory_verified=true' \
+              node -e "require('node:fs').appendFileSync(process.env.TRANSCRIPT_PATH,process.env.MARKER+'\\n')"
+            MARKER='windows_protocol_construction_verified=true' \
+              node -e "require('node:fs').appendFileSync(process.env.TRANSCRIPT_PATH,process.env.MARKER+'\\n')"
+          fi
+          MARKER='app_asar_runtime_contract_verified=true' \
+            node -e "require('node:fs').appendFileSync(process.env.TRANSCRIPT_PATH,process.env.MARKER+'\\n')"
+
+      - name: Record native verification evidence
+        shell: bash
+        env:
+          SIGNER_IDENTITY: ${{ steps.native-macos.outputs.signer_identity || steps.native-windows.outputs.signer_identity }}
+          TRANSCRIPT_PATH: ${{ steps.native-macos.outputs.transcript_path || steps.native-windows.outputs.transcript_path }}
+          NATIVE_VERIFIER_VERSION: ${{ steps.native-macos.outputs.verifier_version || steps.native-windows.outputs.verifier_version }}
+          PACKAGE_SEAL_SHA256: ${{ steps.seal.outputs.sha256 }}
+          SEAL_DIRECTORY: ${{ steps.seal.outputs.directory }}
+        run: |
+          set -euo pipefail
+          trusted_gate="$GITHUB_WORKSPACE/trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs"
+          [[ "$(node "$trusted_gate" validate-seal --target "${{ matrix.target }}" --seal-dir "$SEAL_DIRECTORY" --source-commit "$BLUEY_BROWSER_SOURCE_COMMIT")" == "$PACKAGE_SEAL_SHA256" ]]
+          node "$trusted_gate" record-native \
+            --target "${{ matrix.target }}" \
+            --signer-identity "$SIGNER_IDENTITY" \
+            --transcript "$TRANSCRIPT_PATH" \
+            --package-seal-sha256 "$PACKAGE_SEAL_SHA256" \
+            --tool-version "native=$NATIVE_VERIFIER_VERSION" \
+            --tool-version "node=$(node --version)" \
+            --out "$RUNNER_TEMP/native-verification.json"
+
+      - name: Collect the immutable target evidence
+        shell: bash
+        env:
+          TRANSCRIPT_PATH: ${{ steps.native-macos.outputs.transcript_path || steps.native-windows.outputs.transcript_path }}
+          SEAL_DIRECTORY: ${{ steps.seal.outputs.directory }}
+        run: |
+          set -euo pipefail
+          node trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs collect \
+            --target "${{ matrix.target }}" \
+            --seal-dir "$SEAL_DIRECTORY" \
+            --inventory "$RUNNER_TEMP/app-content-inventory.json" \
+            --native-verification "$RUNNER_TEMP/native-verification.json" \
+            --transcript "$TRANSCRIPT_PATH" \
+            --source-commit "$BLUEY_BROWSER_SOURCE_COMMIT" \
+            --out "$RUNNER_TEMP/bluey-browser-candidate-part"
+
+      - name: Upload this immutable candidate part
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bluey-browser-candidate-part-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bluey-browser-candidate-part
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90
+
+  assemble-candidate:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'candidate' && github.ref_name == github.event.repository.default_branch
+    needs: candidate-targets
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TRUST_POLICY_SHA256: ${{ secrets.BLUEY_BROWSER_RELEASE_TRUST_POLICY_SHA256 }}
+    steps:
+      - name: Check out the trusted workflow validator
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Select Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Download all target evidence from this run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: bluey-browser-candidate-part-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bluey-browser-parts
+          merge-multiple: false
+
+      - name: Materialize the exact approved public trust policy
+        shell: bash
+        env:
+          TRUST_POLICY_BASE64: ${{ secrets.BLUEY_BROWSER_RELEASE_TRUST_POLICY_BASE64 }}
+        run: |
+          set -euo pipefail
+          test -n "$TRUST_POLICY_BASE64"
+          test -n "$TRUST_POLICY_SHA256"
+          trust_policy="$RUNNER_TEMP/bluey-browser-release-trust-policy.json"
+          TRUST_POLICY_BASE64="$TRUST_POLICY_BASE64" OUT="$trust_policy" \
+            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.TRUST_POLICY_BASE64,'base64'),{flag:'wx',mode:0o600})"
+          echo "TRUST_POLICY_FILE=$trust_policy" >> "$GITHUB_ENV"
+
+      - name: Assemble and verify one unsigned native candidate set
+        shell: bash
+        env:
+          ARTIFACT_BASE_URL: ${{ inputs.artifact_base_url }}
+          MANIFEST_GENERATION: ${{ inputs.manifest_generation }}
+          MANIFEST_ID: ${{ inputs.manifest_id }}
+          PUBLISHED_AT_MS: ${{ inputs.published_at_ms }}
+          RELEASE_NOTES_URL: ${{ inputs.release_notes_url }}
+          RELEASE_SEQUENCE: ${{ inputs.release_sequence }}
+        run: |
+          set -euo pipefail
+          arguments=(
+            --parts-dir "$RUNNER_TEMP/bluey-browser-parts"
+            --out "$RUNNER_TEMP/bluey-browser-candidate"
+            --repository "$GITHUB_REPOSITORY"
+            --candidate-run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            --manifest-id "$MANIFEST_ID"
+            --manifest-generation "$MANIFEST_GENERATION"
+            --release-sequence "$RELEASE_SEQUENCE"
+            --published-at-ms "$PUBLISHED_AT_MS"
+            --release-notes-url "$RELEASE_NOTES_URL"
+            --artifact-base-url "$ARTIFACT_BASE_URL"
+            --trust-policy "$TRUST_POLICY_FILE"
+            --trust-policy-sha256 "$TRUST_POLICY_SHA256"
+          )
+          node jobs/scripts/browser-release-ci-gate.mjs assemble "${arguments[@]}"
+          candidate_manifest_sha256="$(node -e "const fs=require('node:fs');const value=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));process.stdout.write(value.manifestSha256)" "$RUNNER_TEMP/bluey-browser-candidate/candidate-set.json")"
+          node jobs/scripts/browser-release-ci-gate.mjs validate \
+            --candidate-dir "$RUNNER_TEMP/bluey-browser-candidate" \
+            --expected-source-commit "${{ inputs.source_commit }}" \
+            --expected-release-id "${{ inputs.release_id }}" \
+            --expected-manifest-sha256 "$candidate_manifest_sha256" \
+            --expected-trust-policy-sha256 "$TRUST_POLICY_SHA256"
+          {
+            echo "### Bluey Browser immutable candidate"
+            echo "- Artifact: \`bluey-browser-candidate-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}\`"
+            echo "- Source commit: \`${{ inputs.source_commit }}\`"
+            echo "- Manifest SHA-256: \`$candidate_manifest_sha256\`"
+            echo "- Trust policy SHA-256: \`$TRUST_POLICY_SHA256\`"
+            echo "- Readiness: \`native-verified-candidate\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the one immutable candidate set
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bluey-browser-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bluey-browser-candidate
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90
+
+  authorize-stored-candidate:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'authorize' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the candidate's exact validator
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Select Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Download the exact stored unsigned candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.candidate_artifact_name }}
+          path: ${{ runner.temp }}/stored-bluey-browser-candidate
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.candidate_run_id }}
+
+      - name: Materialize the independently produced release signatures
+        shell: bash
+        env:
+          MANIFEST_SIGNATURE_SET_BASE64: ${{ inputs.manifest_signature_set_base64 }}
+        run: |
+          set -euo pipefail
+          test -n "$MANIFEST_SIGNATURE_SET_BASE64"
+          signature_set="$RUNNER_TEMP/release-manifest-signatures.json"
+          MANIFEST_SIGNATURE_SET_BASE64="$MANIFEST_SIGNATURE_SET_BASE64" OUT="$signature_set" \
+            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.MANIFEST_SIGNATURE_SET_BASE64,'base64'),{flag:'wx',mode:0o600})"
+          echo "MANIFEST_SIGNATURE_SET_FILE=$signature_set" >> "$GITHUB_ENV"
+
+      - name: Authorize only the verified stored manifest bytes
+        shell: bash
+        env:
+          CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+          CANDIDATE_RELEASE_ID: ${{ inputs.candidate_release_id }}
+          CANDIDATE_SOURCE_COMMIT: ${{ inputs.candidate_source_commit }}
+          CANDIDATE_TRUST_POLICY_SHA256: ${{ inputs.candidate_trust_policy_sha256 }}
+          MANIFEST_SIGNATURE_SET_SHA256: ${{ inputs.manifest_signature_set_sha256 }}
+        run: |
+          set -euo pipefail
+          VERIFICATION_TIME_MS="$(node -e 'process.stdout.write(String(Date.now()))')"
+          # AUTHORIZATION-NO-REBUILD-BEGIN
+          node jobs/scripts/browser-release-ci-gate.mjs authorize \
+            --candidate-dir "$RUNNER_TEMP/stored-bluey-browser-candidate" \
+            --manifest-signature-set "$MANIFEST_SIGNATURE_SET_FILE" \
+            --out "$RUNNER_TEMP/authorized-bluey-browser-candidate" \
+            --authorization-run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --expected-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+            --expected-release-id "$CANDIDATE_RELEASE_ID" \
+            --expected-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256" \
+            --expected-trust-policy-sha256 "$CANDIDATE_TRUST_POLICY_SHA256" \
+            --expected-signature-set-sha256 "$MANIFEST_SIGNATURE_SET_SHA256" \
+            --verification-time-ms "$VERIFICATION_TIME_MS"
+          # AUTHORIZATION-NO-REBUILD-END
+
+      - name: Upload the immutable threshold authorization
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bluey-browser-authorized-${{ inputs.candidate_release_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/authorized-bluey-browser-candidate
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90
+
+  promote-stored-authorization:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'promote' && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the authorized candidate's exact validator
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Select Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Download the exact stored threshold authorization
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ inputs.authorized_artifact_name }}
+          path: ${{ runner.temp }}/stored-bluey-browser-authorization
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.authorized_run_id }}
+
+      - name: Materialize offline activation and canary authorities
+        shell: bash
+        env:
+          ACTIVATION_BASE64: ${{ inputs.activation_base64 }}
+          ACTIVATION_SIGNATURE_SET_BASE64: ${{ inputs.activation_signature_set_base64 }}
+          CANARY_EVIDENCE_BASE64: ${{ inputs.canary_evidence_base64 }}
+        run: |
+          set -euo pipefail
+          test -n "$ACTIVATION_BASE64"
+          test -n "$ACTIVATION_SIGNATURE_SET_BASE64"
+          test -n "$CANARY_EVIDENCE_BASE64"
+          activation="$RUNNER_TEMP/release-activation.json"
+          activation_signatures="$RUNNER_TEMP/release-activation-signatures.json"
+          canary="$RUNNER_TEMP/canary-evidence.json"
+          ACTIVATION_BASE64="$ACTIVATION_BASE64" OUT="$activation" \
+            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.ACTIVATION_BASE64,'base64'),{flag:'wx',mode:0o600})"
+          ACTIVATION_SIGNATURE_SET_BASE64="$ACTIVATION_SIGNATURE_SET_BASE64" OUT="$activation_signatures" \
+            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.ACTIVATION_SIGNATURE_SET_BASE64,'base64'),{flag:'wx',mode:0o600})"
+          CANARY_EVIDENCE_BASE64="$CANARY_EVIDENCE_BASE64" OUT="$canary" \
+            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.CANARY_EVIDENCE_BASE64,'base64'),{flag:'wx',mode:0o600})"
+          {
+            echo "ACTIVATION_FILE=$activation"
+            echo "ACTIVATION_SIGNATURE_SET_FILE=$activation_signatures"
+            echo "CANARY_EVIDENCE_FILE=$canary"
+          } >> "$GITHUB_ENV"
+
+      - name: Promote only stored bytes with exact stable authority
+        shell: bash
+        env:
+          ACTIVATION_SHA256: ${{ inputs.activation_sha256 }}
+          ACTIVATION_SIGNATURE_SET_SHA256: ${{ inputs.activation_signature_set_sha256 }}
+          CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
+          CANDIDATE_RELEASE_ID: ${{ inputs.candidate_release_id }}
+          CANDIDATE_SOURCE_COMMIT: ${{ inputs.candidate_source_commit }}
+          CANDIDATE_TRUST_POLICY_SHA256: ${{ inputs.candidate_trust_policy_sha256 }}
+          MANIFEST_SIGNATURE_SET_SHA256: ${{ inputs.manifest_signature_set_sha256 }}
+          REQUIRE_PRODUCTION_READY: ${{ inputs.require_production_ready }}
+        run: |
+          set -euo pipefail
+          VERIFICATION_TIME_MS="$(node -e 'process.stdout.write(String(Date.now()))')"
+          # PROMOTION-NO-REBUILD-BEGIN
+          node jobs/scripts/browser-release-ci-gate.mjs promote \
+            --authorized-dir "$RUNNER_TEMP/stored-bluey-browser-authorization" \
+            --activation "$ACTIVATION_FILE" \
+            --activation-signature-set "$ACTIVATION_SIGNATURE_SET_FILE" \
+            --canary-evidence "$CANARY_EVIDENCE_FILE" \
+            --out "$RUNNER_TEMP/bluey-browser-promotion" \
+            --promotion-run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --expected-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+            --expected-release-id "$CANDIDATE_RELEASE_ID" \
+            --expected-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256" \
+            --expected-trust-policy-sha256 "$CANDIDATE_TRUST_POLICY_SHA256" \
+            --expected-manifest-signature-set-sha256 "$MANIFEST_SIGNATURE_SET_SHA256" \
+            --expected-activation-sha256 "$ACTIVATION_SHA256" \
+            --expected-activation-signature-set-sha256 "$ACTIVATION_SIGNATURE_SET_SHA256" \
+            --verification-time-ms "$VERIFICATION_TIME_MS" \
+            --require-production-ready "$REQUIRE_PRODUCTION_READY"
+          node jobs/scripts/browser-release-ci-gate.mjs validate-promotion \
+            --promotion-dir "$RUNNER_TEMP/bluey-browser-promotion" \
+            --expected-source-commit "$CANDIDATE_SOURCE_COMMIT" \
+            --expected-release-id "$CANDIDATE_RELEASE_ID" \
+            --expected-manifest-sha256 "$CANDIDATE_MANIFEST_SHA256" \
+            --expected-trust-policy-sha256 "$CANDIDATE_TRUST_POLICY_SHA256" \
+            --expected-manifest-signature-set-sha256 "$MANIFEST_SIGNATURE_SET_SHA256" \
+            --expected-activation-sha256 "$ACTIVATION_SHA256" \
+            --expected-activation-signature-set-sha256 "$ACTIVATION_SIGNATURE_SET_SHA256" \
+            --verification-time-ms "$VERIFICATION_TIME_MS" \
+            --require-production-ready "$REQUIRE_PRODUCTION_READY"
+          # PROMOTION-NO-REBUILD-END
+
+      - name: Upload the immutable promotion authority
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: bluey-browser-promoted-${{ inputs.candidate_release_id }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bluey-browser-promotion
+          compression-level: 0
+          if-no-files-found: error
+          overwrite: false
+          retention-days: 90

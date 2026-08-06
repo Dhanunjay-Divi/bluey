@@ -11,6 +11,7 @@ import {
 } from "@bluey/jobs-automation";
 import {
   scopedLocalRunAuthorization,
+  scopedLocalRunReconciliationAuthorization,
   type LocalRunCapabilities,
   type LocalRunCapabilityOperation,
 } from "./local-capabilities.js";
@@ -87,6 +88,17 @@ export function localRunAuthorization(
 ): { capability: string } {
   try {
     return scopedLocalRunAuthorization(delivery.capabilities, operation);
+  } catch {
+    throw new LocalBrowserError("launch_expired");
+  }
+}
+
+export function localRunReconciliationAuthorization(
+  delivery: LocalRunDelivery,
+  nowMs = Date.now(),
+): { capability: string } {
+  try {
+    return scopedLocalRunReconciliationAuthorization(delivery.capabilities, nowMs);
   } catch {
     throw new LocalBrowserError("launch_expired");
   }

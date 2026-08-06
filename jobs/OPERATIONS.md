@@ -17,10 +17,14 @@ On a Bluey production host, install `ops/bluey-jobs.env.example` as
 secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
 loads the shared API, Valkey, and Postgres environment files. Keep
 `BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
-Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until versioned Bluey
-Browser packages and updater metadata are published and physical macOS/Windows
-install, launch, protocol, and rollback canaries pass. Plan entitlement alone
-must never expose an undistributed client.
+Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until an independently
+approved root trust anchor, exact server release ID, signed channel authority,
+immutable native packages, and physical macOS/Windows install, launch,
+protocol, upgrade, rollback, immutable-host read-back, and portal-download
+canaries are complete. Plan entitlement alone must never expose an
+undistributed client. Native self-update remains a separate release capability;
+the manifest-bound macOS ZIP does not imply that an installed-app updater
+exists.
 Keep `BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0` until the authenticated
 workflow gateway, Temporal workers, and isolated Chromium pool are deployed and
 their start, intervention, restart-recovery, receipt, and rollback canaries pass.
@@ -47,6 +51,12 @@ and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
 ```text
 BLUEY_JOBS_BETA_ENABLED=1
 BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
+# Configure for Browser registry import/verification before enabling local
+# Browser distribution. The server release ID must be accepted by the active
+# signed activation; the JSON contains public root Ed25519 keys and an
+# independently approved threshold.
+# BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID=server-603.1
+# BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON='{"threshold":2,"keys":{"root-key-1":"<base64url-public-key>","root-key-2":"<base64url-public-key>"}}'
 BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
 # Keep managed model generation disabled until provider credentials, the
 # global spend guard, and usage-ledger monitoring are verified in production.
@@ -503,34 +513,183 @@ do not replace a deny-by-default production network policy.
 
 ## Desktop releases
 
-`npm run package --workspace @bluey/jobs-browser` downloads the matching
-Playwright Chromium and builds macOS, Windows, and Linux artifacts. Public
-artifacts require Apple signing/notarization and Windows Authenticode signing.
-Unsigned beta artifacts must not be presented as production installers.
-
-Run direct Electron Builder validation from `jobs/browser` so package-relative
-icons, Chromium resources, and the `dist/main.js` entry resolve correctly:
+Browser release packaging is target-explicit and native-host-only:
 
 ```sh
-CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --dir --config electron-builder.yml
+cd jobs
+npm run package:darwin-arm64 --workspace @bluey/jobs-browser
+npm run package:darwin-x64 --workspace @bluey/jobs-browser
+npm run package:windows-x64 --workspace @bluey/jobs-browser
 ```
 
-The package build cleans every production `dist` directory before compiling.
-Release validation must confirm `app.asar` contains `dist/main.js` and the
-compiled `@bluey/jobs-automation/dist/index.js`, contains no Bluey `src` or
-`tests` directories or test configuration, and includes the matching Chromium
-bundle under the app's `Resources/playwright` directory.
+These are low-level target entry points. They require the already compiled
+automation and Browser trees, target-matching Chromium, exact descriptor inputs,
+and native signing environment; they are not a substitute for the protected
+release workflow and must not be used alone to label an artifact releasable.
 
-The authenticated portal starts a local application by creating a 24-hour
+The generic `package` and `prepare:chromium` entry points intentionally fail
+without one exact target. Linux and universal-macOS artifacts are not supported
+by this release contract. Use the protected `Bluey Browser Release Authority
+Gate` workflow for candidates: it checks out one exact clean default-branch
+commit, materializes build-signing inputs outside the repository, packages once
+on the matching native host, and preserves those same bytes through independent
+threshold authorization and promotion. Do not run Electron Builder directly
+for a releasable artifact and do not rebuild between candidate verification and
+promotion.
+
+Each candidate must prove the exact approved native signer. macOS validation
+verifies signatures, notarization, and existing staples for the ZIP application,
+DMG, and mounted DMG application, then byte-compares their canonical Resources
+and bundle-metadata inventories. Windows validation checks
+the signed/timestamped NSIS installer, extracts its exact `app-64.7z` payload,
+checks the signed/timestamped application executable, and inventories those
+extracted Resources. The gate also proves `app.asar`, the compiled automation
+dependency, matching headed Chromium revision/architecture, embedded build
+authority, excluded source/test/config files, immutable artifact hashes and
+sizes, and all five native packages. Promotion validates a canonical external
+canary-evidence record with the exact required stable check IDs; it does not run
+those physical canaries itself.
+The protected candidate environment must supply
+`BLUEY_BROWSER_MACOS_SIGNER_IDENTITY` and
+`BLUEY_BROWSER_WINDOWS_SIGNER_IDENTITY` alongside the corresponding native
+signing/notarization credentials; an absent or non-exact identity fails before
+candidate evidence can be emitted.
+
+On macOS, post-signing `Info.plist` inspection proves the exact bundle ID,
+product name, and custom-protocol declaration in both package forms. On Windows,
+the source gate proves the locked trusted NSIS construction inputs and the
+packaged runtime's exact protocol-registration call without executing candidate
+application code on the signing runner. Actual Windows registry registration is
+therefore a mandatory fresh, credential-free clean-install canary, together with
+installer/AUMID identity and `bluey-jobs` protocol launch. Outer/inner
+Authenticode signatures, timestamps, ASAR inventory, and the compiled
+`setAsDefaultProtocolClient("bluey-jobs")` call are construction proof only.
+
+The macOS ZIP is retained as a manifest-classified updater artifact only. No
+installed-app feed, downloader, installer coordinator, or automatic rollback is
+shipped by this batch, so it must not be presented as self-update readiness.
+
+### Browser release workflow handoff
+
+The `Bluey Browser Release Authority Gate` workflow has four explicit
+operations. `contract` also runs for pull requests; manually dispatched
+`candidate`, `authorize`, and `promote` operations must run from the repository
+default branch. Every later operation must name the exact prior run, artifact,
+source commit, release ID, and authority digests printed by the earlier run:
+
+1. `contract` exercises the release scripts and fail-closed workflow contract.
+2. `candidate` prepares one exact clean commit without credentials on each
+   native target, packages it once inside the protected
+   `bluey-browser-release-signing` environment, verifies native evidence, and
+   assembles the three target parts into one five-artifact candidate set.
+3. `authorize` downloads that exact candidate and joins it to an independently
+   produced threshold manifest signature set. It neither rebuilds nor signs a
+   native package.
+4. `promote` downloads that exact authorization and joins it to the canonical
+   activation, promotion signature set, and separately collected physical
+   canary-evidence record. `require_production_ready=true` validates the record
+   and its required check IDs; it is not evidence that this source checkout ran
+   the devices.
+
+GitHub artifacts retained by this workflow are handoff evidence, not an
+immutable public download origin. Before registry activation, copy the exact
+verified bytes to the manifest's immutable HTTPS URLs and perform a complete
+public read-back with matching sizes and SHA-256 digests. Never rebuild or
+rename an artifact between candidate, authorization, read-back, and promotion.
+
+### Browser release authority inventory
+
+The protected `bluey-browser-release-signing` native packaging environment must
+configure the build and native-signing values below. An empty, wrong, or extra
+credential must fail the candidate rather than fall back to an unsigned
+package:
+
+- Build identity: `BLUEY_BROWSER_BUILD_PRIVATE_KEY_PKCS8_BASE64`,
+  `BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_BASE64`, and
+  `BLUEY_BROWSER_BUILD_PUBLIC_KEYRING_SHA256`.
+- macOS: `BLUEY_BROWSER_APPLE_API_KEY_BASE64`,
+  `BLUEY_BROWSER_APPLE_API_KEY_ID`, `BLUEY_BROWSER_APPLE_API_ISSUER`,
+  `BLUEY_BROWSER_MACOS_CSC_LINK`, `BLUEY_BROWSER_MACOS_CSC_KEY_PASSWORD`, and
+  `BLUEY_BROWSER_MACOS_SIGNER_IDENTITY`.
+- Windows: `BLUEY_BROWSER_WINDOWS_CSC_LINK`,
+  `BLUEY_BROWSER_WINDOWS_CSC_KEY_PASSWORD`, and
+  `BLUEY_BROWSER_WINDOWS_SIGNER_IDENTITY`.
+
+Candidate assembly must also receive
+`BLUEY_BROWSER_RELEASE_TRUST_POLICY_BASE64` and
+`BLUEY_BROWSER_RELEASE_TRUST_POLICY_SHA256`. They are public authority material,
+not private signing keys, and must identify the exact approved policy used to
+assemble the candidate.
+
+The workflow's manifest signature set, activation, activation signature set,
+and canary evidence are canonical public authorities passed between offline
+ceremony and exact stored-byte verification. Root, release, promotion, and
+incident private keys must never be stored in the repository, candidate
+artifacts, Browser package, API environment, or workflow outputs. The API host
+receives only `BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID` and the independently
+approved public `BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON`.
+
+`BLUEY_JOBS_BROWSER_DEVELOPMENT_RELEASE_DIRECTORY` is deliberately absent from
+the production environment example. It is accepted only by an unpackaged
+Browser process whose Jobs API origin is credential-free loopback HTTP; a
+packaged process ignores it. Never place it in a production service, package,
+or customer environment.
+
+### Browser release registry ceremony
+
+The administrator-authenticated registry exposes eight routes. Import and
+movement requests are strict JSON with unknown fields rejected:
+
+| Route | Request authority | Purpose |
+|-------|-------------------|---------|
+| `POST /admin/jobs/browser-releases/trust-policies` | `{canonicalBase64url, signatureSetBase64url}` | Import or byte-replay a root-authorized trust policy. |
+| `POST /admin/jobs/browser-releases/manifests` | `{canonicalBase64url, signatureSetBase64url, buildProofs}` | Import the threshold-authorized manifest and every exact packaged build proof. |
+| `POST /admin/jobs/browser-releases/activations` | `{canonicalBase64url, signatureSetBase64url}` | Import a promotion-authorized channel activation without moving the head. |
+| `POST /admin/jobs/browser-releases/activations/apply` | `{activationSha256, expectedHeadRevision, expectedTransitionSha256}` | Compare-and-swap the channel head to an imported activation. |
+| `POST /admin/jobs/browser-releases/rollbacks` | `{canonicalBase64url, signatureSetBase64url}` | Apply an exact signed higher-sequence rollback transition. |
+| `POST /admin/jobs/browser-releases/revocations` | `{canonicalBase64url, signatureSetBase64url}` | Append an irreversible incident-authorized revocation. |
+| `POST /admin/jobs/browser-releases/accounts/:account_id/channel` | `{assignmentGeneration, predecessorAssignmentSha256, channel, reasonRef, assignedAtMs}` | Assign one account to one channel with a monotonic generation and predecessor digest. |
+| `GET /admin/jobs/browser-releases/channels/:channel/status` | none | Read current CAS fields, authority digests, expiry, and availability. |
+
+Use this order for a new channel head: configure the public root anchor and
+server release ID; import the trust policy; import the manifest and exact build
+proofs from the stored promotion set; import the activation; read channel
+status; apply the activation with that exact `headRevision` and
+`transitionSha256`; assign only intended accounts with the next exact assignment
+generation; then read channel and account-facing availability again. A replay
+must return the same digests with `replayed=true`; any conflicting replay,
+sequence regression, stale compare-and-swap, incomplete artifact set, obsolete
+origin, expiry, or revocation stops the ceremony.
+
+Rollback and revocation are separate incident paths. A rollback requires a new
+higher-sequence signed authority that binds the current activation and exact
+target manifest. A revocation is append-only and must be followed by channel
+status and account-facing availability checks. Keep
+`BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` throughout rehearsal; enabling
+it is a distinct approved production change after immutable hosting, native
+credentials, and every physical canary have independently passed.
+
+The authenticated portal starts a local application by creating a bounded
 capability in `jobs_local_run_tickets`, then opening
 `bluey-jobs://run/<run-id>?ticket=<random-ticket>`. Only the ticket enters the
 custom-protocol URL. Its secret and frozen packet are encrypted in the Jobs
 database, the database stores a lookup hash separately, and terminal results
-are idempotent. The desktop claims and reports the run through
-`BLUEY_JOBS_API_ORIGIN`; production must keep that origin on HTTPS.
+are idempotent. Claim sends the exact packaged canonical build descriptor,
+detached signature, and request-bound nonce. The server consumes the ticket
+only after the current account assignment, signed channel head, server-runtime
+compatibility, full artifact set, and revocation state pass in one transaction,
+then freezes those bindings into operation-scoped capabilities. Pre-click
+authorization rechecks the current assignment, activation compatibility, and
+revocation state without weakening result/resume or trusted-receipt recovery.
+The desktop claims and reports the run through `BLUEY_JOBS_API_ORIGIN`;
+production must keep that origin on HTTPS.
 
 ## External release gates
 
+- Apple Developer ID/notarization and Windows Authenticode/timestamp credentials,
+  exact approved signer identities, and immutable artifact-host access.
+- Physical macOS arm64/x64 and Windows x64 clean-install, protocol-claim,
+  upgrade, rollback, immutable-readback, and portal-download canary evidence.
 - Gmail and Outlook OAuth applications, redirect URIs, webhook subscriptions,
   and encrypted refresh-token storage.
 - Licensed discovery-provider contracts and API credentials.

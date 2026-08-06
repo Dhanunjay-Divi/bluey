@@ -6,8 +6,18 @@ import {
   prepareBrowserBundleDirectory,
   retainHeadedChromiumOnly,
 } from "./browser-bundle-content.mjs";
+import {
+  readBrowserSourceContract,
+  requireReleaseTarget,
+  validateHeadedChromiumBundle,
+} from "./release-package-contract.mjs";
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+if (process.argv.length !== 3) {
+  throw new Error("Playwright Chromium installation requires one explicit release target");
+}
+const target = requireReleaseTarget(process.argv[2]);
+const sourceContract = await readBrowserSourceContract(packageRoot);
 const require = createRequire(import.meta.url);
 const playwrightRoot = dirname(require.resolve("playwright/package.json"));
 const cli = join(playwrightRoot, "cli.js");
@@ -22,4 +32,11 @@ const result = spawnSync(process.execPath, [cli, "install", "--no-shell", "chrom
 if (result.error) throw result.error;
 if (result.status !== 0) process.exit(result.status ?? 1);
 const retained = await retainHeadedChromiumOnly(browsers);
-console.log(`Bluey Browser retained headed Playwright runtime: ${retained}`);
+await validateHeadedChromiumBundle(
+  browsers,
+  sourceContract.chromiumRevision,
+  target,
+);
+console.log(
+  `Bluey Browser retained headed Playwright runtime ${retained} for ${target.name}`,
+);

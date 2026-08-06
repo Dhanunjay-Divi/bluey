@@ -15,6 +15,7 @@ import {
   reconcileLocalProviderConfirmation,
 } from "../src/provider-final-review.js";
 import { parseBlueyJobsProtocol } from "../src/protocol.js";
+import { localRunCapabilityFixture } from "./fixtures/local-run-capability.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -264,18 +265,7 @@ async function temporaryRunDirectory(): Promise<string> {
 }
 
 function localResumeCapability(): string {
-  const claims = {
-    version: 1,
-    audience: "bluey-jobs-local-run",
-    account_id: "account-123",
-    application_id: "application-123",
-    run_id: "run-123",
-    browser_profile_id: "profile-123",
-    operation: "resume",
-    expires_at_ms: 2_000,
-    nonce: "n".repeat(32),
-  };
-  return `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${"a".repeat(64)}`;
+  return localRunCapabilityFixture("resume", 2_000);
 }
 
 function canonicalJobUrl(adapter: "greenhouse" | "lever"): string {

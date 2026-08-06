@@ -51,7 +51,14 @@ pub fn submitted_local_receipt_replay_authorized(
         .get("resultCapabilitySha256")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    execution.len() == 4
+    let release_authority_valid = match execution.len() {
+        4 => !execution.contains_key("browserRelease"),
+        5 => execution
+            .get("browserRelease")
+            .is_some_and(browser_release_receipt_authority_valid),
+        _ => false,
+    };
+    release_authority_valid
         && execution.get("kind").and_then(Value::as_str) == Some("local_run_ticket")
         && execution.get("runId").and_then(Value::as_str) == Some(run_id)
         && ticket_hash.len() == 64
@@ -412,14 +419,58 @@ pub fn claim_authorized_local_run_ticket(
 /// Atomically validates the exact local-run authority and reserves protected
 /// evidence headroom immediately before the local browser crosses the
 /// irreversible employer Submit boundary.
-pub fn local_run_submit_authorized(
+#[cfg(test)]
+pub(crate) fn local_run_submit_authorized_for_server(
     pool: &DbPool,
     run_id: &str,
     ticket_hash: &str,
+    server_release_id: &str,
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
 ) -> Result<bool> {
-    if capacity.run_id != run_id || capacity.runner != "local" {
+    local_run_submit_authorized_inner(
+        pool,
+        run_id,
+        ticket_hash,
+        server_release_id,
+        final_submit_proof,
+        capacity,
+        false,
+    )
+}
+
+pub(crate) fn local_run_submit_authorized_for_distribution(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+    server_release_id: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> Result<bool> {
+    local_run_submit_authorized_inner(
+        pool,
+        run_id,
+        ticket_hash,
+        server_release_id,
+        final_submit_proof,
+        capacity,
+        true,
+    )
+}
+
+fn local_run_submit_authorized_inner(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+    server_release_id: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    require_distribution_ready: bool,
+) -> Result<bool> {
+    if capacity.run_id != run_id
+        || capacity.runner != "local"
+        || !browser_release_safe_id(server_release_id)
+    {
         return Ok(false);
     }
     let now = now_ms();
@@ -427,9 +478,9 @@ pub fn local_run_submit_authorized(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(
-                &tx, capacity,
-            )?;
+            if require_distribution_ready && !sqlite_runner_volume_fleet_distribution_ready(&tx)? {
+                return Ok(false);
+            }
             let ticket = sqlite_local_run_authority(
                 &tx,
                 run_id,
@@ -444,6 +495,12 @@ pub fn local_run_submit_authorized(
             if !authorized {
                 return Ok(false);
             }
+            if !sqlite_bound_browser_release_submit_allowed(&tx, run_id, server_release_id)? {
+                return Ok(false);
+            }
+            crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(
+                &tx, capacity,
+            )?;
             match bind_final_submit_proof_sqlite_tx(
                 &tx,
                 &capacity.account_id,
@@ -474,8 +531,24 @@ pub fn local_run_submit_authorized(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(
-                &mut tx, capacity,
+            if require_distribution_ready
+                && !postgres_runner_volume_fleet_distribution_ready(&mut tx)?
+            {
+                return Ok(false);
+            }
+            let account_id = tx
+                .query_opt(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = $1 AND ticket_hash = $2",
+                    &[&run_id, &ticket_hash],
+                )?
+                .map(|row| row.get::<_, String>(0));
+            if account_id.as_deref() != Some(capacity.account_id.as_str()) {
+                return Ok(false);
+            }
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &capacity.account_id,
             )?;
             let ticket = postgres_local_run_authority(
                 &mut tx,
@@ -491,6 +564,13 @@ pub fn local_run_submit_authorized(
             if !authorized {
                 return Ok(false);
             }
+            postgres_lock_browser_release_registry_shared(&mut tx)?;
+            if !postgres_bound_browser_release_submit_allowed(&mut tx, run_id, server_release_id)? {
+                return Ok(false);
+            }
+            crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(
+                &mut tx, capacity,
+            )?;
             match bind_final_submit_proof_postgres_tx(
                 &mut tx,
                 &capacity.account_id,
@@ -519,6 +599,24 @@ pub fn local_run_submit_authorized(
             Ok(true)
         }
     })
+}
+
+#[cfg(test)]
+pub fn local_run_submit_authorized(
+    pool: &DbPool,
+    run_id: &str,
+    ticket_hash: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> Result<bool> {
+    local_run_submit_authorized_for_server(
+        pool,
+        run_id,
+        ticket_hash,
+        "test-server",
+        final_submit_proof,
+        capacity,
+    )
 }
 
 fn sqlite_local_run_authority(
@@ -1004,12 +1102,11 @@ pub fn finalize_local_side_effect_unknown(
             }
             let prior_application_state = application.state.clone();
             validate_application_transition(&application.state, "side_effect_unknown")?;
-            if ticket_expires_at_ms <= now
-                || !matches!(
-                    ticket_status.as_str(),
-                    "claimed" | "needs_input" | "click_started"
-                )
-            {
+            if !local_side_effect_unknown_transition_allowed(
+                &ticket_status,
+                ticket_expires_at_ms,
+                now,
+            ) {
                 anyhow::bail!("local run ticket is not active")
             }
             retain_local_unknown_capacity_sqlite_tx(
@@ -1023,8 +1120,7 @@ pub fn finalize_local_side_effect_unknown(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'side_effect_unknown', updated_at_ms = ?5
                   WHERE id = ?1 AND account_id = ?2 AND application_id = ?3
-                    AND ticket_hash = ?4 AND expires_at_ms > ?5
-                    AND status = ?6",
+                    AND ticket_hash = ?4 AND status = ?6",
                 params![
                     run_id,
                     account_id,
@@ -1184,12 +1280,11 @@ pub fn finalize_local_side_effect_unknown(
             }
             let prior_application_state = application.state.clone();
             validate_application_transition(&application.state, "side_effect_unknown")?;
-            if ticket_expires_at_ms <= now
-                || !matches!(
-                    ticket_status.as_str(),
-                    "claimed" | "needs_input" | "click_started"
-                )
-            {
+            if !local_side_effect_unknown_transition_allowed(
+                &ticket_status,
+                ticket_expires_at_ms,
+                now,
+            ) {
                 anyhow::bail!("local run ticket is not active")
             }
             retain_local_unknown_capacity_postgres_tx(
@@ -1203,8 +1298,7 @@ pub fn finalize_local_side_effect_unknown(
                 "UPDATE jobs_local_run_tickets
                     SET status = 'side_effect_unknown', updated_at_ms = $5
                   WHERE id = $1 AND account_id = $2 AND application_id = $3
-                    AND ticket_hash = $4 AND expires_at_ms > $5
-                    AND status = $6",
+                    AND ticket_hash = $4 AND status = $6",
                 &[
                     &run_id,
                     &account_id,
@@ -1285,6 +1379,16 @@ pub fn finalize_local_side_effect_unknown(
             Ok(application)
         }
     })
+}
+
+fn local_side_effect_unknown_transition_allowed(
+    ticket_status: &str,
+    ticket_expires_at_ms: i64,
+    now: i64,
+) -> bool {
+    (matches!(ticket_status, "claimed" | "needs_input") && ticket_expires_at_ms > now)
+        || (ticket_status == "click_started"
+            && ticket_expires_at_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS) > now)
 }
 
 fn retain_local_unknown_capacity_sqlite_tx(

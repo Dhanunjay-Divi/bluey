@@ -467,6 +467,43 @@ export interface JobsEntitlement {
 
 export type RunnerAvailabilityStatus = "available" | "invited_beta" | "upgrade_required";
 
+export type LocalBrowserReleaseChannel = "internal" | "beta" | "stable";
+export type LocalBrowserReleasePlatform = "macos" | "windows";
+export type LocalBrowserReleaseArchitecture = "arm64" | "x64";
+export type LocalBrowserReleasePackageKind = "dmg" | "zip" | "exe";
+
+export interface LocalBrowserReleaseArtifact {
+  platform: LocalBrowserReleasePlatform;
+  architecture: LocalBrowserReleaseArchitecture;
+  package_kind: LocalBrowserReleasePackageKind;
+  role: "installer" | "updater";
+  file_name: string;
+  url: string;
+  size_bytes: number;
+  sha256: string;
+  descriptor_sha256: string;
+}
+
+export type LocalBrowserReleaseAvailability =
+  | {
+      status: "available";
+      reason: string;
+      channel: LocalBrowserReleaseChannel;
+      release_id: string;
+      artifact_origin: string;
+      manifest_sha256: string;
+      release_sequence: number;
+      build_id: string;
+      app_version: string;
+      protocol_version: number;
+      released_at_ms: number;
+      artifacts: LocalBrowserReleaseArtifact[];
+    }
+  | {
+      status: "disabled" | "unassigned" | "unavailable";
+      reason: string;
+    };
+
 export interface RunnerChannelAvailability {
   status: RunnerAvailabilityStatus;
   available: boolean;
@@ -474,6 +511,7 @@ export interface RunnerChannelAvailability {
   distribution_enabled: boolean;
   reason: string;
   next_action: string;
+  release?: LocalBrowserReleaseAvailability;
 }
 
 export interface RunnerAvailability {

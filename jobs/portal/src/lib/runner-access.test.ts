@@ -50,6 +50,17 @@ describe("runner beta copy", () => {
     expect(cloudRunnerAccessCopy(runner("available", true, true)).description).toContain("while your computer is off");
   });
 
+  it("does not present local access as enabled without an exact release artifact", () => {
+    expect(localRunnerAccessCopy(runner("available", true, true), {
+      available: false,
+      reason: "No supported Browser artifact is assigned to this computer.",
+    })).toMatchObject({
+      badge: "Browser unavailable",
+      description: "No supported Browser artifact is assigned to this computer.",
+      action: "Review applications",
+    });
+  });
+
   it("routes plan-locked runners to plans instead of a dead access request", () => {
     expect(localRunnerAccessCopy(runner("upgrade_required", false, false))).toMatchObject({
       badge: "Plan upgrade",

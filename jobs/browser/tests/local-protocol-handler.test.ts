@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   handleLocalProtocol,
+  localClaimNonce,
   type ProtocolActiveRun,
   type LocalProtocolDependencies,
 } from "../src/local-protocol-handler.js";
+import {
+  localRunCapabilityFixture,
+  localRunReleaseFixture,
+} from "./fixtures/local-run-capability.js";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -35,6 +40,18 @@ describe("local protocol controller", () => {
     expect(dependencies.execute).not.toHaveBeenCalled();
   });
 
+  it("does not consume a claim ticket without packaged release authority", async () => {
+    const dependencies = fixture({ buildProof: undefined });
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    await handleLocalProtocol(
+      `bluey-jobs://run/run-123?ticket=${"a".repeat(64)}`,
+      dependencies,
+    );
+    expect(dependencies.showPaused).toHaveBeenCalledWith("unavailable");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("joins concurrent identical run links around one claim and one execution", async () => {
     const dependencies = fixture();
     const gate = deferred<void>();
@@ -58,9 +75,36 @@ describe("local protocol controller", () => {
     expect(dependencies.execute).toHaveBeenCalledTimes(2);
   });
 
+  it("claims with the exact build proof and a deterministic replay nonce", async () => {
+    const dependencies = fixture();
+    const fetchMock = vi.fn(async () => Response.json(claimResponse()));
+    vi.stubGlobal("fetch", fetchMock);
+    const ticket = "a".repeat(64);
+    await handleLocalProtocol(`bluey-jobs://run/run-123?ticket=${ticket}`, dependencies);
+
+    expect(fetchMock).toHaveBeenCalledOnce();
+    const init = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(init.body))).toEqual({
+      ticket,
+      claimNonce: localClaimNonce("run-123", ticket, buildProof()),
+      buildProof: buildProof(),
+    });
+  });
+
   it("pauses safely when account, plan, or identity authority is unavailable", async () => {
     const dependencies = fixture();
     vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 403 })));
+    await handleLocalProtocol(
+      `bluey-jobs://run/run-123?ticket=${"a".repeat(64)}`,
+      dependencies,
+    );
+    expect(dependencies.showPaused).toHaveBeenCalledWith("unavailable");
+    expect(dependencies.execute).not.toHaveBeenCalled();
+  });
+
+  it("pauses without executing when the server requires another Browser release", async () => {
+    const dependencies = fixture();
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(null, { status: 426 })));
     await handleLocalProtocol(
       `bluey-jobs://run/run-123?ticket=${"a".repeat(64)}`,
       dependencies,
@@ -108,6 +152,7 @@ describe("local protocol controller", () => {
 
 function fixture(overrides: Partial<LocalProtocolDependencies> = {}): LocalProtocolDependencies {
   return {
+    buildProof: buildProof(),
     showController: vi.fn(),
     isOnline: () => true,
     admissionDecision: () => ({ allowed: true }),
@@ -122,19 +167,15 @@ function fixture(overrides: Partial<LocalProtocolDependencies> = {}): LocalProto
   };
 }
 
-function resumeCapability(): string {
-  const claims = {
-    version: 1,
-    audience: "bluey-jobs-local-run",
-    account_id: "account-123",
-    application_id: "application-123",
-    run_id: "run-123",
-    browser_profile_id: "profile-123",
-    operation: "resume",
-    expires_at_ms: Date.now() + 60_000,
-    nonce: "n".repeat(32),
+function buildProof() {
+  return {
+    descriptor: Buffer.from("signed descriptor bytes").toString("base64url"),
+    signature: "a".repeat(86),
   };
-  return `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${"a".repeat(64)}`;
+}
+
+function resumeCapability(): string {
+  return localRunCapabilityFixture("resume", Date.now() + 60_000);
 }
 
 function claimResponse(): Record<string, unknown> {
@@ -147,6 +188,7 @@ function claimResponse(): Record<string, unknown> {
     applicationIdentityId: "identity-123",
     url: "https://jobs.example.test/apply",
     packet: { applicationId: "application-123" },
+    _blueyRelease: localRunReleaseFixture(),
     _blueyCapabilities: {
       result: capability("result", expiresAtMs),
       resume: capability("resume", expiresAtMs),
@@ -157,18 +199,7 @@ function claimResponse(): Record<string, unknown> {
 }
 
 function capability(operation: "result" | "resume" | "submit", expiresAtMs: number): string {
-  const claims = {
-    version: 1,
-    audience: "bluey-jobs-local-run",
-    account_id: "account-123",
-    application_id: "application-123",
-    run_id: "run-123",
-    browser_profile_id: "profile-123",
-    operation,
-    expires_at_ms: expiresAtMs,
-    nonce: "n".repeat(32),
-  };
-  return `${Buffer.from(JSON.stringify(claims)).toString("base64url")}.${"a".repeat(64)}`;
+  return localRunCapabilityFixture(operation, expiresAtMs);
 }
 
 function deferred<T>(): {

@@ -48,6 +48,7 @@ import { BrowserContextRegistry } from "./browser-context-registry.js";
 import {
   localResumeUrl,
   localRunAuthorization,
+  localRunReconciliationAuthorization,
   localRunDirectory,
   localRunDirectoryIfValid,
   safeJobContext,
@@ -70,19 +71,23 @@ import {
 import type { ActiveLocalRun } from "./local-run-state.js";
 import { reconcileLocalRunCheckpoints as recoverCheckpoints } from "./checkpoint-recovery.js";
 import { ExecutionSingleFlight } from "./execution-single-flight.js";
+import type { BrowserBuildProof } from "./release-authority.js";
 
 let checkpointStore: LocalCheckpointStore | undefined;
 let browserContexts: BrowserContextRegistry | undefined;
 const activeLocalRuns = new Map<string, ActiveLocalRun>();
 let browserShell: BrowserShell | undefined;
 let runView: RunControllerView | undefined;
+let packagedBuildProof: BrowserBuildProof | undefined;
 const admission = new LocalRunAdmission();
 const executionFlights = new ExecutionSingleFlight();
 
 export async function initializeLocalRunController(
   shell: BrowserShell,
+  buildProof?: BrowserBuildProof,
 ): Promise<void> {
   browserShell = shell;
+  packagedBuildProof = buildProof;
   runView = new RunControllerView(shell, () => [...activeLocalRuns.values()].map(displayForRun));
   browserContexts = new BrowserContextRegistry(
     app.getPath("userData"),
@@ -408,7 +413,9 @@ async function executeLocalRequestSingleFlight(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      ...localRunAuthorization(delivery, "result"),
+      ...(markerExists
+        ? localRunReconciliationAuthorization(delivery)
+        : localRunAuthorization(delivery, "result")),
       receipt: execution.receipt,
       receiptBundle: bundle,
       evidenceObjects,
@@ -484,6 +491,7 @@ async function installCertifiedLocalSubmitGuard(
 
 export async function handleLocalProtocolUrl(rawUrl: string): Promise<void> {
   await handleLocalProtocol(rawUrl, {
+    buildProof: packagedBuildProof,
     showController: () => shell().show(),
     isOnline: () => shell().online,
     admissionDecision: () => admission.decision(shell().online),
@@ -558,7 +566,9 @@ async function reportLocalFailure(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        ...localRunAuthorization(delivery, "result"),
+        ...(failure.status === "side_effect_unknown"
+          ? localRunReconciliationAuthorization(delivery)
+          : localRunAuthorization(delivery, "result")),
         receipt: {
           status: failure.status,
           errorCode: failure.code,
@@ -806,6 +816,7 @@ export async function shutdownLocalRunController(): Promise<void> {
   activeLocalRuns.clear();
   runView = undefined;
   browserShell = undefined;
+  packagedBuildProof = undefined;
 }
 
 export function localApplicationCount(): number {

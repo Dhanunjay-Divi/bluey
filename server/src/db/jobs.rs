@@ -1393,6 +1393,52 @@ pub struct JobsEntitlement {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalBrowserReleaseArtifact {
+    pub platform: String,
+    pub architecture: String,
+    pub package_kind: String,
+    pub role: String,
+    pub file_name: String,
+    pub url: String,
+    pub size_bytes: i64,
+    pub sha256: String,
+    pub descriptor_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum LocalBrowserReleaseAvailability {
+    Available {
+        reason: String,
+        channel: String,
+        release_id: String,
+        artifact_origin: String,
+        manifest_sha256: String,
+        release_sequence: i64,
+        build_id: String,
+        app_version: String,
+        protocol_version: i64,
+        released_at_ms: i64,
+        artifacts: Vec<LocalBrowserReleaseArtifact>,
+    },
+    Disabled {
+        reason: String,
+    },
+    Unassigned {
+        reason: String,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+impl LocalBrowserReleaseAvailability {
+    pub fn is_available(&self) -> bool {
+        matches!(self, Self::Available { .. })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunnerChannelAvailability {
     pub status: String,
     pub available: bool,
@@ -1400,6 +1446,8 @@ pub struct RunnerChannelAvailability {
     pub distribution_enabled: bool,
     pub reason: String,
     pub next_action: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release: Option<LocalBrowserReleaseAvailability>,
 }
 
 impl Default for RunnerChannelAvailability {
@@ -1411,6 +1459,7 @@ impl Default for RunnerChannelAvailability {
             distribution_enabled: false,
             reason: "This runner is not available for this account.".to_string(),
             next_action: "Use Review first.".to_string(),
+            release: None,
         }
     }
 }
@@ -1888,6 +1937,9 @@ include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");
 include!("jobs/runner_volume_purge.rs");
+include!("jobs/browser_release_authority.rs");
+include!("jobs/browser_release_trust.rs");
+include!("jobs/browser_release_registry.rs");
 include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
 

@@ -12,7 +12,7 @@ import {
 } from "./local-checkpoint-store.js";
 import { LocalBrowserError } from "./local-failure.js";
 import {
-  localRunAuthorization,
+  localRunReconciliationAuthorization,
   localRunDirectoryIfValid,
   validateStartRunRequest,
   type StartRunRequest,
@@ -199,7 +199,7 @@ async function reportRecoveredUnknown(
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        ...localRunAuthorization(checkpoint.delivery, "result"),
+        ...localRunReconciliationAuthorization(checkpoint.delivery),
         receipt: {
           status: "side_effect_unknown",
           errorCode: reason,

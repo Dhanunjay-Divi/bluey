@@ -14,16 +14,21 @@
     "start": "electron dist/main.js",
     "prepare:chromium": "node scripts/install-chromium.mjs",
     "prepare:icons": "python3 scripts/generate-icons.py",
-    "package": "npm run build && npm run prepare:chromium && electron-builder --config electron-builder.yml"
+    "package": "node scripts/package-release.mjs",
+    "package:darwin-arm64": "node scripts/package-release.mjs darwin-arm64",
+    "package:darwin-x64": "node scripts/package-release.mjs darwin-x64",
+    "package:windows-x64": "node scripts/package-release.mjs windows-x64"
   },
   "dependencies": {
     "@bluey/jobs-automation": "0.1.0",
     "playwright": "^1.61.1"
   },
   "devDependencies": {
+    "@electron/asar": "3.4.1",
     "@types/node": "^24.0.0",
     "electron": "43.1.0",
     "electron-builder": "^26.0.12",
+    "tar": "7.5.22",
     "typescript": "^5.6.0",
     "vitest": "^4.1.9"
   }

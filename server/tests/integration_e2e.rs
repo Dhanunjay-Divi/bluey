@@ -9,7 +9,7 @@
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use base64::Engine;
-use ed25519_dalek::SigningKey as Ed25519SigningKey;
+use ed25519_dalek::{Signer as _, SigningKey as Ed25519SigningKey};
 use hmac::{Hmac, Mac};
 use serde_json::json;
 use serial_test::serial;
@@ -53,6 +53,160 @@ struct Harness {
 }
 
 type HmacSha256 = Hmac<Sha256>;
+
+const TEST_BROWSER_SERVER_RELEASE_ID: &str = "server-603.1";
+const TEST_BROWSER_RELEASE_KEY_INDEX: usize = 6;
+
+struct BrowserBuildProofFixture {
+    descriptor: String,
+    signature: String,
+    descriptor_sha256: String,
+}
+
+fn browser_release_authority_fixture() -> serde_json::Value {
+    serde_json::from_str(include_str!(
+        "../../jobs/browser/fixtures/release-authority-v1.json"
+    ))
+    .expect("parse shared Browser release authority fixture")
+}
+
+fn browser_build_proof_fixture(platform: &str, architecture: &str) -> BrowserBuildProofFixture {
+    let fixture = browser_release_authority_fixture();
+    let shared_descriptor = fixture["descriptor"]
+        .as_str()
+        .expect("shared Browser build descriptor");
+    let shared_signature = fixture["signature"]
+        .as_str()
+        .expect("shared Browser build signature");
+    let (descriptor, signature) = if platform == "darwin" && architecture == "arm64" {
+        (shared_descriptor.to_string(), shared_signature.to_string())
+    } else {
+        assert!(matches!(
+            (platform, architecture),
+            ("darwin", "x64") | ("windows", "x64")
+        ));
+        let shared_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(shared_descriptor)
+            .expect("decode shared Browser build descriptor");
+        let shared_text = String::from_utf8(shared_bytes).expect("UTF-8 Browser build descriptor");
+        let canonical = shared_text.replacen(
+            "platform=darwin\narchitecture=arm64\n",
+            &format!("platform={platform}\narchitecture={architecture}\n"),
+            1,
+        );
+        assert_ne!(canonical, shared_text);
+        // Mirrors the deterministic release-key fixture used by the shared Node vector.
+        let seed = std::array::from_fn(|offset| {
+            ((TEST_BROWSER_RELEASE_KEY_INDEX * 37 + offset) % 256) as u8
+        });
+        let signing_key = Ed25519SigningKey::from_bytes(&seed);
+        let expected_public_key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signing_key.verifying_key().to_bytes());
+        assert_eq!(fixture["publicKey"], expected_public_key);
+        (
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(canonical.as_bytes()),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(signing_key.sign(canonical.as_bytes()).to_bytes()),
+        )
+    };
+    let descriptor_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&descriptor)
+        .expect("decode target Browser build descriptor");
+    let mut digest = Sha256::new();
+    digest.update(&descriptor_bytes);
+    digest.update(b"signature=");
+    digest.update(signature.as_bytes());
+    digest.update(b"\n");
+    let descriptor_sha256 = hex::encode(digest.finalize());
+    if platform == "darwin" && architecture == "arm64" {
+        assert_eq!(fixture["descriptorSha256"], descriptor_sha256);
+    }
+    BrowserBuildProofFixture {
+        descriptor,
+        signature,
+        descriptor_sha256,
+    }
+}
+
+fn canonical_browser_build_proof() -> serde_json::Value {
+    let proof = browser_build_proof_fixture("darwin", "arm64");
+    json!({
+        "descriptor": proof.descriptor,
+        "signature": proof.signature,
+    })
+}
+
+fn local_browser_claim_nonce(
+    run_id: &str,
+    ticket: &str,
+    build_proof: &serde_json::Value,
+) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bluey-jobs-browser-claim-v1\0");
+    digest.update(run_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(ticket.as_bytes());
+    digest.update(b"\0");
+    digest.update(
+        build_proof["descriptor"]
+            .as_str()
+            .expect("Browser claim descriptor")
+            .as_bytes(),
+    );
+    digest.update(b"\0");
+    digest.update(
+        build_proof["signature"]
+            .as_str()
+            .expect("Browser claim signature")
+            .as_bytes(),
+    );
+    hex::encode(digest.finalize())
+}
+
+fn local_browser_claim_body_with_proof(
+    run_id: &str,
+    ticket: &str,
+    build_proof: serde_json::Value,
+) -> serde_json::Value {
+    let claim_nonce = local_browser_claim_nonce(run_id, ticket, &build_proof);
+    json!({
+        "ticket": ticket,
+        "claimNonce": claim_nonce,
+        "buildProof": build_proof,
+    })
+}
+
+fn local_browser_claim_body(run_id: &str, ticket: &str) -> serde_json::Value {
+    local_browser_claim_body_with_proof(run_id, ticket, canonical_browser_build_proof())
+}
+
+fn legacy_local_run_capability(
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    browser_profile_id: &str,
+    operation: &str,
+    expires_at_ms: i64,
+) -> String {
+    let claims = json!({
+        "version": 1,
+        "audience": "bluey-jobs-local-run",
+        "account_id": account_id,
+        "application_id": application_id,
+        "run_id": run_id,
+        "browser_profile_id": browser_profile_id,
+        "operation": operation,
+        "expires_at_ms": expires_at_ms,
+        "nonce": "phase603legacyrecoverynonce0001",
+    });
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).unwrap());
+    let key =
+        std::env::var("BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY").expect("local Browser capability key");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key.as_bytes()).unwrap();
+    mac.update(payload.as_bytes());
+    format!("{payload}.{}", hex::encode(mac.finalize().into_bytes()))
+}
 
 struct SignedWorkerRequest<'a> {
     path: &'a str,
@@ -282,6 +436,321 @@ fn authorize_empty_legacy_runner_inventory(
     let ready = jobs::runner_volume_fleet_status(pool).unwrap();
     assert_eq!(ready.legacy_inventory_state, "ready");
     ready
+}
+
+struct TestEnvironmentGuard {
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl TestEnvironmentGuard {
+    fn install(values: &[(&'static str, String)]) -> Self {
+        let previous = values
+            .iter()
+            .map(|(name, value)| {
+                let previous = std::env::var_os(name);
+                std::env::set_var(name, value);
+                (*name, previous)
+            })
+            .collect();
+        Self { previous }
+    }
+}
+
+impl Drop for TestEnvironmentGuard {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.iter().rev() {
+            if let Some(value) = value {
+                std::env::set_var(name, value);
+            } else {
+                std::env::remove_var(name);
+            }
+        }
+    }
+}
+
+fn browser_release_root_trust_anchor_json() -> String {
+    let fixture = browser_release_authority_fixture();
+    let encoded_policy = fixture
+        .pointer("/trustPolicy/canonical")
+        .and_then(serde_json::Value::as_str)
+        .expect("canonical Browser trust policy fixture");
+    let policy_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded_policy)
+        .expect("decode canonical Browser trust policy fixture");
+    let policy: serde_json::Value =
+        serde_json::from_slice(&policy_bytes).expect("parse canonical Browser trust policy");
+    let root_threshold = policy["roles"]
+        .as_array()
+        .and_then(|roles| {
+            roles
+                .iter()
+                .find(|role| role["role"] == "root")
+                .and_then(|role| role["threshold"].as_i64())
+        })
+        .expect("root trust threshold");
+    let root_keys = policy["keys"]
+        .as_array()
+        .expect("Browser trust keys")
+        .iter()
+        .filter(|key| key["role"] == "root")
+        .map(|key| {
+            (
+                key["keyId"].as_str().expect("root key id").to_string(),
+                key["publicKey"]
+                    .as_str()
+                    .expect("root public key")
+                    .to_string(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    json!({ "threshold": root_threshold, "keys": root_keys }).to_string()
+}
+
+fn enable_local_browser_distribution_for_test(pool: &DbPool, label: &str) -> TestEnvironmentGuard {
+    let fleet =
+        authorize_empty_legacy_runner_inventory(pool, &format!("phase-603-local-browser-{label}"));
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let mut cutover = jobs::RecordRunnerVolumeFleetCutoverRequest {
+        cutover_state: "reconciling".to_string(),
+        expected_enrollment_generation: fleet.enrollment_generation,
+        expected_purge_generation: fleet.purge_generation,
+        expected_tombstone_generation: fleet.tombstone_generation,
+        expected_destruction_generation: fleet.destruction_generation,
+        expected_legacy_reconciliation_generation: fleet.legacy_reconciliation_generation,
+        expected_storage_attestation_generation: fleet.storage_attestation_generation,
+        expected_storage_attestation_count: fleet.storage_attestation_count,
+        expected_storage_attestation_set_sha256: fleet.storage_attestation_set_sha256,
+        expected_legacy_inventory_generation: fleet.legacy_inventory_generation,
+        expected_legacy_inventory_reconciliation_id: fleet
+            .legacy_inventory_reconciliation_id
+            .expect("legacy inventory reconciliation id"),
+        expected_legacy_inventory_authority_id: fleet
+            .legacy_inventory_authority_id
+            .expect("legacy inventory authority id"),
+        expected_legacy_inventory_authority_sha256: fleet
+            .legacy_inventory_authority_sha256
+            .expect("legacy inventory authority digest"),
+        expected_legacy_inventory_root_count: fleet
+            .legacy_inventory_root_count
+            .expect("legacy inventory root count"),
+        expected_legacy_inventory_root_set_sha256: fleet
+            .legacy_inventory_root_set_sha256
+            .expect("legacy inventory root-set digest"),
+        expected_non_destroyed_volume_count: fleet.non_destroyed_volume_count,
+        expected_destruction_count: fleet.destruction_count,
+        expected_unresolved_legacy_volume_count: fleet.unresolved_legacy_volume_count,
+        evidence_ref: format!("phase-603-local-browser-{label}"),
+        evidence_sha256: hex::encode(Sha256::digest(label.as_bytes())),
+        authorized_by: "phase-603-integration-admin".to_string(),
+        cutover_at_ms: now_ms,
+        now_ms,
+    };
+    jobs::record_runner_volume_fleet_cutover(pool, &cutover)
+        .expect("record reconciling Browser distribution fleet cutover");
+    cutover.cutover_state = "ready".to_string();
+    cutover.now_ms += 1;
+    jobs::record_runner_volume_fleet_cutover(pool, &cutover)
+        .expect("record ready Browser distribution fleet cutover");
+    let ready = jobs::runner_volume_fleet_status(pool).expect("load Browser distribution fleet");
+    assert_eq!(ready.cutover_state, "ready");
+    assert_eq!(ready.legacy_inventory_state, "ready");
+    assert_eq!(
+        ready.storage_attestation_count,
+        ready.non_destroyed_volume_count
+    );
+    assert_eq!(
+        ready.attested_reconciled_volume_count,
+        ready.non_destroyed_volume_count
+    );
+
+    TestEnvironmentGuard::install(&[
+        (
+            "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
+            "1".to_string(),
+        ),
+        (
+            "BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID",
+            TEST_BROWSER_SERVER_RELEASE_ID.to_string(),
+        ),
+        (
+            "BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY",
+            "phase-603-local-browser-capability-key".to_string(),
+        ),
+        (
+            "BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON",
+            browser_release_root_trust_anchor_json(),
+        ),
+    ])
+}
+
+fn decoded_browser_release_authority(
+    fixture: &serde_json::Value,
+    authority: &str,
+    field: &str,
+) -> serde_json::Value {
+    let encoded = fixture[authority][field]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing {authority}.{field} Browser release fixture"));
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .unwrap_or_else(|_| panic!("decode {authority}.{field} Browser release fixture"));
+    serde_json::from_slice(&bytes)
+        .unwrap_or_else(|_| panic!("parse {authority}.{field} Browser release fixture"))
+}
+
+fn seed_canonical_browser_release_authority(pool: &DbPool, account_id: &str) {
+    let fixture = browser_release_authority_fixture();
+    let manifest = decoded_browser_release_authority(&fixture, "manifest", "canonical");
+    let envelope = |authority: &str| jobs::BrowserReleaseAuthorityEnvelope {
+        canonical_base64url: fixture[authority]["canonical"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        signature_set_base64url: fixture[authority]["signatureSet"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+    };
+    jobs::import_browser_release_trust_policy(
+        pool,
+        &envelope("trustPolicy"),
+        "phase-603-integration-admin",
+    )
+    .expect("import canonical Browser trust policy");
+
+    let build_proofs = [("darwin", "arm64"), ("darwin", "x64"), ("windows", "x64")]
+        .into_iter()
+        .map(|(platform, architecture)| {
+            let proof = browser_build_proof_fixture(platform, architecture);
+            let expected_sha256 = manifest["artifacts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|artifact| {
+                    artifact["platform"] == platform && artifact["architecture"] == architecture
+                })
+                .and_then(|artifact| artifact["buildDescriptorSha256"].as_str())
+                .unwrap();
+            assert_eq!(proof.descriptor_sha256, expected_sha256);
+            jobs::BrowserBuildProof {
+                descriptor: proof.descriptor,
+                signature: proof.signature,
+            }
+        })
+        .collect();
+    jobs::import_browser_release_manifest(
+        pool,
+        &jobs::BrowserReleaseManifestImportRequest {
+            canonical_base64url: fixture["manifest"]["canonical"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            signature_set_base64url: fixture["manifest"]["signatureSet"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            build_proofs,
+        },
+        "phase-603-integration-admin",
+    )
+    .expect("import canonical Browser release manifest");
+    jobs::import_browser_release_activation(
+        pool,
+        &envelope("activation"),
+        "phase-603-integration-admin",
+    )
+    .expect("import canonical Browser release activation");
+    let status = jobs::apply_browser_release_activation(
+        pool,
+        &jobs::ApplyBrowserReleaseActivationRequest {
+            activation_sha256: fixture["activation"]["sha256"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            expected_head_revision: 0,
+            expected_transition_sha256: None,
+        },
+        "phase-603-integration-admin",
+    )
+    .expect("apply canonical Browser release activation");
+    assert!(status.available);
+    jobs::assign_browser_release_account_channel(
+        pool,
+        account_id,
+        &jobs::AssignBrowserReleaseChannelRequest {
+            assignment_generation: 1,
+            predecessor_assignment_sha256: None,
+            channel: "beta".to_string(),
+            reason_ref: "phase-603-integration".to_string(),
+            assigned_at_ms: chrono::Utc::now().timestamp_millis(),
+        },
+        "phase-603-integration-admin",
+    )
+    .expect("assign canonical Browser release channel");
+}
+
+fn append_canonical_browser_release_revocation(pool: &DbPool) {
+    let fixture = browser_release_authority_fixture();
+    let result = jobs::append_browser_release_revocation(
+        pool,
+        &jobs::BrowserReleaseAuthorityEnvelope {
+            canonical_base64url: fixture["revocation"]["canonical"]
+                .as_str()
+                .expect("canonical Browser release revocation")
+                .to_string(),
+            signature_set_base64url: fixture["revocation"]["signatureSet"]
+                .as_str()
+                .expect("Browser release revocation signature set")
+                .to_string(),
+        },
+        "phase-603-integration-incident",
+    )
+    .expect("append canonical Browser release revocation");
+    assert_eq!(result.authority_kind, "revocation");
+    assert!(!result.replayed);
+}
+
+fn local_browser_claim_state(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> (String, String, String, String, i64, i64, i64) {
+    pool.get()
+        .unwrap()
+        .query_row(
+            "SELECT ticket.status, application.state, reservation.status, session.status,
+                    (SELECT COUNT(*) FROM jobs_run_events event
+                      WHERE event.run_id = ticket.id
+                        AND event.event_type = 'local_browser_claimed'),
+                    (SELECT COUNT(*) FROM jobs_local_run_release_bindings binding
+                      WHERE binding.run_id = ticket.id),
+                    (SELECT COUNT(*) FROM jobs_local_run_claim_replays replay
+                      WHERE replay.run_id = ticket.id)
+               FROM jobs_local_run_tickets ticket
+               JOIN jobs_applications application
+                 ON application.account_id = ticket.account_id
+                AND application.id = ticket.application_id
+               JOIN jobs_attempt_reservations reservation
+                 ON reservation.account_id = ticket.account_id
+                AND reservation.application_id = ticket.application_id
+               JOIN jobs_browser_sessions session
+                 ON session.account_id = ticket.account_id AND session.id = ticket.id
+              WHERE ticket.account_id = ?1 AND ticket.application_id = ?2 AND ticket.id = ?3",
+            rusqlite::params![account_id, application_id, run_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                ))
+            },
+        )
+        .unwrap()
 }
 
 fn signed_runner_volume_proof(
@@ -870,14 +1339,19 @@ async fn jobs_authenticated_reads_return_retry_after_when_the_bucket_is_exhauste
 #[tokio::test]
 #[serial]
 async fn jobs_local_run_delivery_is_rate_limited_before_ticket_enumeration() {
-    std::env::set_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN", "1");
-    std::env::set_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN_BURST", "1");
+    let _rate_limit = TestEnvironmentGuard::install(&[
+        ("BLUEY_LIMIT_JOBS_RUN_PER_MIN", "1".to_string()),
+        ("BLUEY_LIMIT_JOBS_RUN_PER_MIN_BURST", "1".to_string()),
+    ]);
     let harness = boot_harness().await;
+    let _distribution =
+        enable_local_browser_distribution_for_test(&harness.pool, "claim-rate-limit");
+    let ticket = "a".repeat(64);
     let request = || {
         Request::post("/api/jobs/local-runs/missing-run/claim")
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::to_vec(&json!({ "ticket": "a".repeat(64) })).unwrap(),
+                serde_json::to_vec(&local_browser_claim_body("missing-run", &ticket)).unwrap(),
             ))
             .unwrap()
     };
@@ -898,8 +1372,6 @@ async fn jobs_local_run_delivery_is_rate_limited_before_ticket_enumeration() {
         .unwrap();
     assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
     assert!(limited.headers().get("retry-after").is_some());
-    std::env::remove_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN");
-    std::env::remove_var("BLUEY_LIMIT_JOBS_RUN_PER_MIN_BURST");
 }
 
 #[tokio::test]
@@ -5226,6 +5698,18 @@ async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review(
 #[tokio::test]
 #[serial]
 async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
+    jobs_local_submit_resume_recovers_after_consume_before_marker_case(false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_legacy_v1_local_result_resume_and_submitted_replay_remain_recovery_only() {
+    jobs_local_submit_resume_recovers_after_consume_before_marker_case(true).await;
+}
+
+async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
+    use_legacy_capabilities: bool,
+) {
     use sha2::{Digest, Sha256};
 
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
@@ -5287,6 +5771,12 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         .pointer("/application_identity/id")
         .and_then(serde_json::Value::as_str)
         .unwrap();
+    let ticket_expires_at_ms = chrono::Utc::now().timestamp_millis()
+        + if use_legacy_capabilities {
+            15_000
+        } else {
+            60_000
+        };
     jobs::save_local_run_ticket(
         &harness.pool,
         &account_id,
@@ -5304,19 +5794,54 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             "runner": "local",
             "url": posting.canonical_url
         }),
-        chrono::Utc::now().timestamp_millis() + 60_000,
+        ticket_expires_at_ms,
     )
     .unwrap();
 
-    let claimed = harness
+    let _distribution =
+        enable_local_browser_distribution_for_test(&harness.pool, "submit-resume-claim");
+    seed_canonical_browser_release_authority(&harness.pool, &account_id);
+    let queued_claim_state =
+        local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id);
+    let mut rejected_build_proof = canonical_browser_build_proof();
+    let descriptor_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(rejected_build_proof["descriptor"].as_str().unwrap())
+        .unwrap();
+    let descriptor_text = String::from_utf8(descriptor_bytes).unwrap();
+    let tampered_descriptor = descriptor_text.replacen("source_commit=1", "source_commit=2", 1);
+    assert_ne!(tampered_descriptor, descriptor_text);
+    rejected_build_proof["descriptor"] = json!(
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(tampered_descriptor.as_bytes())
+    );
+    let rejected_claim_body =
+        local_browser_claim_body_with_proof(&run_id, &ticket, rejected_build_proof);
+    let rejected_claim = harness
         .router
         .clone()
         .oneshot(
             Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&rejected_claim_body).unwrap(),
                 ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected_claim.status(), StatusCode::UPGRADE_REQUIRED);
+    assert_eq!(
+        local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id),
+        queued_claim_state
+    );
+
+    let claim_body = local_browser_claim_body(&run_id, &ticket);
+    let claimed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
                 .unwrap(),
         )
         .await
@@ -5325,12 +5850,75 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
     let claimed_bytes = axum::body::to_bytes(claimed.into_body(), 64 * 1024)
         .await
         .unwrap();
+    let claimed_state =
+        local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id);
+    assert_eq!(
+        claimed_state,
+        (
+            "claimed".to_string(),
+            "running".to_string(),
+            "running".to_string(),
+            "running".to_string(),
+            1,
+            1,
+            1,
+        )
+    );
+    let exact_claim_replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&claim_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_claim_replay.status(), StatusCode::OK);
+    let exact_claim_replay_bytes = axum::body::to_bytes(exact_claim_replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(exact_claim_replay_bytes, claimed_bytes);
+    assert_eq!(
+        local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id),
+        claimed_state
+    );
+
+    let conflicting_proof = browser_build_proof_fixture("darwin", "x64");
+    let conflicting_claim_body = local_browser_claim_body_with_proof(
+        &run_id,
+        &ticket,
+        json!({
+            "descriptor": conflicting_proof.descriptor,
+            "signature": conflicting_proof.signature,
+        }),
+    );
+    let conflicting_claim_replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&conflicting_claim_body).unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflicting_claim_replay.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        local_browser_claim_state(&harness.pool, &account_id, &application_id, &run_id),
+        claimed_state
+    );
+
     let claim: serde_json::Value = serde_json::from_slice(&claimed_bytes).unwrap();
-    let result_capability = claim["_blueyCapabilities"]["result"]
+    let issued_result_capability = claim["_blueyCapabilities"]["result"]
         .as_str()
         .unwrap()
         .to_string();
-    let resume_capability = claim["_blueyCapabilities"]["resume"]
+    let issued_resume_capability = claim["_blueyCapabilities"]["resume"]
         .as_str()
         .unwrap()
         .to_string();
@@ -5338,6 +5926,50 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
         .as_str()
         .unwrap()
         .to_string();
+    let issued_result_payload = issued_result_capability.split_once('.').unwrap().0;
+    let issued_result_claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(issued_result_payload)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(issued_result_claims["version"], 2);
+    assert!(issued_result_claims["release"].is_object());
+
+    let result_capability = if use_legacy_capabilities {
+        legacy_local_run_capability(
+            &account_id,
+            &application_id,
+            &run_id,
+            &browser_profile_id,
+            "result",
+            ticket_expires_at_ms,
+        )
+    } else {
+        issued_result_capability
+    };
+    let resume_capability = if use_legacy_capabilities {
+        legacy_local_run_capability(
+            &account_id,
+            &application_id,
+            &run_id,
+            &browser_profile_id,
+            "resume",
+            ticket_expires_at_ms,
+        )
+    } else {
+        issued_resume_capability
+    };
+    let legacy_submit_capability = use_legacy_capabilities.then(|| {
+        legacy_local_run_capability(
+            &account_id,
+            &application_id,
+            &run_id,
+            &browser_profile_id,
+            "submit",
+            ticket_expires_at_ms,
+        )
+    });
     assert_ne!(result_capability, resume_capability);
     assert_ne!(result_capability, submit_capability);
     assert_ne!(resume_capability, submit_capability);
@@ -5414,6 +6046,44 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
     assert_eq!(unapproved_resume.status(), StatusCode::CONFLICT);
 
     let submit_proof = final_submit_proof(&harness, &account_id, &application_id);
+    let raw_ticket_submit = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "ticket": &ticket,
+                        "final_submit_proof": &submit_proof
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(raw_ticket_submit.status(), StatusCode::NOT_FOUND);
+    if let Some(legacy_submit_capability) = legacy_submit_capability.as_ref() {
+        let legacy_submit = harness
+            .router
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "capability": legacy_submit_capability,
+                            "final_submit_proof": &submit_proof
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy_submit.status(), StatusCode::NOT_FOUND);
+    }
     let unapproved_authority = harness
         .router
         .clone()
@@ -5441,7 +6111,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "ticket": ticket,
+                        "capability": &result_capability,
                         "receipt": { "status": "submitted", "issues": [] }
                     }))
                     .unwrap(),
@@ -5478,7 +6148,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&json!({ "capability": &resume_capability })).unwrap(),
                 ))
                 .unwrap(),
         )
@@ -5509,7 +6179,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&json!({ "capability": &resume_capability })).unwrap(),
                 ))
                 .unwrap(),
         )
@@ -5646,13 +6316,20 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&json!({ "capability": &resume_capability })).unwrap(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(expired.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        expired.status(),
+        if use_legacy_capabilities {
+            StatusCode::NOT_FOUND
+        } else {
+            StatusCode::CONFLICT
+        }
+    );
     harness
         .pool
         .get()
@@ -5662,6 +6339,39 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             rusqlite::params![run_id, future_expiry],
         )
         .unwrap();
+
+    if use_legacy_capabilities {
+        let connection = harness.pool.get().unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM jobs_local_run_release_bindings
+                      WHERE run_id = ?1 AND account_id = ?2 AND application_id = ?3",
+                    rusqlite::params![run_id, account_id, application_id],
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        assert!(
+            jobs::get_local_run_browser_release_binding(&harness.pool, &account_id, &run_id,)
+                .unwrap()
+                .is_none()
+        );
+        let wait_ms = ticket_expires_at_ms
+            .saturating_sub(chrono::Utc::now().timestamp_millis())
+            .max(0)
+            .saturating_add(5) as u64;
+        tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+        assert!(chrono::Utc::now().timestamp_millis() > ticket_expires_at_ms);
+        assert_eq!(
+            jobs::get_local_run_ticket(&harness.pool, &account_id, &run_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "click_started"
+        );
+    }
 
     let mut receipt_request = cloud_receipt_request(
         &harness,
@@ -5738,6 +6448,21 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             ["executionAuthority"]["kind"],
         "local_run_ticket"
     );
+    let execution_authority = terminal_application["receipt"]
+        ["_bluey_server_submission_authority_v1"]["executionAuthority"]
+        .as_object()
+        .unwrap();
+    if use_legacy_capabilities {
+        assert_eq!(execution_authority.len(), 4);
+        assert!(!execution_authority.contains_key("browserRelease"));
+    } else {
+        assert_eq!(execution_authority.len(), 5);
+        assert_eq!(execution_authority["browserRelease"]["schemaVersion"], 2);
+        assert_eq!(
+            execution_authority["browserRelease"]["releaseId"],
+            "browser-release-603-1"
+        );
+    }
     assert!(!stored_bundle.lock().unwrap().is_empty());
     assert_eq!(
         jobs::list_application_evidence(&harness.pool, &account_id, Some(&application_id))
@@ -5805,7 +6530,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
             Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&json!({ "capability": &resume_capability })).unwrap(),
                 ))
                 .unwrap(),
         )
@@ -5819,6 +6544,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker() {
 async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation() {
     use sha2::{Digest, Sha256};
 
+    const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
     let object_store = MockServer::start().await;
     let endpoint = object_store.uri();
     let harness = boot_harness_with_config(UpstreamKeys::default(), vec![], None, |config| {
@@ -5877,6 +6603,7 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .pointer("/application_identity/id")
         .and_then(serde_json::Value::as_str)
         .unwrap();
+    let ticket_expires_at_ms = chrono::Utc::now().timestamp_millis() + 15_000;
     jobs::save_local_run_ticket(
         &harness.pool,
         &account_id,
@@ -5894,9 +6621,61 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
             "runner": "local",
             "url": posting.canonical_url
         }),
-        chrono::Utc::now().timestamp_millis() + 60_000,
+        ticket_expires_at_ms,
     )
     .unwrap();
+    let _distribution =
+        enable_local_browser_distribution_for_test(&harness.pool, "side-effect-unknown-claim");
+    seed_canonical_browser_release_authority(&harness.pool, &account_id);
+    let legacy_result_capability = legacy_local_run_capability(
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        "result",
+        ticket_expires_at_ms,
+    );
+    let legacy_resume_capability = legacy_local_run_capability(
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        "resume",
+        ticket_expires_at_ms,
+    );
+    let legacy_submit_capability = legacy_local_run_capability(
+        &account_id,
+        &application_id,
+        &run_id,
+        &browser_profile_id,
+        "submit",
+        ticket_expires_at_ms,
+    );
+    let queued_legacy_result = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &legacy_result_capability,
+                        "receipt": { "status": "failed" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued_legacy_result.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        jobs::get_local_run_ticket(&harness.pool, &account_id, &run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        "queued"
+    );
     let claimed = harness
         .router
         .clone()
@@ -5904,18 +6683,226 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
             Request::post(format!("/api/jobs/local-runs/{run_id}/claim"))
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
+                    serde_json::to_vec(&local_browser_claim_body(&run_id, &ticket)).unwrap(),
                 ))
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(claimed.status(), StatusCode::OK);
+    let claimed_bytes = axum::body::to_bytes(claimed.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let claim: serde_json::Value = serde_json::from_slice(&claimed_bytes).unwrap();
+    let result_capability = claim["_blueyCapabilities"]["result"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let submit_capability = claim["_blueyCapabilities"]["submit"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let result_payload = result_capability.split_once('.').unwrap().0;
+    let result_claims: serde_json::Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(result_payload)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result_claims["version"], 2);
+    assert!(result_claims["release"].is_object());
+
+    let review_title = "Review the Greenhouse application";
+    let review_detail = concat!(
+        "Review every employer-facing field and document in the preserved form, ",
+        "then approve submission."
+    );
+    let final_review = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &legacy_result_capability,
+                        "receipt": {
+                            "status": "needs_input",
+                            "issues": [],
+                            "intervention": {
+                                "kind": "browser_takeover",
+                                "title": review_title,
+                                "detail": review_detail,
+                                "takeoverUrl": format!(
+                                    "bluey-jobs://resume/{run_id}?ticket={ticket}"
+                                ),
+                                "resolution": {
+                                    "kind": "browser_takeover",
+                                    "resumeAfter": true
+                                }
+                            }
+                        }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(final_review.status(), StatusCode::OK);
+    let intervention = jobs::list_interventions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|item| item.title == review_title && item.status == "open")
+        .unwrap();
+    let access_token =
+        auth::jwt::issue(JWT_SECRET, &account_id, auth::jwt::TokenKind::Access).unwrap();
+    let approved = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &intervention.id,
+        json!({ "status": "resolved", "action": "approve_submission" }),
+    )
+    .await;
+    assert_eq!(approved.status(), StatusCode::OK);
+    let consumed = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "capability": &legacy_resume_capability }))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(consumed.status(), StatusCode::OK);
+    assert!(jobs::local_submission_approval_consumed(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        &run_id,
+    )
+    .unwrap());
+
+    append_canonical_browser_release_revocation(&harness.pool);
+    assert!(matches!(
+        jobs::local_browser_release_availability(
+            &harness.pool,
+            &account_id,
+            TEST_BROWSER_SERVER_RELEASE_ID,
+        )
+        .unwrap(),
+        jobs::LocalBrowserReleaseAvailability::Unavailable { .. }
+    ));
+    let submit_proof = final_submit_proof(&harness, &account_id, &application_id);
+    let legacy_submit = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &legacy_submit_capability,
+                        "final_submit_proof": &submit_proof
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(legacy_submit.status(), StatusCode::NOT_FOUND);
+    let blocked_submit = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/authorize-submit"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &submit_capability,
+                        "final_submit_proof": &submit_proof
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked_submit.status(), StatusCode::CONFLICT);
+    let blocked_submit_bytes = axum::body::to_bytes(blocked_submit.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&blocked_submit_bytes).contains("no longer authorized to submit")
+    );
+    let (ticket_status, capacity_count): (String, i64) = harness
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT ticket.status,
+                    (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                      WHERE capacity.account_id = ticket.account_id
+                        AND capacity.application_id = ticket.application_id
+                        AND capacity.run_id = ticket.id)
+               FROM jobs_local_run_tickets ticket WHERE ticket.id = ?1",
+            rusqlite::params![run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(ticket_status, "claimed");
+    assert_eq!(capacity_count, 0);
+
     let initial_capacity =
         local_submission_evidence_capacity(&account_id, &application_id, &run_id);
+    bluey_server::db::object_uploads::reserve_submission_evidence_capacity(
+        &harness.pool,
+        &initial_capacity,
+    )
+    .unwrap();
+    let mut pre_603_application =
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap();
+    pre_603_application.receipt[jobs::FINAL_SUBMIT_PROOF_KEY] =
+        serde_json::to_value(&submit_proof).unwrap();
+    jobs::replace_application_receipt(
+        &harness.pool,
+        &account_id,
+        &application_id,
+        pre_603_application.receipt,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        harness
+            .pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_local_run_tickets
+                    SET status = 'click_started', updated_at_ms = ?2
+                  WHERE id = ?1 AND status = 'claimed'",
+                rusqlite::params![run_id, chrono::Utc::now().timestamp_millis()],
+            )
+            .unwrap(),
+        1
+    );
+    let wait_ms = ticket_expires_at_ms
+        .saturating_sub(chrono::Utc::now().timestamp_millis())
+        .max(0)
+        .saturating_add(5) as u64;
+    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+    assert!(chrono::Utc::now().timestamp_millis() > ticket_expires_at_ms);
 
     let uncertain_body = json!({
-        "ticket": ticket,
+        "capability": &legacy_result_capability,
         "receipt": {
             "status": "side_effect_unknown",
             "issues": [{ "field": "submission", "message": "Outcome unknown" }],
@@ -6028,17 +7015,44 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
                 .saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS)
     );
 
-    let expired_ticket_at = chrono::Utc::now().timestamp_millis() - 1;
-    harness
-        .pool
-        .get()
-        .unwrap()
-        .execute(
-            "UPDATE jobs_local_run_tickets SET expires_at_ms = ?4
-              WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
-            rusqlite::params![account_id, application_id, run_id, expired_ticket_at,],
+    let downgrade = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "capability": &legacy_result_capability,
+                        "receipt": { "status": "failed" }
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
         )
+        .await
         .unwrap();
+    assert_eq!(downgrade.status(), StatusCode::NOT_FOUND);
+    let resume_replay = harness
+        .router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({ "capability": &legacy_resume_capability }))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resume_replay.status(), StatusCode::NOT_FOUND);
+    let stored = jobs::get_application(&harness.pool, &account_id, &application_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.state, "side_effect_unknown");
+
     harness
         .pool
         .get()
@@ -6050,10 +7064,17 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
                 account_id,
                 application_id,
                 run_id,
-                chrono::Utc::now().timestamp_millis() + 10_000,
+                ticket_after.expires_at_ms.saturating_add(10_000),
             ],
         )
         .unwrap();
+    let wait_ms = ticket_after
+        .expires_at_ms
+        .saturating_sub(chrono::Utc::now().timestamp_millis())
+        .max(0)
+        .saturating_add(5) as u64;
+    tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
+    assert!(chrono::Utc::now().timestamp_millis() > ticket_after.expires_at_ms);
     let replay = harness
         .router
         .clone()
@@ -6079,59 +7100,10 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         .unwrap();
     assert_eq!(
         replay_capacity_expiry,
-        expired_ticket_at.saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS)
+        ticket_after
+            .expires_at_ms
+            .saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS)
     );
-    harness
-        .pool
-        .get()
-        .unwrap()
-        .execute(
-            "UPDATE jobs_local_run_tickets SET expires_at_ms = ?4
-              WHERE account_id = ?1 AND application_id = ?2 AND id = ?3",
-            rusqlite::params![
-                account_id,
-                application_id,
-                run_id,
-                ticket_after.expires_at_ms,
-            ],
-        )
-        .unwrap();
-    let downgrade = harness
-        .router
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/jobs/local-runs/{run_id}/result"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({
-                        "ticket": ticket,
-                        "receipt": { "status": "failed" }
-                    }))
-                    .unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(downgrade.status(), StatusCode::CONFLICT);
-    let resume_replay = harness
-        .router
-        .clone()
-        .oneshot(
-            Request::post(format!("/api/jobs/local-runs/{run_id}/resume"))
-                .header("content-type", "application/json")
-                .body(Body::from(
-                    serde_json::to_vec(&json!({ "ticket": ticket })).unwrap(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(resume_replay.status(), StatusCode::CONFLICT);
-    let stored = jobs::get_application(&harness.pool, &account_id, &application_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(stored.state, "side_effect_unknown");
 
     let reconciliation_path =
         format!("/api/jobs/applications/{application_id}/reconcile-submission");
@@ -6301,7 +7273,7 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&json!({
-                        "ticket": ticket,
+                        "capability": &legacy_result_capability,
                         "receipt": { "status": "submitted", "issues": [] }
                     }))
                     .unwrap(),
@@ -6310,7 +7282,7 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
         )
         .await
         .unwrap();
-    assert_eq!(conflicting_late_result.status(), StatusCode::CONFLICT);
+    assert_eq!(conflicting_late_result.status(), StatusCode::NOT_FOUND);
 }
 
 async fn boot_harness() -> Harness {

@@ -7,6 +7,15 @@ under `docs/release/`.
 
 ### Added
 
+- Added a disabled-by-default Bluey Browser release authority with root-signed
+  trust rotation, threshold-signed immutable manifests, channel activations,
+  compare-and-swap rollback, append-only revocation, exact packaged build and
+  protocol claims, transactional pre-click fencing, account-scoped immutable
+  download metadata, and a no-rebuild native package gate that binds—but does
+  not execute—canonical external canary evidence. Local distribution remains
+  disabled pending approved credentials, immutable hosting/read-back, and
+  physical macOS/Windows certification. Installed-app self-update is not
+  implemented by this batch.
 - Added signed managed runner-volume identity, process leases, chained
   current-storage attestations, conservative account-deletion fan-out, exact
   purge acknowledgements, opaque restore tombstones, provider-bound destruction

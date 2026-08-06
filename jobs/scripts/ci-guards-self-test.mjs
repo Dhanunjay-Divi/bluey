@@ -22,6 +22,14 @@ function runnerVolumeParitySchema(integerType) {
   return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
 }
 
+function browserReleaseAuthorityParitySchema(integerType) {
+  const migrationPath =
+    integerType === "INTEGER"
+      ? "infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql"
+      : "infra/postgres/server-runtime/025_jobs_browser_release_authority.sql";
+  return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
+}
+
 function testPrivacyPaths() {
   const rejected = [
     ["jobs/candidates/alice/resume.pdf", "candidate or user data directory"],
@@ -239,6 +247,7 @@ function jobsParitySchema(integerType) {
     CREATE INDEX IF NOT EXISTS idx_jobs_communication_actions_due
       ON jobs_communication_actions(status, next_attempt_at_ms, lease_expires_at_ms);
     ${runnerVolumeParitySchema(integerType)}
+    ${browserReleaseAuthorityParitySchema(integerType)}
   `;
 }
 
@@ -260,6 +269,86 @@ function testSchemaParity() {
   const missingRunnerVolumeIndex = postgres.replace(
     /CREATE INDEX IF NOT EXISTS idx_jobs_runner_volumes_worker_status[\s\S]*?updated_at_ms\);/,
     "",
+  );
+
+  const missingBrowserReleaseBinding = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_local_run_release_bindings \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingBrowserReleaseBinding, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingBrowserActivationIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_browser_release_activations_channel_history[\s\S]*?expires_at_ms\s*\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingBrowserActivationIndex).some((issue) =>
+      issue.includes("Postgres jobs_browser_release_activations required index"),
+    ),
+  );
+
+  const weakenedBrowserRevocationSubject = postgres.replace(
+    "UNIQUE(subject_kind, subject_id, subject_sha256),",
+    "UNIQUE(subject_kind, subject_sha256),",
+  );
+  assert(
+    compareJobsSchemas(sqlite, weakenedBrowserRevocationSubject).some((issue) =>
+      issue.includes("jobs_browser_release_revocations definition"),
+    ),
+  );
+
+  const weakenedBrowserRevocationIndex = postgres.replace(
+    /(CREATE INDEX IF NOT EXISTS idx_jobs_browser_release_revocations_subject[\s\S]*?subject_kind, )subject_id, /,
+    "$1",
+  );
+  assert(
+    compareJobsSchemas(sqlite, weakenedBrowserRevocationIndex).some((issue) =>
+      issue.includes("Postgres jobs_browser_release_revocations required index"),
+    ),
+  );
+
+  const missingBrowserTrustPolicy = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_browser_release_trust_policies \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingBrowserTrustPolicy, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingBrowserChannelHead = postgres.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_browser_release_channel_heads \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingBrowserChannelHead).some((issue) =>
+      issue.includes("Postgres parity tables"),
+    ),
+  );
+
+  const missingBrowserSignatureSetIndex = sqlite.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_browser_release_signature_sets_target[\s\S]*?role\s*\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingBrowserSignatureSetIndex, postgres).some((issue) =>
+      issue.includes("SQLite jobs_browser_release_signature_sets required index"),
+    ),
+  );
+
+  const missingBrowserAuditActor = postgres.replace(
+    /recorded_by\s+TEXT NOT NULL CHECK\(length\(recorded_by\) > 0\),/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingBrowserAuditActor).some((issue) =>
+      issue.includes("jobs_browser_release_signature_sets definition"),
+    ),
   );
   assert(
     compareJobsSchemas(sqlite, missingRunnerVolumeIndex).some((issue) =>

@@ -4,12 +4,26 @@ import path from "node:path";
 
 export const JOBS_PARITY_TABLES = [
   "account_deletion_intents",
+  "jobs_browser_account_channel_assignments",
+  "jobs_browser_release_activations",
+  "jobs_browser_release_artifacts",
+  "jobs_browser_release_channel_heads",
+  "jobs_browser_release_channel_transitions",
+  "jobs_browser_release_manifests",
+  "jobs_browser_release_revocations",
+  "jobs_browser_release_rollbacks",
+  "jobs_browser_release_signature_sets",
+  "jobs_browser_release_signatures",
+  "jobs_browser_release_trust_keys",
+  "jobs_browser_release_trust_policies",
   "jobs_communication_actions",
   "jobs_discovery_memberships",
   "jobs_discovery_runs",
   "jobs_discovery_sources",
   "jobs_execution_leases",
   "jobs_execution_lease_volume_bindings",
+  "jobs_local_run_claim_replays",
+  "jobs_local_run_release_bindings",
   "jobs_local_run_resume_actions",
   "jobs_runner_legacy_inventory_authorities",
   "jobs_runner_account_subjects",
@@ -29,6 +43,72 @@ export const JOBS_PARITY_TABLES = [
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
+  [
+    "jobs_browser_account_channel_assignments",
+    [
+      "idx_jobs_browser_account_channel_assignments_current on jobs_browser_account_channel_assignments (account_id, assignment_generation desc)",
+    ],
+  ],
+  [
+    "jobs_browser_release_activations",
+    [
+      "idx_jobs_browser_release_activations_channel_history on jobs_browser_release_activations (channel, trust_generation desc, channel_sequence desc, expires_at_ms)",
+    ],
+  ],
+  [
+    "jobs_browser_release_artifacts",
+    [
+      "idx_jobs_browser_release_artifacts_descriptor_target on jobs_browser_release_artifacts (build_descriptor_sha256, platform, architecture, package_kind)",
+    ],
+  ],
+  [
+    "jobs_browser_release_channel_transitions",
+    [
+      "idx_jobs_browser_release_channel_transitions_history on jobs_browser_release_channel_transitions (channel, head_revision desc, recorded_at_ms desc)",
+    ],
+  ],
+  [
+    "jobs_browser_release_manifests",
+    [
+      "idx_jobs_browser_release_manifests_release on jobs_browser_release_manifests (release_sequence desc, recorded_at_ms desc)",
+    ],
+  ],
+  [
+    "jobs_browser_release_revocations",
+    [
+      "idx_jobs_browser_release_revocations_subject on jobs_browser_release_revocations (subject_kind, subject_id, subject_sha256, trust_generation desc, revocation_generation desc)",
+    ],
+  ],
+  [
+    "jobs_browser_release_rollbacks",
+    [
+      "idx_jobs_browser_release_rollbacks_channel on jobs_browser_release_rollbacks (channel, trust_generation desc, rollback_generation desc, recorded_at_ms desc)",
+    ],
+  ],
+  [
+    "jobs_browser_release_signature_sets",
+    [
+      "idx_jobs_browser_release_signature_sets_target on jobs_browser_release_signature_sets (target_audience, target_sha256, trust_generation, role)",
+    ],
+  ],
+  [
+    "jobs_browser_release_signatures",
+    [
+      "idx_jobs_browser_release_signatures_key on jobs_browser_release_signatures (key_id, signature_set_sha256)",
+    ],
+  ],
+  [
+    "jobs_browser_release_trust_keys",
+    [
+      "idx_jobs_browser_release_trust_keys_history on jobs_browser_release_trust_keys (key_id, trust_generation desc, state)",
+    ],
+  ],
+  [
+    "jobs_browser_release_trust_policies",
+    [
+      "idx_jobs_browser_release_trust_policies_generation on jobs_browser_release_trust_policies (trust_generation desc, expires_at_ms)",
+    ],
+  ],
   [
     "jobs_communication_actions",
     [
@@ -71,6 +151,18 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
       "idx_jobs_local_resume_actions_application on jobs_local_run_resume_actions (account_id, application_id, created_at_ms desc)",
       "unique idx_jobs_local_resume_actions_active_run on jobs_local_run_resume_actions (run_id) where status = 'approved'",
     ].sort(),
+  ],
+  [
+    "jobs_local_run_claim_replays",
+    [
+      "idx_jobs_local_run_claim_replays_created on jobs_local_run_claim_replays (account_id, created_at_ms desc)",
+    ],
+  ],
+  [
+    "jobs_local_run_release_bindings",
+    [
+      "idx_jobs_local_run_release_bindings_account on jobs_local_run_release_bindings (account_id, application_id, bound_at_ms desc)",
+    ],
   ],
   [
     "jobs_runner_legacy_inventory_authorities",
@@ -208,6 +300,8 @@ function normalizeSql(value) {
     .replace(/\bsmallint\b/gi, "INTEGER")
     .replace(/\bbigint\b/gi, "INTEGER")
     .replace(/\s+/g, " ")
+    .replace(/\(\s+/g, "(")
+    .replace(/\s+\)/g, ")")
     .trim()
     .toLowerCase();
 }
@@ -340,12 +434,21 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/024_jobs_runner_volume_purge.sql",
   );
+  const sqliteBrowserReleaseAuthorityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql",
+  );
+  const postgresBrowserReleaseAuthorityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/025_jobs_browser_release_authority.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
     sqliteDeletionIntentPath,
     sqliteEvidenceCapacityPath,
     sqliteRunnerPurgePath,
+    sqliteBrowserReleaseAuthorityPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -355,6 +458,7 @@ function main() {
     postgresDeletionIntentPath,
     postgresEvidenceCapacityPath,
     postgresRunnerPurgePath,
+    postgresBrowserReleaseAuthorityPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -378,6 +482,22 @@ function main() {
   }
   if (!sqliteSource.includes('"024_jobs_runner_volume_purge.sql"')) {
     issues.push("server migration runner does not record 024_jobs_runner_volume_purge.sql");
+  }
+  const sqliteBrowserReleaseAuthorityInclude =
+    'include_str!("../../../infra/sqlite/server-runtime/047_jobs_browser_release_authority.sql")';
+  if (!sqliteSource.includes(sqliteBrowserReleaseAuthorityInclude)) {
+    issues.push(`server migration runner does not include 047_jobs_browser_release_authority.sql via ${sqliteBrowserReleaseAuthorityInclude}`);
+  }
+  if ((sqliteSource.match(/SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY/g) ?? []).length < 2) {
+    issues.push("server SQLite migration runner does not register 047_jobs_browser_release_authority.sql");
+  }
+  const browserReleaseAuthorityInclude =
+    'include_str!("../../../infra/postgres/server-runtime/025_jobs_browser_release_authority.sql")';
+  if (!sqliteSource.includes(browserReleaseAuthorityInclude)) {
+    issues.push(`server migration runner does not include 025_jobs_browser_release_authority.sql via ${browserReleaseAuthorityInclude}`);
+  }
+  if (!sqliteSource.includes('"025_jobs_browser_release_authority.sql"')) {
+    issues.push("server migration runner does not record 025_jobs_browser_release_authority.sql");
   }
 
   if (issues.length > 0) {
