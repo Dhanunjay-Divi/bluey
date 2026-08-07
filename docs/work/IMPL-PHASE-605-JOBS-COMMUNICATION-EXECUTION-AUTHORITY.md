@@ -37,7 +37,8 @@
 - Rebuilds the checked-in Jobs portal and adds CI enforcement that a clean build
   must not change `web/jobs`.
 - Closes the post-publication hosted-CI findings on Rust 1.97 and GitHub's
-  25-input Browser release dispatch limit without enabling a release or worker.
+  25-input Browser release dispatch limit, and bounds the combined Jobs runner's
+  ephemeral disk use, without enabling a release or worker.
 
 **Does NOT:**
 
@@ -67,12 +68,12 @@
 | Shared communication hash vectors | Created | Identical Unicode/escape/array/integer canonical bytes for Rust and TypeScript. |
 | Portal API/types/components/views/tests | Modified | Write-consent controls, exact review, polling, approval/cancel, and launch truth. |
 | `jobs/scripts/{check-jobs-schema-parity,ci-guards-self-test,browser-release-ci-gate}.mjs` | Modified | Paired schema, migration registration, Browser dispatch limits, and exact promotion-input enforcement. |
-| `.github/workflows/{jobs-ci,jobs-browser-release,release}.yml` | Modified | Reject stale portal output and independently validate the schedulable Browser release contract. |
+| `.github/workflows/{jobs-ci,jobs-browser-release,release}.yml` | Modified | Reject stale portal output, independently validate the schedulable Browser release contract, and reclaim verified build artifacts before the server matrix. |
 | `jobs/runner/native-storage/{src/unix.rs,tests/native_storage.rs}` | Modified | Preserve Apple/Linux alias portability under hosted Rust 1.97 strict Clippy. |
 | `server/src/db/jobs/execution_leases.rs` | Modified | Preserve exact final-submit filename parsing under Rust 1.97 strict Clippy. |
 | `web/jobs/` | Rebuilt | Final production Jobs portal bundle without source maps. |
 | `jobs/OPERATIONS.md`, `ops/bluey-jobs.env.example` | Modified | Disabled gates, startup behavior, canary requirements, reconciliation, and incident truth. |
-| `CHANGELOG.md`, Round 605, `FIX-642` through `FIX-657`, IMPL/REVIEW docs | Created/modified | Scope, defect closure, CI compatibility, evidence, limitations, and handoff. |
+| `CHANGELOG.md`, Round 605, `FIX-642` through `FIX-658`, IMPL/REVIEW docs | Created/modified | Scope, defect closure, CI compatibility, evidence, limitations, and handoff. |
 
 ## Build & Test
 
@@ -132,10 +133,12 @@ Privacy/schema/provenance/CI guards       passed
 GitHub's hosted Jobs run initially stopped at inherited Linux-only Clippy
 findings, the observability run stopped at the server's newly enforced
 `question_mark` lint, and the Browser release workflow was rejected before job
-scheduling because it declared 29 dispatch inputs. FIX-656 and FIX-657 record
-the source corrections and regression coverage. Fresh hosted checks on the
-final exact pull-request SHA remain a merge requirement; they are not provider,
-tenant, canary, or production evidence.
+scheduling because it declared 29 dispatch inputs. A later exact-SHA Jobs run
+passed every preceding step but exhausted the ephemeral runner disk at the final
+server integration test. FIX-656 through FIX-658 record the source corrections,
+disk bound, and regression coverage. Fresh hosted checks on the final exact
+pull-request SHA remain a merge requirement; they are not provider, tenant,
+canary, or production evidence.
 
 The first full Jobs-focused Rust run exposed one outdated cross-account mailbox
 fixture: the new account write fence correctly rejected a nonexistent second

@@ -157,6 +157,12 @@ defects and add independent regression coverage. The Browser promotion envelope 
 authority schema order, verifies exact digests, and does not authorize a release. Fresh hosted
 checks on the final pull-request SHA remain required before merge and are not production evidence.
 
+The next exact-SHA rerun passed every Browser, observability, native Darwin, server, and
+cross-platform CI gate, plus every preceding Jobs step, before the combined Ubuntu runner exhausted
+its ephemeral disk at the final server integration test. FIX-658 bounds CI artifact growth and
+reclaims only already-verified ephemeral build outputs before the server matrix. Its fresh exact-SHA
+rerun remains required; this is CI reliability work, not production authority.
+
 The optional PostgreSQL cases compiled but self-skipped because no authorized
 `BLUEY_TEST_POSTGRES_URL` was supplied. This is source evidence only, not live PostgreSQL,
 provider, tenant, canary, or production evidence.

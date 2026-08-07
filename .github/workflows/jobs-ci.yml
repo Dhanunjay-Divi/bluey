@@ -24,6 +24,10 @@ jobs:
     name: Jobs CI and privacy gate
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
 
     steps:
       - name: Check out repository
@@ -105,6 +109,14 @@ jobs:
             --entrypoint node \
             --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
             bluey-jobs-runner-ci scripts/native-runner-addon-smoke.mjs
+
+      - name: Reclaim ephemeral runner space before server Rust tests
+        run: |
+          df -h /
+          docker system prune --all --force
+          cargo clean --manifest-path jobs/runner/native-storage/Cargo.toml
+          rm -rf jobs/node_modules
+          df -h /
 
       - name: Check server Rust formatting
         run: cargo fmt --manifest-path server/Cargo.toml -- --check

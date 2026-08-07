@@ -120,6 +120,11 @@ under `docs/release/`.
   authority materialization even when GitHub cannot schedule a malformed
   release workflow. No release, promotion, credential, or production flag is
   enabled by this fix.
+- Bounded hosted Jobs CI disk use before the server Rust matrix by disabling
+  incremental/debug-heavy CI artifacts and reclaiming the already-verified
+  Docker, native-storage, and Node dependency outputs. This prevents the
+  ephemeral runner from exhausting its disk at the final integration-test step
+  without weakening any test, privacy, or production gate.
 - Closed reviewed communication authority over the exact source message,
   application, mailbox connection, provider/payload schema, calendar time zone,
   atomic action/approval revision, payload hash, and provider grant. Failed or
