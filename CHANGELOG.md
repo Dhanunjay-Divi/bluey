@@ -110,6 +110,16 @@ under `docs/release/`.
 
 ### Fixed
 
+- Updated the Jobs and observability CI gates for hosted Rust 1.97 without
+  changing runtime behavior: optional final-submit filename parsing now follows
+  the current Clippy contract, while target-dependent Unix `libc` conversions
+  and the shared fallible ACL boundary remain explicit and portable.
+- Reduced the Browser release workflow to GitHub's 25-input dispatch limit by
+  combining promotion-only evidence into one exact, digest-checked JSON
+  envelope. Independent Jobs CI now rejects future input-limit drift and tests
+  authority materialization even when GitHub cannot schedule a malformed
+  release workflow. No release, promotion, credential, or production flag is
+  enabled by this fix.
 - Closed reviewed communication authority over the exact source message,
   application, mailbox connection, provider/payload schema, calendar time zone,
   atomic action/approval revision, payload hash, and provider grant. Failed or

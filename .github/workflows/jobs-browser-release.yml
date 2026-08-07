@@ -111,24 +111,8 @@ on:
         description: Exact immutable threshold-authorization artifact name
         required: false
         type: string
-      activation_base64:
-        description: Canonical promotion-time activation over the stored manifest authority
-        required: false
-        type: string
-      activation_sha256:
-        description: Exact canonical activation digest
-        required: false
-        type: string
-      activation_signature_set_base64:
-        description: Offline-produced canonical detached promotion signature set
-        required: false
-        type: string
-      activation_signature_set_sha256:
-        description: Exact detached activation signature-set digest
-        required: false
-        type: string
-      canary_evidence_base64:
-        description: Canonical canary evidence binding all five native packages
+      promotion_authority_json:
+        description: Exact activation, signature, digest, and canary authority JSON envelope
         required: false
         type: string
       require_production_ready:
@@ -868,34 +852,16 @@ jobs:
       - name: Materialize offline activation and canary authorities
         shell: bash
         env:
-          ACTIVATION_BASE64: ${{ inputs.activation_base64 }}
-          ACTIVATION_SIGNATURE_SET_BASE64: ${{ inputs.activation_signature_set_base64 }}
-          CANARY_EVIDENCE_BASE64: ${{ inputs.canary_evidence_base64 }}
+          BLUEY_BROWSER_PROMOTION_AUTHORITY_JSON: ${{ inputs.promotion_authority_json }}
         run: |
           set -euo pipefail
-          test -n "$ACTIVATION_BASE64"
-          test -n "$ACTIVATION_SIGNATURE_SET_BASE64"
-          test -n "$CANARY_EVIDENCE_BASE64"
-          activation="$RUNNER_TEMP/release-activation.json"
-          activation_signatures="$RUNNER_TEMP/release-activation-signatures.json"
-          canary="$RUNNER_TEMP/canary-evidence.json"
-          ACTIVATION_BASE64="$ACTIVATION_BASE64" OUT="$activation" \
-            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.ACTIVATION_BASE64,'base64'),{flag:'wx',mode:0o600})"
-          ACTIVATION_SIGNATURE_SET_BASE64="$ACTIVATION_SIGNATURE_SET_BASE64" OUT="$activation_signatures" \
-            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.ACTIVATION_SIGNATURE_SET_BASE64,'base64'),{flag:'wx',mode:0o600})"
-          CANARY_EVIDENCE_BASE64="$CANARY_EVIDENCE_BASE64" OUT="$canary" \
-            node -e "const fs=require('node:fs');fs.writeFileSync(process.env.OUT,Buffer.from(process.env.CANARY_EVIDENCE_BASE64,'base64'),{flag:'wx',mode:0o600})"
-          {
-            echo "ACTIVATION_FILE=$activation"
-            echo "ACTIVATION_SIGNATURE_SET_FILE=$activation_signatures"
-            echo "CANARY_EVIDENCE_FILE=$canary"
-          } >> "$GITHUB_ENV"
+          test -n "$BLUEY_BROWSER_PROMOTION_AUTHORITY_JSON"
+          node jobs/scripts/browser-release-ci-gate.mjs materialize-promotion-input \
+            --out "$RUNNER_TEMP/bluey-browser-promotion-input" >> "$GITHUB_ENV"
 
       - name: Promote only stored bytes with exact stable authority
         shell: bash
         env:
-          ACTIVATION_SHA256: ${{ inputs.activation_sha256 }}
-          ACTIVATION_SIGNATURE_SET_SHA256: ${{ inputs.activation_signature_set_sha256 }}
           CANDIDATE_MANIFEST_SHA256: ${{ inputs.candidate_manifest_sha256 }}
           CANDIDATE_RELEASE_ID: ${{ inputs.candidate_release_id }}
           CANDIDATE_SOURCE_COMMIT: ${{ inputs.candidate_source_commit }}

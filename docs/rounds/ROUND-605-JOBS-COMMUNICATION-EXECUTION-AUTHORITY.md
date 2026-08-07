@@ -4,9 +4,10 @@
 
 **Branch:** `feat/phase-605-jobs-communication-execution`
 
-**Status:** SOURCE COMPLETE AND LOCALLY VERIFIED — source-only; all provider write,
-write-consent, and reconciliation flags remain disabled, and no live provider or production
-authority is claimed
+**Status:** SOURCE COMPLETE AND LOCALLY VERIFIED — source-only; Rust 1.97 and Browser
+workflow-definition compatibility are locally closed, fresh hosted exact-SHA checks remain a
+merge gate, all provider write/write-consent/reconciliation flags remain disabled, and no live
+provider or production authority is claimed
 
 ## Objective
 
@@ -147,6 +148,14 @@ monitoring, retention approval, and production canaries remain external gates.
 | CI guards and account-deletion browser guard | Passed; account deletion 3/3 |
 | Diff, conflict-marker, and source-map hygiene | Passed |
 | Independent review | Backend and portal source accepted; documentation findings closed in the Phase 605 review record |
+| Rust 1.97 compatibility | Server fmt/all-target Clippy and 7 final-submit tests passed; native macOS Clippy/14 tests/release build and Linux cross-target Clippy passed |
+| Browser release workflow | 10 release-authority tests, exact 25-input contract validation, real materialized promotion path, and `actionlint` passed |
+
+GitHub's first hosted checks exposed inherited rolling-toolchain findings and a Browser release
+workflow that GitHub could not schedule with 29 dispatch inputs. FIX-656 and FIX-657 close those
+defects and add independent regression coverage. The Browser promotion envelope preserves signed
+authority schema order, verifies exact digests, and does not authorize a release. Fresh hosted
+checks on the final pull-request SHA remain required before merge and are not production evidence.
 
 The optional PostgreSQL cases compiled but self-skipped because no authorized
 `BLUEY_TEST_POSTGRES_URL` was supplied. This is source evidence only, not live PostgreSQL,

@@ -746,6 +746,8 @@ fn device_id(boundary: StorageBoundary) -> String {
     format!("unix:{:x}:mount:{:x}", boundary.device, boundary.mount_id)
 }
 
+// `nlink_t` is narrower on Apple targets but already `u64` on Linux x86-64.
+#[allow(clippy::useless_conversion)]
 fn metadata_link_count(metadata: &libc::stat) -> u64 {
     u64::from(metadata.st_nlink)
 }
@@ -1330,6 +1332,8 @@ fn mount_identity(file: &File) -> StorageResult<u64> {
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
+// Keep the fallible contract shared with the Darwin ACL implementation.
+#[allow(clippy::unnecessary_wraps)]
 fn validate_no_extended_acl(_file: &File) -> StorageResult<()> {
     Ok(())
 }
@@ -1574,6 +1578,8 @@ mod tests {
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
     #[test]
+    // `mode_t` is narrower on Apple targets but already `u32` on Linux.
+    #[allow(clippy::useless_conversion)]
     fn same_device_mount_mismatch_blocks_inventory_and_recursive_removal() {
         let path = std::env::temp_dir().join(format!(
             "bluey-native-mount-boundary-{}-{}",

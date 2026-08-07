@@ -59,6 +59,12 @@ jobs:
       - name: Install Jobs dependencies from lockfile
         run: npm ci --prefix jobs --no-audit --no-fund
 
+      - name: Validate the Browser release workflow contract independently
+        run: |
+          node --test jobs/scripts/browser-release-ci-gate.test.mjs
+          node jobs/scripts/browser-release-ci-gate.mjs workflow \
+            --file .github/workflows/jobs-browser-release.yml
+
       - name: Run all Jobs tests
         run: npm test --prefix jobs
 

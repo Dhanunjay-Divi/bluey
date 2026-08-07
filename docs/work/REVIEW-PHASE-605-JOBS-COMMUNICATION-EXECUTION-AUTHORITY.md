@@ -6,14 +6,16 @@
 > production service, live tenant, provider credential, or external write was
 > used.
 
-**Reviewed snapshot:** complete temporary-index snapshot based on `8845566b`
+**Reviewed snapshot:** complete Phase 605 snapshot through `18a84689`, plus the
+FIX-656/FIX-657 hosted-CI compatibility diff
 
 **Repository index:** empty; review did not rely on the actual Git index
 
-**Reviewers:** independent backend/security and portal/documentation review agents;
-final evidence assembled by the root agent
+**Reviewers:** independent backend/security, portal/documentation, hosted-CI
+security, and Rust/documentation review agents; final evidence assembled by the
+root agent
 
-**Date:** 2026-08-06
+**Date:** 2026-08-07
 
 ## Per-Task Review
 
@@ -125,6 +127,35 @@ final evidence assembled by the root agent
   `BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED`, and
   `BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED` remain exactly `0`.
 
+### Hosted CI compatibility reopening
+
+| Field | Value |
+|-------|-------|
+| Files | Rust final-submit/native-storage paths, Browser release gate/tests, Jobs and Browser workflows, FIX/IMPL/Round/changelog records |
+| Verdict | 🟢 accept locally; fresh hosted exact-SHA checks required before merge |
+
+**Findings:**
+
+- Hosted Rust 1.97 surfaced `question_mark`, `useless_conversion`, and
+  `unnecessary_wraps` findings are closed without changing the accepted
+  final-submit filenames or Unix storage behavior. Both macOS native execution
+  and Linux cross-target strict Clippy pass.
+- The Browser release workflow now declares exactly GitHub's approved 25 input
+  definitions. Promotion authority is carried in one 48 KiB bounded envelope,
+  parsed through the actual signed activation, signature-set, and canary
+  schemas, digest-checked, and written to fixed read-only files under a private
+  directory.
+- The workflow validator compares the exact approved input-key set and rejects
+  missing, extra, inline, uppercase, hyphenated, or underscore-prefixed drift.
+  Its real materialized bytes complete the existing cryptographic
+  `createPromotionSet` path in tests.
+- Jobs CI runs the Browser contract independently, so a malformed Browser
+  workflow cannot hide its own scheduling failure. `actionlint` accepts both
+  modified workflow definitions.
+- Independent review initially found schema-order, input-counter, and inherited
+  Linux test-lint blockers. All were reproduced, corrected, and included in the
+  final regression matrix before this verdict.
+
 ## Cross-Task Findings
 
 | Acceptance criteria | Independent review result |
@@ -139,7 +170,7 @@ final evidence assembled by the root agent
 | AC29 | 🟢 Four-provider fixtures, race/deadline/privacy/log tests, and complete local server/Jobs matrices pass. Live provider evidence remains external. |
 | AC30 | 🟢 Operations and release wording separate source completion from provider, tenant, canary, and production authority; every communication flag remains `0`. |
 
-The line-by-line review covered FIX-642 through FIX-655 and the complete
+The line-by-line review covered FIX-642 through FIX-657 and the complete
 temporary-index snapshot. The independent backend/security verdict was
 `ACCEPT—SOURCE COMPLETE`; the independent portal source verdict was GREEN. The
 documentation reviewer’s startup ownership, reconciliation bounds, conditional
@@ -186,12 +217,25 @@ Account-deletion browser guard           3/3 passed
 Temporary-index privacy scan           2,489 paths / 2,216 text files passed
 Diff and conflict-marker hygiene       passed
 Portal source-map hygiene              passed
+
+Post-review CI compatibility closure
+Rust 1.97 server fmt/all-target Clippy passed
+Rust 1.97 final-submit tests            7/7 passed
+Rust 1.97 native macOS Clippy/tests    14/14 passed
+Rust 1.97 native Linux cross-Clippy    passed
+Native macOS release build             passed
+Browser release authority tests        10/10 passed
+Browser workflow contract/actionlint   passed
+Jobs tests/typechecks/builds            1,507 / 5 / 5 passed
 ```
 
 The initial focused Rust run exposed an outdated cross-account test fixture and
 strict Clippy exposed one unnecessary test-helper allocation. Both were fixed;
 the focused source-freeze rerun, complete server matrix, strict Clippy, and final
-privacy snapshot passed. These discoveries did not widen provider authority.
+privacy snapshot passed. Hosted verification later exposed rolling-toolchain
+and workflow-definition compatibility defects; their locally reproduced
+FIX-656/FIX-657 corrections pass the post-review matrix above. These discoveries
+did not widen provider authority.
 
 No authorized live PostgreSQL database, Google/Microsoft application, provider
 sandbox/live tenant, real provider write or lookup, retention/monitoring
@@ -199,10 +243,10 @@ approval, canary, or production deployment is represented by these results.
 
 ## Overall Verdict
 
-🟢 **ACCEPT—SOURCE COMPLETE, NOT PRODUCTION** - The complete Phase 605
-temporary-index snapshot based on `8845566b` passes independent source review
-and all available local verification gates. The actual repository index remained
-empty throughout review.
+🟢 **ACCEPT—SOURCE COMPLETE, NOT PRODUCTION** - The complete Phase 605 source
+through the reviewed FIX-656/FIX-657 compatibility corrections passes
+independent source review and all available local verification gates. Fresh
+hosted checks on the final exact pull-request SHA remain mandatory before merge.
 
 This verdict does not authorize OAuth scope elevation, provider dispatch,
 reconciliation, a service restart, a flag change, provider certification, live

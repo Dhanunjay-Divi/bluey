@@ -36,6 +36,8 @@
   control-character, lifecycle, and cleanup enforcement plus parity guards.
 - Rebuilds the checked-in Jobs portal and adds CI enforcement that a clean build
   must not change `web/jobs`.
+- Closes the post-publication hosted-CI findings on Rust 1.97 and GitHub's
+  25-input Browser release dispatch limit without enabling a release or worker.
 
 **Does NOT:**
 
@@ -64,11 +66,13 @@
 | `jobs/portal/src/lib/{communication-actions,mailbox-oauth}.ts` | Created | Strict action/hash/revision/readiness and OAuth navigation policy. |
 | Shared communication hash vectors | Created | Identical Unicode/escape/array/integer canonical bytes for Rust and TypeScript. |
 | Portal API/types/components/views/tests | Modified | Write-consent controls, exact review, polling, approval/cancel, and launch truth. |
-| `jobs/scripts/{check-jobs-schema-parity,ci-guards-self-test}.mjs` | Modified | Paired schema and migration-registration enforcement. |
-| `.github/workflows/{jobs-ci,release}.yml` | Modified | Reject a stale checked-in Jobs portal bundle after a clean build. |
+| `jobs/scripts/{check-jobs-schema-parity,ci-guards-self-test,browser-release-ci-gate}.mjs` | Modified | Paired schema, migration registration, Browser dispatch limits, and exact promotion-input enforcement. |
+| `.github/workflows/{jobs-ci,jobs-browser-release,release}.yml` | Modified | Reject stale portal output and independently validate the schedulable Browser release contract. |
+| `jobs/runner/native-storage/{src/unix.rs,tests/native_storage.rs}` | Modified | Preserve Apple/Linux alias portability under hosted Rust 1.97 strict Clippy. |
+| `server/src/db/jobs/execution_leases.rs` | Modified | Preserve exact final-submit filename parsing under Rust 1.97 strict Clippy. |
 | `web/jobs/` | Rebuilt | Final production Jobs portal bundle without source maps. |
 | `jobs/OPERATIONS.md`, `ops/bluey-jobs.env.example` | Modified | Disabled gates, startup behavior, canary requirements, reconciliation, and incident truth. |
-| `CHANGELOG.md`, Round 605, `FIX-642` through `FIX-655`, IMPL/REVIEW docs | Created/modified | Scope, defect closure, evidence, limitations, and handoff. |
+| `CHANGELOG.md`, Round 605, `FIX-642` through `FIX-657`, IMPL/REVIEW docs | Created/modified | Scope, defect closure, CI compatibility, evidence, limitations, and handoff. |
 
 ## Build & Test
 
@@ -108,6 +112,30 @@ Account-deletion browser guard           3/3 passed
 Temporary-index privacy scan           passed
 Diff/conflict/source-map hygiene       passed
 ```
+
+Post-review GitHub Actions compatibility verification added:
+
+```text
+Rust 1.97 server fmt/all-target Clippy    passed
+Rust 1.97 final-submit tests              7/7 passed
+Rust 1.97 native macOS Clippy/tests      14/14 passed
+Rust 1.97 native Linux cross-Clippy      passed
+Native macOS release build               passed
+Browser release authority tests          10/10 passed
+Browser workflow contract                passed; exact 25 approved inputs
+actionlint v1.7.12                        passed on both modified workflows
+Complete Jobs workspace tests            1,507 passed
+Jobs typecheck/build gates                5/5 passed
+Privacy/schema/provenance/CI guards       passed
+```
+
+GitHub's hosted Jobs run initially stopped at inherited Linux-only Clippy
+findings, the observability run stopped at the server's newly enforced
+`question_mark` lint, and the Browser release workflow was rejected before job
+scheduling because it declared 29 dispatch inputs. FIX-656 and FIX-657 record
+the source corrections and regression coverage. Fresh hosted checks on the
+final exact pull-request SHA remain a merge requirement; they are not provider,
+tenant, canary, or production evidence.
 
 The first full Jobs-focused Rust run exposed one outdated cross-account mailbox
 fixture: the new account write fence correctly rejected a nonexistent second
@@ -158,3 +186,4 @@ local fixtures into provider, tenant, canary, or production evidence.
 - [x] Server fmt/check/tests/strict Clippy and full Jobs tests/typechecks/builds pass
 - [x] All three communication flags remain `0`
 - [x] External provider, live PostgreSQL, canary, and production claims remain parked
+- [x] Rust 1.97 and Browser workflow-definition regressions have local cross-target coverage

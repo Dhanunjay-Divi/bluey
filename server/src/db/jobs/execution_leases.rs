@@ -426,10 +426,9 @@ fn final_submit_file_kind_and_hash(name: &str) -> Option<(&'static str, &str)> {
     let stem = name.strip_suffix(".pdf")?;
     let (kind, sha256) = if let Some(sha256) = stem.strip_prefix("resume-") {
         ("resume", sha256)
-    } else if let Some(sha256) = stem.strip_prefix("cover-letter-") {
-        ("cover_letter", sha256)
     } else {
-        return None;
+        let sha256 = stem.strip_prefix("cover-letter-")?;
+        ("cover_letter", sha256)
     };
     valid_final_submit_sha256(sha256).then_some((kind, sha256))
 }

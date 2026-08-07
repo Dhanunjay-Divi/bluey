@@ -39,6 +39,7 @@ import {
   createPromotionSet,
   inspectPackagedAppAsar,
   locatePackagedResources,
+  materializePromotionAuthorityInput,
   recordNativeVerification,
   requireReleaseTarget,
   requireArtifactBaseUrl,
@@ -597,6 +598,38 @@ test("trusted app.asar inspection opens exact runtime files and rejects mutation
 test("the checked-in workflow preserves offline threshold and no-rebuild boundaries", async () => {
   const source = await readFile(WORKFLOW_PATH, "utf8");
   assert.equal(validateWorkflowContract(source), true);
+  for (const overflowName of ["overflow-input", "OverflowInput", "_overflow"]) {
+    assert.throws(
+      () =>
+        validateWorkflowContract(
+          source.replace(
+            "      operation:\n",
+            `      ${overflowName}:\n        description: Overflow\n        type: string\n      operation:\n`,
+          ),
+        ),
+      /exact approved inputs.*25-input dispatch limit/,
+    );
+  }
+  assert.throws(
+    () =>
+      validateWorkflowContract(
+        source.replace(
+          "      operation:\n",
+          "      overflow: { description: Overflow, type: string }\n      operation:\n",
+        ),
+      ),
+    /exact approved inputs.*25-input dispatch limit/,
+  );
+  assert.throws(
+    () =>
+      validateWorkflowContract(
+        source.replace(
+          "      promotion_authority_json:\n",
+          "      removed_promotion_input:\n",
+        ),
+      ),
+    /exact approved inputs.*25-input dispatch limit/,
+  );
   assert.throws(
     () =>
       validateWorkflowContract(
@@ -748,6 +781,89 @@ test("the checked-in workflow preserves offline threshold and no-rebuild boundar
   );
 });
 
+test("promotion authority input materializes only exact canonical bytes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "bluey-browser-promotion-input-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const canary = createCanaryEvidence({
+    sourceCommit: SOURCE_COMMIT,
+    artifacts: ["1", "2", "3", "4", "5"].map((prefix) => ({
+      sha256: prefix.repeat(64),
+    })),
+  });
+  const activation = createActivation({
+    manifestSha256: "a".repeat(64),
+    manifestSignatureSetSha256: "b".repeat(64),
+    canaryEvidenceSha256: canary.sha256,
+    channel: "stable",
+  });
+  const { privateKey } = generateKeyPairSync("ed25519");
+  const signatures = createSignatureSet({
+    signatureSetId: "activation-signatures-603-1",
+    role: "promotion",
+    targetAudience: "bluey-jobs-browser-release-activation-v1",
+    targetBytes: activation.bytes,
+    signedAtMs: VERIFICATION_TIME_MS,
+    signers: [["promotion-key-603", privateKey]],
+  });
+  const envelope = {
+    activationBase64: activation.bytes.toString("base64"),
+    activationSha256: activation.sha256,
+    activationSignatureSetBase64: signatures.bytes.toString("base64"),
+    activationSignatureSetSha256: signatures.sha256,
+    canaryEvidenceBase64: canary.bytes.toString("base64"),
+  };
+  const materialized = await materializePromotionAuthorityInput(
+    JSON.stringify(envelope),
+    join(root, "valid"),
+  );
+  assert.deepEqual(await readFile(materialized.activationFile), activation.bytes);
+  assert.deepEqual(
+    await readFile(materialized.activationSignatureSetFile),
+    signatures.bytes,
+  );
+  assert.deepEqual(await readFile(materialized.canaryEvidenceFile), canary.bytes);
+  assert.equal(materialized.activationSha256, activation.sha256);
+  assert.equal(materialized.activationSignatureSetSha256, signatures.sha256);
+
+  await assert.rejects(
+    materializePromotionAuthorityInput(
+      JSON.stringify({ ...envelope, unexpected: true }),
+      join(root, "unknown-field"),
+    ),
+    /Invalid Browser promotion authority input/,
+  );
+  const duplicateActivationDigest = JSON.stringify(envelope).replace(
+    `"activationSha256":"${activation.sha256}"`,
+    `"activationSha256":"${activation.sha256}","activationSha256":"${activation.sha256}"`,
+  );
+  await assert.rejects(
+    materializePromotionAuthorityInput(
+      duplicateActivationDigest,
+      join(root, "duplicate"),
+    ),
+    /Invalid Browser promotion authority input/,
+  );
+  await assert.rejects(
+    materializePromotionAuthorityInput(
+      JSON.stringify({ ...envelope, activationSha256: "0".repeat(64) }),
+      join(root, "digest-mismatch"),
+    ),
+    /promotion authority digest mismatch/,
+  );
+  const { version, ...activationWithoutVersion } = activation.value;
+  const reorderedActivation = authorityJsonBytes({ ...activationWithoutVersion, version });
+  await assert.rejects(
+    materializePromotionAuthorityInput(
+      JSON.stringify({
+        ...envelope,
+        activationBase64: reorderedActivation.toString("base64"),
+      }),
+      join(root, "noncanonical-activation"),
+    ),
+    /Invalid canonical Browser activation input/,
+  );
+});
+
 test("candidate, threshold authorization, and stable activation bind stored bytes", async (t) => {
   const fixture = await createCandidateFixture();
   t.after(async () => rm(fixture.root, { recursive: true, force: true }));
@@ -857,16 +973,12 @@ test("candidate, threshold authorization, and stable activation bind stored byte
   assert.equal(authorized.authorization.readinessLabel, "threshold-release-authorized");
 
   const canary = createCanaryEvidence(candidate.manifest);
-  const canaryPath = join(fixture.root, "canary-evidence.json");
-  await writeFile(canaryPath, canary.bytes);
   const activation = createActivation({
     manifestSha256: assembled.candidate.manifestSha256,
     manifestSignatureSetSha256: manifestSignatures.sha256,
     canaryEvidenceSha256: canary.sha256,
     channel: "stable",
   });
-  const activationPath = join(fixture.root, "stable-activation.json");
-  await writeFile(activationPath, activation.bytes);
   const activationSignatures = createSignatureSet({
     signatureSetId: "stable-activation-signatures-603-1",
     role: "promotion",
@@ -875,14 +987,22 @@ test("candidate, threshold authorization, and stable activation bind stored byte
     signedAtMs: activation.value.issuedAtMs,
     signers: fixture.promotionSigners,
   });
-  const activationSignaturePath = join(fixture.root, "activation-signatures.json");
-  await writeFile(activationSignaturePath, activationSignatures.bytes);
+  const materializedPromotionInput = await materializePromotionAuthorityInput(
+    JSON.stringify({
+      activationBase64: activation.bytes.toString("base64"),
+      activationSha256: activation.sha256,
+      activationSignatureSetBase64: activationSignatures.bytes.toString("base64"),
+      activationSignatureSetSha256: activationSignatures.sha256,
+      canaryEvidenceBase64: canary.bytes.toString("base64"),
+    }),
+    join(fixture.root, "promotion-input"),
+  );
   const promotionRoot = join(fixture.root, "promotion");
   const promoted = await createPromotionSet({
     authorizedDirectory: authorizedRoot,
-    activationPath,
-    activationSignatureSetPath: activationSignaturePath,
-    canaryEvidencePath: canaryPath,
+    activationPath: materializedPromotionInput.activationFile,
+    activationSignatureSetPath: materializedPromotionInput.activationSignatureSetFile,
+    canaryEvidencePath: materializedPromotionInput.canaryEvidenceFile,
     outputDirectory: promotionRoot,
     promotionRunId: "promotion-run-603-1",
     ...promotionExpected(
@@ -981,7 +1101,7 @@ test("candidate, threshold authorization, and stable activation bind stored byte
       authorizedDirectory: authorizedRoot,
       activationPath: betaActivationPath,
       activationSignatureSetPath: betaSignaturePath,
-      canaryEvidencePath: canaryPath,
+      canaryEvidencePath: materializedPromotionInput.canaryEvidenceFile,
       outputDirectory: join(fixture.root, "beta-production-claim"),
       promotionRunId: "promotion-run-beta-603-1",
       ...promotionExpected(
