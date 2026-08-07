@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowRight,
@@ -20,10 +20,25 @@ import {
   ReceiptText,
   Search,
   Send,
+  ShieldCheck,
   Sparkles,
   TriangleAlert,
+  XCircle,
 } from "lucide-react";
-import type { ApplicationEvidence, CandidateEventInput, Intervention, JobApplication, JobEligibilityDecision, JobPosting, JobsWorkspace, ResumeVersion, RunnerAvailability } from "../types";
+import type {
+  ApplicationEvidence,
+  CandidateEventInput,
+  CommunicationActionDetail,
+  CommunicationActionSummary,
+  Intervention,
+  JobApplication,
+  JobEligibilityDecision,
+  JobPosting,
+  JobsWorkspace,
+  ResumeVersion,
+  ReviewedCommunicationPayload,
+  RunnerAvailability,
+} from "../types";
 import { jobsApi } from "../api";
 import { relativeTime, titleCase } from "../lib/format";
 import { ConfirmDialog, Dialog } from "../components/Dialog";
@@ -34,6 +49,26 @@ import { exportResumeDocx, exportResumePdf } from "../lib/documents";
 import { applicationIssueReasons, applicationIssues, applicationOutcomes, eventActionLabel, latestApplicationOutcome } from "../lib/candidate-events";
 import { formatResumeDiffValue, resumeDiffHasValue, resumeDiffLabel } from "../lib/resume-diff";
 import { applicationAfterInterventionResolution } from "../lib/application-flow";
+import {
+  communicationActionCanApprove,
+  communicationActionCanCancel,
+  communicationActionsNeedPeriodicRefresh,
+  communicationActionRequiresReview,
+  communicationActionStatus,
+  communicationApprovalLabel,
+  communicationApprovalUnavailableReason,
+  communicationCancellationDescription,
+  communicationDetailMatchesSummary,
+  communicationKindLabel,
+  mergeCommunicationActionSummaries,
+  communicationProviderLabel,
+  CommunicationRequestLineage,
+  communicationReviewConfirmation,
+  communicationTransitionMatches,
+  isCommunicationVerificationError,
+  reconcileCommunicationActionDetail,
+  verifiedCommunicationPayload,
+} from "../lib/communication-actions";
 import { safeDownloadFileName, saveDownloadedBlob } from "../lib/download";
 
 interface Props {
@@ -45,6 +80,7 @@ interface Props {
   onLoadResume(id: string): Promise<ResumeVersion | undefined>;
   onResolveIntervention(intervention: Intervention, action: string, resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string }): Promise<void>;
   onSaveCandidateEvent(event: CandidateEventInput): Promise<unknown>;
+  preview?: boolean;
 }
 
 const SERVER_SUBMISSION_FINGERPRINT_KEY = "_bluey_server_submission_fingerprint_v1";
@@ -56,7 +92,17 @@ const stateGroups = [
   ["all", "All"],
 ] as const;
 
-export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconcileSubmission, onCommit, onLoadResume, onResolveIntervention, onSaveCandidateEvent }: Props) {
+export function ApplicationsView({
+  workspace,
+  resumeVersions,
+  onUpdate,
+  onReconcileSubmission,
+  onCommit,
+  onLoadResume,
+  onResolveIntervention,
+  onSaveCandidateEvent,
+  preview = false,
+}: Props) {
   const [filter, setFilter] = useState<(typeof stateGroups)[number][0]>("active");
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<JobApplication | null>(null);
@@ -73,7 +119,27 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
   const [feedbackAction, setFeedbackAction] = useState("");
   const [feedbackNote, setFeedbackNote] = useState("");
   const [reconciliationTarget, setReconciliationTarget] = useState<JobApplication | null>(null);
+  const [communicationActions, setCommunicationActions] = useState<CommunicationActionSummary[]>([]);
+  const [communicationActionsLoading, setCommunicationActionsLoading] = useState(false);
+  const [communicationActionsError, setCommunicationActionsError] = useState("");
+  const [communicationDetail, setCommunicationDetail] = useState<CommunicationActionDetail | null>(null);
+  const [communicationPayload, setCommunicationPayload] = useState<
+    ReviewedCommunicationPayload | null
+  >(null);
+  const [communicationReviewConfirmed, setCommunicationReviewConfirmed] = useState(false);
+  const [communicationMutation, setCommunicationMutation] = useState<
+    "" | "load" | "approve" | "cancel"
+  >("");
+  const [communicationDialogError, setCommunicationDialogError] = useState("");
+  const [communicationNotice, setCommunicationNotice] = useState("");
+  const [communicationCancelTarget, setCommunicationCancelTarget] = useState<
+    CommunicationActionDetail | null
+  >(null);
+  const communicationActionsRef = useRef<CommunicationActionSummary[]>([]);
+  const communicationRequestLineageRef = useRef(new CommunicationRequestLineage());
+  const communicationMutationBusyRef = useRef(false);
   const openInterventions = workspace.interventions.filter((item) => item.status === "open");
+  const pendingCommunicationActions = communicationActions.filter(communicationActionRequiresReview);
 
   const jobs = useMemo(() => new Map(workspace.matches.map((job) => [job.id, job])), [workspace.matches]);
   const selectedSession = selected
@@ -86,6 +152,9 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
     ? workspace.interventions.find((item) => item.application_id === selected.id && item.status === "open")
     : undefined;
   const selectedJob = selected ? jobs.get(selected.job_id) : undefined;
+  const selectedCommunicationActions = selected
+    ? communicationActions.filter((item) => item.application_id === selected.id)
+    : [];
   const selectedEligibility = selected ? applicationEligibility(selected, selectedJob) : undefined;
   const selectedRunnerAvailable = selectedEligibility
     ? hasAvailableRunner(selectedEligibility, workspace.runner_availability)
@@ -109,6 +178,120 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
     if (filter === "active") return !["submitted", "failed"].includes(application.state);
     return true;
   });
+
+  const applyCommunicationActions = useCallback((incoming: CommunicationActionSummary[]) => {
+    const merged = mergeCommunicationActionSummaries(communicationActionsRef.current, incoming);
+    communicationActionsRef.current = merged;
+    setCommunicationActions(merged);
+  }, []);
+
+  const closeUnverifiedCommunication = useCallback((message: string) => {
+    setCommunicationDetail(null);
+    setCommunicationPayload(null);
+    setCommunicationCancelTarget(null);
+    setCommunicationReviewConfirmed(false);
+    setCommunicationNotice("");
+    setCommunicationDialogError(message);
+  }, []);
+
+  const refreshCommunicationActions = useCallback(async (
+    selectedApplicationId?: string,
+    showLoading = false,
+  ) => {
+    if (preview || communicationMutationBusyRef.current) return;
+    const requestVersion = communicationRequestLineageRef.current.begin(showLoading);
+    if (showLoading) setCommunicationActionsLoading(true);
+    setCommunicationActionsError("");
+    try {
+      const batches = [await jobsApi.communicationActions(undefined, 100)];
+      if (selectedApplicationId) {
+        // The selected-action fallback runs second so equal-revision dynamic
+        // readiness comes from the newest provider/grant projection.
+        batches.push(await jobsApi.communicationActions(selectedApplicationId, 100));
+      }
+      if (!communicationRequestLineageRef.current.isCurrent(requestVersion)) return;
+      applyCommunicationActions(batches.flat());
+    } catch (cause) {
+      if (communicationRequestLineageRef.current.isCurrent(requestVersion)) {
+        const message = cause instanceof Error && cause.message.trim()
+          ? cause.message
+          : "Bluey could not load reviewed communication actions.";
+        setCommunicationActionsError(message);
+        if (isCommunicationVerificationError(cause)) {
+          closeUnverifiedCommunication(message);
+        }
+      }
+    } finally {
+      if (communicationRequestLineageRef.current.finishLoading(requestVersion)) {
+        setCommunicationActionsLoading(false);
+      }
+    }
+  }, [applyCommunicationActions, closeUnverifiedCommunication, preview]);
+
+  useEffect(() => {
+    if (preview) {
+      communicationRequestLineageRef.current.supersede();
+      communicationRequestLineageRef.current.clearLoading();
+      communicationActionsRef.current = [];
+      setCommunicationActions([]);
+      setCommunicationActionsError("");
+      setCommunicationActionsLoading(false);
+      return undefined;
+    }
+    void refreshCommunicationActions(selected?.id, true);
+    return () => {
+      communicationRequestLineageRef.current.supersede();
+    };
+  }, [preview, refreshCommunicationActions, selected?.id, workspace]);
+
+  useEffect(() => {
+    const reviewOpen = Boolean(communicationDetail || communicationCancelTarget);
+    if (preview || !communicationActionsNeedPeriodicRefresh(communicationActions, reviewOpen)) {
+      return undefined;
+    }
+    const timer = window.setInterval(() => {
+      void refreshCommunicationActions(selected?.id);
+    }, 15_000);
+    return () => window.clearInterval(timer);
+  }, [
+    communicationActions,
+    communicationCancelTarget,
+    communicationDetail,
+    preview,
+    refreshCommunicationActions,
+    selected?.id,
+  ]);
+
+  useEffect(() => {
+    if (!communicationDetail || communicationMutation) return;
+    const summary = communicationActions.find((item) => item.id === communicationDetail.id);
+    if (!summary) return;
+    try {
+      const reconciled = reconcileCommunicationActionDetail(communicationDetail, summary);
+      if (reconciled !== communicationDetail) {
+        setCommunicationDetail(reconciled);
+        setCommunicationReviewConfirmed(false);
+        setCommunicationNotice("");
+      }
+      if (communicationCancelTarget?.id === reconciled.id) {
+        const reconciledCancelTarget = reconcileCommunicationActionDetail(
+          communicationCancelTarget,
+          summary,
+        );
+        setCommunicationCancelTarget(
+          communicationActionCanCancel(reconciledCancelTarget) ? reconciledCancelTarget : null,
+        );
+      }
+    } catch (cause) {
+      closeUnverifiedCommunication(errorMessage(cause));
+    }
+  }, [
+    closeUnverifiedCommunication,
+    communicationActions,
+    communicationCancelTarget,
+    communicationDetail,
+    communicationMutation,
+  ]);
 
   useEffect(() => {
     let cancelled = false;
@@ -146,6 +329,156 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
     setRememberAnswer(selectedIntervention?.kind !== "sensitive_question");
     setAnswerScope(selectedJob?.track_id ? "track" : "account");
   }, [selectedIntervention?.id, selectedIntervention?.kind, selectedJob?.track_id]);
+
+  const replaceCommunicationAction = (detail: CommunicationActionDetail) => {
+    const {
+      payload: _payload,
+      connection_account_label: _connectionAccountLabel,
+      source_context: _sourceContext,
+      ...summary
+    } = detail;
+    void _payload;
+    void _connectionAccountLabel;
+    void _sourceContext;
+    applyCommunicationActions([summary]);
+  };
+
+  const openCommunicationAction = async (summary: CommunicationActionSummary) => {
+    if (communicationMutationBusyRef.current || communicationMutation) return;
+    communicationMutationBusyRef.current = true;
+    communicationRequestLineageRef.current.supersede();
+    communicationRequestLineageRef.current.clearLoading();
+    setCommunicationActionsLoading(false);
+    setCommunicationMutation("load");
+    setCommunicationDialogError("");
+    setCommunicationNotice("");
+    setCommunicationReviewConfirmed(false);
+    try {
+      const detail = await jobsApi.communicationAction(summary.id);
+      if (!communicationDetailMatchesSummary(summary, detail)) {
+        throw new Error("Bluey could not verify that this is the exact reviewed draft.");
+      }
+      const payload = await verifiedCommunicationPayload(detail);
+      replaceCommunicationAction(detail);
+      setCommunicationDetail(detail);
+      setCommunicationPayload(payload);
+    } catch (cause) {
+      closeUnverifiedCommunication(errorMessage(cause));
+    } finally {
+      communicationMutationBusyRef.current = false;
+      setCommunicationMutation("");
+      void refreshCommunicationActions(summary.application_id);
+    }
+  };
+
+  const approveCommunicationAction = async () => {
+    const initial = communicationDetail;
+    if (!initial
+      || !communicationReviewConfirmed
+      || !communicationActionCanApprove(initial)
+      || communicationMutationBusyRef.current
+      || communicationMutation) {
+      return;
+    }
+    let current: CommunicationActionDetail = initial;
+    communicationMutationBusyRef.current = true;
+    communicationRequestLineageRef.current.supersede();
+    communicationRequestLineageRef.current.clearLoading();
+    setCommunicationActionsLoading(false);
+    setCommunicationMutation("approve");
+    setCommunicationDialogError("");
+    setCommunicationNotice("");
+    try {
+      const latestSummary = communicationActionsRef.current.find(
+        (action) => action.id === current.id,
+      );
+      if (latestSummary) {
+        const reconciled = reconcileCommunicationActionDetail(current, latestSummary);
+        if (reconciled.action_revision !== current.action_revision) {
+          throw new Error("This communication changed. Review the current exact draft again.");
+        }
+        if (reconciled !== current) {
+          current = reconciled;
+          setCommunicationDetail(reconciled);
+          setCommunicationReviewConfirmed(false);
+        }
+      }
+      if (!communicationActionCanApprove(current)) {
+        setCommunicationDialogError(communicationApprovalUnavailableReason(current));
+        return;
+      }
+      await verifiedCommunicationPayload(current);
+      const updated = await jobsApi.approveCommunicationAction(current);
+      if (!communicationTransitionMatches(current, updated, "approved")) {
+        throw new Error("Bluey could not verify the approved draft response.");
+      }
+      const payload = await verifiedCommunicationPayload(updated);
+      replaceCommunicationAction(updated);
+      setCommunicationDetail(updated);
+      setCommunicationPayload(payload);
+      setCommunicationReviewConfirmed(false);
+      setCommunicationNotice(
+        updated.execution_available
+          ? "This exact draft is approved and waiting for provider evidence."
+          : "This exact draft is approved, but provider delivery is unavailable.",
+      );
+    } catch (cause) {
+      closeUnverifiedCommunication(errorMessage(cause));
+    } finally {
+      communicationMutationBusyRef.current = false;
+      setCommunicationMutation("");
+      void refreshCommunicationActions(current.application_id);
+    }
+  };
+
+  const cancelCommunicationAction = async () => {
+    const initial = communicationCancelTarget;
+    if (!initial
+      || !communicationActionCanCancel(initial)
+      || communicationMutationBusyRef.current
+      || communicationMutation) return;
+    let current: CommunicationActionDetail = initial;
+    communicationMutationBusyRef.current = true;
+    communicationRequestLineageRef.current.supersede();
+    communicationRequestLineageRef.current.clearLoading();
+    setCommunicationActionsLoading(false);
+    setCommunicationMutation("cancel");
+    setCommunicationDialogError("");
+    setCommunicationNotice("");
+    try {
+      const latestSummary = communicationActionsRef.current.find(
+        (action) => action.id === current.id,
+      );
+      if (latestSummary) {
+        const reconciled = reconcileCommunicationActionDetail(current, latestSummary);
+        if (reconciled.action_revision !== current.action_revision) {
+          throw new Error("This communication changed. Review the current exact draft again.");
+        }
+        current = reconciled;
+      }
+      if (!communicationActionCanCancel(current)) {
+        throw new Error("This communication changed and can no longer be cancelled.");
+      }
+      await verifiedCommunicationPayload(current);
+      const updated = await jobsApi.cancelCommunicationAction(current);
+      if (!communicationTransitionMatches(current, updated, "cancelled")) {
+        throw new Error("Bluey could not verify the cancelled draft response.");
+      }
+      const payload = await verifiedCommunicationPayload(updated);
+      replaceCommunicationAction(updated);
+      setCommunicationDetail(updated);
+      setCommunicationPayload(payload);
+      setCommunicationCancelTarget(null);
+      setCommunicationReviewConfirmed(false);
+      setCommunicationNotice("This exact draft is cancelled and cannot be delivered.");
+    } catch (cause) {
+      closeUnverifiedCommunication(errorMessage(cause));
+    } finally {
+      communicationMutationBusyRef.current = false;
+      setCommunicationMutation("");
+      void refreshCommunicationActions(current.application_id);
+    }
+  };
 
   const update = async (state: string) => {
     if (!selected) return;
@@ -274,6 +607,12 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
       </section>
 
       {localError && <div className="inline-error" role="alert">{localError}</div>}
+      {communicationActionsError && (
+        <div className="inline-error" role="alert">{communicationActionsError}</div>
+      )}
+      {communicationDialogError && !communicationDetail && !selected && (
+        <div className="inline-error" role="alert">{communicationDialogError}</div>
+      )}
 
       {openInterventions.length > 0 && (
         <section className="intervention-banner">
@@ -289,6 +628,49 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
         </section>
       )}
 
+      {pendingCommunicationActions.length > 0 && (
+        <section className="communication-review-banner">
+          <span className="communication-review-icon"><Mail size={20} /></span>
+          <div>
+            <p>COMMUNICATION REVIEW</p>
+            <h2>
+              {pendingCommunicationActions.length} draft
+              {pendingCommunicationActions.length === 1 ? "" : "s"} waiting for review
+            </h2>
+            <span>Nothing is sent or added to a calendar until you inspect the exact draft.</span>
+          </div>
+          <div className="communication-review-items">
+            {pendingCommunicationActions.slice(0, 2).map((action) => {
+              const application = workspace.applications.find(
+                (item) => item.id === action.application_id,
+              );
+              const job = application ? jobs.get(application.job_id) : undefined;
+              return (
+                <button
+                  key={action.id}
+                  type="button"
+                  aria-label={`Review ${communicationKindLabel(action.kind)} for ${job?.company || "this application"}`}
+                  disabled={!application || communicationMutation === "load"}
+                  onClick={() => {
+                    if (application) setSelected(application);
+                    void openCommunicationAction(action);
+                  }}
+                >
+                  {action.kind === "reply" ? <Mail size={15} /> : <CalendarDays size={15} />}
+                  <span>
+                    <b>{job?.company || communicationKindLabel(action.kind)}</b>
+                    <small>
+                      {communicationKindLabel(action.kind)} · {communicationActionStatus(action).label}
+                    </small>
+                  </span>
+                  <ChevronRight size={16} />
+                </button>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
       <section className="application-toolbar">
         <div className="tab-control">{stateGroups.map(([value, label]) => <button key={value} className={filter === value ? "active" : ""} onClick={() => setFilter(value)}>{label}<span>{applicationCountFor(value, workspace.applications)}</span></button>)}</div>
         <label className="search-field small"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search applications" /></label>
@@ -299,12 +681,26 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
           const job = jobs.get(application.job_id);
           const rowResume = application.resume_version_id ? resumeVersions[application.resume_version_id] : undefined;
           const outcome = latestApplicationOutcome(workspace.candidate_events, application.id);
+          const communication = latestCommunicationAction(
+            communicationActions,
+            application.id,
+          );
           return (
             <button key={application.id} className="application-row" onClick={() => setSelected(application)}>
               <div className="company-mark">{(job?.company || "BJ").slice(0, 2).toUpperCase()}</div>
               <div className="application-main"><strong>{job?.title || "Application"}</strong><span>{job?.company || "Unknown company"} · {job?.location || "Location not listed"}</span></div>
               <div className="application-stage">{stateIcon(application.state)}<span><b>{titleCase(application.state)}</b><small>{relativeTime(application.updated_at_ms)}{outcome ? ` · ${eventActionLabel(outcome.action)}` : ""}</small></span></div>
-              <div className="application-packet"><FileText size={15} /><span>Job-specific resume<small>{rowResume ? `v${rowResume.version_no}` : "Prepared"} · {titleCase(application.submission_mode)}</small></span></div>
+              <div className="application-packet">
+                {communication ? <Mail size={15} /> : <FileText size={15} />}
+                <span>
+                  {communication ? communicationKindLabel(communication.kind) : "Job-specific resume"}
+                  <small>
+                    {communication
+                      ? communicationActionRowStatus(communication)
+                      : `${rowResume ? `v${rowResume.version_no}` : "Prepared"} · ${titleCase(application.submission_mode)}`}
+                  </small>
+                </span>
+              </div>
               <span className="icon-button" aria-hidden="true"><MoreHorizontal size={18} /></span>
             </button>
           );
@@ -323,6 +719,9 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
                 ["Receipt", selected.state === "submitted"],
               ].map(([label, complete], index) => <div key={String(label)} className={complete ? "complete" : ""}><span>{complete ? <Check size={13} /> : index + 1}</span><b>{label}</b></div>)}
             </div>
+            {communicationDialogError && !communicationDetail && (
+              <div className="inline-error" role="alert">{communicationDialogError}</div>
+            )}
             {(latestApplicationOutcome(workspace.candidate_events, selected.id) || applicationIssues(workspace.candidate_events, selected.id).length > 0) && <div className="candidate-event-summary">
               {latestApplicationOutcome(workspace.candidate_events, selected.id) && <span className="status-chip success">Outcome: {eventActionLabel(latestApplicationOutcome(workspace.candidate_events, selected.id)?.action || "")}</span>}
               {applicationIssues(workspace.candidate_events, selected.id).length > 0 && <span className="status-chip warning">{applicationIssues(workspace.candidate_events, selected.id).length} open report{applicationIssues(workspace.candidate_events, selected.id).length === 1 ? "" : "s"}</span>}
@@ -346,6 +745,17 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
                 <DiffList resume={selectedResume} />
                 <CoverLetterPreview coverLetter={selected.cover_letter} />
                 <FinalAnswers answers={selected.answers} />
+                {(communicationActionsLoading
+                  || communicationActionsError
+                  || selectedCommunicationActions.length > 0) && (
+                  <CommunicationActionsSection
+                    actions={selectedCommunicationActions}
+                    loading={communicationActionsLoading}
+                    error={communicationActionsError}
+                    opening={communicationMutation === "load"}
+                    onReview={(action) => void openCommunicationAction(action)}
+                  />
+                )}
                 <PauseReasons application={selected} job={selectedJob} intervention={selectedIntervention} />
                 <div className="claim-note"><CheckCircle2 size={17} /><span><b>No unsupported claims</b><small>{selectedResume?.claim_ids.length || 0} profile facts carry provenance into this version.</small></span></div>
                 {selected.state === "needs_input" && canAnswerIntervention && selectedIntervention
@@ -384,6 +794,62 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
         onConfirm={() => void reconcileNotSubmitted()}
         onClose={() => !busy && setReconciliationTarget(null)}
       />
+      <Dialog
+        open={Boolean(communicationDetail && communicationPayload)}
+        title={communicationDetail ? communicationKindLabel(communicationDetail.kind) : "Reviewed communication"}
+        description={communicationDetail
+          ? `${communicationProviderLabel(communicationDetail.provider)} · Exact draft review`
+          : ""}
+        onClose={() => {
+          if (!communicationMutationBusyRef.current && !communicationMutation) {
+            setCommunicationDetail(null);
+            setCommunicationPayload(null);
+            setCommunicationDialogError("");
+            setCommunicationNotice("");
+            setCommunicationReviewConfirmed(false);
+          }
+        }}
+        size="large"
+      >
+        {communicationDetail && communicationPayload && (
+          <CommunicationActionReview
+            action={communicationDetail}
+            payload={communicationPayload}
+            reviewed={communicationReviewConfirmed}
+            mutation={communicationMutation}
+            error={communicationDialogError}
+            notice={communicationNotice}
+            onReviewedChange={setCommunicationReviewConfirmed}
+            onApprove={() => void approveCommunicationAction()}
+            onCancel={() => setCommunicationCancelTarget(communicationDetail)}
+            onClose={() => {
+              if (communicationMutationBusyRef.current || communicationMutation) return;
+              setCommunicationDetail(null);
+              setCommunicationPayload(null);
+              setCommunicationDialogError("");
+              setCommunicationNotice("");
+              setCommunicationReviewConfirmed(false);
+            }}
+          />
+        )}
+      </Dialog>
+      <ConfirmDialog
+        open={Boolean(communicationCancelTarget)}
+        title={communicationCancelTarget?.kind === "reply"
+          ? "Cancel this reply draft?"
+          : "Cancel this calendar draft?"}
+        description={communicationCancelTarget
+          ? communicationCancellationDescription(communicationCancelTarget.kind)
+          : ""}
+        confirmLabel={communicationMutation === "cancel" ? "Cancelling..." : "Cancel draft"}
+        tone="danger"
+        onConfirm={() => void cancelCommunicationAction()}
+        onClose={() => {
+          if (!communicationMutationBusyRef.current && !communicationMutation) {
+            setCommunicationCancelTarget(null);
+          }
+        }}
+      />
       <Dialog open={receiptOpen} title="Submission receipt" description={selected ? `${jobs.get(selected.job_id)?.company || "Application"} · ${jobs.get(selected.job_id)?.title || ""}` : ""} onClose={() => setReceiptOpen(false)}>
         {selected && <ReceiptView application={selected} resume={selectedResume} evidence={selectedEvidence} />}
       </Dialog>
@@ -410,6 +876,286 @@ export function ApplicationsView({ workspace, resumeVersions, onUpdate, onReconc
       <InterviewPrepDialog target={prepTarget} workspace={workspace} onClose={() => setPrepTarget(null)} />
     </div>
   );
+}
+
+export function CommunicationActionsSection({
+  actions,
+  loading,
+  error,
+  opening,
+  onReview,
+}: {
+  actions: CommunicationActionSummary[];
+  loading: boolean;
+  error: string;
+  opening: boolean;
+  onReview(action: CommunicationActionSummary): void;
+}) {
+  const ordered = [...actions].sort((left, right) => right.created_at_ms - left.created_at_ms);
+  return (
+    <section className="communication-actions-section" aria-busy={loading || opening}>
+      <div className="communication-actions-heading">
+        <div><p>REVIEWED COMMUNICATIONS</p><h4>Replies and calendar actions</h4></div>
+        <span>{ordered.length} draft{ordered.length === 1 ? "" : "s"}</span>
+      </div>
+      {error && <div className="communication-action-message error" role="alert">{error}</div>}
+      {loading && <div className="communication-action-message" role="status">Loading reviewed actions…</div>}
+      <div className="communication-action-list">
+        {ordered.map((action) => {
+          const status = communicationActionStatus(action);
+          return (
+            <article className="communication-action-card" key={action.id}>
+              <span className="communication-action-card-icon">
+                {action.kind === "reply" ? <Mail size={16} /> : <CalendarDays size={16} />}
+              </span>
+              <div>
+                <b>{communicationKindLabel(action.kind)}</b>
+                <small>{communicationProviderLabel(action.provider)}</small>
+                <p>{status.detail}</p>
+              </div>
+              <aside>
+                <span className={`status-chip ${status.tone}`}>{status.label}</span>
+                <button
+                  type="button"
+                  aria-label={`Review ${communicationKindLabel(action.kind)} draft in ${communicationProviderLabel(action.provider)}`}
+                  disabled={opening}
+                  onClick={() => onReview(action)}
+                >
+                  {opening ? "Opening…" : "Review draft"}
+                </button>
+              </aside>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
+export function latestCommunicationAction(
+  actions: CommunicationActionSummary[],
+  applicationId: string,
+): CommunicationActionSummary | undefined {
+  return actions
+    .filter((action) => action.application_id === applicationId)
+    .sort((left, right) => (
+      right.created_at_ms - left.created_at_ms
+      || right.updated_at_ms - left.updated_at_ms
+      || left.id.localeCompare(right.id)
+    ))[0];
+}
+
+export function communicationActionRowStatus(action: CommunicationActionSummary): string {
+  const status = communicationActionStatus(action);
+  return `${status.label} · ${status.detail}`;
+}
+
+export function CommunicationActionReview({
+  action,
+  payload,
+  reviewed,
+  mutation,
+  error,
+  notice,
+  onReviewedChange,
+  onApprove,
+  onCancel,
+  onClose,
+}: {
+  action: CommunicationActionDetail;
+  payload: ReviewedCommunicationPayload;
+  reviewed: boolean;
+  mutation: "" | "load" | "approve" | "cancel";
+  error: string;
+  notice: string;
+  onReviewedChange(value: boolean): void;
+  onApprove(): void;
+  onCancel(): void;
+  onClose(): void;
+}) {
+  const status = communicationActionStatus(action);
+  const canApprove = communicationActionCanApprove(action);
+  const canCancel = communicationActionCanCancel(action);
+  const unavailableReason = communicationApprovalUnavailableReason(action);
+  const busy = mutation === "approve" || mutation === "cancel";
+  return (
+    <div className="communication-action-review">
+      <div className={`communication-action-status ${status.tone}`} role="status">
+        {status.tone === "success" ? <CheckCircle2 size={19} /> : <AlertCircle size={19} />}
+        <span><b>{status.label}</b><small>{status.detail}</small></span>
+      </div>
+      {error && <div className="inline-error" role="alert">{error}</div>}
+      {notice && <div className="communication-action-notice" role="status">{notice}</div>}
+      <section className="communication-draft-content">
+        <div className="communication-draft-heading">
+          <div>
+            <p>EXACT READ-ONLY DRAFT</p>
+            <h3>{communicationKindLabel(action.kind)}</h3>
+          </div>
+          <span>{communicationProviderLabel(action.provider)}</span>
+        </div>
+        <dl className="communication-review-authority">
+          <div>
+            <dt>Connected account</dt>
+            <dd>{action.connection_account_label}</dd>
+          </div>
+          {action.source_context ? (
+            <>
+              <div><dt>Original sender</dt><dd>{action.source_context.sender}</dd></div>
+              <div><dt>Reply address</dt><dd>{action.source_context.reply_target}</dd></div>
+              <div><dt>Original subject</dt><dd>{action.source_context.subject}</dd></div>
+              <div>
+                <dt>Received</dt>
+                <dd>{formatCommunicationSourceDate(action.source_context.received_at_ms)}</dd>
+              </div>
+            </>
+          ) : (
+            <div>
+              <dt>Draft source</dt>
+              <dd>Calendar draft · no inbound message</dd>
+            </div>
+          )}
+        </dl>
+        {payload.kind === "reply" ? (
+          <dl className="communication-reply-fields">
+            <div><dt>To</dt><dd>{payload.to}</dd></div>
+            <div><dt>Subject</dt><dd>{payload.subject}</dd></div>
+            <div className="communication-message-body">
+              <dt>Full message</dt>
+              <dd><pre>{payload.body_text}</pre></dd>
+            </div>
+          </dl>
+        ) : (
+          <dl className="communication-calendar-fields">
+            <div><dt>Title</dt><dd>{payload.title}</dd></div>
+            <div>
+              <dt>Starts</dt>
+              <dd>{formatCommunicationDate(payload.starts_at_ms, payload.time_zone)}</dd>
+            </div>
+            <div>
+              <dt>Ends</dt>
+              <dd>{formatCommunicationDate(payload.ends_at_ms, payload.time_zone)}</dd>
+            </div>
+            <div>
+              <dt>Time zone</dt>
+              <dd>{payload.time_zone}</dd>
+            </div>
+            <div className="communication-attendees">
+              <dt>All attendees</dt>
+              <dd>
+                {payload.attendees.length > 0
+                  ? <ul>{payload.attendees.map((attendee) => <li key={attendee}>{attendee}</li>)}</ul>
+                  : "No attendees"}
+              </dd>
+            </div>
+            <div className="communication-invitation-copy">
+              <dt>Invitations</dt>
+              <dd>
+                {payload.attendees.length > 0
+                  ? "The provider will email an invitation to every listed attendee when this event is created."
+                  : "No attendees are listed, so no invitation will be sent."}
+              </dd>
+            </div>
+          </dl>
+        )}
+        <div className="communication-draft-audit">
+          <b>Draft fingerprint</b><code>{action.payload_sha256}</code>
+          <span>This draft is read-only. Cancel it and create a new draft to change anything.</span>
+        </div>
+      </section>
+      {communicationActionRequiresReview(action) && canApprove && (
+        <label className="communication-review-confirmation">
+          <input
+            type="checkbox"
+            checked={reviewed}
+            disabled={busy}
+            onChange={(event) => onReviewedChange(event.target.checked)}
+          />
+          <span>
+            {communicationReviewConfirmation(
+              action.kind,
+              payload.kind === "calendar" && payload.attendees.length > 0,
+            )}
+          </span>
+        </label>
+      )}
+      {communicationActionRequiresReview(action) && !canApprove && (
+        <div className="communication-approval-unavailable" role="status">
+          <AlertCircle size={17} />
+          <div><b>Approval unavailable</b><p>{unavailableReason}</p></div>
+        </div>
+      )}
+      <div className="dialog-actions spread">
+        <p>
+          Approval grants authority for this exact draft only. It is not provider completion
+          evidence.
+        </p>
+        <div>
+          <button
+            className="button secondary"
+            type="button"
+            aria-label={`Close ${communicationKindLabel(action.kind)} review`}
+            disabled={busy}
+            onClick={onClose}
+          >
+            Close
+          </button>
+          {canCancel && (
+            <button
+              className="button danger subtle"
+              type="button"
+              aria-label={`Cancel ${communicationKindLabel(action.kind)} draft`}
+              disabled={busy}
+              onClick={onCancel}
+            >
+              <XCircle size={16} />Cancel draft
+            </button>
+          )}
+          {communicationActionRequiresReview(action) && (
+            <button
+              className="button primary"
+              type="button"
+              aria-label={canApprove
+                ? communicationApprovalLabel(action.kind)
+                : `${communicationApprovalLabel(action.kind)} unavailable`}
+              disabled={!canApprove || !reviewed || busy}
+              onClick={onApprove}
+            >
+              <ShieldCheck size={16} />
+              {mutation === "approve"
+                ? "Approving…"
+                : canApprove
+                  ? communicationApprovalLabel(action.kind)
+                  : "Approve unavailable"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatCommunicationDate(timestamp: number, timeZone: string): string {
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: "short",
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+    timeZone,
+  }).format(new Date(timestamp));
+}
+
+function formatCommunicationSourceDate(timestamp: number): string {
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(new Date(timestamp));
 }
 
 function normalizeCompanyKey(company: string): string {

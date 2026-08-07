@@ -85,6 +85,79 @@ fn provider_message_from_parts(parts: ProviderMessageParts) -> Result<JobsProvid
     Ok(message)
 }
 
+fn enrich_provider_message_authority_metadata(
+    stored: &mut JobsProviderMessage,
+    incoming: &JobsProviderMessage,
+) -> Result<bool> {
+    if stored.connection_id != incoming.connection_id
+        || stored.provider != incoming.provider
+        || stored.external_id != incoming.external_id
+    {
+        anyhow::bail!("provider message identity collision")
+    }
+    let incoming_metadata = incoming
+        .metadata
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("provider message metadata is invalid"))?;
+    if !stored.metadata.is_object() {
+        if stored.metadata.is_null() {
+            stored.metadata = json!({});
+        } else {
+            anyhow::bail!("stored provider message metadata is invalid")
+        }
+    }
+    let stored_metadata = stored.metadata.as_object_mut().unwrap();
+    let mut changed = false;
+    for key in [
+        "provider_id",
+        "thread_id",
+        "conversation_id",
+        "rfc_message_id",
+        "reply_target",
+    ] {
+        let Some(incoming_value) = incoming_metadata.get(key) else {
+            continue;
+        };
+        let incoming_value = incoming_value
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("provider message authority metadata is invalid"))?;
+        if incoming_value.is_empty() {
+            continue;
+        }
+        if incoming_value.len() > 2_048
+            || incoming_value != incoming_value.trim()
+            || incoming_value.chars().any(char::is_control)
+        {
+            anyhow::bail!("provider message authority metadata is invalid")
+        }
+        if key == "reply_target"
+            && normalize_communication_email(incoming_value)? != incoming_value
+        {
+            anyhow::bail!("provider message reply target is not canonical")
+        }
+        match stored_metadata.get(key) {
+            Some(Value::String(existing)) => {
+                if existing.is_empty() {
+                    stored_metadata
+                        .insert(key.to_string(), Value::String(incoming_value.to_string()));
+                    changed = true;
+                } else if existing != incoming_value {
+                    anyhow::bail!("provider message authority metadata changed")
+                }
+            }
+            Some(_) => anyhow::bail!("stored provider message authority metadata is invalid"),
+            None => {
+                stored_metadata.insert(key.to_string(), Value::String(incoming_value.to_string()));
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        stored.updated_at_ms = now_ms().max(stored.updated_at_ms.saturating_add(1));
+    }
+    Ok(changed)
+}
+
 pub fn mailbox_connection(
     pool: &DbPool,
     account_id: &str,
@@ -713,8 +786,11 @@ pub fn save_provider_message(
 ) -> Result<(JobsProviderMessage, bool)> {
     let mut value = message.clone();
     value.provider = normalize_mailbox_provider(&value.provider)?;
+    value.external_id = value.external_id.trim().to_string();
     if value.connection_id.trim().is_empty()
-        || value.external_id.trim().is_empty()
+        || value.external_id.is_empty()
+        || value.external_id.len() > 2_048
+        || value.external_id.chars().any(char::is_control)
         || value.sender.trim().is_empty()
         || value.received_at_ms <= 0
     {
@@ -722,7 +798,7 @@ pub fn save_provider_message(
     }
     let mailbox = mailbox_connection(pool, account_id, &value.connection_id)?
         .ok_or_else(|| anyhow::anyhow!("mailbox connection not found"))?;
-    if mailbox.provider != value.provider {
+    if mailbox.provider != value.provider || mailbox.status != "connected" {
         anyhow::bail!("provider message does not match the mailbox")
     }
     if let Some(application_id) = value.application_id.as_deref() {
@@ -761,8 +837,15 @@ pub fn save_provider_message(
         value.processed_at_ms = Some(now);
     }
     let message_hash = private_lookup_hash(
+        &format!(
+            "jobs-provider-message:{}:{}",
+            value.provider, value.connection_id
+        ),
+        &value.external_id,
+    )?;
+    let legacy_message_hash = private_lookup_hash(
         &format!("jobs-provider-message:{}", value.provider),
-        value.external_id.trim(),
+        &value.external_id,
     )?;
     let payload = to_json(&value, "Jobs provider message")?;
 
@@ -770,34 +853,109 @@ pub fn save_provider_message(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let inserted = tx.execute(
-                "INSERT INTO jobs_provider_messages (
-                    id, account_id, connection_id, provider, provider_message_hash,
-                    application_id, processing_status, message_json, received_at_ms,
-                    processed_at_ms, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
-                params![
-                    value.id,
-                    account_id,
-                    value.connection_id,
-                    value.provider,
-                    message_hash,
-                    value.application_id,
-                    value.processing_status,
-                    payload,
-                    value.received_at_ms,
-                    value.processed_at_ms,
-                    value.created_at_ms,
-                    value.updated_at_ms,
-                ],
-            )? > 0;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let mailbox_matches: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = ?1 AND id = ?2 AND provider = ?3
+                    AND status = 'connected')",
+                params![account_id, value.connection_id, value.provider],
+                |row| row.get(0),
+            )?;
+            if !mailbox_matches {
+                anyhow::bail!("provider message mailbox authority changed")
+            }
+            if let Some(application_id) = value.application_id.as_deref() {
+                let application_exists: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM jobs_applications
+                      WHERE account_id = ?1 AND id = ?2)",
+                    params![account_id, application_id],
+                    |row| row.get(0),
+                )?;
+                if !application_exists {
+                    anyhow::bail!("provider message application authority changed")
+                }
+            }
+            let existing: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT id, provider_message_hash
+                       FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND provider = ?3
+                        AND provider_message_hash IN (?4, ?5)
+                      ORDER BY CASE WHEN provider_message_hash = ?4 THEN 0 ELSE 1 END
+                      LIMIT 1",
+                    params![
+                        account_id,
+                        value.connection_id,
+                        value.provider,
+                        message_hash,
+                        legacy_message_hash,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (stored_id, inserted) = if let Some((stored_id, stored_hash)) = existing {
+                if stored_hash == legacy_message_hash && stored_hash != message_hash {
+                    let changed = tx.execute(
+                        "UPDATE jobs_provider_messages
+                            SET provider_message_hash = ?4
+                          WHERE account_id = ?1 AND id = ?2 AND connection_id = ?3
+                            AND provider_message_hash = ?5",
+                        params![
+                            account_id,
+                            stored_id,
+                            value.connection_id,
+                            message_hash,
+                            legacy_message_hash,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("provider message legacy identity changed")
+                    }
+                }
+                (stored_id, false)
+            } else {
+                let inserted = tx.execute(
+                    "INSERT INTO jobs_provider_messages (
+                        id, account_id, connection_id, provider, provider_message_hash,
+                        application_id, processing_status, message_json, received_at_ms,
+                        processed_at_ms, created_at_ms, updated_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
+                    params![
+                        value.id,
+                        account_id,
+                        value.connection_id,
+                        value.provider,
+                        message_hash,
+                        value.application_id,
+                        value.processing_status,
+                        payload,
+                        value.received_at_ms,
+                        value.processed_at_ms,
+                        value.created_at_ms,
+                        value.updated_at_ms,
+                    ],
+                )?;
+                if inserted != 1 {
+                    anyhow::bail!("provider message identity collision")
+                }
+                (value.id.clone(), true)
+            };
             let row = tx.query_row(
                 "SELECT id, connection_id, provider, application_id, processing_status,
                         message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
                    FROM jobs_provider_messages
-                  WHERE account_id = ?1 AND provider = ?2 AND provider_message_hash = ?3",
-                params![account_id, value.provider, message_hash],
+                  WHERE account_id = ?1 AND id = ?2 AND connection_id = ?3
+                    AND provider = ?4 AND provider_message_hash = ?5",
+                params![
+                    account_id,
+                    stored_id,
+                    value.connection_id,
+                    value.provider,
+                    message_hash,
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
@@ -813,47 +971,139 @@ pub fn save_provider_message(
                     ))
                 },
             )?;
+            let mut stored = provider_message_from_parts((
+                row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
+            ))?;
+            if !inserted && enrich_provider_message_authority_metadata(&mut stored, &value)? {
+                let payload = to_json(&stored, "Jobs provider message")?;
+                let changed = tx.execute(
+                    "UPDATE jobs_provider_messages
+                        SET message_json = ?4, updated_at_ms = ?5
+                      WHERE account_id = ?1 AND id = ?2 AND connection_id = ?3",
+                    params![
+                        account_id,
+                        stored.id,
+                        stored.connection_id,
+                        payload,
+                        stored.updated_at_ms,
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("provider message authority enrichment changed")
+                }
+            }
             tx.commit()?;
-            Ok((
-                provider_message_from_parts((
-                    row.0, row.1, row.2, row.3, row.4, row.5, row.6, row.7, row.8, row.9,
-                ))?,
-                inserted,
-            ))
+            Ok((stored, inserted))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let inserted = tx.execute(
-                "INSERT INTO jobs_provider_messages (
-                    id, account_id, connection_id, provider, provider_message_hash,
-                    application_id, processing_status, message_json, received_at_ms,
-                    processed_at_ms, created_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-                 ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let mailbox_matches: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM jobs_mailbox_connections
+                      WHERE account_id = $1 AND id = $2 AND provider = $3
+                        AND status = 'connected')",
+                    &[&account_id, &value.connection_id, &value.provider],
+                )?
+                .get(0);
+            if !mailbox_matches {
+                anyhow::bail!("provider message mailbox authority changed")
+            }
+            if let Some(application_id) = value.application_id.as_deref() {
+                let application_exists: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM jobs_applications
+                          WHERE account_id = $1 AND id = $2)",
+                        &[&account_id, &application_id],
+                    )?
+                    .get(0);
+                if !application_exists {
+                    anyhow::bail!("provider message application authority changed")
+                }
+            }
+            let existing = tx.query_opt(
+                "SELECT id, provider_message_hash
+                   FROM jobs_provider_messages
+                  WHERE account_id = $1 AND connection_id = $2 AND provider = $3
+                    AND provider_message_hash IN ($4, $5)
+                  ORDER BY CASE WHEN provider_message_hash = $4 THEN 0 ELSE 1 END
+                  LIMIT 1 FOR UPDATE",
                 &[
-                    &value.id,
                     &account_id,
                     &value.connection_id,
                     &value.provider,
                     &message_hash,
-                    &value.application_id,
-                    &value.processing_status,
-                    &payload,
-                    &value.received_at_ms,
-                    &value.processed_at_ms,
-                    &value.created_at_ms,
-                    &value.updated_at_ms,
+                    &legacy_message_hash,
                 ],
-            )? > 0;
+            )?;
+            let (stored_id, inserted) = if let Some(existing) = existing {
+                let stored_id: String = existing.get(0);
+                let stored_hash: String = existing.get(1);
+                if stored_hash == legacy_message_hash && stored_hash != message_hash {
+                    let changed = tx.execute(
+                        "UPDATE jobs_provider_messages
+                            SET provider_message_hash = $4
+                          WHERE account_id = $1 AND id = $2 AND connection_id = $3
+                            AND provider_message_hash = $5",
+                        &[
+                            &account_id,
+                            &stored_id,
+                            &value.connection_id,
+                            &message_hash,
+                            &legacy_message_hash,
+                        ],
+                    )?;
+                    if changed != 1 {
+                        anyhow::bail!("provider message legacy identity changed")
+                    }
+                }
+                (stored_id, false)
+            } else {
+                let inserted = tx.execute(
+                    "INSERT INTO jobs_provider_messages (
+                        id, account_id, connection_id, provider, provider_message_hash,
+                        application_id, processing_status, message_json, received_at_ms,
+                        processed_at_ms, created_at_ms, updated_at_ms
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                     ON CONFLICT(account_id, provider, provider_message_hash) DO NOTHING",
+                    &[
+                        &value.id,
+                        &account_id,
+                        &value.connection_id,
+                        &value.provider,
+                        &message_hash,
+                        &value.application_id,
+                        &value.processing_status,
+                        &payload,
+                        &value.received_at_ms,
+                        &value.processed_at_ms,
+                        &value.created_at_ms,
+                        &value.updated_at_ms,
+                    ],
+                )?;
+                if inserted != 1 {
+                    anyhow::bail!("provider message identity collision")
+                }
+                (value.id.clone(), true)
+            };
             let row = tx.query_one(
                 "SELECT id, connection_id, provider, application_id, processing_status,
                         message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
                    FROM jobs_provider_messages
-                  WHERE account_id = $1 AND provider = $2 AND provider_message_hash = $3",
-                &[&account_id, &value.provider, &message_hash],
+                  WHERE account_id = $1 AND id = $2 AND connection_id = $3
+                    AND provider = $4 AND provider_message_hash = $5",
+                &[
+                    &account_id,
+                    &stored_id,
+                    &value.connection_id,
+                    &value.provider,
+                    &message_hash,
+                ],
             )?;
-            let stored = provider_message_from_parts((
+            let mut stored = provider_message_from_parts((
                 row.get(0),
                 row.get(1),
                 row.get(2),
@@ -865,6 +1115,24 @@ pub fn save_provider_message(
                 row.get(8),
                 row.get(9),
             ))?;
+            if !inserted && enrich_provider_message_authority_metadata(&mut stored, &value)? {
+                let payload = to_json(&stored, "Jobs provider message")?;
+                let changed = tx.execute(
+                    "UPDATE jobs_provider_messages
+                        SET message_json = $4, updated_at_ms = $5
+                      WHERE account_id = $1 AND id = $2 AND connection_id = $3",
+                    &[
+                        &account_id,
+                        &stored.id,
+                        &stored.connection_id,
+                        &payload,
+                        &stored.updated_at_ms,
+                    ],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("provider message authority enrichment changed")
+                }
+            }
             tx.commit()?;
             Ok((stored, inserted))
         }
@@ -981,6 +1249,111 @@ pub fn list_provider_messages(
                 })
                 .collect()
         }
+    })
+}
+
+pub fn export_provider_messages(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<JobsProviderMessageExport>> {
+    let messages: Vec<JobsProviderMessage> = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT id, connection_id, provider, application_id, processing_status,
+                        message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_provider_messages
+                  WHERE account_id = ?1 ORDER BY received_at_ms, id",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| {
+                Ok((
+                    row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                    row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                ))
+            })?;
+            rows.map(|row| provider_message_from_parts(row?))
+                .collect::<Result<Vec<_>>>()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query(
+                "SELECT id, connection_id, provider, application_id, processing_status,
+                        message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_provider_messages
+                  WHERE account_id = $1 ORDER BY received_at_ms, id",
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(|row| {
+                provider_message_from_parts((
+                    row.get(0), row.get(1), row.get(2), row.get(3), row.get(4),
+                    row.get(5), row.get(6), row.get(7), row.get(8), row.get(9),
+                ))
+            })
+            .collect(),
+    })?;
+    Ok(messages
+        .into_iter()
+        .map(|message| JobsProviderMessageExport {
+            id: message.id,
+            connection_id: message.connection_id,
+            provider: message.provider,
+            sender: message.sender,
+            recipients: message.recipients,
+            subject: message.subject,
+            body_text: message.body_text,
+            received_at_ms: message.received_at_ms,
+            application_id: message.application_id,
+            processing_status: message.processing_status,
+            classification: message.classification,
+            created_at_ms: message.created_at_ms,
+            updated_at_ms: message.updated_at_ms,
+        })
+        .collect())
+}
+
+pub fn provider_message(
+    pool: &DbPool,
+    account_id: &str,
+    connection_id: &str,
+    message_id: &str,
+) -> Result<Option<JobsProviderMessage>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let row = pool
+                .get()?
+                .query_row(
+                    "SELECT id, connection_id, provider, application_id, processing_status,
+                            message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3",
+                    params![account_id, connection_id, message_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?, row.get(9)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(provider_message_from_parts).transpose()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query_opt(
+                "SELECT id, connection_id, provider, application_id, processing_status,
+                        message_json, received_at_ms, processed_at_ms, created_at_ms, updated_at_ms
+                   FROM jobs_provider_messages
+                  WHERE account_id = $1 AND connection_id = $2 AND id = $3",
+                &[&account_id, &connection_id, &message_id],
+            )?
+            .map(|row| {
+                provider_message_from_parts((
+                    row.get(0), row.get(1), row.get(2), row.get(3), row.get(4),
+                    row.get(5), row.get(6), row.get(7), row.get(8), row.get(9),
+                ))
+            })
+            .transpose(),
     })
 }
 
@@ -1127,11 +1500,8 @@ pub fn update_provider_message_processing(
             message.processing_status = processing_status.clone();
             message.classification = classification.clone();
             message.confidence = confidence.clamp(0.0, 1.0);
-            message.metadata = if metadata.is_null() {
-                json!({})
-            } else {
-                metadata.clone()
-            };
+            message.metadata =
+                merge_provider_processing_metadata(&message.metadata, &metadata)?;
             message.processed_at_ms = if message.processing_status == "received" {
                 None
             } else {
@@ -1188,11 +1558,8 @@ pub fn update_provider_message_processing(
             message.processing_status = processing_status;
             message.classification = classification;
             message.confidence = confidence.clamp(0.0, 1.0);
-            message.metadata = if metadata.is_null() {
-                json!({})
-            } else {
-                metadata
-            };
+            message.metadata =
+                merge_provider_processing_metadata(&message.metadata, &metadata)?;
             message.processed_at_ms = if message.processing_status == "received" {
                 None
             } else {
@@ -1219,4 +1586,36 @@ pub fn update_provider_message_processing(
             Ok(Some(message))
         }
     })
+}
+
+fn merge_provider_processing_metadata(existing: &Value, processing: &Value) -> Result<Value> {
+    const PROVIDER_AUTHORITY_KEYS: [&str; 5] = [
+        "provider_id",
+        "thread_id",
+        "conversation_id",
+        "rfc_message_id",
+        "reply_target",
+    ];
+    let mut merged = if existing.is_null() {
+        serde_json::Map::new()
+    } else {
+        existing
+            .as_object()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("provider message metadata is invalid"))?
+    };
+    let processing = if processing.is_null() {
+        return Ok(Value::Object(merged));
+    } else {
+        processing
+            .as_object()
+            .ok_or_else(|| anyhow::anyhow!("provider processing metadata is invalid"))?
+    };
+    for (key, value) in processing {
+        if PROVIDER_AUTHORITY_KEYS.contains(&key.as_str()) {
+            anyhow::bail!("provider processing metadata cannot replace provider authority")
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    Ok(Value::Object(merged))
 }

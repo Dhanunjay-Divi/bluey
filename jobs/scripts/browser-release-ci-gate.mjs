@@ -107,11 +107,48 @@ const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const PRIMARY_PACKAGE = /\.(?:dmg|zip|exe|AppImage)$/;
 const MAX_SAFE_GENERATION = 9_007_199_254_740_991;
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
+// Reserve room beneath GitHub's total 65,535-character dispatch payload limit.
+const MAX_PROMOTION_AUTHORITY_INPUT_BYTES = 48 * 1024;
 const MAX_TRANSCRIPT_BYTES = 1024 * 1024;
 const MAX_INVENTORY_ENTRIES = 40_000;
 const MAX_ASAR_ENTRIES = 40_000;
 const MAX_ASAR_REQUIRED_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_AUTOMATION_BUNDLE_BYTES = 128 * 1024 * 1024;
+const MAX_WORKFLOW_DISPATCH_INPUTS = 25;
+const PROMOTION_AUTHORITY_INPUT_KEYS = Object.freeze([
+  "activationBase64",
+  "activationSha256",
+  "activationSignatureSetBase64",
+  "activationSignatureSetSha256",
+  "canaryEvidenceBase64",
+]);
+const WORKFLOW_DISPATCH_INPUT_NAMES = Object.freeze([
+  "operation",
+  "source_commit",
+  "release_id",
+  "build_id",
+  "build_signing_key_id",
+  "protocol_version",
+  "build_issued_at_ms",
+  "manifest_id",
+  "manifest_generation",
+  "release_sequence",
+  "published_at_ms",
+  "release_notes_url",
+  "artifact_base_url",
+  "candidate_run_id",
+  "candidate_artifact_name",
+  "candidate_source_commit",
+  "candidate_release_id",
+  "candidate_manifest_sha256",
+  "candidate_trust_policy_sha256",
+  "manifest_signature_set_base64",
+  "manifest_signature_set_sha256",
+  "authorized_run_id",
+  "authorized_artifact_name",
+  "promotion_authority_json",
+  "require_production_ready",
+]);
 const REQUIRED_ASAR_FILES = Object.freeze([
   "dist/app-lifecycle.js",
   "dist/main.js",
@@ -1784,6 +1821,76 @@ export async function validatePromotionSet({
   });
 }
 
+export async function materializePromotionAuthorityInput(input, outputDirectory) {
+  requireBoundedString(
+    input,
+    2,
+    MAX_PROMOTION_AUTHORITY_INPUT_BYTES,
+    "Invalid Browser promotion authority input",
+  );
+  let value;
+  try {
+    value = JSON.parse(input);
+  } catch {
+    throw new BrowserReleaseGateError("Invalid Browser promotion authority input");
+  }
+  if (JSON.stringify(value) !== input) {
+    throw new BrowserReleaseGateError("Invalid Browser promotion authority input");
+  }
+  try {
+    requireExactKeys(value, PROMOTION_AUTHORITY_INPUT_KEYS);
+  } catch {
+    throw new BrowserReleaseGateError("Invalid Browser promotion authority input");
+  }
+  const activation = decodeAuthorityJsonBase64(
+    value.activationBase64,
+    parseActivation,
+    16 * 1024,
+    "Invalid canonical Browser activation input",
+  );
+  const activationSignatureSet = decodeAuthorityJsonBase64(
+    value.activationSignatureSetBase64,
+    parseSignatureSet,
+    32 * 1024,
+    "Invalid canonical Browser activation signature input",
+  );
+  const canaryEvidence = decodeAuthorityJsonBase64(
+    value.canaryEvidenceBase64,
+    parseCanaryEvidence,
+    MAX_JSON_BYTES,
+    "Invalid canonical Browser canary input",
+  );
+  requirePattern(value.activationSha256, HEX_64, "Invalid Browser activation digest");
+  requirePattern(
+    value.activationSignatureSetSha256,
+    HEX_64,
+    "Invalid Browser activation signature digest",
+  );
+  if (
+    sha256(activation) !== value.activationSha256 ||
+    sha256(activationSignatureSet) !== value.activationSignatureSetSha256
+  ) {
+    throw new BrowserReleaseGateError("Browser promotion authority digest mismatch");
+  }
+  const root = resolve(outputDirectory);
+  await mkdirExclusive(root);
+  const activationFile = join(root, "release-activation.json");
+  const activationSignatureSetFile = join(root, "release-activation-signatures.json");
+  const canaryEvidenceFile = join(root, "canary-evidence.json");
+  await Promise.all([
+    writeExclusive(activationFile, activation),
+    writeExclusive(activationSignatureSetFile, activationSignatureSet),
+    writeExclusive(canaryEvidenceFile, canaryEvidence),
+  ]);
+  return Object.freeze({
+    activationFile,
+    activationSha256: value.activationSha256,
+    activationSignatureSetFile,
+    activationSignatureSetSha256: value.activationSignatureSetSha256,
+    canaryEvidenceFile,
+  });
+}
+
 export function validateWorkflowContract(workflowSource) {
   if (
     typeof workflowSource !== "string" ||
@@ -1792,6 +1899,27 @@ export function validateWorkflowContract(workflowSource) {
     workflowSource.includes("\0")
   ) {
     throw new BrowserReleaseGateError("Invalid Browser release workflow");
+  }
+  const dispatchInputsBlock = workflowSource.match(
+    /^  workflow_dispatch:\n    inputs:\n([\s\S]*?)(?=^[^\s])/m,
+  )?.[1];
+  const directDispatchRows = dispatchInputsBlock?.match(
+    /^      (?![ #\r\n])\S.*$/gm,
+  ) ?? [];
+  const dispatchInputNames = dispatchInputsBlock
+    ? [...dispatchInputsBlock.matchAll(/^      ([a-z][a-z0-9_]*):\s*$/gm)].map(
+        (match) => match[1],
+      )
+    : [];
+  const expectedDispatchInputs = [...WORKFLOW_DISPATCH_INPUT_NAMES].sort();
+  if (
+    directDispatchRows.length !== dispatchInputNames.length ||
+    dispatchInputNames.length > MAX_WORKFLOW_DISPATCH_INPUTS ||
+    [...dispatchInputNames].sort().join("\n") !== expectedDispatchInputs.join("\n")
+  ) {
+    throw new BrowserReleaseGateError(
+      `The Browser release workflow must define the exact approved inputs within the ${MAX_WORKFLOW_DISPATCH_INPUTS}-input dispatch limit`,
+    );
   }
   for (const fragment of [
     "name: Bluey Browser Release Authority Gate",
@@ -1877,8 +2005,8 @@ export function validateWorkflowContract(workflowSource) {
     "BLUEY_BROWSER_RELEASE_TRUST_POLICY_BASE64",
     "BLUEY_BROWSER_RELEASE_TRUST_POLICY_SHA256",
     "MANIFEST_SIGNATURE_SET_BASE64: ${{ inputs.manifest_signature_set_base64 }}",
-    "ACTIVATION_SIGNATURE_SET_BASE64: ${{ inputs.activation_signature_set_base64 }}",
-    "CANARY_EVIDENCE_BASE64: ${{ inputs.canary_evidence_base64 }}",
+    "BLUEY_BROWSER_PROMOTION_AUTHORITY_JSON: ${{ inputs.promotion_authority_json }}",
+    "browser-release-ci-gate.mjs materialize-promotion-input",
     "process.stdout.write(String(Date.now()))",
     "github.ref_name == github.event.repository.default_branch",
     "ref: ${{ github.workflow_sha }}",
@@ -3674,6 +3802,30 @@ async function readCanonicalJsonBytes(path) {
   return Object.freeze({ bytes, value });
 }
 
+function decodeAuthorityJsonBase64(value, parser, maximum, message) {
+  requireBoundedString(value, 4, MAX_PROMOTION_AUTHORITY_INPUT_BYTES, message);
+  const bytes = Buffer.from(value, "base64");
+  if (bytes.length < 2 || bytes.length > maximum || bytes.toString("base64") !== value) {
+    throw new BrowserReleaseGateError(message);
+  }
+  let input;
+  try {
+    input = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new BrowserReleaseGateError(message);
+  }
+  let parsed;
+  try {
+    parsed = parser(input);
+  } catch {
+    throw new BrowserReleaseGateError(message);
+  }
+  if (!authorityJsonBytes(parsed).equals(bytes)) {
+    throw new BrowserReleaseGateError(message);
+  }
+  return bytes;
+}
+
 async function readBoundedFile(path, maximum, message) {
   const info = await requireFile(path);
   if (info.size < 1 || info.size > maximum) throw new BrowserReleaseGateError(message);
@@ -4077,6 +4229,23 @@ function promotionExpectedOptions(options) {
 async function main(argv = process.argv.slice(2)) {
   const [command, ...rest] = argv;
   const options = parseArguments(rest);
+  if (command === "materialize-promotion-input") {
+    assertOnlyOptions(options, ["out"]);
+    const materialized = await materializePromotionAuthorityInput(
+      process.env.BLUEY_BROWSER_PROMOTION_AUTHORITY_JSON,
+      requiredOption(options, "out"),
+    );
+    console.log(`ACTIVATION_FILE=${materialized.activationFile}`);
+    console.log(`ACTIVATION_SHA256=${materialized.activationSha256}`);
+    console.log(
+      `ACTIVATION_SIGNATURE_SET_FILE=${materialized.activationSignatureSetFile}`,
+    );
+    console.log(
+      `ACTIVATION_SIGNATURE_SET_SHA256=${materialized.activationSignatureSetSha256}`,
+    );
+    console.log(`CANARY_EVIDENCE_FILE=${materialized.canaryEvidenceFile}`);
+    return;
+  }
   if (command === "credentials") {
     assertOnlyOptions(options, ["target"]);
     requireWorkflowCredentials(requiredOption(options, "target"));

@@ -129,6 +129,7 @@ jobs:
           npm test --prefix jobs
           npm run typecheck --prefix jobs
           npm run build --prefix jobs
+          git diff --exit-code -- web/jobs
 
       - name: Build and smoke the managed runner image
         run: |

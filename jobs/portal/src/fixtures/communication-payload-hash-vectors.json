@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "vectors": [
+    {
+      "name": "unicode_reply_with_escaped_newline",
+      "kind": "reply",
+      "payload": {
+        "to": "recruiter@example.org",
+        "subject": "Re: Développeur – étape 2",
+        "body_text": "Thanks, José 👋\nTuesday at 14:30 works."
+      },
+      "canonical_json": "{\"body_text\":\"Thanks, José 👋\\nTuesday at 14:30 works.\",\"subject\":\"Re: Développeur – étape 2\",\"to\":\"recruiter@example.org\"}",
+      "sha256": "08481a5918c08524437851d9a0048dcb64a3097181a52b29d97694bff244c49a"
+    },
+    {
+      "name": "unicode_calendar_with_array_and_safe_integers",
+      "kind": "calendar",
+      "payload": {
+        "title": "Entretien – 東京",
+        "starts_at_ms": 2000000000123,
+        "ends_at_ms": 2000003600123,
+        "time_zone": "Europe/Paris",
+        "attendees": [
+          "zoe@example.org",
+          "li@example.cn"
+        ]
+      },
+      "canonical_json": "{\"attendees\":[\"zoe@example.org\",\"li@example.cn\"],\"ends_at_ms\":2000003600123,\"starts_at_ms\":2000000000123,\"time_zone\":\"Europe/Paris\",\"title\":\"Entretien – 東京\"}",
+      "sha256": "9468b1b8a1cff2d325b487f31296d7e4823760d087a51fd4d0f92dfeb7cc78bd"
+    }
+  ]
+}

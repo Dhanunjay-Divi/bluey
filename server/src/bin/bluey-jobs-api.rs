@@ -4,7 +4,7 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_global_archive, jobs_mailbox_sync,
+    db, jobs_communication_dispatch, jobs_global_archive, jobs_mailbox_sync,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
@@ -64,6 +64,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
     let mailbox_sync_worker = jobs_mailbox_sync::spawn_mailbox_sync_worker(pool.clone());
+    let communication_workers =
+        jobs_communication_dispatch::spawn_communication_workers(pool.clone());
     let global_archive_worker = jobs_global_archive::spawn_global_candidate_archive_worker(
         pool.clone(),
         archive_storage_config,
@@ -77,21 +79,23 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(%addr, "bluey-jobs-api listening");
 
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .with_graceful_shutdown(shutdown_signal())
     .await
-    .context("serve Bluey Jobs API")?;
+    .context("serve Bluey Jobs API");
     if let Some(worker) = mailbox_sync_worker {
         worker.abort();
     }
+    communication_workers.abort();
     if let Some(worker) = global_archive_worker {
         worker.abort();
     }
     spend_truth_janitor.abort();
     usage_reservation_janitor.abort();
+    serve_result?;
     Ok(())
 }
 

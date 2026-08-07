@@ -894,6 +894,16 @@ pub async fn delete_account(
             );
             return Err(axum::http::StatusCode::CONFLICT);
         }
+        Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+            active_actions,
+        }) => {
+            tracing::info!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                active_actions,
+                "account deletion is waiting for an irreversible communication outcome"
+            );
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
         None => return Err(axum::http::StatusCode::NOT_FOUND),
     };
 
@@ -1102,6 +1112,16 @@ pub async fn delete_account(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 active_submissions,
                 "irreversible submission appeared after account deletion was fenced"
+            );
+            return Err(axum::http::StatusCode::CONFLICT);
+        }
+        Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+            active_actions,
+        }) => {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                active_actions,
+                "irreversible communication appeared after account deletion was fenced"
             );
             return Err(axum::http::StatusCode::CONFLICT);
         }

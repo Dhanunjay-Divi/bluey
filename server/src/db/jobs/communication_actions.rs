@@ -2,6 +2,116 @@ const COMMUNICATION_ACTION_PAYLOAD_MAX_BYTES: usize = 64 * 1024;
 const COMMUNICATION_ACTION_LIST_MAX: usize = 100;
 const COMMUNICATION_ACTION_LEASE_MS: i64 = 60 * 1_000;
 const COMMUNICATION_ACTION_MAX_ATTEMPTS: i64 = 5;
+pub(crate) const COMMUNICATION_ACTION_REVISION_MAX: i64 = 9_007_199_254_740_991;
+const COMMUNICATION_ACTION_REVISION_LIFECYCLE_HEADROOM: i64 = 48;
+const COMMUNICATION_RECONCILIATION_ABSENCE_THRESHOLD: i64 = 3;
+const COMMUNICATION_RECONCILIATION_ABSENCE_MIN_AGE_MS: i64 = 15 * 60 * 1_000;
+
+pub(crate) fn communication_review_text_is_safe(value: &str) -> bool {
+    value.chars().all(|character| {
+        !matches!(
+            get_general_category(character),
+            GeneralCategory::Control
+                | GeneralCategory::Format
+                | GeneralCategory::Surrogate
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator
+        )
+    })
+}
+
+pub(crate) fn communication_body_text_is_safe(value: &str) -> bool {
+    value.chars().all(|character| match get_general_category(character) {
+        GeneralCategory::Control => matches!(character, '\t' | '\n' | '\r'),
+        GeneralCategory::Format => matches!(character, '\u{200c}' | '\u{200d}'),
+        GeneralCategory::Surrogate
+        | GeneralCategory::LineSeparator
+        | GeneralCategory::ParagraphSeparator => false,
+        _ => true,
+    })
+}
+
+fn exact_lowercase_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn communication_flag_enabled(name: &str) -> bool {
+    std::env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn require_communication_write_unfenced_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    connection_id: &str,
+) -> Result<()> {
+    let fenced: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM jobs_communication_write_fences
+             WHERE account_id = ?1 AND connection_id IN ('', ?2)
+         )",
+        params![account_id, connection_id],
+        |row| row.get(0),
+    )?;
+    if fenced {
+        anyhow::bail!("communication writes are draining")
+    }
+    Ok(())
+}
+
+fn require_communication_write_unfenced_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    connection_id: &str,
+) -> Result<()> {
+    let fenced: bool = tx
+        .query_one(
+            "SELECT EXISTS(
+                SELECT 1 FROM jobs_communication_write_fences
+                 WHERE account_id = $1 AND connection_id IN ('', $2)
+             )",
+            &[&account_id, &connection_id],
+        )?
+        .get(0);
+    if fenced {
+        anyhow::bail!("communication writes are draining")
+    }
+    Ok(())
+}
+
+fn communication_write_is_fenced(
+    pool: &DbPool,
+    account_id: &str,
+    connection_id: &str,
+) -> Result<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => pool.get()?.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM jobs_communication_write_fences
+                 WHERE account_id = ?1 AND connection_id IN ('', ?2)
+             )",
+            params![account_id, connection_id],
+            |row| row.get(0),
+        ).map_err(Into::into),
+        DbPool::Postgres(_) => Ok(pool
+            .get_pg()?
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM jobs_communication_write_fences
+                     WHERE account_id = $1 AND connection_id IN ('', $2)
+                 )",
+                &[&account_id, &connection_id],
+            )?
+            .get(0)),
+    })
+}
 
 type CommunicationActionRow = (
     String,
@@ -14,16 +124,37 @@ type CommunicationActionRow = (
     String,
     String,
     String,
+    String,
     Option<String>,
     Option<String>,
+    Option<String>,
     i64,
+    Option<i64>,
+    Option<String>,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    i64,
+    String,
+    Option<i64>,
     Option<i64>,
     i64,
     i64,
-    Option<i64>,
-    Option<i64>,
     i64,
+);
+
+type CommunicationReconciliationCandidateRow = (
+    String,
+    String,
+    String,
     i64,
+    String,
+    i64,
+    String,
+    i64,
+    String,
 );
 
 fn canonical_communication_value(value: &Value) -> Value {
@@ -46,9 +177,34 @@ fn canonical_communication_value(value: &Value) -> Value {
 }
 
 fn communication_payload_sha256(payload: &Value) -> Result<String> {
-    let encoded = serde_json::to_vec(payload).context("serialize communication action payload")?;
+    let encoded = serde_json::to_vec(&canonical_communication_value(payload))
+        .context("serialize communication action payload")?;
     if encoded.len() > COMMUNICATION_ACTION_PAYLOAD_MAX_BYTES {
         anyhow::bail!("communication action payload is too large")
+    }
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn communication_authority_sha256(account_id: &str, action: &JobsCommunicationAction) -> Result<String> {
+    let authority = serde_json::json!({
+        "account_id": account_id,
+        "application_id": action.application_id,
+        "connection_id": action.connection_id,
+        "source_message_id": action.source_message_id,
+        "kind": action.kind,
+        "provider": action.provider,
+        "payload": action.payload,
+    });
+    let encoded = serde_json::to_vec(&canonical_communication_value(&authority))
+        .context("serialize communication action authority")?;
+    Ok(hex::encode(Sha256::digest(encoded)))
+}
+
+fn communication_evidence_sha256(evidence: &Value) -> Result<String> {
+    let encoded = serde_json::to_vec(&canonical_communication_value(evidence))
+        .context("serialize communication evidence")?;
+    if encoded.len() > COMMUNICATION_ACTION_PAYLOAD_MAX_BYTES {
+        anyhow::bail!("communication action evidence is too large")
     }
     Ok(hex::encode(Sha256::digest(encoded)))
 }
@@ -72,6 +228,80 @@ fn normalize_communication_provider(value: &str) -> Result<String> {
     Ok(value)
 }
 
+fn validate_communication_kind_provider(kind: &str, provider: &str) -> Result<()> {
+    let valid = matches!(
+        (kind, provider),
+        ("reply", "gmail")
+            | ("reply", "outlook_email")
+            | ("calendar", "google_calendar")
+            | ("calendar", "outlook_calendar")
+    );
+    if !valid {
+        anyhow::bail!("communication action kind and provider do not match")
+    }
+    Ok(())
+}
+
+fn communication_required_grant(provider: &str) -> Result<(&'static str, &'static str)> {
+    match provider {
+        "gmail" => Ok((
+            "recruiter_reply",
+            "https://www.googleapis.com/auth/gmail.send",
+        )),
+        "google_calendar" => Ok((
+            "interview_calendar",
+            "https://www.googleapis.com/auth/calendar.events",
+        )),
+        "outlook_email" => Ok(("recruiter_reply", "Mail.Send")),
+        "outlook_calendar" => Ok(("interview_calendar", "Calendars.ReadWrite")),
+        _ => anyhow::bail!("invalid communication action provider"),
+    }
+}
+
+pub fn communication_grant_sha256(credential: &JobsProviderCredential) -> Result<String> {
+    let mut scopes = credential.scopes.clone();
+    scopes.sort();
+    scopes.dedup();
+    let mut capabilities = credential.capabilities.clone();
+    capabilities.sort();
+    capabilities.dedup();
+    let value = serde_json::json!({
+        "connection_id": credential.connection_id,
+        "provider": credential.provider,
+        "provider_subject": credential.provider_subject,
+        "grant_revision": credential.grant_revision,
+        "scopes": scopes,
+        "capabilities": capabilities,
+    });
+    let bytes = serde_json::to_vec(&canonical_communication_value(&value))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn validate_communication_grant(
+    action_provider: &str,
+    mailbox: &MailboxConnection,
+    credential: &JobsProviderCredential,
+) -> Result<(i64, String)> {
+    let connection_provider = communication_connection_provider(action_provider);
+    let (capability, scope) = communication_required_grant(action_provider)?;
+    if mailbox.status != "connected"
+        || mailbox.provider != connection_provider
+        || credential.connection_id != mailbox.id
+        || credential.provider != connection_provider
+        || credential.grant_revision <= 0
+        || !mailbox.capabilities.iter().any(|value| value == capability)
+        || !credential.capabilities.iter().any(|value| value == capability)
+        || !credential.scopes.iter().any(|value| value == scope)
+    {
+        anyhow::bail!("communication action needs an exact provider write grant")
+    }
+    let computed = communication_grant_sha256(credential)?;
+    if credential.grant_sha256.len() != 64 || credential.grant_sha256 != computed {
+        anyhow::bail!("communication provider grant digest is invalid")
+    }
+    Ok((credential.grant_revision, computed))
+}
+
 fn communication_connection_provider(provider: &str) -> &str {
     match provider {
         "google_calendar" => "gmail",
@@ -84,26 +314,181 @@ fn communication_payload_text<'a>(payload: &'a Value, key: &str) -> Result<&'a s
     payload
         .get(key)
         .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("communication action payload is missing {key}"))
 }
 
-fn validate_communication_payload(kind: &str, payload: &Value) -> Result<()> {
-    if !payload.is_object() {
-        anyhow::bail!("communication action payload must be an object")
+fn normalize_communication_email(value: &str) -> Result<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 320
+        || !communication_review_text_is_safe(&normalized)
+        || normalized
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        anyhow::bail!("communication action email address is invalid")
     }
+    let mut pieces = normalized.split('@');
+    let local = pieces.next().unwrap_or_default();
+    let domain = pieces.next().unwrap_or_default();
+    if local.is_empty()
+        || domain.is_empty()
+        || pieces.next().is_some()
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+        || domain.contains("..")
+        || !domain.contains('.')
+    {
+        anyhow::bail!("communication action email address is invalid")
+    }
+    Ok(normalized)
+}
+
+fn normalize_communication_payload_emails(kind: &str, payload: &mut Value) -> Result<()> {
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("communication action payload must be an object"))?;
     match kind {
         "reply" => {
-            normalize_application_email(communication_payload_text(payload, "to")?)?;
+            if let Some(to) = object.get("to").and_then(Value::as_str) {
+                object.insert(
+                    "to".to_string(),
+                    Value::String(normalize_communication_email(to)?),
+                );
+            }
+        }
+        "calendar" => {
+            if let Some(attendees) = object.get_mut("attendees").and_then(Value::as_array_mut) {
+                for attendee in attendees {
+                    let value = attendee.as_str().unwrap_or_default();
+                    *attendee = Value::String(normalize_communication_email(value)?);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn communication_source_metadata_text<'a>(
+    message: &'a JobsProviderMessage,
+    key: &str,
+) -> Option<&'a str> {
+    message
+        .metadata
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 2_048
+                && *value == value.trim()
+                && communication_review_text_is_safe(value)
+        })
+}
+
+pub(crate) fn communication_source_reply_target(
+    action_provider: &str,
+    message: &JobsProviderMessage,
+) -> Result<String> {
+    match action_provider {
+        "gmail" | "outlook_email" => {
+            let target = communication_source_metadata_text(message, "reply_target")
+                .ok_or_else(|| anyhow::anyhow!("communication reply target is unavailable"))?;
+            let normalized = normalize_communication_email(target)?;
+            if normalized != target {
+                anyhow::bail!("communication reply target is not canonical")
+            }
+            Ok(normalized)
+        }
+        _ => anyhow::bail!("communication reply provider is invalid"),
+    }
+}
+
+pub(crate) fn validate_communication_reply_source(
+    action: &JobsCommunicationAction,
+    message: &JobsProviderMessage,
+) -> Result<()> {
+    if action.kind != "reply" {
+        return Ok(());
+    }
+    let expected_provider = communication_connection_provider(&action.provider);
+    if message.provider != expected_provider
+        || message.connection_id != action.connection_id
+        || message.application_id.as_deref() != Some(action.application_id.as_str())
+    {
+        anyhow::bail!("communication reply source provider does not match its authority")
+    }
+    let recipient =
+        normalize_communication_email(communication_payload_text(&action.payload, "to")?)?;
+    let reply_target = communication_source_reply_target(&action.provider, message)?;
+    if recipient != reply_target {
+        anyhow::bail!("communication reply recipient does not match the source reply target")
+    }
+    match action.provider.as_str() {
+        "gmail" if communication_source_metadata_text(message, "thread_id").is_some() => {}
+        "outlook_email"
+            if communication_source_metadata_text(message, "provider_id").is_some()
+                && communication_source_metadata_text(message, "conversation_id").is_some()
+                && (communication_source_metadata_text(message, "rfc_message_id").is_some()
+                    || (message.external_id.starts_with('<')
+                        && message.external_id.ends_with('>')
+                        && message.external_id.len() <= 998
+                        && !message
+                            .external_id
+                            .bytes()
+                            .any(|byte| byte.is_ascii_control()))) =>
+        {
+        }
+        _ => anyhow::bail!("communication reply source metadata is incomplete"),
+    }
+    Ok(())
+}
+
+fn validate_communication_payload(kind: &str, payload: &Value) -> Result<()> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("communication action payload must be an object"))?;
+    match kind {
+        "reply" => {
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "to" | "subject" | "body_text"))
+            {
+                anyhow::bail!("communication reply payload has unsupported fields")
+            }
+            let to = communication_payload_text(payload, "to")?;
+            if normalize_communication_email(to)? != to {
+                anyhow::bail!("communication reply recipient is not canonical")
+            }
             let subject = communication_payload_text(payload, "subject")?;
             let body = communication_payload_text(payload, "body_text")?;
-            if subject.len() > 998 || body.len() > 32_000 {
+            if subject.len() > 998
+                || subject != subject.trim()
+                || !communication_review_text_is_safe(subject)
+                || body.len() > 32_000
+                || !communication_body_text_is_safe(body)
+            {
                 anyhow::bail!("communication reply content is too long")
             }
         }
         "calendar" => {
+            if object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "title" | "starts_at_ms" | "ends_at_ms" | "attendees" | "time_zone"
+                )
+            }) {
+                anyhow::bail!("calendar action payload has unsupported fields")
+            }
             let title = communication_payload_text(payload, "title")?;
+            let time_zone = communication_payload_text(payload, "time_zone")?;
+            let _: chrono_tz::Tz = time_zone
+                .parse()
+                .map_err(|_| anyhow::anyhow!("calendar action needs a valid IANA time zone"))?;
             let starts_at_ms = payload
                 .get("starts_at_ms")
                 .and_then(Value::as_i64)
@@ -114,19 +499,36 @@ fn validate_communication_payload(kind: &str, payload: &Value) -> Result<()> {
                 .and_then(Value::as_i64)
                 .filter(|value| *value > starts_at_ms)
                 .ok_or_else(|| anyhow::anyhow!("calendar action needs a valid end time"))?;
-            if title.len() > 512 || ends_at_ms.saturating_sub(starts_at_ms) > 24 * 60 * 60 * 1_000
+            if chrono::DateTime::<chrono::Utc>::from_timestamp_millis(starts_at_ms).is_none()
+                || chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ends_at_ms).is_none()
+            {
+                anyhow::bail!("calendar action time is outside the supported range")
+            }
+            if title.len() > 512
+                || title != title.trim()
+                || !communication_review_text_is_safe(title)
+                || time_zone.len() > 64
+                || time_zone != time_zone.trim()
+                || time_zone.bytes().any(|byte| byte.is_ascii_control())
+                || ends_at_ms.saturating_sub(starts_at_ms) > 24 * 60 * 60 * 1_000
             {
                 anyhow::bail!("calendar action duration or title is invalid")
             }
-            if let Some(attendees) = payload.get("attendees") {
-                let attendees = attendees
-                    .as_array()
-                    .ok_or_else(|| anyhow::anyhow!("calendar attendees must be a list"))?;
-                if attendees.len() > 25 {
-                    anyhow::bail!("calendar action has too many attendees")
+            let attendees = payload
+                .get("attendees")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("calendar attendees must be a list"))?;
+            if attendees.len() > 25 {
+                anyhow::bail!("calendar action has too many attendees")
+            }
+            let mut unique_attendees = BTreeSet::new();
+            for attendee in attendees {
+                let attendee = attendee.as_str().unwrap_or_default();
+                if normalize_communication_email(attendee)? != attendee {
+                    anyhow::bail!("calendar attendee is not canonical")
                 }
-                for attendee in attendees {
-                    normalize_application_email(attendee.as_str().unwrap_or_default())?;
+                if !unique_attendees.insert(attendee) {
+                    anyhow::bail!("calendar action has duplicate attendees")
                 }
             }
         }
@@ -136,7 +538,7 @@ fn validate_communication_payload(kind: &str, payload: &Value) -> Result<()> {
 }
 
 fn communication_action_from_row(row: CommunicationActionRow) -> Result<JobsCommunicationAction> {
-    let mut action: JobsCommunicationAction = parse_json(row.9, "Jobs communication action")?;
+    let mut action: JobsCommunicationAction = parse_json(row.10, "Jobs communication action")?;
     action.id = row.0;
     action.application_id = row.1;
     action.connection_id = row.2;
@@ -145,16 +547,25 @@ fn communication_action_from_row(row: CommunicationActionRow) -> Result<JobsComm
     action.provider = row.5;
     action.idempotency_key = row.6;
     action.payload_sha256 = row.7;
-    action.status = row.8;
-    action.provider_object_id = row.10.unwrap_or_default();
-    action.lease_owner = row.11;
-    action.lease_expires_at_ms = row.13;
-    action.next_attempt_at_ms = row.14;
-    action.attempt_count = row.15;
-    action.approved_at_ms = row.16;
-    action.dispatched_at_ms = row.17;
-    action.created_at_ms = row.18;
-    action.updated_at_ms = row.19;
+    action.authority_sha256 = row.8;
+    action.status = row.9;
+    action.provider_object_id = row.11.unwrap_or_default();
+    action.lease_owner = row.12;
+    action.lease_kind = row.13;
+    action.lease_expires_at_ms = row.15;
+    action.active_attempt_id = row.16;
+    action.next_attempt_at_ms = row.17;
+    action.attempt_count = row.18;
+    action.reconciliation_count = row.19;
+    action.approval_revision = row.20;
+    action.approved_authority_sha256 = row.21;
+    action.approved_grant_revision = row.22;
+    action.approved_grant_sha256 = row.23;
+    action.approved_at_ms = row.24;
+    action.dispatched_at_ms = row.25;
+    action.created_at_ms = row.26;
+    action.updated_at_ms = row.27;
+    action.action_revision = row.28;
     Ok(action)
 }
 
@@ -180,6 +591,15 @@ fn sqlite_communication_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Communi
         row.get(17)?,
         row.get(18)?,
         row.get(19)?,
+        row.get(20)?,
+        row.get(21)?,
+        row.get(22)?,
+        row.get(23)?,
+        row.get(24)?,
+        row.get(25)?,
+        row.get(26)?,
+        row.get(27)?,
+        row.get(28)?,
     ))
 }
 
@@ -205,14 +625,26 @@ fn postgres_communication_row(row: postgres::Row) -> CommunicationActionRow {
         row.get(17),
         row.get(18),
         row.get(19),
+        row.get(20),
+        row.get(21),
+        row.get(22),
+        row.get(23),
+        row.get(24),
+        row.get(25),
+        row.get(26),
+        row.get(27),
+        row.get(28),
     )
 }
 
 const COMMUNICATION_ACTION_SELECT: &str =
     "id, application_id, connection_id, source_message_id, kind, provider,
-     idempotency_key, payload_sha256, status, action_json, provider_object_id,
-     lease_owner, fence, lease_expires_at_ms, next_attempt_at_ms, attempt_count,
-     approved_at_ms, dispatched_at_ms, created_at_ms, updated_at_ms";
+     idempotency_key, payload_sha256, authority_sha256, status, action_json,
+     provider_object_id, lease_owner, lease_kind, fence, lease_expires_at_ms,
+     active_attempt_id, next_attempt_at_ms, attempt_count, reconciliation_count,
+     approval_revision, approved_authority_sha256, approved_grant_revision,
+     approved_grant_sha256, approved_at_ms, dispatched_at_ms, created_at_ms,
+     updated_at_ms, action_revision";
 
 pub fn communication_action(
     pool: &DbPool,
@@ -322,6 +754,263 @@ pub fn list_communication_actions(
     })
 }
 
+pub fn export_communication_actions(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<JobsCommunicationActionExport>> {
+    let actions: Vec<JobsCommunicationAction> = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {COMMUNICATION_ACTION_SELECT} FROM jobs_communication_actions
+                  WHERE account_id = ?1 ORDER BY created_at_ms, id"
+            ))?;
+            let rows = stmt.query_map(params![account_id], sqlite_communication_row)?;
+            rows
+                .map(|row| communication_action_from_row(row?))
+                .collect::<Result<Vec<_>>>()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT} FROM jobs_communication_actions
+                      WHERE account_id = $1 ORDER BY created_at_ms, id"
+                ),
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(postgres_communication_row)
+            .map(communication_action_from_row)
+            .collect(),
+    })?;
+    Ok(actions
+        .into_iter()
+        .map(|action| JobsCommunicationActionExport {
+            id: action.id,
+            application_id: action.application_id,
+            connection_id: action.connection_id,
+            source_message_id: action.source_message_id,
+            kind: action.kind,
+            provider: action.provider,
+            payload: action.payload,
+            status: action.status,
+            action_revision: action.action_revision,
+            approval_revision: action.approval_revision,
+            approved_at_ms: action.approved_at_ms,
+            dispatched_at_ms: action.dispatched_at_ms,
+            created_at_ms: action.created_at_ms,
+            updated_at_ms: action.updated_at_ms,
+        })
+        .collect())
+}
+
+pub fn export_communication_evidence(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<JobsCommunicationEvidenceExport>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT evidence.action_id, evidence.event_kind, evidence.recorded_at_ms
+                   FROM jobs_communication_action_attempt_evidence evidence
+                  WHERE evidence.account_id = ?1
+                  ORDER BY evidence.recorded_at_ms, evidence.id",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (action_id, event_kind, recorded) = row?;
+                Ok(JobsCommunicationEvidenceExport {
+                    action_id,
+                    event_kind,
+                    recorded_at_ms: recorded,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query(
+                "SELECT evidence.action_id, evidence.event_kind, evidence.recorded_at_ms
+                   FROM jobs_communication_action_attempt_evidence evidence
+                  WHERE evidence.account_id = $1
+                  ORDER BY evidence.recorded_at_ms, evidence.id",
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(|row| {
+                Ok(JobsCommunicationEvidenceExport {
+                    action_id: row.get(0),
+                    event_kind: row.get(1),
+                    recorded_at_ms: row.get(2),
+                })
+            })
+            .collect(),
+    })
+}
+
+pub fn export_communication_reconciliations(
+    pool: &DbPool,
+    account_id: &str,
+) -> Result<Vec<JobsCommunicationReconciliationExport>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            let mut stmt = conn.prepare(
+                "SELECT reconciliation.action_id, reconciliation.resolution,
+                        reconciliation.recorded_at_ms
+                   FROM jobs_communication_action_reconciliations reconciliation
+                  WHERE reconciliation.account_id = ?1
+                  ORDER BY reconciliation.recorded_at_ms, reconciliation.id",
+            )?;
+            let rows = stmt.query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            rows.map(|row| {
+                let (action_id, resolution, recorded) = row?;
+                Ok(JobsCommunicationReconciliationExport {
+                    action_id,
+                    resolution,
+                    recorded_at_ms: recorded,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+        }
+        DbPool::Postgres(_) => pool
+            .get_pg()?
+            .query(
+                "SELECT reconciliation.action_id, reconciliation.resolution,
+                        reconciliation.recorded_at_ms
+                   FROM jobs_communication_action_reconciliations reconciliation
+                  WHERE reconciliation.account_id = $1
+                  ORDER BY reconciliation.recorded_at_ms, reconciliation.id",
+                &[&account_id],
+            )?
+            .into_iter()
+            .map(|row| {
+                Ok(JobsCommunicationReconciliationExport {
+                    action_id: row.get(0),
+                    resolution: row.get(1),
+                    recorded_at_ms: row.get(2),
+                })
+            })
+            .collect(),
+    })
+}
+
+/// Returns server-authoritative launch readiness for the review UI. This never
+/// exposes provider credentials: callers receive only a boolean and a stable,
+/// user-actionable reason when execution is unavailable.
+pub fn communication_action_execution_readiness(
+    pool: &DbPool,
+    account_id: &str,
+    action: &JobsCommunicationAction,
+) -> Result<(bool, String)> {
+    let dispatch_enabled =
+        communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED");
+    if !dispatch_enabled {
+        return Ok((
+            false,
+            "Communication execution is not enabled on this server.".to_string(),
+        ));
+    }
+    if communication_write_is_fenced(pool, account_id, &action.connection_id)? {
+        return Ok((
+            false,
+            "Communication writes are draining for account or mailbox deletion.".to_string(),
+        ));
+    }
+    if !matches!(
+        action.status.as_str(),
+        "awaiting_approval" | "needs_input" | "approved"
+    ) {
+        return Ok((
+            false,
+            "This communication is not awaiting executable approval.".to_string(),
+        ));
+    }
+    if action.action_revision
+        > COMMUNICATION_ACTION_REVISION_MAX - COMMUNICATION_ACTION_REVISION_LIFECYCLE_HEADROOM
+        || action.updated_at_ms == i64::MAX
+    {
+        return Ok((
+            false,
+            "This draft exhausted its portable revision authority; cancel it and review a fresh draft."
+                .to_string(),
+        ));
+    }
+    if action.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS {
+        return Ok((
+            false,
+            "This draft reached its bounded provider-attempt limit; cancel it and review a fresh draft."
+                .to_string(),
+        ));
+    }
+    let authority_is_current = communication_authority_sha256(account_id, action)
+        .is_ok_and(|digest| digest == action.authority_sha256);
+    if validate_communication_kind_provider(&action.kind, &action.provider).is_err()
+        || validate_communication_payload(&action.kind, &action.payload).is_err()
+        || !authority_is_current
+    {
+        return Ok((
+            false,
+            "This communication draft no longer matches its approved authority.".to_string(),
+        ));
+    }
+    if validate_communication_relationships(pool, account_id, action).is_err() {
+        return Ok((
+            false,
+            "The application, mailbox, or source message is no longer available.".to_string(),
+        ));
+    }
+    let Some(mailbox) = mailbox_connection(pool, account_id, &action.connection_id)? else {
+        return Ok((
+            false,
+            "Reconnect this mailbox before approving communication.".to_string(),
+        ));
+    };
+    let Some(credential) = jobs_provider_credential(pool, account_id, &action.connection_id)? else {
+        return Ok((
+            false,
+            "Authorize the required provider write access before approving communication."
+                .to_string(),
+        ));
+    };
+    let Ok((grant_revision, grant_sha256)) =
+        validate_communication_grant(&action.provider, &mailbox, &credential)
+    else {
+        return Ok((
+            false,
+            "Reconnect this mailbox and authorize the required provider write access."
+                .to_string(),
+        ));
+    };
+    if action.status == "approved"
+        && (action.approval_revision <= 0
+            || action.approved_authority_sha256 != action.authority_sha256
+            || action.approved_grant_revision != grant_revision
+            || action.approved_grant_sha256 != grant_sha256)
+    {
+        return Ok((
+            false,
+            "The provider grant changed; cancel this approved draft, reconnect the mailbox, and review a fresh draft."
+                .to_string(),
+        ));
+    }
+    Ok((true, String::new()))
+}
+
 fn validate_communication_relationships(
     pool: &DbPool,
     account_id: &str,
@@ -338,13 +1027,13 @@ fn validate_communication_relationships(
         anyhow::bail!("communication action does not match a connected mailbox")
     }
     if let Some(message_id) = action.source_message_id.as_deref() {
-        let found = crate::db::run_blocking_db(|| -> Result<bool> {
+        let message = crate::db::run_blocking_db(|| -> Result<Option<JobsProviderMessage>> {
             match pool {
             DbPool::Sqlite(_) => {
                 let conn = pool.get()?;
-                let found = conn
+                let raw: Option<String> = conn
                     .query_row(
-                        "SELECT 1 FROM jobs_provider_messages
+                        "SELECT message_json FROM jobs_provider_messages
                           WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
                             AND application_id = ?4",
                         params![
@@ -353,17 +1042,17 @@ fn validate_communication_relationships(
                             message_id,
                             action.application_id,
                         ],
-                        |_| Ok(()),
+                        |row| row.get(0),
                     )
-                    .optional()?
-                    .is_some();
-                Ok(found)
+                    .optional()?;
+                raw.map(|value| parse_json(value, "Jobs provider message"))
+                    .transpose()
             }
             DbPool::Postgres(_) => {
                 let mut conn = pool.get_pg()?;
-                Ok(conn
+                conn
                     .query_opt(
-                        "SELECT 1 FROM jobs_provider_messages
+                        "SELECT message_json FROM jobs_provider_messages
                           WHERE account_id = $1 AND connection_id = $2 AND id = $3
                             AND application_id = $4",
                         &[
@@ -373,13 +1062,13 @@ fn validate_communication_relationships(
                             &action.application_id,
                         ],
                     )?
-                    .is_some())
+                    .map(|row| parse_json(row.get(0), "Jobs provider message"))
+                    .transpose()
             }
             }
         })?;
-        if !found {
-            anyhow::bail!("source mailbox message not found")
-        }
+        let message = message.ok_or_else(|| anyhow::anyhow!("source mailbox message not found"))?;
+        validate_communication_reply_source(action, &message)?;
     }
     Ok(())
 }
@@ -392,6 +1081,7 @@ pub fn create_communication_action(
     let mut value = action.clone();
     value.kind = normalize_communication_kind(&value.kind)?;
     value.provider = normalize_communication_provider(&value.provider)?;
+    validate_communication_kind_provider(&value.kind, &value.provider)?;
     value.source_message_id = value
         .source_message_id
         .as_deref()
@@ -400,6 +1090,9 @@ pub fn create_communication_action(
         .map(str::to_string);
     if value.kind == "reply" && value.source_message_id.is_none() {
         anyhow::bail!("communication replies require a source mailbox message")
+    }
+    if value.kind == "calendar" && value.source_message_id.is_some() {
+        anyhow::bail!("calendar actions cannot bind a source mailbox message")
     }
     value.idempotency_key = value.idempotency_key.trim().to_string();
     if value.application_id.trim().is_empty()
@@ -410,14 +1103,24 @@ pub fn create_communication_action(
     {
         anyhow::bail!("communication action is incomplete")
     }
+    normalize_communication_payload_emails(&value.kind, &mut value.payload)?;
     value.payload = canonical_communication_value(&value.payload);
     validate_communication_payload(&value.kind, &value.payload)?;
     value.payload_sha256 = communication_payload_sha256(&value.payload)?;
+    value.authority_sha256 = communication_authority_sha256(account_id, &value)?;
     value.status = "awaiting_approval".to_string();
     value.provider_object_id.clear();
     value.lease_owner = None;
+    value.lease_kind = None;
     value.lease_expires_at_ms = None;
+    value.active_attempt_id = None;
     value.attempt_count = 0;
+    value.reconciliation_count = 0;
+    value.action_revision = 1;
+    value.approval_revision = 0;
+    value.approved_authority_sha256.clear();
+    value.approved_grant_revision = 0;
+    value.approved_grant_sha256.clear();
     value.approved_at_ms = None;
     value.dispatched_at_ms = None;
     let now = now_ms();
@@ -436,12 +1139,59 @@ pub fn create_communication_action(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
+            )?;
+            require_communication_write_unfenced_sqlite_tx(
+                &tx,
+                account_id,
+                &value.connection_id,
+            )?;
+            validate_communication_kind_provider(&value.kind, &value.provider)?;
+            validate_communication_payload(&value.kind, &value.payload)?;
+            if communication_authority_sha256(account_id, &value)? != value.authority_sha256 {
+                anyhow::bail!("communication action authority changed before creation")
+            }
+            tx.query_row(
+                "SELECT 1 FROM jobs_applications WHERE account_id = ?1 AND id = ?2",
+                params![account_id, value.application_id],
+                |_| Ok(()),
+            )?;
+            tx.query_row(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = ?1 AND id = ?2 AND status = 'connected'
+                    AND provider = ?3",
+                params![
+                    account_id,
+                    value.connection_id,
+                    communication_connection_provider(&value.provider),
+                ],
+                |_| Ok(()),
+            )?;
+            if value.kind == "reply" {
+                let source_id = value
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_json: String = tx.query_row(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
+                        AND application_id = ?4",
+                    params![account_id, value.connection_id, source_id, value.application_id],
+                    |row| row.get(0),
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_json, "Jobs provider message")?;
+                validate_communication_reply_source(&value, &source)?;
+            }
             let inserted = tx.execute(
                 "INSERT INTO jobs_communication_actions (
                     id, account_id, application_id, connection_id, source_message_id,
-                    kind, provider, idempotency_key, payload_sha256, status, action_json,
-                    next_attempt_at_ms, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    kind, provider, idempotency_key, payload_sha256, authority_sha256,
+                    status, action_json,
+                    next_attempt_at_ms, created_at_ms, updated_at_ms, action_revision
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 1)
                  ON CONFLICT(account_id, idempotency_key) DO NOTHING",
                 params![
                     value.id,
@@ -453,6 +1203,7 @@ pub fn create_communication_action(
                     value.provider,
                     value.idempotency_key,
                     value.payload_sha256,
+                    value.authority_sha256,
                     value.status,
                     payload,
                     value.next_attempt_at_ms,
@@ -476,6 +1227,8 @@ pub fn create_communication_action(
                 || stored.connection_id != value.connection_id
                 || stored.kind != value.kind
                 || stored.provider != value.provider
+                || stored.source_message_id != value.source_message_id
+                || stored.authority_sha256 != value.authority_sha256
             {
                 anyhow::bail!("communication action idempotency key was reused")
             }
@@ -484,12 +1237,57 @@ pub fn create_communication_action(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
+            )?;
+            require_communication_write_unfenced_postgres_tx(
+                &mut tx,
+                account_id,
+                &value.connection_id,
+            )?;
+            validate_communication_kind_provider(&value.kind, &value.provider)?;
+            validate_communication_payload(&value.kind, &value.payload)?;
+            if communication_authority_sha256(account_id, &value)? != value.authority_sha256 {
+                anyhow::bail!("communication action authority changed before creation")
+            }
+            tx.query_one(
+                "SELECT 1 FROM jobs_applications
+                  WHERE account_id = $1 AND id = $2 FOR SHARE",
+                &[&account_id, &value.application_id],
+            )?;
+            tx.query_one(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 AND status = 'connected'
+                    AND provider = $3 FOR SHARE",
+                &[
+                    &account_id,
+                    &value.connection_id,
+                    &communication_connection_provider(&value.provider),
+                ],
+            )?;
+            if value.kind == "reply" {
+                let source_id = value
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_row = tx.query_one(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = $1 AND connection_id = $2 AND id = $3
+                        AND application_id = $4 FOR SHARE",
+                    &[&account_id, &value.connection_id, &source_id, &value.application_id],
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_row.get(0), "Jobs provider message")?;
+                validate_communication_reply_source(&value, &source)?;
+            }
             let inserted = tx.execute(
                 "INSERT INTO jobs_communication_actions (
                     id, account_id, application_id, connection_id, source_message_id,
-                    kind, provider, idempotency_key, payload_sha256, status, action_json,
-                    next_attempt_at_ms, created_at_ms, updated_at_ms
-                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+                    kind, provider, idempotency_key, payload_sha256, authority_sha256,
+                    status, action_json,
+                    next_attempt_at_ms, created_at_ms, updated_at_ms, action_revision
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 1)
                  ON CONFLICT(account_id, idempotency_key) DO NOTHING",
                 &[
                     &value.id,
@@ -501,6 +1299,7 @@ pub fn create_communication_action(
                     &value.provider,
                     &value.idempotency_key,
                     &value.payload_sha256,
+                    &value.authority_sha256,
                     &value.status,
                     &payload,
                     &value.next_attempt_at_ms,
@@ -523,6 +1322,8 @@ pub fn create_communication_action(
                 || stored.connection_id != value.connection_id
                 || stored.kind != value.kind
                 || stored.provider != value.provider
+                || stored.source_message_id != value.source_message_id
+                || stored.authority_sha256 != value.authority_sha256
             {
                 anyhow::bail!("communication action idempotency key was reused")
             }
@@ -531,30 +1332,58 @@ pub fn create_communication_action(
     })
 }
 
-fn transition_communication_action(
+pub fn approve_communication_action(
     pool: &DbPool,
     account_id: &str,
     action_id: &str,
-    approve: bool,
+    expected_action_revision: i64,
+    expected_payload_sha256: &str,
 ) -> Result<Option<JobsCommunicationAction>> {
+    if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+        anyhow::bail!("communication execution is not enabled")
+    }
+    let Some(action) = communication_action(pool, account_id, action_id)? else {
+        return Ok(None);
+    };
+    if !(1..=COMMUNICATION_ACTION_REVISION_MAX).contains(&expected_action_revision)
+        || !exact_lowercase_sha256(expected_payload_sha256)
+        || action.action_revision != expected_action_revision
+        || action.payload_sha256 != expected_payload_sha256
+    {
+        anyhow::bail!("communication action review snapshot changed")
+    }
+    if !matches!(
+        action.status.as_str(),
+        "awaiting_approval" | "needs_input"
+    ) || action.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS
+    {
+        anyhow::bail!("communication action cannot be approved in its current state")
+    }
+    if action.action_revision
+        > COMMUNICATION_ACTION_REVISION_MAX - COMMUNICATION_ACTION_REVISION_LIFECYCLE_HEADROOM
+        || action.updated_at_ms == i64::MAX
+    {
+        anyhow::bail!("communication action revision authority is exhausted")
+    }
+    let authority_sha256 = communication_authority_sha256(account_id, &action)?;
+    if action.authority_sha256 != authority_sha256 {
+        anyhow::bail!("communication action authority digest is invalid")
+    }
+    validate_communication_relationships(pool, account_id, &action)?;
     let now = now_ms();
+
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let (status, approved_at_ms) = if approve {
-                ("approved", Some(now))
-            } else {
-                ("cancelled", None)
-            };
-            conn.execute(
-                "UPDATE jobs_communication_actions
-                    SET status = ?3, approved_at_ms = COALESCE(?4, approved_at_ms),
-                        updated_at_ms = ?5
-                  WHERE account_id = ?1 AND id = ?2
-                    AND status IN ('awaiting_approval', 'needs_input')",
-                params![account_id, action_id, status, approved_at_ms, now],
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
             )?;
-            conn.query_row(
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+                anyhow::bail!("communication execution is not enabled")
+            }
+            let current_row = tx.query_row(
                 &format!(
                     "SELECT {COMMUNICATION_ACTION_SELECT}
                        FROM jobs_communication_actions
@@ -562,61 +1391,388 @@ fn transition_communication_action(
                 ),
                 params![account_id, action_id],
                 sqlite_communication_row,
-            )
-            .optional()?
-            .map(communication_action_from_row)
-            .transpose()
+            )?;
+            let current = communication_action_from_row(current_row)?;
+            require_communication_write_unfenced_sqlite_tx(
+                &tx,
+                account_id,
+                &current.connection_id,
+            )?;
+            if current.action_revision != expected_action_revision
+                || current.payload_sha256 != expected_payload_sha256
+            {
+                anyhow::bail!("communication action review snapshot changed")
+            }
+            if !matches!(current.status.as_str(), "awaiting_approval" | "needs_input")
+                || current.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS
+            {
+                anyhow::bail!("communication action cannot be approved in its current state")
+            }
+            if current.action_revision
+                > COMMUNICATION_ACTION_REVISION_MAX
+                    - COMMUNICATION_ACTION_REVISION_LIFECYCLE_HEADROOM
+                || current.updated_at_ms == i64::MAX
+            {
+                anyhow::bail!("communication action revision authority is exhausted")
+            }
+            validate_communication_kind_provider(&current.kind, &current.provider)?;
+            validate_communication_payload(&current.kind, &current.payload)?;
+            let current_authority = communication_authority_sha256(account_id, &current)?;
+            if current_authority != authority_sha256 || current.authority_sha256 != current_authority {
+                anyhow::bail!("communication action authority changed before approval")
+            }
+            tx.query_row(
+                "SELECT 1 FROM jobs_applications WHERE account_id = ?1 AND id = ?2",
+                params![account_id, current.application_id],
+                |_| Ok(()),
+            )?;
+            if current.kind == "reply" {
+                let source_id = current
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_json: String = tx.query_row(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
+                        AND application_id = ?4",
+                    params![
+                        account_id,
+                        current.connection_id,
+                        source_id,
+                        current.application_id,
+                    ],
+                    |row| row.get(0),
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_json, "Jobs provider message")?;
+                validate_communication_reply_source(&current, &source)?;
+            }
+            let (mailbox_json, credential_json): (String, String) = tx.query_row(
+                "SELECT mailbox.connection_json, credential.credential_json
+                   FROM jobs_mailbox_connections mailbox
+                   JOIN jobs_provider_credentials credential
+                     ON credential.account_id = mailbox.account_id
+                    AND credential.connection_id = mailbox.id
+                  WHERE mailbox.account_id = ?1 AND mailbox.id = ?2
+                    AND mailbox.status = 'connected'",
+                params![account_id, current.connection_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
+            let credential: JobsProviderCredential =
+                parse_json(credential_json, "Jobs provider credential")?;
+            let (grant_revision, grant_sha256) =
+                validate_communication_grant(&current.provider, &mailbox, &credential)?;
+            let effective_timestamp = current
+                .updated_at_ms
+                .checked_add(1)
+                .map(|next| next.max(now))
+                .ok_or_else(|| anyhow::anyhow!("communication action timestamp overflow"))?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'approved', approval_revision = approval_revision + 1,
+                        action_revision = action_revision + 1,
+                        approved_authority_sha256 = ?3, approved_grant_revision = ?4,
+                        approved_grant_sha256 = ?5, approved_at_ms = ?6,
+                        next_attempt_at_ms = ?9,
+                        updated_at_ms = MAX(?6, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?1 AND id = ?2
+                    AND status IN ('awaiting_approval', 'needs_input')
+                    AND authority_sha256 = ?3
+                    AND action_revision = ?7 AND payload_sha256 = ?8
+                    AND action_revision <= 9007199254740943
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![
+                    account_id,
+                    action_id,
+                    authority_sha256,
+                    grant_revision,
+                    grant_sha256,
+                    effective_timestamp,
+                    expected_action_revision,
+                    expected_payload_sha256,
+                    now,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication action cannot be approved in its current state")
+            }
+            let row = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions
+                      WHERE account_id = ?1 AND id = ?2"
+                ),
+                params![account_id, action_id],
+                sqlite_communication_row,
+            )?;
+            let approved = communication_action_from_row(row)?;
+            if approved.status != "approved"
+                || approved.approved_authority_sha256 != authority_sha256
+                || approved.approved_grant_revision != grant_revision
+                || approved.approved_grant_sha256 != grant_sha256
+            {
+                anyhow::bail!("communication action approval binding changed")
+            }
+            tx.commit()?;
+            Ok(Some(approved))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            let (status, approved_at_ms) = if approve {
-                ("approved", Some(now))
-            } else {
-                ("cancelled", None)
-            };
-            conn.execute(
-                "UPDATE jobs_communication_actions
-                    SET status = $3, approved_at_ms = COALESCE($4, approved_at_ms),
-                        updated_at_ms = $5
-                  WHERE account_id = $1 AND id = $2
-                    AND status IN ('awaiting_approval', 'needs_input')",
-                &[&account_id, &action_id, &status, &approved_at_ms, &now],
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
             )?;
-            conn.query_opt(
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+                anyhow::bail!("communication execution is not enabled")
+            }
+            let current_row = tx.query_one(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE"
+                ),
+                &[&account_id, &action_id],
+            )?;
+            let current =
+                communication_action_from_row(postgres_communication_row(current_row))?;
+            require_communication_write_unfenced_postgres_tx(
+                &mut tx,
+                account_id,
+                &current.connection_id,
+            )?;
+            if current.action_revision != expected_action_revision
+                || current.payload_sha256 != expected_payload_sha256
+            {
+                anyhow::bail!("communication action review snapshot changed")
+            }
+            if !matches!(current.status.as_str(), "awaiting_approval" | "needs_input")
+                || current.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS
+            {
+                anyhow::bail!("communication action cannot be approved in its current state")
+            }
+            if current.action_revision
+                > COMMUNICATION_ACTION_REVISION_MAX
+                    - COMMUNICATION_ACTION_REVISION_LIFECYCLE_HEADROOM
+                || current.updated_at_ms == i64::MAX
+            {
+                anyhow::bail!("communication action revision authority is exhausted")
+            }
+            validate_communication_kind_provider(&current.kind, &current.provider)?;
+            validate_communication_payload(&current.kind, &current.payload)?;
+            let current_authority = communication_authority_sha256(account_id, &current)?;
+            if current_authority != authority_sha256 || current.authority_sha256 != current_authority {
+                anyhow::bail!("communication action authority changed before approval")
+            }
+            tx.query_one(
+                "SELECT 1 FROM jobs_applications
+                  WHERE account_id = $1 AND id = $2 FOR SHARE",
+                &[&account_id, &current.application_id],
+            )?;
+            if current.kind == "reply" {
+                let source_id = current
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_row = tx.query_one(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = $1 AND connection_id = $2 AND id = $3
+                        AND application_id = $4 FOR SHARE",
+                    &[
+                        &account_id,
+                        &current.connection_id,
+                        &source_id,
+                        &current.application_id,
+                    ],
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_row.get(0), "Jobs provider message")?;
+                validate_communication_reply_source(&current, &source)?;
+            }
+            let grant_row = tx.query_one(
+                "SELECT mailbox.connection_json, credential.credential_json
+                   FROM jobs_mailbox_connections mailbox
+                   JOIN jobs_provider_credentials credential
+                     ON credential.account_id = mailbox.account_id
+                    AND credential.connection_id = mailbox.id
+                  WHERE mailbox.account_id = $1 AND mailbox.id = $2
+                    AND mailbox.status = 'connected'
+                  FOR UPDATE OF mailbox, credential",
+                &[&account_id, &current.connection_id],
+            )?;
+            let mailbox: MailboxConnection =
+                parse_json(grant_row.get(0), "mailbox connection")?;
+            let credential: JobsProviderCredential =
+                parse_json(grant_row.get(1), "Jobs provider credential")?;
+            let (grant_revision, grant_sha256) =
+                validate_communication_grant(&current.provider, &mailbox, &credential)?;
+            let effective_timestamp = current
+                .updated_at_ms
+                .checked_add(1)
+                .map(|next| next.max(now))
+                .ok_or_else(|| anyhow::anyhow!("communication action timestamp overflow"))?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'approved', approval_revision = approval_revision + 1,
+                        action_revision = action_revision + 1,
+                        approved_authority_sha256 = $3, approved_grant_revision = $4,
+                        approved_grant_sha256 = $5, approved_at_ms = $6,
+                        next_attempt_at_ms = $9,
+                        updated_at_ms = GREATEST($6, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = $1 AND id = $2
+                    AND status IN ('awaiting_approval', 'needs_input')
+                    AND authority_sha256 = $3
+                    AND action_revision = $7 AND payload_sha256 = $8
+                    AND action_revision <= 9007199254740943
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                &[
+                    &account_id,
+                    &action_id,
+                    &authority_sha256,
+                    &grant_revision,
+                    &grant_sha256,
+                    &effective_timestamp,
+                    &expected_action_revision,
+                    &expected_payload_sha256,
+                    &now,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication action cannot be approved in its current state")
+            }
+            let row = tx.query_one(
                 &format!(
                     "SELECT {COMMUNICATION_ACTION_SELECT}
                        FROM jobs_communication_actions
                       WHERE account_id = $1 AND id = $2"
                 ),
                 &[&account_id, &action_id],
-            )?
-            .map(postgres_communication_row)
-            .map(communication_action_from_row)
-            .transpose()
+            )?;
+            let approved = communication_action_from_row(postgres_communication_row(row))?;
+            if approved.status != "approved"
+                || approved.approved_authority_sha256 != authority_sha256
+                || approved.approved_grant_revision != grant_revision
+                || approved.approved_grant_sha256 != grant_sha256
+            {
+                anyhow::bail!("communication action approval binding changed")
+            }
+            tx.commit()?;
+            Ok(Some(approved))
         }
     })
-}
-
-pub fn approve_communication_action(
-    pool: &DbPool,
-    account_id: &str,
-    action_id: &str,
-) -> Result<Option<JobsCommunicationAction>> {
-    let action = transition_communication_action(pool, account_id, action_id, true)?;
-    if let Some(action) = action.as_ref() {
-        if !matches!(action.status.as_str(), "approved" | "dispatching") {
-            anyhow::bail!("communication action cannot be approved in its current state")
-        }
-    }
-    Ok(action)
 }
 
 pub fn cancel_communication_action(
     pool: &DbPool,
     account_id: &str,
     action_id: &str,
+    expected_action_revision: i64,
+    expected_payload_sha256: &str,
 ) -> Result<Option<JobsCommunicationAction>> {
-    let action = transition_communication_action(pool, account_id, action_id, false)?;
+    if !(1..=COMMUNICATION_ACTION_REVISION_MAX).contains(&expected_action_revision)
+        || !exact_lowercase_sha256(expected_payload_sha256)
+    {
+        anyhow::bail!("communication action review snapshot is invalid")
+    }
+    let now = now_ms();
+    let action = crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'cancelled', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        active_attempt_id = NULL, action_revision = action_revision + 1,
+                        updated_at_ms = MAX(?3, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?1 AND id = ?2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND action_revision = ?4 AND payload_sha256 = ?5
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![
+                    account_id,
+                    action_id,
+                    now,
+                    expected_action_revision,
+                    expected_payload_sha256,
+                ],
+            )?;
+            let row = tx
+                .query_row(
+                    &format!(
+                        "SELECT {COMMUNICATION_ACTION_SELECT}
+                           FROM jobs_communication_actions
+                          WHERE account_id = ?1 AND id = ?2"
+                    ),
+                    params![account_id, action_id],
+                    sqlite_communication_row,
+                )
+                .optional()?;
+            let action = row.map(communication_action_from_row).transpose()?;
+            if action.is_some() && changed != 1 {
+                anyhow::bail!("communication action review snapshot changed")
+            }
+            tx.commit()?;
+            Ok(action)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'cancelled', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        active_attempt_id = NULL, action_revision = action_revision + 1,
+                        updated_at_ms = GREATEST($3, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = $1 AND id = $2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND action_revision = $4 AND payload_sha256 = $5
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                &[
+                    &account_id,
+                    &action_id,
+                    &now,
+                    &expected_action_revision,
+                    &expected_payload_sha256,
+                ],
+            )?;
+            let row = tx.query_opt(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions
+                      WHERE account_id = $1 AND id = $2"
+                ),
+                &[&account_id, &action_id],
+            )?;
+            let action = row.map(postgres_communication_row)
+                .map(communication_action_from_row)
+                .transpose()?;
+            if action.is_some() && changed != 1 {
+                anyhow::bail!("communication action review snapshot changed")
+            }
+            tx.commit()?;
+            Ok(action)
+        }
+    })?;
     if let Some(action) = action.as_ref() {
         if action.status != "cancelled" {
             anyhow::bail!("communication action cannot be cancelled after dispatch")
@@ -629,6 +1785,9 @@ pub fn claim_communication_action(
     pool: &DbPool,
     owner_id: &str,
 ) -> Result<Option<JobsCommunicationActionLease>> {
+    if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+        anyhow::bail!("communication execution is not enabled")
+    }
     if owner_id.trim().is_empty() || owner_id.len() > 240 {
         anyhow::bail!("communication worker identity is invalid")
     }
@@ -636,26 +1795,84 @@ pub fn claim_communication_action(
     let expires_at = now.saturating_add(COMMUNICATION_ACTION_LEASE_MS);
     let lease_token = random_execution_lease_token();
     let token_hash = execution_lease_token_hash(&lease_token);
+    let attempt_id = uuid::Uuid::new_v4().to_string();
+    let provider_operation_key = format!("bluey-{}", uuid::Uuid::new_v4());
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute(
-                "UPDATE jobs_communication_actions
-                    SET status = 'side_effect_unknown', updated_at_ms = ?1
-                  WHERE status = 'dispatching' AND lease_expires_at_ms <= ?1",
-                params![now],
-            )?;
-            let candidate: Option<(String, String, i64)> = tx
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+                anyhow::bail!("communication execution is not enabled")
+            }
+            let expired: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT a.id, a.account_id, a.fence
+                    "SELECT id, account_id FROM jobs_communication_actions
+                      WHERE status = 'dispatching' AND lease_expires_at_ms <= ?1
+                      ORDER BY lease_expires_at_ms, id LIMIT 1",
+                    params![now],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((expired_action_id, expired_account_id)) = expired {
+                crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                    &tx,
+                    &expired_account_id,
+                )?;
+                let changed = tx.execute(
+                    "UPDATE jobs_communication_actions
+                        SET status = 'side_effect_unknown',
+                            action_revision = action_revision + 1,
+                            updated_at_ms = MAX(?1, CASE
+                              WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                              ELSE updated_at_ms END)
+                      WHERE account_id = ?2 AND id = ?3 AND status = 'dispatching'
+                        AND lease_expires_at_ms <= ?1
+                        AND action_revision < 9007199254740991
+                        AND updated_at_ms < 9223372036854775807",
+                    params![now, expired_account_id, expired_action_id],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!("expired communication dispatch authority changed")
+                }
+                tx.commit()?;
+                return Ok(None);
+            }
+            let candidate: Option<(String, String, i64, String, String)> = tx
+                .query_row(
+                    "SELECT a.id, a.account_id, a.fence, c.connection_json,
+                            credential.credential_json
                        FROM jobs_communication_actions a
                        JOIN jobs_mailbox_connections c
                          ON c.id = a.connection_id
                         AND c.account_id = a.account_id
                         AND c.status = 'connected'
-                      WHERE a.status IN ('approved', 'failed')
+                       JOIN jobs_provider_credentials credential
+                         ON credential.connection_id = a.connection_id
+                        AND credential.account_id = a.account_id
+                      WHERE a.status = 'approved'
                         AND a.next_attempt_at_ms <= ?1 AND a.attempt_count < ?2
+                        AND a.action_revision <= 9007199254740943
+                        AND a.approval_revision > 0
+                        AND length(a.authority_sha256) = 64
+                        AND a.approved_authority_sha256 = a.authority_sha256
+                        AND NOT EXISTS (
+                          SELECT 1 FROM account_deletion_intents deletion
+                           WHERE deletion.account_id = a.account_id
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM jobs_communication_write_fences fence
+                           WHERE fence.account_id = a.account_id
+                             AND fence.connection_id IN ('', a.connection_id)
+                        )
+                        AND (
+                          a.kind <> 'reply' OR EXISTS (
+                            SELECT 1 FROM jobs_provider_messages message
+                             WHERE message.id = a.source_message_id
+                               AND message.account_id = a.account_id
+                               AND message.connection_id = a.connection_id
+                               AND message.application_id = a.application_id
+                          )
+                        )
                         AND (
                           (a.provider IN ('gmail', 'google_calendar') AND c.provider = 'gmail')
                           OR
@@ -664,24 +1881,128 @@ pub fn claim_communication_action(
                         )
                       ORDER BY a.next_attempt_at_ms ASC, a.created_at_ms ASC LIMIT 1",
                     params![now, COMMUNICATION_ACTION_MAX_ATTEMPTS],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()?;
-            let Some((action_id, account_id, fence)) = candidate else {
+            let Some((action_id, account_id, fence, mailbox_json, credential_json)) = candidate
+            else {
                 tx.commit()?;
                 return Ok(None);
             };
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &account_id,
+            )?;
             let fence = fence
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("communication action fence overflow"))?;
-            tx.execute(
-                "UPDATE jobs_communication_actions
-                    SET status = 'dispatching', lease_owner = ?2, lease_token_sha256 = ?3,
-                        fence = ?4, lease_expires_at_ms = ?5, attempt_count = attempt_count + 1,
-                        dispatched_at_ms = COALESCE(dispatched_at_ms, ?1), updated_at_ms = ?1
-                  WHERE id = ?6 AND account_id = ?7",
-                params![now, owner_id, token_hash, fence, expires_at, action_id, account_id],
+            let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
+            let credential: JobsProviderCredential =
+                parse_json(credential_json, "Jobs provider credential")?;
+            let current = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions WHERE account_id = ?1 AND id = ?2"
+                ),
+                params![account_id, action_id],
+                sqlite_communication_row,
             )?;
+            let current = communication_action_from_row(current)?;
+            require_communication_write_unfenced_sqlite_tx(
+                &tx,
+                &account_id,
+                &current.connection_id,
+            )?;
+            validate_communication_kind_provider(&current.kind, &current.provider)?;
+            validate_communication_payload(&current.kind, &current.payload)?;
+            if current.kind == "reply" {
+                let source_message_id = current
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_json: String = tx.query_row(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
+                        AND application_id = ?4",
+                    params![
+                        account_id,
+                        current.connection_id,
+                        source_message_id,
+                        current.application_id,
+                    ],
+                    |row| row.get(0),
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_json, "Jobs provider message")?;
+                validate_communication_reply_source(&current, &source)?;
+            }
+            let authority_sha256 = communication_authority_sha256(&account_id, &current)?;
+            let (grant_revision, grant_sha256) =
+                validate_communication_grant(&current.provider, &mailbox, &credential)?;
+            if current.authority_sha256 != authority_sha256
+                || current.approved_authority_sha256 != authority_sha256
+                || current.approved_grant_revision != grant_revision
+                || current.approved_grant_sha256 != grant_sha256
+            {
+                anyhow::bail!("communication action approval or provider grant changed")
+            }
+            tx.execute(
+                "INSERT INTO jobs_communication_action_attempts (
+                    id, account_id, action_id, connection_id, provider, dispatch_no, fence,
+                    approval_revision, authority_sha256, grant_revision, grant_sha256,
+                    provider_operation_key, created_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    attempt_id,
+                    account_id,
+                    action_id,
+                    current.connection_id,
+                    current.provider,
+                    current.attempt_count + 1,
+                    fence,
+                    current.approval_revision,
+                    authority_sha256,
+                    grant_revision,
+                    grant_sha256,
+                    provider_operation_key,
+                    now,
+                ],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'dispatching', lease_owner = ?2, lease_kind = 'dispatch',
+                        lease_token_sha256 = ?3, fence = ?4, lease_expires_at_ms = ?5,
+                        active_attempt_id = ?6, attempt_count = attempt_count + 1,
+                        action_revision = action_revision + 1,
+                        dispatched_at_ms = COALESCE(dispatched_at_ms, ?1),
+                        updated_at_ms = MAX(?1, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE id = ?7 AND account_id = ?8 AND status = 'approved'
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![
+                    now,
+                    owner_id,
+                    token_hash,
+                    fence,
+                    expires_at,
+                    attempt_id,
+                    action_id,
+                    account_id,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication action approval changed before dispatch")
+            }
             let row = tx.query_row(
                 &format!(
                     "SELECT {COMMUNICATION_ACTION_SELECT}
@@ -694,6 +2015,13 @@ pub fn claim_communication_action(
             Ok(Some(JobsCommunicationActionLease {
                 account_id,
                 action: communication_action_from_row(row)?,
+                attempt_id,
+                lease_kind: "dispatch".to_string(),
+                provider_operation_key,
+                authority_sha256,
+                approval_revision: current.approval_revision,
+                grant_revision,
+                grant_sha256,
                 lease_token,
                 fence,
             }))
@@ -701,29 +2029,78 @@ pub fn claim_communication_action(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            tx.execute(
-                "UPDATE jobs_communication_actions
-                    SET status = 'side_effect_unknown', updated_at_ms = $1
-                  WHERE status = 'dispatching' AND lease_expires_at_ms <= $1",
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+                anyhow::bail!("communication execution is not enabled")
+            }
+            if let Some(expired) = tx.query_opt(
+                "SELECT id, account_id FROM jobs_communication_actions
+                  WHERE status = 'dispatching' AND lease_expires_at_ms <= $1
+                  ORDER BY lease_expires_at_ms, id LIMIT 1",
                 &[&now],
-            )?;
+            )? {
+                let expired_action_id: String = expired.get(0);
+                let expired_account_id: String = expired.get(1);
+                crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                    &mut tx,
+                    &expired_account_id,
+                )?;
+                tx.execute(
+                    "UPDATE jobs_communication_actions
+                        SET status = 'side_effect_unknown',
+                            action_revision = action_revision + 1,
+                            updated_at_ms = GREATEST($1, CASE
+                              WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                              ELSE updated_at_ms END)
+                      WHERE account_id = $2 AND id = $3 AND status = 'dispatching'
+                        AND lease_expires_at_ms <= $1
+                        AND action_revision < 9007199254740991
+                        AND updated_at_ms < 9223372036854775807",
+                    &[&now, &expired_account_id, &expired_action_id],
+                )?;
+                tx.commit()?;
+                return Ok(None);
+            }
             let candidate = tx.query_opt(
-                "SELECT a.id, a.account_id, a.fence
+                "SELECT a.id, a.account_id
                    FROM jobs_communication_actions a
                    JOIN jobs_mailbox_connections c
                      ON c.id = a.connection_id
                     AND c.account_id = a.account_id
                     AND c.status = 'connected'
-                  WHERE a.status IN ('approved', 'failed')
+                   JOIN jobs_provider_credentials credential
+                     ON credential.connection_id = a.connection_id
+                    AND credential.account_id = a.account_id
+                  WHERE a.status = 'approved'
                     AND a.next_attempt_at_ms <= $1 AND a.attempt_count < $2
+                    AND a.action_revision <= 9007199254740943
+                    AND a.approval_revision > 0
+                    AND length(a.authority_sha256) = 64
+                    AND a.approved_authority_sha256 = a.authority_sha256
+                    AND NOT EXISTS (
+                      SELECT 1 FROM account_deletion_intents deletion
+                       WHERE deletion.account_id = a.account_id
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM jobs_communication_write_fences fence
+                       WHERE fence.account_id = a.account_id
+                         AND fence.connection_id IN ('', a.connection_id)
+                    )
+                    AND (
+                      a.kind <> 'reply' OR EXISTS (
+                        SELECT 1 FROM jobs_provider_messages message
+                         WHERE message.id = a.source_message_id
+                           AND message.account_id = a.account_id
+                           AND message.connection_id = a.connection_id
+                           AND message.application_id = a.application_id
+                      )
+                    )
                     AND (
                       (a.provider IN ('gmail', 'google_calendar') AND c.provider = 'gmail')
                       OR
                       (a.provider IN ('outlook_email', 'outlook_calendar')
                         AND c.provider = 'outlook')
                     )
-                  ORDER BY a.next_attempt_at_ms ASC, a.created_at_ms ASC
-                  FOR UPDATE OF a SKIP LOCKED LIMIT 1",
+                  ORDER BY a.next_attempt_at_ms ASC, a.created_at_ms ASC LIMIT 1",
                 &[&now, &COMMUNICATION_ACTION_MAX_ATTEMPTS],
             )?;
             let Some(candidate) = candidate else {
@@ -732,19 +2109,150 @@ pub fn claim_communication_action(
             };
             let action_id: String = candidate.get(0);
             let account_id: String = candidate.get(1);
-            let fence: i64 = candidate
-                .get::<_, i64>(2)
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &account_id,
+            )?;
+            let locked = tx.query_opt(
+                "SELECT a.fence, c.connection_json, credential.credential_json
+                   FROM jobs_communication_actions a
+                   JOIN jobs_mailbox_connections c
+                     ON c.id = a.connection_id
+                    AND c.account_id = a.account_id
+                    AND c.status = 'connected'
+                   JOIN jobs_provider_credentials credential
+                     ON credential.connection_id = a.connection_id
+                    AND credential.account_id = a.account_id
+                  WHERE a.id = $1 AND a.account_id = $2 AND a.status = 'approved'
+                    AND a.next_attempt_at_ms <= $3 AND a.attempt_count < $4
+                    AND a.approval_revision > 0
+                    AND length(a.authority_sha256) = 64
+                    AND a.approved_authority_sha256 = a.authority_sha256
+                    AND NOT EXISTS (
+                      SELECT 1 FROM account_deletion_intents deletion
+                       WHERE deletion.account_id = a.account_id
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM jobs_communication_write_fences fence
+                       WHERE fence.account_id = a.account_id
+                         AND fence.connection_id IN ('', a.connection_id)
+                    )
+                    AND (
+                      a.kind <> 'reply' OR EXISTS (
+                        SELECT 1 FROM jobs_provider_messages message
+                         WHERE message.id = a.source_message_id
+                           AND message.account_id = a.account_id
+                           AND message.connection_id = a.connection_id
+                           AND message.application_id = a.application_id
+                      )
+                    )
+                    AND (
+                      (a.provider IN ('gmail', 'google_calendar') AND c.provider = 'gmail')
+                      OR (a.provider IN ('outlook_email', 'outlook_calendar')
+                          AND c.provider = 'outlook')
+                    )
+                  FOR UPDATE OF a, c, credential",
+                &[
+                    &action_id,
+                    &account_id,
+                    &now,
+                    &COMMUNICATION_ACTION_MAX_ATTEMPTS,
+                ],
+            )?;
+            let Some(locked) = locked else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let fence: i64 = locked
+                .get::<_, i64>(0)
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("communication action fence overflow"))?;
+            let mailbox: MailboxConnection =
+                parse_json(locked.get(1), "mailbox connection")?;
+            require_communication_write_unfenced_postgres_tx(
+                &mut tx,
+                &account_id,
+                &mailbox.id,
+            )?;
+            let credential: JobsProviderCredential =
+                parse_json(locked.get(2), "Jobs provider credential")?;
+            let current = tx.query_one(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions WHERE account_id = $1 AND id = $2"
+                ),
+                &[&account_id, &action_id],
+            )?;
+            let current = communication_action_from_row(postgres_communication_row(current))?;
+            validate_communication_kind_provider(&current.kind, &current.provider)?;
+            validate_communication_payload(&current.kind, &current.payload)?;
+            if current.kind == "reply" {
+                let source_message_id = current
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_row = tx.query_one(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = $1 AND connection_id = $2 AND id = $3
+                        AND application_id = $4 FOR SHARE",
+                    &[
+                        &account_id,
+                        &current.connection_id,
+                        &source_message_id,
+                        &current.application_id,
+                    ],
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_row.get(0), "Jobs provider message")?;
+                validate_communication_reply_source(&current, &source)?;
+            }
+            let authority_sha256 = communication_authority_sha256(&account_id, &current)?;
+            let (grant_revision, grant_sha256) =
+                validate_communication_grant(&current.provider, &mailbox, &credential)?;
+            if current.authority_sha256 != authority_sha256
+                || current.approved_authority_sha256 != authority_sha256
+                || current.approved_grant_revision != grant_revision
+                || current.approved_grant_sha256 != grant_sha256
+            {
+                anyhow::bail!("communication action approval or provider grant changed")
+            }
+            tx.execute(
+                "INSERT INTO jobs_communication_action_attempts (
+                    id, account_id, action_id, connection_id, provider, dispatch_no, fence,
+                    approval_revision, authority_sha256, grant_revision, grant_sha256,
+                    provider_operation_key, created_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                &[
+                    &attempt_id,
+                    &account_id,
+                    &action_id,
+                    &current.connection_id,
+                    &current.provider,
+                    &(current.attempt_count + 1),
+                    &fence,
+                    &current.approval_revision,
+                    &authority_sha256,
+                    &grant_revision,
+                    &grant_sha256,
+                    &provider_operation_key,
+                    &now,
+                ],
+            )?;
             let row = tx.query_one(
                 &format!(
                     "UPDATE jobs_communication_actions
-                        SET status = 'dispatching', lease_owner = $2, lease_token_sha256 = $3,
-                            fence = $4, lease_expires_at_ms = $5,
+                        SET status = 'dispatching', lease_owner = $2, lease_kind = 'dispatch',
+                            lease_token_sha256 = $3, fence = $4, lease_expires_at_ms = $5,
+                            active_attempt_id = $6,
                             attempt_count = attempt_count + 1,
+                            action_revision = action_revision + 1,
                             dispatched_at_ms = COALESCE(dispatched_at_ms, $1),
-                            updated_at_ms = $1
-                      WHERE id = $6 AND account_id = $7
+                            updated_at_ms = GREATEST($1, CASE
+                              WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                              ELSE updated_at_ms END)
+                      WHERE id = $7 AND account_id = $8 AND status = 'approved'
+                        AND action_revision < 9007199254740991
+                        AND updated_at_ms < 9223372036854775807
                       RETURNING {COMMUNICATION_ACTION_SELECT}"
                 ),
                 &[
@@ -753,6 +2261,7 @@ pub fn claim_communication_action(
                     &token_hash,
                     &fence,
                     &expires_at,
+                    &attempt_id,
                     &action_id,
                     &account_id,
                 ],
@@ -761,6 +2270,13 @@ pub fn claim_communication_action(
             Ok(Some(JobsCommunicationActionLease {
                 account_id,
                 action: communication_action_from_row(postgres_communication_row(row))?,
+                attempt_id,
+                lease_kind: "dispatch".to_string(),
+                provider_operation_key,
+                authority_sha256,
+                approval_revision: current.approval_revision,
+                grant_revision,
+                grant_sha256,
                 lease_token,
                 fence,
             }))
@@ -768,117 +2284,1386 @@ pub fn claim_communication_action(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn finish_communication_action(
-    pool: &DbPool,
-    account_id: &str,
-    action_id: &str,
-    owner_id: &str,
-    lease_token: &str,
-    fence: i64,
-    outcome: &str,
-    provider_object_id: Option<&str>,
-) -> Result<JobsCommunicationAction> {
-    let outcome = outcome.trim().to_ascii_lowercase();
-    if !matches!(
-        outcome.as_str(),
-        "sent" | "calendar_created" | "failed" | "needs_input" | "side_effect_unknown"
-    ) {
-        anyhow::bail!("invalid communication action outcome")
+fn validate_communication_lease_binding(
+    action: &JobsCommunicationAction,
+    lease: &JobsCommunicationLeaseAccess,
+    expected_kind: &str,
+) -> Result<()> {
+    if action.id != lease.action_id
+        || action.active_attempt_id.as_deref() != Some(lease.attempt_id.as_str())
+        || action.lease_owner.as_deref() != Some(lease.owner_id.as_str())
+        || action.lease_kind.as_deref() != Some(expected_kind)
+        || action.authority_sha256 != lease.authority_sha256
+        || action.approval_revision != lease.approval_revision
+        || action.approved_authority_sha256 != lease.authority_sha256
+        || action.approved_grant_revision != lease.grant_revision
+        || action.approved_grant_sha256 != lease.grant_sha256
+    {
+        anyhow::bail!("communication action lease authority changed")
     }
-    let provider_object_id = provider_object_id.unwrap_or_default().trim();
-    if matches!(outcome.as_str(), "sent" | "calendar_created") && provider_object_id.is_empty() {
-        anyhow::bail!("successful communication action needs provider evidence")
+    Ok(())
+}
+
+fn validate_communication_outcome(
+    action: &JobsCommunicationAction,
+    outcome: &str,
+    provider_object_id: &str,
+    evidence: &Value,
+) -> Result<()> {
+    if !evidence.is_object() || evidence.as_object().is_some_and(serde_json::Map::is_empty) {
+        anyhow::bail!("communication action completion needs provider evidence")
+    }
+    if provider_object_id.len() > 2_048 || provider_object_id.chars().any(char::is_control) {
+        anyhow::bail!("communication provider object identity is invalid")
+    }
+    match outcome {
+        "sent" if action.kind == "reply" && !provider_object_id.is_empty() => {
+            validate_communication_success_evidence(action, provider_object_id, evidence)
+        }
+        "calendar_created" if action.kind == "calendar" && !provider_object_id.is_empty() => {
+            validate_communication_success_evidence(action, provider_object_id, evidence)
+        }
+        "needs_input"
+            if provider_object_id.is_empty()
+                && evidence.get("no_side_effect").and_then(Value::as_bool) == Some(true) =>
+        {
+            Ok(())
+        }
+        "side_effect_unknown"
+            if provider_object_id.is_empty()
+                && evidence.get("no_side_effect").and_then(Value::as_bool) != Some(true) =>
+        {
+            Ok(())
+        }
+        "sent" | "calendar_created" => {
+            anyhow::bail!("communication success does not match its exact action kind")
+        }
+        "failed" => anyhow::bail!("new communication failures must return to reviewed input"),
+        _ => anyhow::bail!("invalid communication action outcome"),
+    }
+}
+
+fn validate_communication_success_evidence(
+    action: &JobsCommunicationAction,
+    provider_object_id: &str,
+    evidence: &Value,
+) -> Result<()> {
+    let action_id_sha256 = hex::encode(Sha256::digest(action.id.as_bytes()));
+    if evidence.get("provider").and_then(Value::as_str) != Some(action.provider.as_str())
+        || evidence.get("provider_object_id").and_then(Value::as_str)
+            != Some(provider_object_id)
+        || evidence.get("payload_sha256").and_then(Value::as_str)
+            != Some(action.payload_sha256.as_str())
+        || evidence.get("action_id_sha256").and_then(Value::as_str)
+            != Some(action_id_sha256.as_str())
+    {
+        anyhow::bail!("communication success evidence does not match its exact action")
+    }
+    Ok(())
+}
+
+fn communication_operation_message_id(provider_operation_key: &str) -> String {
+    let digest = hex::encode(Sha256::digest(provider_operation_key.as_bytes()));
+    format!("<{digest}@actions.bluey.sh>")
+}
+
+fn communication_google_event_id(provider_operation_key: &str) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+    let digest = Sha256::digest(provider_operation_key.as_bytes());
+    let mut output = String::with_capacity(32);
+    let mut accumulator = 0u32;
+    let mut bits = 0u8;
+    for byte in digest {
+        accumulator = (accumulator << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 && output.len() < 32 {
+            bits -= 5;
+            output.push(ALPHABET[((accumulator >> bits) & 31) as usize] as char);
+        }
+        if output.len() == 32 {
+            break;
+        }
+    }
+    output
+}
+
+fn communication_microsoft_transaction_id(provider_operation_key: &str) -> String {
+    let digest = Sha256::digest(provider_operation_key.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    uuid::Uuid::from_bytes(bytes).to_string()
+}
+
+fn validate_communication_provider_success_proof(
+    action: &JobsCommunicationAction,
+    provider_operation_key: &str,
+    provider_object_id: &str,
+    evidence: &Value,
+    source: Option<&JobsProviderMessage>,
+) -> Result<()> {
+    let operation_key_sha256 = hex::encode(Sha256::digest(provider_operation_key.as_bytes()));
+    let valid = match action.provider.as_str() {
+        "gmail" | "outlook_email" => {
+            let operation_message_id =
+                communication_operation_message_id(provider_operation_key);
+            let (metadata_key, evidence_key) = if action.provider == "gmail" {
+                ("thread_id", "thread_sha256")
+            } else {
+                ("conversation_id", "conversation_sha256")
+            };
+            let expected_source_sha256 = source
+                .and_then(|value| value.metadata.get(metadata_key))
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| hex::encode(Sha256::digest(value.as_bytes())));
+            evidence
+                .get("operation_message_id")
+                .and_then(Value::as_str)
+                == Some(operation_message_id.as_str())
+                && expected_source_sha256.as_deref().is_some_and(|expected| {
+                    evidence.get(evidence_key).and_then(Value::as_str) == Some(expected)
+                })
+        }
+        "google_calendar" => {
+            let event_id = communication_google_event_id(provider_operation_key);
+            provider_object_id == event_id
+                && evidence.get("deterministic_event_id").and_then(Value::as_str)
+                    == Some(event_id.as_str())
+                && evidence.get("private_marker_sha256").and_then(Value::as_str)
+                    == Some(operation_key_sha256.as_str())
+        }
+        "outlook_calendar" => {
+            let transaction_id =
+                communication_microsoft_transaction_id(provider_operation_key);
+            evidence.get("transaction_id").and_then(Value::as_str)
+                == Some(transaction_id.as_str())
+                && evidence
+                    .get("extended_property_sha256")
+                    .and_then(Value::as_str)
+                    == Some(operation_key_sha256.as_str())
+        }
+        _ => false,
+    };
+    if !valid {
+        anyhow::bail!("communication provider success proof does not match its exact attempt")
+    }
+    Ok(())
+}
+
+fn communication_reply_source_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    action: &JobsCommunicationAction,
+) -> Result<Option<JobsProviderMessage>> {
+    if action.kind != "reply" {
+        return Ok(None);
+    }
+    let source_id = action
+        .source_message_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+    let source_json: String = tx.query_row(
+        "SELECT message_json FROM jobs_provider_messages
+          WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
+            AND application_id = ?4",
+        params![
+            account_id,
+            action.connection_id,
+            source_id,
+            action.application_id,
+        ],
+        |row| row.get(0),
+    )?;
+    let source = parse_json(source_json, "Jobs provider message")?;
+    validate_communication_reply_source(action, &source)?;
+    Ok(Some(source))
+}
+
+fn communication_reply_source_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    action: &JobsCommunicationAction,
+) -> Result<Option<JobsProviderMessage>> {
+    if action.kind != "reply" {
+        return Ok(None);
+    }
+    let source_id = action
+        .source_message_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+    let source_json: String = tx
+        .query_one(
+            "SELECT message_json FROM jobs_provider_messages
+              WHERE account_id = $1 AND connection_id = $2 AND id = $3
+                AND application_id = $4 FOR SHARE",
+            &[
+                &account_id,
+                &action.connection_id,
+                &source_id,
+                &action.application_id,
+            ],
+        )?
+        .get(0);
+    let source = parse_json(source_json, "Jobs provider message")?;
+    validate_communication_reply_source(action, &source)?;
+    Ok(Some(source))
+}
+
+fn validate_communication_reconciliation_evidence(
+    action: &JobsCommunicationAction,
+    provider_operation_key: &str,
+    evidence: &Value,
+) -> Result<()> {
+    let action_id_sha256 = hex::encode(Sha256::digest(action.id.as_bytes()));
+    let provider_operation_key_sha256 =
+        hex::encode(Sha256::digest(provider_operation_key.as_bytes()));
+    if evidence.get("provider").and_then(Value::as_str) != Some(action.provider.as_str())
+        || evidence.get("action_id_sha256").and_then(Value::as_str)
+            != Some(action_id_sha256.as_str())
+        || evidence.get("payload_sha256").and_then(Value::as_str)
+            != Some(action.payload_sha256.as_str())
+        || evidence
+            .get("provider_operation_key_sha256")
+            .and_then(Value::as_str)
+            != Some(provider_operation_key_sha256.as_str())
+        || evidence.get("provider_operation_key").is_some()
+    {
+        anyhow::bail!("communication reconciliation evidence does not match its exact attempt")
+    }
+    Ok(())
+}
+
+pub fn mark_communication_action_request_started(
+    pool: &DbPool,
+    lease: &JobsCommunicationLeaseAccess,
+) -> Result<JobsCommunicationAction> {
+    if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+        anyhow::bail!("communication execution is not enabled")
     }
     let now = now_ms();
-    let next_attempt_at = if outcome == "failed" {
-        now.saturating_add(60 * 1_000)
-    } else {
-        now
-    };
+    let evidence = serde_json::json!({
+        "authority_sha256": lease.authority_sha256,
+        "approval_revision": lease.approval_revision,
+        "grant_revision": lease.grant_revision,
+        "grant_sha256": lease.grant_sha256,
+    });
+    let evidence_sha256 = communication_evidence_sha256(&evidence)?;
+    let evidence_json = to_json(&evidence, "Jobs communication request-start evidence")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let stored: Option<String> = conn
-                .query_row(
-                    "SELECT lease_token_sha256 FROM jobs_communication_actions
-                      WHERE account_id = ?1 AND id = ?2 AND lease_owner = ?3 AND fence = ?4
-                        AND status IN ('dispatching', 'side_effect_unknown')",
-                    params![account_id, action_id, owner_id, fence],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if !stored
-                .as_deref()
-                .is_some_and(|stored| execution_lease_token_matches(stored, lease_token))
-            {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &lease.account_id,
+            )?;
+            let connection_id: String = tx.query_row(
+                "SELECT connection_id FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND id = ?2",
+                params![lease.account_id, lease.action_id],
+                |row| row.get(0),
+            )?;
+            require_communication_write_unfenced_sqlite_tx(
+                &tx,
+                &lease.account_id,
+                &connection_id,
+            )?;
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+                anyhow::bail!("communication execution is not enabled")
+            }
+            let (row, token_hash): (CommunicationActionRow, String) = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+                      FROM jobs_communication_actions
+                      WHERE account_id = ?1 AND id = ?2 AND status = 'dispatching'
+                        AND lease_kind = 'dispatch' AND fence = ?3
+                        AND lease_expires_at_ms > ?4"
+                ),
+                params![lease.account_id, lease.action_id, lease.fence, now],
+                |row| Ok((sqlite_communication_row(row)?, row.get(29)?)),
+            )?;
+            let action = communication_action_from_row(row)?;
+            validate_communication_lease_binding(&action, lease, "dispatch")?;
+            if !execution_lease_token_matches(&token_hash, &lease.lease_token) {
                 anyhow::bail!("communication action lease not found")
             }
-            conn.execute(
-                "UPDATE jobs_communication_actions
-                    SET status = ?5, provider_object_id = NULLIF(?6, ''),
-                        next_attempt_at_ms = ?7, lease_owner = NULL,
-                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
-                        updated_at_ms = ?8
-                  WHERE account_id = ?1 AND id = ?2 AND lease_owner = ?3 AND fence = ?4",
+            validate_communication_kind_provider(&action.kind, &action.provider)?;
+            validate_communication_payload(&action.kind, &action.payload)?;
+            let authority_sha256 = communication_authority_sha256(&lease.account_id, &action)?;
+            let (mailbox_json, credential_json): (String, String) = tx.query_row(
+                "SELECT mailbox.connection_json, credential.credential_json
+                   FROM jobs_mailbox_connections mailbox
+                   JOIN jobs_provider_credentials credential
+                     ON credential.account_id = mailbox.account_id
+                    AND credential.connection_id = mailbox.id
+                  WHERE mailbox.account_id = ?1 AND mailbox.id = ?2
+                    AND mailbox.status = 'connected'",
+                params![lease.account_id, action.connection_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
+            let credential: JobsProviderCredential =
+                parse_json(credential_json, "Jobs provider credential")?;
+            let (grant_revision, grant_sha256) =
+                validate_communication_grant(&action.provider, &mailbox, &credential)?;
+            if authority_sha256 != lease.authority_sha256
+                || grant_revision != lease.grant_revision
+                || grant_sha256 != lease.grant_sha256
+            {
+                anyhow::bail!("communication request-start authority changed")
+            }
+            if action.kind == "reply" {
+                let source_id = action
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_json: String = tx.query_row(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
+                        AND application_id = ?4",
+                    params![
+                        lease.account_id,
+                        action.connection_id,
+                        source_id,
+                        action.application_id,
+                    ],
+                    |row| row.get(0),
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_json, "Jobs provider message")?;
+                validate_communication_reply_source(&action, &source)?;
+            }
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO jobs_communication_action_attempt_evidence (
+                    id, account_id, action_id, attempt_id, event_kind, provider_object_id,
+                    evidence_sha256, evidence_json, recorded_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'request_started', NULL, ?5, ?6, ?7)",
                 params![
-                    account_id,
-                    action_id,
-                    owner_id,
-                    fence,
-                    outcome,
-                    provider_object_id,
-                    next_attempt_at,
+                    uuid::Uuid::new_v4().to_string(),
+                    lease.account_id,
+                    lease.action_id,
+                    lease.attempt_id,
+                    evidence_sha256,
+                    evidence_json,
                     now,
                 ],
             )?;
-            let row = conn.query_row(
+            if inserted == 0 {
+                let exact: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1
+                       FROM jobs_communication_action_attempt_evidence
+                      WHERE attempt_id = ?1 AND event_kind = 'request_started'
+                        AND evidence_sha256 = ?2)",
+                    params![lease.attempt_id, evidence_sha256],
+                    |row| row.get(0),
+                )?;
+                if !exact {
+                    anyhow::bail!("communication request-start evidence changed")
+                }
+            }
+            tx.commit()?;
+            Ok(action)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &lease.account_id,
+            )?;
+            let connection_id: String = tx
+                .query_one(
+                    "SELECT connection_id FROM jobs_communication_actions
+                      WHERE account_id = $1 AND id = $2",
+                    &[&lease.account_id, &lease.action_id],
+                )?
+                .get(0);
+            require_communication_write_unfenced_postgres_tx(
+                &mut tx,
+                &lease.account_id,
+                &connection_id,
+            )?;
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
+                anyhow::bail!("communication execution is not enabled")
+            }
+            let row = tx.query_opt(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+                      FROM jobs_communication_actions
+                      WHERE account_id = $1 AND id = $2 AND status = 'dispatching'
+                        AND lease_kind = 'dispatch' AND fence = $3
+                        AND lease_expires_at_ms > $4 FOR UPDATE"
+                ),
+                &[&lease.account_id, &lease.action_id, &lease.fence, &now],
+            )?.ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
+            let token_hash: String = row.get(29);
+            let action = communication_action_from_row(postgres_communication_row(row))?;
+            validate_communication_lease_binding(&action, lease, "dispatch")?;
+            if !execution_lease_token_matches(&token_hash, &lease.lease_token) {
+                anyhow::bail!("communication action lease not found")
+            }
+            validate_communication_kind_provider(&action.kind, &action.provider)?;
+            validate_communication_payload(&action.kind, &action.payload)?;
+            let authority_sha256 = communication_authority_sha256(&lease.account_id, &action)?;
+            let grant_row = tx.query_one(
+                "SELECT mailbox.connection_json, credential.credential_json
+                   FROM jobs_mailbox_connections mailbox
+                   JOIN jobs_provider_credentials credential
+                     ON credential.account_id = mailbox.account_id
+                    AND credential.connection_id = mailbox.id
+                  WHERE mailbox.account_id = $1 AND mailbox.id = $2
+                    AND mailbox.status = 'connected'
+                  FOR UPDATE OF mailbox, credential",
+                &[&lease.account_id, &action.connection_id],
+            )?;
+            let mailbox: MailboxConnection =
+                parse_json(grant_row.get(0), "mailbox connection")?;
+            let credential: JobsProviderCredential =
+                parse_json(grant_row.get(1), "Jobs provider credential")?;
+            let (grant_revision, grant_sha256) =
+                validate_communication_grant(&action.provider, &mailbox, &credential)?;
+            if authority_sha256 != lease.authority_sha256
+                || grant_revision != lease.grant_revision
+                || grant_sha256 != lease.grant_sha256
+            {
+                anyhow::bail!("communication request-start authority changed")
+            }
+            if action.kind == "reply" {
+                let source_id = action
+                    .source_message_id
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("communication reply source is missing"))?;
+                let source_row = tx.query_one(
+                    "SELECT message_json FROM jobs_provider_messages
+                      WHERE account_id = $1 AND connection_id = $2 AND id = $3
+                        AND application_id = $4 FOR SHARE",
+                    &[
+                        &lease.account_id,
+                        &action.connection_id,
+                        &source_id,
+                        &action.application_id,
+                    ],
+                )?;
+                let source: JobsProviderMessage =
+                    parse_json(source_row.get(0), "Jobs provider message")?;
+                validate_communication_reply_source(&action, &source)?;
+            }
+            let inserted = tx.execute(
+                "INSERT INTO jobs_communication_action_attempt_evidence (
+                    id, account_id, action_id, attempt_id, event_kind, provider_object_id,
+                    evidence_sha256, evidence_json, recorded_at_ms
+                 ) VALUES ($1, $2, $3, $4, 'request_started', NULL, $5, $6, $7)
+                 ON CONFLICT(attempt_id, event_kind) DO NOTHING",
+                &[
+                    &uuid::Uuid::new_v4().to_string(),
+                    &lease.account_id,
+                    &lease.action_id,
+                    &lease.attempt_id,
+                    &evidence_sha256,
+                    &evidence_json,
+                    &now,
+                ],
+            )?;
+            if inserted == 0 {
+                let exact: bool = tx.query_one(
+                    "SELECT EXISTS(SELECT 1
+                       FROM jobs_communication_action_attempt_evidence
+                      WHERE attempt_id = $1 AND event_kind = 'request_started'
+                        AND evidence_sha256 = $2)",
+                    &[&lease.attempt_id, &evidence_sha256],
+                )?.get(0);
+                if !exact {
+                    anyhow::bail!("communication request-start evidence changed")
+                }
+            }
+            tx.commit()?;
+            Ok(action)
+        }
+    })
+}
+
+pub fn finish_communication_action(
+    pool: &DbPool,
+    finish: &JobsCommunicationActionFinish,
+) -> Result<JobsCommunicationAction> {
+    let outcome = finish.outcome.trim().to_ascii_lowercase();
+    let provider_object_id = finish.provider_object_id.trim();
+    if provider_object_id != finish.provider_object_id {
+        anyhow::bail!("communication provider object identity is not canonical")
+    }
+    let evidence = canonical_communication_value(&finish.evidence);
+    let evidence_sha256 = communication_evidence_sha256(&evidence)?;
+    let evidence_json = to_json(&evidence, "Jobs communication completion evidence")?;
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (row, token_hash): (CommunicationActionRow, String) = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+                       FROM jobs_communication_actions
+                      WHERE account_id = ?1 AND id = ?2 AND fence = ?3
+                        AND status IN ('dispatching', 'side_effect_unknown')
+                        AND lease_kind = 'dispatch' AND lease_expires_at_ms > ?4"
+                ),
+                params![
+                    finish.lease.account_id,
+                    finish.lease.action_id,
+                    finish.lease.fence,
+                    now,
+                ],
+                |row| Ok((sqlite_communication_row(row)?, row.get(29)?)),
+            )?;
+            let action = communication_action_from_row(row)?;
+            validate_communication_lease_binding(&action, &finish.lease, "dispatch")?;
+            if !execution_lease_token_matches(&token_hash, &finish.lease.lease_token) {
+                anyhow::bail!("communication action lease not found")
+            }
+            let provider_operation_key: String = tx.query_row(
+                "SELECT provider_operation_key FROM jobs_communication_action_attempts
+                  WHERE id = ?1 AND account_id = ?2 AND action_id = ?3 AND fence = ?4
+                    AND approval_revision = ?5 AND authority_sha256 = ?6
+                    AND grant_revision = ?7 AND grant_sha256 = ?8",
+                params![
+                    finish.lease.attempt_id,
+                    finish.lease.account_id,
+                    finish.lease.action_id,
+                    finish.lease.fence,
+                    finish.lease.approval_revision,
+                    finish.lease.authority_sha256,
+                    finish.lease.grant_revision,
+                    finish.lease.grant_sha256,
+                ],
+                |row| row.get(0),
+            )?;
+            validate_communication_outcome(&action, &outcome, provider_object_id, &evidence)?;
+            if matches!(outcome.as_str(), "sent" | "calendar_created") {
+                let source = communication_reply_source_sqlite_tx(
+                    &tx,
+                    &finish.lease.account_id,
+                    &action,
+                )?;
+                validate_communication_reconciliation_evidence(
+                    &action,
+                    &provider_operation_key,
+                    &evidence,
+                )?;
+                validate_communication_provider_success_proof(
+                    &action,
+                    &provider_operation_key,
+                    provider_object_id,
+                    &evidence,
+                    source.as_ref(),
+                )?;
+            }
+            let request_started: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs_communication_action_attempt_evidence
+                  WHERE attempt_id = ?1 AND event_kind = 'request_started')",
+                params![finish.lease.attempt_id],
+                |row| row.get(0),
+            )?;
+            if matches!(outcome.as_str(), "sent" | "calendar_created" | "side_effect_unknown")
+                && !request_started
+            {
+                anyhow::bail!("communication provider request was not durably started")
+            }
+            tx.execute(
+                "INSERT INTO jobs_communication_action_attempt_evidence (
+                    id, account_id, action_id, attempt_id, event_kind, provider_object_id,
+                    evidence_sha256, evidence_json, recorded_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, NULLIF(?6, ''), ?7, ?8, ?9)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    finish.lease.account_id,
+                    finish.lease.action_id,
+                    finish.lease.attempt_id,
+                    outcome,
+                    provider_object_id,
+                    evidence_sha256,
+                    evidence_json,
+                    now,
+                ],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = ?4, provider_object_id = NULLIF(?5, ''),
+                        lease_owner = NULL, lease_kind = NULL, lease_token_sha256 = NULL,
+                        lease_expires_at_ms = NULL,
+                        action_revision = action_revision + 1,
+                        active_attempt_id = CASE WHEN ?4 = 'needs_input' THEN NULL
+                                                 ELSE active_attempt_id END,
+                        approved_authority_sha256 = CASE WHEN ?4 = 'needs_input' THEN ''
+                                                         ELSE approved_authority_sha256 END,
+                        approved_grant_revision = CASE WHEN ?4 = 'needs_input' THEN 0
+                                                       ELSE approved_grant_revision END,
+                        approved_grant_sha256 = CASE WHEN ?4 = 'needs_input' THEN ''
+                                                    ELSE approved_grant_sha256 END,
+                        approved_at_ms = CASE WHEN ?4 = 'needs_input' THEN NULL
+                                              ELSE approved_at_ms END,
+                        updated_at_ms = MAX(?6, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?1 AND id = ?2 AND fence = ?3
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![
+                    finish.lease.account_id,
+                    finish.lease.action_id,
+                    finish.lease.fence,
+                    outcome,
+                    provider_object_id,
+                    now,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication completion lease changed")
+            }
+            let row = tx.query_row(
                 &format!(
                     "SELECT {COMMUNICATION_ACTION_SELECT}
-                       FROM jobs_communication_actions
-                      WHERE account_id = ?1 AND id = ?2"
+                       FROM jobs_communication_actions WHERE account_id = ?1 AND id = ?2"
                 ),
-                params![account_id, action_id],
+                params![finish.lease.account_id, finish.lease.action_id],
                 sqlite_communication_row,
             )?;
+            tx.commit()?;
             communication_action_from_row(row)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            let stored = conn.query_opt(
-                "SELECT lease_token_sha256 FROM jobs_communication_actions
-                  WHERE account_id = $1 AND id = $2 AND lease_owner = $3 AND fence = $4
-                    AND status IN ('dispatching', 'side_effect_unknown')",
-                &[&account_id, &action_id, &owner_id, &fence],
-            )?;
-            let stored: Option<String> = stored.map(|row| row.get(0));
-            if !stored
-                .as_deref()
-                .is_some_and(|stored| execution_lease_token_matches(stored, lease_token))
-            {
+            let mut tx = conn.transaction()?;
+            let row = tx.query_opt(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+                       FROM jobs_communication_actions
+                      WHERE account_id = $1 AND id = $2 AND fence = $3
+                        AND status IN ('dispatching', 'side_effect_unknown')
+                        AND lease_kind = 'dispatch' AND lease_expires_at_ms > $4 FOR UPDATE"
+                ),
+                &[
+                    &finish.lease.account_id,
+                    &finish.lease.action_id,
+                    &finish.lease.fence,
+                    &now,
+                ],
+            )?.ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
+            let token_hash: String = row.get(29);
+            let action = communication_action_from_row(postgres_communication_row(row))?;
+            validate_communication_lease_binding(&action, &finish.lease, "dispatch")?;
+            if !execution_lease_token_matches(&token_hash, &finish.lease.lease_token) {
                 anyhow::bail!("communication action lease not found")
             }
-            let row = conn.query_one(
+            let provider_operation_key: String = tx
+                .query_one(
+                    "SELECT provider_operation_key FROM jobs_communication_action_attempts
+                      WHERE id = $1 AND account_id = $2 AND action_id = $3 AND fence = $4
+                        AND approval_revision = $5 AND authority_sha256 = $6
+                        AND grant_revision = $7 AND grant_sha256 = $8",
+                    &[
+                        &finish.lease.attempt_id,
+                        &finish.lease.account_id,
+                        &finish.lease.action_id,
+                        &finish.lease.fence,
+                        &finish.lease.approval_revision,
+                        &finish.lease.authority_sha256,
+                        &finish.lease.grant_revision,
+                        &finish.lease.grant_sha256,
+                    ],
+                )?
+                .get(0);
+            validate_communication_outcome(&action, &outcome, provider_object_id, &evidence)?;
+            if matches!(outcome.as_str(), "sent" | "calendar_created") {
+                let source = communication_reply_source_postgres_tx(
+                    &mut tx,
+                    &finish.lease.account_id,
+                    &action,
+                )?;
+                validate_communication_reconciliation_evidence(
+                    &action,
+                    &provider_operation_key,
+                    &evidence,
+                )?;
+                validate_communication_provider_success_proof(
+                    &action,
+                    &provider_operation_key,
+                    provider_object_id,
+                    &evidence,
+                    source.as_ref(),
+                )?;
+            }
+            let request_started: bool = tx.query_one(
+                "SELECT EXISTS(SELECT 1 FROM jobs_communication_action_attempt_evidence
+                  WHERE attempt_id = $1 AND event_kind = 'request_started')",
+                &[&finish.lease.attempt_id],
+            )?.get(0);
+            if matches!(outcome.as_str(), "sent" | "calendar_created" | "side_effect_unknown")
+                && !request_started
+            {
+                anyhow::bail!("communication provider request was not durably started")
+            }
+            tx.execute(
+                "INSERT INTO jobs_communication_action_attempt_evidence (
+                    id, account_id, action_id, attempt_id, event_kind, provider_object_id,
+                    evidence_sha256, evidence_json, recorded_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7, $8, $9)",
+                &[
+                    &uuid::Uuid::new_v4().to_string(),
+                    &finish.lease.account_id,
+                    &finish.lease.action_id,
+                    &finish.lease.attempt_id,
+                    &outcome,
+                    &provider_object_id,
+                    &evidence_sha256,
+                    &evidence_json,
+                    &now,
+                ],
+            )?;
+            let row = tx.query_one(
                 &format!(
                     "UPDATE jobs_communication_actions
-                        SET status = $5, provider_object_id = NULLIF($6, ''),
-                            next_attempt_at_ms = $7, lease_owner = NULL,
-                            lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
-                            updated_at_ms = $8
-                      WHERE account_id = $1 AND id = $2 AND lease_owner = $3 AND fence = $4
+                        SET status = $4, provider_object_id = NULLIF($5, ''),
+                            lease_owner = NULL, lease_kind = NULL, lease_token_sha256 = NULL,
+                            lease_expires_at_ms = NULL,
+                            action_revision = action_revision + 1,
+                            active_attempt_id = CASE WHEN $4 = 'needs_input' THEN NULL
+                                                     ELSE active_attempt_id END,
+                            approved_authority_sha256 = CASE WHEN $4 = 'needs_input' THEN ''
+                                                             ELSE approved_authority_sha256 END,
+                            approved_grant_revision = CASE WHEN $4 = 'needs_input' THEN 0
+                                                           ELSE approved_grant_revision END,
+                            approved_grant_sha256 = CASE WHEN $4 = 'needs_input' THEN ''
+                                                        ELSE approved_grant_sha256 END,
+                            approved_at_ms = CASE WHEN $4 = 'needs_input' THEN NULL
+                                                  ELSE approved_at_ms END,
+                            updated_at_ms = GREATEST($6, CASE
+                              WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                              ELSE updated_at_ms END)
+                      WHERE account_id = $1 AND id = $2 AND fence = $3
+                        AND action_revision < 9007199254740991
+                        AND updated_at_ms < 9223372036854775807
                       RETURNING {COMMUNICATION_ACTION_SELECT}"
                 ),
                 &[
-                    &account_id,
-                    &action_id,
-                    &owner_id,
-                    &fence,
+                    &finish.lease.account_id,
+                    &finish.lease.action_id,
+                    &finish.lease.fence,
                     &outcome,
+                    &provider_object_id,
+                    &now,
+                ],
+            )?;
+            tx.commit()?;
+            communication_action_from_row(postgres_communication_row(row))
+        }
+    })
+}
+
+pub fn claim_communication_action_reconciliation(
+    pool: &DbPool,
+    owner_id: &str,
+) -> Result<Option<JobsCommunicationActionLease>> {
+    if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED") {
+        anyhow::bail!("communication reconciliation is not enabled")
+    }
+    if owner_id.trim().is_empty() || owner_id.len() > 240 {
+        anyhow::bail!("communication worker identity is invalid")
+    }
+    let now = now_ms();
+    let expires_at = now.saturating_add(COMMUNICATION_ACTION_LEASE_MS);
+    let lease_token = random_execution_lease_token();
+    let token_hash = execution_lease_token_hash(&lease_token);
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED") {
+                anyhow::bail!("communication reconciliation is not enabled")
+            }
+            let candidate: Option<CommunicationReconciliationCandidateRow> = tx
+                .query_row(
+                    "SELECT a.id, a.account_id, attempt.id, a.fence,
+                            attempt.provider_operation_key, attempt.approval_revision,
+                            attempt.authority_sha256, attempt.grant_revision,
+                            attempt.grant_sha256
+                       FROM jobs_communication_actions a
+                       JOIN jobs_communication_action_attempts attempt
+                         ON attempt.id = a.active_attempt_id
+                        AND attempt.account_id = a.account_id
+                        AND attempt.action_id = a.id
+                       JOIN jobs_mailbox_connections mailbox
+                         ON mailbox.account_id = a.account_id
+                        AND mailbox.id = a.connection_id
+                        AND mailbox.status = 'connected'
+                      WHERE a.status = 'side_effect_unknown'
+                        AND a.reconciliation_count < 20
+                        AND a.action_revision <= 9007199254740989
+                        AND a.next_attempt_at_ms <= ?1
+                        AND (a.lease_kind IS NULL OR a.lease_expires_at_ms <= ?1)
+                        AND NOT EXISTS (
+                          SELECT 1 FROM account_deletion_intents deletion
+                           WHERE deletion.account_id = a.account_id
+                        )
+                      ORDER BY a.next_attempt_at_ms, a.updated_at_ms, a.id LIMIT 1",
+                    params![now],
+                    |row| {
+                        Ok((
+                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
+                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((
+                action_id,
+                account_id,
+                attempt_id,
+                current_fence,
+                provider_operation_key,
+                approval_revision,
+                authority_sha256,
+                grant_revision,
+                grant_sha256,
+            )) = candidate else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &account_id,
+            )?;
+            let fence = current_fence
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("communication action fence overflow"))?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET lease_owner = ?2, lease_kind = 'reconcile', lease_token_sha256 = ?3,
+                        fence = ?4, lease_expires_at_ms = ?5,
+                        reconciliation_count = reconciliation_count + 1,
+                        action_revision = action_revision + 1,
+                        updated_at_ms = MAX(?1, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?6 AND id = ?7 AND status = 'side_effect_unknown'
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![now, owner_id, token_hash, fence, expires_at, account_id, action_id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication reconciliation authority changed")
+            }
+            let row = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions WHERE account_id = ?1 AND id = ?2"
+                ),
+                params![account_id, action_id],
+                sqlite_communication_row,
+            )?;
+            tx.commit()?;
+            Ok(Some(JobsCommunicationActionLease {
+                account_id,
+                action: communication_action_from_row(row)?,
+                attempt_id,
+                lease_kind: "reconcile".to_string(),
+                provider_operation_key,
+                authority_sha256,
+                approval_revision,
+                grant_revision,
+                grant_sha256,
+                lease_token,
+                fence,
+            }))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED") {
+                anyhow::bail!("communication reconciliation is not enabled")
+            }
+            let candidate = tx.query_opt(
+                "SELECT a.id, a.account_id
+                   FROM jobs_communication_actions a
+                   JOIN jobs_communication_action_attempts attempt
+                     ON attempt.id = a.active_attempt_id
+                    AND attempt.account_id = a.account_id
+                    AND attempt.action_id = a.id
+                   JOIN jobs_mailbox_connections mailbox
+                     ON mailbox.account_id = a.account_id
+                    AND mailbox.id = a.connection_id
+                    AND mailbox.status = 'connected'
+                  WHERE a.status = 'side_effect_unknown'
+                    AND a.reconciliation_count < 20
+                    AND a.action_revision <= 9007199254740989
+                    AND a.next_attempt_at_ms <= $1
+                    AND (a.lease_kind IS NULL OR a.lease_expires_at_ms <= $1)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM account_deletion_intents deletion
+                       WHERE deletion.account_id = a.account_id
+                    )
+                  ORDER BY a.next_attempt_at_ms, a.updated_at_ms, a.id
+                  LIMIT 1",
+                &[&now],
+            )?;
+            let Some(candidate) = candidate else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let action_id: String = candidate.get(0);
+            let account_id: String = candidate.get(1);
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &account_id,
+            )?;
+            let locked = tx.query_opt(
+                "SELECT attempt.id, a.fence, attempt.provider_operation_key,
+                        attempt.approval_revision, attempt.authority_sha256,
+                        attempt.grant_revision, attempt.grant_sha256
+                   FROM jobs_communication_actions a
+                   JOIN jobs_communication_action_attempts attempt
+                     ON attempt.id = a.active_attempt_id
+                    AND attempt.account_id = a.account_id
+                    AND attempt.action_id = a.id
+                   JOIN jobs_mailbox_connections mailbox
+                     ON mailbox.account_id = a.account_id
+                    AND mailbox.id = a.connection_id
+                    AND mailbox.status = 'connected'
+                  WHERE a.id = $1 AND a.account_id = $2
+                    AND a.status = 'side_effect_unknown'
+                    AND a.reconciliation_count < 20
+                    AND a.action_revision <= 9007199254740989
+                    AND a.next_attempt_at_ms <= $3
+                    AND (a.lease_kind IS NULL OR a.lease_expires_at_ms <= $3)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM account_deletion_intents deletion
+                       WHERE deletion.account_id = a.account_id
+                    )
+                  FOR UPDATE OF a, mailbox",
+                &[&action_id, &account_id, &now],
+            )?;
+            let Some(locked) = locked else {
+                tx.commit()?;
+                return Ok(None);
+            };
+            let attempt_id: String = locked.get(0);
+            let fence = locked
+                .get::<_, i64>(1)
+                .checked_add(1)
+                .ok_or_else(|| anyhow::anyhow!("communication action fence overflow"))?;
+            let provider_operation_key: String = locked.get(2);
+            let approval_revision: i64 = locked.get(3);
+            let authority_sha256: String = locked.get(4);
+            let grant_revision: i64 = locked.get(5);
+            let grant_sha256: String = locked.get(6);
+            let row = tx.query_one(
+                &format!(
+                    "UPDATE jobs_communication_actions
+                        SET lease_owner = $2, lease_kind = 'reconcile',
+                            lease_token_sha256 = $3, fence = $4, lease_expires_at_ms = $5,
+                            reconciliation_count = reconciliation_count + 1,
+                            action_revision = action_revision + 1,
+                            updated_at_ms = GREATEST($1, CASE
+                              WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                              ELSE updated_at_ms END)
+                      WHERE account_id = $6 AND id = $7 AND status = 'side_effect_unknown'
+                        AND action_revision < 9007199254740991
+                        AND updated_at_ms < 9223372036854775807
+                      RETURNING {COMMUNICATION_ACTION_SELECT}"
+                ),
+                &[&now, &owner_id, &token_hash, &fence, &expires_at, &account_id, &action_id],
+            )?;
+            tx.commit()?;
+            Ok(Some(JobsCommunicationActionLease {
+                account_id,
+                action: communication_action_from_row(postgres_communication_row(row))?,
+                attempt_id,
+                lease_kind: "reconcile".to_string(),
+                provider_operation_key,
+                authority_sha256,
+                approval_revision,
+                grant_revision,
+                grant_sha256,
+                lease_token,
+                fence,
+            }))
+        }
+    })
+}
+
+pub fn reconcile_communication_action(
+    pool: &DbPool,
+    reconciliation: &JobsCommunicationActionReconciliation,
+) -> Result<JobsCommunicationAction> {
+    if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED") {
+        anyhow::bail!("communication reconciliation is not enabled")
+    }
+    let resolution = reconciliation.resolution.trim().to_ascii_lowercase();
+    let provider_object_id = reconciliation.provider_object_id.trim();
+    if provider_object_id != reconciliation.provider_object_id
+        || provider_object_id.len() > 2_048
+        || provider_object_id.chars().any(char::is_control)
+    {
+        anyhow::bail!("communication provider object identity is invalid")
+    }
+    if matches!(resolution.as_str(), "confirmed_absent" | "inconclusive")
+        && !provider_object_id.is_empty()
+    {
+        anyhow::bail!("communication absence evidence cannot name a provider object")
+    }
+    let evidence = canonical_communication_value(&reconciliation.evidence);
+    if !evidence.is_object() || evidence.as_object().is_some_and(serde_json::Map::is_empty) {
+        anyhow::bail!("communication reconciliation needs provider evidence")
+    }
+    if resolution == "confirmed_absent"
+        && evidence.get("authoritative_absence").and_then(Value::as_bool) != Some(true)
+    {
+        anyhow::bail!("communication absence needs authoritative provider evidence")
+    }
+    let evidence_sha256 = communication_evidence_sha256(&evidence)?;
+    let evidence_json = to_json(&evidence, "Jobs communication reconciliation evidence")?;
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED") {
+                anyhow::bail!("communication reconciliation is not enabled")
+            }
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                &reconciliation.lease.account_id,
+            )?;
+            let (row, token_hash): (CommunicationActionRow, String) = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+                      FROM jobs_communication_actions
+                      WHERE account_id = ?1 AND id = ?2 AND fence = ?3
+                        AND status = 'side_effect_unknown' AND lease_kind = 'reconcile'
+                        AND lease_expires_at_ms > ?4"
+                ),
+                params![
+                    reconciliation.lease.account_id,
+                    reconciliation.lease.action_id,
+                    reconciliation.lease.fence,
+                    now,
+                ],
+                |row| Ok((sqlite_communication_row(row)?, row.get(29)?)),
+            )?;
+            let action = communication_action_from_row(row)?;
+            tx.query_row(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = ?1 AND id = ?2 AND status = 'connected'",
+                params![reconciliation.lease.account_id, action.connection_id],
+                |_| Ok(()),
+            )?;
+            validate_communication_lease_binding(&action, &reconciliation.lease, "reconcile")?;
+            let provider_operation_key: String = tx.query_row(
+                "SELECT provider_operation_key
+                   FROM jobs_communication_action_attempts
+                  WHERE account_id = ?1 AND action_id = ?2 AND id = ?3",
+                params![
+                    reconciliation.lease.account_id,
+                    reconciliation.lease.action_id,
+                    reconciliation.lease.attempt_id,
+                ],
+                |row| row.get(0),
+            )?;
+            validate_communication_reconciliation_evidence(
+                &action,
+                &provider_operation_key,
+                &evidence,
+            )?;
+            if resolution == "confirmed_absent"
+                && action.dispatched_at_ms.is_none_or(|dispatched_at| {
+                    now < dispatched_at
+                        .saturating_add(COMMUNICATION_RECONCILIATION_ABSENCE_MIN_AGE_MS)
+                })
+            {
+                anyhow::bail!("communication absence was checked before the minimum age")
+            }
+            if !execution_lease_token_matches(&token_hash, &reconciliation.lease.lease_token) {
+                anyhow::bail!("communication action lease not found")
+            }
+            let prior_absences: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_action_reconciliations
+                  WHERE account_id = ?1 AND action_id = ?2 AND attempt_id = ?3
+                    AND resolution = 'confirmed_absent'",
+                params![
+                    reconciliation.lease.account_id,
+                    reconciliation.lease.action_id,
+                    reconciliation.lease.attempt_id,
+                ],
+                |row| row.get(0),
+            )?;
+            let status = match resolution.as_str() {
+                "confirmed_sent" if action.kind == "reply" && !provider_object_id.is_empty() => {
+                    "sent"
+                }
+                "confirmed_calendar"
+                    if action.kind == "calendar" && !provider_object_id.is_empty() =>
+                {
+                    "calendar_created"
+                }
+                "confirmed_absent"
+                    if prior_absences.saturating_add(1)
+                        >= COMMUNICATION_RECONCILIATION_ABSENCE_THRESHOLD =>
+                {
+                    "needs_input"
+                }
+                "confirmed_absent" => "side_effect_unknown",
+                "inconclusive" => "side_effect_unknown",
+                _ => anyhow::bail!("invalid communication reconciliation resolution"),
+            };
+            if matches!(status, "sent" | "calendar_created") {
+                let source = communication_reply_source_sqlite_tx(
+                    &tx,
+                    &reconciliation.lease.account_id,
+                    &action,
+                )?;
+                validate_communication_success_evidence(&action, provider_object_id, &evidence)?;
+                validate_communication_provider_success_proof(
+                    &action,
+                    &provider_operation_key,
+                    provider_object_id,
+                    &evidence,
+                    source.as_ref(),
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO jobs_communication_action_reconciliations (
+                    id, account_id, action_id, attempt_id, fence, resolution,
+                    provider_object_id, evidence_sha256, evidence_json, recorded_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULLIF(?7, ''), ?8, ?9, ?10)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    reconciliation.lease.account_id,
+                    reconciliation.lease.action_id,
+                    reconciliation.lease.attempt_id,
+                    reconciliation.lease.fence,
+                    resolution,
+                    provider_object_id,
+                    evidence_sha256,
+                    evidence_json,
+                    now,
+                ],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = ?4, provider_object_id = NULLIF(?5, ''),
+                        lease_owner = NULL, lease_kind = NULL, lease_token_sha256 = NULL,
+                        lease_expires_at_ms = NULL,
+                        action_revision = action_revision + 1,
+                        active_attempt_id = CASE WHEN ?4 = 'needs_input' THEN NULL
+                                                 ELSE active_attempt_id END,
+                        approved_authority_sha256 = CASE WHEN ?4 = 'needs_input' THEN ''
+                                                         ELSE approved_authority_sha256 END,
+                        approved_grant_revision = CASE WHEN ?4 = 'needs_input' THEN 0
+                                                       ELSE approved_grant_revision END,
+                        approved_grant_sha256 = CASE WHEN ?4 = 'needs_input' THEN ''
+                                                    ELSE approved_grant_sha256 END,
+                        approved_at_ms = CASE WHEN ?4 = 'needs_input' THEN NULL
+                                              ELSE approved_at_ms END,
+                        next_attempt_at_ms = ?6,
+                        updated_at_ms = MAX(?7, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?1 AND id = ?2 AND fence = ?3
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![
+                    reconciliation.lease.account_id,
+                    reconciliation.lease.action_id,
+                    reconciliation.lease.fence,
+                    status,
+                    provider_object_id,
+                    if status == "side_effect_unknown" { now.saturating_add(5 * 60_000) } else { now },
+                    now,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("communication reconciliation lease changed")
+            }
+            let row = tx.query_row(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}
+                       FROM jobs_communication_actions WHERE account_id = ?1 AND id = ?2"
+                ),
+                params![reconciliation.lease.account_id, reconciliation.lease.action_id],
+                sqlite_communication_row,
+            )?;
+            tx.commit()?;
+            communication_action_from_row(row)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED") {
+                anyhow::bail!("communication reconciliation is not enabled")
+            }
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                &reconciliation.lease.account_id,
+            )?;
+            let row = tx.query_opt(
+                &format!(
+                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+                      FROM jobs_communication_actions
+                      WHERE account_id = $1 AND id = $2 AND fence = $3
+                        AND status = 'side_effect_unknown' AND lease_kind = 'reconcile'
+                        AND lease_expires_at_ms > $4
+                      FOR UPDATE"
+                ),
+                &[
+                    &reconciliation.lease.account_id,
+                    &reconciliation.lease.action_id,
+                    &reconciliation.lease.fence,
+                    &now,
+                ],
+            )?.ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
+            let token_hash: String = row.get(29);
+            let action = communication_action_from_row(postgres_communication_row(row))?;
+            tx.query_one(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 AND status = 'connected' FOR SHARE",
+                &[&reconciliation.lease.account_id, &action.connection_id],
+            )?;
+            validate_communication_lease_binding(&action, &reconciliation.lease, "reconcile")?;
+            let provider_operation_key: String = tx
+                .query_one(
+                    "SELECT provider_operation_key
+                       FROM jobs_communication_action_attempts
+                      WHERE account_id = $1 AND action_id = $2 AND id = $3",
+                    &[
+                        &reconciliation.lease.account_id,
+                        &reconciliation.lease.action_id,
+                        &reconciliation.lease.attempt_id,
+                    ],
+                )?
+                .get(0);
+            validate_communication_reconciliation_evidence(
+                &action,
+                &provider_operation_key,
+                &evidence,
+            )?;
+            if resolution == "confirmed_absent"
+                && action.dispatched_at_ms.is_none_or(|dispatched_at| {
+                    now < dispatched_at
+                        .saturating_add(COMMUNICATION_RECONCILIATION_ABSENCE_MIN_AGE_MS)
+                })
+            {
+                anyhow::bail!("communication absence was checked before the minimum age")
+            }
+            if !execution_lease_token_matches(&token_hash, &reconciliation.lease.lease_token) {
+                anyhow::bail!("communication action lease not found")
+            }
+            let prior_absences: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_action_reconciliations
+                      WHERE account_id = $1 AND action_id = $2 AND attempt_id = $3
+                        AND resolution = 'confirmed_absent'",
+                    &[
+                        &reconciliation.lease.account_id,
+                        &reconciliation.lease.action_id,
+                        &reconciliation.lease.attempt_id,
+                    ],
+                )?
+                .get(0);
+            let status = match resolution.as_str() {
+                "confirmed_sent" if action.kind == "reply" && !provider_object_id.is_empty() => {
+                    "sent"
+                }
+                "confirmed_calendar"
+                    if action.kind == "calendar" && !provider_object_id.is_empty() =>
+                {
+                    "calendar_created"
+                }
+                "confirmed_absent"
+                    if prior_absences.saturating_add(1)
+                        >= COMMUNICATION_RECONCILIATION_ABSENCE_THRESHOLD =>
+                {
+                    "needs_input"
+                }
+                "confirmed_absent" => "side_effect_unknown",
+                "inconclusive" => "side_effect_unknown",
+                _ => anyhow::bail!("invalid communication reconciliation resolution"),
+            };
+            if matches!(status, "sent" | "calendar_created") {
+                let source = communication_reply_source_postgres_tx(
+                    &mut tx,
+                    &reconciliation.lease.account_id,
+                    &action,
+                )?;
+                validate_communication_success_evidence(&action, provider_object_id, &evidence)?;
+                validate_communication_provider_success_proof(
+                    &action,
+                    &provider_operation_key,
+                    provider_object_id,
+                    &evidence,
+                    source.as_ref(),
+                )?;
+            }
+            tx.execute(
+                "INSERT INTO jobs_communication_action_reconciliations (
+                    id, account_id, action_id, attempt_id, fence, resolution,
+                    provider_object_id, evidence_sha256, evidence_json, recorded_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, $9, $10)",
+                &[
+                    &uuid::Uuid::new_v4().to_string(),
+                    &reconciliation.lease.account_id,
+                    &reconciliation.lease.action_id,
+                    &reconciliation.lease.attempt_id,
+                    &reconciliation.lease.fence,
+                    &resolution,
+                    &provider_object_id,
+                    &evidence_sha256,
+                    &evidence_json,
+                    &now,
+                ],
+            )?;
+            let next_attempt_at = if status == "side_effect_unknown" {
+                now.saturating_add(5 * 60_000)
+            } else {
+                now
+            };
+            let row = tx.query_one(
+                &format!(
+                    "UPDATE jobs_communication_actions
+                        SET status = $4, provider_object_id = NULLIF($5, ''),
+                            lease_owner = NULL, lease_kind = NULL,
+                            lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                            action_revision = action_revision + 1,
+                            active_attempt_id = CASE WHEN $4 = 'needs_input' THEN NULL
+                                                     ELSE active_attempt_id END,
+                            approved_authority_sha256 = CASE WHEN $4 = 'needs_input' THEN ''
+                                                             ELSE approved_authority_sha256 END,
+                            approved_grant_revision = CASE WHEN $4 = 'needs_input' THEN 0
+                                                           ELSE approved_grant_revision END,
+                            approved_grant_sha256 = CASE WHEN $4 = 'needs_input' THEN ''
+                                                        ELSE approved_grant_sha256 END,
+                            approved_at_ms = CASE WHEN $4 = 'needs_input' THEN NULL
+                                                  ELSE approved_at_ms END,
+                            next_attempt_at_ms = $6,
+                            updated_at_ms = GREATEST($7, CASE
+                              WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                              ELSE updated_at_ms END)
+                      WHERE account_id = $1 AND id = $2 AND fence = $3
+                        AND action_revision < 9007199254740991
+                        AND updated_at_ms < 9223372036854775807
+                      RETURNING {COMMUNICATION_ACTION_SELECT}"
+                ),
+                &[
+                    &reconciliation.lease.account_id,
+                    &reconciliation.lease.action_id,
+                    &reconciliation.lease.fence,
+                    &status,
                     &provider_object_id,
                     &next_attempt_at,
                     &now,
                 ],
             )?;
+            tx.commit()?;
             communication_action_from_row(postgres_communication_row(row))
         }
     })

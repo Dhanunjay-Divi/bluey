@@ -4,17 +4,24 @@ import { describe, expect, it } from "vitest";
 import type {
   ApplicationEvidence,
   AtsCertificationSummary,
+  CommunicationActionDetail,
+  CommunicationActionSummary,
   JobApplication,
   JobEligibilityDecision,
   RunnerAvailability,
 } from "../types";
+import { reviewedCommunicationPayload } from "../lib/communication-actions";
 import {
   answerInterventionActionLabel,
+  CommunicationActionReview,
+  CommunicationActionsSection,
   applicationCountFor,
   applicationEligibility,
   applicationNeedsReview,
+  communicationActionRowStatus,
   hasVerifiedSubmissionEvidence,
   hasAvailableRunner,
+  latestCommunicationAction,
   ReceiptView,
   runnerUnavailableReason,
 } from "./ApplicationsView";
@@ -155,6 +162,238 @@ describe("answer intervention review", () => {
   it("labels the answer action as a save-for-review step", () => {
     expect(answerInterventionActionLabel(false)).toBe("Save answer for review");
     expect(answerInterventionActionLabel(true)).toBe("Saving...");
+  });
+});
+
+describe("reviewed communication actions", () => {
+  const action = (
+    overrides: Partial<CommunicationActionDetail> = {},
+  ): CommunicationActionDetail => ({
+    id: "action-one",
+    application_id: "application-one",
+    connection_id: "connection-one",
+    source_message_id: "message-one",
+    kind: "reply",
+    provider: "gmail",
+    payload_sha256: "a".repeat(64),
+    action_revision: 1,
+    status: "awaiting_approval",
+    execution_available: true,
+    execution_unavailable_reason: "",
+    approved_at_ms: null,
+    dispatched_at_ms: null,
+    created_at_ms: 1_786_000_000_000,
+    updated_at_ms: 1_786_000_000_000,
+    connection_account_label: "candidate@gmail.com",
+    source_context: {
+      sender: "recruiter@example.org",
+      reply_target: "recruiter@example.org",
+      subject: "Interview availability",
+      received_at_ms: 1_785_999_000_000,
+    },
+    payload: {
+      to: "recruiter@example.org",
+      subject: "Interview availability",
+      body_text: "Tuesday afternoon works for me.\n\nThank you,\nTaylor",
+    },
+    ...overrides,
+  });
+
+  const renderReview = (
+    reviewedAction: CommunicationActionDetail,
+    reviewed = false,
+  ): string => {
+    const payload = reviewedCommunicationPayload(reviewedAction);
+    return renderToStaticMarkup(createElement(CommunicationActionReview, {
+      action: reviewedAction,
+      payload,
+      reviewed,
+      mutation: "",
+      error: "",
+      notice: "",
+      onReviewedChange: () => undefined,
+      onApprove: () => undefined,
+      onCancel: () => undefined,
+      onClose: () => undefined,
+    }));
+  };
+
+  it("keeps list cards payload-free while exposing status and inspect control", () => {
+    const { payload: _payload, ...summary } = action();
+    expect(_payload).toBeDefined();
+    const html = renderToStaticMarkup(createElement(CommunicationActionsSection, {
+      actions: [summary as CommunicationActionSummary],
+      loading: false,
+      error: "",
+      opening: false,
+      onReview: () => undefined,
+    }));
+
+    expect(html).toContain("Recruiter reply");
+    expect(html).toContain("Needs approval");
+    expect(html).toContain("Review draft");
+    expect(html).toContain("Review Recruiter reply draft in Gmail");
+    expect(html).not.toContain("Tuesday afternoon works for me");
+    expect(html).not.toContain("recruiter@example.org");
+  });
+
+  it("renders the exact full reply and requires explicit review before approval", () => {
+    const html = renderReview(action());
+
+    expect(html).toContain("recruiter@example.org");
+    expect(html).toContain("Interview availability");
+    expect(html).toContain("Tuesday afternoon works for me.\n\nThank you,\nTaylor");
+    expect(html).toContain("candidate@gmail.com");
+    expect(html).toContain("Original sender");
+    expect(html).toContain("Reply address");
+    expect(html).toContain(
+      "I reviewed the connected account, original sender, reply address, subject, "
+        + "received time, recipient, and full reply.",
+    );
+    expect(html).toContain("Approve reply");
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*Approve reply/s);
+    expect(html).toContain("This draft is read-only");
+  });
+
+  it("renders the server-owned unavailable reason beside a disabled approval", () => {
+    const html = renderReview(action({
+      execution_available: false,
+      execution_unavailable_reason:
+        "Sending from connected inboxes is not available in this release.",
+    }));
+
+    expect(html).toContain("Approval unavailable");
+    expect(html).toContain("Sending from connected inboxes is not available in this release.");
+    expect(html).toContain("Approve unavailable");
+    expect(html).not.toContain("I reviewed the recipient, subject, and full message.");
+  });
+
+  it("renders the exact server reason when an approved action becomes unavailable", () => {
+    const html = renderReview(action({
+      status: "approved",
+      execution_available: false,
+      execution_unavailable_reason: "Reconnect the exact mailbox before continuing.",
+      approved_at_ms: 1_786_000_000_001,
+      updated_at_ms: 1_786_000_000_001,
+    }));
+
+    expect(html).toContain("Approved · unavailable");
+    expect(html).toContain("Reconnect the exact mailbox before continuing.");
+    expect(html).toContain("message has not been completed");
+  });
+
+  it("renders calendar times in the explicit action time zone and every attendee", () => {
+    const html = renderReview(action({
+      kind: "calendar",
+      provider: "google_calendar",
+      source_message_id: null,
+      source_context: null,
+      payload: {
+        title: "Interview with Acme",
+        starts_at_ms: 2_000_000_000_000,
+        ends_at_ms: 2_000_003_600_000,
+        time_zone: "America/New_York",
+        attendees: ["candidate@example.org", "recruiter@example.org"],
+      },
+    }));
+
+    expect(html).toContain("Interview with Acme");
+    expect(html).toContain("America/New_York");
+    expect(html).toContain("candidate@example.org");
+    expect(html).toContain("recruiter@example.org");
+    expect(html).toContain(
+      "The provider will email an invitation to every listed attendee when this event is created.",
+    );
+    expect(html).toContain(
+      "understand the provider will email every listed attendee",
+    );
+    expect(html).toContain("Approve calendar event");
+  });
+
+  it("states that a calendar draft with no attendees sends no invitations", () => {
+    const html = renderReview(action({
+      kind: "calendar",
+      provider: "google_calendar",
+      source_message_id: null,
+      source_context: null,
+      payload: {
+        title: "Private interview hold",
+        starts_at_ms: 2_000_000_000_000,
+        ends_at_ms: 2_000_003_600_000,
+        time_zone: "America/New_York",
+        attendees: [],
+      },
+    }));
+
+    expect(html).toContain("No attendees are listed, so no invitation will be sent.");
+    expect(html).toContain(
+      "understand no invitation will be sent because there are no attendees",
+    );
+  });
+
+  it("offers a fresh reviewed approval after provider-authoritative absence", () => {
+    const html = renderReview(action({ status: "needs_input" }));
+
+    expect(html).toContain("Review again");
+    expect(html).toContain("new approval revision");
+    expect(html).toContain("never retry automatically");
+    expect(html).toContain("Approve reply");
+    expect(html).toContain("Cancel draft");
+  });
+
+  it("never offers approval, cancellation, or retry for an uncertain side effect", () => {
+    const html = renderReview(action({ status: "side_effect_unknown" }));
+
+    expect(html).toContain("Outcome unknown");
+    expect(html).toContain("Do not retry");
+    expect(html).not.toContain("Approve reply");
+    expect(html).not.toContain("Cancel draft");
+  });
+
+  it("uses provider-authoritative truth in terminal and uncertain application rows", () => {
+    const sent = action({ status: "sent" });
+    const calendarCreated = action({
+      kind: "calendar",
+      provider: "google_calendar",
+      source_message_id: null,
+      source_context: null,
+      status: "calendar_created",
+    });
+    const uncertain = action({ status: "side_effect_unknown" });
+
+    expect(communicationActionRowStatus(sent)).toContain("provider confirmed the message");
+    expect(communicationActionRowStatus(calendarCreated)).toContain(
+      "provider confirmed the calendar event",
+    );
+    expect(communicationActionRowStatus(uncertain)).toContain("Do not retry");
+    for (const value of [sent, calendarCreated, uncertain]) {
+      expect(communicationActionRowStatus(value)).not.toContain("Nothing sent");
+    }
+  });
+
+  it("does not call a post-reconciliation cancellation pre-dispatch", () => {
+    const cancelled = action({
+      status: "cancelled",
+      dispatched_at_ms: 1_786_000_000_001,
+      updated_at_ms: 1_786_000_000_002,
+    });
+
+    expect(communicationActionRowStatus(cancelled)).toContain(
+      "Provider evidence showed no message was created",
+    );
+    expect(communicationActionRowStatus(cancelled)).not.toContain("before dispatch");
+  });
+
+  it("shows the latest communication action instead of an older pending draft", () => {
+    const pending = action({ id: "pending", created_at_ms: 100, updated_at_ms: 100 });
+    const sent = action({
+      id: "sent",
+      status: "sent",
+      created_at_ms: 200,
+      updated_at_ms: 300,
+    });
+
+    expect(latestCommunicationAction([pending, sent], "application-one")?.id).toBe("sent");
   });
 });
 

@@ -3693,6 +3693,38 @@ pub fn save_mailbox_connection_with_credential(
 
     let mut stored_credential = credential.clone();
     stored_credential.connection_id = mailbox.id.clone();
+    stored_credential.scopes = stored_credential
+        .scopes
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    stored_credential.scopes.sort();
+    stored_credential.scopes.dedup();
+    stored_credential.capabilities = stored_credential
+        .capabilities
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    stored_credential.capabilities.sort();
+    stored_credential.capabilities.dedup();
+    if stored_credential.grant_revision < 0 {
+        anyhow::bail!("provider grant revision is invalid")
+    }
+    if stored_credential.grant_revision > 0 {
+        let computed = communication_grant_sha256(&stored_credential)?;
+        if !stored_credential.grant_sha256.is_empty()
+            && stored_credential.grant_sha256 != computed
+        {
+            anyhow::bail!("provider grant digest is invalid")
+        }
+        stored_credential.grant_sha256 = computed;
+    } else if !stored_credential.grant_sha256.is_empty() {
+        anyhow::bail!("legacy provider credential cannot carry a grant digest")
+    }
     if stored_credential.created_at_ms == 0 {
         stored_credential.created_at_ms = now;
     }
@@ -3719,6 +3751,29 @@ pub fn save_mailbox_connection_with_credential(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
+            )?;
+            let was_disconnected = tx
+                .query_row(
+                    "SELECT status FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, mailbox.id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .is_some_and(|status| status == "disconnected");
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, mailbox.id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
             if is_new {
                 let active_count: i64 = tx.query_row(
                     "SELECT COUNT(*) FROM jobs_mailbox_connections
@@ -3788,16 +3843,42 @@ pub fn save_mailbox_connection_with_credential(
                     sync_state.updated_at_ms,
                 ],
             )?;
+            if was_disconnected {
+                tx.execute(
+                    "DELETE FROM jobs_communication_write_fences
+                      WHERE account_id = ?1 AND connection_id = ?2
+                        AND reason = 'mailbox_disconnect'",
+                    params![account_id, mailbox.id],
+                )?;
+            }
             tx.commit()?;
             Ok((mailbox, stored_credential))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            tx.query_one(
-                "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
-                &[&account_id],
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
             )?;
+            let was_disconnected = tx
+                .query_opt(
+                    "SELECT status FROM jobs_mailbox_connections
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &mailbox.id],
+                )?
+                .is_some_and(|row| row.get::<_, String>(0) == "disconnected");
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &mailbox.id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
             if is_new {
                 let active_count: i64 = tx
                     .query_one(
@@ -3868,6 +3949,225 @@ pub fn save_mailbox_connection_with_credential(
                     &sync_state.updated_at_ms,
                 ],
             )?;
+            if was_disconnected {
+                tx.execute(
+                    "DELETE FROM jobs_communication_write_fences
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND reason = 'mailbox_disconnect'",
+                    &[&account_id, &mailbox.id],
+                )?;
+            }
+            tx.commit()?;
+            Ok((mailbox, stored_credential))
+        }
+    })
+}
+
+pub fn save_mailbox_connection_with_credential_cas(
+    pool: &DbPool,
+    account_id: &str,
+    connection: &MailboxConnection,
+    credential: &JobsProviderCredential,
+    expected_grant_revision: i64,
+) -> Result<(MailboxConnection, JobsProviderCredential)> {
+    if connection.id.trim().is_empty()
+        || credential.connection_id != connection.id
+        || connection.provider != credential.provider
+        || !matches!(connection.provider.as_str(), "gmail" | "outlook")
+        || expected_grant_revision < 0
+        || credential.grant_revision != expected_grant_revision.saturating_add(1)
+    {
+        anyhow::bail!("provider write-grant CAS request is invalid")
+    }
+    let mut mailbox = connection.clone();
+    mailbox.status = "connected".to_string();
+    mailbox.capabilities = credential.capabilities.clone();
+    mailbox.capabilities.sort();
+    mailbox.capabilities.dedup();
+    mailbox.updated_at_ms = now_ms();
+
+    let mut stored_credential = credential.clone();
+    stored_credential.scopes.sort();
+    stored_credential.scopes.dedup();
+    stored_credential.capabilities = mailbox.capabilities.clone();
+    stored_credential.grant_sha256 = communication_grant_sha256(&stored_credential)?;
+    stored_credential.updated_at_ms = mailbox.updated_at_ms;
+    let subject_hash = private_lookup_hash(
+        &format!("mailbox:{}", mailbox.provider),
+        stored_credential.provider_subject.trim(),
+    )?;
+    let mailbox_json = to_json(&mailbox, "mailbox connection")?;
+    let credential_json = to_json(&stored_credential, "Jobs provider credential")?;
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
+            )?;
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, mailbox.id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            let raw: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_mailbox_connections mailbox
+                       JOIN jobs_provider_credentials credential
+                         ON credential.account_id = mailbox.account_id
+                        AND credential.connection_id = mailbox.id
+                      WHERE mailbox.account_id = ?1 AND mailbox.id = ?2
+                        AND mailbox.provider = ?3 AND mailbox.provider_subject_hash = ?4
+                        AND mailbox.status = 'connected'
+                        AND credential.provider = ?3
+                        AND credential.provider_subject_hash = ?4",
+                    params![account_id, mailbox.id, mailbox.provider, subject_hash],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (current_mailbox_json, current_credential_json) = raw
+                .ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
+            let current_mailbox: MailboxConnection =
+                parse_json(current_mailbox_json, "mailbox connection")?;
+            let current: JobsProviderCredential =
+                parse_json(current_credential_json, "Jobs provider credential")?;
+            if current.grant_revision != expected_grant_revision
+                || current.provider_subject != stored_credential.provider_subject
+                || current_mailbox.status != "connected"
+                || current_mailbox.provider != mailbox.provider
+            {
+                anyhow::bail!("provider grant revision changed during authorization")
+            }
+            if expected_grant_revision > 0
+                && (current.grant_sha256.len() != 64
+                    || communication_grant_sha256(&current)? != current.grant_sha256)
+            {
+                anyhow::bail!("current provider grant digest is invalid")
+            }
+            let mailbox_updated = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'connected', connection_json = ?4, updated_at_ms = ?5
+                  WHERE account_id = ?1 AND id = ?2 AND provider = ?3
+                    AND provider_subject_hash = ?6 AND status = 'connected'",
+                params![
+                    account_id,
+                    mailbox.id,
+                    mailbox.provider,
+                    mailbox_json,
+                    mailbox.updated_at_ms,
+                    subject_hash,
+                ],
+            )?;
+            let credential_updated = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = ?5, updated_at_ms = ?6
+                  WHERE account_id = ?1 AND connection_id = ?2 AND provider = ?3
+                    AND provider_subject_hash = ?4",
+                params![
+                    account_id,
+                    stored_credential.connection_id,
+                    stored_credential.provider,
+                    subject_hash,
+                    credential_json,
+                    stored_credential.updated_at_ms,
+                ],
+            )?;
+            if mailbox_updated != 1 || credential_updated != 1 {
+                anyhow::bail!("provider grant CAS target changed")
+            }
+            tx.commit()?;
+            Ok((mailbox, stored_credential))
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
+            )?;
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &mailbox.id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            let row = tx
+                .query_opt(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_mailbox_connections mailbox
+                       JOIN jobs_provider_credentials credential
+                         ON credential.account_id = mailbox.account_id
+                        AND credential.connection_id = mailbox.id
+                      WHERE mailbox.account_id = $1 AND mailbox.id = $2
+                        AND mailbox.provider = $3 AND mailbox.provider_subject_hash = $4
+                        AND mailbox.status = 'connected'
+                        AND credential.provider = $3
+                        AND credential.provider_subject_hash = $4
+                      FOR UPDATE OF mailbox, credential",
+                    &[&account_id, &mailbox.id, &mailbox.provider, &subject_hash],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
+            let current_mailbox: MailboxConnection =
+                parse_json(row.get(0), "mailbox connection")?;
+            let current: JobsProviderCredential =
+                parse_json(row.get(1), "Jobs provider credential")?;
+            if current.grant_revision != expected_grant_revision
+                || current.provider_subject != stored_credential.provider_subject
+                || current_mailbox.status != "connected"
+                || current_mailbox.provider != mailbox.provider
+            {
+                anyhow::bail!("provider grant revision changed during authorization")
+            }
+            if expected_grant_revision > 0
+                && (current.grant_sha256.len() != 64
+                    || communication_grant_sha256(&current)? != current.grant_sha256)
+            {
+                anyhow::bail!("current provider grant digest is invalid")
+            }
+            let mailbox_updated = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'connected', connection_json = $4, updated_at_ms = $5
+                  WHERE account_id = $1 AND id = $2 AND provider = $3
+                    AND provider_subject_hash = $6 AND status = 'connected'",
+                &[
+                    &account_id,
+                    &mailbox.id,
+                    &mailbox.provider,
+                    &mailbox_json,
+                    &mailbox.updated_at_ms,
+                    &subject_hash,
+                ],
+            )?;
+            let credential_updated = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = $5, updated_at_ms = $6
+                  WHERE account_id = $1 AND connection_id = $2 AND provider = $3
+                    AND provider_subject_hash = $4",
+                &[
+                    &account_id,
+                    &stored_credential.connection_id,
+                    &stored_credential.provider,
+                    &subject_hash,
+                    &credential_json,
+                    &stored_credential.updated_at_ms,
+                ],
+            )?;
+            if mailbox_updated != 1 || credential_updated != 1 {
+                anyhow::bail!("provider grant CAS target changed")
+            }
             tx.commit()?;
             Ok((mailbox, stored_credential))
         }
@@ -3991,15 +4291,188 @@ pub fn delete_mailbox_connection(
     account_id: &str,
     connection_id: &str,
 ) -> Result<bool> {
+    let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_mailbox_connections WHERE account_id = ?1 AND id = ?2",
-            params![account_id, connection_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_mailbox_connections WHERE account_id = $1 AND id = $2",
-            &[&account_id, &connection_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
+            )?;
+            let raw: Option<String> = tx
+                .query_row(
+                    "SELECT connection_json FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, connection_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(raw) = raw else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO jobs_communication_write_fences (
+                    account_id, connection_id, reason, created_at_ms
+                 ) VALUES (?1, ?2, 'mailbox_disconnect', ?3)",
+                params![account_id, connection_id, now],
+            )?;
+            let ambiguous: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )?;
+            if ambiguous > 0 {
+                tx.commit()?;
+                anyhow::bail!(
+                    "mailbox cannot be disconnected while communication outcome is unresolved"
+                )
+            }
+            let exhausted: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND (action_revision >= 9007199254740991
+                         OR updated_at_ms >= 9223372036854775807)",
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )?;
+            if exhausted > 0 {
+                anyhow::bail!("mailbox communication revision authority is exhausted")
+            }
+            let mut mailbox: MailboxConnection = parse_json(raw, "mailbox connection")?;
+            mailbox.status = "disconnected".to_string();
+            mailbox.capabilities.clear();
+            mailbox.updated_at_ms = now;
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'cancelled', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        active_attempt_id = NULL, approved_authority_sha256 = '',
+                        approved_grant_revision = 0, approved_grant_sha256 = '',
+                        action_revision = action_revision + 1,
+                        updated_at_ms = MAX(?3, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                params![account_id, connection_id, now],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_credentials
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![account_id, connection_id],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_sync_state
+                  WHERE account_id = ?1 AND connection_id = ?2",
+                params![account_id, connection_id],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'disconnected', connection_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2",
+                params![account_id, connection_id, payload, now],
+            )?;
+            tx.commit()?;
+            Ok(changed == 1)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
+            )?;
+            let Some(row) = tx.query_opt(
+                "SELECT connection_json FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &connection_id],
+            )? else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            tx.execute(
+                "INSERT INTO jobs_communication_write_fences (
+                    account_id, connection_id, reason, created_at_ms
+                 ) VALUES ($1, $2, 'mailbox_disconnect', $3)
+                 ON CONFLICT(account_id, connection_id) DO NOTHING",
+                &[&account_id, &connection_id, &now],
+            )?;
+            let ambiguous: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*) FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &connection_id],
+                )?
+                .get(0);
+            if ambiguous > 0 {
+                tx.commit()?;
+                anyhow::bail!(
+                    "mailbox cannot be disconnected while communication outcome is unresolved"
+                )
+            }
+            let exhausted: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                        AND (action_revision >= 9007199254740991
+                             OR updated_at_ms >= 9223372036854775807)",
+                    &[&account_id, &connection_id],
+                )?
+                .get(0);
+            if exhausted > 0 {
+                anyhow::bail!("mailbox communication revision authority is exhausted")
+            }
+            let mut mailbox: MailboxConnection =
+                parse_json(row.get(0), "mailbox connection")?;
+            mailbox.status = "disconnected".to_string();
+            mailbox.capabilities.clear();
+            mailbox.updated_at_ms = now;
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            tx.execute(
+                "UPDATE jobs_communication_actions
+                    SET status = 'cancelled', lease_owner = NULL, lease_kind = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        active_attempt_id = NULL, approved_authority_sha256 = '',
+                        approved_grant_revision = 0, approved_grant_sha256 = '',
+                        action_revision = action_revision + 1,
+                        updated_at_ms = GREATEST($3, CASE
+                          WHEN updated_at_ms < 9223372036854775807 THEN updated_at_ms + 1
+                          ELSE updated_at_ms END)
+                  WHERE account_id = $1 AND connection_id = $2
+                    AND status IN ('awaiting_approval', 'needs_input', 'approved')
+                    AND action_revision < 9007199254740991
+                    AND updated_at_ms < 9223372036854775807",
+                &[&account_id, &connection_id, &now],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_credentials
+                  WHERE account_id = $1 AND connection_id = $2",
+                &[&account_id, &connection_id],
+            )?;
+            tx.execute(
+                "DELETE FROM jobs_provider_sync_state
+                  WHERE account_id = $1 AND connection_id = $2",
+                &[&account_id, &connection_id],
+            )?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'disconnected', connection_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2",
+                &[&account_id, &connection_id, &payload, &now],
+            )?;
+            tx.commit()?;
+            Ok(changed == 1)
+        }
     })
 }
 
@@ -4008,38 +4481,142 @@ pub fn mark_mailbox_reauthorization_required(
     account_id: &str,
     connection_id: &str,
 ) -> Result<bool> {
-    let Some(mut mailbox) = mailbox_connection(pool, account_id, connection_id)? else {
-        return Ok(false);
-    };
-    if mailbox.status == "reauthorization_required" {
-        return Ok(true);
-    }
-    mailbox.status = "reauthorization_required".to_string();
-    mailbox.updated_at_ms = now_ms();
-    let payload = to_json(&mailbox, "mailbox connection")?;
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "UPDATE jobs_mailbox_connections
-                SET status = 'reauthorization_required',
-                    connection_json = ?3,
-                    updated_at_ms = ?4
-              WHERE account_id = ?1 AND id = ?2",
-            params![account_id, connection_id, payload, mailbox.updated_at_ms],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "UPDATE jobs_mailbox_connections
-                SET status = 'reauthorization_required',
-                    connection_json = $3,
-                    updated_at_ms = $4
-              WHERE account_id = $1 AND id = $2",
-            &[
-                &account_id,
-                &connection_id,
-                &payload,
-                &mailbox.updated_at_ms,
-            ],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let current: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT status, connection_json, updated_at_ms
+                       FROM jobs_mailbox_connections
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, connection_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((status, payload, updated_at_ms)) = current else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!(
+                    "mailbox authorization cannot change while communication is unresolved"
+                )
+            }
+            if status == "reauthorization_required" {
+                tx.commit()?;
+                return Ok(true);
+            }
+            if status != "connected" {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let mut mailbox: MailboxConnection = parse_json(payload, "mailbox connection")?;
+            if mailbox.id != connection_id || mailbox.status != status {
+                anyhow::bail!("mailbox connection authority is inconsistent")
+            }
+            mailbox.status = "reauthorization_required".to_string();
+            mailbox.updated_at_ms = now_ms().max(updated_at_ms.saturating_add(1));
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'reauthorization_required',
+                        connection_json = ?3,
+                        updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2 AND status = 'connected'",
+                params![account_id, connection_id, payload, mailbox.updated_at_ms],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("mailbox authorization authority changed")
+            }
+            tx.commit()?;
+            Ok(true)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let current = tx.query_opt(
+                "SELECT status, connection_json, updated_at_ms
+                   FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                &[&account_id, &connection_id],
+            )?;
+            let Some(current) = current else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            let status: String = current.get(0);
+            let payload: String = current.get(1);
+            let updated_at_ms: i64 = current.get(2);
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &connection_id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!(
+                    "mailbox authorization cannot change while communication is unresolved"
+                )
+            }
+            if status == "reauthorization_required" {
+                tx.commit()?;
+                return Ok(true);
+            }
+            if status != "connected" {
+                tx.commit()?;
+                return Ok(false);
+            }
+            let mut mailbox: MailboxConnection = parse_json(payload, "mailbox connection")?;
+            if mailbox.id != connection_id || mailbox.status != status {
+                anyhow::bail!("mailbox connection authority is inconsistent")
+            }
+            mailbox.status = "reauthorization_required".to_string();
+            mailbox.updated_at_ms = now_ms().max(updated_at_ms.saturating_add(1));
+            let payload = to_json(&mailbox, "mailbox connection")?;
+            let changed = tx.execute(
+                "UPDATE jobs_mailbox_connections
+                    SET status = 'reauthorization_required',
+                        connection_json = $3,
+                        updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2 AND status = 'connected'",
+                &[&account_id, &connection_id, &payload, &mailbox.updated_at_ms],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("mailbox authorization authority changed")
+            }
+            tx.commit()?;
+            Ok(true)
+        }
     })
+}
+
+fn canonical_jobs_oauth_state_token(state_token: &str) -> Result<&str> {
+    if state_token.len() < 32
+        || state_token.len() > 512
+        || state_token.trim() != state_token
+        || !state_token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        anyhow::bail!("OAuth state token is invalid")
+    }
+    Ok(state_token)
 }
 
 pub fn save_jobs_oauth_state(
@@ -4048,22 +4625,25 @@ pub fn save_jobs_oauth_state(
     state_token: &str,
     state: &JobsOAuthState,
 ) -> Result<()> {
-    if state_token.trim().len() < 32 {
-        anyhow::bail!("OAuth state token is too short")
-    }
+    let state_token = canonical_jobs_oauth_state_token(state_token)?;
     if !matches!(state.provider.as_str(), "gmail" | "outlook") {
         anyhow::bail!("unsupported Jobs OAuth provider")
     }
-    let state_hash = private_lookup_hash("jobs-oauth-state", state_token.trim())?;
+    let state_hash = private_lookup_hash("jobs-oauth-state", state_token)?;
     let payload = to_json(state, "Jobs OAuth state")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
-                "DELETE FROM jobs_oauth_states WHERE expires_at_ms <= ?1",
-                params![now_ms()],
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
             )?;
-            conn.execute(
+            tx.execute(
+                "DELETE FROM jobs_oauth_states
+                  WHERE account_id = ?1 AND expires_at_ms <= ?2",
+                params![account_id, now_ms()],
+            )?;
+            let inserted = tx.execute(
                 "INSERT INTO jobs_oauth_states (
                     state_hash, account_id, provider, state_json, expires_at_ms, created_at_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -4077,16 +4657,24 @@ pub fn save_jobs_oauth_state(
                     state.created_at_ms,
                 ],
             )?;
+            if inserted != 1 {
+                anyhow::bail!("OAuth state token already exists")
+            }
+            tx.commit()?;
             Ok(())
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            tx.execute(
-                "DELETE FROM jobs_oauth_states WHERE expires_at_ms <= $1",
-                &[&now_ms()],
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
             )?;
             tx.execute(
+                "DELETE FROM jobs_oauth_states
+                  WHERE account_id = $1 AND expires_at_ms <= $2",
+                &[&account_id, &now_ms()],
+            )?;
+            let inserted = tx.execute(
                 "INSERT INTO jobs_oauth_states (
                     state_hash, account_id, provider, state_json, expires_at_ms, created_at_ms
                  ) VALUES ($1, $2, $3, $4, $5, $6)
@@ -4100,6 +4688,9 @@ pub fn save_jobs_oauth_state(
                     &state.created_at_ms,
                 ],
             )?;
+            if inserted != 1 {
+                anyhow::bail!("OAuth state token already exists")
+            }
             tx.commit()?;
             Ok(())
         }
@@ -4110,7 +4701,8 @@ pub fn consume_jobs_oauth_state(
     pool: &DbPool,
     state_token: &str,
 ) -> Result<Option<(String, JobsOAuthState)>> {
-    let state_hash = private_lookup_hash("jobs-oauth-state", state_token.trim())?;
+    let state_token = canonical_jobs_oauth_state_token(state_token)?;
+    let state_hash = private_lookup_hash("jobs-oauth-state", state_token)?;
     let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -4168,6 +4760,37 @@ pub fn save_jobs_provider_credential(
     account_id: &str,
     credential: &JobsProviderCredential,
 ) -> Result<JobsProviderCredential> {
+    let mut credential = credential.clone();
+    credential.scopes = credential
+        .scopes
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    credential.scopes.sort();
+    credential.scopes.dedup();
+    credential.capabilities = credential
+        .capabilities
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect();
+    credential.capabilities.sort();
+    credential.capabilities.dedup();
+    if credential.grant_revision < 0 {
+        anyhow::bail!("provider grant revision is invalid")
+    }
+    if credential.grant_revision > 0 {
+        let computed = communication_grant_sha256(&credential)?;
+        if !credential.grant_sha256.is_empty() && credential.grant_sha256 != computed {
+            anyhow::bail!("provider grant digest is invalid")
+        }
+        credential.grant_sha256 = computed;
+    } else if !credential.grant_sha256.is_empty() {
+        anyhow::bail!("legacy provider credential cannot carry a grant digest")
+    }
     if !matches!(credential.provider.as_str(), "gmail" | "outlook") {
         anyhow::bail!("unsupported Jobs credential provider")
     }
@@ -4181,10 +4804,33 @@ pub fn save_jobs_provider_credential(
         &format!("mailbox:{}", credential.provider),
         credential.provider_subject.trim(),
     )?;
-    let payload = to_json(credential, "Jobs provider credential")?;
+    let payload = to_json(&credential, "Jobs provider credential")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
+            )?;
+            tx.query_row(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = ?1 AND id = ?2 AND provider = ?3
+                    AND status = 'connected'",
+                params![account_id, credential.connection_id, credential.provider],
+                |_| Ok(()),
+            )?;
+            let unresolved_actions: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs_communication_actions
+                  WHERE account_id = ?1 AND connection_id = ?2
+                    AND status IN ('dispatching', 'side_effect_unknown')",
+                params![account_id, credential.connection_id],
+                |row| row.get(0),
+            )?;
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            tx.execute(
                 "INSERT INTO jobs_provider_credentials (
                     connection_id, account_id, provider, provider_subject_hash,
                     credential_json, created_at_ms, updated_at_ms
@@ -4205,10 +4851,34 @@ pub fn save_jobs_provider_credential(
                     credential.updated_at_ms,
                 ],
             )?;
-            Ok(credential.clone())
+            tx.commit()?;
+            Ok(credential)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
+            )?;
+            tx.query_one(
+                "SELECT 1 FROM jobs_mailbox_connections
+                  WHERE account_id = $1 AND id = $2 AND provider = $3
+                    AND status = 'connected' FOR UPDATE",
+                &[&account_id, &credential.connection_id, &credential.provider],
+            )?;
+            let unresolved_actions: i64 = tx
+                .query_one(
+                    "SELECT COUNT(*)::bigint FROM jobs_communication_actions
+                      WHERE account_id = $1 AND connection_id = $2
+                        AND status IN ('dispatching', 'side_effect_unknown')",
+                    &[&account_id, &credential.connection_id],
+                )?
+                .get(0);
+            if unresolved_actions > 0 {
+                anyhow::bail!("provider grant cannot change while communication is unresolved")
+            }
+            tx.execute(
                 "INSERT INTO jobs_provider_credentials (
                     connection_id, account_id, provider, provider_subject_hash,
                     credential_json, created_at_ms, updated_at_ms
@@ -4229,7 +4899,8 @@ pub fn save_jobs_provider_credential(
                     &credential.updated_at_ms,
                 ],
             )?;
-            Ok(credential.clone())
+            tx.commit()?;
+            Ok(credential)
         }
     })
 }
@@ -4263,6 +4934,223 @@ pub fn jobs_provider_credential(
             .map(|row| parse_json(row.get(0), "Jobs provider credential"))
             .transpose(),
     })
+}
+
+/// Atomically rotates provider tokens without changing the authority grant.
+/// The caller supplies the exact credential snapshot it refreshed from; a
+/// disconnect, consent upgrade, or concurrent refresh makes the CAS fail.
+pub fn refresh_jobs_provider_credential_cas(
+    pool: &DbPool,
+    account_id: &str,
+    expected: &JobsProviderCredential,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at_ms: i64,
+) -> Result<JobsProviderCredential> {
+    if !crate::jobs_provider_auth::valid_provider_token(access_token)
+        || refresh_token.is_some_and(|value| {
+            !crate::jobs_provider_auth::valid_provider_token(value)
+        })
+        || !crate::jobs_provider_auth::valid_provider_token(&expected.access_token)
+        || (!expected.refresh_token.is_empty()
+            && !crate::jobs_provider_auth::valid_provider_token(&expected.refresh_token))
+    {
+        anyhow::bail!("provider credential refresh token is invalid")
+    }
+    if expected.connection_id.trim().is_empty()
+        || !matches!(expected.provider.as_str(), "gmail" | "outlook")
+        || expected.provider_subject.trim().is_empty()
+        || expected.access_token.is_empty()
+        || expires_at_ms <= now_ms()
+        || expected.grant_revision < 0
+    {
+        anyhow::bail!("provider credential refresh CAS request is invalid")
+    }
+    if expected.grant_revision > 0
+        && (expected.grant_sha256.len() != 64
+            || communication_grant_sha256(expected)? != expected.grant_sha256)
+    {
+        anyhow::bail!("provider credential refresh grant digest is invalid")
+    }
+    let subject_hash = private_lookup_hash(
+        &format!("mailbox:{}", expected.provider),
+        expected.provider_subject.trim(),
+    )?;
+
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx,
+                account_id,
+            )?;
+            let raw: Option<(String, String)> = tx
+                .query_row(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_provider_credentials credential
+                       JOIN jobs_mailbox_connections mailbox
+                         ON mailbox.account_id = credential.account_id
+                        AND mailbox.id = credential.connection_id
+                      WHERE credential.account_id = ?1 AND credential.connection_id = ?2
+                        AND credential.provider = ?3
+                        AND credential.provider_subject_hash = ?4
+                        AND credential.updated_at_ms = ?5
+                        AND mailbox.status = 'connected'",
+                    params![
+                        account_id,
+                        expected.connection_id,
+                        expected.provider,
+                        subject_hash,
+                        expected.updated_at_ms,
+                    ],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let (mailbox_json, raw) =
+                raw.ok_or_else(|| anyhow::anyhow!("provider credential refresh lost CAS"))?;
+            let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
+            let current: JobsProviderCredential =
+                parse_json(raw, "Jobs provider credential")?;
+            validate_provider_refresh_mailbox(expected, &mailbox)?;
+            validate_provider_refresh_snapshot(expected, &current)?;
+            let mut updated = current;
+            updated.access_token = access_token.to_string();
+            if let Some(refresh_token) = refresh_token {
+                updated.refresh_token = refresh_token.to_string();
+            }
+            updated.expires_at_ms = expires_at_ms;
+            updated.updated_at_ms = now_ms().max(expected.updated_at_ms.saturating_add(1));
+            let payload = to_json(&updated, "Jobs provider credential")?;
+            let changed = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = ?6, updated_at_ms = ?7
+                  WHERE account_id = ?1 AND connection_id = ?2 AND provider = ?3
+                    AND provider_subject_hash = ?4 AND updated_at_ms = ?5",
+                params![
+                    account_id,
+                    expected.connection_id,
+                    expected.provider,
+                    subject_hash,
+                    expected.updated_at_ms,
+                    payload,
+                    updated.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("provider credential refresh lost CAS")
+            }
+            tx.commit()?;
+            Ok(updated)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx,
+                account_id,
+            )?;
+            let row = tx
+                .query_opt(
+                    "SELECT mailbox.connection_json, credential.credential_json
+                       FROM jobs_provider_credentials credential
+                       JOIN jobs_mailbox_connections mailbox
+                         ON mailbox.account_id = credential.account_id
+                        AND mailbox.id = credential.connection_id
+                      WHERE credential.account_id = $1 AND credential.connection_id = $2
+                        AND credential.provider = $3
+                        AND credential.provider_subject_hash = $4
+                        AND credential.updated_at_ms = $5
+                        AND mailbox.status = 'connected'
+                      FOR UPDATE OF mailbox, credential",
+                    &[
+                        &account_id,
+                        &expected.connection_id,
+                        &expected.provider,
+                        &subject_hash,
+                        &expected.updated_at_ms,
+                    ],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("provider credential refresh lost CAS"))?;
+            let current: JobsProviderCredential =
+                parse_json(row.get(1), "Jobs provider credential")?;
+            let mailbox: MailboxConnection = parse_json(row.get(0), "mailbox connection")?;
+            validate_provider_refresh_mailbox(expected, &mailbox)?;
+            validate_provider_refresh_snapshot(expected, &current)?;
+            let mut updated = current;
+            updated.access_token = access_token.to_string();
+            if let Some(refresh_token) = refresh_token {
+                updated.refresh_token = refresh_token.to_string();
+            }
+            updated.expires_at_ms = expires_at_ms;
+            updated.updated_at_ms = now_ms().max(expected.updated_at_ms.saturating_add(1));
+            let payload = to_json(&updated, "Jobs provider credential")?;
+            let changed = tx.execute(
+                "UPDATE jobs_provider_credentials
+                    SET credential_json = $6, updated_at_ms = $7
+                  WHERE account_id = $1 AND connection_id = $2 AND provider = $3
+                    AND provider_subject_hash = $4 AND updated_at_ms = $5",
+                &[
+                    &account_id,
+                    &expected.connection_id,
+                    &expected.provider,
+                    &subject_hash,
+                    &expected.updated_at_ms,
+                    &payload,
+                    &updated.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("provider credential refresh lost CAS")
+            }
+            tx.commit()?;
+            Ok(updated)
+        }
+    })
+}
+
+fn validate_provider_refresh_snapshot(
+    expected: &JobsProviderCredential,
+    current: &JobsProviderCredential,
+) -> Result<()> {
+    if current.connection_id != expected.connection_id
+        || current.provider != expected.provider
+        || current.provider_subject != expected.provider_subject
+        || current.updated_at_ms != expected.updated_at_ms
+        || current.access_token != expected.access_token
+        || current.refresh_token != expected.refresh_token
+        || current.grant_revision != expected.grant_revision
+        || current.grant_sha256 != expected.grant_sha256
+        || current.scopes != expected.scopes
+        || current.capabilities != expected.capabilities
+    {
+        anyhow::bail!("provider credential refresh lost CAS")
+    }
+    Ok(())
+}
+
+fn validate_provider_refresh_mailbox(
+    expected: &JobsProviderCredential,
+    mailbox: &MailboxConnection,
+) -> Result<()> {
+    let mut capabilities = mailbox.capabilities.clone();
+    capabilities.sort();
+    capabilities.dedup();
+    let mut expected_capabilities = expected.capabilities.clone();
+    expected_capabilities.sort();
+    expected_capabilities.dedup();
+    if mailbox.id != expected.connection_id
+        || mailbox.provider != expected.provider
+        || mailbox.status != "connected"
+        || (expected.grant_revision > 0 && capabilities != expected_capabilities)
+        || (expected.grant_revision == 0
+            && !expected_capabilities
+                .iter()
+                .all(|capability| capabilities.contains(capability)))
+    {
+        anyhow::bail!("provider credential refresh mailbox authority changed")
+    }
+    Ok(())
 }
 
 pub fn list_integrations(pool: &DbPool, account_id: &str) -> Result<Vec<JobsIntegration>> {

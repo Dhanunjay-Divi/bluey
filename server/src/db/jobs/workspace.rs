@@ -90,5 +90,9 @@ pub fn account_export(
         resume_versions: list_resume_versions(pool, account_id)?,
         attempt_reservations: list_attempt_reservations(pool, account_id)?,
         run_events: list_account_run_events(pool, account_id)?,
+        provider_messages: export_provider_messages(pool, account_id)?,
+        communication_actions: export_communication_actions(pool, account_id)?,
+        communication_evidence: export_communication_evidence(pool, account_id)?,
+        communication_reconciliations: export_communication_reconciliations(pool, account_id)?,
     }))
 }

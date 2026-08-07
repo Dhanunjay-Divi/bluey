@@ -452,6 +452,77 @@ export interface MailboxMessage {
   classification: string;
 }
 
+export type CommunicationActionKind = "reply" | "calendar";
+
+export type CommunicationActionProvider =
+  | "gmail"
+  | "outlook_email"
+  | "google_calendar"
+  | "outlook_calendar";
+
+export type CommunicationActionStatus =
+  | "awaiting_approval"
+  | "approved"
+  | "dispatching"
+  | "sent"
+  | "calendar_created"
+  | "needs_input"
+  | "failed"
+  | "side_effect_unknown"
+  | "cancelled";
+
+export interface CommunicationActionSummary {
+  id: string;
+  application_id: string;
+  connection_id: string;
+  source_message_id: string | null;
+  kind: CommunicationActionKind;
+  provider: CommunicationActionProvider;
+  payload_sha256: string;
+  action_revision: number;
+  status: CommunicationActionStatus;
+  execution_available: boolean;
+  execution_unavailable_reason: string;
+  approved_at_ms: number | null;
+  dispatched_at_ms: number | null;
+  created_at_ms: number;
+  updated_at_ms: number;
+}
+
+export interface CommunicationSourceContext {
+  sender: string;
+  reply_target: string;
+  subject: string;
+  received_at_ms: number;
+}
+
+export interface CommunicationActionDetail extends CommunicationActionSummary {
+  connection_account_label: string;
+  source_context: CommunicationSourceContext | null;
+  /** Parsed and fail-closed by the portal before any review control is shown. */
+  payload: unknown;
+}
+
+export interface CommunicationReplyPayload {
+  kind: "reply";
+  to: string;
+  subject: string;
+  body_text: string;
+}
+
+export interface CommunicationCalendarPayload {
+  kind: "calendar";
+  title: string;
+  starts_at_ms: number;
+  ends_at_ms: number;
+  time_zone: string;
+  attendees: string[];
+}
+
+export type ReviewedCommunicationPayload =
+  | CommunicationReplyPayload
+  | CommunicationCalendarPayload;
+
 export type DiscoverySourceHealth = "healthy" | "degraded" | "paused" | "waiting";
 
 export interface DiscoverySource {

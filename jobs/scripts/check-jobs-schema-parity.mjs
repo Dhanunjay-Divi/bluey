@@ -41,6 +41,10 @@ export const JOBS_PARITY_TABLES = [
   "jobs_ats_certification_trust_keys",
   "jobs_ats_certification_trust_policies",
   "jobs_communication_actions",
+  "jobs_communication_action_attempts",
+  "jobs_communication_action_attempt_evidence",
+  "jobs_communication_action_reconciliations",
+  "jobs_communication_write_fences",
   "jobs_discovery_memberships",
   "jobs_discovery_runs",
   "jobs_discovery_sources",
@@ -215,7 +219,28 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     [
       "idx_jobs_communication_actions_account on jobs_communication_actions (account_id, application_id, created_at_ms desc)",
       "idx_jobs_communication_actions_due on jobs_communication_actions (status, next_attempt_at_ms, lease_expires_at_ms)",
+      "unique idx_jobs_communication_action_authority on jobs_communication_actions (id, account_id, connection_id)",
+      "unique idx_jobs_communication_action_attempt_authority on jobs_communication_actions (id, account_id, connection_id, provider)",
+      "unique idx_jobs_communication_provider_object on jobs_communication_actions (account_id, connection_id, provider, provider_object_id) where provider_object_id is not null and provider_object_id <> ''",
     ].sort(),
+  ],
+  [
+    "jobs_communication_action_attempts",
+    [
+      "idx_jobs_communication_attempts_action on jobs_communication_action_attempts (account_id, action_id, dispatch_no desc)",
+    ],
+  ],
+  [
+    "jobs_communication_action_attempt_evidence",
+    [
+      "idx_jobs_communication_attempt_evidence_action on jobs_communication_action_attempt_evidence (account_id, action_id, recorded_at_ms desc)",
+    ],
+  ],
+  [
+    "jobs_communication_action_reconciliations",
+    [
+      "idx_jobs_communication_reconciliations_action on jobs_communication_action_reconciliations (account_id, action_id, recorded_at_ms desc)",
+    ],
   ],
   [
     "jobs_discovery_memberships",
@@ -611,6 +636,14 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/028_jobs_runner_process_runtime_authority.sql",
   );
+  const sqliteCommunicationExecutionPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/051_jobs_communication_execution.sql",
+  );
+  const postgresCommunicationExecutionPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/029_jobs_communication_execution.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -621,6 +654,7 @@ function main() {
     sqliteAtsCertificationAuthorityPath,
     sqliteBrowserRuntimeComponentsPath,
     sqliteRunnerProcessRuntimePath,
+    sqliteCommunicationExecutionPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -634,6 +668,7 @@ function main() {
     postgresAtsCertificationAuthorityPath,
     postgresBrowserRuntimeComponentsPath,
     postgresRunnerProcessRuntimePath,
+    postgresCommunicationExecutionPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -714,6 +749,11 @@ function main() {
       "050_jobs_runner_process_runtime_authority.sql",
       "SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY",
     ],
+    [
+      "SQLite",
+      "051_jobs_communication_execution.sql",
+      "SQLITE_JOBS_COMMUNICATION_EXECUTION",
+    ],
   ]) {
     const migrationPath = `infra/${dialect.toLowerCase()}/server-runtime/${migration}`;
     if (!sqliteSource.includes(migrationPath)) {
@@ -731,6 +771,7 @@ function main() {
     "026_jobs_ats_certification_authority.sql",
     "027_jobs_browser_release_runtime_components.sql",
     "028_jobs_runner_process_runtime_authority.sql",
+    "029_jobs_communication_execution.sql",
   ]) {
     const migrationPath = `infra/postgres/server-runtime/${migration}`;
     if (!sqliteSource.includes(migrationPath)) {

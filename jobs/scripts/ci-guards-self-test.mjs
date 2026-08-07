@@ -53,6 +53,14 @@ function atsCertificationParitySchema(integerType) {
     .join("\n");
 }
 
+function communicationExecutionParitySchema(integerType) {
+  const migrationPath =
+    integerType === "INTEGER"
+      ? "infra/sqlite/server-runtime/051_jobs_communication_execution.sql"
+      : "infra/postgres/server-runtime/029_jobs_communication_execution.sql";
+  return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
+}
+
 function testPrivacyPaths() {
   const rejected = [
     ["jobs/candidates/alice/resume.pdf", "candidate or user data directory"],
@@ -154,6 +162,22 @@ function testSecretScanning() {
     scanTextForSecrets("tests/fixtures/synthetic-auth.txt", placeholders),
     [],
   );
+}
+
+function testPortalBundleFreshnessWorkflowGuard() {
+  for (const workflowPath of [
+    ".github/workflows/jobs-ci.yml",
+    ".github/workflows/release.yml",
+  ]) {
+    const workflow = fs.readFileSync(path.join(repoRoot, workflowPath), "utf8");
+    const buildIndex = workflow.indexOf("npm run build --prefix jobs");
+    const freshnessIndex = workflow.indexOf("git diff --exit-code -- web/jobs");
+    assert(buildIndex >= 0, `${workflowPath} must build the Jobs workspaces`);
+    assert(
+      freshnessIndex > buildIndex,
+      `${workflowPath} must reject a stale checked-in Jobs portal bundle after the build`,
+    );
+  }
 }
 
 function jobsParitySchema(integerType) {
@@ -297,6 +321,7 @@ function jobsParitySchema(integerType) {
     ${runnerVolumeParitySchema(integerType)}
     ${browserReleaseAuthorityParitySchema(integerType)}
     ${atsCertificationParitySchema(integerType)}
+    ${communicationExecutionParitySchema(integerType)}
   `;
 }
 
@@ -475,6 +500,26 @@ function testSchemaParity() {
   const missingCommunicationTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS jobs_communication_actions \([\s\S]*?\n    \);/,
     "",
+  );
+
+  const missingCommunicationEvidenceTable = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_communication_action_attempt_evidence \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingCommunicationEvidenceTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingCommunicationReconciliationIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_communication_reconciliations_action[\s\S]*?\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingCommunicationReconciliationIndex).some((issue) =>
+      issue.includes("jobs_communication_action_reconciliations index"),
+    ),
   );
   assert(
     compareJobsSchemas(missingCommunicationTable, postgres).some((issue) =>
@@ -728,10 +773,12 @@ function testProvenance() {
 
 testPrivacyPaths();
 testSecretScanning();
+testPortalBundleFreshnessWorkflowGuard();
 testSchemaParity();
 testLicenseInventory();
 testProvenance();
 
 console.log(
-  "Jobs CI guard self-tests passed (privacy, schema parity, lock inventory, and provenance).",
+  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, "
+    + "lock inventory, and provenance).",
 );

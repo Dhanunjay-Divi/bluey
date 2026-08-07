@@ -10,6 +10,7 @@ import type {
   CareerTrack,
   CandidateEvent,
   CandidateEventInput,
+  CommunicationActionSummary,
   DiscoverySource,
   DiscoverySourceCatalogResponse,
   AnswerMemory,
@@ -23,8 +24,6 @@ import type {
   JobsWorkspace,
   MailboxConnection,
   MailboxMessage,
-  MailboxOAuthStart,
-  MailboxProviderAvailability,
   MailboxSyncState,
   PacketCommitResult,
   QueueApplicationRunResponse,
@@ -33,6 +32,14 @@ import type {
   ResumeVersion,
   UploadResumeSourceResponse,
 } from "./types";
+import {
+  decodeCommunicationActionDetail,
+  decodeCommunicationActionSummaries,
+} from "./lib/communication-actions";
+import {
+  decodeMailboxOAuthStart,
+  decodeMailboxProviderAvailability,
+} from "./lib/mailbox-oauth";
 
 const ACCESS_TOKEN_KEY = "bluey_access_token";
 const REFRESH_TOKEN_KEY = "bluey_refresh_token";
@@ -426,12 +433,26 @@ export const jobsApi = {
     }),
   deleteApplicationIdentity: (id: string) =>
     request<void>(`/api/jobs/application-identities/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  mailboxOAuthProviders: () =>
-    request<MailboxProviderAvailability[]>("/api/jobs/mailbox-oauth/config"),
-  startMailboxOAuth: (provider: MailboxConnection["provider"]) =>
-    request<MailboxOAuthStart>(`/api/jobs/mailbox-oauth/${encodeURIComponent(provider)}/start`, {
-      method: "POST",
-    }),
+  mailboxOAuthProviders: async () => {
+    const payload = await request<unknown>("/api/jobs/mailbox-oauth/config");
+    return decodeMailboxProviderAvailability(payload);
+  },
+  startMailboxOAuth: async (provider: MailboxConnection["provider"]) => {
+    const payload = await request<unknown>(
+      `/api/jobs/mailbox-oauth/${encodeURIComponent(provider)}/start`,
+      {
+        method: "POST",
+      },
+    );
+    return decodeMailboxOAuthStart(payload);
+  },
+  startMailboxCommunicationAuthorization: async (connectionId: string) => {
+    const payload = await request<unknown>(
+      `/api/jobs/mailbox-connections/${encodeURIComponent(connectionId)}/communication-authorization/start`,
+      { method: "POST" },
+    );
+    return decodeMailboxOAuthStart(payload);
+  },
   mailboxSyncState: (id: string) =>
     request<MailboxSyncState>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync-state`),
   syncMailbox: (id: string) =>
@@ -443,6 +464,54 @@ export const jobsApi = {
     if (connectionId) params.set("connection_id", connectionId);
     if (status) params.set("status", status);
     return request<MailboxMessage[]>(`/api/jobs/mailbox-messages?${params.toString()}`);
+  },
+  communicationActions: async (applicationId?: string, limit = 100) => {
+    const params = new URLSearchParams({ limit: String(Math.min(Math.max(limit, 1), 100)) });
+    if (applicationId) params.set("application_id", applicationId);
+    const payload = await request<unknown>(
+      `/api/jobs/communication-actions?${params.toString()}`,
+      { cache: "no-store" },
+    );
+    return decodeCommunicationActionSummaries(payload);
+  },
+  communicationAction: async (id: string) => {
+    const payload = await request<unknown>(
+      `/api/jobs/communication-actions/${encodeURIComponent(id)}`,
+      { cache: "no-store" },
+    );
+    return decodeCommunicationActionDetail(payload);
+  },
+  approveCommunicationAction: async (
+    action: Pick<CommunicationActionSummary, "id" | "action_revision" | "payload_sha256">,
+  ) => {
+    const payload = await request<unknown>(
+      `/api/jobs/communication-actions/${encodeURIComponent(action.id)}/approve`,
+      {
+        method: "POST",
+        cache: "no-store",
+        body: JSON.stringify({
+          action_revision: action.action_revision,
+          payload_sha256: action.payload_sha256,
+        }),
+      },
+    );
+    return decodeCommunicationActionDetail(payload);
+  },
+  cancelCommunicationAction: async (
+    action: Pick<CommunicationActionSummary, "id" | "action_revision" | "payload_sha256">,
+  ) => {
+    const payload = await request<unknown>(
+      `/api/jobs/communication-actions/${encodeURIComponent(action.id)}/cancel`,
+      {
+        method: "POST",
+        cache: "no-store",
+        body: JSON.stringify({
+          action_revision: action.action_revision,
+          payload_sha256: action.payload_sha256,
+        }),
+      },
+    );
+    return decodeCommunicationActionDetail(payload);
   },
   deleteMailboxConnection: (id: string) =>
     request<void>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),

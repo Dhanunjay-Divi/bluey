@@ -42,6 +42,7 @@ import {
   interventionActionResumesApplication,
   interventionResolutionToast,
 } from "./lib/application-flow";
+import { validateMailboxOAuthAuthorizationUrl } from "./lib/mailbox-oauth";
 
 const MatchesView = lazy(() => import("./views/MatchesView").then((module) => ({ default: module.MatchesView })));
 const ApplicationsView = lazy(() => import("./views/ApplicationsView").then((module) => ({ default: module.ApplicationsView })));
@@ -129,6 +130,23 @@ export async function uploadResumeSourceWithLineage(
     }
     throw error;
   }
+}
+
+export async function openMailboxCommunicationAuthorization(
+  preview: boolean,
+  connection: MailboxConnection,
+  start: (connectionId: string) => Promise<{ authorization_url: string }>,
+  redirect: (authorizationUrl: string) => void,
+  portalOrigin: string,
+): Promise<void> {
+  if (preview) return;
+  const result = await start(connection.id);
+  redirect(validateMailboxOAuthAuthorizationUrl(
+    result,
+    connection.provider,
+    "communication_write",
+    portalOrigin,
+  ));
 }
 
 function resumeUploadAttemptFingerprint(profile: CareerProfile, pageCount?: number): string {
@@ -697,7 +715,22 @@ export default function App() {
     }
 
     const result = await jobsApi.startMailboxOAuth(provider);
-    window.location.assign(result.authorization_url);
+    window.location.assign(validateMailboxOAuthAuthorizationUrl(
+      result,
+      provider,
+      "mailbox_read",
+      window.location.origin,
+    ));
+  }, []);
+
+  const authorizeMailboxCommunication = useCallback(async (connection: MailboxConnection) => {
+    await openMailboxCommunicationAuthorization(
+      isPreview,
+      connection,
+      jobsApi.startMailboxCommunicationAuthorization,
+      (authorizationUrl) => window.location.assign(authorizationUrl),
+      window.location.origin,
+    );
   }, []);
 
   const mailboxSyncState = useCallback(async (connection: MailboxConnection): Promise<MailboxSyncState> => {
@@ -967,6 +1000,7 @@ export default function App() {
               onLoadResume={loadResumeVersion}
               onResolveIntervention={resolveIntervention}
               onSaveCandidateEvent={saveCandidateEvent}
+              preview={isPreview}
             />
           }
         />
@@ -1013,6 +1047,7 @@ export default function App() {
               onDeleteIdentity={deleteApplicationIdentity}
               onMailboxProviders={mailboxOAuthProviders}
               onConnectMailbox={connectMailbox}
+              onAuthorizeMailboxCommunication={authorizeMailboxCommunication}
               onMailboxSyncState={mailboxSyncState}
               onMailboxMessages={mailboxMessages}
               onSyncMailbox={syncMailbox}

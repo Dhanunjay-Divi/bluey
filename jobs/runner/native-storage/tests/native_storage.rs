@@ -324,6 +324,8 @@ fn rejects_hardlinks_and_preserves_the_outside_link() {
 }
 
 #[test]
+// Apple exposes narrower file-type aliases while Linux already uses `u32`.
+#[allow(clippy::useless_conversion)]
 fn rejects_special_files_without_unlinking_them() {
     let fixture = TestDirectory::new("special");
     let root = RunnerStorageRoot::open(&fixture.root).expect("open root");
