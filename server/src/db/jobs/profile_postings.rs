@@ -571,6 +571,70 @@ pub fn list_tracks(pool: &DbPool, account_id: &str) -> Result<Vec<CareerTrack>> 
     })
 }
 
+fn require_track_mutation_unleased_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    track_id: &str,
+) -> Result<()> {
+    let leased: bool = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM jobs_discovery_sources
+             WHERE account_id = ?1 AND (provider = ?2 OR track_id = ?3)
+               AND lease_token IS NOT NULL AND lease_expires_at_ms > ?4
+         )",
+        params![
+            account_id,
+            CURATED_DISCOVERY_PROVIDER,
+            track_id,
+            now_ms()
+        ],
+        |row| row.get(0),
+    )?;
+    if leased {
+        anyhow::bail!("Career Track changes wait for the active discovery lease to finish")
+    }
+    Ok(())
+}
+
+fn require_track_mutation_unleased_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    track_id: &str,
+) -> Result<()> {
+    let rows = tx.query(
+        "SELECT lease_token, lease_expires_at_ms FROM jobs_discovery_sources
+          WHERE account_id = $1 AND (provider = $2 OR track_id = $3)
+          ORDER BY id FOR UPDATE",
+        &[&account_id, &CURATED_DISCOVERY_PROVIDER, &track_id],
+    )?;
+    let now = now_ms();
+    if rows.iter().any(|row| {
+        row.get::<_, Option<String>>(0).is_some()
+            && row
+                .get::<_, Option<i64>>(1)
+                .is_some_and(|expires_at_ms| expires_at_ms > now)
+    }) {
+        anyhow::bail!("Career Track changes wait for the active discovery lease to finish")
+    }
+    Ok(())
+}
+
+fn lock_track_account_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    if tx
+        .query_opt(
+            "SELECT 1 FROM accounts WHERE id = $1 FOR KEY SHARE",
+            &[&account_id],
+        )?
+        .is_none()
+    {
+        anyhow::bail!("account not found")
+    }
+    Ok(())
+}
+
 pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Result<CareerTrack> {
     let mut value = track.clone();
     if let Some(identity_id) = value.application_identity_id.as_deref() {
@@ -591,7 +655,10 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
     let payload = to_json(&value, "Career Track")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_track_mutation_unleased_sqlite(&tx, account_id, &value.id)?;
+            tx.execute(
                 "INSERT INTO jobs_tracks(id, account_id, track_json, active, created_at_ms, updated_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
@@ -608,11 +675,17 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
                     value.updated_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
             let active = i32::from(value.active);
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_track_account_postgres(&mut tx, account_id)?;
+            require_track_mutation_unleased_postgres(&mut tx, account_id, &value.id)?;
+            tx.execute(
                 "INSERT INTO jobs_tracks(id, account_id, track_json, active, created_at_ms, updated_at_ms)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT(id) DO UPDATE SET
@@ -629,6 +702,7 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
                     &value.updated_at_ms,
                 ],
             )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -639,6 +713,7 @@ pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<b
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_track_mutation_unleased_sqlite(&tx, account_id, track_id)?;
             let exists = tx
                 .query_row(
                     "SELECT 1 FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
@@ -696,6 +771,8 @@ pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<b
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_track_account_postgres(&mut tx, account_id)?;
+            require_track_mutation_unleased_postgres(&mut tx, account_id, track_id)?;
             let exists = tx
                 .query_opt(
                     "SELECT 1 FROM jobs_tracks WHERE account_id = $1 AND id = $2 FOR UPDATE",

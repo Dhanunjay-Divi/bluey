@@ -46,6 +46,7 @@ getrandom = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 unicode-general-category = "1"
+unicode-normalization = "0.1"
 
 # Error handling
 anyhow = "1"

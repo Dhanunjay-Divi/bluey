@@ -358,6 +358,8 @@ const SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
 );
 const SQLITE_JOBS_COMMUNICATION_EXECUTION: &str =
     include_str!("../../../infra/sqlite/server-runtime/051_jobs_communication_execution.sql");
+const SQLITE_JOBS_OPERATIONAL_HOLDS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/052_jobs_operational_holds.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1694,6 +1696,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY,
     // 0051 - exact reviewed communication dispatch and reconciliation evidence.
     SQLITE_JOBS_COMMUNICATION_EXECUTION,
+    // 0052 - durable, revisioned operational holds and exact CAS heads.
+    SQLITE_JOBS_OPERATIONAL_HOLDS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2238,6 +2242,9 @@ const POSTGRES_JOBS_RUNNER_PROCESS_RUNTIME_AUTHORITY: &str = include_str!(
 pub const JOBS_COMMUNICATION_EXECUTION_MIGRATION_ID: &str = "029_jobs_communication_execution.sql";
 const POSTGRES_JOBS_COMMUNICATION_EXECUTION: &str =
     include_str!("../../../infra/postgres/server-runtime/029_jobs_communication_execution.sql");
+pub const JOBS_OPERATIONAL_HOLDS_MIGRATION_ID: &str = "030_jobs_operational_holds.sql";
+const POSTGRES_JOBS_OPERATIONAL_HOLDS: &str =
+    include_str!("../../../infra/postgres/server-runtime/030_jobs_operational_holds.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2342,6 +2349,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_COMMUNICATION_EXECUTION_MIGRATION_ID,
         POSTGRES_JOBS_COMMUNICATION_EXECUTION,
+    ),
+    (
+        JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
+        POSTGRES_JOBS_OPERATIONAL_HOLDS,
     ),
 ];
 
@@ -2482,8 +2493,207 @@ mod blocking_boundary_tests {
 mod sqlite_migration_replay_tests {
     use super::{
         ensure_column, open_pool, run_migrations, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
     };
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_operational_hold_event(
+        conn: &rusqlite::Connection,
+        event_id: &str,
+        event_sha256: &str,
+        revision_no: i64,
+        previous_revision_no: Option<i64>,
+        predecessor_event_id: Option<&str>,
+        transition: &str,
+        reason_code: &str,
+        recorded_by: &str,
+        recorded_at_ms: i64,
+    ) -> rusqlite::Result<usize> {
+        let event_ref = format!("event-{event_sha256}");
+        conn.execute(
+            "INSERT INTO jobs_operational_hold_events (
+                event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+                scope_kind, scope_id, revision_no, previous_revision_no,
+                predecessor_event_id, transition, reason_code, reason_ref,
+                recorded_by, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, 'ZXZlbnQ', 'all', 'global', '*', ?4, ?5, ?6,
+                       ?7, ?8, 'incident-123', ?9, ?10)",
+            rusqlite::params![
+                event_id,
+                event_ref,
+                event_sha256,
+                revision_no,
+                previous_revision_no,
+                predecessor_event_id,
+                transition,
+                reason_code,
+                recorded_by,
+                recorded_at_ms,
+            ],
+        )
+    }
+
+    #[test]
+    fn operational_holds_require_exact_history_and_monotonic_heads() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(SQLITE_JOBS_OPERATIONAL_HOLDS).unwrap();
+
+        for table in [
+            "jobs_operational_hold_events",
+            "jobs_operational_hold_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not seed launch authority");
+        }
+
+        let wrong_global_scope = conn.execute(
+            "INSERT INTO jobs_operational_hold_events (
+                event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+                scope_kind, scope_id, revision_no, previous_revision_no,
+                predecessor_event_id, transition, reason_code, reason_ref,
+                recorded_by, recorded_at_ms
+             ) VALUES ('wrong-global', ?1, ?2, 'ZXZlbnQ', 'all', 'global', 'global',
+                       1, NULL, NULL, 'held', 'incident', NULL, 'operator', 1)",
+            rusqlite::params![format!("event-{}", "d".repeat(64)), "d".repeat(64)],
+        );
+        assert!(wrong_global_scope.is_err());
+
+        insert_operational_hold_event(
+            &conn,
+            "hold-1",
+            &"a".repeat(64),
+            1,
+            None,
+            None,
+            "held",
+            "incident",
+            "operator-1",
+            100,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_operational_hold_heads (
+                capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+                current_event_ref, state, updated_by, updated_at_ms
+             ) VALUES ('all', 'global', '*', ?1, 1, 'hold-1', ?2,
+                       'held', 'operator-1', 100)",
+            rusqlite::params![
+                format!("scope-{}", "f".repeat(64)),
+                format!("event-{}", "a".repeat(64)),
+            ],
+        )
+        .unwrap();
+
+        let skipped_revision = insert_operational_hold_event(
+            &conn,
+            "hold-3-skipped",
+            &"c".repeat(64),
+            3,
+            Some(2),
+            Some("hold-2"),
+            "released",
+            "manual_release",
+            "operator-3",
+            300,
+        );
+        assert!(skipped_revision.is_err());
+
+        insert_operational_hold_event(
+            &conn,
+            "hold-2",
+            &"b".repeat(64),
+            2,
+            Some(1),
+            Some("hold-1"),
+            "held",
+            "security_review",
+            "operator-2",
+            200,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_operational_hold_heads
+                SET head_revision = 2, current_event_id = 'hold-2', current_event_ref = ?1,
+                    state = 'held',
+                    updated_by = 'operator-2', updated_at_ms = 200
+              WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+            rusqlite::params![format!("event-{}", "b".repeat(64))],
+        )
+        .expect("held-to-held escalation must advance the exact head");
+
+        insert_operational_hold_event(
+            &conn,
+            "hold-3",
+            &"c".repeat(64),
+            3,
+            Some(2),
+            Some("hold-2"),
+            "released",
+            "manual_release",
+            "operator-3",
+            300,
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_operational_hold_heads
+                    SET head_revision = 3, current_event_id = 'hold-3', current_event_ref = ?1,
+                        state = 'held',
+                        updated_by = 'operator-3', updated_at_ms = 300
+                  WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+                rusqlite::params![format!("event-{}", "c".repeat(64))],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE jobs_operational_hold_heads
+                SET head_revision = 3, current_event_id = 'hold-3', current_event_ref = ?1,
+                    state = 'released',
+                    updated_by = 'operator-3', updated_at_ms = 300
+              WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+            rusqlite::params![format!("event-{}", "c".repeat(64))],
+        )
+        .unwrap();
+
+        let redundant_release = insert_operational_hold_event(
+            &conn,
+            "hold-4-redundant-release",
+            &"d".repeat(64),
+            4,
+            Some(3),
+            Some("hold-3"),
+            "released",
+            "manual_release",
+            "operator-4",
+            400,
+        );
+        assert!(redundant_release.is_err());
+
+        assert!(conn
+            .execute(
+                "UPDATE jobs_operational_hold_events SET reason_code = 'maintenance'
+                  WHERE event_id = 'hold-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_operational_hold_events WHERE event_id = 'hold-1'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_operational_hold_heads
+                  WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+                [],
+            )
+            .is_err());
+    }
 
     #[test]
     fn ats_certification_authority_starts_empty_with_immutable_history() {
@@ -3461,17 +3671,18 @@ mod postgres_migration_tests {
     use super::{
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
         JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
-        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
-        POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
-        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        JOBS_OPERATIONAL_HOLDS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, POSTGRES_ACCOUNT_DELETION_INTENTS,
+        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
+        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_OPERATIONAL_HOLDS,
         POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_MIGRATIONS,
         POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
         SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
         SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
-        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
-        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
+        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
     };
 
     #[test]
@@ -4058,6 +4269,58 @@ mod postgres_migration_tests {
             assert!(!SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY.contains(&insert));
         }
         assert_eq!(*postgres_sql, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY);
+    }
+
+    #[test]
+    fn operational_holds_are_runtime_migrated_with_dialect_parity() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_OPERATIONAL_HOLDS_MIGRATION_ID)
+            .expect("operational holds must migrate before Jobs work is admitted");
+        assert_eq!(*version, "030_jobs_operational_holds.sql");
+
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_operational_hold_events",
+            "CREATE TABLE IF NOT EXISTS jobs_operational_hold_heads",
+            "idx_jobs_operational_hold_events_history",
+            "idx_jobs_operational_hold_heads_lookup",
+            "idx_jobs_operational_hold_heads_refs",
+            "trg_jobs_operational_hold_events_validate_insert",
+            "trg_jobs_operational_hold_events_no_update",
+            "trg_jobs_operational_hold_events_no_delete",
+            "trg_jobs_operational_hold_heads_validate_insert",
+            "trg_jobs_operational_hold_heads_monotonic",
+            "trg_jobs_operational_hold_heads_no_delete",
+            "previous_revision_no",
+            "predecessor_event_id",
+            "head_revision",
+            "current_event_id",
+            "manual_release",
+            "communication_dispatch",
+            "discovery_source",
+            "model_provider",
+            "scope_id = '*'",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL operational-hold migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_OPERATIONAL_HOLDS.contains(required),
+                "SQLite operational-hold migration missing {required}"
+            );
+        }
+        for forbidden in ["expires_at", "ttl", "INSERT INTO jobs_operational_hold"] {
+            assert!(
+                !postgres_sql.contains(forbidden),
+                "PostgreSQL operational holds must not contain {forbidden}"
+            );
+            assert!(
+                !SQLITE_JOBS_OPERATIONAL_HOLDS.contains(forbidden),
+                "SQLite operational holds must not contain {forbidden}"
+            );
+        }
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_OPERATIONAL_HOLDS);
     }
 
     #[test]

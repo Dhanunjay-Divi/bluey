@@ -54,6 +54,8 @@ export const JOBS_PARITY_TABLES = [
   "jobs_local_run_claim_replays",
   "jobs_local_run_release_bindings",
   "jobs_local_run_resume_actions",
+  "jobs_operational_hold_events",
+  "jobs_operational_hold_heads",
   "jobs_runner_legacy_inventory_authorities",
   "jobs_runner_account_subjects",
   "jobs_runner_purge_enforcements",
@@ -301,6 +303,19 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
     ],
   ],
   [
+    "jobs_operational_hold_events",
+    [
+      "idx_jobs_operational_hold_events_history on jobs_operational_hold_events (capability, scope_kind, scope_id, revision_no desc)",
+    ],
+  ],
+  [
+    "jobs_operational_hold_heads",
+    [
+      "idx_jobs_operational_hold_heads_lookup on jobs_operational_hold_heads (state, capability, scope_kind, scope_id)",
+      "idx_jobs_operational_hold_heads_refs on jobs_operational_hold_heads (capability, scope_kind, scope_ref, head_revision)",
+    ],
+  ],
+  [
     "jobs_runner_legacy_inventory_authorities",
     [
       "idx_jobs_runner_legacy_inventory_authorities_reconciliation on jobs_runner_legacy_inventory_authorities (reconciliation_id, authority_generation, authority_state)",
@@ -508,6 +523,407 @@ function firstDifference(left, right) {
   return null;
 }
 
+function extractSingleSqlObject(sql, expression) {
+  const matches = [...sql.matchAll(expression)];
+  if (matches.length !== 1) return null;
+  return normalizeSql(matches[0][0]);
+}
+
+function extractSqliteTrigger(sql, triggerName) {
+  return extractSingleSqlObject(
+    sql,
+    new RegExp(
+      `CREATE\\s+TRIGGER\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?${triggerName}\\b[\\s\\S]*?\\bEND\\s*;`,
+      "gi",
+    ),
+  );
+}
+
+function extractPostgresFunction(sql, functionName) {
+  return extractSingleSqlObject(
+    sql,
+    new RegExp(
+      `CREATE\\s+OR\\s+REPLACE\\s+FUNCTION\\s+${functionName}\\s*\\([^)]*\\)` +
+        `\\s*RETURNS\\s+trigger[\\s\\S]*?\\$\\$\\s*;`,
+      "gi",
+    ),
+  );
+}
+
+function extractPostgresTrigger(sql, triggerName) {
+  return extractSingleSqlObject(
+    sql,
+    new RegExp(`CREATE\\s+TRIGGER\\s+${triggerName}\\b[\\s\\S]*?;`, "gi"),
+  );
+}
+
+function requireOperationalHoldFragments(
+  issues,
+  dialect,
+  objectName,
+  objectSource,
+  requirements,
+) {
+  if (!objectSource) {
+    issues.push(
+      `${dialect} operational-hold object ${objectName} must exist exactly once`,
+    );
+    return;
+  }
+  for (const [invariant, fragment] of requirements) {
+    if (!objectSource.includes(normalizeSql(fragment))) {
+      issues.push(
+        `${dialect} operational-hold invariant ${invariant} is missing from ${objectName}`,
+      );
+    }
+  }
+}
+
+function operationalHoldTableRequirements(issues, dialect, sql) {
+  const eventTable = extractTable(sql, "jobs_operational_hold_events");
+  const headTable = extractTable(sql, "jobs_operational_hold_heads");
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "jobs_operational_hold_events",
+    eventTable ? normalizeSql(eventTable.join(", ")) : null,
+    [
+      [
+        "first event is held",
+        "revision_no = 1 AND previous_revision_no IS NULL " +
+          "AND predecessor_event_id IS NULL AND transition = 'held'",
+      ],
+      [
+        "previous revision is exactly n-1",
+        "revision_no > 1 AND previous_revision_no = revision_no - 1 " +
+          "AND predecessor_event_id IS NOT NULL",
+      ],
+      [
+        "ancestry revision/event uniqueness",
+        "UNIQUE(capability, scope_kind, scope_id, revision_no, event_id)",
+      ],
+      [
+        "head revision/event/ref uniqueness",
+        "UNIQUE(capability, scope_kind, scope_id, revision_no, event_id, event_ref)",
+      ],
+      [
+        "ancestry foreign key",
+        "FOREIGN KEY(capability, scope_kind, scope_id, previous_revision_no, " +
+          "predecessor_event_id) REFERENCES jobs_operational_hold_events(" +
+          "capability, scope_kind, scope_id, revision_no, event_id) ON DELETE RESTRICT",
+      ],
+    ],
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "jobs_operational_hold_heads",
+    headTable ? normalizeSql(headTable.join(", ")) : null,
+    [
+      ["head scope authority", "PRIMARY KEY(capability, scope_kind, scope_id)"],
+      [
+        "head foreign key",
+        "FOREIGN KEY(capability, scope_kind, scope_id, head_revision, " +
+          "current_event_id, current_event_ref) REFERENCES jobs_operational_hold_events(" +
+          "capability, scope_kind, scope_id, revision_no, event_id, event_ref) " +
+          "ON DELETE RESTRICT",
+      ],
+    ],
+  );
+}
+
+const OPERATIONAL_HOLD_EVENT_VALIDATION_REQUIREMENTS = [
+  ["predecessor capability link", "predecessor.capability = NEW.capability"],
+  ["predecessor scope-kind link", "predecessor.scope_kind = NEW.scope_kind"],
+  ["predecessor scope-id link", "predecessor.scope_id = NEW.scope_id"],
+  [
+    "predecessor revision link",
+    "predecessor.revision_no = NEW.previous_revision_no",
+  ],
+  ["predecessor event link", "predecessor.event_id = NEW.predecessor_event_id"],
+  [
+    "predecessor time ordering",
+    "predecessor.recorded_at_ms <= NEW.recorded_at_ms",
+  ],
+  [
+    "released-to-released rejection",
+    "NOT (NEW.transition = 'released' AND predecessor.transition = 'released')",
+  ],
+];
+
+const OPERATIONAL_HOLD_HEAD_INSERT_REQUIREMENTS = [
+  ["head insert revision is one", "NEW.head_revision <> 1"],
+  ["head insert capability link", "event.capability = NEW.capability"],
+  ["head insert scope-kind link", "event.scope_kind = NEW.scope_kind"],
+  ["head insert scope-id link", "event.scope_id = NEW.scope_id"],
+  ["head insert revision link", "event.revision_no = NEW.head_revision"],
+  ["head insert event-id link", "event.event_id = NEW.current_event_id"],
+  ["head insert event-ref link", "event.event_ref = NEW.current_event_ref"],
+  ["head insert transition link", "event.transition = NEW.state"],
+  ["head insert actor link", "event.recorded_by = NEW.updated_by"],
+  ["head insert time link", "event.recorded_at_ms = NEW.updated_at_ms"],
+];
+
+const OPERATIONAL_HOLD_HEAD_UPDATE_REQUIREMENTS = [
+  ["head capability is immutable", "NEW.capability <> OLD.capability"],
+  ["head scope kind is immutable", "NEW.scope_kind <> OLD.scope_kind"],
+  ["head scope id is immutable", "NEW.scope_id <> OLD.scope_id"],
+  ["head scope-ref is immutable", "NEW.scope_ref <> OLD.scope_ref"],
+  [
+    "head update advances exactly one revision",
+    "NEW.head_revision <> OLD.head_revision + 1",
+  ],
+  ["head event-id advances", "NEW.current_event_id = OLD.current_event_id"],
+  ["head event-ref advances", "NEW.current_event_ref = OLD.current_event_ref"],
+  ["head update time is monotonic", "NEW.updated_at_ms < OLD.updated_at_ms"],
+  ["head update capability link", "event.capability = NEW.capability"],
+  ["head update scope-kind link", "event.scope_kind = NEW.scope_kind"],
+  ["head update scope-id link", "event.scope_id = NEW.scope_id"],
+  ["head update revision link", "event.revision_no = NEW.head_revision"],
+  [
+    "head update previous-revision link",
+    "event.previous_revision_no = OLD.head_revision",
+  ],
+  [
+    "head update predecessor-event link",
+    "event.predecessor_event_id = OLD.current_event_id",
+  ],
+  ["head update event-id link", "event.event_id = NEW.current_event_id"],
+  ["head update event-ref link", "event.event_ref = NEW.current_event_ref"],
+  ["head update transition link", "event.transition = NEW.state"],
+  ["head update actor link", "event.recorded_by = NEW.updated_by"],
+  ["head update time link", "event.recorded_at_ms = NEW.updated_at_ms"],
+];
+
+function operationalHoldSqliteRequirements(issues, sql) {
+  const dialect = "SQLite";
+  operationalHoldTableRequirements(issues, dialect, sql);
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "trg_jobs_operational_hold_events_validate_insert",
+    extractSqliteTrigger(
+      sql,
+      "trg_jobs_operational_hold_events_validate_insert",
+    ),
+    [
+      [
+        "event validation trigger binding",
+        "BEFORE INSERT ON jobs_operational_hold_events",
+      ],
+      ...OPERATIONAL_HOLD_EVENT_VALIDATION_REQUIREMENTS,
+    ],
+  );
+  for (const [triggerName, operation] of [
+    ["trg_jobs_operational_hold_events_no_update", "UPDATE"],
+    ["trg_jobs_operational_hold_events_no_delete", "DELETE"],
+  ]) {
+    requireOperationalHoldFragments(
+      issues,
+      dialect,
+      triggerName,
+      extractSqliteTrigger(sql, triggerName),
+      [
+        [
+          `event ${operation.toLowerCase()} immutability`,
+          `BEFORE ${operation} ON jobs_operational_hold_events`,
+        ],
+        [
+          `event ${operation.toLowerCase()} rejection`,
+          "RAISE(ABORT, 'operational hold event is immutable')",
+        ],
+      ],
+    );
+  }
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "trg_jobs_operational_hold_heads_validate_insert",
+    extractSqliteTrigger(
+      sql,
+      "trg_jobs_operational_hold_heads_validate_insert",
+    ),
+    [
+      [
+        "head insert trigger binding",
+        "BEFORE INSERT ON jobs_operational_hold_heads",
+      ],
+      ...OPERATIONAL_HOLD_HEAD_INSERT_REQUIREMENTS,
+    ],
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "trg_jobs_operational_hold_heads_monotonic",
+    extractSqliteTrigger(sql, "trg_jobs_operational_hold_heads_monotonic"),
+    [
+      [
+        "head update trigger binding",
+        "BEFORE UPDATE ON jobs_operational_hold_heads",
+      ],
+      ...OPERATIONAL_HOLD_HEAD_UPDATE_REQUIREMENTS,
+    ],
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "trg_jobs_operational_hold_heads_no_delete",
+    extractSqliteTrigger(sql, "trg_jobs_operational_hold_heads_no_delete"),
+    [
+      [
+        "head delete immutability",
+        "BEFORE DELETE ON jobs_operational_hold_heads",
+      ],
+      [
+        "head delete rejection",
+        "RAISE(ABORT, 'operational hold head cannot be deleted')",
+      ],
+    ],
+  );
+}
+
+function operationalHoldPostgresRequirements(issues, sql) {
+  const dialect = "Postgres";
+  operationalHoldTableRequirements(issues, dialect, sql);
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "validate_jobs_operational_hold_event",
+    extractPostgresFunction(sql, "validate_jobs_operational_hold_event"),
+    OPERATIONAL_HOLD_EVENT_VALIDATION_REQUIREMENTS,
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "validate_jobs_operational_hold_head_insert",
+    extractPostgresFunction(sql, "validate_jobs_operational_hold_head_insert"),
+    OPERATIONAL_HOLD_HEAD_INSERT_REQUIREMENTS,
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "enforce_jobs_operational_hold_head_monotonic",
+    extractPostgresFunction(
+      sql,
+      "enforce_jobs_operational_hold_head_monotonic",
+    ),
+    OPERATIONAL_HOLD_HEAD_UPDATE_REQUIREMENTS,
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "reject_jobs_operational_hold_event_mutation",
+    extractPostgresFunction(sql, "reject_jobs_operational_hold_event_mutation"),
+    [
+      [
+        "event mutation rejection",
+        "RAISE EXCEPTION 'operational hold event is immutable'",
+      ],
+    ],
+  );
+  requireOperationalHoldFragments(
+    issues,
+    dialect,
+    "reject_jobs_operational_hold_head_delete",
+    extractPostgresFunction(sql, "reject_jobs_operational_hold_head_delete"),
+    [
+      [
+        "head delete rejection",
+        "RAISE EXCEPTION 'operational hold head cannot be deleted'",
+      ],
+    ],
+  );
+
+  for (const [triggerName, requirements] of [
+    [
+      "trg_jobs_operational_hold_events_validate_insert",
+      [
+        [
+          "event validation trigger binding",
+          "BEFORE INSERT ON jobs_operational_hold_events",
+        ],
+        [
+          "event validation function binding",
+          "EXECUTE FUNCTION validate_jobs_operational_hold_event()",
+        ],
+      ],
+    ],
+    [
+      "trg_jobs_operational_hold_events_no_update",
+      [
+        [
+          "event update immutability",
+          "BEFORE UPDATE ON jobs_operational_hold_events",
+        ],
+        [
+          "event update rejection binding",
+          "EXECUTE FUNCTION reject_jobs_operational_hold_event_mutation()",
+        ],
+      ],
+    ],
+    [
+      "trg_jobs_operational_hold_events_no_delete",
+      [
+        [
+          "event delete immutability",
+          "BEFORE DELETE ON jobs_operational_hold_events",
+        ],
+        [
+          "event delete rejection binding",
+          "EXECUTE FUNCTION reject_jobs_operational_hold_event_mutation()",
+        ],
+      ],
+    ],
+    [
+      "trg_jobs_operational_hold_heads_validate_insert",
+      [
+        [
+          "head insert trigger binding",
+          "BEFORE INSERT ON jobs_operational_hold_heads",
+        ],
+        [
+          "head insert function binding",
+          "EXECUTE FUNCTION validate_jobs_operational_hold_head_insert()",
+        ],
+      ],
+    ],
+    [
+      "trg_jobs_operational_hold_heads_monotonic",
+      [
+        [
+          "head update trigger binding",
+          "BEFORE UPDATE ON jobs_operational_hold_heads",
+        ],
+        [
+          "head update function binding",
+          "EXECUTE FUNCTION enforce_jobs_operational_hold_head_monotonic()",
+        ],
+      ],
+    ],
+    [
+      "trg_jobs_operational_hold_heads_no_delete",
+      [
+        [
+          "head delete immutability",
+          "BEFORE DELETE ON jobs_operational_hold_heads",
+        ],
+        [
+          "head delete rejection binding",
+          "EXECUTE FUNCTION reject_jobs_operational_hold_head_delete()",
+        ],
+      ],
+    ],
+  ]) {
+    requireOperationalHoldFragments(
+      issues,
+      dialect,
+      triggerName,
+      extractPostgresTrigger(sql, triggerName),
+      [["trigger row binding", "FOR EACH ROW"], ...requirements],
+    );
+  }
+}
+
 export function compareJobsSchemas(sqliteSource, postgresSource) {
   const issues = [];
   const expectedNames = [...JOBS_PARITY_TABLES].sort();
@@ -558,6 +974,9 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
       );
     }
   }
+
+  operationalHoldSqliteRequirements(issues, sqliteSource);
+  operationalHoldPostgresRequirements(issues, postgresSource);
 
   return issues;
 }
@@ -644,6 +1063,14 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/029_jobs_communication_execution.sql",
   );
+  const sqliteOperationalHoldsPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/052_jobs_operational_holds.sql",
+  );
+  const postgresOperationalHoldsPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/030_jobs_operational_holds.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -655,6 +1082,7 @@ function main() {
     sqliteBrowserRuntimeComponentsPath,
     sqliteRunnerProcessRuntimePath,
     sqliteCommunicationExecutionPath,
+    sqliteOperationalHoldsPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -669,6 +1097,7 @@ function main() {
     postgresBrowserRuntimeComponentsPath,
     postgresRunnerProcessRuntimePath,
     postgresCommunicationExecutionPath,
+    postgresOperationalHoldsPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -754,6 +1183,11 @@ function main() {
       "051_jobs_communication_execution.sql",
       "SQLITE_JOBS_COMMUNICATION_EXECUTION",
     ],
+    [
+      "SQLite",
+      "052_jobs_operational_holds.sql",
+      "SQLITE_JOBS_OPERATIONAL_HOLDS",
+    ],
   ]) {
     const migrationPath = `infra/${dialect.toLowerCase()}/server-runtime/${migration}`;
     if (!sqliteSource.includes(migrationPath)) {
@@ -772,6 +1206,7 @@ function main() {
     "027_jobs_browser_release_runtime_components.sql",
     "028_jobs_runner_process_runtime_authority.sql",
     "029_jobs_communication_execution.sql",
+    "030_jobs_operational_holds.sql",
   ]) {
     const migrationPath = `infra/postgres/server-runtime/${migration}`;
     if (!sqliteSource.includes(migrationPath)) {

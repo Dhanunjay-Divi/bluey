@@ -133,7 +133,7 @@ fn verify_with_late_grace(
     late_grace_ms: i64,
 ) -> anyhow::Result<LocalRunCapabilityClaims> {
     validate_operation(expected_operation)?;
-    if late_grace_ms > 0 && expected_operation != "result" {
+    if late_grace_ms > 0 && !matches!(expected_operation, "result" | "submit") {
         anyhow::bail!("invalid local run capability");
     }
     if token.len() > 4_096 {
@@ -289,6 +289,15 @@ mod tests {
             "submit"
         );
         assert!(verify(&submit, "run", "result", 1_000).is_err());
+        assert!(verify(&submit, "run", "submit", 2_000).is_err());
+        assert!(verify_for_reconciliation(&submit, "run", "submit", 2_000).is_ok());
+        assert!(verify_for_reconciliation(
+            &submit,
+            "run",
+            "submit",
+            2_000 + RECONCILIATION_GRACE_MS
+        )
+        .is_err());
         assert!(verify(&token, "run", "result", 2_000).is_err());
         assert!(verify_for_reconciliation(&token, "run", "result", 2_000).is_ok());
         assert!(verify_for_reconciliation(
@@ -334,6 +343,7 @@ mod tests {
 
         let submit = issue_legacy_v1("submit", 2_000);
         assert!(verify(&submit, "run", "submit", 1_000).is_err());
+        assert!(verify_for_reconciliation(&submit, "run", "submit", 2_000).is_err());
         std::env::remove_var("BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY");
     }
 

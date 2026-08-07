@@ -1462,6 +1462,11 @@ pub fn reserve_application_attempt(
     application_id: &str,
     runner: &str,
 ) -> Result<AttemptReservation> {
+    let runner_kind = match runner {
+        "cloud" | "local" => Some(runner),
+        "unassigned" => None,
+        _ => anyhow::bail!("application runner is invalid"),
+    };
     let application = get_application(pool, account_id, application_id)?
         .ok_or_else(|| anyhow::anyhow!("application not found"))?;
     let posting = get_posting(pool, account_id, &application.job_id)?
@@ -1478,6 +1483,21 @@ pub fn reserve_application_attempt(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let hold_context = operational_hold_context_for_application_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                runner_kind,
+                None,
+                None,
+            )
+            .map_err(anyhow::Error::new)?;
+            require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::ApplicationQueue,
+                &hold_context,
+            )
+            .map_err(anyhow::Error::new)?;
             if let Some(existing) = tx
                 .query_row(
                     "SELECT id, application_id, company_key, period_key, runner, status,
@@ -1586,10 +1606,27 @@ pub fn reserve_application_attempt(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             tx.query_one(
                 "SELECT account_id FROM jobs_entitlements WHERE account_id = $1 FOR UPDATE",
                 &[&account_id],
             )?;
+            let hold_context = operational_hold_context_for_application_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                runner_kind,
+                None,
+                None,
+            )
+            .map_err(anyhow::Error::new)?;
+            require_operational_capability_postgres_tx(
+                &mut tx,
+                OperationalCapability::ApplicationQueue,
+                &hold_context,
+            )
+            .map_err(anyhow::Error::new)?;
             if let Some(row) = tx.query_opt(
                 "SELECT id, application_id, company_key, period_key, runner, status,
                         reserved_at_ms, updated_at_ms
@@ -1623,10 +1660,10 @@ pub fn reserve_application_attempt(
             }
             let authorities = tx.query(
                 "SELECT s.status, s.health, m.availability_status, m.last_seen_at_ms
-                   FROM jobs_discovery_memberships m
+                  FROM jobs_discovery_memberships m
                    JOIN jobs_discovery_sources s ON s.id = m.source_id
                   WHERE m.account_id = $1 AND m.job_id = $2
-                  FOR UPDATE OF s, m",
+                  FOR SHARE OF s, m",
                 &[&account_id, &posting.id],
             )?;
             if !authorities.is_empty() {
@@ -1799,7 +1836,7 @@ fn ensure_discovery_authority_in_pg_tx(
            FROM jobs_discovery_memberships m
            JOIN jobs_discovery_sources s ON s.id = m.source_id
           WHERE m.account_id = $1 AND m.job_id = $2
-          FOR UPDATE OF s, m",
+          FOR SHARE OF s, m",
         &[&account_id, &job_id],
     )?;
     if authorities.is_empty() {

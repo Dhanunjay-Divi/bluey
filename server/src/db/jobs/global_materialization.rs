@@ -614,6 +614,7 @@ fn persist_global_materialization(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
             tx.execute(
                 "INSERT INTO jobs_global_candidate_materializations (
                     account_id, candidate_id, job_id, track_id, source_updated_at_ms,

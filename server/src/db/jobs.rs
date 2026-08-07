@@ -172,12 +172,22 @@ fn discovery_next_run_at(source: &DiscoverySource, completed_at_ms: i64, failure
 
 const DISCOVERY_ACCOUNT_LOCK_SQL: &str =
     "SELECT pg_advisory_xact_lock(hashtextextended('jobs-discovery-account:' || $1, 0))";
+const DISCOVERY_ACCOUNT_SHARED_LOCK_SQL: &str =
+    "SELECT pg_advisory_xact_lock_shared(hashtextextended('jobs-discovery-account:' || $1, 0))";
 
 fn lock_discovery_account_postgres(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
 ) -> Result<()> {
     tx.query_one(DISCOVERY_ACCOUNT_LOCK_SQL, &[&account_id])?;
+    Ok(())
+}
+
+pub(crate) fn lock_discovery_account_shared_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    tx.query_one(DISCOVERY_ACCOUNT_SHARED_LOCK_SQL, &[&account_id])?;
     Ok(())
 }
 
@@ -2168,6 +2178,7 @@ include!("jobs/global_materialization.rs");
 include!("jobs/global_archive.rs");
 include!("jobs/resume_assets.rs");
 include!("jobs/auto_submit.rs");
+include!("jobs/operational_holds.rs");
 include!("jobs/eligibility.rs");
 include!("jobs/applications.rs");
 include!("jobs/customer_data.rs");

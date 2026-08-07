@@ -1,4 +1,35 @@
 
+const OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT: usize = 8;
+
+type DiscoveryOperationalHoldScanCursor = (i64, String);
+
+static DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS: std::sync::LazyLock<
+    std::sync::Mutex<Option<DiscoveryOperationalHoldScanCursor>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+fn operational_hold_scan_cursor_snapshot<K: Clone>(
+    cursor: &std::sync::Mutex<Option<K>>,
+) -> Option<K> {
+    cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
+fn compare_exchange_operational_hold_scan_cursor<K: Eq>(
+    cursor: &std::sync::Mutex<Option<K>>,
+    expected: Option<&K>,
+    next: Option<K>,
+) {
+    let mut cursor = cursor
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if cursor.as_ref() != expected {
+        return;
+    }
+    *cursor = next;
+}
+
 pub fn list_discovery_sources(pool: &DbPool, account_id: &str) -> Result<Vec<DiscoverySource>> {
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -1179,6 +1210,152 @@ fn discovery_source_from_pg_row(row: postgres::Row) -> Result<DiscoverySource> {
     })
 }
 
+fn add_discovery_track_operational_context(
+    context: &mut OperationalHoldContext,
+    track_id: &str,
+    track_json: String,
+    relational_active: bool,
+    include_scopes: bool,
+) -> Result<()> {
+    let track: CareerTrack = parse_json(track_json, "Career Track")?;
+    if track.id != track_id || track.active != relational_active {
+        anyhow::bail!("discovery source Career Track projection changed")
+    }
+    if !include_scopes {
+        return Ok(());
+    }
+    context.insert_scope(OperationalHoldScopeKind::CareerTrack, track_id)?;
+    for region in track.locations {
+        if let Some(region) = operational_region(&region) {
+            context.insert_scope(OperationalHoldScopeKind::Region, region)?;
+        }
+    }
+    Ok(())
+}
+
+fn discovery_operational_context_base(source: &DiscoverySource) -> Result<OperationalHoldContext> {
+    let mut context = OperationalHoldContext::new()
+        .with_scope(OperationalHoldScopeKind::DiscoverySource, &source.id)?
+        .with_scope(OperationalHoldScopeKind::Account, &source.account_id)?
+        .with_scope(OperationalHoldScopeKind::AtsProvider, &source.provider)?;
+    if !source.track_id.trim().is_empty() {
+        context.insert_scope(OperationalHoldScopeKind::CareerTrack, &source.track_id)?;
+    }
+    Ok(context)
+}
+
+fn discovery_operational_context_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<OperationalHoldContext> {
+    let mut context = discovery_operational_context_base(source)?;
+    if source.track_id.trim().is_empty() {
+        let mut statement = tx.prepare(
+            "SELECT id, track_json, active FROM jobs_tracks
+              WHERE account_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement.query_map(params![source.account_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (track_id, track_json, active) = row?;
+            add_discovery_track_operational_context(
+                &mut context,
+                &track_id,
+                track_json,
+                active,
+                active,
+            )?;
+        }
+    } else {
+        let (track_id, track_json, active) = tx
+            .query_row(
+                "SELECT id, track_json, active FROM jobs_tracks
+              WHERE account_id = ?1 AND id = ?2",
+                params![source.account_id, source.track_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("discovery source Career Track was not found"))?;
+        add_discovery_track_operational_context(
+            &mut context,
+            &track_id,
+            track_json,
+            active,
+            true,
+        )?;
+    }
+    Ok(context)
+}
+
+fn discovery_operational_context_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<OperationalHoldContext> {
+    let mut context = discovery_operational_context_base(source)?;
+    let rows = if source.track_id.trim().is_empty() {
+        tx.query(
+            "SELECT id, track_json, active FROM jobs_tracks
+              WHERE account_id = $1 ORDER BY id FOR SHARE",
+            &[&source.account_id],
+        )?
+    } else {
+        vec![tx
+            .query_opt(
+                "SELECT id, track_json, active FROM jobs_tracks
+                  WHERE account_id = $1 AND id = $2 FOR SHARE",
+                &[&source.account_id, &source.track_id],
+            )?
+            .ok_or_else(|| anyhow::anyhow!("discovery source Career Track was not found"))?]
+    };
+    for row in rows {
+        let relational_active = row.get::<_, i32>(2) != 0;
+        let include_scopes = !source.track_id.trim().is_empty() || relational_active;
+        add_discovery_track_operational_context(
+            &mut context,
+            &row.get::<_, String>(0),
+            row.get::<_, String>(1),
+            relational_active,
+            include_scopes,
+        )?;
+    }
+    Ok(context)
+}
+
+fn discovery_operationally_allowed_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<bool> {
+    let context = discovery_operational_context_sqlite(tx, source)?;
+    operational_hold_allows(require_operational_capability_sqlite_tx(
+        tx,
+        OperationalCapability::Discovery,
+        &context,
+    ))
+}
+
+fn discovery_operationally_allowed_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &DiscoverySource,
+) -> Result<bool> {
+    let context = discovery_operational_context_postgres(tx, source)?;
+    operational_hold_allows(require_operational_capability_postgres_tx(
+        tx,
+        OperationalCapability::Discovery,
+        &context,
+    ))
+}
+
 pub fn lease_due_discovery_source(
     pool: &DbPool,
     worker_id: &str,
@@ -1205,9 +1382,24 @@ pub fn lease_due_discovery_source(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let source = tx
-                .query_row(
-                    "SELECT id, account_id, track_id, provider, source_key, source_json,
+            let initial_scan_cursor =
+                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS);
+            let mut scan_cursor = initial_scan_cursor.clone();
+            let mut wrapped = false;
+            let mut scanned = 0;
+            let mut exhausted = false;
+            let source = loop {
+                if scanned >= OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+                    break None;
+                }
+                let cursor_next_run_at_ms = scan_cursor.as_ref().map(|cursor| cursor.0);
+                let cursor_source_id = scan_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.1.as_str())
+                    .unwrap_or_default();
+                let candidate = tx
+                    .query_row(
+                        "SELECT id, account_id, track_id, provider, source_key, source_json,
                             status, health, consecutive_failures, run_interval_ms,
                             next_run_at_ms, last_success_at_ms, last_failure_at_ms,
                             last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
@@ -1220,13 +1412,49 @@ pub fn lease_due_discovery_source(
                              WHERE r.source_id = jobs_discovery_sources.id
                                AND r.status = 'committing'
                         )
+                        AND (?2 IS NULL OR next_run_at_ms > ?2
+                             OR (next_run_at_ms = ?2 AND id > ?3))
                       ORDER BY next_run_at_ms ASC, id ASC LIMIT 1",
-                    params![now],
-                    discovery_source_from_sqlite_row,
-                )
-                .optional()?;
+                        params![now, cursor_next_run_at_ms, cursor_source_id],
+                        discovery_source_from_sqlite_row,
+                    )
+                    .optional()?;
+                let Some(candidate) = candidate else {
+                    if !wrapped && initial_scan_cursor.is_some() {
+                        scan_cursor = None;
+                        wrapped = true;
+                        continue;
+                    }
+                    exhausted = true;
+                    break None;
+                };
+                let candidate_cursor = (candidate.next_run_at_ms, candidate.id.clone());
+                if wrapped
+                    && initial_scan_cursor
+                        .as_ref()
+                        .is_some_and(|initial| &candidate_cursor >= initial)
+                {
+                    exhausted = true;
+                    break None;
+                }
+                scan_cursor = Some(candidate_cursor);
+                scanned += 1;
+                if discovery_operationally_allowed_sqlite(&tx, &candidate)? {
+                    break Some(candidate);
+                }
+            };
+            let next_scan_cursor = (source.is_none()
+                && !exhausted
+                && scanned == OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT)
+                .then(|| scan_cursor.clone())
+                .flatten();
             let Some(source) = source else {
                 tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
                 return Ok(None);
             };
             let scheduled_for_ms = source.next_run_at_ms;
@@ -1247,6 +1475,11 @@ pub fn lease_due_discovery_source(
                 params![run_id, source.account_id, source.id, replay_key, now],
             )?;
             tx.commit()?;
+            compare_exchange_operational_hold_scan_cursor(
+                &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                initial_scan_cursor.as_ref(),
+                next_scan_cursor,
+            );
             Ok(Some(DiscoverySourceLease {
                 source: DiscoverySource {
                     lease_expires_at_ms: Some(lease_expires),
@@ -1261,29 +1494,81 @@ pub fn lease_due_discovery_source(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let row = tx.query_opt(
-                "SELECT id, account_id, track_id, provider, source_key, source_json,
-                        status, health, consecutive_failures, run_interval_ms,
-                        next_run_at_ms, last_success_at_ms, last_failure_at_ms,
-                        last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
-                   FROM jobs_discovery_sources
-                  WHERE status = 'active' AND health <> 'paused'
-                    AND next_run_at_ms <= $1
-                    AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
-                    AND NOT EXISTS (
-                        SELECT 1 FROM jobs_discovery_runs r
-                         WHERE r.source_id = jobs_discovery_sources.id
-                           AND r.status = 'committing'
-                    )
-                  ORDER BY next_run_at_ms ASC, id ASC
-                  FOR UPDATE SKIP LOCKED LIMIT 1",
-                &[&now],
-            )?;
-            let Some(row) = row else {
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            let initial_scan_cursor =
+                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS);
+            let mut scan_cursor = initial_scan_cursor.clone();
+            let mut wrapped = false;
+            let mut scanned = 0;
+            let mut exhausted = false;
+            let source = loop {
+                if scanned >= OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+                    break None;
+                }
+                let cursor_next_run_at_ms = scan_cursor.as_ref().map(|cursor| cursor.0);
+                let cursor_source_id = scan_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.1.as_str())
+                    .unwrap_or_default();
+                let row = tx.query_opt(
+                    "SELECT id, account_id, track_id, provider, source_key, source_json,
+                            status, health, consecutive_failures, run_interval_ms,
+                            next_run_at_ms, last_success_at_ms, last_failure_at_ms,
+                            last_error_code, lease_expires_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_discovery_sources
+                      WHERE status = 'active' AND health <> 'paused'
+                        AND next_run_at_ms <= $1
+                        AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM jobs_discovery_runs r
+                             WHERE r.source_id = jobs_discovery_sources.id
+                               AND r.status = 'committing'
+                        )
+                        AND ($2::BIGINT IS NULL OR next_run_at_ms > $2
+                             OR (next_run_at_ms = $2 AND id > $3))
+                      ORDER BY next_run_at_ms ASC, id ASC
+                      FOR UPDATE SKIP LOCKED LIMIT 1",
+                    &[&now, &cursor_next_run_at_ms, &cursor_source_id],
+                )?;
+                let Some(row) = row else {
+                    if !wrapped && initial_scan_cursor.is_some() {
+                        scan_cursor = None;
+                        wrapped = true;
+                        continue;
+                    }
+                    exhausted = true;
+                    break None;
+                };
+                let candidate = discovery_source_from_pg_row(row)?;
+                let candidate_cursor = (candidate.next_run_at_ms, candidate.id.clone());
+                if wrapped
+                    && initial_scan_cursor
+                        .as_ref()
+                        .is_some_and(|initial| &candidate_cursor >= initial)
+                {
+                    exhausted = true;
+                    break None;
+                }
+                scan_cursor = Some(candidate_cursor);
+                scanned += 1;
+                if discovery_operationally_allowed_postgres(&mut tx, &candidate)? {
+                    break Some(candidate);
+                }
+            };
+            let next_scan_cursor = (source.is_none()
+                && !exhausted
+                && scanned == OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT)
+                .then(|| scan_cursor.clone())
+                .flatten();
+            let Some(source) = source else {
                 tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
                 return Ok(None);
             };
-            let source = discovery_source_from_pg_row(row)?;
             let scheduled_for_ms = source.next_run_at_ms;
             let replay_key = discovery_replay_key(&source.id, scheduled_for_ms);
             let run_id = discovery_run_id(&source.id, &replay_key);
@@ -1308,6 +1593,11 @@ pub fn lease_due_discovery_source(
                 &[&run_id, &source.account_id, &source.id, &replay_key, &now],
             )?;
             tx.commit()?;
+            compare_exchange_operational_hold_scan_cursor(
+                &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                initial_scan_cursor.as_ref(),
+                next_scan_cursor,
+            );
             Ok(Some(DiscoverySourceLease {
                 source: DiscoverySource {
                     lease_expires_at_ms: Some(lease_expires),
@@ -2747,6 +3037,7 @@ fn best_curated_discovery_track<'a>(
 ) -> Option<&'a CareerTrack> {
     tracks
         .iter()
+        .filter(|track| track.active)
         .filter_map(|track| {
             let target_family = canonical_role_family(Some(track), posting);
             let posting_family = posting_role_family(posting);
@@ -3069,4 +3360,406 @@ fn completed_discovery_run(
         }
     }
     Ok(completed.map(|(result, _)| result))
+}
+
+#[cfg(test)]
+fn discovery_operational_hold_test_pool() -> DbPool {
+    let path = std::env::temp_dir().join(format!(
+        "bluey-discovery-hold-{}-{}.sqlite3",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let pool = crate::db::open_pool(&path).unwrap();
+    crate::db::run_migrations(&pool).unwrap();
+    pool.get()
+        .unwrap()
+        .execute(
+            "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+             VALUES ('acct-discovery-hold', 'discovery-hold@example.com', 'hash', 0)",
+            [],
+        )
+        .unwrap();
+    pool
+}
+
+#[cfg(test)]
+fn append_discovery_operational_hold_test_event(
+    pool: &DbPool,
+    event_id: &str,
+    capability: OperationalCapability,
+    scope_kind: OperationalHoldScopeKind,
+    scope_id: &str,
+    transition: OperationalHoldTransition,
+    expected_event_id: Option<&str>,
+) {
+    append_operational_hold_event(
+        pool,
+        &AppendOperationalHoldEventRequest {
+            event_id: event_id.to_string(),
+            capability,
+            scope_kind,
+            scope_id: scope_id.to_string(),
+            transition,
+            reason_code: if transition == OperationalHoldTransition::Held {
+                OperationalHoldReasonCode::Incident
+            } else {
+                OperationalHoldReasonCode::ManualRelease
+            },
+            reason_ref: None,
+            expected_head_revision: i64::from(expected_event_id.is_some()),
+            expected_current_event_id: expected_event_id.map(str::to_string),
+        },
+        "discovery-test-operator",
+    )
+    .unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_track_operational_context_omits_unknown_region_sentinels() {
+    let track = CareerTrack {
+        id: "track-region-context".to_string(),
+        name: "Region context".to_string(),
+        role: "Software Engineer".to_string(),
+        locations: vec![
+            "Unknown".to_string(),
+            "N/A".to_string(),
+            "NA".to_string(),
+            "Not Specified".to_string(),
+            "Unspecified".to_string(),
+            "  ".to_string(),
+            "München".to_string(),
+        ],
+        remote_preference: "hybrid_ok".to_string(),
+        application_identity_id: None,
+        policy: CareerTrackPolicy::default(),
+        active: true,
+        match_count: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let mut context = OperationalHoldContext::new();
+    add_discovery_track_operational_context(
+        &mut context,
+        &track.id,
+        to_json(&track, "Career Track").unwrap(),
+        true,
+        true,
+    )
+    .unwrap();
+
+    for sentinel in ["unknown", "n/a", "na", "not specified", "unspecified"] {
+        assert!(!context.matches(OperationalHoldScopeKind::Region, sentinel));
+    }
+    assert!(context.matches(OperationalHoldScopeKind::Region, "münchen"));
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_lease_fails_closed_for_missing_or_mismatched_bound_track() {
+    let pool = discovery_operational_hold_test_pool();
+    let track = CareerTrack {
+        id: "track-discovery-context".to_string(),
+        name: "Discovery context".to_string(),
+        role: "Software Engineer".to_string(),
+        locations: vec!["New York, NY".to_string()],
+        remote_preference: "hybrid_ok".to_string(),
+        application_identity_id: None,
+        policy: CareerTrackPolicy::default(),
+        active: true,
+        match_count: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    upsert_track(&pool, "acct-discovery-hold", &track).unwrap();
+    let source = upsert_discovery_source(
+        &pool,
+        "acct-discovery-hold",
+        &DiscoverySourceInput {
+            track_id: track.id.clone(),
+            provider: "greenhouse".to_string(),
+            source_key: "context-board".to_string(),
+            company: "Context Incorporated".to_string(),
+            run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+        },
+    )
+    .unwrap();
+    pool.get()
+        .unwrap()
+        .execute(
+            "DELETE FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+            params!["acct-discovery-hold", track.id],
+        )
+        .unwrap();
+
+    let missing = lease_due_discovery_source(&pool, "missing-track-worker").unwrap_err();
+    assert!(missing
+        .to_string()
+        .contains("discovery source Career Track was not found"));
+
+    upsert_track(&pool, "acct-discovery-hold", &track).unwrap();
+    let mismatched = CareerTrack {
+        id: "track-other".to_string(),
+        ..track.clone()
+    };
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_tracks SET track_json = ?3
+              WHERE account_id = ?1 AND id = ?2",
+            params![
+                "acct-discovery-hold",
+                track.id,
+                to_json(&mismatched, "mismatched Career Track").unwrap()
+            ],
+        )
+        .unwrap();
+
+    let mismatched = lease_due_discovery_source(&pool, "mismatched-track-worker").unwrap_err();
+    assert!(mismatched
+        .to_string()
+        .contains("discovery source Career Track projection changed"));
+    let lease_owner: Option<String> = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT lease_owner FROM jobs_discovery_sources WHERE id = ?1",
+            params![source.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(lease_owner.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_lease_skips_native_pauses_and_operational_holds_without_starvation() {
+    let pool = discovery_operational_hold_test_pool();
+    let track = upsert_track(
+        &pool,
+        "acct-discovery-hold",
+        &CareerTrack {
+            id: "track-discovery-hold".to_string(),
+            name: "Held discovery".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: None,
+            policy: CareerTrackPolicy::default(),
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        },
+    )
+    .unwrap();
+    let make_source = |provider: &str, source_key: &str| {
+        upsert_discovery_source(
+            &pool,
+            "acct-discovery-hold",
+            &DiscoverySourceInput {
+                track_id: track.id.clone(),
+                provider: provider.to_string(),
+                source_key: source_key.to_string(),
+                company: format!("{source_key} Incorporated"),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap()
+    };
+    let paused = ensure_managed_curated_discovery_source(&pool, "acct-discovery-hold")
+        .unwrap()
+        .unwrap();
+    assert!(paused.track_id.is_empty());
+    let held = make_source("greenhouse", "held-board");
+    let allowed = make_source("lever", "allowed-board");
+    set_discovery_source_status(
+        &pool,
+        "acct-discovery-hold",
+        &paused.id,
+        "paused",
+    )
+    .unwrap();
+    let schedule = now_ms().saturating_sub(10_000);
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_discovery_sources
+                SET next_run_at_ms = CASE id
+                    WHEN ?1 THEN ?4 WHEN ?2 THEN ?5 ELSE ?6 END
+              WHERE id IN (?1, ?2, ?3)",
+            params![
+                paused.id,
+                held.id,
+                allowed.id,
+                schedule,
+                schedule + 1,
+                schedule + 2,
+            ],
+        )
+        .unwrap();
+
+    let mut conn = pool.get().unwrap();
+    let tx = conn.transaction().unwrap();
+    let paused_context = discovery_operational_context_sqlite(&tx, &paused).unwrap();
+    assert!(paused_context.matches(OperationalHoldScopeKind::CareerTrack, &track.id));
+    assert!(paused_context.matches(OperationalHoldScopeKind::Region, "new york, ny"));
+    let held_context = discovery_operational_context_sqlite(&tx, &held).unwrap();
+    assert!(held_context.matches(OperationalHoldScopeKind::Global, "*"));
+    assert!(held_context.matches(
+        OperationalHoldScopeKind::DiscoverySource,
+        &held.id
+    ));
+    assert!(held_context.matches(
+        OperationalHoldScopeKind::Account,
+        "acct-discovery-hold"
+    ));
+    assert!(held_context.matches(OperationalHoldScopeKind::CareerTrack, &track.id));
+    assert!(held_context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
+    assert!(held_context.matches(OperationalHoldScopeKind::Region, "new york, ny"));
+    tx.commit().unwrap();
+
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "discovery-global-all-hold",
+        OperationalCapability::All,
+        OperationalHoldScopeKind::Global,
+        "*",
+        OperationalHoldTransition::Held,
+        None,
+    );
+    assert!(lease_due_discovery_source(&pool, "held-worker")
+        .unwrap()
+        .is_none());
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "discovery-global-all-release",
+        OperationalCapability::All,
+        OperationalHoldScopeKind::Global,
+        "*",
+        OperationalHoldTransition::Released,
+        Some("discovery-global-all-hold"),
+    );
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "discovery-source-hold",
+        OperationalCapability::Discovery,
+        OperationalHoldScopeKind::DiscoverySource,
+        &held.id,
+        OperationalHoldTransition::Held,
+        None,
+    );
+
+    let lease = lease_due_discovery_source(&pool, "allowed-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    let conn = pool.get().unwrap();
+    let held_lease: Option<String> = conn
+        .query_row(
+            "SELECT lease_owner FROM jobs_discovery_sources WHERE id = ?1",
+            params![held.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(held_lease.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn discovery_held_candidate_scan_is_bounded_and_advances_on_the_next_call() {
+    let pool = discovery_operational_hold_test_pool();
+    let track = |id: &str, name: &str| CareerTrack {
+        id: id.to_string(),
+        name: name.to_string(),
+        role: "Software Engineer".to_string(),
+        locations: vec!["New York, NY".to_string()],
+        remote_preference: "hybrid_ok".to_string(),
+        application_identity_id: None,
+        policy: CareerTrackPolicy::default(),
+        active: true,
+        match_count: 0,
+        created_at_ms: 0,
+        updated_at_ms: 0,
+    };
+    let held_track = track("track-bounded-held", "Bounded held discovery");
+    let allowed_track = track("track-bounded-allowed", "Bounded allowed discovery");
+    upsert_track(&pool, "acct-discovery-hold", &held_track).unwrap();
+    upsert_track(&pool, "acct-discovery-hold", &allowed_track).unwrap();
+
+    let mut held_sources = Vec::new();
+    for index in 0..OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+        held_sources.push(
+            upsert_discovery_source(
+                &pool,
+                "acct-discovery-hold",
+                &DiscoverySourceInput {
+                    track_id: held_track.id.clone(),
+                    provider: "greenhouse".to_string(),
+                    source_key: format!("bounded-held-board-{index:02}"),
+                    company: format!("Bounded Held {index:02} Incorporated"),
+                    run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+                },
+            )
+            .unwrap(),
+        );
+    }
+    let allowed = upsert_discovery_source(
+        &pool,
+        "acct-discovery-hold",
+        &DiscoverySourceInput {
+            track_id: allowed_track.id.clone(),
+            provider: "lever".to_string(),
+            source_key: "bounded-allowed-board".to_string(),
+            company: "Bounded Allowed Incorporated".to_string(),
+            run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+        },
+    )
+    .unwrap();
+    let schedule = now_ms().saturating_sub(100_000);
+    let conn = pool.get().unwrap();
+    for (index, source) in held_sources.iter().enumerate() {
+        conn.execute(
+            "UPDATE jobs_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+            params![source.id, schedule + index as i64],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE jobs_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+        params![
+            allowed.id,
+            schedule + OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT as i64
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "bounded-direct-greenhouse-hold",
+        OperationalCapability::Discovery,
+        OperationalHoldScopeKind::AtsProvider,
+        "greenhouse",
+        OperationalHoldTransition::Held,
+        None,
+    );
+
+    let worker_id = "bounded-direct-held-scan-worker";
+    assert!(lease_due_discovery_source(&pool, worker_id)
+        .unwrap()
+        .is_none());
+    let lease = lease_due_discovery_source(&pool, worker_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    assert!(held_sources.iter().all(|source| {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT lease_owner IS NULL FROM jobs_discovery_sources WHERE id = ?1",
+                params![source.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    }));
 }

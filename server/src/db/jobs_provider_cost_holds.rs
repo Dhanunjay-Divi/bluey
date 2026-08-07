@@ -314,25 +314,6 @@ pub fn reserve(
                   WHERE occurred_at < datetime(?1 / 1000, 'unixepoch')",
                 params![retention_cutoff],
             )?;
-            let jobs_fence: Option<(String, String)> = tx
-                .query_row(
-                    "SELECT reservation_token, status FROM jobs_resume_generations
-                      WHERE account_id = ?1 AND generation_key = ?2",
-                    params![account_id, generation_key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?;
-            if let Some((active_token, status)) = jobs_fence {
-                if active_token != reservation_token || status != "reserved" {
-                    anyhow::bail!("Jobs provider cost hold lost its generation lease fence")
-                }
-                tx.execute(
-                    "UPDATE jobs_resume_generations SET updated_at_ms = ?3
-                      WHERE account_id = ?1 AND generation_key = ?2
-                        AND reservation_token = ?4 AND status = 'reserved'",
-                    params![account_id, generation_key, now, reservation_token],
-                )?;
-            }
             let existing: Option<(String, String, String, String, i64, String, String)> = tx
                 .query_row(
                     "SELECT account_scope_hash, generation_scope_hash, provider, model,
@@ -377,6 +358,39 @@ pub fn reserve(
                     });
                 }
                 anyhow::bail!("Jobs provider cost hold was already terminal")
+            }
+            let jobs_fence: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT reservation_token, status, job_id FROM jobs_resume_generations
+                      WHERE account_id = ?1 AND generation_key = ?2",
+                    params![account_id, generation_key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((active_token, status, job_id)) = jobs_fence {
+                if active_token != reservation_token || status != "reserved" {
+                    anyhow::bail!("Jobs provider cost hold lost its generation lease fence")
+                }
+                let hold_context = super::jobs::operational_hold_context_for_job_sqlite_tx(
+                    &tx,
+                    account_id,
+                    &job_id,
+                    Some(provider),
+                    Some(model),
+                )
+                .map_err(anyhow::Error::new)?;
+                super::jobs::require_operational_capability_sqlite_tx(
+                    &tx,
+                    super::jobs::OperationalCapability::Generation,
+                    &hold_context,
+                )
+                .map_err(anyhow::Error::new)?;
+                tx.execute(
+                    "UPDATE jobs_resume_generations SET updated_at_ms = ?3
+                      WHERE account_id = ?1 AND generation_key = ?2
+                        AND reservation_token = ?4 AND status = 'reserved'",
+                    params![account_id, generation_key, now, reservation_token],
+                )?;
             }
             let generation_exposure = super::usage::sqlite_saturated_cost_sum(
                 &tx,
@@ -466,27 +480,12 @@ pub fn reserve(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            super::jobs::lock_operational_hold_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
+            super::jobs::lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             let now = postgres_transaction_now_ms(&mut tx)?;
             let window_start = now.saturating_sub(guard.window_hours.saturating_mul(3_600_000));
             let retention_cutoff = now.saturating_sub(UPSTREAM_SPEND_TRUTH_RETENTION_MS);
-            let jobs_fence = tx.query_opt(
-                "SELECT reservation_token, status FROM jobs_resume_generations
-                  WHERE account_id = $1 AND generation_key = $2 FOR UPDATE",
-                &[&account_id, &generation_key],
-            )?;
-            if let Some(row) = jobs_fence {
-                let active_token: String = row.get(0);
-                let status: String = row.get(1);
-                if active_token != reservation_token || status != "reserved" {
-                    anyhow::bail!("Jobs provider cost hold lost its generation lease fence")
-                }
-                tx.execute(
-                    "UPDATE jobs_resume_generations SET updated_at_ms = $3
-                      WHERE account_id = $1 AND generation_key = $2
-                        AND reservation_token = $4 AND status = 'reserved'",
-                    &[&account_id, &generation_key, &now, &reservation_token],
-                )?;
-            }
             tx.query_one(
                 "SELECT pg_advisory_xact_lock(hashtextextended('jobs-provider-cost-global', 0))",
                 &[],
@@ -529,6 +528,39 @@ pub fn reserve(
                     });
                 }
                 anyhow::bail!("Jobs provider cost hold was already terminal")
+            }
+            let jobs_fence = tx.query_opt(
+                "SELECT reservation_token, status, job_id FROM jobs_resume_generations
+                  WHERE account_id = $1 AND generation_key = $2 FOR UPDATE",
+                &[&account_id, &generation_key],
+            )?;
+            if let Some(row) = jobs_fence {
+                let active_token: String = row.get(0);
+                let status: String = row.get(1);
+                let job_id: String = row.get(2);
+                if active_token != reservation_token || status != "reserved" {
+                    anyhow::bail!("Jobs provider cost hold lost its generation lease fence")
+                }
+                let hold_context = super::jobs::operational_hold_context_for_job_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    &job_id,
+                    Some(provider),
+                    Some(model),
+                )
+                .map_err(anyhow::Error::new)?;
+                super::jobs::require_operational_capability_postgres_tx(
+                    &mut tx,
+                    super::jobs::OperationalCapability::Generation,
+                    &hold_context,
+                )
+                .map_err(anyhow::Error::new)?;
+                tx.execute(
+                    "UPDATE jobs_resume_generations SET updated_at_ms = $3
+                      WHERE account_id = $1 AND generation_key = $2
+                        AND reservation_token = $4 AND status = 'reserved'",
+                    &[&account_id, &generation_key, &now, &reservation_token],
+                )?;
             }
             let generation_exposure: i64 = tx
                 .query_one(
@@ -959,6 +991,36 @@ pub fn settle_with_usage(
 mod tests {
     use super::*;
 
+    fn append_generation_hold(
+        pool: &DbPool,
+        account_id: &str,
+        event_id: &str,
+        transition: super::super::jobs::OperationalHoldTransition,
+        revision: i64,
+        predecessor: Option<&str>,
+    ) {
+        super::super::jobs::append_operational_hold_event(
+            pool,
+            &super::super::jobs::AppendOperationalHoldEventRequest {
+                event_id: event_id.to_string(),
+                capability: super::super::jobs::OperationalCapability::Generation,
+                scope_kind: super::super::jobs::OperationalHoldScopeKind::Account,
+                scope_id: account_id.to_string(),
+                transition,
+                reason_code: if transition == super::super::jobs::OperationalHoldTransition::Held {
+                    super::super::jobs::OperationalHoldReasonCode::Incident
+                } else {
+                    super::super::jobs::OperationalHoldReasonCode::ManualRelease
+                },
+                reason_ref: Some("INC-606".to_string()),
+                expected_head_revision: revision,
+                expected_current_event_id: predecessor.map(str::to_string),
+            },
+            "admin-606",
+        )
+        .unwrap();
+    }
+
     fn temp_pool() -> DbPool {
         let path = std::env::temp_dir().join(format!(
             "bluey-provider-holds-{}.sqlite3",
@@ -973,6 +1035,107 @@ mod tests {
         crate::db::accounts::Account::create(pool, "holds@bluey.test", "hash")
             .unwrap()
             .id
+    }
+
+    #[test]
+    fn jobs_generation_hold_blocks_provider_reservation_until_explicit_release() {
+        let pool = temp_pool();
+        let account_id = account(&pool);
+        let generation_key = "router:held-generation:llm";
+        let reservation_token = "held-generation-token";
+        let now = chrono::Utc::now().timestamp_millis();
+        let posting_json = serde_json::json!({
+            "company": "Acme",
+            "title": "Engineer",
+            "source": "greenhouse",
+            "canonical_url": "https://boards.greenhouse.io/acme/jobs/held-generation",
+            "location": "New York, NY",
+            "track_id": "software-engineering",
+        })
+        .to_string();
+        let conn = pool.get().unwrap();
+        conn.execute(
+            "INSERT INTO jobs_postings (
+                id, account_id, canonical_key, posting_json, source, canonical_url,
+                company, title, location, match_score, status, created_at_ms, updated_at_ms
+             ) VALUES (
+                'job-held-generation', ?1, 'job-held-generation', ?3,
+                'greenhouse', 'https://boards.greenhouse.io/acme/jobs/held-generation',
+                'Acme', 'Engineer', 'New York, NY', 90, 'matched', ?2, ?2
+             )",
+            params![account_id, now, posting_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_resume_generations (
+                id, account_id, job_id, generation_key, reservation_token,
+                status, created_at_ms, updated_at_ms
+             ) VALUES (
+                'generation-held', ?1, 'job-held-generation', ?2, ?3,
+                'reserved', ?4, ?4
+             )",
+            params![account_id, generation_key, reservation_token, now],
+        )
+        .unwrap();
+        drop(conn);
+        append_generation_hold(
+            &pool,
+            &account_id,
+            "generation-hold-1",
+            super::super::jobs::OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        let guard = UpstreamSpendGuard {
+            limit_cents: 1_000,
+            window_hours: 24,
+        };
+        assert!(reserve(
+            &pool,
+            &account_id,
+            generation_key,
+            reservation_token,
+            "held-generation-attempt",
+            "openai",
+            "gpt-5.4-mini",
+            3,
+            100,
+            guard,
+        )
+        .is_err());
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM jobs_provider_cost_holds", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        append_generation_hold(
+            &pool,
+            &account_id,
+            "generation-hold-2",
+            super::super::jobs::OperationalHoldTransition::Released,
+            1,
+            Some("generation-hold-1"),
+        );
+        assert!(matches!(
+            reserve(
+                &pool,
+                &account_id,
+                generation_key,
+                reservation_token,
+                "held-generation-attempt",
+                "openai",
+                "gpt-5.4-mini",
+                3,
+                100,
+                guard,
+            )
+            .unwrap(),
+            CostHoldReservation::Held { .. }
+        ));
     }
 
     #[test]
@@ -1118,7 +1281,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_hold_returns_persisted_token_without_creating_a_second_hold() {
+    fn recovered_hold_precedes_later_generation_hold_without_weakening_identity() {
         let pool = temp_pool();
         let account_id = account(&pool);
         let guard = UpstreamSpendGuard {
@@ -1144,6 +1307,14 @@ mod tests {
                 reservation_token: "first-token".into()
             }
         );
+        append_generation_hold(
+            &pool,
+            &account_id,
+            "recovered-generation-hold",
+            super::super::jobs::OperationalHoldTransition::Held,
+            0,
+            None,
+        );
         let recovered = reserve(
             &pool,
             &account_id,
@@ -1163,6 +1334,22 @@ mod tests {
                 reservation_token: "first-token".into()
             }
         );
+        let changed_identity = reserve(
+            &pool,
+            &account_id,
+            "router:req:llm",
+            "different-token",
+            "req:attempt:0",
+            "openai",
+            "gpt-5.6-mini",
+            3,
+            100,
+            guard,
+        );
+        assert!(changed_identity
+            .unwrap_err()
+            .to_string()
+            .contains("identity collision"));
         let count: i64 = pool
             .get()
             .unwrap()

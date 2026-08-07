@@ -1,3 +1,9 @@
+type GlobalDiscoveryOperationalHoldScanCursor = (i64, String);
+
+static GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS: std::sync::LazyLock<
+    std::sync::Mutex<Option<GlobalDiscoveryOperationalHoldScanCursor>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
 #[derive(Debug, Clone)]
 struct NormalizedGlobalCandidate {
     external_id: String,
@@ -277,6 +283,45 @@ pub fn list_global_discovery_sources(pool: &DbPool) -> Result<Vec<GlobalDiscover
     })
 }
 
+fn global_discovery_operational_context(
+    source: &GlobalDiscoverySource,
+) -> Result<OperationalHoldContext> {
+    let source_family = global_source_family(source)?;
+    let mut context = OperationalHoldContext::new()
+        .with_scope(OperationalHoldScopeKind::DiscoverySource, &source.id)?
+        .with_scope(OperationalHoldScopeKind::AtsProvider, &source.provider)?;
+    if let Some(ats_family) = operational_known_ats_provider(&source_family) {
+        if ats_family != source.provider {
+            context.insert_scope(OperationalHoldScopeKind::AtsProvider, ats_family)?;
+        }
+    }
+    Ok(context)
+}
+
+fn global_discovery_operationally_allowed_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    source: &GlobalDiscoverySource,
+) -> Result<bool> {
+    let context = global_discovery_operational_context(source)?;
+    operational_hold_allows(require_operational_capability_sqlite_tx(
+        tx,
+        OperationalCapability::Discovery,
+        &context,
+    ))
+}
+
+fn global_discovery_operationally_allowed_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    source: &GlobalDiscoverySource,
+) -> Result<bool> {
+    let context = global_discovery_operational_context(source)?;
+    operational_hold_allows(require_operational_capability_postgres_tx(
+        tx,
+        OperationalCapability::Discovery,
+        &context,
+    ))
+}
+
 pub fn lease_due_global_discovery_source(
     pool: &DbPool,
     worker_id: &str,
@@ -294,29 +339,83 @@ pub fn lease_due_global_discovery_source(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let raw = tx
-                .query_row(
-                    "SELECT id, provider, source_key, source_json, status, health,
+            let initial_scan_cursor = operational_hold_scan_cursor_snapshot(
+                &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+            );
+            let mut scan_cursor = initial_scan_cursor.clone();
+            let mut wrapped = false;
+            let mut scanned = 0;
+            let mut exhausted = false;
+            let source = loop {
+                if scanned >= OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+                    break None;
+                }
+                let cursor_next_run_at_ms = scan_cursor.as_ref().map(|cursor| cursor.0);
+                let cursor_source_id = scan_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.1.as_str())
+                    .unwrap_or_default();
+                let raw = tx
+                    .query_row(
+                        "SELECT id, provider, source_key, source_json, status, health,
                             consecutive_failures, run_interval_ms, next_run_at_ms,
                             last_success_at_ms, last_failure_at_ms, last_error_code,
                             lease_expires_at_ms, created_at_ms, updated_at_ms
-                       FROM jobs_global_discovery_sources
-                      WHERE status = 'active' AND next_run_at_ms <= ?1
+                      FROM jobs_global_discovery_sources
+                      WHERE status = 'active' AND health <> 'paused'
+                        AND next_run_at_ms <= ?1
                         AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?1)
+                        AND (?2 IS NULL OR next_run_at_ms > ?2
+                             OR (next_run_at_ms = ?2 AND id > ?3))
                       ORDER BY next_run_at_ms, id LIMIT 1",
-                    params![now],
-                    global_source_from_sqlite_row,
-                )
-                .optional()?;
-            let Some(source) = raw else {
+                        params![now, cursor_next_run_at_ms, cursor_source_id],
+                        global_source_from_sqlite_row,
+                    )
+                    .optional()?;
+                let Some(candidate) = raw else {
+                    if !wrapped && initial_scan_cursor.is_some() {
+                        scan_cursor = None;
+                        wrapped = true;
+                        continue;
+                    }
+                    exhausted = true;
+                    break None;
+                };
+                let candidate_cursor = (candidate.next_run_at_ms, candidate.id.clone());
+                if wrapped
+                    && initial_scan_cursor
+                        .as_ref()
+                        .is_some_and(|initial| &candidate_cursor >= initial)
+                {
+                    exhausted = true;
+                    break None;
+                }
+                scan_cursor = Some(candidate_cursor);
+                scanned += 1;
+                if global_discovery_operationally_allowed_sqlite(&tx, &candidate)? {
+                    break Some(candidate);
+                }
+            };
+            let next_scan_cursor = (source.is_none()
+                && !exhausted
+                && scanned == OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT)
+                .then(|| scan_cursor.clone())
+                .flatten();
+            let Some(source) = source else {
                 tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
                 return Ok(None);
             };
             let changed = tx.execute(
                 "UPDATE jobs_global_discovery_sources
                     SET lease_owner = ?2, lease_token = ?3, lease_expires_at_ms = ?4,
                         health = 'running', updated_at_ms = ?1
-                  WHERE id = ?5 AND status = 'active' AND next_run_at_ms = ?6
+                  WHERE id = ?5 AND status = 'active' AND health <> 'paused'
+                    AND next_run_at_ms = ?6
                     AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= ?1)",
                 params![
                     now,
@@ -329,11 +428,21 @@ pub fn lease_due_global_discovery_source(
             )?;
             if changed != 1 {
                 tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
                 return Ok(None);
             }
             let replay_key = global_replay_key(&source);
             ensure_global_run_sqlite(&tx, &source, &replay_key, now)?;
             tx.commit()?;
+            compare_exchange_operational_hold_scan_cursor(
+                &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                initial_scan_cursor.as_ref(),
+                next_scan_cursor,
+            );
             Ok(Some(GlobalDiscoverySourceLease {
                 scheduled_for_ms: source.next_run_at_ms,
                 source,
@@ -344,27 +453,82 @@ pub fn lease_due_global_discovery_source(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let row = tx.query_opt(
-                "SELECT id, provider, source_key, source_json, status, health,
-                        consecutive_failures, run_interval_ms, next_run_at_ms,
-                        last_success_at_ms, last_failure_at_ms, last_error_code,
-                        lease_expires_at_ms, created_at_ms, updated_at_ms
-                   FROM jobs_global_discovery_sources
-                  WHERE status = 'active' AND next_run_at_ms <= $1
-                    AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
-                  ORDER BY next_run_at_ms, id LIMIT 1 FOR UPDATE SKIP LOCKED",
-                &[&now],
-            )?;
-            let Some(row) = row else {
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            let initial_scan_cursor = operational_hold_scan_cursor_snapshot(
+                &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+            );
+            let mut scan_cursor = initial_scan_cursor.clone();
+            let mut wrapped = false;
+            let mut scanned = 0;
+            let mut exhausted = false;
+            let source = loop {
+                if scanned >= OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+                    break None;
+                }
+                let cursor_next_run_at_ms = scan_cursor.as_ref().map(|cursor| cursor.0);
+                let cursor_source_id = scan_cursor
+                    .as_ref()
+                    .map(|cursor| cursor.1.as_str())
+                    .unwrap_or_default();
+                let row = tx.query_opt(
+                    "SELECT id, provider, source_key, source_json, status, health,
+                            consecutive_failures, run_interval_ms, next_run_at_ms,
+                            last_success_at_ms, last_failure_at_ms, last_error_code,
+                            lease_expires_at_ms, created_at_ms, updated_at_ms
+                       FROM jobs_global_discovery_sources
+                      WHERE status = 'active' AND health <> 'paused'
+                        AND next_run_at_ms <= $1
+                        AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)
+                        AND ($2::BIGINT IS NULL OR next_run_at_ms > $2
+                             OR (next_run_at_ms = $2 AND id > $3))
+                      ORDER BY next_run_at_ms, id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                    &[&now, &cursor_next_run_at_ms, &cursor_source_id],
+                )?;
+                let Some(row) = row else {
+                    if !wrapped && initial_scan_cursor.is_some() {
+                        scan_cursor = None;
+                        wrapped = true;
+                        continue;
+                    }
+                    exhausted = true;
+                    break None;
+                };
+                let candidate = global_source_from_pg_row(row)?;
+                let candidate_cursor = (candidate.next_run_at_ms, candidate.id.clone());
+                if wrapped
+                    && initial_scan_cursor
+                        .as_ref()
+                        .is_some_and(|initial| &candidate_cursor >= initial)
+                {
+                    exhausted = true;
+                    break None;
+                }
+                scan_cursor = Some(candidate_cursor);
+                scanned += 1;
+                if global_discovery_operationally_allowed_postgres(&mut tx, &candidate)? {
+                    break Some(candidate);
+                }
+            };
+            let next_scan_cursor = (source.is_none()
+                && !exhausted
+                && scanned == OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT)
+                .then(|| scan_cursor.clone())
+                .flatten();
+            let Some(source) = source else {
                 tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
                 return Ok(None);
             };
-            let source = global_source_from_pg_row(row)?;
             let changed = tx.execute(
                 "UPDATE jobs_global_discovery_sources
                     SET lease_owner = $2, lease_token = $3, lease_expires_at_ms = $4,
                         health = 'running', updated_at_ms = $1
-                  WHERE id = $5 AND status = 'active' AND next_run_at_ms = $6
+                  WHERE id = $5 AND status = 'active' AND health <> 'paused'
+                    AND next_run_at_ms = $6
                     AND (lease_expires_at_ms IS NULL OR lease_expires_at_ms <= $1)",
                 &[
                     &now,
@@ -377,11 +541,21 @@ pub fn lease_due_global_discovery_source(
             )?;
             if changed != 1 {
                 tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
                 return Ok(None);
             }
             let replay_key = global_replay_key(&source);
             ensure_global_run_postgres(&mut tx, &source, &replay_key, now)?;
             tx.commit()?;
+            compare_exchange_operational_hold_scan_cursor(
+                &GLOBAL_DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                initial_scan_cursor.as_ref(),
+                next_scan_cursor,
+            );
             Ok(Some(GlobalDiscoverySourceLease {
                 scheduled_for_ms: source.next_run_at_ms,
                 source,
@@ -1127,4 +1301,312 @@ fn upsert_global_candidate_postgres(
         &[&source_id, &candidate.external_id, &candidate_id, &candidate.content_hash, &now, &run_id],
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn global_discovery_non_ats_family_remains_leaseable_and_typed_ats_family_is_scoped() {
+    let pool = discovery_operational_hold_test_pool();
+    let snapshot_at_ms = now_ms().saturating_sub(60_000);
+    let sources = sync_global_discovery_sources(
+        &pool,
+        &[
+            GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "remoteok-unheld".to_string(),
+                source_family: "remoteok".to_string(),
+                artifact_url: "https://storage.stapply.ai/remoteok-unheld.csv".to_string(),
+                artifact_sha256: "1".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms,
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+            GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "greenhouse-future".to_string(),
+                source_family: "greenhouse".to_string(),
+                artifact_url: "https://storage.stapply.ai/greenhouse-future.csv".to_string(),
+                artifact_sha256: "2".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms,
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        ],
+    )
+    .unwrap();
+    let remoteok = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "remoteok")
+        .unwrap();
+    let greenhouse = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "greenhouse")
+        .unwrap();
+    let remoteok_context = global_discovery_operational_context(remoteok).unwrap();
+    assert!(remoteok_context.matches(OperationalHoldScopeKind::AtsProvider, "jobhive"));
+    assert!(!remoteok_context.matches(OperationalHoldScopeKind::AtsProvider, "remoteok"));
+    let greenhouse_context = global_discovery_operational_context(greenhouse).unwrap();
+    assert!(greenhouse_context.matches(OperationalHoldScopeKind::AtsProvider, "jobhive"));
+    assert!(greenhouse_context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
+
+    let due_at = now_ms().saturating_sub(10_000);
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_global_discovery_sources
+                SET next_run_at_ms = CASE id WHEN ?1 THEN ?3 ELSE ?4 END
+              WHERE id IN (?1, ?2)",
+            params![remoteok.id, greenhouse.id, due_at, due_at + 1],
+        )
+        .unwrap();
+    let lease = lease_due_global_discovery_source(&pool, "remoteok-unheld-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, remoteok.id);
+}
+
+#[cfg(test)]
+#[test]
+fn global_discovery_lease_skips_native_health_pause_without_resuming_it() {
+    let pool = discovery_operational_hold_test_pool();
+    let snapshot_at_ms = now_ms().saturating_sub(60_000);
+    let sources = sync_global_discovery_sources(
+        &pool,
+        &[
+            GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "lever-native-paused".to_string(),
+                source_family: "lever".to_string(),
+                artifact_url: "https://storage.stapply.ai/lever-native-paused.csv".to_string(),
+                artifact_sha256: "c".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms,
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+            GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "ashby-native-allowed".to_string(),
+                source_family: "ashby".to_string(),
+                artifact_url: "https://storage.stapply.ai/ashby-native-allowed.csv".to_string(),
+                artifact_sha256: "d".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms,
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        ],
+    )
+    .unwrap();
+    let paused = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "lever")
+        .unwrap()
+        .clone();
+    let allowed = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "ashby")
+        .unwrap()
+        .clone();
+    let schedule = now_ms().saturating_sub(10_000);
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_global_discovery_sources
+                SET health = CASE id WHEN ?1 THEN 'paused' ELSE 'waiting' END,
+                    next_run_at_ms = CASE id WHEN ?1 THEN ?3 ELSE ?4 END
+              WHERE id IN (?1, ?2)",
+            params![paused.id, allowed.id, schedule, schedule + 1],
+        )
+        .unwrap();
+
+    let lease = lease_due_global_discovery_source(&pool, "native-pause-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    let (health, lease_owner): (String, Option<String>) = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT health, lease_owner FROM jobs_global_discovery_sources WHERE id = ?1",
+            params![paused.id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(health, "paused");
+    assert!(lease_owner.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn global_discovery_lease_skips_held_due_source_without_starving_next_source() {
+    let pool = discovery_operational_hold_test_pool();
+    let snapshot_at_ms = now_ms().saturating_sub(60_000);
+    let sources = sync_global_discovery_sources(
+        &pool,
+        &[
+            GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "lever-held".to_string(),
+                source_family: "lever".to_string(),
+                artifact_url: "https://storage.stapply.ai/lever-held.csv".to_string(),
+                artifact_sha256: "a".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms,
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+            GlobalDiscoverySourceInput {
+                provider: "jobhive".to_string(),
+                source_key: "ashby-allowed".to_string(),
+                source_family: "ashby".to_string(),
+                artifact_url: "https://storage.stapply.ai/ashby-allowed.csv".to_string(),
+                artifact_sha256: "b".repeat(64),
+                expected_rows: 1,
+                snapshot_at_ms,
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        ],
+    )
+    .unwrap();
+    let held = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "lever")
+        .unwrap()
+        .clone();
+    let allowed = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "ashby")
+        .unwrap()
+        .clone();
+    let schedule = now_ms().saturating_sub(10_000);
+    pool.get()
+        .unwrap()
+        .execute(
+            "UPDATE jobs_global_discovery_sources
+                SET next_run_at_ms = CASE id WHEN ?1 THEN ?3 ELSE ?4 END
+              WHERE id IN (?1, ?2)",
+            params![held.id, allowed.id, schedule, schedule + 1],
+        )
+        .unwrap();
+
+    let context = global_discovery_operational_context(&held).unwrap();
+    assert!(context.matches(OperationalHoldScopeKind::Global, "*"));
+    assert!(context.matches(
+        OperationalHoldScopeKind::DiscoverySource,
+        &held.id
+    ));
+    assert!(context.matches(OperationalHoldScopeKind::AtsProvider, "jobhive"));
+    assert!(context.matches(OperationalHoldScopeKind::AtsProvider, "lever"));
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "global-discovery-source-hold",
+        OperationalCapability::Discovery,
+        OperationalHoldScopeKind::DiscoverySource,
+        &held.id,
+        OperationalHoldTransition::Held,
+        None,
+    );
+
+    let lease = lease_due_global_discovery_source(&pool, "global-allowed-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    let held_lease: Option<String> = pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT lease_owner FROM jobs_global_discovery_sources WHERE id = ?1",
+            params![held.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(held_lease.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn global_discovery_held_candidate_scan_is_bounded_and_advances_on_the_next_call() {
+    let pool = discovery_operational_hold_test_pool();
+    let snapshot_at_ms = now_ms().saturating_sub(60_000);
+    let mut inputs = Vec::new();
+    for index in 0..OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+        inputs.push(GlobalDiscoverySourceInput {
+            provider: "jobhive".to_string(),
+            source_key: format!("bounded-lever-held-{index:02}"),
+            source_family: "lever".to_string(),
+            artifact_url: format!(
+                "https://storage.stapply.ai/bounded-lever-held-{index:02}.csv"
+            ),
+            artifact_sha256: format!("{:064x}", index + 1),
+            expected_rows: 1,
+            snapshot_at_ms,
+            run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+        });
+    }
+    inputs.push(GlobalDiscoverySourceInput {
+        provider: "jobhive".to_string(),
+        source_key: "bounded-ashby-allowed".to_string(),
+        source_family: "ashby".to_string(),
+        artifact_url: "https://storage.stapply.ai/bounded-ashby-allowed.csv".to_string(),
+        artifact_sha256: "f".repeat(64),
+        expected_rows: 1,
+        snapshot_at_ms,
+        run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+    });
+    let sources = sync_global_discovery_sources(&pool, &inputs).unwrap();
+    let mut held_sources = sources
+        .iter()
+        .filter(|source| global_source_family(source).unwrap() == "lever")
+        .cloned()
+        .collect::<Vec<_>>();
+    held_sources.sort_by(|left, right| left.source_key.cmp(&right.source_key));
+    let allowed = sources
+        .iter()
+        .find(|source| global_source_family(source).unwrap() == "ashby")
+        .unwrap()
+        .clone();
+    let schedule = now_ms().saturating_sub(100_000);
+    let conn = pool.get().unwrap();
+    for (index, source) in held_sources.iter().enumerate() {
+        conn.execute(
+            "UPDATE jobs_global_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+            params![source.id, schedule + index as i64],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE jobs_global_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+        params![
+            allowed.id,
+            schedule + OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT as i64
+        ],
+    )
+    .unwrap();
+    drop(conn);
+    append_discovery_operational_hold_test_event(
+        &pool,
+        "bounded-global-lever-hold",
+        OperationalCapability::Discovery,
+        OperationalHoldScopeKind::AtsProvider,
+        "lever",
+        OperationalHoldTransition::Held,
+        None,
+    );
+
+    let worker_id = "bounded-global-held-scan-worker";
+    assert!(lease_due_global_discovery_source(&pool, worker_id)
+        .unwrap()
+        .is_none());
+    let lease = lease_due_global_discovery_source(&pool, worker_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.source.id, allowed.id);
+    assert!(held_sources.iter().all(|source| {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT lease_owner IS NULL FROM jobs_global_discovery_sources WHERE id = ?1",
+                params![source.id],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap()
+    }));
 }
