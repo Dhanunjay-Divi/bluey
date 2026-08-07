@@ -255,6 +255,37 @@ Run the same check during incident response:
 sudo /usr/local/sbin/check-bluey-jobs-discovery.sh
 ```
 
+The health host must have Python 3 and `psql` installed. Provision a dedicated,
+random 32-byte hex `BLUEY_JOBS_DIAGNOSTIC_KEY` through the host secret manager
+or the root-owned environment file read by the check:
+
+```text
+BLUEY_JOBS_DIAGNOSTIC_KEY=<64 hexadecimal characters>
+```
+
+By default the check sources `/etc/bluey-api/bluey-api.env` and
+`/etc/bluey-api/bluey-postgres.env`; the health unit does not load
+`bluey-jobs.env` directly. A reviewed systemd drop-in may instead set
+`BLUEY_JOBS_API_ENV_FILE` to a dedicated root-owned secret file. Do not reuse
+`BLUEY_JOBS_DATA_KEY`: the diagnostic key is only for domain-separated opaque
+source correlation and never enters SQL, a process argument, or alert output.
+The check resolves exact Python and `psql` paths, starts each helper with a
+minimal clean environment, and passes the diagnostic key or database URL only
+through an inherited file descriptor. The `psql` child receives the database
+URL as `PGDATABASE`; the renderer receives no database, data-encryption,
+diagnostic, or provider key in its environment. Use
+`BLUEY_JOBS_PYTHON_BIN` only when the reviewed Python 3 executable is not named
+`python3`, and use `BLUEY_JOBS_PSQL_BIN` only for a reviewed `psql` executable.
+A missing or malformed key, missing dependency, unknown diagnostic dimension,
+or invalid diagnostic row fails the check. Provisioning this key and those
+host dependencies plus process-table inspection on the target host is an
+external deployment gate; source tests do not prove it.
+
+An overdue-source alert has the bounded form
+`direct|global:<provider>:ref-<64-lowercase-hex>`. It must never contain the raw
+source key. Treat any raw source, account, employer, URL, token, or secret in
+this diagnostic as a privacy incident and stop the rollout.
+
 The 12-hour limit is twice the slowest normal six-hour global cadence. A source
 older than that is delayed even when its last stored health value says
 `healthy`. The Jobs portal uses the same threshold and shows `Updates delayed`
@@ -330,6 +361,255 @@ Roll out one provider tenant at a time. Confirm canonical deduplication,
 freshness, missing-job grace, and portal source health before provisioning the
 next tenant. A missing job is expired only after two complete snapshots and a
 30-minute grace period; failed or partial snapshots never close jobs.
+
+### Operational Jobs holds and readiness
+
+Run the `bluey-ops` preflight before creating or releasing an operational hold
+or changing its deployment contract.
+
+Phase 606 adds one durable, fail-closed control plane for stopping new Jobs
+authority before a side effect. It does not enable a feature and it is not a
+replacement for a feature flag, discovery-source pause, signed ATS circuit,
+account-deletion fence, provider grant, Browser release, or runner authority.
+The same protected routes are mounted on the full Bluey server and the
+standalone Jobs API; both surfaces must use the same Jobs database and data-key
+configuration.
+
+The closed capability set is `discovery`, `generation`, `application_queue`,
+`runner_claim`, `final_submit`, `mailbox_sync`, and
+`communication_dispatch`. An operator-only `all` hold applies alongside the
+requested concrete capability. The closed scope set is `global`,
+`discovery_source`, `ats_provider`, `ats_adapter`, `employer_domain`, `account`,
+`career_track`, `region`, `runner_kind`, `mailbox_provider`, `model_provider`,
+and `model`.
+
+The protected administrator routes are:
+
+| Route | Contract |
+|-------|----------|
+| `POST /admin/jobs/operational-holds/events` | Append or exactly replay one hold/release event. |
+| `GET /admin/jobs/operational-holds` | List redacted heads with encrypted keyset pagination. |
+| `GET /admin/jobs/readiness` | Read aggregate generic and native blockers by capability. |
+
+Every route requires a bearer access token for an active administrator account.
+They reject normal accounts, apply a 64 KiB request-body limit, and treat
+unknown mutation fields as invalid. Every success, validation error,
+authentication error, conflict, and storage error is private and non-storable:
+
+```text
+Cache-Control: private, no-store
+Pragma: no-cache
+```
+
+Do not put request bodies, bearer tokens, raw scope IDs, event IDs, reason
+references, or responses into shared terminals, tickets, URLs, or logs.
+
+#### Create the first hold
+
+The first event for one capability/scope pair must be `held`, must expect
+revision zero, and must not name a predecessor. Use the raw route only after
+resolving the exact server-owned scope. For example:
+
+```http
+POST /admin/jobs/operational-holds/events
+Authorization: Bearer <administrator-access-token>
+Content-Type: application/json
+
+{
+  "eventId": "<unique-operator-event-id>",
+  "capability": "generation",
+  "scopeKind": "account",
+  "scopeId": "<exact-account-id>",
+  "transition": "held",
+  "reasonCode": "incident",
+  "reasonRef": "INC-606",
+  "expectedHeadRevision": 0,
+  "expectedCurrentEventId": null
+}
+```
+
+`global` accepts only `scopeId: "*"`. Account, Career Track, and discovery
+source IDs remain exact identifiers. Region and Unicode employer-domain scopes
+are lowercased and NFC-normalized; verified employer-domain context includes
+both its normalized Unicode form and its ASCII IDNA form. Other categorical
+scope values are lowercase ASCII. Unknown-like regions such as `unknown`,
+`n/a`, `not specified`, and `unspecified` are omitted from derived admission
+context rather than becoming scope authority.
+
+The closed reason-code set is `incident`, `security_review`, `privacy_review`,
+`compliance_review`, `quality_regression`, `provider_outage`, `capacity_guard`,
+`maintenance`, `account_request`, `certification_guard`, `rollout_guard`, and
+`manual_release`. A reason reference is optional, at most 120 ASCII characters,
+starts with an alphanumeric character, and otherwise contains only letters,
+digits, `.`, `_`, or `-`.
+
+A new append returns `201 Created`; an exact replay of the same event and actor
+returns `200 OK` with `replayed: true`. Changed bytes or actor under an existing
+event ID, stale compare-and-swap state, an unresolved opaque reference, or an
+account-deletion fence returns a bounded conflict. Invalid input is rejected,
+and storage or canonical-state corruption returns an unavailable response.
+Never interpret a timeout, transport loss, or unavailable response as release
+authority: read the current head before deciding whether an exact replay is
+appropriate.
+
+The response exposes only `capability`, `scopeKind`, `scopeRef`, `headRevision`,
+`currentEventRef`, `eventSha256`, `state`, `reasonCode`, `recordedAtMs`, and
+`replayed`. It never exposes raw scope ID, raw event ID, reason reference,
+administrator identity, or canonical event bytes.
+
+#### List and transition a hold by opaque reference
+
+List active heads with:
+
+```http
+GET /admin/jobs/operational-holds?activeOnly=true&limit=50
+Authorization: Bearer <administrator-access-token>
+```
+
+`activeOnly` defaults to `true`; set it to `false` when released heads are also
+needed. `limit` defaults to 50 and must be from 1 through 100. When
+`nextCursor` is present, pass it unchanged as `cursor` with the same
+`activeOnly` value. The cursor is encrypted, purpose-bound, bounded to 2,048
+bytes, and ordered by the internal capability/scope key. Do not decode, edit,
+or reuse it with another filter. Follow pages until `nextCursor` is absent.
+
+The list deliberately returns no raw scope or event identity. Use its exact
+`scopeRef`, `headRevision`, and `currentEventRef` for a later transition:
+
+```http
+POST /admin/jobs/operational-holds/events
+Authorization: Bearer <administrator-access-token>
+Content-Type: application/json
+
+{
+  "eventId": "<new-unique-operator-event-id>",
+  "capability": "generation",
+  "scopeKind": "account",
+  "scopeRef": "scope-<64-lowercase-hex>",
+  "transition": "released",
+  "reasonCode": "manual_release",
+  "reasonRef": "INC-606",
+  "expectedHeadRevision": 1,
+  "expectedCurrentEventRef": "event-<64-lowercase-hex>"
+}
+```
+
+The server resolves both refs against one indexed current head, verifies them
+in constant time, then applies the same canonical compare-and-swap and replay
+rules as a raw transition. Never release by guessing a ref, reconstructing a
+raw identifier from an alert, changing only one expected field, deleting a
+row, or updating a head directly. A release has no TTL and is itself an
+append-only event. `held -> held`, `held -> released`, and
+`released -> held` each require the exact current predecessor; a second
+consecutive release and a first-event release are rejected.
+
+#### Interpret readiness without weakening native authority
+
+`GET /admin/jobs/readiness` returns schema version 1, aggregate readiness, one
+entry for every concrete capability, the paused discovery-source count, the
+open ATS-circuit count, and the evaluation timestamp. Each capability entry
+contains `ready`, `blockerCount`, `operationalHoldCount`, and
+`nativeBlockerCount`. An active `all` hold is counted for every concrete
+capability in addition to its capability-specific holds.
+
+Native authority remains independent:
+
+- paused discovery sources contribute native blockers only to `discovery`;
+- open signed ATS circuits contribute native blockers only to `final_submit`;
+- releasing a generic hold does not resume a source or close a circuit; and
+- resuming a source or reviewing a circuit does not release a generic hold.
+
+Readiness fails closed when storage is unavailable or a count contains an
+unknown/private dimension. A zero generic-hold count does not grant provider,
+tenant, account, runner, model, or submission authority. Verify every relevant
+native status and disabled-by-default release flag separately. The protected
+metrics endpoint uses only the closed capability and scope-kind labels; it must
+not contain raw tenant, source, employer, model, URL, token, hash, cursor,
+reason reference, actor, event ID, or error text.
+
+Holds stop only new authority at these boundaries:
+
+- direct and global discovery lease acquisition;
+- paid managed-generation provider reservation;
+- application-attempt reservation, including an active-reservation replay;
+- local and cloud runner claim or reissue;
+- local and cloud final pre-click authorization;
+- mailbox-sync lease claim; and
+- communication-dispatch claim and its durable request-start marker.
+
+Those boundaries validate their complete server-owned projection before they
+evaluate a hold. Mailbox sync requires the connection, relational sync state,
+and encrypted sync state to name the same provider. A `curated_feed:*` posting
+requires the account's exact managed `curated_feed` / `bluey-curated-v1`
+membership before application- or job-scoped authority is admitted. Discovery
+leases freeze relevant Career Track insert, update, and delete operations while
+the lease is unexpired; successful completion, recorded failure, or lease
+expiry releases that freeze. Account-wide curated discovery validates every
+Track's relational/JSON ID and active projection and selects only active
+Tracks; a directly bound inactive Track remains in Career Track and Region hold
+scope. Treat any projection mismatch as storage corruption: stop admission and
+repair the canonical rows rather than releasing a hold or editing a head.
+
+An API-created `unassigned` application reservation has no `runner_kind` scope;
+use `application_queue` and the other applicable account, Track, employer, ATS,
+region, or model scopes to stop that reservation. A later cloud or local runner
+claim independently evaluates its concrete `runner_kind` before atomically
+persisting the binding.
+
+Do not use a hold to suppress evidence after a possible side effect. Heartbeat,
+Browser-profile sealing, exact click-started replay, worker result and receipt
+persistence, submission checkpoint recovery, mailbox completion,
+communication completion, and read-only reconciliation remain available so
+Bluey can reduce uncertainty safely.
+
+For local `click_started` recovery, "exact" binds the ticket and encrypted
+payload, account/application/run, running session, final-submit proof, terminal
+ATS authority, active evidence capacity, and the complete Browser
+build/release binding frozen onto the run. It does not freeze the current server
+process deployment ID from the first authorization call. If the immutable
+activation frozen onto that Browser binding accepted server releases `A` and
+`B`, a possible side effect started under `A` may be recovered after the server
+deploys `B`. An ID outside that same frozen accepted set is denied. The replay
+must return the already durable ATS receipt authority without another marker,
+canary reservation, capacity reservation, or final click. This accepted
+`A -> B` rule is recovery continuity, not permission to switch the frozen
+Browser manifest, build, channel, activation, or trust authority.
+
+The HTTP exception is equally narrow. An expired signed v2 submit capability
+may reach recovery only for a durable `click_started` ticket and only inside
+the reconciliation grace. A disabled local-distribution flag blocks claimed or
+new submit work but permits that exact ticket to reach database reconstruction.
+If the object-storage maximum changed after the marker, recovery uses the
+already active durable reserved bytes/object count and the current upload
+limits; it never reserves replacement capacity. Signed v1 or v2 result
+reconciliation uses that durable capacity when ticket state is
+`click_started` or `side_effect_unknown`; submit recovery remains signed
+v2-only. Claimed, `needs_input`, and other new/pre-side-effect paths derive
+capacity from current storage configuration. Missing, inactive, expired,
+non-local, or wrong-scope durable capacity is denied.
+
+During an incident pause, set only
+`BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0`. Keep the current
+`BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID`, imported root/activation/manifest
+authority, Jobs data key, and evidence object-storage configuration available
+until every post-marker run is submitted, reconciled, or otherwise terminal.
+The server release ID is still required to prove that the current deployment is
+in the frozen activation's accepted set, and object-storage configuration is
+still required to retain current upload limits. Removing either dependency is
+not a safe kill switch: it strands evidence/recovery while possible employer
+side effects remain unresolved.
+
+Before production operation, complete the external gates that source work
+cannot prove: authorized live PostgreSQL migration and two-connection lock
+rehearsal, backup/restore evidence, exact artifact promotion, shared database
+and data-key configuration across both router surfaces, administrator access
+and audit ownership, alert thresholds, incident/release drills, and an approved
+canary that proves a committed hold wins against concurrent new admission while
+post-marker recovery still completes. Also provision the separate diagnostic
+key and Python 3 dependency described above. Keep every Jobs, model, Browser,
+mailbox, communication, provider, and tenant flag at its existing parked value
+until its own launch gate passes; an operational release is never an enabling
+action.
 
 ### Browser execution leases
 

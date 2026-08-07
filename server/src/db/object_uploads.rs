@@ -344,6 +344,48 @@ pub fn reserve_submission_evidence_capacity(
     })
 }
 
+/// Load the durable capacity identity for one exact Jobs submission run.
+///
+/// This read is intentionally non-locking. Callers use it only to reconstruct
+/// the stable replay identity; the owning submission transaction rechecks the
+/// same row under its normal lock before authorizing any replay.
+pub(crate) fn get_submission_evidence_capacity(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> Result<Option<SubmissionEvidenceCapacity>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let conn = pool.get()?;
+            conn.query_row(
+                &format!(
+                    "SELECT {SUBMISSION_CAPACITY_COLUMNS}
+                       FROM jobs_submission_evidence_capacity
+                      WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3"
+                ),
+                params![account_id, application_id, run_id],
+                row_to_submission_evidence_capacity_sqlite,
+            )
+            .optional()
+            .map_err(Into::into)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            conn.query_opt(
+                &format!(
+                    "SELECT {SUBMISSION_CAPACITY_COLUMNS}
+                       FROM jobs_submission_evidence_capacity
+                      WHERE account_id = $1 AND application_id = $2 AND run_id = $3"
+                ),
+                &[&account_id, &application_id, &run_id],
+            )?
+            .map(row_to_submission_evidence_capacity_postgres)
+            .transpose()
+        }
+    })
+}
+
 /// Replay-safe release for a run that is proven not to have crossed the
 /// irreversible boundary. `side_effect_unknown` callers must retain capacity
 /// for reconciliation instead of invoking this function.
@@ -1414,7 +1456,7 @@ pub(crate) fn extend_exact_submission_evidence_capacity_expiry_sqlite_tx(
     expires_at_ms: i64,
     now_ms: i64,
 ) -> Result<bool> {
-    validate_submission_evidence_capacity_input(expected)?;
+    validate_existing_submission_evidence_capacity_identity(expected, now_ms)?;
     validate_submission_evidence_capacity_expiry(&expected.runner, expires_at_ms, now_ms)?;
     Ok(tx.execute(
         "UPDATE jobs_submission_evidence_capacity
@@ -1444,7 +1486,7 @@ pub(crate) fn extend_exact_submission_evidence_capacity_expiry_postgres_tx(
     expires_at_ms: i64,
     now_ms: i64,
 ) -> Result<bool> {
-    validate_submission_evidence_capacity_input(expected)?;
+    validate_existing_submission_evidence_capacity_identity(expected, now_ms)?;
     validate_submission_evidence_capacity_expiry(&expected.runner, expires_at_ms, now_ms)?;
     Ok(tx.execute(
         "UPDATE jobs_submission_evidence_capacity
@@ -1464,6 +1506,35 @@ pub(crate) fn extend_exact_submission_evidence_capacity_expiry_postgres_tx(
             &now_ms,
         ],
     )? == 1)
+}
+
+/// Validate only the immutable identity of an already-reserved capacity row.
+/// Current quotas and the new-reservation TTL are deliberately excluded: a
+/// replay must be able to present the exact durable reservation after either
+/// configuration drift or an earlier reconciliation extension. The UPDATE
+/// below still proves the row is exact, active, and unexpired transactionally.
+fn validate_existing_submission_evidence_capacity_identity(
+    expected: &NewSubmissionEvidenceCapacity,
+    now_ms: i64,
+) -> Result<()> {
+    if expected.account_id.trim().is_empty()
+        || expected.account_id.len() > 240
+        || expected.application_id.trim().is_empty()
+        || expected.application_id.len() > 128
+        || expected.run_id.trim().is_empty()
+        || expected.run_id.len() > 128
+        || !matches!(expected.runner.as_str(), "cloud" | "local")
+        || expected.reserved_bytes <= 0
+        || expected.reserved_objects <= 0
+        || expected.now_ms < 0
+        || now_ms < 0
+        || expected.expires_at_ms <= now_ms
+    {
+        return Err(
+            UploadControlError::InvalidMetadata("existing submission evidence capacity").into(),
+        );
+    }
+    Ok(())
 }
 
 /// Rebind an exact active capacity to a shorter or longer expiry. This is only

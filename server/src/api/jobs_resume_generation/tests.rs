@@ -67,6 +67,12 @@ mod tests {
         let account_id = uuid::Uuid::new_v4().to_string();
         let job_id = uuid::Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp_millis();
+        let posting_json = json!({
+            "company": "Example",
+            "title": "Engineer",
+            "source": "test",
+        })
+        .to_string();
         pool.get()
             .unwrap()
             .execute(
@@ -80,9 +86,15 @@ mod tests {
             .execute(
                 "INSERT INTO jobs_postings (id, account_id, canonical_key, posting_json, source, \
                  canonical_url, company, title, location, match_score, status, created_at_ms, updated_at_ms) \
-                 VALUES (?1, ?2, ?3, '{}', 'test', NULL, 'Example', 'Engineer', NULL, 0, \
+                 VALUES (?1, ?2, ?3, ?5, 'test', NULL, 'Example', 'Engineer', NULL, 0, \
                  'matched', ?4, ?4)",
-                rusqlite::params![job_id, account_id, format!("test:{job_id}"), now],
+                rusqlite::params![
+                    job_id,
+                    account_id,
+                    format!("test:{job_id}"),
+                    now,
+                    posting_json
+                ],
             )
             .unwrap();
         (pool, account_id, job_id)

@@ -1,5 +1,18 @@
 type ExecutionLeaseResult<T> = std::result::Result<T, ExecutionLeaseError>;
 
+fn execution_lease_from_operational_hold_error(
+    error: OperationalHoldError,
+) -> ExecutionLeaseError {
+    match error {
+        OperationalHoldError::Storage(error) => ExecutionLeaseError::Storage(error),
+        OperationalHoldError::InvalidRequest
+        | OperationalHoldError::NotFound
+        | OperationalHoldError::Conflict
+        | OperationalHoldError::IdentityConflict
+        | OperationalHoldError::Held(_) => ExecutionLeaseError::Conflict,
+    }
+}
+
 #[derive(Debug)]
 struct StoredExecutionLease {
     account_id: String,
@@ -1299,6 +1312,21 @@ fn claim_execution_lease_inner(
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
+            let hold_context = operational_hold_context_for_application_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                Some("cloud"),
+                None,
+                None,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::RunnerClaim,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
             let browser_profile_id =
                 sqlite_execution_target(&tx, account_id, application_id, run_id)?;
             if browser_profile_id != supplied_browser_profile_id {
@@ -1430,6 +1458,9 @@ fn claim_execution_lease_inner(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_operational_hold_shared_postgres_tx(&mut tx)
+                .map_err(execution_lease_from_operational_hold_error)?;
+            lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             lock_postgres_ats_certification(&mut tx)
                 .map_err(execution_lease_from_ats_certification_error)?;
             let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
@@ -1476,6 +1507,21 @@ fn claim_execution_lease_inner(
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
+            let hold_context = operational_hold_context_for_application_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                Some("cloud"),
+                None,
+                None,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_postgres_tx(
+                &mut tx,
+                OperationalCapability::RunnerClaim,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
             let browser_profile_id =
                 postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
             if browser_profile_id != supplied_browser_profile_id {
@@ -2259,6 +2305,21 @@ pub fn start_irreversible_submission(
                 tx.commit()?;
                 return Ok(record);
             }
+            let hold_context = operational_hold_context_for_application_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                Some("cloud"),
+                None,
+                None,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::FinalSubmit,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
             if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
                 return Err(ExecutionLeaseError::Conflict);
             }
@@ -2332,6 +2393,9 @@ pub fn start_irreversible_submission(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_operational_hold_shared_postgres_tx(&mut tx)
+                .map_err(execution_lease_from_operational_hold_error)?;
+            lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             lock_postgres_ats_certification(&mut tx)
                 .map_err(execution_lease_from_ats_certification_error)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
@@ -2378,6 +2442,21 @@ pub fn start_irreversible_submission(
                 tx.commit()?;
                 return Ok(record);
             }
+            let hold_context = operational_hold_context_for_application_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                Some("cloud"),
+                None,
+                None,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_postgres_tx(
+                &mut tx,
+                OperationalCapability::FinalSubmit,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
             if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
                 return Err(ExecutionLeaseError::Conflict);
             }

@@ -504,6 +504,31 @@ fn local_run_submit_authorization_inner(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let click_started: i64 = tx.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM jobs_local_run_tickets
+                     WHERE id = ?1 AND ticket_hash = ?2 AND status = 'click_started'
+                 )",
+                params![run_id, ticket_hash],
+                |row| row.get(0),
+            )?;
+            if click_started != 0 {
+                crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                    &tx,
+                    &capacity.account_id,
+                )?;
+                let authorization = sqlite_local_click_started_submit_replay(
+                    &tx,
+                    run_id,
+                    ticket_hash,
+                    server_release_id,
+                    final_submit_proof,
+                    capacity,
+                    now,
+                )?;
+                tx.commit()?;
+                return Ok(authorization);
+            }
             if require_distribution_ready && !sqlite_runner_volume_fleet_distribution_ready(&tx)? {
                 return Ok(None);
             }
@@ -514,15 +539,37 @@ fn local_run_submit_authorization_inner(
                 now,
                 LocalRunAuthorityPhase::Submit,
             )?;
-            let authorized = ticket.is_some_and(|ticket| {
-                ticket.account_id == capacity.account_id
-                    && ticket.application_id == capacity.application_id
-            });
-            if !authorized {
+            let Some(ticket) = ticket else {
+                return Ok(None);
+            };
+            if ticket.account_id != capacity.account_id
+                || ticket.application_id != capacity.application_id
+            {
                 return Ok(None);
             }
             if !sqlite_bound_browser_release_submit_allowed(&tx, run_id, server_release_id)? {
                 return Ok(None);
+            }
+            let hold_context = match operational_hold_context_for_application_sqlite_tx(
+                &tx,
+                &capacity.account_id,
+                &capacity.application_id,
+                Some("local"),
+                None,
+                None,
+            ) {
+                Ok(context) => context,
+                Err(OperationalHoldError::Storage(error)) => return Err(error),
+                Err(_) => return Ok(None),
+            };
+            match require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::FinalSubmit,
+                &hold_context,
+            ) {
+                Ok(()) => {}
+                Err(OperationalHoldError::Storage(error)) => return Err(error),
+                Err(_) => return Ok(None),
             }
             let ats_certified_receipt_authority = match consume_local_ats_certification_sqlite_tx(
                 &tx,
@@ -573,20 +620,42 @@ fn local_run_submit_authorization_inner(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)?;
             lock_postgres_ats_certification(&mut tx)?;
-            if require_distribution_ready
-                && !postgres_runner_volume_fleet_distribution_ready(&mut tx)?
-            {
-                return Ok(None);
-            }
-            let account_id = tx
+            let ticket_identity = tx
                 .query_opt(
-                    "SELECT account_id FROM jobs_local_run_tickets
+                    "SELECT account_id, status FROM jobs_local_run_tickets
                       WHERE id = $1 AND ticket_hash = $2",
                     &[&run_id, &ticket_hash],
                 )?
-                .map(|row| row.get::<_, String>(0));
-            if account_id.as_deref() != Some(capacity.account_id.as_str()) {
+                .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)));
+            let Some((account_id, ticket_status)) = ticket_identity else {
+                return Ok(None);
+            };
+            if account_id != capacity.account_id {
+                return Ok(None);
+            }
+            if ticket_status == "click_started" {
+                crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                    &mut tx,
+                    &capacity.account_id,
+                )?;
+                let authorization = postgres_local_click_started_submit_replay(
+                    &mut tx,
+                    run_id,
+                    ticket_hash,
+                    server_release_id,
+                    final_submit_proof,
+                    capacity,
+                    now,
+                )?;
+                tx.commit()?;
+                return Ok(authorization);
+            }
+            if require_distribution_ready
+                && !postgres_runner_volume_fleet_distribution_ready(&mut tx)?
+            {
                 return Ok(None);
             }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
@@ -600,16 +669,38 @@ fn local_run_submit_authorization_inner(
                 now,
                 LocalRunAuthorityPhase::Submit,
             )?;
-            let authorized = ticket.is_some_and(|ticket| {
-                ticket.account_id == capacity.account_id
-                    && ticket.application_id == capacity.application_id
-            });
-            if !authorized {
+            let Some(ticket) = ticket else {
+                return Ok(None);
+            };
+            if ticket.account_id != capacity.account_id
+                || ticket.application_id != capacity.application_id
+            {
                 return Ok(None);
             }
             postgres_lock_browser_release_registry_shared(&mut tx)?;
             if !postgres_bound_browser_release_submit_allowed(&mut tx, run_id, server_release_id)? {
                 return Ok(None);
+            }
+            let hold_context = match operational_hold_context_for_application_postgres_tx(
+                &mut tx,
+                &capacity.account_id,
+                &capacity.application_id,
+                Some("local"),
+                None,
+                None,
+            ) {
+                Ok(context) => context,
+                Err(OperationalHoldError::Storage(error)) => return Err(error),
+                Err(_) => return Ok(None),
+            };
+            match require_operational_capability_postgres_tx(
+                &mut tx,
+                OperationalCapability::FinalSubmit,
+                &hold_context,
+            ) {
+                Ok(()) => {}
+                Err(OperationalHoldError::Storage(error)) => return Err(error),
+                Err(_) => return Ok(None),
             }
             let ats_certified_receipt_authority = match consume_local_ats_certification_postgres_tx(
                 &mut tx,
@@ -660,6 +751,386 @@ fn local_run_submit_authorization_inner(
     })
 }
 
+fn local_click_started_ticket_matches(
+    ticket: &LocalRunTicket,
+    run_id: &str,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+) -> bool {
+    ticket.id == run_id
+        && ticket.status == "click_started"
+        && ticket.account_id == capacity.account_id
+        && ticket.application_id == capacity.application_id
+        && ticket.payload.get("accountId").and_then(Value::as_str)
+            == Some(capacity.account_id.as_str())
+        && ticket.payload.get("applicationId").and_then(Value::as_str)
+            == Some(capacity.application_id.as_str())
+        && ticket.payload.get("runId").and_then(Value::as_str) == Some(run_id)
+        && ticket.payload.get("runner").and_then(Value::as_str) == Some("local")
+}
+
+fn local_click_started_application_matches(
+    application: &JobApplication,
+    relational_state: &str,
+    run_id: &str,
+    final_submit_proof: &FinalSubmitProof,
+) -> Result<bool> {
+    let presented = serde_json::to_value(final_submit_proof)?;
+    Ok(application.state == relational_state
+        && relational_state == "running"
+        && application.run_id.as_deref() == Some(run_id)
+        && application.receipt.get(FINAL_SUBMIT_PROOF_KEY) == Some(&presented))
+}
+
+fn local_click_started_session_matches(
+    session: &BrowserSession,
+    relational_runner: &str,
+    relational_status: &str,
+    application_id: &str,
+    run_id: &str,
+) -> bool {
+    session.id == run_id
+        && session.application_id.as_deref() == Some(application_id)
+        && session.runner == relational_runner
+        && relational_runner == "local"
+        && session.status == relational_status
+        && relational_status == "running"
+}
+
+fn sqlite_local_click_started_release_matches(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    account_id: &str,
+    application_id: &str,
+    server_release_id: &str,
+) -> Result<bool> {
+    let Some(binding) = sqlite_browser_release_binding(tx, run_id, account_id)? else {
+        return Ok(false);
+    };
+    let row: Option<(String, String)> = tx
+        .query_row(
+            "SELECT b.binding_sha256, activation.accepted_server_release_ids_json
+               FROM jobs_local_run_release_bindings b
+               JOIN jobs_browser_release_activations activation
+                 ON activation.activation_sha256 = b.activation_sha256
+                AND activation.manifest_sha256 = b.manifest_sha256
+                AND activation.channel = b.channel
+                AND activation.activation_generation = b.activation_generation
+                AND activation.trust_generation = b.trust_generation
+                AND activation.channel_sequence = b.channel_sequence
+                AND activation.manifest_signature_set_sha256 =
+                    b.manifest_signature_set_sha256
+                AND activation.authorization_signature_set_sha256 =
+                    b.activation_authorization_signature_set_sha256
+              WHERE b.run_id = ?1 AND b.account_id = ?2 AND b.application_id = ?3",
+            params![run_id, account_id, application_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((stored_binding_sha256, accepted_server_release_ids_json)) = row else {
+        return Ok(false);
+    };
+    Ok(browser_release_constant_time_eq(
+        &stored_binding_sha256,
+        &browser_release_binding_sha256(&binding),
+    ) && browser_activation_accepts_server(
+        &accepted_server_release_ids_json,
+        server_release_id,
+    )?)
+}
+
+fn postgres_local_click_started_release_matches(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    account_id: &str,
+    application_id: &str,
+    server_release_id: &str,
+) -> Result<bool> {
+    let Some(binding) = postgres_browser_release_binding(tx, run_id, account_id)? else {
+        return Ok(false);
+    };
+    let row = tx.query_opt(
+        "SELECT b.binding_sha256, activation.accepted_server_release_ids_json
+           FROM jobs_local_run_release_bindings b
+           JOIN jobs_browser_release_activations activation
+             ON activation.activation_sha256 = b.activation_sha256
+            AND activation.manifest_sha256 = b.manifest_sha256
+            AND activation.channel = b.channel
+            AND activation.activation_generation = b.activation_generation
+            AND activation.trust_generation = b.trust_generation
+            AND activation.channel_sequence = b.channel_sequence
+            AND activation.manifest_signature_set_sha256 = b.manifest_signature_set_sha256
+            AND activation.authorization_signature_set_sha256 =
+                b.activation_authorization_signature_set_sha256
+          WHERE b.run_id = $1 AND b.account_id = $2 AND b.application_id = $3
+          FOR SHARE OF b, activation",
+        &[&run_id, &account_id, &application_id],
+    )?;
+    let Some(row) = row else {
+        return Ok(false);
+    };
+    let stored_binding_sha256: String = row.get(0);
+    let accepted_server_release_ids_json: String = row.get(1);
+    Ok(browser_release_constant_time_eq(
+        &stored_binding_sha256,
+        &browser_release_binding_sha256(&binding),
+    ) && browser_activation_accepts_server(
+        &accepted_server_release_ids_json,
+        server_release_id,
+    )?)
+}
+
+fn sqlite_local_click_started_capacity_matches(
+    tx: &rusqlite::Transaction<'_>,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now: i64,
+) -> Result<bool> {
+    let matches: i64 = tx.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM jobs_submission_evidence_capacity
+             WHERE account_id = ?1 AND application_id = ?2 AND run_id = ?3
+               AND runner = ?4 AND reserved_bytes = ?5 AND reserved_objects = ?6
+               AND state = 'active' AND expires_at_ms > ?7
+         )",
+        params![
+            capacity.account_id,
+            capacity.application_id,
+            capacity.run_id,
+            capacity.runner,
+            capacity.reserved_bytes,
+            capacity.reserved_objects,
+            now,
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(matches != 0)
+}
+
+fn postgres_local_click_started_capacity_matches(
+    tx: &mut postgres::Transaction<'_>,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now: i64,
+) -> Result<bool> {
+    Ok(tx
+        .query_opt(
+            "SELECT 1 FROM jobs_submission_evidence_capacity
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                AND runner = $4 AND reserved_bytes = $5 AND reserved_objects = $6
+                AND state = 'active' AND expires_at_ms > $7
+              FOR UPDATE",
+            &[
+                &capacity.account_id,
+                &capacity.application_id,
+                &capacity.run_id,
+                &capacity.runner,
+                &capacity.reserved_bytes,
+                &capacity.reserved_objects,
+                &now,
+            ],
+        )?
+        .is_some())
+}
+
+fn sqlite_local_click_started_submit_replay(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    ticket_hash: &str,
+    server_release_id: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now: i64,
+) -> Result<Option<LocalRunSubmitAuthorization>> {
+    if final_submit_proof.schema_version != 4 {
+        return Ok(None);
+    }
+    let ticket = tx
+        .query_row(
+            "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                    payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+               FROM jobs_local_run_tickets
+              WHERE id = ?1 AND ticket_hash = ?2 AND status = 'click_started'",
+            params![run_id, ticket_hash],
+            local_run_ticket_from_sqlite_row,
+        )
+        .optional()?;
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    if !local_click_started_ticket_matches(&ticket, run_id, capacity)
+        || !sqlite_local_click_started_release_matches(
+            tx,
+            run_id,
+            &ticket.account_id,
+            &ticket.application_id,
+            server_release_id,
+        )?
+    {
+        return Ok(None);
+    }
+    let authority = match recover_terminal_ats_authority_sqlite_tx(
+        tx,
+        &ticket.account_id,
+        &ticket.application_id,
+        run_id,
+    ) {
+        Ok(authority) => authority,
+        Err(ExecutionLeaseError::Storage(error)) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let application_row: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT job_id, application_json, state FROM jobs_applications
+              WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, ticket.application_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((job_id, application_json, application_state)) = application_row else {
+        return Ok(None);
+    };
+    let application = parse_application_json(
+        application_json,
+        &ticket.application_id,
+        &job_id,
+        "local click-started replay application",
+    )?;
+    if !local_click_started_application_matches(
+        &application,
+        &application_state,
+        run_id,
+        final_submit_proof,
+    )? {
+        return Ok(None);
+    }
+    let session_row: Option<(String, String, String)> = tx
+        .query_row(
+            "SELECT session_json, runner, status FROM jobs_browser_sessions
+              WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, run_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((session_json, session_runner, session_status)) = session_row else {
+        return Ok(None);
+    };
+    let session: BrowserSession = parse_json(session_json, "local click-started replay session")?;
+    if !local_click_started_session_matches(
+        &session,
+        &session_runner,
+        &session_status,
+        &ticket.application_id,
+        run_id,
+    ) || !sqlite_local_click_started_capacity_matches(tx, capacity, now)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(LocalRunSubmitAuthorization {
+        ats_certified_receipt_authority: Some(authority),
+    }))
+}
+
+fn postgres_local_click_started_submit_replay(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    ticket_hash: &str,
+    server_release_id: &str,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now: i64,
+) -> Result<Option<LocalRunSubmitAuthorization>> {
+    if final_submit_proof.schema_version != 4 {
+        return Ok(None);
+    }
+    let ticket = tx
+        .query_opt(
+            "SELECT id, account_id, application_id, ticket_hash, ticket_secret,
+                    payload_json, status, expires_at_ms, created_at_ms, updated_at_ms
+               FROM jobs_local_run_tickets
+              WHERE id = $1 AND ticket_hash = $2 AND status = 'click_started'
+              FOR UPDATE",
+            &[&run_id, &ticket_hash],
+        )?
+        .map(local_run_ticket_from_pg_row)
+        .transpose()?;
+    let Some(ticket) = ticket else {
+        return Ok(None);
+    };
+    if !local_click_started_ticket_matches(&ticket, run_id, capacity) {
+        return Ok(None);
+    }
+    postgres_lock_browser_release_registry_shared(tx)?;
+    if !postgres_local_click_started_release_matches(
+        tx,
+        run_id,
+        &ticket.account_id,
+        &ticket.application_id,
+        server_release_id,
+    )? {
+        return Ok(None);
+    }
+    let authority = match recover_terminal_ats_authority_postgres_tx(
+        tx,
+        &ticket.account_id,
+        &ticket.application_id,
+        run_id,
+    ) {
+        Ok(authority) => authority,
+        Err(ExecutionLeaseError::Storage(error)) => return Err(error),
+        Err(_) => return Ok(None),
+    };
+    let application_row = tx.query_opt(
+        "SELECT job_id, application_json, state FROM jobs_applications
+          WHERE account_id = $1 AND id = $2 FOR UPDATE",
+        &[&ticket.account_id, &ticket.application_id],
+    )?;
+    let Some(application_row) = application_row else {
+        return Ok(None);
+    };
+    let job_id: String = application_row.get(0);
+    let application_json: String = application_row.get(1);
+    let application_state: String = application_row.get(2);
+    let application = parse_application_json(
+        application_json,
+        &ticket.application_id,
+        &job_id,
+        "local click-started replay application",
+    )?;
+    if !local_click_started_application_matches(
+        &application,
+        &application_state,
+        run_id,
+        final_submit_proof,
+    )? {
+        return Ok(None);
+    }
+    let session_row = tx.query_opt(
+        "SELECT session_json, runner, status FROM jobs_browser_sessions
+          WHERE account_id = $1 AND id = $2 FOR UPDATE",
+        &[&ticket.account_id, &run_id],
+    )?;
+    let Some(session_row) = session_row else {
+        return Ok(None);
+    };
+    let session: BrowserSession = parse_json(
+        session_row.get::<_, String>(0),
+        "local click-started replay session",
+    )?;
+    let session_runner: String = session_row.get(1);
+    let session_status: String = session_row.get(2);
+    if !local_click_started_session_matches(
+        &session,
+        &session_runner,
+        &session_status,
+        &ticket.application_id,
+        run_id,
+    ) || !postgres_local_click_started_capacity_matches(tx, capacity, now)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(LocalRunSubmitAuthorization {
+        ats_certified_receipt_authority: Some(authority),
+    }))
+}
+
 fn local_ats_observed_surface(final_submit_proof: &FinalSubmitProof) -> Option<AtsObservedSurface> {
     let observed = final_submit_proof.observed_surface.as_ref()?;
     Some(AtsObservedSurface {
@@ -697,11 +1168,11 @@ fn consume_local_ats_certification_sqlite_tx(
     match validate_consume_reserve_ats_application_certification_from_context_sqlite_tx(
         tx, &request, now_ms,
     ) {
-        Ok(AtsCertificationPhaseBTransactionOutcome::Authorized(result)) => Ok(Some(
-            LocalAtsCertificationConsume::Authorized(Box::new(
+        Ok(AtsCertificationPhaseBTransactionOutcome::Authorized(result)) => {
+            Ok(Some(LocalAtsCertificationConsume::Authorized(Box::new(
                 result.ats_certified_receipt_authority,
-            )),
-        )),
+            ))))
+        }
         Ok(AtsCertificationPhaseBTransactionOutcome::LayoutDriftQuarantined) => {
             Ok(Some(LocalAtsCertificationConsume::LayoutDriftQuarantined))
         }
@@ -733,11 +1204,11 @@ fn consume_local_ats_certification_postgres_tx(
     match validate_consume_reserve_ats_application_certification_from_context_postgres_tx(
         tx, &request, now_ms,
     ) {
-        Ok(AtsCertificationPhaseBTransactionOutcome::Authorized(result)) => Ok(Some(
-            LocalAtsCertificationConsume::Authorized(Box::new(
+        Ok(AtsCertificationPhaseBTransactionOutcome::Authorized(result)) => {
+            Ok(Some(LocalAtsCertificationConsume::Authorized(Box::new(
                 result.ats_certified_receipt_authority,
-            )),
-        )),
+            ))))
+        }
         Ok(AtsCertificationPhaseBTransactionOutcome::LayoutDriftQuarantined) => {
             Ok(Some(LocalAtsCertificationConsume::LayoutDriftQuarantined))
         }

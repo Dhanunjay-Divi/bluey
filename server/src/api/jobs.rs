@@ -4381,21 +4381,27 @@ async fn authorize_local_run_submit(
     Path(run_id): Path<String>,
     Json(req): Json<LocalRunSubmitAccessRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    if !jobs_local_browser_distribution_enabled(&state.pool) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "Bluey Browser local runs are currently paused.".to_string(),
-        ));
-    }
-    let ticket = authorize_local_run_operation(
+    let authorization = authorize_local_run_operation(
         &state,
         &run_id,
         &req.capability,
         &req.ticket,
         "submit",
         None,
-    )?
-    .ticket;
+    )?;
+    let exact_click_started_replay = authorization.capability_version
+        == Some(super::jobs_local_capability::TOKEN_VERSION)
+        && authorization.ticket.status == "click_started";
+    let ticket = authorization.ticket;
+    if !local_submit_distribution_allowed(
+        exact_click_started_replay,
+        jobs_local_browser_distribution_enabled(&state.pool),
+    ) {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Browser local runs are currently paused.".to_string(),
+        ));
+    }
     let (application, _) = local_result_binding(&state, &ticket, &run_id)?;
     let posting = jobs::get_posting(&state.pool, &ticket.account_id, &application.job_id)
         .map_err(internal)?
@@ -4420,6 +4426,7 @@ async fn authorize_local_run_submit(
         &ticket.account_id,
         &ticket.application_id,
         &run_id,
+        exact_click_started_replay,
     )?;
     let now_ms = capacity.now_ms;
     let server_release_id = browser_server_release_id()?;
@@ -4464,6 +4471,7 @@ fn local_submission_evidence_capacity(
     account_id: &str,
     application_id: &str,
     run_id: &str,
+    exact_click_started_replay: bool,
 ) -> Result<NewSubmissionEvidenceCapacity, ApiError> {
     let storage_config = state.config.object_storage.clone().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -4471,6 +4479,28 @@ fn local_submission_evidence_capacity(
     ))?;
     let storage = ObjectStorage::new(storage_config);
     let now_ms = jobs::now_ms();
+    if exact_click_started_replay {
+        let durable = object_uploads::get_submission_evidence_capacity(
+            &state.pool,
+            account_id,
+            application_id,
+            run_id,
+        )
+        .map_err(internal)?;
+        return local_durable_recovery_evidence_capacity(
+            durable,
+            account_id,
+            application_id,
+            run_id,
+            now_ms,
+            storage.upload_limits(),
+        )
+        .ok_or((
+            StatusCode::CONFLICT,
+            "This application is no longer authorized to submit. Return to Bluey Jobs to review it."
+                .to_string(),
+        ));
+    }
     let bundle_capacity_bytes = storage.max_object_bytes().min(MAX_RECEIPT_BUNDLE_BYTES) as i64;
     Ok(NewSubmissionEvidenceCapacity {
         account_id: account_id.to_string(),
@@ -4482,6 +4512,39 @@ fn local_submission_evidence_capacity(
         expires_at_ms: now_ms.saturating_add(jobs::SUBMISSION_RECONCILIATION_GRACE_MS),
         now_ms,
         limits: storage.upload_limits(),
+    })
+}
+
+fn local_durable_recovery_evidence_capacity(
+    durable: Option<object_uploads::SubmissionEvidenceCapacity>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    now_ms: i64,
+    limits: crate::object_storage::UploadLimits,
+) -> Option<NewSubmissionEvidenceCapacity> {
+    let durable = durable?;
+    if durable.account_id != account_id
+        || durable.application_id != application_id
+        || durable.run_id != run_id
+        || durable.runner != "local"
+        || durable.state != "active"
+        || durable.expires_at_ms <= now_ms
+        || durable.reserved_bytes <= 0
+        || durable.reserved_objects <= 0
+    {
+        return None;
+    }
+    Some(NewSubmissionEvidenceCapacity {
+        account_id: durable.account_id,
+        application_id: durable.application_id,
+        run_id: durable.run_id,
+        runner: durable.runner,
+        reserved_bytes: durable.reserved_bytes,
+        reserved_objects: durable.reserved_objects,
+        expires_at_ms: durable.expires_at_ms,
+        now_ms,
+        limits,
     })
 }
 
@@ -4743,6 +4806,7 @@ async fn save_local_run_result(
                 &ticket.account_id,
                 &ticket.application_id,
                 &run_id,
+                local_result_uses_durable_submission_evidence_capacity(&ticket.status),
             )?;
             let mut reconciliation_receipt = req.receipt;
             if let Some(receipt) = reconciliation_receipt.as_object_mut() {
@@ -4897,11 +4961,6 @@ fn authorize_local_run_operation(
             reconciliation_status,
             Some("submitted" | "side_effect_unknown")
         );
-    let allow_expired_click_started = operation == "result"
-        && matches!(
-            reconciliation_status,
-            Some("submitted" | "side_effect_unknown")
-        );
     #[cfg(debug_assertions)]
     if capability.is_empty() && !_legacy_ticket.is_empty() {
         let hash = local_run_ticket_hash(_legacy_ticket)?;
@@ -4917,14 +4976,14 @@ fn authorize_local_run_operation(
                 "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
             ));
         }
-        if ticket.expires_at_ms <= now
-            && !(allow_late_reconciliation
-                && matches!(ticket.status.as_str(), "side_effect_unknown" | "complete")
-                && ticket
-                    .expires_at_ms
-                    .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
-                    > now)
-        {
+        if !local_run_operation_expiry_allowed(
+            operation,
+            reconciliation_status,
+            None,
+            &ticket.status,
+            ticket.expires_at_ms,
+            now,
+        ) {
             return Err((
                 StatusCode::NOT_FOUND,
                 "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
@@ -4936,7 +4995,7 @@ fn authorize_local_run_operation(
         });
     }
 
-    let claims = if allow_late_reconciliation {
+    let claims = if allow_late_reconciliation || operation == "submit" {
         super::jobs_local_capability::verify_for_reconciliation(capability, run_id, operation, now)
     } else {
         super::jobs_local_capability::verify(capability, run_id, operation, now)
@@ -4969,15 +5028,14 @@ fn authorize_local_run_operation(
             "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
         ));
     }
-    if ticket.expires_at_ms <= now
-        && !(allow_late_reconciliation
-            && (matches!(ticket.status.as_str(), "side_effect_unknown" | "complete")
-                || (allow_expired_click_started && ticket.status == "click_started"))
-            && ticket
-                .expires_at_ms
-                .saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS)
-                > now)
-    {
+    if !local_run_operation_expiry_allowed(
+        operation,
+        reconciliation_status,
+        Some(claims.version),
+        &ticket.status,
+        ticket.expires_at_ms,
+        now,
+    ) {
         return Err((
             StatusCode::NOT_FOUND,
             "This Bluey Browser launch has expired. Start it again from Jobs.".to_string(),
@@ -4987,6 +5045,45 @@ fn authorize_local_run_operation(
         ticket,
         capability_version: Some(claims.version),
     })
+}
+
+fn local_run_operation_expiry_allowed(
+    operation: &str,
+    reconciliation_status: Option<&str>,
+    capability_version: Option<u8>,
+    ticket_status: &str,
+    expires_at_ms: i64,
+    now_ms: i64,
+) -> bool {
+    if expires_at_ms > now_ms {
+        return true;
+    }
+    if expires_at_ms.saturating_add(super::jobs_local_capability::RECONCILIATION_GRACE_MS) <= now_ms
+    {
+        return false;
+    }
+    let result_reconciliation = operation == "result"
+        && matches!(
+            reconciliation_status,
+            Some("submitted" | "side_effect_unknown")
+        )
+        && (matches!(ticket_status, "side_effect_unknown" | "complete")
+            || (capability_version.is_some() && ticket_status == "click_started"));
+    let submit_replay = operation == "submit"
+        && capability_version == Some(super::jobs_local_capability::TOKEN_VERSION)
+        && ticket_status == "click_started";
+    result_reconciliation || submit_replay
+}
+
+fn local_submit_distribution_allowed(
+    exact_click_started_replay: bool,
+    distribution_enabled: bool,
+) -> bool {
+    distribution_enabled || exact_click_started_replay
+}
+
+fn local_result_uses_durable_submission_evidence_capacity(ticket_status: &str) -> bool {
+    matches!(ticket_status, "click_started" | "side_effect_unknown")
 }
 
 fn legacy_local_run_capability_status_allowed(ticket_status: &str, operation: &str) -> bool {
@@ -8834,6 +8931,253 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+
+    #[test]
+    fn expired_v2_submit_capability_is_limited_to_click_started_replay() {
+        let expires_at_ms = 10_000;
+        let now_ms = expires_at_ms + 1;
+        assert!(local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::TOKEN_VERSION),
+            "click_started",
+            expires_at_ms,
+            now_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::LEGACY_TOKEN_VERSION),
+            "click_started",
+            expires_at_ms,
+            now_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::TOKEN_VERSION),
+            "click_started",
+            expires_at_ms,
+            expires_at_ms
+                .saturating_add(super::super::jobs_local_capability::RECONCILIATION_GRACE_MS),
+        ));
+    }
+
+    #[test]
+    fn expired_claimed_submit_capability_remains_denied() {
+        assert!(!local_run_operation_expiry_allowed(
+            "submit",
+            None,
+            Some(super::super::jobs_local_capability::TOKEN_VERSION),
+            "claimed",
+            10_000,
+            10_001,
+        ));
+    }
+
+    #[test]
+    fn legacy_result_reconciliation_expiry_contract_is_preserved() {
+        let expires_at_ms = 10_000;
+        let within_grace_ms = expires_at_ms + 1;
+        let legacy_v1 = Some(super::super::jobs_local_capability::LEGACY_TOKEN_VERSION);
+
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            None,
+            "click_started",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        assert!(local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            legacy_v1,
+            "click_started",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        for terminal_status in ["side_effect_unknown", "complete"] {
+            assert!(local_run_operation_expiry_allowed(
+                "result",
+                Some("side_effect_unknown"),
+                None,
+                terminal_status,
+                expires_at_ms,
+                within_grace_ms,
+            ));
+            assert!(local_run_operation_expiry_allowed(
+                "result",
+                Some("submitted"),
+                legacy_v1,
+                terminal_status,
+                expires_at_ms,
+                within_grace_ms,
+            ));
+        }
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("failed"),
+            legacy_v1,
+            "click_started",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            legacy_v1,
+            "claimed",
+            expires_at_ms,
+            within_grace_ms,
+        ));
+        assert!(!local_run_operation_expiry_allowed(
+            "result",
+            Some("submitted"),
+            legacy_v1,
+            "click_started",
+            expires_at_ms,
+            expires_at_ms
+                .saturating_add(super::super::jobs_local_capability::RECONCILIATION_GRACE_MS),
+        ));
+    }
+
+    #[test]
+    fn disabled_distribution_denies_claimed_submit_but_allows_click_started_replay() {
+        assert!(!local_submit_distribution_allowed(false, false));
+        assert!(local_submit_distribution_allowed(true, false));
+        assert!(local_submit_distribution_allowed(false, true));
+    }
+
+    fn durable_local_submission_capacity() -> object_uploads::SubmissionEvidenceCapacity {
+        object_uploads::SubmissionEvidenceCapacity {
+            account_id: "account-1".to_string(),
+            application_id: "application-1".to_string(),
+            run_id: "run-1".to_string(),
+            runner: "local".to_string(),
+            reserved_bytes: 384,
+            reserved_objects: 3,
+            consumed_bytes: 0,
+            consumed_objects: 0,
+            state: "active".to_string(),
+            expires_at_ms: 20_000,
+            created_at_ms: 9_000,
+            updated_at_ms: 9_000,
+            completed_at_ms: None,
+        }
+    }
+
+    fn reduced_upload_limits() -> crate::object_storage::UploadLimits {
+        crate::object_storage::UploadLimits {
+            max_object_bytes: 64,
+            max_account_bytes: 128,
+            max_daily_bytes: 128,
+            max_account_objects: 2,
+        }
+    }
+
+    #[test]
+    fn click_started_replay_preserves_durable_capacity_across_config_drift() {
+        let capacity = local_durable_recovery_evidence_capacity(
+            Some(durable_local_submission_capacity()),
+            "account-1",
+            "application-1",
+            "run-1",
+            10_000,
+            reduced_upload_limits(),
+        )
+        .expect("active exact capacity");
+
+        assert_eq!(capacity.reserved_bytes, 384);
+        assert_eq!(capacity.reserved_objects, 3);
+        assert_eq!(capacity.expires_at_ms, 20_000);
+        assert_eq!(capacity.now_ms, 10_000);
+        assert_eq!(capacity.limits, reduced_upload_limits());
+    }
+
+    #[test]
+    fn result_reconciliation_uses_durable_capacity_only_after_the_click_boundary() {
+        for durable_status in ["click_started", "side_effect_unknown"] {
+            assert!(local_result_uses_durable_submission_evidence_capacity(
+                durable_status
+            ));
+            let capacity = local_durable_recovery_evidence_capacity(
+                Some(durable_local_submission_capacity()),
+                "account-1",
+                "application-1",
+                "run-1",
+                10_000,
+                reduced_upload_limits(),
+            )
+            .expect("recovery keeps the durable capacity identity despite current config drift");
+            assert_eq!(capacity.reserved_bytes, 384);
+            assert_eq!(capacity.reserved_objects, 3);
+        }
+        for new_reservation_status in ["claimed", "needs_input"] {
+            assert!(!local_result_uses_durable_submission_evidence_capacity(
+                new_reservation_status
+            ));
+        }
+    }
+
+    #[test]
+    fn click_started_replay_rejects_missing_inactive_expired_or_wrong_run_capacity() {
+        let limits = reduced_upload_limits();
+        let rebuild = |durable| {
+            local_durable_recovery_evidence_capacity(
+                durable,
+                "account-1",
+                "application-1",
+                "run-1",
+                10_000,
+                limits,
+            )
+        };
+        assert!(rebuild(None).is_none());
+
+        let mut inactive = durable_local_submission_capacity();
+        inactive.state = "released".to_string();
+        assert!(rebuild(Some(inactive)).is_none());
+
+        let mut expired = durable_local_submission_capacity();
+        expired.expires_at_ms = 10_000;
+        assert!(rebuild(Some(expired)).is_none());
+
+        let mut wrong_runner = durable_local_submission_capacity();
+        wrong_runner.runner = "cloud".to_string();
+        assert!(rebuild(Some(wrong_runner)).is_none());
+
+        let mut wrong_run = durable_local_submission_capacity();
+        wrong_run.run_id = "run-2".to_string();
+        assert!(rebuild(Some(wrong_run)).is_none());
+    }
+
+    #[test]
+    fn local_submit_distribution_gate_defers_only_durable_replay_to_database_authority() {
+        let source = include_str!("jobs.rs");
+        let submit = source
+            .split("async fn authorize_local_run_submit")
+            .nth(1)
+            .expect("local submit route")
+            .split("fn local_submission_evidence_capacity")
+            .next()
+            .expect("bounded local submit route");
+        let ticket = submit
+            .find("authorize_local_run_operation")
+            .expect("ticket capability authority");
+        let durable_replay = submit
+            .find("local_submit_distribution_allowed")
+            .expect("durable replay distribution exception");
+        let distribution = submit
+            .find("jobs_local_browser_distribution_enabled")
+            .expect("local distribution flag");
+        let database = submit
+            .find("local_run_submit_authorization_for_distribution")
+            .expect("atomic database submit authority");
+        assert!(
+            ticket < durable_replay && durable_replay < distribution && distribution < database
+        );
+    }
 
     #[test]
     fn ats_kind_matches_shared_exact_target_vectors() {

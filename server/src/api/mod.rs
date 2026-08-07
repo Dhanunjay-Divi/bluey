@@ -26,6 +26,7 @@ pub mod jobs_interview_prep;
 pub mod jobs_local_capability;
 mod jobs_mailbox;
 pub mod jobs_mailbox_oauth;
+pub mod jobs_operations;
 pub(crate) mod jobs_resume_assets;
 pub(crate) mod jobs_resume_generation;
 pub mod jobs_runner_volumes;
@@ -217,6 +218,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .merge(jobs::admin_router())
         .merge(jobs_ats_certifications::admin_router())
         .merge(jobs_browser_releases::admin_router())
+        .merge(jobs_operations::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
 
@@ -391,6 +393,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
     Router::new()
         .merge(public)
         .merge(protected)
+        .layer(from_fn(jobs_operations::private_admin_no_store))
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
 }
@@ -423,11 +426,18 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
             auth::require_auth,
         ));
 
-    let jobs_admin = jobs::admin_router()
+    let jobs_admin = Router::new()
+        .route("/admin/metrics", get(metrics::get_metrics))
+        .merge(jobs::admin_router())
         .merge(jobs_ats_certifications::admin_router())
         .merge(jobs_browser_releases::admin_router())
+        .merge(jobs_operations::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            account::reject_mutation_after_deletion_fence,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -455,6 +465,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         )
         .merge(jobs_admin)
         .merge(protected)
+        .layer(from_fn(jobs_operations::private_admin_no_store))
         .layer(from_fn(middleware::request_id::request_id_middleware))
         .with_state(state)
 }

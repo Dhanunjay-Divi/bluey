@@ -12,6 +12,15 @@ use bluey_server::{
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
 
+fn validate_runtime_config() -> anyhow::Result<()> {
+    db::jobs::validate_data_encryption_config().context("validate Jobs data encryption")?;
+    api::jobs_local_capability::validate_runtime_config()
+        .context("validate Bluey Browser capability configuration")?;
+    api::jobs_runner_volumes::validate_runtime_config()
+        .context("validate managed runner-volume purge signing configuration")?;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Tracing
@@ -24,10 +33,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Config
     let config = Config::from_env().context("load config")?;
-    api::jobs_local_capability::validate_runtime_config()
-        .context("validate Bluey Browser capability configuration")?;
-    api::jobs_runner_volumes::validate_runtime_config()
-        .context("validate managed runner-volume purge signing configuration")?;
+    validate_runtime_config()?;
     tracing::info!(
         port = config.port,
         db_backend = ?config.db_backend,
@@ -136,5 +142,23 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c    => tracing::info!("ctrl-c received"),
         _ = terminate => tracing::info!("SIGTERM received"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial]
+    fn full_server_startup_rejects_an_invalid_jobs_data_key() {
+        let previous = std::env::var_os("BLUEY_JOBS_DATA_KEY");
+        std::env::set_var("BLUEY_JOBS_DATA_KEY", "malformed-key");
+        let error = validate_runtime_config().unwrap_err().to_string();
+        match previous {
+            Some(value) => std::env::set_var("BLUEY_JOBS_DATA_KEY", value),
+            None => std::env::remove_var("BLUEY_JOBS_DATA_KEY"),
+        }
+        assert!(error.contains("validate Jobs data encryption"));
     }
 }

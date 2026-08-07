@@ -61,6 +61,14 @@ function communicationExecutionParitySchema(integerType) {
   return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
 }
 
+function operationalHoldsParitySchema(integerType) {
+  const migrationPath =
+    integerType === "INTEGER"
+      ? "infra/sqlite/server-runtime/052_jobs_operational_holds.sql"
+      : "infra/postgres/server-runtime/030_jobs_operational_holds.sql";
+  return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
+}
+
 function testPrivacyPaths() {
   const rejected = [
     ["jobs/candidates/alice/resume.pdf", "candidate or user data directory"],
@@ -322,13 +330,230 @@ function jobsParitySchema(integerType) {
     ${browserReleaseAuthorityParitySchema(integerType)}
     ${atsCertificationParitySchema(integerType)}
     ${communicationExecutionParitySchema(integerType)}
+    ${operationalHoldsParitySchema(integerType)}
   `;
+}
+
+function replaceFirstForGuardTest(source, original, replacement, invariant) {
+  assert(
+    source.includes(original),
+    `guard self-test fixture must contain ${invariant}`,
+  );
+  return source.replace(original, replacement);
+}
+
+function assertOperationalHoldDriftRejected({
+  dialect,
+  invariant,
+  original,
+  replacement,
+  sqlite,
+  postgres,
+}) {
+  const operationalMigration = operationalHoldsParitySchema(
+    dialect === "SQLite" ? "INTEGER" : "BIGINT",
+  );
+  const mutatedMigration = replaceFirstForGuardTest(
+    operationalMigration,
+    original,
+    replacement,
+    invariant,
+  );
+  const source = dialect === "SQLite" ? sqlite : postgres;
+  assert(
+    source.includes(operationalMigration),
+    `${dialect} guard fixture must contain the operational-hold migration`,
+  );
+  const mutated = source.replace(operationalMigration, () => mutatedMigration);
+  const issues =
+    dialect === "SQLite"
+      ? compareJobsSchemas(mutated, postgres)
+      : compareJobsSchemas(sqlite, mutated);
+  assert(
+    issues.some((issue) =>
+      issue.includes(`${dialect} operational-hold invariant ${invariant}`),
+    ),
+    `${dialect} ${invariant} drift must fail the operational-hold semantic guard; ` +
+      `issues=${JSON.stringify(issues)}`,
+  );
 }
 
 function testSchemaParity() {
   const sqlite = jobsParitySchema("INTEGER");
   const postgres = jobsParitySchema("BIGINT");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+
+  for (const mutation of [
+    {
+      dialect: "Postgres",
+      invariant: "predecessor time ordering",
+      original: "predecessor.recorded_at_ms <= NEW.recorded_at_ms",
+      replacement: "predecessor.recorded_at_ms > NEW.recorded_at_ms",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "released-to-released rejection",
+      original:
+        "NOT (NEW.transition = 'released' AND predecessor.transition = 'released')",
+      replacement:
+        "NOT (NEW.transition = 'held' AND predecessor.transition = 'held')",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "first event is held",
+      original: "predecessor_event_id IS NULL AND transition = 'held'",
+      replacement: "predecessor_event_id IS NULL AND transition = 'released'",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "previous revision is exactly n-1",
+      original: "previous_revision_no = revision_no - 1",
+      replacement: "previous_revision_no < revision_no",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "ancestry revision/event uniqueness",
+      original:
+        "UNIQUE(capability, scope_kind, scope_id, revision_no, event_id)",
+      replacement: "UNIQUE(capability, scope_kind, revision_no, event_id)",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head revision/event/ref uniqueness",
+      original:
+        "UNIQUE(capability, scope_kind, scope_id, revision_no, event_id, event_ref)",
+      replacement:
+        "UNIQUE(capability, scope_kind, scope_id, revision_no, event_id)",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "ancestry foreign key",
+      original:
+        "capability, scope_kind, scope_id, previous_revision_no, predecessor_event_id",
+      replacement:
+        "capability, scope_kind, previous_revision_no, predecessor_event_id",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head foreign key",
+      original:
+        "capability, scope_kind, scope_id, head_revision, current_event_id, current_event_ref",
+      replacement:
+        "capability, scope_kind, scope_id, head_revision, current_event_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head insert revision is one",
+      original: "NEW.head_revision <> 1",
+      replacement: "NEW.head_revision < 1",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head insert capability link",
+      original: "event.capability = NEW.capability",
+      replacement: "event.capability <> NEW.capability",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head insert revision link",
+      original: "event.revision_no = NEW.head_revision",
+      replacement: "event.revision_no <= NEW.head_revision",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head insert event-ref link",
+      original: "event.event_ref = NEW.current_event_ref",
+      replacement: "event.event_ref <> NEW.current_event_ref",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head insert transition link",
+      original: "event.transition = NEW.state",
+      replacement: "event.transition <> NEW.state",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head insert actor link",
+      original: "event.recorded_by = NEW.updated_by",
+      replacement: "event.recorded_by <> NEW.updated_by",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head insert time link",
+      original: "event.recorded_at_ms = NEW.updated_at_ms",
+      replacement: "event.recorded_at_ms <= NEW.updated_at_ms",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head update advances exactly one revision",
+      original: "NEW.head_revision <> OLD.head_revision + 1",
+      replacement: "NEW.head_revision <= OLD.head_revision",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head scope-ref is immutable",
+      original: "NEW.scope_ref <> OLD.scope_ref",
+      replacement: "NEW.scope_ref = OLD.scope_ref",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "head update predecessor-event link",
+      original: "event.predecessor_event_id = OLD.current_event_id",
+      replacement: "event.predecessor_event_id <> OLD.current_event_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head update event-id link",
+      original:
+        "event.predecessor_event_id = OLD.current_event_id\n" +
+        "          AND event.event_id = NEW.current_event_id",
+      replacement:
+        "event.predecessor_event_id = OLD.current_event_id\n" +
+        "          AND event.event_id <> NEW.current_event_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "event update immutability",
+      original:
+        "CREATE TRIGGER trg_jobs_operational_hold_events_no_update\n" +
+        "BEFORE UPDATE ON jobs_operational_hold_events",
+      replacement:
+        "CREATE TRIGGER trg_jobs_operational_hold_events_no_update\n" +
+        "BEFORE INSERT ON jobs_operational_hold_events",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "event delete immutability",
+      original:
+        "CREATE TRIGGER IF NOT EXISTS trg_jobs_operational_hold_events_no_delete\n" +
+        "BEFORE DELETE ON jobs_operational_hold_events",
+      replacement:
+        "CREATE TRIGGER IF NOT EXISTS trg_jobs_operational_hold_events_no_delete\n" +
+        "BEFORE INSERT ON jobs_operational_hold_events",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "head delete immutability",
+      original:
+        "CREATE TRIGGER trg_jobs_operational_hold_heads_no_delete\n" +
+        "BEFORE DELETE ON jobs_operational_hold_heads",
+      replacement:
+        "CREATE TRIGGER trg_jobs_operational_hold_heads_no_delete\n" +
+        "BEFORE UPDATE ON jobs_operational_hold_heads",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "trigger row binding",
+      original:
+        "BEFORE INSERT ON jobs_operational_hold_events\n" +
+        "FOR EACH ROW EXECUTE FUNCTION validate_jobs_operational_hold_event();",
+      replacement:
+        "BEFORE INSERT ON jobs_operational_hold_events\n" +
+        "FOR EACH STATEMENT EXECUTE FUNCTION validate_jobs_operational_hold_event();",
+    },
+  ]) {
+    assertOperationalHoldDriftRejected({ ...mutation, sqlite, postgres });
+  }
 
   const missingAtsBindingTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS jobs_application_ats_certification_bindings \([\s\S]*?\n\);/,
@@ -507,8 +732,8 @@ function testSchemaParity() {
     "",
   );
   assert(
-    compareJobsSchemas(missingCommunicationEvidenceTable, postgres).some((issue) =>
-      issue.includes("SQLite parity tables"),
+    compareJobsSchemas(missingCommunicationEvidenceTable, postgres).some(
+      (issue) => issue.includes("SQLite parity tables"),
     ),
   );
 
@@ -517,8 +742,9 @@ function testSchemaParity() {
     "",
   );
   assert(
-    compareJobsSchemas(sqlite, missingCommunicationReconciliationIndex).some((issue) =>
-      issue.includes("jobs_communication_action_reconciliations index"),
+    compareJobsSchemas(sqlite, missingCommunicationReconciliationIndex).some(
+      (issue) =>
+        issue.includes("jobs_communication_action_reconciliations index"),
     ),
   );
   assert(
@@ -779,6 +1005,6 @@ testLicenseInventory();
 testProvenance();
 
 console.log(
-  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, "
-    + "lock inventory, and provenance).",
+  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, " +
+    "lock inventory, and provenance).",
 );

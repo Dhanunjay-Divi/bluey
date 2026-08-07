@@ -384,6 +384,8 @@ where
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
+            lock_operational_hold_shared_postgres_tx(&mut transaction)
+                .map_err(anyhow::Error::new)?;
             lock_postgres_ats_certification(&mut transaction)?;
             let disposition = postgres_claim_local_run_with_browser_release(
                 &mut transaction,
@@ -474,6 +476,68 @@ fn browser_release_phase_a_context(
     }))
 }
 
+fn sqlite_browser_runner_claim_operational_block(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<Option<BrowserLocalRunClaimDisposition>> {
+    let hold_context = match operational_hold_context_for_application_sqlite_tx(
+        tx,
+        account_id,
+        application_id,
+        Some("local"),
+        None,
+        None,
+    ) {
+        Ok(context) => context,
+        Err(OperationalHoldError::Storage(error)) => return Err(error),
+        Err(_) => return Ok(Some(BrowserLocalRunClaimDisposition::Rejected)),
+    };
+    match require_operational_capability_sqlite_tx(
+        tx,
+        OperationalCapability::RunnerClaim,
+        &hold_context,
+    ) {
+        Ok(()) => Ok(None),
+        Err(OperationalHoldError::Held(_)) => Ok(Some(
+            BrowserLocalRunClaimDisposition::DistributionUnavailable,
+        )),
+        Err(OperationalHoldError::Storage(error)) => Err(error),
+        Err(_) => Ok(Some(BrowserLocalRunClaimDisposition::Rejected)),
+    }
+}
+
+fn postgres_browser_runner_claim_operational_block(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<Option<BrowserLocalRunClaimDisposition>> {
+    let hold_context = match operational_hold_context_for_application_postgres_tx(
+        tx,
+        account_id,
+        application_id,
+        Some("local"),
+        None,
+        None,
+    ) {
+        Ok(context) => context,
+        Err(OperationalHoldError::Storage(error)) => return Err(error),
+        Err(_) => return Ok(Some(BrowserLocalRunClaimDisposition::Rejected)),
+    };
+    match require_operational_capability_postgres_tx(
+        tx,
+        OperationalCapability::RunnerClaim,
+        &hold_context,
+    ) {
+        Ok(()) => Ok(None),
+        Err(OperationalHoldError::Held(_)) => Ok(Some(
+            BrowserLocalRunClaimDisposition::DistributionUnavailable,
+        )),
+        Err(OperationalHoldError::Storage(error)) => Err(error),
+        Err(_) => Ok(Some(BrowserLocalRunClaimDisposition::Rejected)),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sqlite_claim_local_run_with_browser_release<F>(
     tx: &rusqlite::Transaction<'_>,
@@ -497,6 +561,15 @@ where
         claim_nonce_sha256,
         claim_request_sha256,
     )? {
+        if let BrowserLocalRunClaimDisposition::Success(success) = &disposition {
+            if let Some(blocked) = sqlite_browser_runner_claim_operational_block(
+                tx,
+                &success.ticket.account_id,
+                &success.ticket.application_id,
+            )? {
+                return Ok(blocked);
+            }
+        }
         return Ok(disposition);
     }
     let account_id: Option<String> = tx
@@ -519,6 +592,13 @@ where
     else {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     };
+    if let Some(blocked) = sqlite_browser_runner_claim_operational_block(
+        tx,
+        &ticket.account_id,
+        &ticket.application_id,
+    )? {
+        return Ok(blocked);
+    }
     let reservation_status: Option<String> = tx
         .query_row(
             "SELECT status FROM jobs_attempt_reservations
@@ -873,6 +953,15 @@ where
         claim_nonce_sha256,
         claim_request_sha256,
     )? {
+        if let BrowserLocalRunClaimDisposition::Success(success) = &disposition {
+            if let Some(blocked) = postgres_browser_runner_claim_operational_block(
+                tx,
+                &success.ticket.account_id,
+                &success.ticket.application_id,
+            )? {
+                return Ok(blocked);
+            }
+        }
         return Ok(disposition);
     }
     let account_id = tx
@@ -885,6 +974,7 @@ where
     let Some(account_id) = account_id else {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     };
+    lock_discovery_account_shared_postgres(tx, &account_id)?;
     if require_distribution_ready && !postgres_runner_volume_fleet_distribution_ready(tx)? {
         return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
     }
@@ -898,6 +988,13 @@ where
     else {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     };
+    if let Some(blocked) = postgres_browser_runner_claim_operational_block(
+        tx,
+        &ticket.account_id,
+        &ticket.application_id,
+    )? {
+        return Ok(blocked);
+    }
     let reservation_status = tx
         .query_opt(
             "SELECT status FROM jobs_attempt_reservations

@@ -7,6 +7,40 @@ under `docs/release/`.
 
 ### Added
 
+- Added a disabled-by-default, revisioned Bluey Jobs operational-hold control
+  plane for discovery, managed generation, application queueing, runner claims,
+  final Submit authorization, mailbox sync, and reviewed communication
+  dispatch. Holds are scoped by server-owned global, source, ATS, employer,
+  account, Career Track, region, runner, mailbox-provider, and model-provider
+  identities; they stop only new authority and preserve receipt persistence and
+  reconciliation after a possible side effect. Existing source pauses and
+  signed ATS circuits remain independent fail-closed authorities. Canonical
+  head validation covers held and released states across admission, readiness,
+  listing, replay, and release; semantic schema guards protect paired trigger,
+  ancestry, and immutability rules. Exact provider request-start and local
+  `click_started` recovery survives a later hold. A local run keeps its exact
+  frozen Browser build/release binding while allowing a current-server
+  deployment `A -> B` only when the immutable bound activation accepted both
+  IDs; an unaccepted server ID is denied. Signed v2 submit grace, a local
+  distribution pause, and object-storage maximum drift preserve only durable
+  recovery, reusing its exact active reserved capacity under current upload
+  limits. Signed v1/v2 result reconciliation retains this capacity for
+  `click_started`/`side_effect_unknown`; claimed, `needs_input`, and new paths
+  derive current configuration, while legacy submit and invalid durable
+  authority remain denied. Mailbox sync validates canonical, relational, and
+  encrypted provider projections before leasing. Discovery admission freezes
+  Career Track mutations for the lease, rejects Track projection drift, omits
+  inactive Tracks from curated selection, and retains Region holds for an
+  explicitly bound inactive Track. A partially materialized curated posting
+  without its exact managed discovery membership fails closed until repaired.
+  PostgreSQL application/job context and every relevant discovery writer share
+  one account fence, so admission evaluates a stable scope snapshot. An
+  `unassigned` application reservation omits runner-kind scope; later cloud or
+  local claims evaluate their concrete runner kind before binding it.
+  Operational API, metrics, debug, and
+  discovery-diagnostic projections redact private identities and isolate child
+  process secrets. No provider, tenant, credential, release flag, or production
+  state is changed by this source work.
 - Added a disabled-by-default, server-owned reviewed communication execution
   authority for Gmail/Outlook replies and Google/Microsoft calendar events,
   with explicit write-consent and action revisions, exact Reply-To and provider

@@ -50,6 +50,59 @@ mod tests {
         pool
     }
 
+    fn append_account_operational_hold(
+        pool: &DbPool,
+        capability: OperationalCapability,
+        event_id: &str,
+        transition: OperationalHoldTransition,
+        revision: i64,
+        predecessor: Option<&str>,
+    ) {
+        append_operational_hold_for_scope(
+            pool,
+            capability,
+            OperationalHoldScopeKind::Account,
+            "acct-jobs",
+            event_id,
+            transition,
+            revision,
+            predecessor,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_operational_hold_for_scope(
+        pool: &DbPool,
+        capability: OperationalCapability,
+        scope_kind: OperationalHoldScopeKind,
+        scope_id: &str,
+        event_id: &str,
+        transition: OperationalHoldTransition,
+        revision: i64,
+        predecessor: Option<&str>,
+    ) {
+        append_operational_hold_event(
+            pool,
+            &AppendOperationalHoldEventRequest {
+                event_id: event_id.to_string(),
+                capability,
+                scope_kind,
+                scope_id: scope_id.to_string(),
+                transition,
+                reason_code: if transition == OperationalHoldTransition::Held {
+                    OperationalHoldReasonCode::Incident
+                } else {
+                    OperationalHoldReasonCode::ManualRelease
+                },
+                reason_ref: Some("INC-606".to_string()),
+                expected_head_revision: revision,
+                expected_current_event_id: predecessor.map(str::to_string),
+            },
+            "admin-606",
+        )
+        .unwrap();
+    }
+
     fn assert_account_deletion_fence<T>(result: Result<T>) {
         match result {
             Err(error) => assert!(matches!(
@@ -385,6 +438,43 @@ mod tests {
             .expect("capacity reservation after release authority");
         assert!(ticket < shared_lock && shared_lock < release && release < capacity);
 
+        let replay = submit_source
+            .split("fn postgres_local_click_started_submit_replay")
+            .nth(1)
+            .expect("PostgreSQL click-started replay implementation")
+            .split("fn local_ats_observed_surface")
+            .next()
+            .expect("bounded PostgreSQL click-started replay implementation");
+        let ticket_lock = replay
+            .find("FOR UPDATE")
+            .expect("click-started ticket lock");
+        let shared_lock = replay
+            .find("postgres_lock_browser_release_registry_shared(tx)")
+            .expect("click-started release-registry lock");
+        let release = replay
+            .find("postgres_local_click_started_release_matches")
+            .expect("click-started frozen release authority");
+        let ats = replay
+            .find("recover_terminal_ats_authority_postgres_tx")
+            .expect("click-started terminal ATS authority");
+        let application = replay
+            .find("SELECT job_id, application_json, state FROM jobs_applications")
+            .expect("click-started application lock");
+        let session = replay
+            .find("SELECT session_json, runner, status FROM jobs_browser_sessions")
+            .expect("click-started session lock");
+        let capacity = replay
+            .find("postgres_local_click_started_capacity_matches")
+            .expect("click-started capacity authority");
+        assert!(
+            ticket_lock < shared_lock
+                && shared_lock < release
+                && release < ats
+                && ats < application
+                && application < session
+                && session < capacity
+        );
+
         let availability = claim_source
             .split("pub fn local_browser_release_availability")
             .nth(1)
@@ -499,6 +589,301 @@ mod tests {
             .find("postgres_runner_volume_fleet_distribution_ready")
             .expect("local Phase B runner row authority");
         assert!(local_phase_b_lock < local_phase_b_first_row);
+    }
+
+    #[test]
+    fn postgres_operational_hold_lock_is_first_in_every_protected_admission() {
+        fn operation<'a>(source: &'a str, start: &str, end: &str, label: &str) -> &'a str {
+            source
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing {label} start"))
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("missing {label} end"))
+        }
+
+        fn assert_first_lock(
+            operation: &str,
+            begin: &str,
+            hold_lock: &str,
+            first_protected_lock: &str,
+            label: &str,
+        ) {
+            let begin_position = operation
+                .find(begin)
+                .unwrap_or_else(|| panic!("missing {label} PostgreSQL transaction"));
+            let after_begin = begin_position + begin.len();
+            let hold = after_begin
+                + operation[after_begin..]
+                    .find(hold_lock)
+                    .unwrap_or_else(|| panic!("missing {label} operational-hold lock"));
+            assert!(
+                operation[after_begin..hold].trim().is_empty(),
+                "{label} must acquire the operational-hold lock immediately after BEGIN"
+            );
+            let protected = after_begin
+                + operation[after_begin..]
+                    .find(first_protected_lock)
+                    .unwrap_or_else(|| panic!("missing {label} protected lock"));
+            assert!(hold < protected, "{label} lock order is inverted");
+        }
+
+        let browser = include_str!("browser_release_authority.rs");
+        assert_first_lock(
+            operation(
+                browser,
+                "fn claim_local_run_with_browser_release_inner",
+                "fn browser_claim_request_sha256",
+                "local Browser claim",
+            ),
+            "let mut transaction = connection.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut transaction)",
+            "lock_postgres_ats_certification(&mut transaction)",
+            "local Browser claim",
+        );
+
+        let discovery = include_str!("discovery.rs");
+        assert_first_lock(
+            operation(
+                discovery,
+                "pub fn lease_due_discovery_source",
+                "fn discovery_lease_token_hash",
+                "direct discovery lease",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "SELECT id, account_id, track_id",
+            "direct discovery lease",
+        );
+
+        let global_discovery = include_str!("global_discovery.rs");
+        assert_first_lock(
+            operation(
+                global_discovery,
+                "pub fn lease_due_global_discovery_source",
+                "pub fn ingest_global_discovery_batch",
+                "global discovery lease",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "SELECT id, provider, source_key",
+            "global discovery lease",
+        );
+
+        let local_runner = include_str!("local_runner.rs");
+        assert_first_lock(
+            operation(
+                local_runner,
+                "fn local_run_submit_authorization_inner",
+                "fn local_ats_observed_surface",
+                "local final-submit admission",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "lock_postgres_ats_certification(&mut tx)",
+            "local final-submit admission",
+        );
+        let local_submit = operation(
+            local_runner,
+            "fn local_run_submit_authorization_inner",
+            "fn local_ats_observed_surface",
+            "local final-submit admission",
+        );
+        let (local_submit_sqlite, local_submit_postgres) = local_submit
+            .split_once("DbPool::Postgres(_) =>")
+            .expect("local final-submit SQLite/PostgreSQL branches");
+        for (branch, replay) in [
+            (
+                local_submit_sqlite,
+                "sqlite_local_click_started_submit_replay",
+            ),
+            (
+                local_submit_postgres,
+                "postgres_local_click_started_submit_replay",
+            ),
+        ] {
+            assert!(
+                branch.find(replay).unwrap()
+                    < branch
+                        .find("operational_hold_context_for_application")
+                        .unwrap(),
+                "durable local click-started replay must remain before hold evaluation"
+            );
+        }
+
+        let execution = include_str!("execution_leases.rs");
+        assert_first_lock(
+            operation(
+                execution,
+                "fn claim_execution_lease_inner(",
+                "fn execution_lease_from_runner_volume_error",
+                "cloud runner claim",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "lock_postgres_ats_certification(&mut tx)",
+            "cloud runner claim",
+        );
+        let cloud_submit = operation(
+            execution,
+            "pub fn start_irreversible_submission(",
+            "fn execution_finish_allowed",
+            "cloud final-submit admission",
+        );
+        assert_first_lock(
+            cloud_submit,
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "lock_postgres_ats_certification(&mut tx)",
+            "cloud final-submit admission",
+        );
+        let cloud_submit_postgres = cloud_submit
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL cloud final-submit admission");
+        assert!(
+            cloud_submit_postgres
+                .find("lease.phase == \"click_started\"")
+                .unwrap()
+                < cloud_submit_postgres
+                    .find("operational_hold_context_for_application_postgres_tx")
+                    .unwrap(),
+            "durable cloud click-started replay must remain before hold evaluation"
+        );
+
+        let eligibility = include_str!("eligibility.rs");
+        assert_first_lock(
+            operation(
+                eligibility,
+                "pub fn reserve_application_attempt(",
+                "pub fn update_attempt_reservation_status(",
+                "application reservation",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "SELECT account_id FROM jobs_entitlements",
+            "application reservation",
+        );
+
+        let provider_cost = include_str!("../jobs_provider_cost_holds.rs");
+        assert_first_lock(
+            operation(
+                provider_cost,
+                "pub fn reserve(",
+                "pub fn settle_with_usage(",
+                "managed generation provider reservation",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "super::jobs::lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "SELECT reservation_token, status, job_id",
+            "managed generation provider reservation",
+        );
+
+        let communication = include_str!("communication_actions.rs");
+        assert_first_lock(
+            operation(
+                communication,
+                "pub fn claim_communication_action(",
+                "fn validate_communication_lease_binding(",
+                "communication dispatch claim",
+            ),
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "SELECT id, account_id FROM jobs_communication_actions",
+            "communication dispatch claim",
+        );
+        let request_start = operation(
+            communication,
+            "pub fn mark_communication_action_request_started(",
+            "pub fn finish_communication_action(",
+            "communication request-start marker",
+        );
+        assert_first_lock(
+            request_start,
+            "let mut tx = conn.transaction()?;",
+            "lock_operational_hold_shared_postgres_tx(&mut tx)",
+            "require_active_account_write_fence_postgres_tx",
+            "communication request-start marker",
+        );
+        let request_start_postgres = request_start
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL communication request-start marker");
+        assert!(
+            request_start_postgres
+                .find("existing_evidence_sha256")
+                .unwrap()
+                < request_start_postgres
+                    .find("communication_dispatch_is_held_postgres_tx")
+                    .unwrap(),
+            "durable communication request-start replay must remain before hold evaluation"
+        );
+    }
+
+    #[test]
+    fn postgres_operational_context_account_fence_covers_scope_snapshot_and_writers() {
+        let jobs_source = include_str!("../jobs.rs");
+        assert!(jobs_source.contains(
+            "pg_advisory_xact_lock(hashtextextended('jobs-discovery-account:' || $1, 0))"
+        ));
+        assert!(jobs_source.contains(
+            "pg_advisory_xact_lock_shared(hashtextextended('jobs-discovery-account:' || $1, 0))"
+        ));
+
+        let holds = include_str!("operational_holds.rs");
+        for (start, end, label) in [
+            (
+                "pub(crate) fn operational_hold_context_for_application_postgres_tx(",
+                "pub(crate) fn operational_hold_context_for_job_sqlite_tx(",
+                "application context",
+            ),
+            (
+                "pub(crate) fn operational_hold_context_for_job_postgres_tx(",
+                "pub(crate) fn operational_hold_context_for_mailbox_sqlite_tx(",
+                "job context",
+            ),
+        ] {
+            let operation = holds
+                .split(start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing PostgreSQL {label}"))
+                .split(end)
+                .next()
+                .unwrap_or_else(|| panic!("unbounded PostgreSQL {label}"));
+            let fence = operation
+                .find("lock_discovery_account_shared_postgres")
+                .unwrap_or_else(|| panic!("missing shared account fence in {label}"));
+            let posting = operation
+                .find("FROM jobs_postings")
+                .unwrap_or_else(|| panic!("missing posting snapshot in {label}"));
+            assert!(fence < posting, "{label} reads posting before its account fence");
+            assert!(operation.contains("FOR SHARE"));
+            assert!(!operation.contains("FOR UPDATE OF membership, source"));
+        }
+
+        let materialization = include_str!("global_materialization.rs")
+            .split("fn persist_global_materialization(")
+            .nth(1)
+            .expect("global materialization persistence")
+            .split("fn remove_global_materialization(")
+            .next()
+            .expect("bounded global materialization persistence");
+        let postgres_materialization = materialization
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL global materialization persistence");
+        let writer_fence = postgres_materialization
+            .find("lock_discovery_account_postgres(&mut tx, account_id)")
+            .expect("global materialization discovery-account writer fence");
+        let membership_write = postgres_materialization
+            .find("INSERT INTO jobs_discovery_memberships")
+            .expect("global materialization membership write");
+        assert!(writer_fence < membership_write);
+
+        let eligibility = include_str!("eligibility.rs");
+        assert!(eligibility.matches("FOR SHARE OF s, m").count() >= 2);
+        assert!(!eligibility.contains("FOR UPDATE OF s, m"));
     }
 
     #[test]
@@ -3687,7 +4072,7 @@ mod tests {
                     recorded_by, recorded_at_ms
                  ) VALUES (
                     ?1, 'test-activation', 1, 1, 'beta', 1, ?2, ?3, ?4,
-                    '[\"test-server\"]', ?5, 'dGVzdA', 1,
+                    '[\"alternate-test-server\",\"test-server\"]', ?5, 'dGVzdA', 1,
                     9007199254740991, 'test-suite', 1
                  )",
                 params![
@@ -4448,10 +4833,7 @@ mod tests {
             |ticket, _| Ok(json!({ "runId": ticket.id })),
         )
         .unwrap();
-        assert!(matches!(
-            claim,
-            BrowserLocalRunClaimDisposition::Success(_)
-        ));
+        assert!(matches!(claim, BrowserLocalRunClaimDisposition::Success(_)));
         let application = get_application(pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
@@ -4492,18 +4874,17 @@ mod tests {
                 format!("certified-cloud-chromium-{suffix}").as_bytes(),
             )),
         };
-        let installed =
-            super::runner_volume_purge_tests::install_certified_cloud_runtime_fixture(
-                pool,
-                "acct-jobs",
-                &application.id,
-                &run_id,
-                &browser_profile_id,
-                &owner_id,
-                runtime,
-                fixture_now,
-            )
-            .expect("install exact certified cloud runtime fixture");
+        let installed = super::runner_volume_purge_tests::install_certified_cloud_runtime_fixture(
+            pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &browser_profile_id,
+            &owner_id,
+            runtime,
+            fixture_now,
+        )
+        .expect("install exact certified cloud runtime fixture");
         let runtime_target = installed.runtime_target.clone();
         let application = require_frozen_cover_letter(pool, application);
         let (application, proof) =
@@ -4526,15 +4907,9 @@ mod tests {
         assert_eq!(grant.runtime_grant_id, installed.runtime_grant_id);
         assert_eq!(grant.runtime_sha256, installed.runtime_sha256);
         update_attempt_reservation_status(pool, "acct-jobs", &application.id, "running").unwrap();
-        let application = update_application(
-            pool,
-            "acct-jobs",
-            &application.id,
-            "running",
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let application = update_application(pool, "acct-jobs", &application.id, "running", None)
+            .unwrap()
+            .unwrap();
         CertifiedCloudExecutionFixture {
             application,
             run_id,
@@ -4551,15 +4926,10 @@ mod tests {
         run_id: &str,
         suffix: &str,
     ) -> (JobApplication, Intervention) {
-        let application = update_application(
-            pool,
-            "acct-jobs",
-            &application.id,
-            "needs_input",
-            None,
-        )
-        .unwrap()
-        .unwrap();
+        let application =
+            update_application(pool, "acct-jobs", &application.id, "needs_input", None)
+                .unwrap()
+                .unwrap();
         let mut session = list_browser_sessions(pool, "acct-jobs")
             .unwrap()
             .into_iter()
@@ -6153,6 +6523,328 @@ mod tests {
         assert!(ensure_managed_curated_discovery_source(&pool, "acct-jobs")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn curated_discovery_lease_freezes_track_mutations_until_terminal_result() {
+        let pool = test_pool();
+        let source = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let lease = lease_due_discovery_source(&pool, "curated-track-freeze-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.source.id, source.id);
+
+        let mut existing = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        existing.name = "Changed during lease".to_string();
+        assert!(upsert_track(&pool, "acct-jobs", &existing)
+            .unwrap_err()
+            .to_string()
+            .contains("active discovery lease"));
+
+        let mut added = existing.clone();
+        added.id = "track-added-during-lease".to_string();
+        added.created_at_ms = 0;
+        added.updated_at_ms = 0;
+        assert!(upsert_track(&pool, "acct-jobs", &added)
+            .unwrap_err()
+            .to_string()
+            .contains("active discovery lease"));
+        assert!(delete_track(&pool, "acct-jobs", "track-default")
+            .unwrap_err()
+            .to_string()
+            .contains("active discovery lease"));
+
+        complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[],
+            true,
+        )
+        .unwrap();
+        upsert_track(&pool, "acct-jobs", &existing).unwrap();
+
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_discovery_sources SET next_run_at_ms = ?2 WHERE id = ?1",
+                params![source.id, now_ms() - 1],
+            )
+            .unwrap();
+        let retry = lease_due_discovery_source(&pool, "curated-track-failure-worker")
+            .unwrap()
+            .unwrap();
+        fail_discovery_run(
+            &pool,
+            &source.id,
+            &retry.lease_token,
+            &retry.replay_key,
+            retry.scheduled_for_ms,
+            "timeout",
+        )
+        .unwrap();
+        upsert_track(&pool, "acct-jobs", &added).unwrap();
+        assert!(delete_track(&pool, "acct-jobs", &added.id).unwrap());
+    }
+
+    #[test]
+    fn inactive_held_track_is_not_admitted_or_selected_by_curated_discovery() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences::default();
+        let mut inactive = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        inactive.id = "track-inactive-held".to_string();
+        inactive.name = "Inactive held track".to_string();
+        inactive.active = false;
+        inactive.created_at_ms = 0;
+        inactive.updated_at_ms = 0;
+        upsert_track(&pool, "acct-jobs", &inactive).unwrap();
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::Discovery,
+            OperationalHoldScopeKind::CareerTrack,
+            &inactive.id,
+            "inactive-curated-track-hold",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        let candidate = test_posting(
+            "https://jobs.lever.co/acme/inactive-held-track",
+            now_ms(),
+            now_ms(),
+        );
+        assert!(best_curated_discovery_track(
+            &candidate,
+            &profile,
+            &preferences,
+            std::slice::from_ref(&inactive),
+        )
+        .is_none());
+
+        let source = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let lease = lease_due_discovery_source(&pool, "inactive-held-track-worker")
+            .unwrap()
+            .unwrap();
+        let result = complete_discovery_run(
+            &pool,
+            &source.id,
+            &lease.lease_token,
+            &lease.replay_key,
+            lease.scheduled_for_ms,
+            &[curated_discovered_job(
+                "inactive-held-track-lead",
+                "https://jobs.lever.co/acme/inactive-held-track",
+            )],
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.upserted_count, 1);
+        assert_eq!(list_postings(&pool, "acct-jobs").unwrap()[0].track_id, "track-default");
+    }
+
+    #[test]
+    fn discovery_track_active_projection_mismatch_fails_closed() {
+        let pool = test_pool();
+        ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let track_json = to_json(&track, "active Career Track").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?2, active = 0 WHERE id = ?1",
+                params![track.id, track_json],
+            )
+            .unwrap();
+        assert!(lease_due_discovery_source(&pool, "active-projection-worker")
+            .unwrap_err()
+            .to_string()
+            .contains("projection changed"));
+
+        let mut inactive = track;
+        inactive.active = false;
+        let inactive_json = to_json(&inactive, "inactive Career Track").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?2, active = 1 WHERE id = ?1",
+                params![inactive.id, inactive_json],
+            )
+            .unwrap();
+        assert!(lease_due_discovery_source(&pool, "inactive-projection-worker")
+            .unwrap_err()
+            .to_string()
+            .contains("projection changed"));
+    }
+
+    #[test]
+    fn inactive_bound_track_keeps_its_region_hold_scope() {
+        let pool = test_pool();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.active = false;
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+        upsert_discovery_source(
+            &pool,
+            "acct-jobs",
+            &DiscoverySourceInput {
+                track_id: track.id,
+                provider: "greenhouse".to_string(),
+                source_key: "inactive-bound-region".to_string(),
+                company: "Acme".to_string(),
+                run_interval_ms: DISCOVERY_MIN_INTERVAL_MS,
+            },
+        )
+        .unwrap();
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::Discovery,
+            OperationalHoldScopeKind::Region,
+            "new york, ny",
+            "inactive-bound-region-hold",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        assert!(lease_due_discovery_source(&pool, "inactive-bound-region-worker")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn curated_posting_without_managed_membership_fails_closed_until_repaired() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let posting = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &test_posting(
+                "https://jobs.lever.co/acme/curated-authority-gap",
+                now_ms(),
+                now_ms(),
+            ),
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let (application, _) = prepare_application(
+            &pool,
+            "acct-jobs",
+            &posting.id,
+            "factual",
+            "review_first",
+        )
+        .unwrap();
+        let mut curated = posting.clone();
+        curated.source = "curated_feed:feed-simplify-new-grad".to_string();
+        let curated_json = to_json(&curated, "curated authority-gap posting").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_postings SET posting_json = ?2, source = ?3 WHERE id = ?1",
+                params![posting.id, curated_json, curated.source],
+            )
+            .unwrap();
+
+        {
+            let mut conn = pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            for error in [
+                operational_hold_context_for_job_sqlite_tx(
+                    &tx,
+                    "acct-jobs",
+                    &posting.id,
+                    None,
+                    None,
+                )
+                .unwrap_err(),
+                operational_hold_context_for_application_sqlite_tx(
+                    &tx,
+                    "acct-jobs",
+                    &application.id,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap_err(),
+            ] {
+                match error {
+                    OperationalHoldError::Storage(source) => assert!(source
+                        .to_string()
+                        .contains("no managed discovery authority")),
+                    other => panic!("unexpected curated authority error: {other:?}"),
+                }
+            }
+            tx.commit().unwrap();
+        }
+
+        let source = ensure_managed_curated_discovery_source(&pool, "acct-jobs")
+            .unwrap()
+            .unwrap();
+        let observed_at_ms = now_ms();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_discovery_memberships (
+                    source_id, account_id, canonical_key, external_id, job_id, content_hash,
+                    first_seen_at_ms, last_seen_at_ms, last_seen_run_id, availability_status
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8, 'active')",
+                params![
+                    source.id,
+                    "acct-jobs",
+                    posting.canonical_key,
+                    "curated-authority-gap",
+                    posting.id,
+                    "a".repeat(64),
+                    observed_at_ms,
+                    "repaired-authority-gap",
+                ],
+            )
+            .unwrap();
+
+        let mut conn = pool.get().unwrap();
+        let tx = conn.transaction().unwrap();
+        let job_context = operational_hold_context_for_job_sqlite_tx(
+            &tx,
+            "acct-jobs",
+            &posting.id,
+            None,
+            None,
+        )
+        .unwrap();
+        let application_context = operational_hold_context_for_application_sqlite_tx(
+            &tx,
+            "acct-jobs",
+            &application.id,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(job_context
+            .scopes
+            .get(&OperationalHoldScopeKind::DiscoverySource)
+            .is_some_and(|ids| ids.contains(&source.id)));
+        assert!(application_context
+            .scopes
+            .get(&OperationalHoldScopeKind::DiscoverySource)
+            .is_some_and(|ids| ids.contains(&source.id)));
+        tx.commit().unwrap();
     }
 
     #[test]
@@ -12383,11 +13075,7 @@ mod tests {
         let deletion_barrier = barrier.clone();
         let deletion = std::thread::spawn(move || {
             deletion_barrier.wait();
-            crate::db::account_data::begin_account_deletion(
-                &deletion_pool,
-                "acct-jobs",
-                now_ms(),
-            )
+            crate::db::account_data::begin_account_deletion(&deletion_pool, "acct-jobs", now_ms())
         });
         barrier.wait();
         let saved = save.join().unwrap();
@@ -13086,11 +13774,9 @@ mod tests {
         };
         let (stored, inserted) = save_provider_message(&pool, "acct-jobs", &message).unwrap();
         assert!(inserted);
-        let legacy_hash = private_lookup_hash(
-            "jobs-provider-message:gmail",
-            message.external_id.as_str(),
-        )
-        .unwrap();
+        let legacy_hash =
+            private_lookup_hash("jobs-provider-message:gmail", message.external_id.as_str())
+                .unwrap();
         pool.get()
             .unwrap()
             .execute(
@@ -13340,9 +14026,7 @@ mod tests {
             let guard = Self {
                 _lock: lock,
                 dispatch: std::env::var_os("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED"),
-                reconciliation: std::env::var_os(
-                    "BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED",
-                ),
+                reconciliation: std::env::var_os("BLUEY_JOBS_COMMUNICATION_RECONCILIATION_ENABLED"),
             };
             if enabled {
                 std::env::set_var("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED", "true");
@@ -13437,8 +14121,9 @@ mod tests {
         });
         match action.provider.as_str() {
             "gmail" | "outlook_email" => {
-                evidence["operation_message_id"] =
-                    json!(communication_operation_message_id(&lease.provider_operation_key));
+                evidence["operation_message_id"] = json!(communication_operation_message_id(
+                    &lease.provider_operation_key
+                ));
                 let source = provider_message(
                     pool,
                     &lease.account_id,
@@ -13644,12 +14329,10 @@ mod tests {
             approve_communication_action(&pool, "acct-jobs", &action.id)
                 .unwrap()
                 .unwrap();
-            let lease = claim_communication_action(
-                &pool,
-                &format!("processed-{action_provider}-worker"),
-            )
-            .unwrap()
-            .unwrap();
+            let lease =
+                claim_communication_action(&pool, &format!("processed-{action_provider}-worker"))
+                    .unwrap()
+                    .unwrap();
             assert_eq!(lease.action.id, action.id);
             let owner = format!("processed-{action_provider}-worker");
             mark_communication_action_request_started(
@@ -13764,10 +14447,10 @@ mod tests {
             let mut reply = valid_reply.clone();
             reply["subject"] = json!(format!("before{unsafe_character}after"));
             assert!(validate_communication_payload("reply", &reply).is_err());
-            assert!(normalize_communication_email(&format!(
-                "local{unsafe_character}@example.org"
-            ))
-            .is_err());
+            assert!(
+                normalize_communication_email(&format!("local{unsafe_character}@example.org"))
+                    .is_err()
+            );
         }
 
         let mut calendar = json!({
@@ -13957,10 +14640,12 @@ mod tests {
         .unwrap_err()
         .to_string()
         .contains("communication is unresolved"));
-        assert!(save_jobs_provider_credential(&pool, "acct-jobs", &downgraded)
-            .unwrap_err()
-            .to_string()
-            .contains("communication is unresolved"));
+        assert!(
+            save_jobs_provider_credential(&pool, "acct-jobs", &downgraded)
+                .unwrap_err()
+                .to_string()
+                .contains("communication is unresolved")
+        );
         let preserved = jobs_provider_credential(&pool, "acct-jobs", &mailbox.id)
             .unwrap()
             .unwrap();
@@ -14145,9 +14830,11 @@ mod tests {
         );
         reply_to_action.provider = "outlook_email".to_string();
         reply_to_action.payload["to"] = json!("talent@example.org");
-        assert!(create_communication_action(&pool, "acct-jobs", &reply_to_action)
-            .unwrap()
-            .1);
+        assert!(
+            create_communication_action(&pool, "acct-jobs", &reply_to_action)
+                .unwrap()
+                .1
+        );
 
         let mut sender_action = reply_to_action;
         sender_action.idempotency_key = "outlook-sender-is-not-reply-target".to_string();
@@ -14230,12 +14917,8 @@ mod tests {
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
-        let action = communication_test_action(
-            &application,
-            &mailbox,
-            &message,
-            "request-start-singleton",
-        );
+        let action =
+            communication_test_action(&application, &mailbox, &message, "request-start-singleton");
         let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
         approve_communication_action(&pool, "acct-jobs", &stored.id)
             .unwrap()
@@ -14286,6 +14969,404 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn communication_request_start_replay_and_completion_survive_later_matching_hold() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "request-start-later-operational-hold",
+        );
+        let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &stored.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "request-start-hold-worker")
+            .unwrap()
+            .unwrap();
+        let access = communication_lease_access(&lease, "request-start-hold-worker");
+        let started = mark_communication_action_request_started(&pool, &access).unwrap();
+
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::CommunicationDispatch,
+            OperationalHoldScopeKind::MailboxProvider,
+            "gmail",
+            "communication-request-start-later-hold",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        {
+            let mut conn = pool.get().unwrap();
+            let tx = conn.transaction().unwrap();
+            let context =
+                operational_hold_context_for_mailbox_sqlite_tx(&tx, "acct-jobs", &mailbox.id)
+                    .unwrap();
+            assert!(matches!(
+                evaluate_operational_capability_sqlite_tx(
+                    &tx,
+                    OperationalCapability::CommunicationDispatch,
+                    &context,
+                )
+                .unwrap(),
+                OperationalCapabilityEvaluation::Held(_)
+            ));
+            tx.commit().unwrap();
+        }
+
+        let replayed = mark_communication_action_request_started(&pool, &access).unwrap();
+        assert_eq!(replayed, started);
+        let request_started_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                  WHERE attempt_id = ?1 AND event_kind = 'request_started'",
+                params![lease.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(request_started_count, 1);
+
+        let completed = finish_communication_action(
+            &pool,
+            &communication_success_finish(
+                &pool,
+                &lease,
+                "request-start-hold-worker",
+                "gmail-message-after-operational-hold",
+            ),
+        )
+        .unwrap();
+        assert_eq!(completed.status, "sent");
+        assert_eq!(
+            completed.provider_object_id,
+            "gmail-message-after-operational-hold"
+        );
+        let completion_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                  WHERE attempt_id = ?1 AND event_kind = 'sent'",
+                params![lease.attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(completion_count, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_dispatch_hold_skips_held_candidate_for_later_allowed_mailbox() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        let (application, gmail, gmail_message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let outlook = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "outlook".to_string(),
+                status: "connected".to_string(),
+                account_label: "outlook@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: vec!["recruiter_reply".to_string()],
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "microsoft-subject-communication-dispatch-hold",
+        )
+        .unwrap();
+        save_jobs_provider_credential(
+            &pool,
+            "acct-jobs",
+            &JobsProviderCredential {
+                connection_id: outlook.id.clone(),
+                provider: "outlook".to_string(),
+                provider_subject: "microsoft-subject-communication-dispatch-hold".to_string(),
+                access_token: "dummy-outlook-dispatch-hold-access-token".to_string(),
+                refresh_token: "dummy-outlook-dispatch-hold-refresh-token".to_string(),
+                scopes: vec!["Mail.Send".to_string()],
+                capabilities: vec!["recruiter_reply".to_string()],
+                grant_revision: 1,
+                grant_sha256: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        let outlook_message = communication_test_source_message(
+            &pool,
+            &application,
+            &outlook,
+            "outlook-message-communication-dispatch-hold",
+        );
+
+        let gmail_action = communication_test_action(
+            &application,
+            &gmail,
+            &gmail_message,
+            "held-gmail-communication-dispatch",
+        );
+        let (gmail_action, _) =
+            create_communication_action(&pool, "acct-jobs", &gmail_action).unwrap();
+        let gmail_action = approve_communication_action(&pool, "acct-jobs", &gmail_action.id)
+            .unwrap()
+            .unwrap();
+        let mut outlook_action = communication_test_action(
+            &application,
+            &outlook,
+            &outlook_message,
+            "allowed-outlook-communication-dispatch",
+        );
+        outlook_action.provider = "outlook_email".to_string();
+        let (outlook_action, _) =
+            create_communication_action(&pool, "acct-jobs", &outlook_action).unwrap();
+        let outlook_action = approve_communication_action(&pool, "acct-jobs", &outlook_action.id)
+            .unwrap()
+            .unwrap();
+        let due_now = now_ms();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_communication_actions
+                    SET next_attempt_at_ms = CASE id
+                      WHEN ?1 THEN ?3 - 2 ELSE ?3 - 1 END
+                  WHERE account_id = 'acct-jobs' AND id IN (?1, ?2)",
+                params![gmail_action.id, outlook_action.id, due_now],
+            )
+            .unwrap();
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::CommunicationDispatch,
+            OperationalHoldScopeKind::MailboxProvider,
+            "gmail",
+            "held-communication-dispatch-mailbox-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        let lease = claim_communication_action(&pool, "communication-hold-skip-worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.action.id, outlook_action.id);
+        assert_eq!(lease.action.provider, "outlook_email");
+        let held = communication_action(&pool, "acct-jobs", &gmail_action.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(held.status, "approved");
+        assert_eq!(held.attempt_count, 0);
+        assert!(held.active_attempt_id.is_none());
+        assert!(held.lease_owner.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_held_candidate_scan_is_bounded_and_advances_on_the_next_call() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        let (application, gmail, gmail_message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let outlook = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "outlook".to_string(),
+                status: "connected".to_string(),
+                account_label: "bounded-outlook@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: vec!["recruiter_reply".to_string()],
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "microsoft-subject-bounded-communication-dispatch",
+        )
+        .unwrap();
+        save_jobs_provider_credential(
+            &pool,
+            "acct-jobs",
+            &JobsProviderCredential {
+                connection_id: outlook.id.clone(),
+                provider: "outlook".to_string(),
+                provider_subject: "microsoft-subject-bounded-communication-dispatch".to_string(),
+                access_token: "dummy-bounded-outlook-dispatch-access-token".to_string(),
+                refresh_token: "dummy-bounded-outlook-dispatch-refresh-token".to_string(),
+                scopes: vec!["Mail.Send".to_string()],
+                capabilities: vec!["recruiter_reply".to_string()],
+                grant_revision: 1,
+                grant_sha256: String::new(),
+                expires_at_ms: now_ms() + 3_600_000,
+                created_at_ms: now_ms(),
+                updated_at_ms: now_ms(),
+            },
+        )
+        .unwrap();
+        let outlook_message = communication_test_source_message(
+            &pool,
+            &application,
+            &outlook,
+            "bounded-outlook-communication-message",
+        );
+
+        let mut held_actions = Vec::new();
+        for index in 0..OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT {
+            let action = communication_test_action(
+                &application,
+                &gmail,
+                &gmail_message,
+                &format!("bounded-held-gmail-{index:02}"),
+            );
+            let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+            held_actions.push(
+                approve_communication_action(&pool, "acct-jobs", &action.id)
+                    .unwrap()
+                    .unwrap(),
+            );
+        }
+        let mut allowed_action = communication_test_action(
+            &application,
+            &outlook,
+            &outlook_message,
+            "bounded-allowed-outlook",
+        );
+        allowed_action.provider = "outlook_email".to_string();
+        let (allowed_action, _) =
+            create_communication_action(&pool, "acct-jobs", &allowed_action).unwrap();
+        let allowed_action = approve_communication_action(&pool, "acct-jobs", &allowed_action.id)
+            .unwrap()
+            .unwrap();
+        let schedule = now_ms().saturating_sub(100_000);
+        let conn = pool.get().unwrap();
+        for (index, action) in held_actions.iter().enumerate() {
+            conn.execute(
+                "UPDATE jobs_communication_actions SET next_attempt_at_ms = ?2 WHERE id = ?1",
+                params![action.id, schedule + index as i64],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE jobs_communication_actions SET next_attempt_at_ms = ?2 WHERE id = ?1",
+            params![
+                allowed_action.id,
+                schedule + OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT as i64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::CommunicationDispatch,
+            OperationalHoldScopeKind::MailboxProvider,
+            "gmail",
+            "bounded-held-communication-mailbox",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        let owner_id = "bounded-communication-held-scan-worker";
+        assert!(claim_communication_action(&pool, owner_id)
+            .unwrap()
+            .is_none());
+        let lease = claim_communication_action(&pool, owner_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(lease.action.id, allowed_action.id);
+        assert!(held_actions.iter().all(|action| {
+            let action = communication_action(&pool, "acct-jobs", &action.id)
+                .unwrap()
+                .unwrap();
+            action.status == "approved"
+                && action.attempt_count == 0
+                && action.active_attempt_id.is_none()
+                && action.lease_owner.is_none()
+        }));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn communication_dispatch_hold_after_claim_demotes_without_request_started_evidence() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let pool = test_pool();
+        let (application, mailbox, message) =
+            communication_test_application_mailbox_and_message(&pool);
+        let action = communication_test_action(
+            &application,
+            &mailbox,
+            &message,
+            "communication-dispatch-hold-after-claim",
+        );
+        let (action, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
+        approve_communication_action(&pool, "acct-jobs", &action.id)
+            .unwrap()
+            .unwrap();
+        let lease = claim_communication_action(&pool, "communication-hold-race-worker")
+            .unwrap()
+            .unwrap();
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::CommunicationDispatch,
+            OperationalHoldScopeKind::MailboxProvider,
+            "gmail",
+            "held-communication-dispatch-after-claim-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        let error = mark_communication_action_request_started(
+            &pool,
+            &communication_lease_access(&lease, "communication-hold-race-worker"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "communication dispatch is unavailable");
+        let demoted = communication_action(&pool, "acct-jobs", &action.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(demoted.status, "needs_input");
+        assert_eq!(demoted.action_revision, lease.action.action_revision + 1);
+        assert!(demoted.lease_owner.is_none());
+        assert!(demoted.lease_kind.is_none());
+        assert!(demoted.lease_expires_at_ms.is_none());
+        assert!(demoted.active_attempt_id.is_none());
+        assert!(demoted.approved_authority_sha256.is_empty());
+        assert_eq!(demoted.approved_grant_revision, 0);
+        assert!(demoted.approved_grant_sha256.is_empty());
+        assert!(demoted.approved_at_ms.is_none());
+        let (lease_token_sha256, evidence_count): (Option<String>, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT action.lease_token_sha256,
+                        (SELECT COUNT(*)
+                           FROM jobs_communication_action_attempt_evidence evidence
+                          WHERE evidence.account_id = action.account_id
+                            AND evidence.action_id = action.id
+                            AND evidence.attempt_id = ?2
+                            AND evidence.event_kind = 'request_started')
+                   FROM jobs_communication_actions action
+                  WHERE action.account_id = 'acct-jobs' AND action.id = ?1",
+                params![action.id, lease.attempt_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(lease_token_sha256.is_none());
+        assert_eq!(evidence_count, 0);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn communication_audit_schema_rejects_cross_authority_rows() {
         let _flags = CommunicationFlagGuard::enabled();
         let pool = test_pool();
@@ -14300,19 +15381,11 @@ mod tests {
             .unwrap();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
-        let first = communication_test_action(
-            &application,
-            &mailbox,
-            &message,
-            "audit-authority-first",
-        );
+        let first =
+            communication_test_action(&application, &mailbox, &message, "audit-authority-first");
         let (first, _) = create_communication_action(&pool, "acct-jobs", &first).unwrap();
-        let second = communication_test_action(
-            &application,
-            &mailbox,
-            &message,
-            "audit-authority-second",
-        );
+        let second =
+            communication_test_action(&application, &mailbox, &message, "audit-authority-second");
         let (second, _) = create_communication_action(&pool, "acct-jobs", &second).unwrap();
         approve_communication_action(&pool, "acct-jobs", &first.id)
             .unwrap()
@@ -14557,11 +15630,7 @@ mod tests {
         let deletion_barrier = std::sync::Arc::clone(&barrier);
         let deletion = std::thread::spawn(move || {
             deletion_barrier.wait();
-            crate::db::account_data::begin_account_deletion(
-                &deletion_pool,
-                "acct-jobs",
-                now_ms(),
-            )
+            crate::db::account_data::begin_account_deletion(&deletion_pool, "acct-jobs", now_ms())
         });
         barrier.wait();
         let (lease, request_started) = claim.join().unwrap();
@@ -14783,12 +15852,8 @@ mod tests {
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
-        let action = communication_test_action(
-            &application,
-            &mailbox,
-            &message,
-            "review-snapshot-cas",
-        );
+        let action =
+            communication_test_action(&application, &mailbox, &message, "review-snapshot-cas");
         let (created, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
         assert!(super::approve_communication_action(
             &pool,
@@ -14841,12 +15906,8 @@ mod tests {
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
-        let action = communication_test_action(
-            &application,
-            &mailbox,
-            &message,
-            "revision-exhaustion",
-        );
+        let action =
+            communication_test_action(&application, &mailbox, &message, "revision-exhaustion");
         let (created, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
@@ -14966,10 +16027,10 @@ mod tests {
             .is_err());
 
         assert!(matches!(
-            crate::db::account_data::begin_account_deletion(&pool, "acct-jobs", now_ms())
-                .unwrap(),
-            Some(crate::db::account_data::BeginAccountDeletionResult::Ready(_))
-                | Some(crate::db::account_data::BeginAccountDeletionResult::WaitingForUploads(_))
+            crate::db::account_data::begin_account_deletion(&pool, "acct-jobs", now_ms()).unwrap(),
+            Some(crate::db::account_data::BeginAccountDeletionResult::Ready(
+                _
+            )) | Some(crate::db::account_data::BeginAccountDeletionResult::WaitingForUploads(_))
         ));
         pool.get()
             .unwrap()
@@ -15136,9 +16197,11 @@ mod tests {
                 params![stored.id, now_ms() + 60_000],
             )
             .unwrap();
-        assert!(claim_communication_action_reconciliation(&pool, "absence-reconciler")
-            .unwrap()
-            .is_none());
+        assert!(
+            claim_communication_action_reconciliation(&pool, "absence-reconciler")
+                .unwrap()
+                .is_none()
+        );
         pool.get()
             .unwrap()
             .execute(
@@ -15322,12 +16385,8 @@ mod tests {
         let pool = test_pool();
         let (application, mailbox, message) =
             communication_test_application_mailbox_and_message(&pool);
-        let action = communication_test_action(
-            &application,
-            &mailbox,
-            &message,
-            "cancel-deletion-fence",
-        );
+        let action =
+            communication_test_action(&application, &mailbox, &message, "cancel-deletion-fence");
         let (stored, _) = create_communication_action(&pool, "acct-jobs", &action).unwrap();
         pool.get()
             .unwrap()
@@ -15340,11 +16399,7 @@ mod tests {
             )
             .unwrap();
 
-        assert_account_deletion_fence(cancel_communication_action(
-            &pool,
-            "acct-jobs",
-            &stored.id,
-        ));
+        assert_account_deletion_fence(cancel_communication_action(&pool, "acct-jobs", &stored.id));
         assert_eq!(
             communication_action(&pool, "acct-jobs", &stored.id)
                 .unwrap()
@@ -16450,7 +17505,7 @@ mod tests {
         };
         assert!(replay.replayed);
         assert!(
-            !local_run_submit_authorized(&pool, &run_id, &ticket_hash, &proof, &capacity,).unwrap()
+            local_run_submit_authorized(&pool, &run_id, &ticket_hash, &proof, &capacity,).unwrap()
         );
 
         let session = list_browser_sessions(&pool, "acct-jobs")
@@ -16598,8 +17653,7 @@ mod tests {
     #[test]
     fn certified_cloud_production_path_is_single_submit_even_after_response_loss() {
         let pool = test_pool();
-        let fixture =
-            certified_cloud_execution_fixture(&pool, "certified-cloud-production");
+        let fixture = certified_cloud_execution_fixture(&pool, "certified-cloud-production");
         let runtime = &fixture.runtime_target;
         let phase_a: (
             String,
@@ -16647,8 +17701,7 @@ mod tests {
             )
         );
 
-        let capacity =
-            test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
+        let capacity = test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
         let started = start_irreversible_submission(
             &pool,
             "acct-jobs",
@@ -16774,8 +17827,7 @@ mod tests {
     fn certified_cloud_layout_drift_quarantines_before_any_submit_write() {
         let pool = test_pool();
         let fixture = certified_cloud_execution_fixture(&pool, "certified-cloud-drift");
-        let capacity =
-            test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
+        let capacity = test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
         let unknown_layout = proof_with_unknown_layout(fixture.proof);
         for _ in 0..2 {
             assert!(matches!(
@@ -16828,14 +17880,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             state,
-            (
-                "preflight".to_string(),
-                0,
-                "prepared".to_string(),
-                1,
-                1,
-                0,
-            )
+            ("preflight".to_string(), 0, "prepared".to_string(), 1, 1, 0,)
         );
     }
 
@@ -17859,6 +18904,122 @@ mod tests {
         assert_eq!(application_state, "running");
         assert_eq!(attempt_status, "reserved");
         assert_eq!(session_status, "running");
+    }
+
+    #[test]
+    fn local_unknown_replay_survives_durable_capacity_config_drift() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash) =
+            local_click_started_fixture(&pool, "unknown-config-drift");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let durable_expiry = now_ms().saturating_add(2 * 86_400_000);
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_submission_evidence_capacity SET expires_at_ms = ?3
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, run_id, durable_expiry],
+            )
+            .unwrap();
+
+        let drifted_capacity = |durable: crate::db::object_uploads::SubmissionEvidenceCapacity| {
+            NewSubmissionEvidenceCapacity {
+                account_id: durable.account_id,
+                application_id: durable.application_id,
+                run_id: durable.run_id,
+                runner: durable.runner,
+                reserved_bytes: durable.reserved_bytes,
+                reserved_objects: durable.reserved_objects,
+                expires_at_ms: durable.expires_at_ms,
+                now_ms: now_ms(),
+                limits: UploadLimits {
+                    max_object_bytes: 1,
+                    max_account_bytes: durable.reserved_bytes.saturating_sub(1),
+                    max_daily_bytes: 1,
+                    max_account_objects: durable.reserved_objects.saturating_sub(1),
+                },
+            }
+        };
+        let durable = crate::db::object_uploads::get_submission_evidence_capacity(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+        )
+        .unwrap()
+        .expect("durable click-started capacity");
+        let capacity = drifted_capacity(durable);
+        assert!(capacity.reserved_bytes > capacity.limits.max_account_bytes);
+        assert!(capacity.reserved_objects > capacity.limits.max_account_objects);
+        assert!(capacity.expires_at_ms > capacity.now_ms.saturating_add(86_400_000));
+
+        let session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run_id)
+            .unwrap();
+        let receipt = json!({
+            "status": "side_effect_unknown",
+            "issues": [{
+                "field": "submission",
+                "message": "The submit response was lost after the durable click boundary."
+            }]
+        });
+        let finalized = finalize_local_side_effect_unknown(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &capacity,
+            receipt.clone(),
+            &session,
+        )
+        .unwrap();
+        assert_eq!(finalized.state, "side_effect_unknown");
+
+        let durable = crate::db::object_uploads::get_submission_evidence_capacity(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+        )
+        .unwrap()
+        .expect("durable side-effect-unknown capacity");
+        let replay_capacity = drifted_capacity(durable);
+        let terminal_session = list_browser_sessions(&pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == run_id)
+            .unwrap();
+        let replayed = finalize_local_side_effect_unknown(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &run_id,
+            &ticket_hash,
+            &replay_capacity,
+            receipt,
+            &terminal_session,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(replayed).unwrap(),
+            serde_json::to_value(finalized).unwrap()
+        );
+        let (capacity_count, stored_expiry): (i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*), MAX(expires_at_ms)
+                   FROM jobs_submission_evidence_capacity
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1 AND run_id = ?2",
+                params![application.id, run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(capacity_count, 1);
+        assert_eq!(stored_expiry, durable_expiry);
     }
 
     #[test]
@@ -18997,13 +20158,9 @@ mod tests {
             "certified-answer-local-after-click",
         );
 
-        let error = resolve_intervention_answer_for_review(
-            &pool,
-            "acct-jobs",
-            &intervention.id,
-            "No",
-        )
-        .unwrap_err();
+        let error =
+            resolve_intervention_answer_for_review(&pool, "acct-jobs", &intervention.id, "No")
+                .unwrap_err();
         assert!(error.to_string().contains("awaiting reconciliation"));
 
         let consumed = certified_binding_state(&pool, &application.id, &run_id);
@@ -19309,13 +20466,9 @@ mod tests {
             "certified-answer-cloud-after-click",
         );
 
-        let error = resolve_intervention_answer_for_review(
-            &pool,
-            "acct-jobs",
-            &intervention.id,
-            "No",
-        )
-        .unwrap_err();
+        let error =
+            resolve_intervention_answer_for_review(&pool, "acct-jobs", &intervention.id, "No")
+                .unwrap_err();
         assert!(error.to_string().contains("awaiting reconciliation"));
 
         let consumed = certified_binding_state(&pool, &application.id, &run_id);
@@ -19739,6 +20892,653 @@ mod tests {
         assert_eq!(
             list_attempt_reservations(&pool, "acct-jobs").unwrap()[0].status,
             "running"
+        );
+    }
+
+    #[test]
+    fn application_queue_hold_blocks_even_active_reservation_replay_until_release() {
+        let pool = test_pool();
+        let (application, _, _) = execution_lease_fixture(&pool, "held-queue");
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::ApplicationQueue,
+            "held-queue-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        let error =
+            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<OperationalHoldError>(),
+            Some(OperationalHoldError::Held(_))
+        ));
+        let runner: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT runner FROM jobs_attempt_reservations
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![application.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runner, "unassigned");
+
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::ApplicationQueue,
+            "held-queue-2",
+            OperationalHoldTransition::Released,
+            1,
+            Some("held-queue-1"),
+        );
+        assert_eq!(
+            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local",)
+                .unwrap()
+                .runner,
+            "local"
+        );
+    }
+
+    #[test]
+    fn runner_claim_hold_creates_no_cloud_lease_until_release() {
+        let pool = test_pool();
+        let (application, run_id, browser_profile_id) =
+            execution_lease_fixture(&pool, "held-runner-claim");
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::RunnerClaim,
+            "held-runner-claim-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        assert!(matches!(
+            claim_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                "held-owner",
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM jobs_execution_leases", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::RunnerClaim,
+            "held-runner-claim-2",
+            OperationalHoldTransition::Released,
+            1,
+            Some("held-runner-claim-1"),
+        );
+        assert_eq!(
+            claim_execution_lease(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &browser_profile_id,
+                "held-owner",
+            )
+            .unwrap()
+            .phase,
+            "prepared"
+        );
+    }
+
+    #[test]
+    fn local_runner_hold_blocks_new_claim_and_exact_reissue_until_release() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, _) =
+            local_run_authority_fixture_unbound(&pool, "held-local-claim");
+        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&pool);
+        let nonce = "d".repeat(64);
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::RunnerClaim,
+            "held-local-claim-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &run_id,
+                &ticket_hash,
+                &nonce,
+                &descriptor,
+                "test-server",
+                |_, _| anyhow::bail!("held claim must not mint a response"),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::DistributionUnavailable
+        ));
+        let (ticket_status, replay_count): (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT ticket.status,
+                        (SELECT COUNT(*) FROM jobs_local_run_claim_replays replay
+                          WHERE replay.run_id = ticket.id)
+                   FROM jobs_local_run_tickets ticket WHERE ticket.id = ?1",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "queued");
+        assert_eq!(replay_count, 0);
+
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::RunnerClaim,
+            "held-local-claim-2",
+            OperationalHoldTransition::Released,
+            1,
+            Some("held-local-claim-1"),
+        );
+        let first = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |ticket, _| Ok(json!({ "runId": ticket.id })),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(first) = first else {
+            panic!("released local claim did not succeed")
+        };
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::RunnerClaim,
+            "held-local-claim-3",
+            OperationalHoldTransition::Held,
+            2,
+            Some("held-local-claim-2"),
+        );
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &pool,
+                &run_id,
+                &ticket_hash,
+                &nonce,
+                &descriptor,
+                "test-server",
+                |_, _| anyhow::bail!("held replay must not mint a fresh response"),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::DistributionUnavailable
+        ));
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::RunnerClaim,
+            "held-local-claim-4",
+            OperationalHoldTransition::Released,
+            3,
+            Some("held-local-claim-3"),
+        );
+        let replay = claim_local_run_with_browser_release(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            &nonce,
+            &descriptor,
+            "test-server",
+            |_, _| anyhow::bail!("exact replay must not mint a fresh response"),
+        )
+        .unwrap();
+        let BrowserLocalRunClaimDisposition::Success(replay) = replay else {
+            panic!("released exact local claim replay did not recover")
+        };
+        assert!(replay.replayed);
+        assert_eq!(replay.response_json, first.response_json);
+    }
+
+    #[test]
+    fn final_submit_hold_blocks_before_marker_but_not_exact_post_marker_replay() {
+        let pool = test_pool();
+        let fixture = certified_cloud_execution_fixture(&pool, "held-final-submit");
+        let capacity = test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::FinalSubmit,
+            "held-final-submit-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        assert!(matches!(
+            start_irreversible_submission(
+                &pool,
+                "acct-jobs",
+                &fixture.application.id,
+                &fixture.run_id,
+                &fixture.lease_token,
+                fixture.lease_fence,
+                &fixture.proof,
+                &capacity,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        let (phase, capacity_count): (String, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT lease.phase,
+                        (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                          WHERE capacity.account_id = lease.account_id
+                            AND capacity.application_id = lease.application_id
+                            AND capacity.run_id = lease.run_id)
+                   FROM jobs_execution_leases lease WHERE lease.run_id = ?1",
+                params![fixture.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(phase, "prepared");
+        assert_eq!(capacity_count, 0);
+
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::FinalSubmit,
+            "held-final-submit-2",
+            OperationalHoldTransition::Released,
+            1,
+            Some("held-final-submit-1"),
+        );
+        let first = start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.lease_token,
+            fixture.lease_fence,
+            &fixture.proof,
+            &capacity,
+        )
+        .unwrap();
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::FinalSubmit,
+            "held-final-submit-3",
+            OperationalHoldTransition::Held,
+            2,
+            Some("held-final-submit-2"),
+        );
+        let replay = start_irreversible_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.lease_token,
+            fixture.lease_fence,
+            &fixture.proof,
+            &capacity,
+        )
+        .unwrap();
+        assert_eq!(replay, first);
+    }
+
+    #[test]
+    fn local_final_submit_hold_blocks_new_marker_but_not_exact_click_started_replay() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, proof) =
+            certified_local_intervention_fixture(&pool, "held-local-submit");
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::FinalSubmit,
+            "held-local-submit-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        assert!(
+            !local_run_submit_authorized(&pool, &run_id, &ticket_hash, &proof, &capacity,).unwrap()
+        );
+        let ticket_status: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ticket_status, "claimed");
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::FinalSubmit,
+            "held-local-submit-2",
+            OperationalHoldTransition::Released,
+            1,
+            Some("held-local-submit-1"),
+        );
+        let first = local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .expect("released local pre-click authority");
+        assert!(first.ats_certified_receipt_authority.is_some());
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "click_started"
+        );
+        let stable_state = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT binding.phase, binding.fence, binding.phase_b_request_sha256,
+                        (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations
+                          WHERE binding_id = binding.binding_id),
+                        (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                          WHERE capacity.account_id = binding.account_id
+                            AND capacity.application_id = binding.application_id
+                            AND capacity.run_id = binding.run_id)
+                   FROM jobs_application_ats_certification_bindings binding
+                  WHERE binding.account_id = 'acct-jobs'
+                    AND binding.application_id = ?1 AND binding.run_id = ?2",
+                params![application.id, run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(stable_state.0, "consumed");
+        assert_eq!(stable_state.1, 1);
+        assert_eq!(stable_state.2.len(), 64);
+        assert_eq!((stable_state.3, stable_state.4), (1, 1));
+
+        append_account_operational_hold(
+            &pool,
+            OperationalCapability::FinalSubmit,
+            "held-local-submit-3",
+            OperationalHoldTransition::Held,
+            2,
+            Some("held-local-submit-2"),
+        );
+        let replay = local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .expect("held exact click-started replay");
+        assert_eq!(replay, first);
+
+        let replay_after_accepted_server_deploy = local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "alternate-test-server",
+            &proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .expect("accepted server deployment must not strand click-started recovery");
+        assert_eq!(replay_after_accepted_server_deploy, first);
+
+        let mut changed_proof = proof.clone();
+        changed_proof.adapter_version = "changed-adapter-version".to_string();
+        assert!(local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &changed_proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .is_none());
+
+        let mut changed_capacity = capacity.clone();
+        changed_capacity.reserved_bytes += 1;
+        assert!(local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &changed_capacity,
+            false,
+        )
+        .unwrap()
+        .is_none());
+        assert!(local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "changed-server-release",
+            &proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .is_none());
+
+        let after_replays = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT binding.phase, binding.fence, binding.phase_b_request_sha256,
+                        (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations
+                          WHERE binding_id = binding.binding_id),
+                        (SELECT COUNT(*) FROM jobs_submission_evidence_capacity capacity
+                          WHERE capacity.account_id = binding.account_id
+                            AND capacity.application_id = binding.application_id
+                            AND capacity.run_id = binding.run_id)
+                   FROM jobs_application_ats_certification_bindings binding
+                  WHERE binding.account_id = 'acct-jobs'
+                    AND binding.application_id = ?1 AND binding.run_id = ?2",
+                params![application.id, run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after_replays, stable_state);
+    }
+
+    #[test]
+    fn local_distribution_gate_blocks_new_submit_but_allows_exact_click_started_replay() {
+        let pool = test_pool();
+        let (application, run_id, ticket_hash, proof) =
+            certified_local_intervention_fixture(&pool, "disabled-local-submit");
+        let mut capacity = test_submission_evidence_capacity(&application.id, &run_id);
+        capacity.runner = "local".to_string();
+
+        assert!(!local_run_submit_authorized_for_distribution(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+        )
+        .unwrap());
+        assert_eq!(
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT status FROM jobs_local_run_tickets WHERE id = ?1",
+                    params![run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "claimed"
+        );
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            0
+        );
+
+        let first = local_run_submit_authorization_inner(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+            false,
+        )
+        .unwrap()
+        .expect("server-side pre-click authority");
+        let replay = local_run_submit_authorization_for_distribution(
+            &pool,
+            &run_id,
+            &ticket_hash,
+            "test-server",
+            &proof,
+            &capacity,
+        )
+        .unwrap()
+        .expect("distribution-disabled exact click-started replay");
+        assert_eq!(replay, first);
+        assert_eq!(
+            submission_capacity_count(&pool, &application.id, &run_id),
+            1
+        );
+    }
+
+    #[test]
+    fn mailbox_provider_hold_skips_held_candidate_without_starving_allowed_provider() {
+        let pool = test_pool();
+        set_entitlement_plan(&pool, "acct-jobs", "pro").unwrap();
+        let gmail = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "gmail".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "google-subject-held-mailbox",
+        )
+        .unwrap();
+        initialize_mailbox_sync_state(&pool, "acct-jobs", &gmail.id, "gmail").unwrap();
+        let outlook = save_mailbox_connection(
+            &pool,
+            "acct-jobs",
+            &MailboxConnection {
+                id: String::new(),
+                provider: "outlook".to_string(),
+                status: "connected".to_string(),
+                account_label: "jobs@example.com".to_string(),
+                aliases: Vec::new(),
+                capabilities: Vec::new(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+            "microsoft-subject-allowed-mailbox",
+        )
+        .unwrap();
+        initialize_mailbox_sync_state(&pool, "acct-jobs", &outlook.id, "outlook").unwrap();
+        let due_now = now_ms();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_provider_sync_state
+                    SET next_sync_at_ms = CASE connection_id
+                      WHEN ?1 THEN ?3 - 2 ELSE ?3 - 1 END
+                  WHERE account_id = 'acct-jobs' AND connection_id IN (?1, ?2)",
+                params![gmail.id, outlook.id, due_now],
+            )
+            .unwrap();
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::MailboxSync,
+            OperationalHoldScopeKind::MailboxProvider,
+            "gmail",
+            "held-mailbox-1",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+
+        assert!(
+            claim_mailbox_sync(&pool, "acct-jobs", &gmail.id, "direct-worker", 60_000,)
+                .unwrap()
+                .is_none()
+        );
+        let claimed = claim_due_mailbox_syncs(&pool, "batch-worker", 60_000, 1).unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].1.connection_id, outlook.id);
+
+        append_operational_hold_for_scope(
+            &pool,
+            OperationalCapability::MailboxSync,
+            OperationalHoldScopeKind::MailboxProvider,
+            "gmail",
+            "held-mailbox-2",
+            OperationalHoldTransition::Released,
+            1,
+            Some("held-mailbox-1"),
+        );
+        assert!(
+            claim_mailbox_sync(&pool, "acct-jobs", &gmail.id, "direct-worker", 60_000,)
+                .unwrap()
+                .is_some()
         );
     }
 }
