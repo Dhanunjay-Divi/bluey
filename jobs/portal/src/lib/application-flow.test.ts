@@ -13,26 +13,27 @@ import {
   effectiveSubmissionMode,
   interventionActionResumesApplication,
   interventionResolutionToast,
+  cloudAutomationEligibleApplications,
+  isCloudAutomationEligibleApplication,
   isFinalSubmissionReview,
-  runnerEligibleApplications,
 } from "./application-flow";
 
 const runners = (available: boolean): RunnerAvailability => ({
   local: {
+    status: "invited_beta",
+    available: false,
+    plan_included: false,
+    distribution_enabled: false,
+    reason: "Local execution is parked.",
+    next_action: "Use cloud automation or Review.",
+  },
+  cloud: {
     status: available ? "available" : "invited_beta",
     available,
     plan_included: true,
     distribution_enabled: available,
     reason: available ? "Available." : "Invited beta.",
-    next_action: available ? "Run locally." : "Review first.",
-  },
-  cloud: {
-    status: "upgrade_required",
-    available: false,
-    plan_included: false,
-    distribution_enabled: false,
-    reason: "Upgrade required.",
-    next_action: "View plans.",
+    next_action: available ? "Queue in the cloud." : "Review first.",
   },
   auto_submit_available: available,
   auto_submit_reason: available ? "Auto-submit is available." : "Auto-submit is still in invited beta.",
@@ -67,12 +68,12 @@ const NOW_MS = Date.now();
 const activeCertification = (): AtsCertificationSummary => ({
   provider_label: "Greenhouse",
   adapter_version: "2026.07.1-beta.1",
-  certified_runner_kinds: ["local"],
+  certified_runner_kinds: ["cloud"],
   status: "active",
   last_verified_at_ms: NOW_MS - 60_000,
   expires_at_ms: NOW_MS + 60 * 60_000,
   reason: "Server verification is current for this job and runner.",
-  next_action: "Review the application kit and choose Local Browser.",
+  next_action: "Review the application kit and choose cloud automation.",
   canary_available: true,
 });
 
@@ -111,21 +112,44 @@ const job = (canAutoSubmit: boolean, summary: unknown = activeCertification()): 
 });
 
 describe("application workflow boundaries", () => {
-  it("never exposes awaiting-review packets to a browser runner", () => {
-    expect(runnerEligibleApplications([
+  it("queues only cloud-authorized applications with no active run", () => {
+    const applications = [
       application("awaiting_review"),
       application("queued"),
       application("needs_input"),
-    ]).map((item) => item.state)).toEqual(["queued"]);
+    ];
+    const workspace = automationWorkspace(applications);
+
+    expect(cloudAutomationEligibleApplications(workspace).map((item) => item.state))
+      .toEqual(["queued"]);
+    expect(isCloudAutomationEligibleApplication(workspace, applications[1])).toBe(true);
+
+    expect(cloudAutomationEligibleApplications({
+      ...workspace,
+      runner_availability: runners(false),
+    })).toEqual([]);
+    expect(cloudAutomationEligibleApplications({
+      ...workspace,
+      browser_sessions: [browserSession],
+    })).toEqual([]);
+    expect(cloudAutomationEligibleApplications({
+      ...workspace,
+      matches: [job(true, { ...activeCertification(), certified_runner_kinds: ["local"] })],
+    })).toEqual([]);
   });
 
   it("downgrades Auto-submit unless both the job and a runner are authorized", () => {
     const missingSummary = job(true);
     delete missingSummary.eligibility?.ats_certification;
-    const cloudOnly = {
-      ...runners(true),
-      local: { ...runners(true).local, available: false },
-      cloud: { ...runners(true).cloud, available: true },
+    const localOnly = {
+      ...runners(false),
+      local: {
+        ...runners(false).local,
+        status: "available" as const,
+        available: true,
+        distribution_enabled: true,
+      },
+      auto_submit_available: true,
     };
 
     expect(effectiveSubmissionMode(job(false), "auto_submit", runners(true), true)).toBe("review_first");
@@ -134,7 +158,7 @@ describe("application workflow boundaries", () => {
     expect(effectiveSubmissionMode(job(true), "auto_submit", runners(true), true)).toBe("auto_submit");
     expect(effectiveSubmissionMode(missingSummary, "auto_submit", runners(true), true))
       .toBe("review_first");
-    expect(effectiveSubmissionMode(job(true), "auto_submit", cloudOnly, true))
+    expect(effectiveSubmissionMode(job(true), "auto_submit", localOnly, true))
       .toBe("review_first");
   });
 
@@ -172,11 +196,18 @@ describe("application workflow boundaries", () => {
 
   it("recognizes only the structured, open final-review intervention", () => {
     const intervention = finalReviewIntervention();
-    expect(isFinalSubmissionReview(intervention)).toBe(true);
-    expect(isFinalSubmissionReview({ ...intervention, status: "resolved" })).toBe(false);
-    expect(isFinalSubmissionReview({ ...intervention, kind: "captcha" })).toBe(false);
-    expect(isFinalSubmissionReview({ ...intervention, resolution_kind: "email_otp_approval" })).toBe(false);
-    expect(isFinalSubmissionReview({ ...intervention, choices: ["Continue"] })).toBe(false);
+    const takeoverUrl = "https://jobs-browser.bluey.sh/sessions/browser-1";
+    expect(isFinalSubmissionReview(intervention, takeoverUrl)).toBe(true);
+    expect(isFinalSubmissionReview(intervention)).toBe(false);
+    expect(isFinalSubmissionReview(intervention, `${takeoverUrl}-other`)).toBe(false);
+    expect(isFinalSubmissionReview({ ...intervention, status: "resolved" }, takeoverUrl)).toBe(false);
+    expect(isFinalSubmissionReview({ ...intervention, kind: "captcha" }, takeoverUrl)).toBe(false);
+    expect(isFinalSubmissionReview(
+      { ...intervention, resolution_kind: "email_otp_approval" },
+      takeoverUrl,
+    )).toBe(false);
+    expect(isFinalSubmissionReview({ ...intervention, choices: ["Continue"] }, takeoverUrl))
+      .toBe(false);
     expect(isFinalSubmissionReview({
       ...intervention,
       title: "Review this application",
@@ -189,13 +220,24 @@ describe("application workflow boundaries", () => {
           },
         },
       },
-    })).toBe(false);
+    }, takeoverUrl)).toBe(false);
     expect(isFinalSubmissionReview({
       ...intervention,
       metadata: { receipt: { ...(intervention.metadata.receipt as object), issues: [{ severity: "blocking" }] } },
-    })).toBe(false);
+    }, takeoverUrl)).toBe(false);
   });
 });
+
+function automationWorkspace(applications: JobApplication[]): Parameters<
+  typeof cloudAutomationEligibleApplications
+>[0] {
+  return {
+    applications,
+    browser_sessions: [],
+    matches: [job(true)],
+    runner_availability: runners(true),
+  };
+}
 
 function finalReviewIntervention(): Intervention {
   const title = "Review the Greenhouse application";

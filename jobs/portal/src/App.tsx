@@ -35,10 +35,12 @@ import { Onboarding } from "./components/Onboarding";
 import { LoadError, LoadingScreen } from "./components/PageState";
 import { previewPosting, previewResume } from "./lib/preview-application";
 import { runnerAvailabilityOrLocked } from "./lib/runner-access";
+import { automationRoute, portalPreviewState } from "./lib/portal-navigation";
 import { portalEligibilityDecision } from "./lib/ats-certification";
 import {
   applicationAfterInterventionResolution,
   browserSessionAfterInterventionResolution,
+  isCloudAutomationEligibleApplication,
   interventionActionResumesApplication,
   interventionResolutionToast,
 } from "./lib/application-flow";
@@ -47,15 +49,15 @@ import { validateMailboxOAuthAuthorizationUrl } from "./lib/mailbox-oauth";
 const MatchesView = lazy(() => import("./views/MatchesView").then((module) => ({ default: module.MatchesView })));
 const ApplicationsView = lazy(() => import("./views/ApplicationsView").then((module) => ({ default: module.ApplicationsView })));
 const ResumeView = lazy(() => import("./views/ResumeView").then((module) => ({ default: module.ResumeView })));
-const BrowserView = lazy(() => import("./views/BrowserView").then((module) => ({ default: module.BrowserView })));
+const AutomationView = lazy(() => import("./views/AutomationView").then((module) => ({
+  default: module.AutomationView,
+})));
 const SettingsView = lazy(() => import("./views/SettingsView").then((module) => ({ default: module.SettingsView })));
 
-const pageQuery = new URLSearchParams(window.location.search);
-const isPreview = pageQuery.get("preview") === "1";
-const previewScenario = pageQuery.get("scenario") || "";
-const previewSearch = isPreview
-  ? `?${new URLSearchParams({ preview: "1", ...(previewScenario ? { scenario: previewScenario } : {}) })}`
-  : "";
+const previewState = portalPreviewState(window.location.search);
+const isPreview = previewState.enabled;
+const previewScenario = previewState.scenario;
+const previewSearch = previewState.search;
 const initialPreviewWorkspace = previewWorkspaceForScenario(previewWorkspace, previewScenario);
 
 type ResumeUploadRequestId = ReturnType<Crypto["randomUUID"]>;
@@ -831,20 +833,25 @@ export default function App() {
     return saved;
   }, []);
 
-  const queueRun = useCallback(async (application: JobApplication, runner: "local" | "cloud") => {
+  const queueCloudRun = useCallback(async (application: JobApplication) => {
     if (!workspace) return;
     const job = workspace.matches.find((item) => item.id === application.job_id);
     if (!job) throw new Error("That job is no longer available.");
     if (application.state !== "queued") {
-      throw new Error("Approve this application before choosing a browser runner.");
+      throw new Error("Approve this application before starting cloud automation.");
+    }
+    if (!isCloudAutomationEligibleApplication(workspace, application)) {
+      throw new Error(
+        "This application is not currently eligible for a new cloud automation run.",
+      );
     }
     let updatedApplication = application;
     let session: BrowserSession = {
       id: "",
-      runner,
+      runner: "cloud",
       status: "queued",
       current_company: job.company,
-      current_step: "Waiting to start",
+      current_step: "Waiting for cloud automation",
       application_id: application.id,
       created_at_ms: 0,
       updated_at_ms: 0,
@@ -854,45 +861,17 @@ export default function App() {
       updatedApplication = { ...application, state: "queued", updated_at_ms: now };
       session = { ...session, id: `run-${now}`, created_at_ms: now, updated_at_ms: now };
     } else {
-      const queued = await jobsApi.queueApplicationRun(application.id, runner);
+      const queued = await jobsApi.queueApplicationRun(application.id, "cloud");
       updatedApplication = queued.application;
       session = queued.browser_session;
-      if (runner === "local" && queued.launch_url) window.location.assign(queued.launch_url);
     }
     setWorkspace((current) => current ? {
       ...current,
       applications: current.applications.map((item) => item.id === application.id ? updatedApplication : item),
       browser_sessions: [session, ...current.browser_sessions.filter((item) => item.id !== session.id)],
     } : current);
-    setToast(runner === "local"
-      ? `${job.company} is opening in Bluey Browser.`
-      : `${job.company} is queued for the cloud runner.`);
+    setToast(`${job.company} is queued for cloud automation.`);
   }, [workspace]);
-
-  const queueCloudRun = useCallback(
-    (application: JobApplication) => queueRun(application, "cloud"),
-    [queueRun],
-  );
-
-  const queueLocalRun = useCallback(
-    (application: JobApplication) => queueRun(application, "local"),
-    [queueRun],
-  );
-
-  const updateBrowserSession = useCallback(async (session: BrowserSession, status: string) => {
-    const next: BrowserSession = {
-      ...session,
-      status,
-      current_step: status === "paused" ? "Paused by you" : session.current_step,
-      updated_at_ms: Date.now(),
-    };
-    const saved = isPreview ? next : await jobsApi.saveBrowserSession(next);
-    setWorkspace((current) => current ? {
-      ...current,
-      browser_sessions: current.browser_sessions.map((item) => item.id === saved.id ? saved : item),
-    } : current);
-    setToast(status === "paused" ? "Browser run paused." : "Browser run updated.");
-  }, []);
 
   const resolveIntervention = useCallback(async (
     intervention: Intervention,
@@ -993,6 +972,7 @@ export default function App() {
           element={
             <ApplicationsView
               workspace={workspace}
+              previewSearch={previewSearch}
               resumeVersions={resumeVersions}
               onUpdate={updateApplication}
               onReconcileSubmission={reconcileSubmissionNotSubmitted}
@@ -1018,16 +998,19 @@ export default function App() {
           }
         />
         <Route
-          path="browser"
+          path="automation"
           element={
-            <BrowserView
+            <AutomationView
               workspace={workspace}
-              onQueueLocal={queueLocalRun}
+              previewSearch={previewSearch}
               onQueueCloud={queueCloudRun}
-              onUpdateSession={updateBrowserSession}
               onResolveIntervention={resolveIntervention}
             />
           }
+        />
+        <Route
+          path="browser"
+          element={<Navigate to={automationRoute(previewSearch)} replace />}
         />
         <Route
           path="settings"

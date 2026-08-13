@@ -33,7 +33,7 @@ const navItems = [
   { to: "/matches", label: "Matches", icon: LayoutDashboard },
   { to: "/applications", label: "Applications", icon: BriefcaseBusiness },
   { to: "/resume", label: "Resume", icon: FileText },
-  { to: "/browser", label: "Browser", icon: PanelsTopLeft },
+  { to: "/automation", label: "Automation", icon: PanelsTopLeft },
   { to: "/settings", label: "Settings", icon: Settings },
 ];
 

@@ -34,12 +34,12 @@ function certificationSummary(
   return {
     provider_label: certified ? "Greenhouse" : "Application system",
     adapter_version: certified ? "2026.07.1-beta.1" : null,
-    certified_runner_kinds: certified ? ["local"] : [],
+    certified_runner_kinds: certified ? ["cloud"] : [],
     status: certified ? "active" : "review_only",
     last_verified_at_ms: certified ? Date.now() - 60_000 : null,
     expires_at_ms: certified ? Date.now() + 60 * 60_000 : null,
     reason: certified
-      ? "The current job and Local Browser runner passed server verification."
+      ? "The current job and cloud runner passed server verification."
       : "Review first is required for this application system.",
     next_action: certified
       ? "Review the application kit and choose an available runner."
@@ -103,25 +103,25 @@ function match(canPrepare: boolean, capability: NonNullable<JobPosting["eligibil
 
 const runners = (available: boolean): RunnerAvailability => ({
   local: {
+    status: "invited_beta",
+    available: false,
+    plan_included: false,
+    distribution_enabled: false,
+    reason: "Local execution is parked.",
+    next_action: "Use cloud automation or Review.",
+  },
+  cloud: {
     status: available ? "available" : "invited_beta",
     available,
     plan_included: true,
     distribution_enabled: available,
-    reason: available ? "Available." : "Bluey Browser is still in invited beta.",
-    next_action: available ? "Run locally." : "Use Review first.",
-  },
-  cloud: {
-    status: "upgrade_required",
-    available: false,
-    plan_included: false,
-    distribution_enabled: false,
-    reason: "Cloud plan required.",
-    next_action: "View plans.",
+    reason: available ? "Available." : "Cloud automation is still in invited beta.",
+    next_action: available ? "Queue in the cloud." : "Use Review first.",
   },
   auto_submit_available: available,
   auto_submit_reason: available
     ? "Auto-submit is available."
-    : "Auto-submit is not available in this release because your included runner is still in invited beta.",
+    : "Cloud automation is still in invited beta.",
 });
 
 const authorization = (status: AutoSubmitAuthorization["status"] = "active"): AutoSubmitAuthorization => ({
@@ -311,18 +311,42 @@ describe("Career Track filtering and submission truth", () => {
     );
   });
 
-  it("does not widen Local Browser certification to an available cloud runner", () => {
-    const cloudOnly = {
-      ...runners(true),
-      local: { ...runners(true).local, available: false },
-      cloud: { ...runners(true).cloud, available: true },
+  it("does not expose a local-only certification through cloud automation", () => {
+    const localCertified = match(true, "certified");
+    if (localCertified.eligibility?.ats_certification) {
+      localCertified.eligibility.ats_certification = {
+        ...localCertified.eligibility.ats_certification,
+        certified_runner_kinds: ["local"],
+        reason: "The current job and local runner passed server verification.",
+        next_action: "Review the application kit before continuing.",
+      };
+    }
+
+    expect(canAutoSubmit(localCertified, runners(true), [authorization()])).toBe(false);
+    expect(autoSubmitUnavailableReason(
+      localCertified,
+      runners(true),
+      [authorization()],
+    )).toContain("cloud automation");
+  });
+
+  it("does not treat a parked local runner as web automation availability", () => {
+    const localOnly = {
+      ...runners(false),
+      local: {
+        ...runners(false).local,
+        status: "available" as const,
+        available: true,
+        distribution_enabled: true,
+      },
+      auto_submit_available: true,
     };
 
-    expect(canAutoSubmit(match(true, "certified"), cloudOnly, [authorization()])).toBe(false);
+    expect(canAutoSubmit(match(true, "certified"), localOnly, [authorization()])).toBe(false);
     expect(autoSubmitUnavailableReason(
       match(true, "certified"),
-      cloudOnly,
+      localOnly,
       [authorization()],
-    )).toContain("certification scope");
+    )).toContain("invited beta");
   });
 });

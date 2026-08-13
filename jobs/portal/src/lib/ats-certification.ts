@@ -77,6 +77,7 @@ const FUTURE_CLOCK_SKEW_MS = 5 * 60 * 1_000;
 export interface AtsCertificationPresentation {
   server_authored: boolean;
   capability: SubmissionCapability;
+  can_queue_cloud: boolean;
   provider_label: string;
   adapter_version: string;
   certified_runner_kinds: AtsCertifiedRunnerKind[];
@@ -167,20 +168,24 @@ export function portalEligibilityDecision(
     return {
       ...decision,
       can_auto_submit: false,
+      // The server still carries a local-runner field for parked native clients.
+      // Never surface that authority through the web-only launch experience.
+      can_queue_local: false,
       ats_certification: summary,
     };
   }
 
   if (!currentActive || !summary) return reviewOnlyDecision(decision, summary);
 
-  const canQueueLocal = decision.can_queue_local
-    && summary.certified_runner_kinds.includes("local");
   const canQueueCloud = decision.can_queue_cloud
     && summary.certified_runner_kinds.includes("cloud");
   return {
     ...decision,
-    can_auto_submit: decision.can_auto_submit && (canQueueLocal || canQueueCloud),
-    can_queue_local: canQueueLocal,
+    can_auto_submit: decision.can_auto_submit && canQueueCloud,
+    // Local Browser distribution is parked for the web launch. Preserve the
+    // server response type, but never project local queue authority into the
+    // customer portal.
+    can_queue_local: false,
     can_queue_cloud: canQueueCloud,
     ats_certification: summary,
   };
@@ -206,6 +211,7 @@ export function atsCertificationPresentation(
   return {
     server_authored: true,
     capability: safeDecision.capability,
+    can_queue_cloud: safeDecision.can_queue_cloud,
     provider_label: summary.provider_label,
     adapter_version: summary.adapter_version || "Not verified",
     certified_runner_kinds: [...summary.certified_runner_kinds],
@@ -319,6 +325,7 @@ function fallbackPresentation(): AtsCertificationPresentation {
   return {
     server_authored: false,
     capability: "unknown_review",
+    can_queue_cloud: false,
     provider_label: "Application system",
     adapter_version: "Not verified",
     certified_runner_kinds: [],

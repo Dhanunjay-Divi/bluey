@@ -73,6 +73,7 @@ import { safeDownloadFileName, saveDownloadedBlob } from "../lib/download";
 
 interface Props {
   workspace: JobsWorkspace;
+  previewSearch: string;
   resumeVersions: Record<string, ResumeVersion>;
   onUpdate(application: JobApplication, state: string): Promise<void>;
   onReconcileSubmission(application: JobApplication): Promise<void>;
@@ -94,6 +95,7 @@ const stateGroups = [
 
 export function ApplicationsView({
   workspace,
+  previewSearch,
   resumeVersions,
   onUpdate,
   onReconcileSubmission,
@@ -602,7 +604,7 @@ export function ApplicationsView({
   return (
     <div className="view-shell applications-view">
       <section className="view-heading">
-        <div><p className="eyebrow">APPLICATION CONTROL</p><h1>Applications</h1><span>Every tailored application, browser run, intervention, and receipt in one timeline.</span></div>
+        <div><p className="eyebrow">APPLICATION CONTROL</p><h1>Applications</h1><span>Every tailored application, cloud automation run, intervention, and receipt in one timeline.</span></div>
         <div className="heading-stat"><b>{workspace.applications.filter((item) => item.state === "submitted").length}</b><span>submitted this month</span></div>
       </section>
 
@@ -768,7 +770,7 @@ export function ApplicationsView({
                       </div>
                       <button className="button primary compact" disabled={busy || !answer.trim()} onClick={() => void submitInterventionAnswer()}>{answerInterventionActionLabel(busy)}<ArrowRight size={15} /></button>
                     </div>
-                  : selected.state === "needs_input" && <div className="input-needed"><AlertCircle size={17} /><div><b>Bluey needs you</b><p>{selectedIntervention?.detail || "Open the browser takeover to continue."}</p></div></div>}
+                  : selected.state === "needs_input" && <div className="input-needed"><AlertCircle size={17} /><div><b>Bluey needs you</b><p>{selectedIntervention?.detail || "Open the secure takeover to continue."}</p></div></div>}
                 {selected.state === "awaiting_review" && !selectedRunnerAvailable && (
                   <div className="input-needed" role="status">
                     <AlertCircle size={17} />
@@ -781,7 +783,101 @@ export function ApplicationsView({
                 <div className="download-row"><button disabled={busy || !selectedResume} onClick={() => void download("pdf")}><Download size={15} />PDF</button><button disabled={busy || !selectedResume} onClick={() => void download("docx")}><Download size={15} />DOCX</button></div>
               </section>
             </div>
-            <div className="dialog-actions spread"><p>{selected.state === "submitted" ? "Receipt locked to this exact resume and answer set." : selected.state === "side_effect_unknown" ? "Automatic retry is disabled until the employer-facing outcome is reconciled." : selected.state === "awaiting_review" && !selectedRunnerAvailable ? "Your tailored kit is ready. Download it or continue on the original job site." : "Approving counts this tailored application once. Retries do not double-charge."}</p><div><button className="button secondary" onClick={() => openFeedback(selected, "issue")}><TriangleAlert size={16} />Report problem</button>{selected.state === "side_effect_unknown" && <button className="button danger subtle" disabled={busy} onClick={() => setReconciliationTarget(selected)}><AlertCircle size={16} />I checked: not submitted</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => openFeedback(selected, "outcome")}><CalendarDays size={16} />Update outcome</button>}{selected.state === "needs_input" && !canAnswerIntervention && selectedSession?.takeover_url && <a className="button secondary" href={selectedSession.takeover_url}><MonitorUp size={16} />Take over browser</a>}{selected.state === "needs_input" && !canAnswerIntervention && !selectedSession?.takeover_url && <button className="button secondary" disabled title="A scoped resume link is not available for this run"><MonitorUp size={16} />Takeover unavailable</button>}{selected.state === "awaiting_review" && selectedRunnerAvailable && <button className="button primary" disabled={busy} onClick={() => void update("queued")}><Play size={16} />Approve application</button>}{selected.state === "awaiting_review" && !selectedRunnerAvailable && selectedCanHandoff && <button className="button primary" disabled={busy} onClick={() => void openHandoff()}><Send size={16} />Open job site</button>}{selected.state === "queued" && <a className="button primary" href="/jobs/browser"><Send size={16} />Choose runner</a>}{selected.state === "submitted" && selectedJob && selectedResume && <button className="button primary" onClick={() => { setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume }); setSelected(null); }}><Sparkles size={16} />Prepare interview</button>}{selected.state === "submitted" && <button className="button secondary" onClick={() => setReceiptOpen(true)}><CheckCircle2 size={16} />View receipt</button>}</div></div>
+            <div className="dialog-actions spread">
+              <p>
+                {selected.state === "submitted"
+                  ? "Receipt locked to this exact resume and answer set."
+                  : selected.state === "side_effect_unknown"
+                    ? "Automatic retry is disabled until the employer-facing outcome is reconciled."
+                    : selected.state === "awaiting_review" && !selectedRunnerAvailable
+                      ? "Your tailored kit is ready. Download it or continue on the original job site."
+                      : "Approving counts this tailored application once. Retries do not double-charge."}
+              </p>
+              <div>
+                <button className="button secondary" onClick={() => openFeedback(selected, "issue")}>
+                  <TriangleAlert size={16} />Report problem
+                </button>
+                {selected.state === "side_effect_unknown" && (
+                  <button
+                    className="button danger subtle"
+                    disabled={busy}
+                    onClick={() => setReconciliationTarget(selected)}
+                  >
+                    <AlertCircle size={16} />I checked: not submitted
+                  </button>
+                )}
+                {selected.state === "submitted" && (
+                  <button className="button secondary" onClick={() => openFeedback(selected, "outcome")}>
+                    <CalendarDays size={16} />Update outcome
+                  </button>
+                )}
+                {selected.state === "needs_input" && !canAnswerIntervention
+                  && selectedSession?.takeover_url && (
+                  <a className="button secondary" href={selectedSession.takeover_url}>
+                    <MonitorUp size={16} />Open secure takeover
+                  </a>
+                )}
+                {selected.state === "needs_input" && !canAnswerIntervention
+                  && !selectedSession?.takeover_url && (
+                  <button
+                    className="button secondary"
+                    disabled
+                    title="A secure takeover link is not available for this run"
+                  >
+                    <MonitorUp size={16} />Takeover unavailable
+                  </button>
+                )}
+                {selected.state === "awaiting_review" && selectedRunnerAvailable && (
+                  <button
+                    className="button primary"
+                    disabled={busy}
+                    onClick={() => void update("queued")}
+                  >
+                    <Play size={16} />Approve application
+                  </button>
+                )}
+                {selected.state === "awaiting_review" && !selectedRunnerAvailable
+                  && selectedCanHandoff && (
+                  <button
+                    className="button primary"
+                    disabled={busy}
+                    onClick={() => void openHandoff()}
+                  >
+                    <Send size={16} />Open job site
+                  </button>
+                )}
+                {selected.state === "queued" && selectedRunnerAvailable && (
+                  <a className="button primary" href={`/jobs/automation${previewSearch}`}>
+                    <Send size={16} />View automation
+                  </a>
+                )}
+                {selected.state === "queued" && !selectedRunnerAvailable && selectedCanHandoff && (
+                  <button
+                    className="button primary"
+                    disabled={busy}
+                    onClick={() => void openHandoff()}
+                  >
+                    <Send size={16} />Open job site
+                  </button>
+                )}
+                {selected.state === "submitted" && selectedJob && selectedResume && (
+                  <button
+                    className="button primary"
+                    onClick={() => {
+                      setPrepTarget({ application: selected, job: selectedJob, resume: selectedResume });
+                      setSelected(null);
+                    }}
+                  >
+                    <Sparkles size={16} />Prepare interview
+                  </button>
+                )}
+                {selected.state === "submitted" && (
+                  <button className="button secondary" onClick={() => setReceiptOpen(true)}>
+                    <CheckCircle2 size={16} />View receipt
+                  </button>
+                )}
+              </div>
+            </div>
           </div>
         )}
       </Dialog>
@@ -1277,8 +1373,7 @@ export function hasAvailableRunner(
   runners: RunnerAvailability,
 ): boolean {
   const safeEligibility = portalEligibilityDecision(eligibility, true);
-  return (safeEligibility.can_queue_local && runners.local.available)
-    || (safeEligibility.can_queue_cloud && runners.cloud.available);
+  return safeEligibility.can_queue_cloud && runners.cloud.available;
 }
 
 export function runnerUnavailableReason(
@@ -1297,16 +1392,16 @@ export function runnerUnavailableReason(
   }
   if (safeEligibility.capability === "unknown_review") {
     return safeEligibility.review_reasons[0]?.message
-      || "This application system is not certified for a Bluey runner. Review the kit and continue on the job site.";
+      || "This application system is not certified for cloud automation. Review the kit and continue on the job site.";
   }
   if (safeEligibility.capability === "blocked") {
-    return "This listing cannot use a Bluey runner.";
+    return "This listing cannot use Bluey automation.";
   }
-  if (!safeEligibility.can_queue_local && !safeEligibility.can_queue_cloud) {
+  if (!safeEligibility.can_queue_cloud) {
     return safeEligibility.review_reasons[0]?.message
-      || "This application must stay in review until the current eligibility checks pass.";
+      || "Cloud automation is not certified for this application. Review the kit and continue on the original job site.";
   }
-  return runners.auto_submit_reason;
+  return runners.cloud.reason || runners.cloud.next_action;
 }
 
 function capabilityLabel(capability: JobEligibilityDecision["capability"]): string {

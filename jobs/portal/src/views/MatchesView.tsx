@@ -599,8 +599,7 @@ export function canAutoSubmit(
   authorizations: AutoSubmitAuthorization[],
 ): boolean {
   const eligibility = jobEligibility(job);
-  const certifiedRunnerAvailable = (eligibility.can_queue_local && runners.local.available)
-    || (eligibility.can_queue_cloud && runners.cloud.available);
+  const certifiedRunnerAvailable = eligibility.can_queue_cloud && runners.cloud.available;
   return eligibility.can_auto_submit
     && certifiedRunnerAvailable
     && runners.auto_submit_available
@@ -622,6 +621,9 @@ export function autoSubmitUnavailableReason(
     )?.message || "Review first is required because this application system is not certified.";
   }
   if (eligibility.capability === "blocked") return "This listing cannot use a Bluey runner.";
+  if (!eligibility.can_queue_cloud) {
+    return "This application system is not currently certified for cloud automation.";
+  }
   if (!eligibility.can_auto_submit) return "Auto-submit is available only after every server rule and application-system check passes.";
   const authorization = authorizations.find(
     (item) => item.career_track_id === job.track_id,
@@ -632,13 +634,10 @@ export function autoSubmitUnavailableReason(
   if (!authorization || authorization.status !== "active") {
     return "Enable Auto-submit for this Career Track in Settings first.";
   }
-  if (runners && !runners.auto_submit_available) return runners.auto_submit_reason;
-  const certifiedRunnerAvailable = runners
-    && ((eligibility.can_queue_local && runners.local.available)
-      || (eligibility.can_queue_cloud && runners.cloud.available));
-  if (runners && !certifiedRunnerAvailable) {
-    return "No currently available runner is included in this job's certification scope.";
+  if (runners && !runners.cloud.available) {
+    return runners.cloud.reason || runners.cloud.next_action;
   }
+  if (runners && !runners.auto_submit_available) return runners.auto_submit_reason;
   if (eligibility.can_auto_submit) return undefined;
   return "Auto-submit is available only after every server rule and application-system check passes.";
 }

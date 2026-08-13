@@ -123,6 +123,14 @@ under `docs/release/`.
 
 ### Changed
 
+- Made `/jobs/automation` the canonical Bluey Jobs execution surface and the
+  managed cloud Background runner the sole customer queue choice. The launch
+  portal no longer asks customers to install, download, select, or open a
+  separate local Bluey Browser; legacy `/jobs/browser` links redirect to the
+  Automation view, while active managed browser sessions, interventions,
+  takeover, and final form review remain available. Cloud execution is still
+  plan- and distribution-gated, every production flag remains unchanged, and
+  the unmerged Phase 607 local updater work stays parked for possible P2 demand.
 - Preserved three remaining Codex-owned local branch tips on named remote archive
   branches and documented why their older discovery, spend-accounting, and
   optional-provider patches must not be bulk-merged over current main.
@@ -144,6 +152,11 @@ under `docs/release/`.
 
 ### Fixed
 
+- Made Jobs provider write-grant upgrades advance their credential-refresh CAS
+  timestamp even when both mutations occur in the same clock tick. A stale
+  token refresh now deterministically loses authority instead of reaching a
+  later mailbox-shape check, eliminating the hosted CI race without weakening
+  the grant digest or transaction fence.
 - Updated the Jobs and observability CI gates for hosted Rust 1.97 without
   changing runtime behavior: optional final-submit filename parsing now follows
   the current Clippy contract, while target-dependent Unix `libc` conversions
