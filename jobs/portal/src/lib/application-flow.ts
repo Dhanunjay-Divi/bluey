@@ -3,13 +3,45 @@ import type {
   Intervention,
   JobApplication,
   JobPosting,
+  JobsWorkspace,
   RunnerAvailability,
   SubmissionMode,
 } from "../types";
 import { portalEligibilityDecision } from "./ats-certification";
 
-export function runnerEligibleApplications(applications: JobApplication[]): JobApplication[] {
-  return applications.filter((application) => application.state === "queued");
+export function cloudAutomationEligibleApplications(workspace: Pick<
+  JobsWorkspace,
+  "applications" | "browser_sessions" | "matches" | "runner_availability"
+>): JobApplication[] {
+  return workspace.applications.filter(
+    (application) => isCloudAutomationEligibleApplication(workspace, application),
+  );
+}
+
+export function isCloudAutomationEligibleApplication(
+  workspace: Pick<
+    JobsWorkspace,
+    "browser_sessions" | "matches" | "runner_availability"
+  >,
+  application: JobApplication,
+): boolean {
+  if (application.state !== "queued" || !workspace.runner_availability.cloud.available) {
+    return false;
+  }
+  if (workspace.browser_sessions.some(
+    (session) => session.application_id === application.id
+      && !["complete", "failed"].includes(session.status),
+  )) {
+    return false;
+  }
+  const job = workspace.matches.find((item) => item.id === application.job_id);
+  const storedEligibility = application.receipt.eligibility;
+  const eligibility = portalEligibilityDecision(
+    storedEligibility && typeof storedEligibility === "object"
+      ? storedEligibility
+      : job?.eligibility,
+  );
+  return eligibility.can_queue_cloud;
 }
 
 export function interventionActionResumesApplication(action: string): boolean {
@@ -72,8 +104,7 @@ export function effectiveSubmissionMode(
   trackAuthorized: boolean,
 ): SubmissionMode {
   const eligibility = portalEligibilityDecision(job.eligibility);
-  const certifiedRunnerAvailable = (eligibility.can_queue_local && runners.local.available)
-    || (eligibility.can_queue_cloud && runners.cloud.available);
+  const certifiedRunnerAvailable = eligibility.can_queue_cloud && runners.cloud.available;
   return requested === "auto_submit"
     && eligibility.can_auto_submit
     && certifiedRunnerAvailable
@@ -83,7 +114,10 @@ export function effectiveSubmissionMode(
     : "review_first";
 }
 
-export function isFinalSubmissionReview(intervention: Intervention | undefined): boolean {
+export function isFinalSubmissionReview(
+  intervention: Intervention | undefined,
+  activeTakeoverUrl?: string,
+): boolean {
   if (!intervention
     || intervention.status !== "open"
     || intervention.kind !== "browser_takeover"
@@ -106,7 +140,7 @@ export function isFinalSubmissionReview(intervention: Intervention | undefined):
     && receipt.issues.length === 0
     && source.kind === "browser_takeover"
     && typeof source.takeoverUrl === "string"
-    && source.takeoverUrl.length > 0
+    && source.takeoverUrl === activeTakeoverUrl
     && source.title === intervention.title
     && source.detail === intervention.detail
     && resolution.kind === "browser_takeover"

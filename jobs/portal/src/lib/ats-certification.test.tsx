@@ -24,6 +24,20 @@ function activeSummary(): AtsCertificationSummary {
   };
 }
 
+function reviewOnlySummary(): AtsCertificationSummary {
+  return {
+    provider_label: "Greenhouse",
+    adapter_version: null,
+    certified_runner_kinds: [],
+    status: "review_only",
+    last_verified_at_ms: null,
+    expires_at_ms: null,
+    reason: "This application requires reviewed automation.",
+    next_action: "Review the exact application kit before continuing.",
+    canary_available: false,
+  };
+}
+
 function eligibility(
   summary: unknown = activeSummary(),
 ): JobEligibilityDecision {
@@ -129,7 +143,7 @@ describe("ATS certification portal boundary", () => {
     })).toMatchObject({ provider_label: "Application site" });
   });
 
-  it("limits a certified decision to the runner kinds in the server summary", () => {
+  it("projects only cloud-certified authority into the web portal", () => {
     const decoded = portalEligibilityDecision(eligibility(), false, NOW_MS);
     const cloudOnly = portalEligibilityDecision(eligibility({
       ...activeSummary(),
@@ -137,8 +151,8 @@ describe("ATS certification portal boundary", () => {
     }), false, NOW_MS);
 
     expect(decoded.capability).toBe("certified");
-    expect(decoded.can_auto_submit).toBe(true);
-    expect(decoded.can_queue_local).toBe(true);
+    expect(decoded.can_auto_submit).toBe(false);
+    expect(decoded.can_queue_local).toBe(false);
     expect(decoded.can_queue_cloud).toBe(false);
     expect(cloudOnly.capability).toBe("certified");
     expect(cloudOnly.can_auto_submit).toBe(true);
@@ -190,9 +204,14 @@ describe("ATS certification portal boundary", () => {
       ...eligibility(),
       capability: "beta_review" as const,
       can_auto_submit: false,
+      can_queue_local: true,
     };
 
-    expect(portalEligibilityDecision(inconsistent, false, NOW_MS).can_auto_submit).toBe(false);
+    expect(portalEligibilityDecision(inconsistent, false, NOW_MS)).toMatchObject({
+      can_auto_submit: false,
+      can_queue_local: false,
+      can_queue_cloud: true,
+    });
     expect(atsCertificationPresentation(inconsistent, NOW_MS)).toMatchObject({
       server_authored: false,
       capability: "unknown_review",
@@ -202,30 +221,97 @@ describe("ATS certification portal boundary", () => {
     });
   });
 
+  it("labels queueable beta authority without claiming certification", () => {
+    const beta: JobEligibilityDecision = {
+      ...eligibility(reviewOnlySummary()),
+      capability: "beta_review",
+      can_auto_submit: false,
+      can_queue_local: true,
+      can_queue_cloud: true,
+    };
+    const presentation = atsCertificationPresentation(beta, NOW_MS);
+    const markup = renderToStaticMarkup(<AtsCertificationSummaryCard eligibility={beta} />);
+
+    expect(presentation).toMatchObject({
+      server_authored: true,
+      capability: "beta_review",
+      can_queue_cloud: true,
+      status: "review_only",
+      certified_runner_kinds: [],
+    });
+    expect(markup).toContain("Reviewed beta");
+    expect(markup).toContain("Beta · Final review");
+    expect(markup).toContain("Cloud · final review");
+    expect(markup).toContain("Bluey pauses again for final form approval.");
+    expect(markup).not.toContain("continue on the original job site");
+    expect(markup).not.toContain(">Certified<");
+  });
+
+  it("keeps nonqueueable beta and retained local authority in Review", () => {
+    const localOnly: JobEligibilityDecision = {
+      ...eligibility(reviewOnlySummary()),
+      capability: "beta_review",
+      can_auto_submit: false,
+      can_queue_local: true,
+      can_queue_cloud: false,
+    };
+    const presentation = atsCertificationPresentation(localOnly, NOW_MS);
+    const markup = renderToStaticMarkup(<AtsCertificationSummaryCard eligibility={localOnly} />);
+
+    expect(presentation).toMatchObject({
+      can_queue_cloud: false,
+      certified_runner_kinds: [],
+    });
+    expect(portalEligibilityDecision(localOnly, false, NOW_MS).can_queue_local).toBe(false);
+    expect(markup).toContain("Review only");
+    expect(markup).toContain("Not certified");
+    expect(markup).toContain("continue on the original job site");
+    expect(markup).not.toContain("Reviewed beta");
+  });
+
   it("renders only display-safe summary fields and never opaque authority material", () => {
+    const cloudSummary = {
+      ...activeSummary(),
+      certified_runner_kinds: ["cloud"] as const,
+      reason: "The current job and cloud runner passed server verification.",
+      next_action: "Review the application kit and choose cloud automation.",
+    };
     const validMarkup = renderToStaticMarkup(
-      <AtsCertificationSummaryCard eligibility={eligibility()} />,
+      <AtsCertificationSummaryCard eligibility={eligibility(cloudSummary)} />,
     );
     const malformedMarkup = renderToStaticMarkup(
       <AtsCertificationSummaryCard eligibility={eligibility({
-        ...activeSummary(),
+        ...cloudSummary,
         target_key: "greenhouse:private-tenant:123",
       })} />,
     );
 
-    expect(validMarkup).toContain("RUNNER CERTIFICATION");
+    expect(validMarkup).toContain("CLOUD AUTOMATION");
     expect(validMarkup).toContain("Greenhouse");
     expect(validMarkup).toContain("2026.07.1-beta.1");
-    expect(validMarkup).toContain("Local Browser");
+    expect(validMarkup).toContain("Cloud runner");
     expect(validMarkup).toContain("Last verified");
     expect(validMarkup).toContain("Expires");
-    expect(validMarkup).toContain("Server verification is current for this job and runner.");
-    expect(validMarkup).toContain("Review the application kit and choose Local Browser.");
+    expect(validMarkup).toContain("The current job and cloud runner passed server verification.");
+    expect(validMarkup).toContain("Review the application kit and choose cloud automation.");
     expect(validMarkup).toContain("Available");
+    expect(validMarkup).not.toContain("Local Browser");
     expect(validMarkup).not.toContain("private-tenant");
     expect(malformedMarkup).toContain("Server certification summary unavailable");
     expect(malformedMarkup).toContain("Review only");
     expect(malformedMarkup).not.toContain("private-tenant");
+  });
+
+  it("keeps a local-only certification out of the web launch surface", () => {
+    const markup = renderToStaticMarkup(
+      <AtsCertificationSummaryCard eligibility={eligibility()} />,
+    );
+
+    expect(markup).toContain("CLOUD AUTOMATION");
+    expect(markup).toContain("Not certified");
+    expect(markup).toContain("Review only");
+    expect(markup).toContain("continue on the original job site");
+    expect(markup).not.toContain("Local Browser");
   });
 
   it.each([
@@ -238,6 +324,9 @@ describe("ATS certification portal boundary", () => {
   ] as const)("renders the bounded server-authored %s state", (status, label) => {
     const summary: AtsCertificationSummary = {
       ...activeSummary(),
+      certified_runner_kinds: ["cloud"],
+      reason: "The current job and cloud runner passed server verification.",
+      next_action: "Review the application kit and choose cloud automation.",
       status,
       canary_available: status === "active",
     };
@@ -251,8 +340,8 @@ describe("ATS certification portal boundary", () => {
     expect(markup).toContain(`>${label}</span>`);
     expect(markup).toContain("Greenhouse");
     expect(markup).toContain("2026.07.1-beta.1");
-    expect(markup).toContain("Local Browser");
-    expect(markup).toContain("Server verification is current for this job and runner.");
+    expect(markup).toContain("Cloud runner");
+    expect(markup).toContain("The current job and cloud runner passed server verification.");
     expect(markup).not.toContain("target_key");
     expect(markup).not.toContain("sha256");
   });

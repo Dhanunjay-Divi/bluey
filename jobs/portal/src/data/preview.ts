@@ -13,7 +13,7 @@ const betaEligibility = (extraReview: JobEligibilityDecision["review_reasons"] =
   capability: "beta_review",
   can_prepare: true,
   can_auto_submit: false,
-  can_queue_local: true,
+  can_queue_local: false,
   can_queue_cloud: true,
   hard_failures: [],
   review_reasons: [
@@ -691,7 +691,7 @@ export const previewWorkspace: JobsWorkspace = {
     used_packets: 24,
     period_start_ms: now - 9 * 86_400_000,
     period_end_ms: now + 21 * 86_400_000,
-    local_browser: true,
+    local_browser: false,
     cloud_browser: true,
     overage_cents: 50,
     monthly_price_cents: 4900,
@@ -701,92 +701,12 @@ export const previewWorkspace: JobsWorkspace = {
   },
   runner_availability: {
     local: {
-      status: "available",
-      available: true,
-      plan_included: true,
-      distribution_enabled: true,
-      reason: "Bluey Browser is available on this account.",
-      next_action: "Approve a packet, then run it on this computer.",
-      release: {
-        status: "available",
-        reason: "The active beta release is available for this account.",
-        channel: "beta",
-        release_id: "browser-release-preview-603",
-        artifact_origin: "https://artifacts.bluey.sh",
-        manifest_sha256: "6c".repeat(32),
-        release_sequence: 1,
-        build_id: "browser-603.1",
-        app_version: "0.1.0",
-        protocol_version: 1,
-        released_at_ms: now - 86_400_000,
-        artifacts: [
-          {
-            platform: "macos",
-            architecture: "arm64",
-            package_kind: "dmg",
-            role: "installer",
-            file_name: "Bluey-Browser-0.1.0-mac-arm64.dmg",
-            url:
-              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
-              "Bluey-Browser-0.1.0-mac-arm64.dmg",
-            size_bytes: 184_320_000,
-            sha256: "72".repeat(32),
-            descriptor_sha256: "8d".repeat(32),
-          },
-          {
-            platform: "macos",
-            architecture: "arm64",
-            package_kind: "zip",
-            role: "updater",
-            file_name: "Bluey-Browser-0.1.0-mac-arm64.zip",
-            url:
-              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
-              "Bluey-Browser-0.1.0-mac-arm64.zip",
-            size_bytes: 183_910_400,
-            sha256: "73".repeat(32),
-            descriptor_sha256: "8d".repeat(32),
-          },
-          {
-            platform: "macos",
-            architecture: "x64",
-            package_kind: "dmg",
-            role: "installer",
-            file_name: "Bluey-Browser-0.1.0-mac-x64.dmg",
-            url:
-              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
-              "Bluey-Browser-0.1.0-mac-x64.dmg",
-            size_bytes: 187_432_960,
-            sha256: "93".repeat(32),
-            descriptor_sha256: "af".repeat(32),
-          },
-          {
-            platform: "macos",
-            architecture: "x64",
-            package_kind: "zip",
-            role: "updater",
-            file_name: "Bluey-Browser-0.1.0-mac-x64.zip",
-            url:
-              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
-              "Bluey-Browser-0.1.0-mac-x64.zip",
-            size_bytes: 187_023_360,
-            sha256: "94".repeat(32),
-            descriptor_sha256: "af".repeat(32),
-          },
-          {
-            platform: "windows",
-            architecture: "x64",
-            package_kind: "exe",
-            role: "installer",
-            file_name: "Bluey-Browser-0.1.0-win-x64.exe",
-            url:
-              "https://artifacts.bluey.sh/jobs/browser/releases/browser-release-preview-603/" +
-              "Bluey-Browser-0.1.0-win-x64.exe",
-            size_bytes: 191_102_976,
-            sha256: "b4".repeat(32),
-            descriptor_sha256: "d1".repeat(32),
-          },
-        ],
-      },
+      status: "invited_beta",
+      available: false,
+      plan_included: false,
+      distribution_enabled: false,
+      reason: "Local execution is not part of the web launch.",
+      next_action: "Use cloud automation or Review first.",
     },
     cloud: {
       status: "available",
@@ -797,8 +717,7 @@ export const previewWorkspace: JobsWorkspace = {
       next_action: "Approve a packet, then queue it in the cloud.",
     },
     auto_submit_available: true,
-    auto_submit_reason:
-      "Auto-submit can use either Bluey Browser or the background runner.",
+    auto_submit_reason: "Auto-submit can use the enabled cloud automation runner.",
   },
 };
 
@@ -886,7 +805,7 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
             ...(certified.eligibility ?? betaEligibility()),
             capability: "certified",
             can_auto_submit: true,
-            can_queue_local: true,
+            can_queue_local: false,
             can_queue_cloud: true,
             review_reasons: [],
           },
@@ -935,16 +854,10 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
         local: {
           status: "invited_beta",
           available: false,
-          plan_included: true,
+          plan_included: false,
           distribution_enabled: false,
-          reason:
-            "Bluey Browser is included in your plan but has not been enabled for this release.",
-          next_action:
-            "Use Review first; Bluey will prepare the exact resume and answers for handoff.",
-          release: {
-            status: "disabled",
-            reason: "Bluey Browser distribution is disabled for this release.",
-          },
+          reason: "Local execution is not part of the web launch.",
+          next_action: "Use Review first; Bluey prepares the exact resume and answers for handoff.",
         },
         cloud: {
           status: "upgrade_required",
@@ -958,7 +871,7 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
         },
         auto_submit_available: false,
         auto_submit_reason:
-          "Auto-submit is not available in this release because your included runner is still in invited beta. Review first and job-site handoff remain available.",
+          "Cloud automation is not available for this account. Review first and job-site handoff remain available.",
       },
     };
   }

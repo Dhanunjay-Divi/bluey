@@ -41,7 +41,7 @@ export function AuthGate() {
           <div className="entry-assurances" aria-label="Bluey Jobs defaults">
             <span><Check size={14} />Job-specific resume every time</span>
             <span><Check size={14} />Review first by default</span>
-            <span><Check size={14} />Five complete applications free</span>
+            <span><Check size={14} />Five tailored application kits free</span>
           </div>
         </div>
 
@@ -78,7 +78,7 @@ export function AuthGate() {
       <section className="entry-section entry-plans" id="jobs-plans">
         <div className="entry-section-heading"><p className="eyebrow">PLANS</p><h2>{runnerLandingCopy.plansTitle}</h2></div>
         <div className="entry-plan-table">
-          <div><span><b>Free</b><small>Build your profile and review tailored applications</small></span><strong>$0</strong><p>1 Career Track · 5 complete applications</p></div>
+          <div><span><b>Free</b><small>Build your profile and review tailored applications</small></span><strong>$0</strong><p>1 Career Track · 5 tailored application kits</p></div>
           <div><span><b>Pro</b><small>{runnerLandingCopy.proSummary}</small></span><strong>$29<small>/month</small></strong><p>{runnerLandingCopy.proDetails}</p></div>
           <div><span><b>Cloud</b><small>{runnerLandingCopy.cloudSummary}</small></span><strong>$49<small>/month</small></strong><p>{runnerLandingCopy.cloudDetails}</p></div>
         </div>

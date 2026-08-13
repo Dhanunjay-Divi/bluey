@@ -17,6 +17,12 @@ On a Bluey production host, install `ops/bluey-jobs.env.example` as
 secret, and set mode `0640` with owner `root:bluey`. The Jobs systemd unit also
 loads the shared API, Valkey, and Postgres environment files. Keep
 `BLUEY_JOBS_BETA_ENABLED=0` until the restricted beta is intentionally opened.
+The launch product is the browser-delivered Jobs portal at `/jobs/automation`
+with the managed cloud Background runner. Customers install nothing. The
+legacy `/jobs/browser` route is compatibility navigation only and must not be
+used to advertise a local installer. Keep the retained local release and
+recovery procedures below for unresolved historical authority and possible P2
+demand; they are not a prerequisite for a cloud-first beta.
 Keep `BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0` until an independently
 approved root trust anchor, exact server release ID, signed channel authority,
 immutable native packages, and physical macOS/Windows install, launch,
@@ -976,7 +982,15 @@ status and account-facing availability checks. Keep
 it is a distinct approved production change after immutable hosting, native
 credentials, and every physical canary have independently passed.
 
-The authenticated portal starts a local application by creating a bounded
+#### Parked P2 local-client protocol (server-retained, not a portal launch path)
+
+The current browser-delivered portal never starts a local application or opens
+the custom protocol below. The server retains this recovery-compatible contract
+for historical local runs and a possible separately reviewed P2 client; it is
+not part of the cloud-first launch and its distribution flag remains disabled.
+
+If local distribution is reactivated in a later approved batch, a reviewed
+client starts an application by creating a bounded
 capability in `jobs_local_run_tickets`, then opening
 `bluey-jobs://run/<run-id>?ticket=<random-ticket>`. Only the ticket enters the
 custom-protocol URL. Its secret and frozen packet are encrypted in the Jobs
@@ -1425,10 +1439,8 @@ canaries pass, the strongest honest wording is:
 
 ## External release gates
 
-- Apple Developer ID/notarization and Windows Authenticode/timestamp credentials,
-  exact approved signer identities, and immutable artifact-host access.
-- Physical macOS arm64/x64 and Windows x64 clean-install, protocol-claim,
-  upgrade, rollback, immutable-readback, and portal-download canary evidence.
+Cloud-first launch gates:
+
 - Gmail and Outlook OAuth applications, redirect URIs, webhook subscriptions,
   and encrypted refresh-token storage.
 - Licensed discovery-provider contracts and API credentials.
@@ -1437,5 +1449,15 @@ canaries pass, the strongest honest wording is:
 - Live sandbox certification for representative tenants of every supported ATS.
 - Regional Temporal, Postgres, Valkey, OpenSearch, and browser-pool monitoring.
 
+Parked P2 local-distribution gates, required only before an installable local
+runner is reconsidered:
+
+- Apple Developer ID/notarization and Windows Authenticode/timestamp credentials,
+  exact approved signer identities, and immutable artifact-host access.
+- Physical macOS arm64/x64 and Windows x64 clean-install, protocol-claim,
+  upgrade, rollback, immutable-readback, and portal-download canary evidence.
+
 No source change can manufacture provider approvals, signing certificates, or
-production credentials. Keep the Jobs beta flag off until these gates pass.
+production credentials. Keep the Jobs beta flag off until the applicable
+cloud-first launch gates pass. Keep local distribution disabled independently;
+do not block the browser-delivered launch on the parked P2 device matrix.

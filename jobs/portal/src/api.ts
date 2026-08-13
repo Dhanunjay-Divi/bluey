@@ -4,7 +4,6 @@ import type {
   ApplicationEvidence,
   ApplicationIdentity,
   AutoSubmitAuthorization,
-  BrowserSession,
   CareerFact,
   CareerProfile,
   CareerTrack,
@@ -380,11 +379,6 @@ export const jobsApi = {
     ),
   resumeVersion: (id: string) =>
     request<ResumeVersion>(`/api/jobs/resume-versions/${encodeURIComponent(id)}`),
-  saveBrowserSession: (session: BrowserSession) =>
-    request<BrowserSession>("/api/jobs/browser-sessions", {
-      method: "POST",
-      body: JSON.stringify(session),
-    }),
   resolveIntervention: (
     id: string,
     status: string,

@@ -694,19 +694,20 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .security-note b { font-size: 11px; }
 .security-note small { color: var(--muted); font-size: 9px; }
 .active-browser-run { min-height: 220px; display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(290px, .65fr); border: 1px solid color-mix(in srgb, var(--accent) 48%, var(--border)); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.browser-window-preview, .run-control { min-width: 0; }
 .browser-window-preview { padding: 12px; display: grid; grid-template-rows: 34px 1fr 34px; border-right: 1px solid var(--border); background: var(--surface-2); }
 .browser-window-preview > header { display: flex; align-items: center; gap: 5px; }
 .browser-window-preview > header > span { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 .browser-window-preview > header > span:first-child { background: var(--red); }
 .browser-window-preview > header > span:nth-child(2) { background: var(--amber); }
 .browser-window-preview > header > span:nth-child(3) { background: var(--green); }
-.browser-window-preview > header > div { height: 24px; min-width: 250px; margin-left: 8px; padding: 0 10px; display: flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--muted); font-size: 9px; }
-.browser-window-preview > main { display: flex; align-items: center; justify-content: center; gap: 14px; }
+.browser-window-preview > header > div { height: 24px; min-width: 0; margin-left: 8px; padding: 0 10px; flex: 1; display: flex; align-items: center; gap: 6px; overflow: hidden; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--muted); font-size: 9px; white-space: nowrap; }
+.browser-window-preview-body { min-width: 0; display: flex; align-items: center; justify-content: center; gap: 14px; }
 .browser-company { width: 52px; height: 52px; display: grid; place-items: center; border-radius: 8px; background: var(--accent-soft); color: var(--accent); font-size: 14px; font-weight: 900; }
-.browser-window-preview main > span { display: grid; gap: 3px; }
-.browser-window-preview main p { color: var(--muted); font-size: 8px; font-weight: 850; }
-.browser-window-preview main h2 { font-size: 17px; }
-.browser-window-preview main b { color: var(--text-soft); font-size: 11px; }
+.browser-window-preview-body > span { min-width: 0; display: grid; gap: 3px; }
+.browser-window-preview-body p { color: var(--muted); font-size: 8px; font-weight: 850; }
+.browser-window-preview-body h2 { overflow: hidden; font-size: 17px; text-overflow: ellipsis; white-space: nowrap; }
+.browser-window-preview-body b { overflow: hidden; color: var(--text-soft); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
 .browser-window-preview > footer { display: flex; align-items: center; gap: 12px; }
 .browser-window-preview > footer > div { height: 4px; flex: 1; border-radius: 3px; background: var(--surface-3); overflow: hidden; }
 .browser-window-preview > footer > div span { display: block; height: 100%; background: var(--accent); }
@@ -721,7 +722,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .run-alert div { display: grid; gap: 3px; }
 .run-alert b { font-size: 10px; }
 .run-alert p { color: var(--text-soft); font-size: 9px; line-height: 1.4; }
-.runner-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.runner-grid { display: grid; grid-template-columns: minmax(0, 1fr); gap: 18px; }
 .runner-option { min-height: 220px; padding: 20px; display: grid; grid-template-columns: 48px minmax(0, 1fr) auto; align-items: start; gap: 15px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .runner-option.enabled { border-color: color-mix(in srgb, var(--accent) 38%, var(--border)); }
 .runner-icon { width: 46px; height: 46px; display: grid; place-items: center; border-radius: 8px; background: var(--accent-soft); color: var(--accent); }
@@ -743,18 +744,11 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .adapter-list > div > span { grid-row: 1 / 3; width: 28px; height: 28px; display: grid; place-items: center; border-radius: 6px; background: var(--surface-3); color: var(--accent); font-weight: 900; }
 .adapter-list b { font-size: 10px; }
 .adapter-list small { color: var(--green); font-size: 9px; }
+.adapter-list .adapter-review small { color: var(--amber); }
 .handoff-policy { margin-top: 12px; padding: 11px 12px; display: flex; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); color: var(--amber); }
 .handoff-policy div { display: grid; gap: 2px; }
 .handoff-policy b { color: var(--text-soft); font-size: 11px; }
 .handoff-policy p { color: var(--muted); font-size: 10px; }
-.launch-steps { padding: 18px 20px; display: grid; gap: 8px; }
-.launch-steps > div { min-height: 64px; padding: 10px; display: grid; grid-template-columns: 30px minmax(0, 1fr) auto; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 7px; }
-.launch-steps > div > span { width: 26px; height: 26px; display: grid; place-items: center; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-size: 10px; font-weight: 850; }
-.launch-steps p { display: grid; gap: 3px; }
-.launch-steps b { font-size: 11px; }
-.launch-steps small { color: var(--muted); font-size: 10px; }
-.browser-architecture-choice { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
-.browser-architecture-choice .button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
 .cloud-queue-list { padding: 18px 20px; display: grid; gap: 8px; }
 .cloud-queue-list > button { min-height: 60px; padding: 9px; display: grid; grid-template-columns: 36px minmax(0, 1fr) 24px; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); text-align: left; }
 .cloud-queue-list > button > span { min-width: 0; display: grid; gap: 3px; }

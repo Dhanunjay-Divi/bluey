@@ -403,11 +403,11 @@ export function SettingsView({
       />
 
       <section className="settings-section" id="plans">
-        <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included applications used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
+        <div className="settings-section-title"><span><CreditCard /></span><div><p>PLAN</p><h2>{titleCase(workspace.entitlement.plan)} Jobs</h2><small>{workspace.entitlement.used_packets} of {workspace.entitlement.monthly_packet_limit} included application kits used this month.</small></div><a className="button secondary compact" href="/account#billing">Shared balance<ArrowRight size={15} /></a></div>
         <div className="plan-grid">
-          <Plan name="Free" price="$0" details="1 agent · 5 reviewed applications · 2 application emails" active={workspace.entitlement.plan === "free"} />
-          <Plan name="Pro" price="$29" details="3 agents · 50 applications · 10 application emails · local runner beta waitlist" active={workspace.entitlement.plan === "pro"} />
-          <Plan name="Cloud" price="$49" details="5 agents · 100 applications · 25 application emails · invited cloud runner beta" active={workspace.entitlement.plan === "cloud"} />
+          <Plan name="Free" price="$0" details="1 agent · 5 reviewed application kits · 2 application emails" active={workspace.entitlement.plan === "free"} />
+          <Plan name="Pro" price="$29" details="3 agents · 50 application kits · 10 application emails · web review and job-site handoff" active={workspace.entitlement.plan === "pro"} />
+          <Plan name="Cloud" price="$49" details="5 agents · 100 application kits · 25 application emails · invited cloud automation beta" active={workspace.entitlement.plan === "cloud"} />
         </div>
         <p className="plan-footnote">
           Application emails are included. Connected inboxes start with read-only employer-update
@@ -415,7 +415,7 @@ export function SettingsView({
           calendar-write scopes for reviewed replies and events; every exact draft still requires
           approval. After the included applications, each additional completed application is
           {` ${money(workspace.entitlement.overage_cents)} `}
-          from your shared Bluey balance. Retries and browser handoffs do not count again.
+          from your shared Bluey balance. Retries and secure handoffs do not count again.
         </p>
       </section>
 

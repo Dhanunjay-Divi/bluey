@@ -6,20 +6,20 @@ export const lockedRunnerAvailability: RunnerAvailability = {
     available: false,
     plan_included: false,
     distribution_enabled: false,
-    reason: "Bluey Browser availability could not be confirmed.",
-    next_action: "Use Review first while Bluey refreshes your runner access.",
+    reason: "This automation channel is unavailable in the web experience.",
+    next_action: "Review the application kit and continue on the original job site.",
   },
   cloud: {
     status: "invited_beta",
     available: false,
     plan_included: false,
     distribution_enabled: false,
-    reason: "Background runner availability could not be confirmed.",
-    next_action: "Use Review first while Bluey refreshes your runner access.",
+    reason: "Cloud automation availability could not be confirmed.",
+    next_action: "Use Review first while Bluey refreshes cloud automation access.",
   },
   auto_submit_available: false,
   auto_submit_reason:
-    "Auto-submit is unavailable until Bluey confirms runner access. Review first and job-site handoff remain available.",
+    "Auto-submit is unavailable until Bluey confirms cloud automation access. Review first and job-site handoff remain available.",
 };
 
 export function runnerAvailabilityOrLocked(
@@ -29,16 +29,16 @@ export function runnerAvailabilityOrLocked(
 }
 
 export const runnerLandingCopy = {
-  flowTitle: "Review before a runner starts",
+  flowTitle: "Review before cloud automation starts",
   flowBody:
-    "Approve the exact application kit first. Local and cloud runners are opening gradually to invited beta accounts.",
-  plansTitle: "Start free. Join runner beta when it opens.",
-  proSummary: "Local browser access for invited beta accounts",
-  proDetails: "3 Career Tracks · 50 applications · invited local runner beta",
-  cloudSummary: "Background runner access for invited beta accounts",
-  cloudDetails: "5 Career Tracks · 100 applications · invited cloud runner beta",
+    "Approve the exact application kit first. Cloud automation is opening gradually to invited beta accounts; Review first and job-site handoff stay available to everyone.",
+  plansTitle: "Start free. Request cloud automation beta access.",
+  proSummary: "Tailored applications in the web portal",
+  proDetails: "3 Career Tracks · 50 application kits · web review and job-site handoff",
+  cloudSummary: "Cloud automation for invited beta accounts",
+  cloudDetails: "5 Career Tracks · 100 application kits · invited cloud automation beta",
   accessNote:
-    "Runner access appears only after it is enabled for your account. Every plan keeps the exact resume and answers used for each application.",
+    "Cloud automation appears only after it is enabled for your account. Every plan keeps the exact resume and answers used for each application.",
 } as const;
 
 export interface RunnerAccessCopy {
@@ -48,76 +48,18 @@ export interface RunnerAccessCopy {
   action: string;
 }
 
-export interface LocalBrowserReleaseCopyState {
-  available: boolean;
-  reason: string;
-}
-
-export function localRunnerAccessCopy(
-  access: RunnerChannelAvailability,
-  release?: LocalBrowserReleaseCopyState,
-): RunnerAccessCopy {
-  if (access.available && release && !release.available) {
-    return {
-      badge: "Browser unavailable",
-      description: release.reason,
-      points: [
-        "No download is shown without an exact active release",
-        "Review tailored packets in the portal now",
-        "No local run starts until Browser availability is confirmed",
-      ],
-      action: "Review applications",
-    };
-  }
-  if (access.available) {
-    return {
-      badge: "Enabled",
-      description:
-        "Applications run on your computer in a separate Jobs browser. Take over at any moment.",
-      points: [
-        "Keeps your job-site sign-ins ready",
-        "Uses the same reviewed application packet",
-        "Stops when your computer is off",
-      ],
-      action: "Run locally",
-    };
-  }
-  if (access.status === "upgrade_required") {
-    return {
-      badge: "Plan upgrade",
-      description: access.reason,
-      points: [
-        access.next_action,
-        "Review tailored packets in the portal now",
-        "No browser run starts without runner access",
-      ],
-      action: "View plans",
-    };
-  }
-  return {
-    badge: "Invited beta",
-    description: access.reason,
-    points: [
-      access.next_action,
-      "Review tailored packets in the portal now",
-      "No browser run starts until this release enables it",
-    ],
-    action: "Review applications",
-  };
-}
-
 export function cloudRunnerAccessCopy(access: RunnerChannelAvailability): RunnerAccessCopy {
   if (access.available) {
     return {
-      badge: "Enabled",
+      badge: "Enabled for this account",
       description:
-        "Bluey continues from an encrypted, isolated browser profile while your computer is off.",
+        "For this enabled account, Bluey can continue in an encrypted, isolated cloud session.",
       points: [
         "Offers one-click email-code approval",
-        "Pauses for security checks and user handoff",
+        "Pauses for security checks and secure takeover",
         "Stores an evidence-backed submission receipt",
       ],
-      action: "Queue a run",
+      action: "Start cloud automation",
     };
   }
   if (access.status === "upgrade_required") {
@@ -126,8 +68,8 @@ export function cloudRunnerAccessCopy(access: RunnerChannelAvailability): Runner
       description: access.reason,
       points: [
         access.next_action,
-        "Review tailored packets in the portal now",
-        "No cloud run starts without runner access",
+        "Review tailored packets in the web portal now",
+        "Continue safely on the original job site",
       ],
       action: "View plans",
     };
@@ -137,8 +79,8 @@ export function cloudRunnerAccessCopy(access: RunnerChannelAvailability): Runner
     description: access.reason,
     points: [
       access.next_action,
-      "Review tailored packets in the portal now",
-      "No cloud run starts until this release enables it",
+      "Review tailored packets in the web portal now",
+      "No cloud automation starts until access is enabled",
     ],
     action: "Review applications",
   };

@@ -33,15 +33,15 @@ function certificationSummary(
   return {
     provider_label: certified ? "Lever" : "Application system",
     adapter_version: certified ? "2026.07.0-beta.1" : null,
-    certified_runner_kinds: certified ? ["local"] : [],
+    certified_runner_kinds: certified ? ["cloud"] : [],
     status: certified ? "active" : "review_only",
     last_verified_at_ms: certified ? Date.now() - 60_000 : null,
     expires_at_ms: certified ? Date.now() + 60 * 60_000 : null,
     reason: certified
-      ? "The current job and Local Browser runner passed server verification."
+      ? "The current job and cloud automation passed server verification."
       : "Review first is required for this application system.",
     next_action: certified
-      ? "Review the application kit and choose an available runner."
+      ? "Review the application kit before starting cloud automation."
       : "Review the application kit before continuing.",
     canary_available: false,
   };
@@ -63,27 +63,27 @@ const eligibility = (
   ats_certification: certificationSummary(capability),
 });
 
-const runners = (available: boolean): RunnerAvailability => ({
+const runners = (cloudAvailable: boolean): RunnerAvailability => ({
   local: {
-    status: available ? "available" : "invited_beta",
-    available,
+    status: "available",
+    available: true,
     plan_included: true,
-    distribution_enabled: available,
-    reason: available ? "Available." : "Bluey Browser is still in invited beta.",
-    next_action: available ? "Run locally." : "Use Review first.",
+    distribution_enabled: true,
+    reason: "Legacy local access is available.",
+    next_action: "Use a legacy local client.",
   },
   cloud: {
-    status: "upgrade_required",
-    available: false,
-    plan_included: false,
-    distribution_enabled: false,
-    reason: "Cloud plan required.",
-    next_action: "View plans.",
+    status: cloudAvailable ? "available" : "invited_beta",
+    available: cloudAvailable,
+    plan_included: true,
+    distribution_enabled: cloudAvailable,
+    reason: cloudAvailable ? "Cloud automation is available." : "Cloud automation is still in invited beta.",
+    next_action: cloudAvailable ? "Start cloud automation." : "Use Review first.",
   },
-  auto_submit_available: available,
-  auto_submit_reason: available
+  auto_submit_available: cloudAvailable,
+  auto_submit_reason: cloudAvailable
     ? "Auto-submit is available."
-    : "Auto-submit is not available in this release because your included runner is still in invited beta.",
+    : "Auto-submit is not available in this release.",
 });
 
 describe("reviewed application runner availability", () => {
@@ -93,12 +93,22 @@ describe("reviewed application runner availability", () => {
     expect(runnerUnavailableReason(eligibility("unknown_review"), runners(true))).toContain("not certified");
   });
 
-  it("requires an actually distributed runner even for a certified application", () => {
+  it("requires cloud availability even when legacy local access is available", () => {
     const certified = eligibility("certified", true);
 
     expect(hasAvailableRunner(certified, runners(false))).toBe(false);
     expect(runnerUnavailableReason(certified, runners(false))).toContain("invited beta");
     expect(hasAvailableRunner(certified, runners(true))).toBe(true);
+  });
+
+  it("keeps a local-only certification in Review and handoff", () => {
+    const localOnly = eligibility("certified", true);
+    localOnly.can_queue_cloud = false;
+
+    expect(hasAvailableRunner(localOnly, runners(true))).toBe(false);
+    expect(runnerUnavailableReason(localOnly, runners(true))).toContain(
+      "Cloud automation is not certified",
+    );
   });
 
   it("surfaces a hard Career Track failure before runner messaging", () => {
