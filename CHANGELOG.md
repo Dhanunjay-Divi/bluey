@@ -152,6 +152,11 @@ under `docs/release/`.
 
 ### Fixed
 
+- Made Jobs provider write-grant upgrades advance their credential-refresh CAS
+  timestamp even when both mutations occur in the same clock tick. A stale
+  token refresh now deterministically loses authority instead of reaching a
+  later mailbox-shape check, eliminating the hosted CI race without weakening
+  the grant digest or transaction fence.
 - Updated the Jobs and observability CI gates for hosted Rust 1.97 without
   changing runtime behavior: optional final-submit filename parsing now follows
   the current Clippy contract, while target-dependent Unix `libc` conversions
