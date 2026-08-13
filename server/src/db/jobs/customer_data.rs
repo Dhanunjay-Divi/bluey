@@ -3991,13 +3991,10 @@ pub fn save_mailbox_connection_with_credential_cas(
     stored_credential.scopes.dedup();
     stored_credential.capabilities = mailbox.capabilities.clone();
     stored_credential.grant_sha256 = communication_grant_sha256(&stored_credential)?;
-    stored_credential.updated_at_ms = mailbox.updated_at_ms;
     let subject_hash = private_lookup_hash(
         &format!("mailbox:{}", mailbox.provider),
         stored_credential.provider_subject.trim(),
     )?;
-    let mailbox_json = to_json(&mailbox, "mailbox connection")?;
-    let credential_json = to_json(&stored_credential, "Jobs provider credential")?;
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -4052,6 +4049,14 @@ pub fn save_mailbox_connection_with_credential_cas(
             {
                 anyhow::bail!("current provider grant digest is invalid")
             }
+            let authority_updated_at_ms = now_ms()
+                .max(current_mailbox.updated_at_ms.saturating_add(1))
+                .max(current.updated_at_ms.saturating_add(1));
+            mailbox.updated_at_ms = authority_updated_at_ms;
+            stored_credential.updated_at_ms = authority_updated_at_ms;
+            let mailbox_json = to_json(&mailbox, "mailbox connection")?;
+            let credential_json =
+                to_json(&stored_credential, "Jobs provider credential")?;
             let mailbox_updated = tx.execute(
                 "UPDATE jobs_mailbox_connections
                     SET status = 'connected', connection_json = ?4, updated_at_ms = ?5
@@ -4137,6 +4142,14 @@ pub fn save_mailbox_connection_with_credential_cas(
             {
                 anyhow::bail!("current provider grant digest is invalid")
             }
+            let authority_updated_at_ms = now_ms()
+                .max(current_mailbox.updated_at_ms.saturating_add(1))
+                .max(current.updated_at_ms.saturating_add(1));
+            mailbox.updated_at_ms = authority_updated_at_ms;
+            stored_credential.updated_at_ms = authority_updated_at_ms;
+            let mailbox_json = to_json(&mailbox, "mailbox connection")?;
+            let credential_json =
+                to_json(&stored_credential, "Jobs provider credential")?;
             let mailbox_updated = tx.execute(
                 "UPDATE jobs_mailbox_connections
                     SET status = 'connected', connection_json = $4, updated_at_ms = $5

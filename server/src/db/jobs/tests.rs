@@ -13364,6 +13364,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(upgraded.grant_revision, 2);
+        assert!(
+            upgraded.updated_at_ms > stale.updated_at_ms,
+            "a grant upgrade must advance the refresh CAS authority even within one clock tick"
+        );
         assert!(refresh_jobs_provider_credential_cas(
             &pool,
             "acct-jobs",
