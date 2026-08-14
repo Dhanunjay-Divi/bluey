@@ -16,6 +16,9 @@ async function run(): Promise<void> {
     taskQueue: process.env.BLUEY_JOBS_TASK_QUEUE || "bluey-jobs-applications",
     workflowsPath: new URL("./workflows.js", import.meta.url).pathname,
     activities,
+    dataConverter: {
+      failureConverterPath: new URL("./failure-converter.js", import.meta.url).pathname,
+    },
   });
   await worker.run();
 }

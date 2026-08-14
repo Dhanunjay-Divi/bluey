@@ -28,6 +28,7 @@ pub mod jobs_global_archive;
 pub mod jobs_mailbox_sync;
 pub(crate) mod jobs_provider_auth;
 pub mod jobs_resume_template;
+pub mod jobs_workflow_dispatch;
 pub mod mail;
 pub mod object_storage;
 pub mod pricing;

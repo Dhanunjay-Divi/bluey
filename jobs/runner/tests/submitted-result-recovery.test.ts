@@ -31,6 +31,10 @@ const RESULT_CONTEXT = {
   requestId: "run-123:initial",
   profileScope: "b".repeat(40),
 };
+const V2_RESULT_CONTEXT = {
+  requestId: "wfreq-v2-12345678-1234-5678-9234-123456789abc",
+  profileScope: "b".repeat(40),
+};
 
 describe("submitted result recovery", () => {
   it("replays the exact submitted finish and promotes the staged receipt after restart", async () => {
@@ -83,6 +87,31 @@ describe("submitted result recovery", () => {
 
     expect(replaySubmittedFinish).toHaveBeenCalledTimes(1);
     await expect(readResult(root, RESULT_CONTEXT, key)).resolves.toEqual(
+      result,
+    );
+  });
+
+  it("recovers a staged submitted result under exact v2 request authority", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bluey-submitted-result-v2-"));
+    const key = randomBytes(32);
+    const result = submittedResult();
+    await stageResult(root, V2_RESULT_CONTEXT, result, key);
+    const replaySubmittedFinish = vi.fn(async () => {});
+
+    await expect(
+      recoverSubmittedResult(
+        root,
+        key,
+        {
+          ...recoveryAuthority(),
+          resultContext: V2_RESULT_CONTEXT,
+        },
+        { replaySubmittedFinish },
+      ),
+    ).resolves.toEqual(result);
+
+    expect(replaySubmittedFinish).toHaveBeenCalledTimes(1);
+    await expect(readResult(root, V2_RESULT_CONTEXT, key)).resolves.toEqual(
       result,
     );
   });
@@ -239,6 +268,38 @@ describe("submitted result recovery", () => {
       result,
     });
     expect(storage.root.fileNames()).toEqual(["step-result.json.enc"]);
+  });
+
+  it("replays and promotes an exact managed v2 staged receipt after restart", async () => {
+    const key = randomBytes(32);
+    const storage = retainedManagedResultStorage(
+      durableResultScope(V2_RESULT_CONTEXT),
+    );
+    const result = submittedResult();
+    await stageManagedResult(
+      storage.capability,
+      V2_RESULT_CONTEXT,
+      result,
+      key,
+    );
+    const replaySubmittedFinish = vi.fn(async () => {});
+
+    await expect(
+      recoverManagedSubmittedResult(
+        storage.capability,
+        key,
+        {
+          ...recoveryAuthority(),
+          resultContext: V2_RESULT_CONTEXT,
+        },
+        { replaySubmittedFinish },
+      ),
+    ).resolves.toEqual(result);
+
+    expect(replaySubmittedFinish).toHaveBeenCalledTimes(1);
+    await expect(
+      readManagedResult(storage.capability, V2_RESULT_CONTEXT, key),
+    ).resolves.toEqual(result);
   });
 
   it("returns an exact managed committed result idempotently without server replay", async () => {

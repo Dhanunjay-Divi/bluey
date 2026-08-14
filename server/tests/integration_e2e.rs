@@ -269,6 +269,29 @@ fn signed_worker_json_request(
     request
 }
 
+fn debug_worker_oversized_json_request(
+    path: &str,
+    token: &str,
+    minimum_body_bytes: usize,
+) -> Request<Body> {
+    let body = serde_json::to_vec(&json!({
+        "padding": "x".repeat(minimum_body_bytes),
+    }))
+    .unwrap();
+    assert!(body.len() > minimum_body_bytes);
+    Request::post(path)
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+fn assert_workflow_command_response_headers(headers: &axum::http::HeaderMap) {
+    assert_eq!(headers.get("content-type").unwrap(), "application/json");
+    assert_eq!(headers.get("cache-control").unwrap(), "no-store");
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
+}
+
 fn ats_certification_mutation_count(pool: &DbPool) -> i64 {
     pool.get()
         .unwrap()
@@ -6057,20 +6080,472 @@ async fn jobs_intervention_answer_revises_packet_without_resuming_runner() {
 #[serial]
 async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review() {
     const JWT_SECRET: &str = "test-secret-at-least-32-chars-long-xxx";
-    const WORKFLOW_TOKEN: &str = "jobs-workflow-test-token";
+    const WORKER_SIGNING_KEY: &str = "phase609-workflow-worker-signing-key";
+    std::env::set_var("BLUEY_JOBS_WORKER_SIGNING_KEY", WORKER_SIGNING_KEY);
     let harness = boot_harness().await;
-    let (account_id, application_id, run_id, _) = setup_execution_lease_run(&harness).await;
-    jobs::update_application(&harness.pool, &account_id, &application_id, "running", None).unwrap();
-    jobs::update_application(
+    let (account_id, application_id, _run_id, _) = setup_execution_lease_run(&harness).await;
+    jobs::set_entitlement_plan(&harness.pool, &account_id, "cloud").unwrap();
+    let access_token =
+        auth::jwt::issue(JWT_SECRET, &account_id, auth::jwt::TokenKind::Access).unwrap();
+
+    let queued = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/jobs/applications/{application_id}/runs"))
+                .header("authorization", format!("Bearer {access_token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"runner":"cloud"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(queued.status(), StatusCode::OK);
+    let queued_bytes = axum::body::to_bytes(queued.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let queued_value: serde_json::Value = serde_json::from_slice(&queued_bytes).unwrap();
+    assert_eq!(queued_value["workflow_command"]["operation"], "start");
+    assert_eq!(queued_value["workflow_command"]["state"], "pending");
+    assert!(harness
+        .openai
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.url.path() != "/workflow-commands"));
+
+    let dispatch_now = chrono::Utc::now().timestamp_millis();
+    let start_lease = jobs::claim_jobs_workflow_command(
         &harness.pool,
-        &account_id,
-        &application_id,
-        "needs_input",
+        "integration-dispatcher-owner",
+        dispatch_now,
+        30_000,
+    )
+    .unwrap()
+    .expect("claim staged start command");
+    assert_eq!(
+        start_lease.command.command_kind,
+        jobs::JobsWorkflowCommandKind::Start
+    );
+    let materialize_path = format!(
+        "/api/jobs/internal/workflow-commands/{}/materialize",
+        start_lease.command.request_id
+    );
+    let materialize_body = json!({
+        "schema_version": 2,
+        "workflow_id": start_lease.command.workflow_id,
+        "payload_digest": start_lease.command.payload_hmac_sha256,
+        "operation": "start",
+    });
+    let worker_timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claimed_material = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &materialize_path,
+            "workflow-command-materialize",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-materialize-claimed-0001",
+            &materialize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(claimed_material.status(), StatusCode::NOT_FOUND);
+    assert_workflow_command_response_headers(claimed_material.headers());
+    jobs::mark_jobs_workflow_command_request_started(&harness.pool, &start_lease, dispatch_now + 1)
+        .unwrap();
+    let materialized = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &materialize_path,
+            "workflow-command-materialize",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-materialize-delivering-0002",
+            &materialize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(materialized.status(), StatusCode::OK);
+    assert_workflow_command_response_headers(materialized.headers());
+    let materialized_bytes = axum::body::to_bytes(materialized.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let materialized_value: serde_json::Value =
+        serde_json::from_slice(&materialized_bytes).unwrap();
+    assert_eq!(materialized_value["schema_version"], 2);
+    assert_eq!(materialized_value["operation"], "start");
+    assert_eq!(
+        materialized_value["request_id"],
+        start_lease.command.request_id
+    );
+    assert_eq!(
+        materialized_value["result_request_id"],
+        start_lease.command.request_id
+    );
+    assert_eq!(
+        materialized_value["browser_session_id"],
+        format!("cloud-{application_id}")
+    );
+
+    let mut malformed_materialize_body = materialize_body.clone();
+    malformed_materialize_body["account_id"] = json!(account_id);
+    let malformed = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &materialize_path,
+            "workflow-command-materialize",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-materialize-malformed-0003",
+            &malformed_materialize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+    assert_workflow_command_response_headers(malformed.headers());
+
+    let mut mismatched_materialize_body = materialize_body.clone();
+    mismatched_materialize_body["payload_digest"] = json!("f".repeat(64));
+    let mismatched = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &materialize_path,
+            "workflow-command-materialize",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-materialize-mismatch-0004",
+            &mismatched_materialize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(mismatched.status(), StatusCode::CONFLICT);
+    assert_workflow_command_response_headers(mismatched.headers());
+    let stale_lease = jobs::JobsWorkflowCommandLease {
+        command: start_lease.command.clone(),
+        attempt_id: start_lease.attempt_id.clone(),
+        lease_owner: start_lease.lease_owner.clone(),
+        lease_token: "stale-lease-token-1234567890".to_string(),
+        fence: start_lease.fence,
+        lease_expires_at_ms: start_lease.lease_expires_at_ms,
+    };
+    let stale_completion = jobs::complete_jobs_workflow_command(
+        &harness.pool,
+        &stale_lease,
+        jobs::JobsWorkflowCommandCompletion::Accepted(jobs::JobsWorkflowAcceptanceReceipt {
+            outcome: jobs::JobsWorkflowAcceptedOutcome::Accepted,
+            request_id: start_lease.command.request_id.clone(),
+            payload_hmac_sha256: start_lease.command.payload_hmac_sha256.clone(),
+            workflow_id: start_lease.command.workflow_id.clone(),
+            intervention_id: None,
+            temporal_run_id: "temporal-run-integration-1234567890".to_string(),
+        }),
+        dispatch_now + 2,
+        None,
+    )
+    .unwrap_err();
+    assert!(stale_completion
+        .downcast_ref::<jobs::JobsWorkflowCommandError>()
+        .is_some_and(|error| matches!(error, jobs::JobsWorkflowCommandError::StaleLease)));
+
+    jobs::complete_jobs_workflow_command(
+        &harness.pool,
+        &start_lease,
+        jobs::JobsWorkflowCommandCompletion::Accepted(jobs::JobsWorkflowAcceptanceReceipt {
+            outcome: jobs::JobsWorkflowAcceptedOutcome::Accepted,
+            request_id: start_lease.command.request_id.clone(),
+            payload_hmac_sha256: start_lease.command.payload_hmac_sha256.clone(),
+            workflow_id: start_lease.command.workflow_id.clone(),
+            intervention_id: None,
+            temporal_run_id: "temporal-run-integration-1234567890".to_string(),
+        }),
+        dispatch_now + 2,
         None,
     )
     .unwrap();
-    let access_token =
-        auth::jwt::issue(JWT_SECRET, &account_id, auth::jwt::TokenKind::Access).unwrap();
+
+    jobs::update_application(&harness.pool, &account_id, &application_id, "running", None).unwrap();
+
+    let title = "Review the Greenhouse application";
+    let detail = "Review every employer-facing field and document in the preserved form, then approve submission.";
+    let final_review_receipt = json!({
+        "status": "needs_input",
+        "issues": [],
+        "intervention": {
+            "kind": "browser_takeover",
+            "title": title,
+            "detail": detail,
+            "takeoverUrl": "https://takeover.example/session",
+            "resolution": { "kind": "browser_takeover", "resumeAfter": true }
+        }
+    });
+    let prepare_path = format!(
+        "/api/jobs/internal/workflow-commands/{}/intervention/prepare",
+        start_lease.command.request_id
+    );
+    const DEBUG_WORKER_TOKEN: &str = "phase609-debug-worker-body-limit-token";
+    std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", DEBUG_WORKER_TOKEN);
+    let oversized_prepare = harness
+        .jobs_router
+        .clone()
+        .oneshot(debug_worker_oversized_json_request(
+            &prepare_path,
+            DEBUG_WORKER_TOKEN,
+            256 * 1024,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(oversized_prepare.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_workflow_command_response_headers(oversized_prepare.headers());
+    let bounded_paths = [
+        materialize_path.clone(),
+        format!(
+            "/api/jobs/internal/workflow-commands/{}/intervention/wfint-v2-123456789012/publish",
+            start_lease.command.request_id
+        ),
+        format!(
+            "/api/jobs/internal/workflow-commands/{}/finalize",
+            start_lease.command.request_id
+        ),
+    ];
+    for path in &bounded_paths {
+        let oversized = harness
+            .jobs_router
+            .clone()
+            .oneshot(debug_worker_oversized_json_request(
+                path,
+                DEBUG_WORKER_TOKEN,
+                16 * 1024,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "workflow command route did not enforce the 16 KiB limit: {path}"
+        );
+        assert_workflow_command_response_headers(oversized.headers());
+    }
+    std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN");
+    let prepare_body = json!({
+        "schema_version": 2,
+        "workflow_id": start_lease.command.workflow_id,
+        "payload_digest": start_lease.command.payload_hmac_sha256,
+        "operation": "start",
+        "receipt": final_review_receipt,
+    });
+    let interventions_before_prepare = jobs::list_interventions(&harness.pool, &account_id)
+        .unwrap()
+        .len();
+    let application_state_before_prepare =
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap()
+            .state;
+    let browser_status_before_prepare = jobs::list_browser_sessions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == format!("cloud-{application_id}"))
+        .unwrap()
+        .status;
+    let prepared = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &prepare_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-prepare-intervention-0005",
+            &prepare_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prepared.status(), StatusCode::OK);
+    assert_workflow_command_response_headers(prepared.headers());
+    let prepared_bytes = axum::body::to_bytes(prepared.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let prepared_value: serde_json::Value = serde_json::from_slice(&prepared_bytes).unwrap();
+    assert_eq!(prepared_value["schema_version"], 2);
+    assert_eq!(prepared_value["request_id"], start_lease.command.request_id);
+    assert_eq!(
+        prepared_value["workflow_id"],
+        start_lease.command.workflow_id
+    );
+    assert_eq!(
+        prepared_value["payload_digest"],
+        start_lease.command.payload_hmac_sha256
+    );
+    assert_eq!(prepared_value["operation"], "start");
+    assert!(prepared_value.get("command_intervention_id").is_none());
+    assert_eq!(prepared_value["replayed"], false);
+    let prepared_intervention_id = prepared_value["intervention_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(prepared_intervention_id.starts_with("wfint-v2-"));
+    assert_eq!(
+        jobs::list_interventions(&harness.pool, &account_id)
+            .unwrap()
+            .len(),
+        interventions_before_prepare,
+        "prepare must remain hidden until the workflow records its authority"
+    );
+    assert_eq!(
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        application_state_before_prepare,
+        "prepare must not expose needs_input before workflow state records the prompt"
+    );
+    assert_eq!(
+        jobs::list_browser_sessions(&harness.pool, &account_id)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == format!("cloud-{application_id}"))
+            .unwrap()
+            .status,
+        browser_status_before_prepare,
+        "prepare must not pause the browser before publication"
+    );
+
+    let prepared_replay = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &prepare_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-prepare-intervention-0006",
+            &prepare_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(prepared_replay.status(), StatusCode::OK);
+    let prepared_replay_bytes = axum::body::to_bytes(prepared_replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let prepared_replay_value: serde_json::Value =
+        serde_json::from_slice(&prepared_replay_bytes).unwrap();
+    assert_eq!(
+        prepared_replay_value["intervention_id"],
+        prepared_intervention_id
+    );
+    assert_eq!(prepared_replay_value["replayed"], true);
+
+    let mut changed_prepare_body = prepare_body.clone();
+    changed_prepare_body["receipt"]["intervention"]["detail"] = json!("Changed receipt");
+    let changed_prepare = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &prepare_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-prepare-intervention-0007",
+            &changed_prepare_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(changed_prepare.status(), StatusCode::CONFLICT);
+    assert_workflow_command_response_headers(changed_prepare.headers());
+
+    let publish_path = format!(
+        "/api/jobs/internal/workflow-commands/{}/intervention/{prepared_intervention_id}/publish",
+        start_lease.command.request_id
+    );
+    let publish_body = json!({
+        "schema_version": 2,
+        "workflow_id": start_lease.command.workflow_id,
+        "payload_digest": start_lease.command.payload_hmac_sha256,
+        "operation": "start",
+    });
+    let published = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &publish_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-publish-intervention-0008",
+            &publish_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK);
+    assert_workflow_command_response_headers(published.headers());
+    let published_bytes = axum::body::to_bytes(published.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let published_value: serde_json::Value = serde_json::from_slice(&published_bytes).unwrap();
+    assert_eq!(published_value["intervention_id"], prepared_intervention_id);
+    assert_eq!(published_value["replayed"], false);
+    let final_review = jobs::list_interventions(&harness.pool, &account_id)
+        .unwrap()
+        .into_iter()
+        .find(|intervention| intervention.id == prepared_intervention_id)
+        .expect("published intervention becomes visible exactly once");
+    assert_eq!(final_review.title, title);
+    assert_eq!(final_review.detail, detail);
+    assert_eq!(
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "needs_input"
+    );
+    assert_eq!(
+        jobs::list_browser_sessions(&harness.pool, &account_id)
+            .unwrap()
+            .into_iter()
+            .find(|session| session.id == format!("cloud-{application_id}"))
+            .unwrap()
+            .status,
+        "needs_input"
+    );
+
+    let published_replay = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &publish_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-publish-intervention-0009",
+            &publish_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(published_replay.status(), StatusCode::OK);
+    let published_replay_bytes = axum::body::to_bytes(published_replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let published_replay_value: serde_json::Value =
+        serde_json::from_slice(&published_replay_bytes).unwrap();
+    assert_eq!(published_replay_value["replayed"], true);
 
     let generic = jobs::save_intervention(
         &harness.pool,
@@ -6116,43 +6591,6 @@ async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review(
     .await;
     assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
 
-    let title = "Review the Greenhouse application";
-    let detail = "Review every employer-facing field and document in the preserved form, then approve submission.";
-    let final_review = jobs::save_intervention(
-        &harness.pool,
-        &account_id,
-        &Intervention {
-            id: String::new(),
-            application_id: Some(application_id.clone()),
-            kind: "browser_takeover".to_string(),
-            status: "open".to_string(),
-            title: title.to_string(),
-            detail: detail.to_string(),
-            choices: Vec::new(),
-            resolution_kind: "browser_takeover".to_string(),
-            resume_after_resolution: true,
-            provider: String::new(),
-            provider_message_id: String::new(),
-            expires_at_ms: None,
-            metadata: json!({
-                "_bluey_worker_receipt_v1": true,
-                "receipt": {
-                    "status": "needs_input",
-                    "issues": [],
-                    "intervention": {
-                        "kind": "browser_takeover",
-                        "title": title,
-                        "detail": detail,
-                        "takeoverUrl": "https://takeover.example/session",
-                        "resolution": { "kind": "browser_takeover", "resumeAfter": true }
-                    }
-                }
-            }),
-            created_at_ms: 0,
-            resolved_at_ms: None,
-        },
-    )
-    .unwrap();
     let answer_rejected = resolve_intervention_request(
         &harness,
         &access_token,
@@ -6166,20 +6604,6 @@ async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review(
     .await;
     assert_eq!(answer_rejected.status(), StatusCode::BAD_REQUEST);
 
-    std::env::set_var("BLUEY_JOBS_WORKFLOW_ORIGIN", harness.openai.uri());
-    std::env::set_var("BLUEY_JOBS_WORKFLOW_TOKEN", WORKFLOW_TOKEN);
-    let resume_path = format!("/workflows/applications/{account_id}/{run_id}/resume");
-    Mock::given(method("POST"))
-        .and(path(resume_path.as_str()))
-        .and(header(
-            "authorization",
-            format!("Bearer {WORKFLOW_TOKEN}").as_str(),
-        ))
-        .respond_with(ResponseTemplate::new(202).set_body_json(json!({ "resumed": true })))
-        .expect(1)
-        .mount(&harness.openai)
-        .await;
-
     let approved = resolve_intervention_request(
         &harness,
         &access_token,
@@ -6192,21 +6616,246 @@ async fn jobs_submission_approval_accepts_only_the_stored_provider_final_review(
         .await
         .unwrap();
     let approved_value: serde_json::Value = serde_json::from_slice(&approved_bytes).unwrap();
-    let requests = harness.openai.received_requests().await.unwrap();
-    let resume_request = requests
-        .iter()
-        .find(|request| request.url.path() == resume_path)
-        .unwrap();
-    let resume_body: serde_json::Value = serde_json::from_slice(&resume_request.body).unwrap();
-    std::env::remove_var("BLUEY_JOBS_WORKFLOW_ORIGIN");
-    std::env::remove_var("BLUEY_JOBS_WORKFLOW_TOKEN");
 
     assert_eq!(approved_status, StatusCode::OK);
     assert_eq!(approved_value["intervention"]["status"], "approved");
-    assert_eq!(approved_value["application"]["state"], "queued");
-    assert_eq!(resume_body["action"], "approve_submission");
-    assert_eq!(resume_body["field"], "");
-    assert_eq!(resume_body["answer"], "");
+    assert_eq!(approved_value["application"]["state"], "needs_input");
+    assert_eq!(approved_value["workflow_command"]["schema_version"], 2);
+    assert_eq!(approved_value["workflow_command"]["operation"], "resume");
+    assert_eq!(approved_value["workflow_command"]["state"], "pending");
+    assert_eq!(approved_value["workflow_command"]["replayed"], false);
+
+    let replay = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &final_review.id,
+        json!({ "status": "resolved", "action": "approve_submission" }),
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    let replay_bytes = axum::body::to_bytes(replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let replay_value: serde_json::Value = serde_json::from_slice(&replay_bytes).unwrap();
+    assert_eq!(
+        replay_value["workflow_command"]["command_id"],
+        approved_value["workflow_command"]["command_id"]
+    );
+    assert_eq!(
+        replay_value["workflow_command"]["request_id"],
+        approved_value["workflow_command"]["request_id"]
+    );
+    assert_eq!(replay_value["workflow_command"]["replayed"], true);
+
+    let resume_dispatch_now = chrono::Utc::now().timestamp_millis() + 100;
+    let resume_lease = jobs::claim_jobs_workflow_command(
+        &harness.pool,
+        "integration-dispatcher-owner",
+        resume_dispatch_now,
+        30_000,
+    )
+    .unwrap()
+    .expect("claim staged resume command");
+    assert_eq!(
+        resume_lease.command.request_id,
+        approved_value["workflow_command"]["request_id"]
+    );
+    assert_eq!(
+        resume_lease.command.intervention_id.as_deref(),
+        Some(final_review.id.as_str())
+    );
+    jobs::mark_jobs_workflow_command_request_started(
+        &harness.pool,
+        &resume_lease,
+        resume_dispatch_now + 1,
+    )
+    .unwrap();
+    jobs::complete_jobs_workflow_command(
+        &harness.pool,
+        &resume_lease,
+        jobs::JobsWorkflowCommandCompletion::Accepted(jobs::JobsWorkflowAcceptanceReceipt {
+            outcome: jobs::JobsWorkflowAcceptedOutcome::Accepted,
+            request_id: resume_lease.command.request_id.clone(),
+            payload_hmac_sha256: resume_lease.command.payload_hmac_sha256.clone(),
+            workflow_id: resume_lease.command.workflow_id.clone(),
+            intervention_id: resume_lease.command.intervention_id.clone(),
+            temporal_run_id: "temporal-run-integration-1234567890".to_string(),
+        }),
+        resume_dispatch_now + 2,
+        None,
+    )
+    .unwrap();
+    let finalize_path = format!(
+        "/api/jobs/internal/workflow-commands/{}/finalize",
+        resume_lease.command.request_id
+    );
+    let finalize_body = json!({
+        "schema_version": 2,
+        "workflow_id": resume_lease.command.workflow_id,
+        "payload_digest": resume_lease.command.payload_hmac_sha256,
+        "operation": "resume",
+        "intervention_id": final_review.id,
+        "terminal_state": "failed",
+        "reason_code": "runner_failed",
+    });
+    let blocked_finalization = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &finalize_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-finalize-open-intervention-0010",
+            &finalize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked_finalization.status(), StatusCode::CONFLICT);
+    assert_workflow_command_response_headers(blocked_finalization.headers());
+    assert_eq!(
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "needs_input",
+        "fresh runner failure must not terminalize beside an open public intervention"
+    );
+
+    let mut ambiguous_finalize_body = finalize_body.clone();
+    ambiguous_finalize_body["terminal_state"] = json!("side_effect_unknown");
+    ambiguous_finalize_body["reason_code"] = json!("runner_ambiguous");
+    let blocked_ambiguous_finalization = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &finalize_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-finalize-open-ambiguous-0011",
+            &ambiguous_finalize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked_ambiguous_finalization.status(),
+        StatusCode::CONFLICT
+    );
+    assert_workflow_command_response_headers(blocked_ambiguous_finalization.headers());
+
+    let cancelled_generic = resolve_intervention_request(
+        &harness,
+        &access_token,
+        &generic.id,
+        json!({ "status": "cancelled" }),
+    )
+    .await;
+    assert_eq!(cancelled_generic.status(), StatusCode::OK);
+
+    let finalized = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &finalize_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-finalize-workflow-0012",
+            &finalize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(finalized.status(), StatusCode::OK);
+    assert_workflow_command_response_headers(finalized.headers());
+    let finalized_bytes = axum::body::to_bytes(finalized.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let finalized_value: serde_json::Value = serde_json::from_slice(&finalized_bytes).unwrap();
+    assert_eq!(finalized_value["schema_version"], 2);
+    assert_eq!(
+        finalized_value["request_id"],
+        resume_lease.command.request_id
+    );
+    assert_eq!(
+        finalized_value["workflow_id"],
+        resume_lease.command.workflow_id
+    );
+    assert_eq!(
+        finalized_value["payload_digest"],
+        resume_lease.command.payload_hmac_sha256
+    );
+    assert_eq!(finalized_value["operation"], "resume");
+    assert_eq!(finalized_value["command_intervention_id"], final_review.id);
+    assert!(finalized_value.get("open_intervention_id").is_none());
+    assert_eq!(finalized_value["terminal_state"], "failed");
+    assert_eq!(finalized_value["reason_code"], "runner_failed");
+    assert_eq!(finalized_value["replayed"], false);
+
+    jobs::save_intervention(&harness.pool, &account_id, &generic).unwrap();
+    assert!(jobs::list_interventions(&harness.pool, &account_id)
+        .unwrap()
+        .iter()
+        .any(|intervention| intervention.id == generic.id && intervention.status == "open"));
+
+    let finalized_replay = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &finalize_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-finalize-workflow-0013",
+            &finalize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(finalized_replay.status(), StatusCode::OK);
+    let finalized_replay_bytes = axum::body::to_bytes(finalized_replay.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let finalized_replay_value: serde_json::Value =
+        serde_json::from_slice(&finalized_replay_bytes).unwrap();
+    assert_eq!(finalized_replay_value["replayed"], true);
+
+    let mut invalid_finalize_body = finalize_body.clone();
+    invalid_finalize_body["reason_code"] = json!("intervention_timeout");
+    let invalid_finalization = harness
+        .jobs_router
+        .clone()
+        .oneshot(signed_worker_json_request(
+            &finalize_path,
+            "workflow-command-execution",
+            "phase609-workflow-worker",
+            worker_timestamp,
+            "phase609-finalize-workflow-0014",
+            &invalid_finalize_body,
+            WORKER_SIGNING_KEY,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(invalid_finalization.status(), StatusCode::BAD_REQUEST);
+    assert_workflow_command_response_headers(invalid_finalization.headers());
+    assert_eq!(
+        jobs::get_application(&harness.pool, &account_id, &application_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "failed"
+    );
+    assert!(harness
+        .openai
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .all(|request| request.url.path() != "/workflow-commands"));
+    std::env::remove_var("BLUEY_JOBS_WORKER_SIGNING_KEY");
 }
 
 #[tokio::test]

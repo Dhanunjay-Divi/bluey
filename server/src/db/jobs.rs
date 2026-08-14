@@ -2185,6 +2185,7 @@ include!("jobs/customer_data.rs");
 include!("jobs/submission_reconciliation.rs");
 include!("jobs/mailbox_sync.rs");
 include!("jobs/communication_actions.rs");
+include!("jobs/workflow_commands.rs");
 include!("jobs/execution_authority.rs");
 include!("jobs/local_runner.rs");
 include!("jobs/execution_leases.rs");

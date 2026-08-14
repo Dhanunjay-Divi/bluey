@@ -24,6 +24,8 @@ const DISCOVERY_SIGNED_BODY_BYTES: usize = 32 * 1024 * 1024;
 const BROWSER_PROFILE_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 const RECEIPT_SIGNED_BODY_BYTES: usize = 64 * 1024 * 1024;
 const ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES: usize = 256 * 1024;
+const WORKFLOW_COMMAND_SIGNED_BODY_BYTES: usize = 16 * 1024;
+const WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES: usize = 256 * 1024;
 const ATS_LAYOUT_OBSERVATION_PATH: &str =
     "/api/jobs/internal/ats-certifications/layout-observations";
 
@@ -200,7 +202,11 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
     if !method.eq_ignore_ascii_case("POST") || !path.starts_with("/api/jobs/internal/") {
         return None;
     }
-    if path == ATS_LAYOUT_OBSERVATION_PATH {
+    if workflow_command_materialize_path(path) {
+        Some("workflow-command-materialize")
+    } else if workflow_command_execution_path(path) {
+        Some("workflow-command-execution")
+    } else if path == ATS_LAYOUT_OBSERVATION_PATH {
         Some("ats-layout-observation")
     } else if path.contains("/runner-volumes/") {
         Some("runner-volume")
@@ -222,7 +228,11 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
 }
 
 fn signed_body_limit(path: &str) -> usize {
-    if path == ATS_LAYOUT_OBSERVATION_PATH {
+    if workflow_command_intervention_prepare_path(path) {
+        WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES
+    } else if workflow_command_materialize_path(path) || workflow_command_execution_path(path) {
+        WORKFLOW_COMMAND_SIGNED_BODY_BYTES
+    } else if path == ATS_LAYOUT_OBSERVATION_PATH {
         ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES
     } else if path.ends_with("/receipt") {
         RECEIPT_SIGNED_BODY_BYTES
@@ -235,6 +245,58 @@ fn signed_body_limit(path: &str) -> usize {
     } else {
         DEFAULT_SIGNED_BODY_BYTES
     }
+}
+
+fn workflow_command_materialize_path(path: &str) -> bool {
+    let Some(request_id) = path
+        .strip_prefix("/api/jobs/internal/workflow-commands/")
+        .and_then(|rest| rest.strip_suffix("/materialize"))
+    else {
+        return false;
+    };
+    valid_workflow_identifier(request_id, 20, 128)
+}
+
+fn workflow_command_execution_path(path: &str) -> bool {
+    workflow_command_intervention_prepare_path(path)
+        || workflow_command_finalize_path(path)
+        || workflow_command_intervention_publish_path(path)
+}
+
+fn workflow_command_intervention_prepare_path(path: &str) -> bool {
+    workflow_command_request_id(path, "/intervention/prepare").is_some()
+}
+
+fn workflow_command_finalize_path(path: &str) -> bool {
+    workflow_command_request_id(path, "/finalize").is_some()
+}
+
+fn workflow_command_intervention_publish_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/jobs/internal/workflow-commands/") else {
+        return false;
+    };
+    let Some((request_id, rest)) = rest.split_once("/intervention/") else {
+        return false;
+    };
+    let Some(intervention_id) = rest.strip_suffix("/publish") else {
+        return false;
+    };
+    valid_workflow_identifier(request_id, 20, 128)
+        && valid_workflow_identifier(intervention_id, 20, 128)
+}
+
+fn workflow_command_request_id<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let request_id = path
+        .strip_prefix("/api/jobs/internal/workflow-commands/")?
+        .strip_suffix(suffix)?;
+    valid_workflow_identifier(request_id, 20, 128).then_some(request_id)
+}
+
+fn valid_workflow_identifier(value: &str, min: usize, max: usize) -> bool {
+    (min..=max).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
 fn required_header<'a>(request: &'a Request<Body>, name: &str) -> Result<&'a str, AuthError> {
@@ -340,6 +402,55 @@ mod tests {
         assert_eq!(
             worker_scope(
                 "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/materialize"
+            ),
+            Some("workflow-command-materialize")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/prepare"
+            ),
+            Some("workflow-command-execution")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/wfint-v2-123456789012/publish"
+            ),
+            Some("workflow-command-execution")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/finalize"
+            ),
+            Some("workflow-command-execution")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/short/materialize"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq-v2-1234567890/intervention/short/publish"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/workflow-commands/wfreq:v2:1234567890/materialize"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
                 "/api/jobs/internal/ats-certifications/layout-observations/extra"
             ),
             None
@@ -371,6 +482,24 @@ mod tests {
         assert_eq!(
             signed_body_limit(ATS_LAYOUT_OBSERVATION_PATH),
             ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/materialize"
+            ),
+            WORKFLOW_COMMAND_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/prepare"
+            ),
+            WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit(
+                "/api/jobs/internal/workflow-commands/wfreq-v2-123456789012/intervention/wfint-v2-123456789012/publish"
+            ),
+            WORKFLOW_COMMAND_SIGNED_BODY_BYTES
         );
     }
 

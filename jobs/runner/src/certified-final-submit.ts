@@ -8,23 +8,24 @@ type FinalSubmitCheckpointAuthority = Pick<
 >;
 
 /**
- * Phase B must authorize the one-use submit before a durable irreversible
- * checkpoint can be written. The caller may activate the provider control
- * only after this boundary resolves.
+ * Record the irreversible-attempt boundary before Phase B I/O. A lost Phase B
+ * success response must remain recoverable after a hard restart even when the
+ * caller cannot write a second checkpoint. The caller may activate the
+ * provider control only after Phase B resolves successfully.
  */
 export async function authorizeCloudFinalSubmitBeforeCheckpoint(
   lease: FinalSubmitAuthorizer,
   proof: FinalSubmitProof,
   writeCheckpoint: () => Promise<void>,
 ): Promise<void> {
-  await lease.beforeFinalSubmit(proof);
   await writeCheckpoint();
+  await lease.beforeFinalSubmit(proof);
 }
 
 /**
- * A failed Phase B attempt is single-shot, but it is not durable local proof
- * that submit was authorized. Only a successful response may retain or write
- * an irreversible cloud checkpoint.
+ * A failed Phase B attempt does not expose certified click authority. The
+ * conservative pre-I/O checkpoint is still retained because a transport
+ * failure cannot distinguish a server rejection from a lost success response.
  */
 export function hasCloudIrreversibleCheckpointAuthority(
   lease: FinalSubmitCheckpointAuthority,

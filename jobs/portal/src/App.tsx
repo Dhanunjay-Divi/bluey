@@ -43,6 +43,7 @@ import {
   isCloudAutomationEligibleApplication,
   interventionActionResumesApplication,
   interventionResolutionToast,
+  workspaceNeedsCloudAutomationRefresh,
 } from "./lib/application-flow";
 import { validateMailboxOAuthAuthorizationUrl } from "./lib/mailbox-oauth";
 
@@ -203,6 +204,25 @@ export default function App() {
   useEffect(() => {
     if (!isPreview && accessToken()) void refresh();
   }, [refresh]);
+
+  useEffect(() => {
+    if (isPreview
+      || !workspace
+      || !accessToken()
+      || !workspaceNeedsCloudAutomationRefresh(workspace)) return;
+
+    let cancelled = false;
+    let timer = 0;
+    const poll = async () => {
+      await refresh();
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 5_000);
+    };
+    timer = window.setTimeout(() => void poll(), 3_000);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [refresh, workspace]);
 
   useEffect(() => {
     if (!toast) return;

@@ -9,6 +9,7 @@ import {
   type DurableResultContext,
 } from "./result-store.js";
 import type { ManagedResultStorage } from "./subject-storage-manager.js";
+import { requestIdMatchesRun } from "./run-checkpoint-store.js";
 
 export interface SubmittedResultRecoveryAuthority {
   accountId: string;
@@ -215,10 +216,7 @@ function validRecoveryAuthority(
   authority: SubmittedResultRecoveryAuthority,
 ): boolean {
   const requestId = authority.resultContext.requestId;
-  const validRequestId =
-    requestId === `${authority.runId}:initial` ||
-    (requestId.startsWith(`${authority.runId}:resume:`) &&
-      /^:resume:[1-6]$/.test(requestId.slice(authority.runId.length)));
+  const validRequestId = requestIdMatchesRun(authority.runId, requestId);
   return (
     /^[A-Za-z0-9_-]{3,160}$/.test(authority.accountId) &&
     /^[A-Za-z0-9_-]{3,160}$/.test(authority.applicationId) &&

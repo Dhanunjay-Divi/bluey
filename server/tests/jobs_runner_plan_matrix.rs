@@ -23,10 +23,7 @@ use serde_json::{json, Value};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
-use wiremock::{
-    matchers::{header, method, path},
-    Mock, MockServer, ResponseTemplate,
-};
+use wiremock::MockServer;
 
 const TEST_SECRET: &str = "jobs-runner-plan-matrix-secret-32-bytes";
 const JOBS_DATA_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -577,6 +574,21 @@ impl Drop for TestContext {
     }
 }
 
+#[test]
+fn jobs_api_handlers_have_no_direct_workflow_gateway_boundary() {
+    let api_source = include_str!("../src/api/jobs.rs");
+    assert!(!api_source.contains("/workflows/applications"));
+    assert!(!api_source.contains("signal_workflow_resume"));
+    assert!(!api_source.contains("WORKFLOW_START_TIMEOUT"));
+    assert!(api_source.contains("stage_cloud_workflow_start"));
+    assert!(api_source.contains("stage_cloud_workflow_resume"));
+    assert!(api_source.contains("mark_jobs_workflow_execution_submitted"));
+
+    let dispatcher_source = include_str!("../src/jobs_workflow_dispatch.rs");
+    assert!(dispatcher_source.contains("join(\"workflow-commands\")"));
+    assert!(!dispatcher_source.contains("workflows/applications"));
+}
+
 #[tokio::test]
 #[serial]
 async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
@@ -707,7 +719,8 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
     assert!(!replay.newly_metered);
     assert_eq!(replay.used_packets, 1);
 
-    // Cloud includes both runners, but the cloud path is unavailable without its gateway.
+    // Cloud includes both runners. The request handler only stages durable work; it never
+    // depends on gateway configuration or performs gateway I/O.
     let cloud = ctx.account("cloud", "cloud");
     assign_browser_release_channel(&ctx.pool, &cloud.account.id);
     let cloud_local_application = ctx.prepare(&cloud.account, "cloud-local");
@@ -722,28 +735,42 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
     let (cloud_gateway_approval, _) = ctx.approve(&cloud_gateway_application, &cloud.token).await;
     assert_eq!(cloud_gateway_approval, StatusCode::OK);
     std::env::remove_var("BLUEY_JOBS_WORKFLOW_TOKEN");
-    let (missing_gateway_status, _) = ctx
+    let (staged_status, staged_body) = ctx
         .queue(&cloud_gateway_application, &cloud.token, "cloud")
         .await;
-    assert_eq!(missing_gateway_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(staged_status, StatusCode::OK, "{staged_body}");
+    assert_eq!(staged_body["application"]["state"], "queued");
+    assert_eq!(staged_body["browser_session"]["runner"], "cloud");
+    assert!(staged_body["browser_session"]["id"]
+        .as_str()
+        .is_some_and(|session_id| session_id.starts_with("cloud-")));
+    assert!(staged_body["workflow_id"]
+        .as_str()
+        .is_some_and(|workflow_id| workflow_id.starts_with("bluey-jobs-v2-")));
+    assert_eq!(staged_body["workflow_command"]["schema_version"], 2);
+    assert_eq!(staged_body["workflow_command"]["operation"], "start");
+    assert_eq!(staged_body["workflow_command"]["state"], "pending");
+    assert_eq!(staged_body["workflow_command"]["replayed"], false);
 
     let gateway = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/workflows/applications"))
-        .and(header("authorization", "Bearer matrix-workflow-token"))
-        .respond_with(ResponseTemplate::new(200))
-        .expect(1)
-        .mount(&gateway)
-        .await;
     std::env::set_var("BLUEY_JOBS_WORKFLOW_ORIGIN", gateway.uri());
     std::env::set_var("BLUEY_JOBS_WORKFLOW_TOKEN", "matrix-workflow-token");
-    let (cloud_status, cloud_body) = ctx
+    let (replay_status, replay_body) = ctx
         .queue(&cloud_gateway_application, &cloud.token, "cloud")
         .await;
-    assert_eq!(cloud_status, StatusCode::OK);
-    assert_eq!(cloud_body["application"]["state"], "queued");
-    assert_eq!(cloud_body["browser_session"]["runner"], "cloud");
-    assert!(cloud_body["workflow_id"]
-        .as_str()
-        .is_some_and(|workflow_id| workflow_id.starts_with("bluey-jobs:")));
+    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(
+        replay_body["workflow_command"]["command_id"],
+        staged_body["workflow_command"]["command_id"]
+    );
+    assert_eq!(
+        replay_body["workflow_command"]["request_id"],
+        staged_body["workflow_command"]["request_id"]
+    );
+    assert_eq!(
+        replay_body["workflow_command"]["workflow_id"],
+        staged_body["workflow_command"]["workflow_id"]
+    );
+    assert_eq!(replay_body["workflow_command"]["replayed"], true);
+    assert!(gateway.received_requests().await.unwrap().is_empty());
 }

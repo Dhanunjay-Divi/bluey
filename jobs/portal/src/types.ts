@@ -361,6 +361,7 @@ export interface InterventionResolutionResult {
   intervention: Intervention;
   answer_memory?: AnswerMemory;
   application?: JobApplication;
+  workflow_command?: WorkflowCommandAdmission;
 }
 
 export interface ApplicationEvidence {
@@ -671,5 +672,24 @@ export interface QueueApplicationRunResponse {
   browser_session: BrowserSession;
   workflow_id: string;
   run_id: string;
+  workflow_command?: WorkflowCommandAdmission;
   launch_url?: string;
+}
+
+export interface WorkflowCommandAdmission {
+  schema_version: 2;
+  command_id: string;
+  request_id: string;
+  workflow_id: string;
+  operation: "start" | "resume";
+  state:
+    | "pending"
+    | "claimed"
+    | "delivering"
+    | "delivery_unknown"
+    | "accepted"
+    | "identity_conflict"
+    | "rejected"
+    | "cancelled";
+  replayed: boolean;
 }
