@@ -16,6 +16,7 @@ import {
   cloudAutomationEligibleApplications,
   isCloudAutomationEligibleApplication,
   isFinalSubmissionReview,
+  workspaceNeedsCloudAutomationRefresh,
 } from "./application-flow";
 
 const runners = (available: boolean): RunnerAvailability => ({
@@ -185,14 +186,50 @@ describe("application workflow boundaries", () => {
     (action) => {
       expect(interventionActionResumesApplication(action)).toBe(true);
       expect(applicationAfterInterventionResolution(application("needs_input"), undefined, action, 2))
-        .toMatchObject({ state: "queued", updated_at_ms: 2 });
+        .toMatchObject({ state: "needs_input", updated_at_ms: 2 });
       expect(browserSessionAfterInterventionResolution(browserSession, action, 2)).toMatchObject({
-        status: "queued",
-        current_step: "Resuming application",
+        status: "needs_input",
+        current_step: "Approval saved; secure resume queued",
         updated_at_ms: 2,
       });
+      expect(interventionResolutionToast(action)).toContain("resume is queued");
     },
   );
+
+  it("polls only while managed cloud work can still change without user input", () => {
+    const session = { ...browserSession, runner: "cloud" as const };
+    const approvedIntervention = {
+      ...finalReviewIntervention(),
+      application_id: session.application_id,
+      status: "approved",
+    };
+
+    expect(workspaceNeedsCloudAutomationRefresh({
+      browser_sessions: [{ ...session, status: "queued" }],
+      interventions: [],
+    })).toBe(true);
+    expect(workspaceNeedsCloudAutomationRefresh({
+      browser_sessions: [{ ...session, status: "running" }],
+      interventions: [],
+    })).toBe(true);
+    expect(workspaceNeedsCloudAutomationRefresh({
+      browser_sessions: [{ ...session, status: "needs_input" }],
+      interventions: [approvedIntervention],
+    })).toBe(true);
+
+    expect(workspaceNeedsCloudAutomationRefresh({
+      browser_sessions: [{ ...session, status: "needs_input" }],
+      interventions: [{ ...approvedIntervention, status: "open" }],
+    })).toBe(false);
+    expect(workspaceNeedsCloudAutomationRefresh({
+      browser_sessions: [{ ...session, runner: "local", status: "running" }],
+      interventions: [],
+    })).toBe(false);
+    expect(workspaceNeedsCloudAutomationRefresh({
+      browser_sessions: [{ ...session, status: "complete" }],
+      interventions: [],
+    })).toBe(false);
+  });
 
   it("recognizes only the structured, open final-review intervention", () => {
     const intervention = finalReviewIntervention();

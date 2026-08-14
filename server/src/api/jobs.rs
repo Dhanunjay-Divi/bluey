@@ -5,8 +5,8 @@
 
 use axum::{
     body::Body,
-    extract::{DefaultBodyLimit, Path, State},
-    http::{HeaderMap, Request, StatusCode},
+    extract::{rejection::JsonRejection, DefaultBodyLimit, Path, State},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -41,12 +41,56 @@ use crate::{
 
 pub(super) type ApiError = (StatusCode, String);
 
+#[derive(Debug, Serialize)]
+pub struct WorkflowCommandAdmissionResponse {
+    pub schema_version: i64,
+    pub command_id: String,
+    pub request_id: String,
+    pub workflow_id: String,
+    pub operation: String,
+    pub state: String,
+    pub replayed: bool,
+}
+
+impl WorkflowCommandAdmissionResponse {
+    fn from_admission(admission: &jobs::JobsWorkflowCommandAdmission) -> Self {
+        Self {
+            schema_version: admission.command.protocol_version,
+            command_id: admission.command.id.clone(),
+            request_id: admission.command.request_id.clone(),
+            workflow_id: admission.command.workflow_id.clone(),
+            operation: match admission.command.command_kind {
+                jobs::JobsWorkflowCommandKind::Start => "start",
+                jobs::JobsWorkflowCommandKind::Resume => "resume",
+            }
+            .to_string(),
+            state: workflow_command_state_name(admission.command.state).to_string(),
+            replayed: admission.replayed,
+        }
+    }
+}
+
+fn workflow_command_state_name(state: jobs::JobsWorkflowCommandState) -> &'static str {
+    match state {
+        jobs::JobsWorkflowCommandState::Pending => "pending",
+        jobs::JobsWorkflowCommandState::Claimed => "claimed",
+        jobs::JobsWorkflowCommandState::Delivering => "delivering",
+        jobs::JobsWorkflowCommandState::DeliveryUnknown => "delivery_unknown",
+        jobs::JobsWorkflowCommandState::Accepted => "accepted",
+        jobs::JobsWorkflowCommandState::IdentityConflict => "identity_conflict",
+        jobs::JobsWorkflowCommandState::Rejected => "rejected",
+        jobs::JobsWorkflowCommandState::Cancelled => "cancelled",
+    }
+}
+
 // Receipts include the exact resume and confirmation screenshot as base64 so
 // the server can verify and persist evidence before accepting "submitted".
 const RECEIPT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const DISCOVERY_SNAPSHOT_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
 const BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const EXECUTION_LEASE_CLAIM_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const WORKFLOW_COMMAND_BODY_LIMIT_BYTES: usize = 16 * 1024;
+const WORKFLOW_INTERVENTION_PREPARE_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const TRUSTED_WORKER_RECEIPT_KEY: &str = "_bluey_worker_receipt_v1";
 const SUBMISSION_FINGERPRINT_KEY: &str = "_bluey_server_submission_fingerprint_v1";
 const MAX_RECEIPT_DOCUMENTS: usize = 8;
@@ -275,6 +319,27 @@ pub fn worker_router() -> Router<AppState> {
             post(worker_store_browser_profile_snapshot).route_layer(DefaultBodyLimit::max(
                 BROWSER_PROFILE_SNAPSHOT_BODY_LIMIT_BYTES,
             )),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/materialize",
+            post(worker_materialize_workflow_command)
+                .route_layer(DefaultBodyLimit::max(WORKFLOW_COMMAND_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/intervention/prepare",
+            post(worker_prepare_workflow_intervention).route_layer(DefaultBodyLimit::max(
+                WORKFLOW_INTERVENTION_PREPARE_BODY_LIMIT_BYTES,
+            )),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/intervention/:intervention_id/publish",
+            post(worker_publish_workflow_intervention)
+                .route_layer(DefaultBodyLimit::max(WORKFLOW_COMMAND_BODY_LIMIT_BYTES)),
+        )
+        .route(
+            "/api/jobs/internal/workflow-commands/:request_id/finalize",
+            post(worker_finalize_workflow_execution)
+                .route_layer(DefaultBodyLimit::max(WORKFLOW_COMMAND_BODY_LIMIT_BYTES)),
         )
         .route(
             "/api/jobs/internal/discovery/lease",
@@ -2394,6 +2459,8 @@ pub struct QueueApplicationRunResponse {
     pub workflow_id: String,
     pub run_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_command: Option<WorkflowCommandAdmissionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub launch_url: Option<String>,
 }
 
@@ -2477,26 +2544,26 @@ pub async fn queue_application_run(
             .unwrap_or_else(|| "This site is not eligible for that runner.".to_string());
         return Err((StatusCode::CONFLICT, message));
     }
-    let (identity_id, identity_email) = approved_application_identity(&application)?;
-    let existing_run = if matches!(
+    let existing_run_id = if matches!(
         application.state.as_str(),
         "queued" | "running" | "needs_input"
     ) {
-        if let Some(run_id) = application.run_id.clone() {
-            jobs::list_browser_sessions(&state.pool, &account.id)
-                .map_err(internal)?
-                .into_iter()
-                .find(|session| session.id == run_id)
-                .map(|session| (run_id, session))
-        } else {
-            None
-        }
+        application.run_id.clone()
     } else {
         None
     };
-    if existing_run
+    let existing_session = if let Some(run_id) = existing_run_id.as_deref() {
+        let cloud_session_id = format!("cloud-{}", application.id);
+        jobs::list_browser_sessions(&state.pool, &account.id)
+            .map_err(internal)?
+            .into_iter()
+            .find(|session| session.id == run_id || session.id == cloud_session_id)
+    } else {
+        None
+    };
+    if existing_session
         .as_ref()
-        .is_some_and(|(_, session)| session.runner != req.runner)
+        .is_some_and(|session| session.runner != req.runner)
     {
         return Err((
             StatusCode::CONFLICT,
@@ -2510,32 +2577,76 @@ pub async fn queue_application_run(
             "This listing needs a reviewed handoff before cloud automation.".to_string(),
         ));
     }
-    let run_id = existing_run
-        .as_ref()
-        .map(|(run_id, _)| run_id.clone())
-        .unwrap_or_else(|| {
-            application_run_id(
-                &account.id,
-                &application.id,
-                &resume.id,
-                application.updated_at_ms,
-            )
-        });
-    let cloud_gateway = if req.runner == "cloud" {
-        let origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
-            .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-        let token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
-        if token.is_empty() {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                "The cloud runner is temporarily unavailable.".to_string(),
-            ));
-        }
-        Some((origin, token))
-    } else {
-        None
-    };
-    jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, &req.runner)
+    let run_id = existing_run_id.unwrap_or_else(|| {
+        application_run_id(
+            &account.id,
+            &application.id,
+            &resume.id,
+            application.updated_at_ms,
+        )
+    });
+    let private_workflow_input = approved_workflow_input(
+        &account.id,
+        &application,
+        &posting,
+        &resume,
+        &req.runner,
+        &run_id,
+    )?;
+    if req.runner == "cloud" {
+        let workflow_id = workflow_id_for_run(&run_id);
+        let browser_session_id = format!("cloud-{}", application.id);
+        let browser_session = existing_session
+            .as_ref()
+            .filter(|session| session.id == browser_session_id)
+            .cloned()
+            .unwrap_or_else(|| BrowserSession {
+                id: browser_session_id.clone(),
+                runner: "cloud".to_string(),
+                status: "queued".to_string(),
+                current_company: posting.company.clone(),
+                current_step: "Waiting for a browser".to_string(),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            });
+        let admission = jobs::stage_cloud_workflow_start(
+            &state.pool,
+            &jobs::StageCloudWorkflowStart {
+                account_id: account.id.clone(),
+                application_id: application.id.clone(),
+                run_id: run_id.clone(),
+                workflow_id: workflow_id.clone(),
+                idempotency_key: run_id.clone(),
+                workflow_input: private_workflow_input,
+                browser_session,
+                now_ms: jobs::now_ms(),
+            },
+        )
+        .map_err(domain_error)?;
+        application = jobs::get_application(&state.pool, &account.id, &application.id)
+            .map_err(internal)?
+            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+        let browser_session = jobs::list_browser_sessions(&state.pool, &account.id)
+            .map_err(internal)?
+            .into_iter()
+            .find(|session| session.id == browser_session_id)
+            .ok_or((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "The queued cloud browser session is unavailable.".to_string(),
+            ))?;
+        return Ok(Json(QueueApplicationRunResponse {
+            application,
+            browser_session,
+            workflow_id,
+            run_id,
+            workflow_command: Some(WorkflowCommandAdmissionResponse::from_admission(&admission)),
+            launch_url: None,
+        }));
+    }
+
+    jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "local")
         .map_err(domain_error)?;
     jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(|error| {
         let _ = jobs::update_attempt_reservation_status(
@@ -2557,125 +2668,67 @@ pub async fn queue_application_run(
         .map_err(domain_error)?
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
     }
-
-    let (mut frozen_packet, frozen_job, approved_packet_checksum) =
-        approved_execution_snapshot(&application)?;
-    validate_approved_execution_matches(
-        &application,
-        &posting,
-        &resume,
-        &identity_id,
-        &identity_email,
-        &frozen_packet,
-        &frozen_job,
-    )?;
-    let browser_profile_id = browser_profile_id(&account.id, &identity_id);
-    attach_approved_execution_transport(
-        &application,
-        &mut frozen_packet,
-        approved_packet_checksum,
-    )?;
-    let workflow_input = json!({
-        "accountId": account.id,
-        "applicationId": application.id,
-        "jobId": posting.id,
-        "canonicalJobKey": posting.canonical_key,
-        "packetId": resume.id,
-        "applicationIdentityId": identity_id,
-        "browserProfileId": browser_profile_id,
-        "packet": frozen_packet,
-        "job": frozen_job,
-        "runner": req.runner,
-        "url": posting.canonical_url,
-        "idempotencyKey": run_id,
-        "runId": run_id,
-        "browserSessionId": format!("{}-{}", req.runner, application.id),
+    let mut browser_session = existing_session.unwrap_or_else(|| BrowserSession {
+        id: run_id.clone(),
+        runner: "local".to_string(),
+        status: "queued".to_string(),
+        current_company: posting.company.clone(),
+        current_step: "Waiting for a browser".to_string(),
+        application_id: Some(application.id.clone()),
+        takeover_url: None,
+        created_at_ms: 0,
+        updated_at_ms: 0,
     });
-    if let Some((gateway_origin, gateway_token)) = cloud_gateway.as_ref() {
-        let response = reqwest::Client::new()
-            .post(format!(
-                "{}/workflows/applications",
-                gateway_origin.trim_end_matches('/')
-            ))
-            .bearer_auth(gateway_token)
-            .json(&workflow_input)
-            .send()
-            .await
-            .map_err(|error| {
-                tracing::error!(error = %error, "Bluey Jobs workflow gateway failed");
-                (
-                    StatusCode::BAD_GATEWAY,
-                    "Bluey could not start the cloud application. Try again.".to_string(),
-                )
-            })?;
-        if !response.status().is_success() && response.status() != StatusCode::CONFLICT {
-            tracing::error!(status = %response.status(), "Bluey Jobs workflow gateway rejected run");
-            return Err((
-                StatusCode::BAD_GATEWAY,
-                "Bluey could not start the cloud application. Try again.".to_string(),
-            ));
-        }
-    }
-
-    let mut browser_session =
-        existing_run
-            .map(|(_, session)| session)
-            .unwrap_or_else(|| BrowserSession {
-                id: run_id.clone(),
-                runner: req.runner.clone(),
-                status: "queued".to_string(),
-                current_company: posting.company.clone(),
-                current_step: "Waiting for a browser".to_string(),
-                application_id: Some(application.id.clone()),
-                takeover_url: None,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-            });
     browser_session = jobs::upsert_browser_session(&state.pool, &account.id, &browser_session)
         .map_err(internal)?;
     application = jobs::assign_application_run(&state.pool, &account.id, &application.id, &run_id)
         .map_err(internal)?
         .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-
-    if req.runner == "local" {
-        let ticket = if let Some(existing) =
-            jobs::get_local_run_ticket(&state.pool, &account.id, &run_id).map_err(internal)?
-        {
-            existing
-        } else {
-            let secret = random_local_run_ticket();
-            let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-            jobs::save_local_run_ticket(
-                &state.pool,
-                &account.id,
-                &application.id,
-                &run_id,
-                &hash,
-                &secret,
-                workflow_input,
-                jobs::now_ms() + 24 * 60 * 60 * 1_000,
-            )
-            .map_err(internal)?
-        };
-        return Ok(Json(QueueApplicationRunResponse {
-            application,
-            browser_session,
-            workflow_id: String::new(),
-            run_id: run_id.clone(),
-            launch_url: Some(format!(
-                "bluey-jobs://run/{run_id}?ticket={}",
-                ticket.ticket_secret
-            )),
-        }));
-    }
-
-    let workflow_id = format!("bluey-jobs:{}:{}", account.id, run_id);
+    let local_workflow_input = json!({
+        "accountId": private_workflow_input["accountId"].clone(),
+        "applicationId": private_workflow_input["applicationId"].clone(),
+        "jobId": private_workflow_input["jobId"].clone(),
+        "canonicalJobKey": private_workflow_input["canonicalJobKey"].clone(),
+        "packetId": private_workflow_input["packetId"].clone(),
+        "applicationIdentityId": private_workflow_input["applicationIdentityId"].clone(),
+        "browserProfileId": private_workflow_input["browserProfileId"].clone(),
+        "packet": private_workflow_input["packet"].clone(),
+        "job": private_workflow_input["job"].clone(),
+        "runner": "local",
+        "url": private_workflow_input["url"].clone(),
+        "idempotencyKey": run_id,
+        "runId": run_id,
+        "browserSessionId": format!("local-{}", application.id),
+    });
+    let ticket = if let Some(existing) =
+        jobs::get_local_run_ticket(&state.pool, &account.id, &run_id).map_err(internal)?
+    {
+        existing
+    } else {
+        let secret = random_local_run_ticket();
+        let hash = hex::encode(Sha256::digest(secret.as_bytes()));
+        jobs::save_local_run_ticket(
+            &state.pool,
+            &account.id,
+            &application.id,
+            &run_id,
+            &hash,
+            &secret,
+            local_workflow_input,
+            jobs::now_ms() + 24 * 60 * 60 * 1_000,
+        )
+        .map_err(internal)?
+    };
     Ok(Json(QueueApplicationRunResponse {
         application,
         browser_session,
-        workflow_id,
-        run_id,
-        launch_url: None,
+        workflow_id: String::new(),
+        run_id: run_id.clone(),
+        workflow_command: None,
+        launch_url: Some(format!(
+            "bluey-jobs://run/{run_id}?ticket={}",
+            ticket.ticket_secret
+        )),
     }))
 }
 
@@ -2690,6 +2743,49 @@ fn application_run_id(
         account_id, application_id, resume_version_id, application_updated_at_ms
     );
     hex::encode(Sha256::digest(input.as_bytes()))[..40].to_string()
+}
+
+fn workflow_id_for_run(run_id: &str) -> String {
+    format!("bluey-jobs-v2-{run_id}")
+}
+
+fn approved_workflow_input(
+    account_id: &str,
+    application: &JobApplication,
+    posting: &JobPosting,
+    resume: &ResumeVersion,
+    runner: &str,
+    run_id: &str,
+) -> Result<Value, ApiError> {
+    if !matches!(runner, "local" | "cloud") {
+        return bad_request("Choose the local or cloud runner.");
+    }
+    let (identity_id, identity_email) = approved_application_identity(application)?;
+    let (mut packet, job, approved_packet_checksum) = approved_execution_snapshot(application)?;
+    validate_approved_execution_matches(
+        application,
+        posting,
+        resume,
+        &identity_id,
+        &identity_email,
+        &packet,
+        &job,
+    )?;
+    attach_approved_execution_transport(application, &mut packet, approved_packet_checksum)?;
+    Ok(json!({
+        "accountId": account_id,
+        "applicationId": application.id,
+        "jobId": posting.id,
+        "canonicalJobKey": posting.canonical_key,
+        "packetId": resume.id,
+        "applicationIdentityId": identity_id,
+        "browserProfileId": browser_profile_id(account_id, &identity_id),
+        "packet": packet,
+        "job": job,
+        "runner": runner,
+        "url": posting.canonical_url,
+        "idempotencyKey": run_id,
+    }))
 }
 
 fn browser_profile_id(account_id: &str, identity_id: &str) -> String {
@@ -3434,6 +3530,8 @@ pub struct InterventionResolutionResult {
     pub application: Option<JobApplication>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_resume: Option<jobs::LocalRunResumeAction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_command: Option<WorkflowCommandAdmissionResponse>,
 }
 
 pub async fn update_intervention(
@@ -3474,7 +3572,7 @@ pub async fn update_intervention(
             }
         }
     } else if action == "approve_submission" {
-        if original_status != "open" {
+        if !matches!(original_status.as_str(), "open" | "approved") {
             return Err((
                 StatusCode::CONFLICT,
                 "This intervention has already been resolved.".to_string(),
@@ -3602,27 +3700,121 @@ pub async fn update_intervention(
             answer_memory: remembered_answer,
             application: Some(revision.application),
             local_resume: None,
+            workflow_command: None,
         }));
+    }
+    let resumes_runner = matches!(action.as_str(), "approve_email_otp" | "approve_submission")
+        && updated.resume_after_resolution
+        && matches!(updated.status.as_str(), "approved" | "resolved");
+    if resumes_runner {
+        if let Some(application_id) = updated.application_id.as_deref() {
+            let application = jobs::get_application(&state.pool, &account.id, application_id)
+                .map_err(internal)?
+                .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+            let run_id = application.run_id.as_deref().ok_or((
+                StatusCode::CONFLICT,
+                "This application has no active browser run.".to_string(),
+            ))?;
+            let sessions =
+                jobs::list_browser_sessions(&state.pool, &account.id).map_err(internal)?;
+            let local_session = action == "approve_submission"
+                && sessions
+                    .iter()
+                    .any(|session| session.id == run_id && session.runner == "local");
+            if !local_session {
+                let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
+                    .map_err(internal)?
+                    .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+                let resume_id = application.resume_version_id.as_deref().ok_or((
+                    StatusCode::CONFLICT,
+                    "The approved application resume is unavailable.".to_string(),
+                ))?;
+                let resume = jobs::get_resume_version(&state.pool, &account.id, resume_id)
+                    .map_err(internal)?
+                    .ok_or((
+                        StatusCode::CONFLICT,
+                        "The approved application resume is unavailable.".to_string(),
+                    ))?;
+                let workflow_id = workflow_id_for_run(run_id);
+                let browser_session_id = format!("cloud-{}", application.id);
+                if !sessions.iter().any(|session| {
+                    session.id == browser_session_id
+                        && session.runner == "cloud"
+                        && session.application_id.as_deref() == Some(application.id.as_str())
+                }) {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "The cloud browser run is not waiting for this approval.".to_string(),
+                    ));
+                }
+                let field = updated
+                    .metadata
+                    .pointer("/receipt/intervention/field")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let workflow_input = approved_workflow_input(
+                    &account.id,
+                    &application,
+                    &posting,
+                    &resume,
+                    "cloud",
+                    run_id,
+                )?;
+                let admission = jobs::stage_cloud_workflow_resume(
+                    &state.pool,
+                    &jobs::StageCloudWorkflowResume {
+                        account_id: account.id.clone(),
+                        application_id: application.id.clone(),
+                        run_id: run_id.to_string(),
+                        workflow_id,
+                        intervention_id: updated.id.clone(),
+                        idempotency_key: updated.id.clone(),
+                        workflow_input,
+                        browser_session_id,
+                        resolution: json!({
+                            "action": action,
+                            "field": field,
+                            "answer": "",
+                        }),
+                        now_ms: jobs::now_ms(),
+                    },
+                )
+                .map_err(domain_error)?;
+                let saved = jobs::list_interventions(&state.pool, &account.id)
+                    .map_err(internal)?
+                    .into_iter()
+                    .find(|item| item.id == intervention_id)
+                    .ok_or((StatusCode::NOT_FOUND, "Intervention not found.".to_string()))?;
+                let application = jobs::get_application(&state.pool, &account.id, application_id)
+                    .map_err(internal)?
+                    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+                return Ok(Json(InterventionResolutionResult {
+                    intervention: saved,
+                    answer_memory: remembered_answer,
+                    application: Some(application),
+                    local_resume: None,
+                    workflow_command: Some(WorkflowCommandAdmissionResponse::from_admission(
+                        &admission,
+                    )),
+                }));
+            }
+        }
     }
     let mut saved = if action == "approve_submission" {
         Some(jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?)
     } else {
         None
     };
-    let resumed_application =
-        if matches!(action.as_str(), "approve_email_otp" | "approve_submission")
-            && updated.resume_after_resolution
-            && matches!(updated.status.as_str(), "approved" | "resolved")
-        {
-            if let Some(application_id) = updated.application_id.as_deref() {
-                jobs::update_application(&state.pool, &account.id, application_id, "queued", None)
-                    .map_err(domain_error)?
-            } else {
-                None
-            }
+    let resumed_application = if resumes_runner {
+        if let Some(application_id) = updated.application_id.as_deref() {
+            jobs::update_application(&state.pool, &account.id, application_id, "queued", None)
+                .map_err(domain_error)?
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
     let mut saved = match saved.take() {
         Some(saved) => saved,
         None => jobs::save_intervention(&state.pool, &account.id, &updated).map_err(internal)?,
@@ -3630,11 +3822,6 @@ pub async fn update_intervention(
     let mut local_resume = None;
     if let Some(application) = resumed_application.as_ref() {
         if let Some(run_id) = application.run_id.as_deref() {
-            let field = saved
-                .metadata
-                .pointer("/receipt/intervention/field")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
             let local_session = if action == "approve_submission" {
                 jobs::list_browser_sessions(&state.pool, &account.id)
                     .map_err(internal)?
@@ -3669,21 +3856,10 @@ pub async fn update_intervention(
                 };
                 local_resume = Some(approved);
             } else {
-                if let Err(error) =
-                    signal_workflow_resume(&account.id, run_id, &action, field, "").await
-                {
-                    tracing::error!(error = %error.1, "Bluey Jobs workflow resume failed");
-                    saved.status = "open".to_string();
-                    jobs::save_intervention(&state.pool, &account.id, &saved).map_err(internal)?;
-                    let _ = jobs::update_application(
-                        &state.pool,
-                        &account.id,
-                        &application.id,
-                        "needs_input",
-                        None,
-                    );
-                    return Err(error);
-                }
+                return Err((
+                    StatusCode::CONFLICT,
+                    "The browser run is not waiting for this approval.".to_string(),
+                ));
             }
         }
     }
@@ -3692,6 +3868,7 @@ pub async fn update_intervention(
         answer_memory: remembered_answer,
         application: resumed_application,
         local_resume,
+        workflow_command: None,
     }))
 }
 
@@ -3763,48 +3940,6 @@ fn is_provider_final_review_intervention(
         }
         _ => false,
     }
-}
-
-async fn signal_workflow_resume(
-    account_id: &str,
-    run_id: &str,
-    action: &str,
-    field: &str,
-    answer: &str,
-) -> Result<(), ApiError> {
-    let origin = std::env::var("BLUEY_JOBS_WORKFLOW_ORIGIN")
-        .unwrap_or_else(|_| "http://127.0.0.1:8090".to_string());
-    let token = std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN").unwrap_or_default();
-    if token.is_empty() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "The application runner is temporarily unavailable.".to_string(),
-        ));
-    }
-    let response = reqwest::Client::new()
-        .post(format!(
-            "{}/workflows/applications/{}/{}/resume",
-            origin.trim_end_matches('/'),
-            account_id,
-            run_id
-        ))
-        .bearer_auth(token)
-        .json(&json!({ "action": action, "field": field, "answer": answer }))
-        .send()
-        .await
-        .map_err(|_| {
-            (
-                StatusCode::BAD_GATEWAY,
-                "Bluey could not resume the application. Try again.".to_string(),
-            )
-        })?;
-    if !response.status().is_success() {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            "Bluey could not resume the application. Try again.".to_string(),
-        ));
-    }
-    Ok(())
 }
 
 pub async fn answer_memory(
@@ -5224,6 +5359,823 @@ fn authenticated_execution_lease_owner<'a>(
     Ok(worker.worker_id.as_str())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandMaterializeRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+enum WorkflowCommandMaterializeResponse {
+    Start {
+        schema_version: i64,
+        request_id: String,
+        workflow_id: String,
+        payload_digest: String,
+        workflow_input: Value,
+        browser_session_id: String,
+        result_request_id: String,
+    },
+    Resume {
+        schema_version: i64,
+        request_id: String,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        workflow_input: Value,
+        browser_session_id: String,
+        result_request_id: String,
+        resolution: Value,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandInterventionPrepareRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        receipt: Value,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        receipt: Value,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandAuthorityRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowCommandTerminalState {
+    Failed,
+    SideEffectUnknown,
+}
+
+impl WorkflowCommandTerminalState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::SideEffectUnknown => "side_effect_unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkflowCommandTerminalReason {
+    RunnerFailed,
+    RunnerAmbiguous,
+    InterventionTimeout,
+    InterventionLimit,
+}
+
+impl WorkflowCommandTerminalReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RunnerFailed => "runner_failed",
+            Self::RunnerAmbiguous => "runner_ambiguous",
+            Self::InterventionTimeout => "intervention_timeout",
+            Self::InterventionLimit => "intervention_limit",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkflowCommandFinalizeRequest {
+    Start {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        terminal_state: WorkflowCommandTerminalState,
+        reason_code: WorkflowCommandTerminalReason,
+        #[serde(default, deserialize_with = "deserialize_present_string")]
+        open_intervention_id: Option<String>,
+    },
+    Resume {
+        schema_version: i64,
+        workflow_id: String,
+        payload_digest: String,
+        intervention_id: String,
+        terminal_state: WorkflowCommandTerminalState,
+        reason_code: WorkflowCommandTerminalReason,
+        #[serde(default, deserialize_with = "deserialize_present_string")]
+        open_intervention_id: Option<String>,
+    },
+}
+
+fn deserialize_present_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    String::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowCommandInterventionMutationResponse {
+    schema_version: i64,
+    request_id: String,
+    workflow_id: String,
+    payload_digest: String,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_intervention_id: Option<String>,
+    intervention_id: String,
+    replayed: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkflowCommandFinalizationResponse {
+    schema_version: i64,
+    request_id: String,
+    workflow_id: String,
+    payload_digest: String,
+    operation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_intervention_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    open_intervention_id: Option<String>,
+    terminal_state: &'static str,
+    reason_code: &'static str,
+    replayed: bool,
+}
+
+async fn worker_prepare_workflow_intervention(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path(request_id): Path<String>,
+    request: Result<Json<WorkflowCommandInterventionPrepareRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    let (schema_version, workflow_id, payload_digest, command_kind, intervention_id, receipt) =
+        match request {
+            WorkflowCommandInterventionPrepareRequest::Start {
+                schema_version,
+                workflow_id,
+                payload_digest,
+                receipt,
+            } => (
+                schema_version,
+                workflow_id,
+                payload_digest,
+                jobs::JobsWorkflowCommandKind::Start,
+                None,
+                receipt,
+            ),
+            WorkflowCommandInterventionPrepareRequest::Resume {
+                schema_version,
+                workflow_id,
+                payload_digest,
+                intervention_id,
+                receipt,
+            } => (
+                schema_version,
+                workflow_id,
+                payload_digest,
+                jobs::JobsWorkflowCommandKind::Resume,
+                Some(intervention_id),
+                receipt,
+            ),
+        };
+    if !valid_workflow_command_authority(
+        schema_version,
+        &workflow_id,
+        &payload_digest,
+        intervention_id.as_deref(),
+    ) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let prepared = match jobs::prepare_jobs_workflow_intervention(
+        &state.pool,
+        &jobs::PrepareJobsWorkflowIntervention {
+            request_id: request_id.clone(),
+            payload_hmac_sha256: payload_digest.clone(),
+            workflow_id: workflow_id.clone(),
+            command_kind,
+            intervention_id: intervention_id.clone(),
+            receipt,
+            now_ms: jobs::now_ms(),
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    if prepared.request_id != request_id || prepared.payload_hmac_sha256 != payload_digest {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+    workflow_command_serialized_response(
+        StatusCode::OK,
+        WorkflowCommandInterventionMutationResponse {
+            schema_version: 2,
+            request_id,
+            workflow_id,
+            payload_digest,
+            operation: workflow_command_operation(command_kind),
+            command_intervention_id: intervention_id,
+            intervention_id: prepared.intervention_id,
+            replayed: prepared.replayed,
+        },
+    )
+}
+
+async fn worker_publish_workflow_intervention(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path((request_id, prepared_intervention_id)): Path<(String, String)>,
+    request: Result<Json<WorkflowCommandAuthorityRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128)
+        || !workflow_command_opaque_identifier(&prepared_intervention_id, 128)
+    {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    let (schema_version, workflow_id, payload_digest, command_kind, intervention_id) =
+        workflow_command_authority_parts(request);
+    if !valid_workflow_command_authority(
+        schema_version,
+        &workflow_id,
+        &payload_digest,
+        intervention_id.as_deref(),
+    ) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let published = match jobs::publish_jobs_workflow_intervention(
+        &state.pool,
+        &jobs::PublishJobsWorkflowIntervention {
+            request_id: request_id.clone(),
+            payload_hmac_sha256: payload_digest.clone(),
+            workflow_id: workflow_id.clone(),
+            command_kind,
+            command_intervention_id: intervention_id.clone(),
+            intervention_id: prepared_intervention_id.clone(),
+            now_ms: jobs::now_ms(),
+        },
+    ) {
+        Ok(published) => published,
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    if published.intervention.id != prepared_intervention_id {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+    workflow_command_serialized_response(
+        StatusCode::OK,
+        WorkflowCommandInterventionMutationResponse {
+            schema_version: 2,
+            request_id,
+            workflow_id,
+            payload_digest,
+            operation: workflow_command_operation(command_kind),
+            command_intervention_id: intervention_id,
+            intervention_id: prepared_intervention_id,
+            replayed: published.replayed,
+        },
+    )
+}
+
+async fn worker_finalize_workflow_execution(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path(request_id): Path<String>,
+    request: Result<Json<WorkflowCommandFinalizeRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    let parts = workflow_command_finalization_parts(request);
+    if !valid_workflow_command_authority(
+        parts.schema_version,
+        &parts.workflow_id,
+        &parts.payload_digest,
+        parts.intervention_id.as_deref(),
+    ) || parts
+        .open_intervention_id
+        .as_deref()
+        .is_some_and(|value| !workflow_command_opaque_identifier(value, 128))
+    {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Some(outcome) = workflow_command_terminal_outcome(
+        parts.terminal_state,
+        parts.reason_code,
+        parts.open_intervention_id.as_deref(),
+    ) else {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    };
+    let finalized = match jobs::finalize_jobs_workflow_execution(
+        &state.pool,
+        &jobs::FinalizeJobsWorkflowExecution {
+            request_id: request_id.clone(),
+            payload_hmac_sha256: parts.payload_digest.clone(),
+            workflow_id: parts.workflow_id.clone(),
+            command_kind: parts.command_kind,
+            intervention_id: parts.intervention_id.clone(),
+            outcome,
+            open_intervention_id: parts.open_intervention_id.clone(),
+            now_ms: jobs::now_ms(),
+        },
+    ) {
+        Ok(finalized) => finalized,
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    if finalized.request_id != request_id || finalized.outcome != outcome {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+    workflow_command_serialized_response(
+        StatusCode::OK,
+        WorkflowCommandFinalizationResponse {
+            schema_version: 2,
+            request_id,
+            workflow_id: parts.workflow_id,
+            payload_digest: parts.payload_digest,
+            operation: workflow_command_operation(parts.command_kind),
+            command_intervention_id: parts.intervention_id,
+            open_intervention_id: parts.open_intervention_id,
+            terminal_state: parts.terminal_state.as_str(),
+            reason_code: parts.reason_code.as_str(),
+            replayed: finalized.replayed,
+        },
+    )
+}
+
+fn workflow_command_authority_parts(
+    request: WorkflowCommandAuthorityRequest,
+) -> (
+    i64,
+    String,
+    String,
+    jobs::JobsWorkflowCommandKind,
+    Option<String>,
+) {
+    match request {
+        WorkflowCommandAuthorityRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+        } => (
+            schema_version,
+            workflow_id,
+            payload_digest,
+            jobs::JobsWorkflowCommandKind::Start,
+            None,
+        ),
+        WorkflowCommandAuthorityRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+        } => (
+            schema_version,
+            workflow_id,
+            payload_digest,
+            jobs::JobsWorkflowCommandKind::Resume,
+            Some(intervention_id),
+        ),
+    }
+}
+
+struct WorkflowCommandFinalizationParts {
+    schema_version: i64,
+    workflow_id: String,
+    payload_digest: String,
+    command_kind: jobs::JobsWorkflowCommandKind,
+    intervention_id: Option<String>,
+    terminal_state: WorkflowCommandTerminalState,
+    reason_code: WorkflowCommandTerminalReason,
+    open_intervention_id: Option<String>,
+}
+
+fn workflow_command_finalization_parts(
+    request: WorkflowCommandFinalizeRequest,
+) -> WorkflowCommandFinalizationParts {
+    match request {
+        WorkflowCommandFinalizeRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        } => WorkflowCommandFinalizationParts {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            command_kind: jobs::JobsWorkflowCommandKind::Start,
+            intervention_id: None,
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        },
+        WorkflowCommandFinalizeRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        } => WorkflowCommandFinalizationParts {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            command_kind: jobs::JobsWorkflowCommandKind::Resume,
+            intervention_id: Some(intervention_id),
+            terminal_state,
+            reason_code,
+            open_intervention_id,
+        },
+    }
+}
+
+fn workflow_command_terminal_outcome(
+    state: WorkflowCommandTerminalState,
+    reason: WorkflowCommandTerminalReason,
+    open_intervention_id: Option<&str>,
+) -> Option<jobs::JobsWorkflowTerminalOutcome> {
+    use jobs::{JobsWorkflowTerminalOutcome as Outcome, JobsWorkflowTerminalReason as Reason};
+
+    match (state, reason, open_intervention_id) {
+        (
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::RunnerFailed,
+            None,
+        ) => Some(Outcome::Failed(Reason::RunnerFailed)),
+        (
+            WorkflowCommandTerminalState::SideEffectUnknown,
+            WorkflowCommandTerminalReason::RunnerAmbiguous,
+            None,
+        ) => Some(Outcome::SideEffectUnknown(Reason::RunnerAmbiguous)),
+        (
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionTimeout,
+            Some(_),
+        ) => Some(Outcome::Failed(Reason::InterventionTimeout)),
+        (
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionLimit,
+            None,
+        ) => Some(Outcome::Failed(Reason::InterventionLimit)),
+        _ => None,
+    }
+}
+
+fn workflow_command_operation(kind: jobs::JobsWorkflowCommandKind) -> &'static str {
+    match kind {
+        jobs::JobsWorkflowCommandKind::Start => "start",
+        jobs::JobsWorkflowCommandKind::Resume => "resume",
+    }
+}
+
+fn valid_workflow_command_authority(
+    schema_version: i64,
+    workflow_id: &str,
+    payload_digest: &str,
+    intervention_id: Option<&str>,
+) -> bool {
+    schema_version == 2
+        && workflow_command_opaque_identifier(workflow_id, 192)
+        && workflow_command_digest(payload_digest)
+        && intervention_id.is_none_or(|value| workflow_command_opaque_identifier(value, 128))
+}
+
+async fn worker_materialize_workflow_command(
+    State(state): State<AppState>,
+    Extension(_worker): Extension<JobsWorkerIdentity>,
+    Path(request_id): Path<String>,
+    request: Result<Json<WorkflowCommandMaterializeRequest>, JsonRejection>,
+) -> Response {
+    if !workflow_command_opaque_identifier(&request_id, 128) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let Json(req) = match request {
+        Ok(request) => request,
+        Err(rejection) => return workflow_command_json_rejection_response(rejection),
+    };
+    if !valid_workflow_command_materialize_request(&req) {
+        return workflow_command_error_response(
+            StatusCode::BAD_REQUEST,
+            "rejected",
+            "invalid_request",
+        );
+    }
+    let command = match jobs::get_materializable_jobs_workflow_command_by_request_id(
+        &state.pool,
+        &request_id,
+    ) {
+        Ok(Some(command)) => command,
+        Ok(None) => {
+            return workflow_command_error_response(StatusCode::NOT_FOUND, "rejected", "not_found")
+        }
+        Err(error) => return workflow_command_database_error_response(error),
+    };
+    let exact_authority = match &req {
+        WorkflowCommandMaterializeRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+        } => {
+            *schema_version == 2
+                && command.protocol_version == 2
+                && command.command_kind == jobs::JobsWorkflowCommandKind::Start
+                && workflow_id == &command.workflow_id
+                && payload_digest == &command.payload_hmac_sha256
+                && command.intervention_id.is_none()
+        }
+        WorkflowCommandMaterializeRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+        } => {
+            *schema_version == 2
+                && command.protocol_version == 2
+                && command.command_kind == jobs::JobsWorkflowCommandKind::Resume
+                && workflow_id == &command.workflow_id
+                && payload_digest == &command.payload_hmac_sha256
+                && command.intervention_id.as_ref() == Some(intervention_id)
+        }
+    };
+    if !exact_authority {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+
+    let response = match (req, command.envelope.payload) {
+        (
+            WorkflowCommandMaterializeRequest::Start { .. },
+            jobs::JobsWorkflowCommandPayload::Start(material),
+        ) => WorkflowCommandMaterializeResponse::Start {
+            schema_version: 2,
+            request_id: command.request_id,
+            workflow_id: command.workflow_id,
+            payload_digest: command.payload_hmac_sha256,
+            workflow_input: material.workflow_input,
+            browser_session_id: material.browser_session_id,
+            result_request_id: material.result_request_id,
+        },
+        (
+            WorkflowCommandMaterializeRequest::Resume {
+                intervention_id, ..
+            },
+            jobs::JobsWorkflowCommandPayload::Resume(material),
+        ) => WorkflowCommandMaterializeResponse::Resume {
+            schema_version: 2,
+            request_id: command.request_id,
+            workflow_id: command.workflow_id,
+            payload_digest: command.payload_hmac_sha256,
+            intervention_id,
+            workflow_input: material.workflow_input,
+            browser_session_id: material.browser_session_id,
+            result_request_id: material.result_request_id,
+            resolution: material.resolution,
+        },
+        _ => {
+            return workflow_command_error_response(
+                StatusCode::CONFLICT,
+                "identity_conflict",
+                "identity_conflict",
+            )
+        }
+    };
+    match serde_json::to_value(response) {
+        Ok(value) => workflow_command_json_response(StatusCode::OK, value),
+        Err(_) => workflow_command_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rejected",
+            "internal_error",
+        ),
+    }
+}
+
+fn valid_workflow_command_materialize_request(req: &WorkflowCommandMaterializeRequest) -> bool {
+    let (schema_version, workflow_id, payload_digest, intervention_id) = match req {
+        WorkflowCommandMaterializeRequest::Start {
+            schema_version,
+            workflow_id,
+            payload_digest,
+        } => (*schema_version, workflow_id, payload_digest, None),
+        WorkflowCommandMaterializeRequest::Resume {
+            schema_version,
+            workflow_id,
+            payload_digest,
+            intervention_id,
+        } => (
+            *schema_version,
+            workflow_id,
+            payload_digest,
+            Some(intervention_id),
+        ),
+    };
+    schema_version == 2
+        && workflow_command_opaque_identifier(workflow_id, 192)
+        && workflow_command_digest(payload_digest)
+        && intervention_id.is_none_or(|value| workflow_command_opaque_identifier(value, 128))
+}
+
+fn workflow_command_opaque_identifier(value: &str, max_bytes: usize) -> bool {
+    (20..=max_bytes).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn workflow_command_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn workflow_command_database_error_response(error: anyhow::Error) -> Response {
+    if error
+        .downcast_ref::<UploadControlError>()
+        .is_some_and(|error| {
+            matches!(
+                error,
+                UploadControlError::AccountDeleting | UploadControlError::SessionNotOwned
+            )
+        })
+    {
+        return workflow_command_error_response(StatusCode::NOT_FOUND, "rejected", "not_found");
+    }
+    if let Some(error) = error.downcast_ref::<jobs::JobsWorkflowCommandError>() {
+        return match error {
+            jobs::JobsWorkflowCommandError::InvalidRequest => workflow_command_error_response(
+                StatusCode::BAD_REQUEST,
+                "rejected",
+                "invalid_request",
+            ),
+            jobs::JobsWorkflowCommandError::IdentityConflict => workflow_command_error_response(
+                StatusCode::CONFLICT,
+                "identity_conflict",
+                "identity_conflict",
+            ),
+            jobs::JobsWorkflowCommandError::NotFound
+            | jobs::JobsWorkflowCommandError::InvalidState
+            | jobs::JobsWorkflowCommandError::RequestNotStarted
+            | jobs::JobsWorkflowCommandError::CleanupFenced => {
+                workflow_command_error_response(StatusCode::NOT_FOUND, "rejected", "not_found")
+            }
+            jobs::JobsWorkflowCommandError::StaleLease
+            | jobs::JobsWorkflowCommandError::LeaseExpired => workflow_command_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rejected",
+                "internal_error",
+            ),
+        };
+    }
+    tracing::warn!(
+        reason_code = "workflow_command_internal_database_error",
+        "Jobs workflow command internal request could not complete"
+    );
+    workflow_command_error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "rejected",
+        "internal_error",
+    )
+}
+
+fn workflow_command_serialized_response<T: Serialize>(status: StatusCode, value: T) -> Response {
+    match serde_json::to_value(value) {
+        Ok(value) => workflow_command_json_response(status, value),
+        Err(_) => workflow_command_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "rejected",
+            "internal_error",
+        ),
+    }
+}
+
+fn workflow_command_error_response(
+    status: StatusCode,
+    outcome: &'static str,
+    reason: &'static str,
+) -> Response {
+    workflow_command_json_response(
+        status,
+        json!({
+            "schema_version": 2,
+            "outcome": outcome,
+            "reason": reason,
+        }),
+    )
+}
+
+fn workflow_command_json_rejection_response(rejection: JsonRejection) -> Response {
+    let status = if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        StatusCode::PAYLOAD_TOO_LARGE
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    workflow_command_error_response(status, "rejected", "invalid_request")
+}
+
+fn workflow_command_json_response(status: StatusCode, value: Value) -> Response {
+    let mut response = (status, Json(value)).into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 async fn worker_claim_execution_lease(
     State(state): State<AppState>,
     Extension(worker): Extension<JobsWorkerIdentity>,
@@ -6259,7 +7211,14 @@ async fn persist_submission_receipt(
         )?;
         return match submission_finalize_error_disposition(Some(&application), &request_fingerprint)
         {
-            SubmissionFinalizeErrorDisposition::Replay => Ok(application),
+            SubmissionFinalizeErrorDisposition::Replay => mark_submitted_cloud_workflow_terminal(
+                &state.pool,
+                application,
+                account_id,
+                application_id,
+                &run_id,
+                expected_runner,
+            ),
             SubmissionFinalizeErrorDisposition::Conflict
             | SubmissionFinalizeErrorDisposition::NotCommitted => Err((
                 StatusCode::CONFLICT,
@@ -6480,9 +7439,9 @@ async fn persist_submission_receipt(
         &terminal_session,
         local_ticket_hash,
     );
-    match finalized {
-        Ok(jobs::SubmissionFinalizeResult::Committed(application)) => Ok(application),
-        Ok(jobs::SubmissionFinalizeResult::Replayed(application)) => Ok(application),
+    let finalized_application = match finalized {
+        Ok(jobs::SubmissionFinalizeResult::Committed(application))
+        | Ok(jobs::SubmissionFinalizeResult::Replayed(application)) => Ok(application),
         Err(error) => {
             // A PostgreSQL COMMIT can take effect even when the client receives
             // a transport error. Never delete evidence on an uncertain result:
@@ -6516,7 +7475,47 @@ async fn persist_submission_receipt(
                 }
             }
         }
+    }?;
+    mark_submitted_cloud_workflow_terminal(
+        &state.pool,
+        finalized_application,
+        account_id,
+        application_id,
+        &run_id,
+        expected_runner,
+    )
+}
+
+fn mark_submitted_cloud_workflow_terminal(
+    pool: &crate::db::DbPool,
+    application: JobApplication,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    expected_runner: &str,
+) -> Result<JobApplication, ApiError> {
+    if expected_runner != "cloud" {
+        return Ok(application);
     }
+    jobs::mark_jobs_workflow_execution_submitted(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        &workflow_id_for_run(run_id),
+        jobs::now_ms(),
+    )
+    .map_err(|_| {
+        tracing::warn!(
+            reason_code = "workflow_submission_terminal_evidence_failed",
+            "Submitted Jobs workflow terminal evidence could not be persisted"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Bluey Jobs is still finalizing this submitted application. Please retry.".to_string(),
+        )
+    })?;
+    Ok(application)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8931,6 +9930,89 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+
+    #[test]
+    fn workflow_finalization_accepts_only_closed_state_reason_prompt_pairs() {
+        use jobs::{JobsWorkflowTerminalOutcome as Outcome, JobsWorkflowTerminalReason as Reason};
+
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::Failed,
+                WorkflowCommandTerminalReason::RunnerFailed,
+                None,
+            ),
+            Some(Outcome::Failed(Reason::RunnerFailed))
+        );
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::SideEffectUnknown,
+                WorkflowCommandTerminalReason::RunnerAmbiguous,
+                None,
+            ),
+            Some(Outcome::SideEffectUnknown(Reason::RunnerAmbiguous))
+        );
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::Failed,
+                WorkflowCommandTerminalReason::InterventionTimeout,
+                Some("wfint-v2-1234567890"),
+            ),
+            Some(Outcome::Failed(Reason::InterventionTimeout))
+        );
+        assert_eq!(
+            workflow_command_terminal_outcome(
+                WorkflowCommandTerminalState::Failed,
+                WorkflowCommandTerminalReason::InterventionLimit,
+                None,
+            ),
+            Some(Outcome::Failed(Reason::InterventionLimit))
+        );
+        assert!(workflow_command_terminal_outcome(
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionLimit,
+            Some("wfint-v2-1234567890"),
+        )
+        .is_none());
+        assert!(workflow_command_terminal_outcome(
+            WorkflowCommandTerminalState::Failed,
+            WorkflowCommandTerminalReason::InterventionTimeout,
+            None,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn workflow_finalization_rejects_explicit_null_optional_authority() {
+        let request = json!({
+            "schema_version": 2,
+            "workflow_id": "bluey-jobs-v2-1234567890",
+            "payload_digest": "a".repeat(64),
+            "operation": "start",
+            "terminal_state": "failed",
+            "reason_code": "runner_failed",
+            "open_intervention_id": null,
+        });
+        assert!(
+            serde_json::from_value::<WorkflowCommandFinalizeRequest>(request).is_err(),
+            "optional authority must be omitted rather than supplied as null"
+        );
+    }
+
+    #[test]
+    fn workflow_command_identifiers_require_twenty_closed_characters() {
+        assert!(!workflow_command_opaque_identifier(
+            "wfreq-v2-123456789",
+            128
+        ));
+        assert!(workflow_command_opaque_identifier(
+            "wfreq-v2-12345678901",
+            128
+        ));
+        assert!(!workflow_command_opaque_identifier(
+            "wfreq-v2-12345678901.",
+            128
+        ));
+    }
 
     #[test]
     fn expired_v2_submit_capability_is_limited_to_click_started_replay() {

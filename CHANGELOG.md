@@ -7,6 +7,25 @@ under `docs/release/`.
 
 ### Added
 
+- Added disabled-by-default, database-first Bluey Jobs workflow-command authority for managed
+  start and intervention resume. Immutable encrypted commands, request-start evidence, fenced
+  at-least-once dispatch, exact Temporal protocol-v2 identity, intervention-bound Updates,
+  two-phase intervention publication, opaque failure conversion, and replay-safe terminal
+  submitted/ambiguity evidence replace direct request-handler delivery and unsafe compensation.
+  Exact Update recovery covers the running-to-closed race without treating a timeout as proof of
+  closure; runner results bind the request and complete run identity, and encrypted minimal
+  ambiguity tombstones plus result-aware restart recovery preserve a possible employer side
+  effect without replaying Submit. Exact committed interventions remain recoverable after ordinary
+  checkpoint expiry by trying current authority restore first; only an expired claim rejected as
+  `lease_unavailable` may retire through exact old token/fence reconciliation, while every other
+  error fails closed. Startup persistence first proves the account/application-identity-derived
+  profile scope. Closed Jobs API errors and bearer
+  tokens are accepted only through their exact response/header and symmetric safe-token contracts.
+  The unfinished cleanup library is not imported or route-registered by the gateway and cannot be
+  enabled by environment; authenticated legacy Temporal inventory and account-deletion integration
+  remain Phase 610 work, so cleanup generations intentionally cannot complete.
+  Workflow-command dispatch, cleanup, and cloud Browser distribution remain `0`; no provider,
+  tenant, credential, deployment, canary, or production state changed.
 - Added a disabled-by-default, revisioned Bluey Jobs operational-hold control
   plane for discovery, managed generation, application queueing, runner claims,
   final Submit authorization, mailbox sync, and reviewed communication

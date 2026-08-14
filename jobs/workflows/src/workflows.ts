@@ -1,4 +1,11 @@
-import { condition, defineSignal, proxyActivities, setHandler } from "@temporalio/workflow";
+import {
+  ApplicationFailure,
+  condition,
+  defineSignal,
+  defineUpdate,
+  proxyActivities,
+  setHandler,
+} from "@temporalio/workflow";
 import {
   assertApprovedExecutionChecksum,
   createApprovedExecutionSnapshot,
@@ -9,11 +16,21 @@ import type {
   ApplicationWorkflowResult,
   InterventionResolution,
   JobsActivities,
+  OpaqueWorkflowActivities,
   RunnerExecutionResult,
+  WorkflowCommandAuthority,
+  WorkflowCommandStep,
+  WorkflowPublishedIntervention,
+  WorkflowResumeCommandAuthority,
+  WorkflowUpdateReceipt,
 } from "./contracts.js";
 import { decideInterventionResolution } from "./intervention-policy.js";
 
 export const resolveInterventionSignal = defineSignal<[InterventionResolution]>("resolveIntervention");
+export const resolveInterventionUpdate = defineUpdate<
+  WorkflowUpdateReceipt,
+  [WorkflowResumeCommandAuthority]
+>("resolveInterventionV2");
 
 const activities = proxyActivities<Omit<JobsActivities, "runApplication" | "resumeApplication">>({
   startToCloseTimeout: "10 minutes",
@@ -37,6 +54,199 @@ const runnerActivities = proxyActivities<Pick<JobsActivities, "runApplication" |
     maximumAttempts: 4,
   },
 });
+
+const opaqueActivities = proxyActivities<OpaqueWorkflowActivities>({
+  startToCloseTimeout: "10 minutes",
+  retry: {
+    initialInterval: "2 seconds",
+    backoffCoefficient: 2,
+    maximumInterval: "1 minute",
+  },
+});
+
+/**
+ * Protocol-v2 workflow. Only opaque random identifiers and an authenticated
+ * digest are visible to Temporal; private execution data is loaded inside the
+ * activities and never crosses the deterministic workflow boundary.
+ */
+export async function applicationWorkflowV2(
+  authority: WorkflowCommandAuthority,
+): Promise<{ state: "submitted" | "failed" | "side_effect_unknown" }> {
+  assertWorkflowAuthority(authority);
+  let openInterventionId: string | undefined;
+  let pendingResolution: WorkflowResumeCommandAuthority | undefined;
+  const acceptedUpdates = new Map<string, WorkflowUpdateReceipt>();
+
+  setHandler(
+    resolveInterventionUpdate,
+    (value): WorkflowUpdateReceipt => {
+      const existing = acceptedUpdates.get(value.requestId);
+      if (existing) return existing;
+      const receipt = Object.freeze({ ...value, outcome: "accepted" as const });
+      acceptedUpdates.set(value.requestId, receipt);
+      pendingResolution = Object.freeze({ ...value });
+      return receipt;
+    },
+    {
+      validator: (value) => {
+        assertResumeAuthority(value);
+        const existing = acceptedUpdates.get(value.requestId);
+        if (existing) {
+          if (!sameResumeAuthority(existing, value)) throwIdentityConflict();
+          return;
+        }
+        if (value.workflowId !== authority.workflowId
+          || value.interventionId !== openInterventionId
+          || pendingResolution !== undefined) {
+          throwIdentityConflict();
+        }
+      },
+    },
+  );
+
+  let command: WorkflowCommandAuthority | WorkflowResumeCommandAuthority = authority;
+  let step = assertCommandStep(await opaqueActivities.executeApplicationCommand(authority));
+
+  for (let interventionCount = 0; step.state === "intervention_prepared";) {
+    openInterventionId = step.interventionId;
+    if (interventionCount >= 6) {
+      // The seventh prompt is still hidden preparation state. It was never
+      // published, so it is not valid public intervention authority for
+      // finalization.
+      openInterventionId = undefined;
+      return assertTerminalResult(await opaqueActivities.finalizeApplicationCommand({
+        command,
+        terminalState: "failed",
+        reasonCode: "intervention_limit",
+      }));
+    }
+    interventionCount += 1;
+    pendingResolution = undefined;
+    assertPublishedIntervention(
+      await opaqueActivities.publishApplicationIntervention({
+        command,
+        interventionId: openInterventionId,
+      }),
+      openInterventionId,
+    );
+    const resolved = await condition(() => pendingResolution !== undefined, "24 hours");
+    if (!resolved || !pendingResolution) {
+      const terminalInterventionId = openInterventionId;
+      openInterventionId = undefined;
+      pendingResolution = undefined;
+      return assertTerminalResult(await opaqueActivities.finalizeApplicationCommand({
+        command,
+        terminalState: "failed",
+        reasonCode: "intervention_timeout",
+        openInterventionId: terminalInterventionId,
+      }));
+    }
+    const resumeCommand = pendingResolution;
+    openInterventionId = undefined;
+    pendingResolution = undefined;
+    command = resumeCommand;
+    step = assertCommandStep(await opaqueActivities.resumeApplicationCommand({
+      workflow: authority,
+      command: resumeCommand,
+    }));
+  }
+  if (step.state === "submitted") return { state: "submitted" };
+  return assertTerminalResult(await opaqueActivities.finalizeApplicationCommand({
+    command,
+    terminalState: step.state,
+    reasonCode: step.state === "failed" ? "runner_failed" : "runner_ambiguous",
+  }));
+}
+
+function assertCommandStep(value: WorkflowCommandStep): WorkflowCommandStep {
+  if (value.state === "intervention_prepared") {
+    if (!hasExactKeys(value, ["interventionId", "state"])
+      || !OPAQUE_ID.test(value.interventionId)) {
+      throwInvalidAuthority();
+    }
+    return value;
+  }
+  if (!hasExactKeys(value, ["state"])
+    || (value.state !== "submitted"
+      && value.state !== "failed"
+      && value.state !== "side_effect_unknown")) {
+    throwInvalidAuthority();
+  }
+  return value;
+}
+
+function assertPublishedIntervention(
+  value: WorkflowPublishedIntervention,
+  expectedInterventionId: string,
+): void {
+  if (!hasExactKeys(value, ["interventionId", "state"])
+    || value.state !== "needs_input"
+    || value.interventionId !== expectedInterventionId) {
+    throwIdentityConflict();
+  }
+}
+
+function assertTerminalResult(
+  value: Awaited<ReturnType<OpaqueWorkflowActivities["finalizeApplicationCommand"]>>,
+): { state: "failed" | "side_effect_unknown" } {
+  if (!hasExactKeys(value, ["state"])
+    || (value.state !== "failed" && value.state !== "side_effect_unknown")) {
+    throwIdentityConflict();
+  }
+  return value;
+}
+
+function assertWorkflowAuthority(value: WorkflowCommandAuthority): void {
+  if (!hasExactKeys(value, ["payloadDigest", "requestId", "schemaVersion", "workflowId"])
+    || value.schemaVersion !== 2
+    || !OPAQUE_ID.test(value.requestId)
+    || !OPAQUE_ID.test(value.workflowId)
+    || !DIGEST.test(value.payloadDigest)) {
+    throwInvalidAuthority();
+  }
+}
+
+function assertResumeAuthority(value: WorkflowResumeCommandAuthority): void {
+  if (!hasExactKeys(
+    value,
+    ["interventionId", "payloadDigest", "requestId", "schemaVersion", "workflowId"],
+  )
+    || value.schemaVersion !== 2
+    || !OPAQUE_ID.test(value.requestId)
+    || !OPAQUE_ID.test(value.workflowId)
+    || !DIGEST.test(value.payloadDigest)
+    || !OPAQUE_ID.test(value.interventionId)) {
+    throwInvalidAuthority();
+  }
+}
+
+function sameResumeAuthority(
+  left: WorkflowResumeCommandAuthority,
+  right: WorkflowResumeCommandAuthority,
+): boolean {
+  return left.schemaVersion === right.schemaVersion
+    && left.requestId === right.requestId
+    && left.workflowId === right.workflowId
+    && left.payloadDigest === right.payloadDigest
+    && left.interventionId === right.interventionId;
+}
+
+function hasExactKeys(value: unknown, expected: readonly string[]): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const keys = Object.keys(value).sort();
+  return keys.length === expected.length && keys.every((key, index) => key === expected[index]);
+}
+
+function throwInvalidAuthority(): never {
+  throw ApplicationFailure.nonRetryable("invalid_authority", "invalid_authority");
+}
+
+function throwIdentityConflict(): never {
+  throw ApplicationFailure.nonRetryable("identity_conflict", "identity_conflict");
+}
+
+const OPAQUE_ID = /^[A-Za-z0-9_-]{20,200}$/;
+const DIGEST = /^[a-f0-9]{64}$/;
 
 export async function applicationWorkflow(
   input: ApplicationWorkflowInput,

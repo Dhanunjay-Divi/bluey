@@ -61,6 +61,123 @@ export interface InterventionResolution {
   answer?: string;
 }
 
+/**
+ * Protocol-v2 workflow history contains only opaque command authority. The
+ * application packet and intervention content stay behind activity boundaries.
+ */
+export interface WorkflowCommandAuthority {
+  schemaVersion: 2;
+  requestId: string;
+  workflowId: string;
+  payloadDigest: string;
+}
+
+export interface WorkflowResumeCommandAuthority extends WorkflowCommandAuthority {
+  interventionId: string;
+}
+
+export interface WorkflowUpdateReceipt extends WorkflowResumeCommandAuthority {
+  outcome: "accepted";
+}
+
+export type WorkflowCommandOperation = "start" | "resume";
+
+export type WorkflowGatewayCommand = WorkflowCommandAuthority & (
+  | { operation: "start" }
+  | { operation: "resume"; interventionId: string }
+);
+
+export interface WorkflowGatewayReceipt extends WorkflowCommandAuthority {
+  outcome: "accepted" | "already_accepted";
+  temporalRunId: string;
+  interventionId?: string;
+}
+
+export type WorkflowGatewayErrorReason =
+  | "identity_conflict"
+  | "invalid_request"
+  | "unsupported_protocol"
+  | "workflow_not_found"
+  | "workflow_closed"
+  | "describe_ambiguous"
+  | "temporal_unavailable";
+
+export interface WorkflowGatewayError {
+  schemaVersion: 2;
+  outcome: "identity_conflict" | "rejected" | "delivery_unknown";
+  reason: WorkflowGatewayErrorReason;
+}
+
+export interface WorkflowCleanupAuthority {
+  schemaVersion: 2;
+  cleanupRequestId: string;
+  generation: number;
+  targetSetDigest: string;
+  cleanupFence: number;
+  workflowId: string;
+  startRequestId: string;
+  startPayloadDigest: string;
+  firstExecutionRunId?: string;
+}
+
+export type WorkflowCleanupPendingReason =
+  | "termination_pending"
+  | "history_delete_pending"
+  | "visibility_pending"
+  | "temporal_unavailable";
+
+export type WorkflowCleanupReceipt = WorkflowCleanupAuthority & {
+  evidenceDigest: string;
+} & (
+  | { outcome: "complete"; reason: "absence_proved" }
+  | { outcome: "pending"; reason: WorkflowCleanupPendingReason }
+);
+
+export type WorkflowTerminalState = "failed" | "side_effect_unknown";
+
+export type WorkflowTerminalReasonCode =
+  | "runner_failed"
+  | "runner_ambiguous"
+  | "intervention_timeout"
+  | "intervention_limit";
+
+export type WorkflowCommandStep =
+  | { state: "submitted" | WorkflowTerminalState }
+  | { state: "intervention_prepared"; interventionId: string };
+
+export interface WorkflowInterventionAuthority {
+  command: WorkflowCommandAuthority | WorkflowResumeCommandAuthority;
+  interventionId: string;
+}
+
+export interface WorkflowPublishedIntervention {
+  state: "needs_input";
+  interventionId: string;
+}
+
+export interface WorkflowTerminalCommand {
+  command: WorkflowCommandAuthority | WorkflowResumeCommandAuthority;
+  terminalState: WorkflowTerminalState;
+  reasonCode: WorkflowTerminalReasonCode;
+  openInterventionId?: string;
+}
+
+export interface OpaqueWorkflowActivities {
+  executeApplicationCommand(
+    authority: WorkflowCommandAuthority,
+  ): Promise<WorkflowCommandStep>;
+  resumeApplicationCommand(input: {
+    workflow: WorkflowCommandAuthority;
+    command: WorkflowResumeCommandAuthority;
+  }): Promise<WorkflowCommandStep>;
+  publishApplicationIntervention(
+    authority: WorkflowInterventionAuthority,
+  ): Promise<WorkflowPublishedIntervention>;
+  finalizeApplicationCommand(
+    input: WorkflowTerminalCommand,
+  ): Promise<{ state: WorkflowTerminalState }>;
+}
+
 export interface JobsActivities {
   assertEntitlement(input: ApplicationWorkflowInput): Promise<void>;
   loadPacket(input: ApplicationWorkflowInput): Promise<void>;

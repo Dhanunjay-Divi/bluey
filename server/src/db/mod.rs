@@ -360,6 +360,8 @@ const SQLITE_JOBS_COMMUNICATION_EXECUTION: &str =
     include_str!("../../../infra/sqlite/server-runtime/051_jobs_communication_execution.sql");
 const SQLITE_JOBS_OPERATIONAL_HOLDS: &str =
     include_str!("../../../infra/sqlite/server-runtime/052_jobs_operational_holds.sql");
+const SQLITE_JOBS_WORKFLOW_COMMANDS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/053_jobs_workflow_commands.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1698,6 +1700,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_COMMUNICATION_EXECUTION,
     // 0052 - durable, revisioned operational holds and exact CAS heads.
     SQLITE_JOBS_OPERATIONAL_HOLDS,
+    // 0053 - durable workflow start/resume commands and delivery evidence.
+    SQLITE_JOBS_WORKFLOW_COMMANDS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2245,6 +2249,9 @@ const POSTGRES_JOBS_COMMUNICATION_EXECUTION: &str =
 pub const JOBS_OPERATIONAL_HOLDS_MIGRATION_ID: &str = "030_jobs_operational_holds.sql";
 const POSTGRES_JOBS_OPERATIONAL_HOLDS: &str =
     include_str!("../../../infra/postgres/server-runtime/030_jobs_operational_holds.sql");
+pub const JOBS_WORKFLOW_COMMANDS_MIGRATION_ID: &str = "031_jobs_workflow_commands.sql";
+const POSTGRES_JOBS_WORKFLOW_COMMANDS: &str =
+    include_str!("../../../infra/postgres/server-runtime/031_jobs_workflow_commands.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2353,6 +2360,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
         POSTGRES_JOBS_OPERATIONAL_HOLDS,
+    ),
+    (
+        JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
+        POSTGRES_JOBS_WORKFLOW_COMMANDS,
     ),
 ];
 
@@ -3672,18 +3683,52 @@ mod postgres_migration_tests {
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
         JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
         JOBS_OPERATIONAL_HOLDS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
-        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, POSTGRES_ACCOUNT_DELETION_INTENTS,
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
-        POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY, POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY,
-        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_OPERATIONAL_HOLDS,
-        POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
-        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_MIGRATIONS,
-        POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
+        POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
+        POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
+        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
+        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_COMMANDS,
+        POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
         SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
         SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
         SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
         SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_WORKFLOW_COMMANDS,
     };
+
+    #[test]
+    fn workflow_cleanup_migrations_are_dialect_parity_and_fail_closed() {
+        let postgres = POSTGRES_JOBS_WORKFLOW_COMMANDS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sqlite = SQLITE_JOBS_WORKFLOW_COMMANDS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .any(|(id, sql)| *id == JOBS_WORKFLOW_COMMANDS_MIGRATION_ID
+                && *sql == POSTGRES_JOBS_WORKFLOW_COMMANDS));
+        assert!(postgres.contains(
+            "legacy_reconciled BOOLEAN NOT NULL DEFAULT FALSE CHECK(NOT legacy_reconciled)"
+        ));
+        assert!(sqlite
+            .contains("legacy_reconciled INTEGER NOT NULL DEFAULT 0 CHECK(legacy_reconciled = 0)"));
+        assert!(postgres.contains("legacy_unresolved_count BETWEEN 1 AND 9007199254740991"));
+        assert!(sqlite.contains("legacy_unresolved_count BETWEEN 1 AND 9007199254740991"));
+        for schema in [&postgres, &sqlite] {
+            assert!(schema.contains("cleanup_request_id"));
+            assert!(schema.contains("cleanup_fence"));
+            assert!(schema.contains("observation_kind = 'absence_proved'"));
+            assert!(schema.matches("target_state = 'absence_proved'").count() >= 3);
+            assert!(
+                schema.contains("firstExecutionRunId") || schema.contains("first_execution_run_id")
+            );
+        }
+    }
 
     #[test]
     fn embedded_postgres_migrations_are_operator_discoverable() {

@@ -18,6 +18,21 @@ export function cloudAutomationEligibleApplications(workspace: Pick<
   );
 }
 
+export function workspaceNeedsCloudAutomationRefresh(workspace: Pick<
+  JobsWorkspace,
+  "browser_sessions" | "interventions"
+>): boolean {
+  return workspace.browser_sessions.some((session) => {
+    if (session.runner !== "cloud") return false;
+    if (session.status === "queued" || session.status === "running") return true;
+    if (session.status !== "needs_input" || !session.application_id) return false;
+    return workspace.interventions.some(
+      (intervention) => intervention.application_id === session.application_id
+        && intervention.status === "approved",
+    );
+  });
+}
+
 export function isCloudAutomationEligibleApplication(
   workspace: Pick<
     JobsWorkspace,
@@ -63,7 +78,7 @@ export function applicationAfterInterventionResolution(
   }
   if (returnedApplication) return returnedApplication;
   if (!interventionActionResumesApplication(action)) return application;
-  return { ...application, state: "queued", updated_at_ms: updatedAtMs };
+  return { ...application, state: "needs_input", updated_at_ms: updatedAtMs };
 }
 
 export function browserSessionAfterInterventionResolution(
@@ -82,17 +97,17 @@ export function browserSessionAfterInterventionResolution(
   if (!interventionActionResumesApplication(action)) return session;
   return {
     ...session,
-    status: "queued",
-    current_step: "Resuming application",
+    status: "needs_input",
+    current_step: "Approval saved; secure resume queued",
     updated_at_ms: updatedAtMs,
   };
 }
 
 export function interventionResolutionToast(action: string): string {
   if (action === "approve_submission") {
-    return "Submission approved. Bluey is completing the application.";
+    return "Submission approved. Secure resume is queued.";
   }
-  if (action === "approve_email_otp") return "Email code approved. Bluey is resuming.";
+  if (action === "approve_email_otp") return "Email code approved. Secure resume is queued.";
   if (action === "answer") return "Answer saved. The updated application kit requires review.";
   return "Intervention resolved.";
 }

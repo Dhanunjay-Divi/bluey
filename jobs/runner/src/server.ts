@@ -31,10 +31,7 @@ import {
   type SubmissionReceipt,
 } from "@bluey/jobs-automation";
 import { installBrowserNetworkGuard } from "./browser-network-guard.js";
-import {
-  authorizeCloudFinalSubmitBeforeCheckpoint,
-  hasCloudIrreversibleCheckpointAuthority,
-} from "./certified-final-submit.js";
+import { authorizeCloudFinalSubmitBeforeCheckpoint } from "./certified-final-submit.js";
 import {
   createBrowserProfileSnapshotClientFromEnv,
   type BrowserProfileSnapshotClient,
@@ -75,12 +72,16 @@ import {
 } from "./profile-store.js";
 import {
   CURRENT_CHECKPOINT_VERSION,
+  isWorkflowCommandRequestId,
   removeManagedRunCheckpoint,
   scanManagedRunCheckpoints,
+  scanRunCheckpoints,
   writeManagedRunCheckpoint,
   type CloudRunCheckpoint,
   type RunCheckpointScan,
+  requestIdMatchesRun,
 } from "./run-checkpoint-store.js";
+export { requestIdMatchesRun } from "./run-checkpoint-store.js";
 import {
   ProfileRecoveryBlockedError,
   ProfileRecoveryIsolation,
@@ -89,6 +90,7 @@ import { providerRegistryForExecution } from "./resume-policy.js";
 import {
   durableResultScope,
   readManagedResult,
+  readManagedResultState,
   readResult,
   ResultStoreError,
   stageManagedResult,
@@ -136,6 +138,7 @@ interface CloudRunRequest {
   browserProfileId: string;
   browserSessionId: string;
   runId: string;
+  requestId: string;
   applicationId: string;
   url: string;
   packet: ApplicationPacket;
@@ -175,6 +178,11 @@ type CloudRunResult = {
   receiptAuthority?: SubmissionReceiptAuthority;
   receiptPath?: string;
 };
+
+interface DurableSideEffectUnknownAuthority extends DurableRunResultRequest {
+  schemaVersion: 2;
+  outcome: "side_effect_unknown";
+}
 
 interface BrowserRunExecution {
   result: CloudRunResult;
@@ -235,7 +243,39 @@ interface TrackedAccountWork {
 
 const trackedAccountWork = new Map<string, TrackedAccountWork>();
 
+export class DurableSideEffectUnknownError extends LeasedRunError {
+  constructor() {
+    super("side_effect_unknown");
+    this.name = "DurableSideEffectUnknownError";
+  }
+}
+
+export class AmbiguityPersistenceError extends Error {
+  constructor() {
+    super("Durable runner ambiguity authority could not be persisted");
+    this.name = "AmbiguityPersistenceError";
+  }
+}
+
+export class TerminalResultPersistenceError extends Error {
+  constructor() {
+    super("Durable runner terminal result could not be persisted");
+    this.name = "TerminalResultPersistenceError";
+  }
+}
+
+export class DurableFailedRunResultError extends Error {
+  constructor(
+    readonly requestId: string,
+    readonly result: CloudRunResult,
+  ) {
+    super("The failed runner result is durably committed");
+    this.name = "DurableFailedRunResultError";
+  }
+}
+
 const runnerServer = createServer(async (request, response) => {
+  let workflowCommandRequestId: string | undefined;
   try {
     if (request.url === "/healthz" && request.method === "GET") {
       return json(response, runnerVolumeReady ? 200 : 503, {
@@ -246,36 +286,79 @@ const runnerServer = createServer(async (request, response) => {
       return json(response, 401, { error: "Unauthorized" });
     runnerVolumeClient.requireReady();
     if (request.url === "/results" && request.method === "POST") {
+      const lookup = validateDurableRunResultRequest(
+        await body<unknown>(request),
+      );
+      if (isWorkflowCommandRequestId(lookup.requestId)) {
+        workflowCommandRequestId = lookup.requestId;
+      }
       const completed = await recoverDurableRunResultWithResidency(
         root,
         profileKey!,
-        await body<unknown>(request),
+        lookup,
       );
-      if (!completed)
-        return json(response, 404, { error: "Durable result not found" });
-      return json(response, 200, completed);
+      if (completed) {
+        const ambiguity = parseSideEffectUnknownAuthority(completed, lookup);
+        if (ambiguity) {
+          await settleDurableSideEffectUnknownCheckpoint(lookup);
+          throw new DurableSideEffectUnknownError();
+        }
+        return json(
+          response,
+          200,
+          authoritativeRunnerResult(completed, lookup.requestId),
+        );
+      }
+      if (await recoverDurableSideEffectUnknownWithResidency(lookup)) {
+        throw new DurableSideEffectUnknownError();
+      }
+      return json(response, 404, { error: "Durable result not found" });
     }
     if (request.url === "/runs" && request.method === "POST") {
       const input = await validate(await body<CloudRunRequest>(request));
-      const requestId = `${input.runId}:initial`;
+      const requestId = input.requestId;
+      if (isWorkflowCommandRequestId(requestId)) {
+        workflowCommandRequestId = requestId;
+      }
       const paths = profilePaths(
         root,
         input.accountId,
         input.applicationIdentityId,
       );
       const resultContext = { requestId, profileScope: paths.scope };
+      const resultLookup = durableResultLookup(input, requestId);
       const checkpointCreatedAtMs = Date.now();
       const completed = await readMutationResult(resultContext, input);
-      if (completed) return json(response, 200, completed);
+      if (completed) {
+        if (parseSideEffectUnknownAuthority(completed, resultLookup)) {
+          throw new DurableSideEffectUnknownError();
+        }
+        return json(
+          response,
+          200,
+          authoritativeRunnerResult(completed, requestId),
+        );
+      }
+      if (await recoverDurableSideEffectUnknownWithResidency(resultLookup)) {
+        throw new DurableSideEffectUnknownError();
+      }
       const result = await serializedProfileMutation(paths.scope, async () => {
         const existing = await readMutationResult(resultContext, input);
-        if (existing) return existing;
+        if (existing) {
+          if (parseSideEffectUnknownAuthority(existing, resultLookup)) {
+            throw new DurableSideEffectUnknownError();
+          }
+          return existing;
+        }
         await requireProfileMutation(paths.scope);
         const recoveredDuringRetry = await readMutationResult(
           resultContext,
           input,
         );
         if (recoveredDuringRetry) return recoveredDuringRetry;
+        if (await recoverDurableSideEffectUnknownWithResidency(resultLookup)) {
+          throw new DurableSideEffectUnknownError();
+        }
         const recovered = await recoverSubmittedCheckpointForRequest(
           paths.scope,
           input.browserSessionId,
@@ -295,26 +378,43 @@ const runnerServer = createServer(async (request, response) => {
             run(input, paths, activeLease, requestId, checkpointCreatedAtMs),
           async (activeLease) => {
             const managedPaths = trackedManagedProfilePaths(activeLease);
-            if (hasCloudIrreversibleCheckpointAuthority(activeLease)) {
-              if (!managedPaths) throw new ProfileRecoveryBlockedError();
-              await markCloudCheckpointUnknown(
-                input,
-                managedPaths,
-                [],
+            if (activeLease.finalSubmitAttempted) {
+              return persistAndAbortSideEffectUnknown(
+                async () => {
+                  if (!managedPaths) throw new ProfileRecoveryBlockedError();
+                  return markCloudCheckpointUnknown(
+                    input,
+                    managedPaths,
+                    [],
+                    activeLease,
+                    requestId,
+                    checkpointCreatedAtMs,
+                    input.url,
+                  );
+                },
                 activeLease,
-                requestId,
-                checkpointCreatedAtMs,
-                input.url,
-              ).catch(() => undefined);
-            } else if (managedPaths) {
-              await removeCloudRunCheckpoint(
-                managedPaths,
-                input.browserSessionId,
-                activeLease,
-              ).catch(() => undefined);
+                async () => {
+                  finishTrackedAccountWork(input.browserSessionId, activeLease);
+                },
+                reconcileStoredCheckpoint,
+              );
             }
-            finishTrackedAccountWork(input.browserSessionId, activeLease);
-            return abortLeasedRun(activeLease, async () => {});
+            return persistAndFinishFailedRun(
+              requestId,
+              () => persistFailedRunResult(input, requestId, activeLease),
+              activeLease,
+              () =>
+                managedPaths
+                  ? removeCloudRunCheckpoint(
+                      managedPaths,
+                      input.browserSessionId,
+                      activeLease,
+                    )
+                  : Promise.resolve(),
+              async () => {
+                finishTrackedAccountWork(input.browserSessionId, activeLease);
+              },
+            );
           },
         );
         if (execution.keepActive) {
@@ -328,21 +428,20 @@ const runnerServer = createServer(async (request, response) => {
               ),
             );
           } catch {
-            return abortLeasedRun(lease, async () => {
-              await closeBrowserExecution(
+            return leaveLeasedRunRetryable(lease, () =>
+              closeBrowserExecution(
                 execution.context,
                 execution.paths,
                 input,
                 lease,
-              );
-              await removeCloudRunCheckpoint(
-                execution.paths,
-                input.browserSessionId,
-                lease,
-              );
+              ),
+            );
+          }
+          if (!execution.context) {
+            return leaveLeasedRunRetryable(lease, async () => {
+              finishTrackedAccountWork(input.browserSessionId, lease);
             });
           }
-          if (!execution.context) return abortLeasedRun(lease, async () => {});
           if (trackedAccountWorkIsStopping(input.browserSessionId, lease)) {
             return abortLeasedRun(lease, async () => {
               await closeBrowserExecution(
@@ -375,22 +474,89 @@ const runnerServer = createServer(async (request, response) => {
           lease,
         );
         if (outcome === "side_effect_unknown") {
-          await markCloudCheckpointUnknown(
-            input,
-            execution.paths,
-            execution.events,
+          return persistAndAbortSideEffectUnknown(
+            () =>
+              markCloudCheckpointUnknown(
+                input,
+                execution.paths,
+                execution.events,
+                lease,
+                requestId,
+                checkpointCreatedAtMs,
+                input.url,
+              ),
             lease,
+            () =>
+              closeBrowserExecution(
+                execution.context,
+                execution.paths,
+                input,
+                lease,
+              ),
+            reconcileStoredCheckpoint,
+          );
+        }
+        if (outcome === "failed") {
+          return persistAndFinishFailedRun(
             requestId,
-            checkpointCreatedAtMs,
-            input.url,
-          ).catch(() => undefined);
-          return abortLeasedRun(lease, () =>
-            closeBrowserExecution(
-              execution.context,
-              execution.paths,
-              input,
-              lease,
-            ),
+            () =>
+              persistFailedRunResult(input, requestId, lease, execution.result),
+            lease,
+            () =>
+              removeCloudRunCheckpoint(
+                execution.paths,
+                input.browserSessionId,
+                lease,
+              ),
+            async () => {
+              try {
+                await closeBrowserExecution(
+                  execution.context,
+                  execution.paths,
+                  input,
+                  lease,
+                  false,
+                );
+              } finally {
+                finishTrackedAccountWork(input.browserSessionId, lease);
+              }
+            },
+          );
+        }
+        if (outcome === "released") {
+          return persistAndFinishSafeRunResult(
+            async () => {
+              await withRegisteredResultWrite(lease, resultContext, (storage) =>
+                writeManagedResult(
+                  storage,
+                  resultContext,
+                  execution.result,
+                  profileKey!,
+                ),
+              );
+              return execution.result;
+            },
+            lease,
+            "released",
+            () =>
+              removeCloudRunCheckpoint(
+                execution.paths,
+                input.browserSessionId,
+                lease,
+              ),
+            async () => {
+              try {
+                await closeBrowserExecution(
+                  execution.context,
+                  execution.paths,
+                  input,
+                  lease,
+                  false,
+                );
+              } finally {
+                finishTrackedAccountWork(input.browserSessionId, lease);
+              }
+            },
           );
         }
         return finalizeLeasedRun({
@@ -434,7 +600,7 @@ const runnerServer = createServer(async (request, response) => {
           finishTrackedAccountWork(input.browserSessionId, lease),
         );
       });
-      return json(response, 200, result);
+      return json(response, 200, authoritativeRunnerResult(result, requestId));
     }
     const resume = request.url?.match(
       /^\/runs\/([A-Za-z0-9_-]{3,160})\/resume$/,
@@ -484,18 +650,32 @@ const runnerServer = createServer(async (request, response) => {
           error: "The run resolution binding is invalid",
         });
       }
+      if (isWorkflowCommandRequestId(resolution.requestId)) {
+        workflowCommandRequestId = resolution.requestId;
+      }
+      const resultLookup = durableResultLookup(binding, resolution.requestId);
       const result = await serializedBrowserSessionMutation(
         resume[1]!,
         resolution.profileScope,
         async () => {
           const existing = await readMutationResult(resultContext, binding);
-          if (existing) return existing;
+          if (existing) {
+            if (parseSideEffectUnknownAuthority(existing, resultLookup)) {
+              throw new DurableSideEffectUnknownError();
+            }
+            return existing;
+          }
           await requireProfileMutation(resolution.profileScope);
           const recoveredDuringRetry = await readMutationResult(
             resultContext,
             binding,
           );
           if (recoveredDuringRetry) return recoveredDuringRetry;
+          if (
+            await recoverDurableSideEffectUnknownWithResidency(resultLookup)
+          ) {
+            throw new DurableSideEffectUnknownError();
+          }
           const recovered = await recoverSubmittedCheckpointForRequest(
             resolution.profileScope,
             resume[1]!,
@@ -553,17 +733,79 @@ const runnerServer = createServer(async (request, response) => {
               active.lease,
             );
             if (outcome === "side_effect_unknown") {
-              await markCloudCheckpointUnknown(
-                active.input,
-                active.paths,
-                active.events,
+              return persistAndAbortSideEffectUnknown(
+                () =>
+                  markCloudCheckpointUnknown(
+                    active.input,
+                    active.paths,
+                    active.events,
+                    active.lease,
+                    resolution.requestId,
+                    active.checkpointCreatedAtMs,
+                    active.context.pages()[0]?.url() || active.input.url,
+                  ),
                 active.lease,
+                () => closeActiveRun(resume[1]!, active),
+                reconcileStoredCheckpoint,
+              );
+            }
+            if (outcome === "failed") {
+              return persistAndFinishFailedRun(
                 resolution.requestId,
-                active.checkpointCreatedAtMs,
-                active.context.pages()[0]?.url() || active.input.url,
-              ).catch(() => undefined);
-              return abortLeasedRun(active.lease, () =>
-                closeActiveRun(resume[1]!, active),
+                () =>
+                  persistFailedRunResult(
+                    active.input,
+                    resolution.requestId,
+                    active.lease,
+                    executed,
+                  ),
+                active.lease,
+                () =>
+                  removeCloudRunCheckpoint(
+                    active.paths,
+                    active.input.browserSessionId,
+                    active.lease,
+                  ),
+                async () => {
+                  try {
+                    await closeActiveRun(resume[1]!, active, false);
+                  } finally {
+                    finishTrackedAccountWork(resume[1]!, active.lease);
+                  }
+                },
+              );
+            }
+            if (outcome === "released") {
+              return persistAndFinishSafeRunResult(
+                async () => {
+                  await withRegisteredResultWrite(
+                    active.lease,
+                    resultContext,
+                    (storage) =>
+                      writeManagedResult(
+                        storage,
+                        resultContext,
+                        executed,
+                        profileKey!,
+                      ),
+                  );
+                  return executed;
+                },
+                active.lease,
+                "released",
+                () =>
+                  removeCloudRunCheckpoint(
+                    active.paths,
+                    active.input.browserSessionId,
+                    active.lease,
+                  ),
+                async () => {
+                  try {
+                    await closeActiveRun(resume[1]!, active, false);
+                  } finally {
+                    finishTrackedAccountWork(resume[1]!, active.lease);
+                  }
+                },
               );
             }
             return finalizeLeasedRun({
@@ -607,32 +849,53 @@ const runnerServer = createServer(async (request, response) => {
             );
           } catch (error) {
             if (error instanceof LeasedRunError) throw error;
-            if (hasCloudIrreversibleCheckpointAuthority(active.lease)) {
-              await markCloudCheckpointUnknown(
-                active.input,
-                active.paths,
-                active.events,
+            if (error instanceof AmbiguityPersistenceError) throw error;
+            if (error instanceof DurableFailedRunResultError) throw error;
+            if (error instanceof TerminalResultPersistenceError) throw error;
+            if (active.lease.finalSubmitAttempted) {
+              return persistAndAbortSideEffectUnknown(
+                () =>
+                  markCloudCheckpointUnknown(
+                    active.input,
+                    active.paths,
+                    active.events,
+                    active.lease,
+                    resolution.requestId,
+                    active.checkpointCreatedAtMs,
+                    active.context.pages()[0]?.url() || active.input.url,
+                  ),
                 active.lease,
-                resolution.requestId,
-                active.checkpointCreatedAtMs,
-                active.context.pages()[0]?.url() || active.input.url,
-              ).catch(() => undefined);
-            } else {
-              await removeCloudRunCheckpoint(
-                active.paths,
-                active.input.browserSessionId,
-                active.lease,
-              ).catch(() => undefined);
+                () => closeActiveRun(resume[1]!, active),
+                reconcileStoredCheckpoint,
+              );
             }
-            return abortLeasedRun(active.lease, () =>
-              closeActiveRun(resume[1]!, active),
+            return persistAndFinishFailedRun(
+              resolution.requestId,
+              () =>
+                persistFailedRunResult(
+                  active.input,
+                  resolution.requestId,
+                  active.lease,
+                ),
+              active.lease,
+              () =>
+                removeCloudRunCheckpoint(
+                  active.paths,
+                  active.input.browserSessionId,
+                  active.lease,
+                ),
+              () => closeActiveRun(resume[1]!, active),
             );
           }
         },
       );
       if (!result)
         return json(response, 404, { error: "Browser run not found" });
-      return json(response, 200, result);
+      return json(
+        response,
+        200,
+        authoritativeRunnerResult(result, resolution.requestId),
+      );
     }
     const release = request.url?.match(/^\/runs\/([A-Za-z0-9_-]{3,160})$/);
     if (release && request.method === "DELETE") {
@@ -671,9 +934,19 @@ const runnerServer = createServer(async (request, response) => {
     }
     return json(response, 404, { error: "Not found" });
   } catch (error) {
-    const failure = publicRunnerFailure(error);
+    if (error instanceof DurableFailedRunResultError) {
+      return json(
+        response,
+        200,
+        authoritativeRunnerResult(error.result, error.requestId),
+      );
+    }
+    const failure = publicRunnerFailureResponse(
+      error,
+      workflowCommandRequestId,
+    );
     console.error("Bluey Jobs runner request failed", { code: failure.code });
-    return json(response, failure.status, { error: failure.message });
+    return json(response, failure.status, failure.body);
   }
 });
 
@@ -731,8 +1004,7 @@ async function startRunner(): Promise<void> {
       requiredRunnerEnv("BLUEY_JOBS_RUNNER_SERVER_COMMAND_KEYS"),
     ),
     stopAccountWork: stopAccountWorkBySubjectHash,
-    quiesceForStorageAttestation:
-      prepareRunnerForStorageAttestation,
+    quiesceForStorageAttestation: prepareRunnerForStorageAttestation,
     onReadinessChanged: (ready) => {
       runnerVolumeReady = ready;
       if (ready) storageAttestationQuiescing = false;
@@ -932,6 +1204,10 @@ async function restoreCloudRunCheckpoint(
     if (!checkpointMatchesBinding(found, binding)) {
       throw new ResultStoreError("result_promotion_conflict");
     }
+    const safeRecovery = await recoverSafeWorkflowCommandCheckpoint(found);
+    if (safeRecovery !== "not_applicable") {
+      return activeRuns.get(browserSessionId);
+    }
     if (restartDisposition(found.phase, found.expiresAtMs) !== "restore") {
       await reconcileStoredCheckpoint(found);
       return undefined;
@@ -946,12 +1222,71 @@ async function restoreCloudRunCheckpoint(
 async function recoverCheckpoint(
   checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
 ): Promise<void> {
+  assertWorkflowCommandCheckpointProfileScope(checkpoint);
+  const safeRecovery = await recoverSafeWorkflowCommandCheckpoint(checkpoint);
+  if (safeRecovery !== "not_applicable") {
+    return;
+  }
   const disposition = restartDisposition(
     checkpoint.phase,
     checkpoint.expiresAtMs,
   );
   if (disposition === "restore") await restoreCheckpoint(checkpoint);
   else await reconcileStoredCheckpoint(checkpoint);
+}
+
+async function recoverSafeWorkflowCommandCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): Promise<SafeCheckpointRecoveryDisposition> {
+  assertWorkflowCommandCheckpointProfileScope(checkpoint);
+  const context = {
+    requestId: checkpoint.workflow.requestId,
+    profileScope: checkpoint.profileScope,
+  };
+  return stabilizeSafeWorkflowCommandCheckpoint(checkpoint, {
+    read: () =>
+      runnerVolumeClient.withExistingResultResidency(
+        localResultScope(context),
+        (storage) =>
+          storage
+            ? readManagedResultState<unknown>(storage, context, profileKey!)
+            : Promise.resolve(undefined),
+      ),
+    persistFailed: (result) =>
+      persistCheckpointFailedResult(checkpoint, result),
+    restore: () => restoreSafeWorkflowCommandCheckpoint(checkpoint, {
+      restore: () => restoreCheckpoint(checkpoint),
+      reconcile: () => reconcileAndRemoveCheckpoint(checkpoint),
+    }),
+    retire: () => reconcileAndRemoveCheckpoint(checkpoint),
+  });
+}
+
+function expiredCheckpointClaimRejected(
+  checkpoint: Pick<CloudRunCheckpoint<CloudRunRequest, RunEvent>, "expiresAtMs">,
+  error: unknown,
+): boolean {
+  return checkpoint.expiresAtMs <= Date.now()
+    && error instanceof ExecutionLeaseError
+    && error.operation === "claim"
+    && error.code === "lease_unavailable";
+}
+
+export async function restoreSafeWorkflowCommandCheckpoint(
+  checkpoint: Pick<CloudRunCheckpoint<CloudRunRequest, RunEvent>, "expiresAtMs">,
+  operations: { restore(): Promise<void>; reconcile(): Promise<void> },
+): Promise<void> {
+  try {
+    await operations.restore();
+  } catch (error) {
+    if (!expiredCheckpointClaimRejected(checkpoint, error)) throw error;
+    // The intervention result may have been published and timed out while this
+    // runner was offline. Canonical finalization then makes a new lease claim
+    // impossible. The exact old token/fence reconciliation is the only
+    // authority allowed to retire that expired checkpoint; a transient or
+    // differently-owned lease remains fail-closed.
+    await operations.reconcile();
+  }
 }
 
 async function recoverProfileScope(profileScope: string): Promise<void> {
@@ -1137,10 +1472,116 @@ function checkpointMatchesBinding(
   );
 }
 
+export function assertWorkflowCommandCheckpointProfileScope(
+  checkpoint: Pick<
+    CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+    "profileScope" | "request"
+  >,
+): void {
+  const expected = profilePaths(
+    root,
+    checkpoint.request.accountId,
+    checkpoint.request.applicationIdentityId,
+  ).scope;
+  if (checkpoint.profileScope !== expected) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+}
+
+type SafeCheckpointRecoveryDisposition =
+  "not_applicable" | "restored" | "retired";
+
+export async function stabilizeSafeWorkflowCommandCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+  operations: {
+    read(): Promise<
+      { state: "staged" | "committed"; result: unknown } | undefined
+    >;
+    persistFailed(result: CloudRunResult): Promise<void>;
+    restore(): Promise<void>;
+    retire(): Promise<void>;
+  },
+): Promise<SafeCheckpointRecoveryDisposition> {
+  if (
+    checkpoint.version !== CURRENT_CHECKPOINT_VERSION ||
+    !["prepared", "needs_input", "provider_review"].includes(
+      checkpoint.phase,
+    ) ||
+    !isWorkflowCommandRequestId(checkpoint.workflow.requestId) ||
+    checkpoint.request.requestId !== checkpoint.workflow.requestId
+  ) {
+    return "not_applicable";
+  }
+
+  const stored = await operations.read();
+  if (!stored) {
+    await operations.persistFailed(
+      createDurableFailedRunResult(checkpoint.request),
+    );
+    await operations.retire();
+    return "retired";
+  }
+  if (stored.state !== "committed") {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  assertDurableResultBinding(stored.result, checkpoint.request);
+  const status = (stored.result as CloudRunResult).receipt.status;
+  if (
+    status === "needs_input" &&
+    (checkpoint.phase === "needs_input" ||
+      checkpoint.phase === "provider_review")
+  ) {
+    // The opaque Temporal activity retries without a schedule-to-close limit.
+    // An exact committed intervention result may therefore be discovered after
+    // the ordinary 24-hour checkpoint window. Preserve the matching browser
+    // authority until the workflow publishes that intervention and starts its
+    // own bounded response timer; restoreCheckpoint revalidates all current
+    // server authority and writes a fresh bounded checkpoint before I/O.
+    await operations.restore();
+    return "restored";
+  }
+  if (status === "failed") {
+    await operations.retire();
+    return "retired";
+  }
+  throw new ResultStoreError("result_promotion_conflict");
+}
+
 async function reconcileStoredCheckpoint(
   checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
 ): Promise<void> {
+  assertWorkflowCommandCheckpointProfileScope(checkpoint);
   if (await recoverSubmittedCheckpointResult(checkpoint)) return;
+  if (await reconcileCommittedSafeCheckpointResult(checkpoint)) return;
+  if (
+    await stabilizeSideEffectUnknownCheckpoint(checkpoint, {
+      persist: () => persistSideEffectUnknownTombstone(checkpoint),
+      reconcile: () =>
+        reconcileCheckpointMetadata(
+          checkpoint.request,
+          {
+            fence: checkpoint.lease.fence,
+            expiresAtMs: checkpoint.lease.expiresAtMs,
+            ownerId: checkpoint.lease.ownerId,
+            leaseToken: checkpoint.lease.leaseToken ?? "",
+          },
+          checkpoint.version,
+          checkpoint.phase,
+        ),
+      remove: () =>
+        removeExistingCloudRunCheckpoint(
+          checkpoint.profileScope,
+          checkpoint.browserSessionId,
+        ),
+    })
+  )
+    return;
+  await reconcileAndRemoveCheckpoint(checkpoint);
+}
+
+async function reconcileAndRemoveCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): Promise<void> {
   await reconcileCheckpointMetadata(
     checkpoint.request,
     {
@@ -1155,6 +1596,173 @@ async function reconcileStoredCheckpoint(
   await removeExistingCloudRunCheckpoint(
     checkpoint.profileScope,
     checkpoint.browserSessionId,
+  );
+}
+
+async function reconcileCommittedSafeCheckpointResult(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): Promise<boolean> {
+  if (
+    checkpoint.version !== CURRENT_CHECKPOINT_VERSION ||
+    restartDisposition(checkpoint.phase, checkpoint.expiresAtMs) ===
+      "side_effect_unknown" ||
+    checkpoint.request.requestId !== checkpoint.workflow.requestId ||
+    !requestIdMatchesRun(
+      checkpoint.request.runId,
+      checkpoint.workflow.requestId,
+    )
+  ) {
+    return false;
+  }
+  const context = {
+    requestId: checkpoint.workflow.requestId,
+    profileScope: checkpoint.profileScope,
+  };
+  const stored = await runnerVolumeClient.withExistingResultResidency(
+    localResultScope(context),
+    (storage) =>
+      storage
+        ? readManagedResultState<unknown>(storage, context, profileKey!)
+        : Promise.resolve(undefined),
+  );
+  if (!stored) return false;
+  if (stored.state !== "committed") {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  assertDurableResultBinding(stored.result, checkpoint.request);
+  const status = (stored.result as CloudRunResult).receipt.status;
+  if (status !== "failed" && status !== "needs_input") {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  await reconcileCheckpointMetadata(
+    checkpoint.request,
+    {
+      fence: checkpoint.lease.fence,
+      expiresAtMs: checkpoint.lease.expiresAtMs,
+      ownerId: checkpoint.lease.ownerId,
+      leaseToken: checkpoint.lease.leaseToken ?? "",
+    },
+    checkpoint.version,
+    checkpoint.phase,
+  );
+  await removeExistingCloudRunCheckpoint(
+    checkpoint.profileScope,
+    checkpoint.browserSessionId,
+  );
+  return true;
+}
+
+async function persistCheckpointFailedResult(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+  result: CloudRunResult,
+): Promise<void> {
+  assertWorkflowCommandCheckpointProfileScope(checkpoint);
+  const purgeSubject = checkpoint.lease.purgeSubject;
+  if (
+    !purgeSubject ||
+    !/^[A-Za-z0-9_-]{43}$/.test(purgeSubject) ||
+    !isWorkflowCommandRequestId(checkpoint.workflow.requestId) ||
+    checkpoint.request.requestId !== checkpoint.workflow.requestId
+  ) {
+    throw new ProfileRecoveryBlockedError();
+  }
+  const expected = createDurableFailedRunResult(checkpoint.request);
+  if (JSON.stringify(result) !== JSON.stringify(expected)) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  const context = {
+    requestId: checkpoint.workflow.requestId,
+    profileScope: checkpoint.profileScope,
+  };
+  await runnerVolumeClient.withResultWriteResidency(
+    purgeSubject,
+    localResultScope(context),
+    async (storage) => {
+      const existing = await readManagedResultState<unknown>(
+        storage,
+        context,
+        profileKey!,
+      );
+      if (existing) {
+        if (
+          existing.state !== "committed" ||
+          JSON.stringify(existing.result) !== JSON.stringify(expected)
+        ) {
+          throw new ResultStoreError("result_promotion_conflict");
+        }
+        return;
+      }
+      await writeManagedResult(storage, context, expected, profileKey!);
+    },
+  );
+}
+
+async function persistSideEffectUnknownTombstone(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): Promise<void> {
+  assertWorkflowCommandCheckpointProfileScope(checkpoint);
+  const purgeSubject = checkpoint.lease.purgeSubject;
+  if (!purgeSubject || !/^[A-Za-z0-9_-]{43}$/.test(purgeSubject)) {
+    throw new ProfileRecoveryBlockedError();
+  }
+  const context = {
+    requestId: checkpoint.workflow.requestId,
+    profileScope: checkpoint.profileScope,
+  };
+  await runnerVolumeClient.withResultWriteResidency(
+    purgeSubject,
+    localResultScope(context),
+    async (storage) => {
+      const authority = createDurableSideEffectUnknownAuthority(
+        checkpoint.request,
+        checkpoint.workflow.requestId,
+      );
+      const existing = await readManagedResultState<unknown>(
+        storage,
+        context,
+        profileKey!,
+      );
+      if (existing) {
+        if (
+          existing.state !== "committed" ||
+          !parseSideEffectUnknownAuthority(existing.result, authority)
+        ) {
+          throw new ResultStoreError("result_promotion_conflict");
+        }
+        return;
+      }
+      await writeManagedResult(storage, context, authority, profileKey!);
+    },
+  );
+}
+
+export async function stabilizeSideEffectUnknownCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+  operations: {
+    persist(): Promise<void>;
+    reconcile(): Promise<void>;
+    remove(): Promise<void>;
+  },
+): Promise<boolean> {
+  if (!isDurableSideEffectUnknownCheckpoint(checkpoint)) return false;
+  await operations.persist();
+  await operations.reconcile();
+  await operations.remove();
+  return true;
+}
+
+function isDurableSideEffectUnknownCheckpoint(
+  checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent>,
+): boolean {
+  return (
+    checkpoint.version === CURRENT_CHECKPOINT_VERSION &&
+    restartDisposition(checkpoint.phase, checkpoint.expiresAtMs) ===
+      "side_effect_unknown" &&
+    checkpoint.workflow.status === "side_effect_unknown" &&
+    isWorkflowCommandRequestId(checkpoint.workflow.requestId) &&
+    checkpoint.request.requestId === checkpoint.workflow.requestId &&
+    typeof checkpoint.lease.purgeSubject === "string" &&
+    /^[A-Za-z0-9_-]{43}$/.test(checkpoint.lease.purgeSubject)
   );
 }
 
@@ -1178,7 +1786,9 @@ async function recoverSubmittedCheckpointForRequest(
       throw new ResultStoreError("result_promotion_conflict");
     }
     const recovered = await recoverSubmittedCheckpointResult(checkpoint);
-    if (recovered) assertDurableResultBinding(recovered, binding);
+    if (recovered) {
+      assertDurableResultBinding(recovered, binding);
+    }
     return recovered;
   } catch {
     recoveryIsolation.rejectMutation(profileScope);
@@ -1194,16 +1804,33 @@ async function readMutationResult(
       localResultScope(resultContext),
       (storage) =>
         storage
-          ? readManagedResult<CloudRunResult>(
-              storage,
-              resultContext,
-              profileKey!,
-            )
+          ? readManagedResult<
+              CloudRunResult | DurableSideEffectUnknownAuthority
+            >(storage, resultContext, profileKey!)
           : Promise.resolve(undefined),
     );
-    if (result) assertMutationResultBinding(result, resultContext, binding);
-    return result;
-  } catch {
+    if (result) {
+      if (
+        parseSideEffectUnknownAuthority(result, {
+          ...binding,
+          requestId: resultContext.requestId,
+        })
+      ) {
+        await settleDurableSideEffectUnknownCheckpoint({
+          ...binding,
+          requestId: resultContext.requestId,
+        });
+        throw new DurableSideEffectUnknownError();
+      }
+      assertMutationResultBinding(
+        result as CloudRunResult,
+        resultContext,
+        binding,
+      );
+    }
+    return result as CloudRunResult | undefined;
+  } catch (error) {
+    if (error instanceof DurableSideEffectUnknownError) throw error;
     recoveryIsolation.rejectMutation(resultContext.profileScope);
   }
 }
@@ -1214,12 +1841,10 @@ function assertMutationResultBinding(
   binding: DurableResultBinding,
 ): void {
   assertDurableResultBinding(result, binding);
-  const validRequestId =
-    resultContext.requestId === `${binding.runId}:initial` ||
-    (resultContext.requestId.startsWith(`${binding.runId}:resume:`) &&
-      /^:resume:[1-6]$/.test(
-        resultContext.requestId.slice(binding.runId.length),
-      ));
+  const validRequestId = requestIdMatchesRun(
+    binding.runId,
+    resultContext.requestId,
+  );
   if (
     !validRequestId ||
     profilePaths(root, binding.accountId, binding.applicationIdentityId)
@@ -1254,8 +1879,29 @@ async function recoverSubmittedCheckpointResult(
   };
   const recovered = await runnerVolumeClient.withExistingResultResidency(
     localResultScope(resultContext),
-    (storage) => {
+    async (storage) => {
       if (!storage) return Promise.resolve(undefined);
+      const existing = await readManagedResultState<unknown>(
+        storage,
+        resultContext,
+        profileKey!,
+      );
+      if (
+        existing &&
+        parseSideEffectUnknownAuthority(existing.result, {
+          accountId: checkpoint.request.accountId,
+          applicationId: checkpoint.request.applicationId,
+          applicationIdentityId: checkpoint.request.applicationIdentityId,
+          browserSessionId: checkpoint.request.browserSessionId,
+          runId: checkpoint.request.runId,
+          requestId: checkpoint.workflow.requestId,
+        })
+      ) {
+        if (existing.state !== "committed") {
+          throw new ResultStoreError("result_promotion_conflict");
+        }
+        return undefined;
+      }
       return recoverManagedSubmittedResult<CloudRunResult>(
         storage,
         profileKey!,
@@ -1310,7 +1956,7 @@ async function writeCloudCheckpoint(input: {
   status: CloudRunCheckpoint["workflow"]["status"];
   browserUrl: string;
   providerReview?: { adapter: string; adapterVersion?: string };
-}): Promise<void> {
+}): Promise<CloudRunCheckpoint<CloudRunRequest, RunEvent>> {
   const now = Date.now();
   const checkpoint: CloudRunCheckpoint<CloudRunRequest, RunEvent> = {
     version: CURRENT_CHECKPOINT_VERSION,
@@ -1320,7 +1966,7 @@ async function writeCloudCheckpoint(input: {
     expiresAtMs: now + 24 * 60 * 60 * 1_000,
     profileScope: input.paths.scope,
     browserSessionId: input.input.browserSessionId,
-    request: input.input,
+    request: { ...input.input, requestId: input.requestId },
     browser: { url: input.browserUrl },
     workflow: {
       status: input.status,
@@ -1328,7 +1974,12 @@ async function writeCloudCheckpoint(input: {
       ...(input.providerReview ? { providerReview: input.providerReview } : {}),
     },
     events: input.events,
-    lease: input.lease.checkpointMetadata(),
+    lease: {
+      ...input.lease.checkpointMetadata(),
+      ...(input.lease.purgeSubject
+        ? { purgeSubject: input.lease.purgeSubject }
+        : {}),
+    },
   };
   await withTrackedProfileResidency(
     input.lease,
@@ -1338,6 +1989,7 @@ async function writeCloudCheckpoint(input: {
       await writeManagedRunCheckpoint(storage, checkpoint, profileKey!);
     },
   );
+  return checkpoint;
 }
 
 async function markCloudCheckpointUnknown(
@@ -1348,8 +2000,8 @@ async function markCloudCheckpointUnknown(
   requestId: string,
   checkpointCreatedAtMs: number,
   browserUrl: string,
-): Promise<void> {
-  await writeCloudCheckpoint({
+): Promise<CloudRunCheckpoint<CloudRunRequest, RunEvent>> {
+  return writeCloudCheckpoint({
     input,
     paths,
     events,
@@ -1360,6 +2012,83 @@ async function markCloudCheckpointUnknown(
     status: "side_effect_unknown",
     browserUrl,
   });
+}
+
+export async function persistAndAbortSideEffectUnknown<T>(
+  persist: () => Promise<T>,
+  lease: ActiveExecutionLease,
+  cleanup: () => Promise<void>,
+  compact: (persisted: T) => Promise<void>,
+): Promise<never> {
+  let persisted: T;
+  try {
+    persisted = await persist();
+  } catch {
+    await cleanup().catch(() => undefined);
+    await lease.stopHeartbeat().catch(() => undefined);
+    throw new AmbiguityPersistenceError();
+  }
+  await abortLeasedRun(lease, cleanup).catch(() => undefined);
+  try {
+    await compact(persisted);
+  } catch {
+    throw new AmbiguityPersistenceError();
+  }
+  throw new DurableSideEffectUnknownError();
+}
+
+export async function leaveLeasedRunRetryable(
+  lease: ActiveExecutionLease,
+  cleanup: () => Promise<void>,
+): Promise<never> {
+  await cleanup().catch(() => undefined);
+  await lease.stopHeartbeat().catch(() => undefined);
+  throw new TerminalResultPersistenceError();
+}
+
+export async function persistAndFinishFailedRun(
+  requestId: string,
+  persist: () => Promise<CloudRunResult>,
+  lease: ActiveExecutionLease,
+  retireCheckpoint: () => Promise<void>,
+  cleanup: () => Promise<void>,
+): Promise<never> {
+  const result = await persistAndFinishSafeRunResult(
+    persist,
+    lease,
+    "failed",
+    retireCheckpoint,
+    cleanup,
+  );
+  throw new DurableFailedRunResultError(requestId, result);
+}
+
+async function persistAndFinishSafeRunResult(
+  persist: () => Promise<CloudRunResult>,
+  lease: ActiveExecutionLease,
+  outcome: "failed" | "released",
+  retireCheckpoint: () => Promise<void>,
+  cleanup: () => Promise<void>,
+): Promise<CloudRunResult> {
+  let result: CloudRunResult;
+  try {
+    result = await persist();
+  } catch {
+    await cleanup().catch(() => undefined);
+    await lease.stopHeartbeat().catch(() => undefined);
+    throw new TerminalResultPersistenceError();
+  }
+
+  let checkpointRetired = true;
+  try {
+    await retireCheckpoint();
+  } catch {
+    checkpointRetired = false;
+  }
+  await cleanup().catch(() => undefined);
+  await lease.finish(outcome).catch(() => undefined);
+  if (!checkpointRetired) throw new TerminalResultPersistenceError();
+  return result;
 }
 
 async function run(
@@ -1478,7 +2207,7 @@ async function executeRun(
   lease: ActiveExecutionLease,
   navigate: boolean,
   resumeAction?: string,
-  requestId = `${input.runId}:initial`,
+  requestId = input.requestId,
   checkpointCreatedAtMs = Date.now(),
 ) {
   assertApprovedExecutionChecksum(input.packet, input.job);
@@ -1565,17 +2294,19 @@ async function executeRun(
       await authorizeCloudFinalSubmitBeforeCheckpoint(
         lease,
         finalSubmitProof,
-        () => writeCloudCheckpoint({
-          input,
-          paths,
-          events,
-          lease,
-          requestId,
-          checkpointCreatedAtMs,
-          phase: "final_submit_started",
-          status: "side_effect_unknown",
-          browserUrl: browserPage.url(),
-        }),
+        async () => {
+          await writeCloudCheckpoint({
+            input,
+            paths,
+            events,
+            lease,
+            requestId,
+            checkpointCreatedAtMs,
+            phase: "final_submit_started",
+            status: "side_effect_unknown",
+            browserUrl: browserPage.url(),
+          });
+        },
       );
     },
     afterFinalSubmit: async (outcome: "activated" | "activation_uncertain") => {
@@ -1596,7 +2327,10 @@ async function executeRun(
       });
     },
   } as const;
-  const providerRegistry = providerRegistryForExecution(runtimePacket, resumeAction);
+  const providerRegistry = providerRegistryForExecution(
+    runtimePacket,
+    resumeAction,
+  );
   const execution = providerRegistry
     ? await executeApplication(adapterContext, providerRegistry)
     : await executeApplication(adapterContext);
@@ -1675,9 +2409,7 @@ async function executeRun(
     result: execution.receipt,
     finalUrl: page.url(),
     screenshotKeys: [screenshotPath],
-    ...(atsCertifiedReceiptAuthority
-      ? { atsCertifiedReceiptAuthority }
-      : {}),
+    ...(atsCertifiedReceiptAuthority ? { atsCertifiedReceiptAuthority } : {}),
   });
   const receiptPath = await writeManagedReceiptArtifact(
     paths,
@@ -1738,6 +2470,71 @@ function durableResultIdentity(
   };
 }
 
+export function createDurableFailedRunResult(
+  binding: DurableResultBinding,
+): CloudRunResult {
+  return {
+    accountId: binding.accountId,
+    applicationId: binding.applicationId,
+    applicationIdentityId: binding.applicationIdentityId,
+    browserSessionId: binding.browserSessionId,
+    runId: binding.runId,
+    receipt: {
+      status: "failed",
+      issues: [
+        {
+          field: "submission",
+          message: "The automated browser run ended before submission.",
+          severity: "blocking",
+        },
+      ],
+    },
+  };
+}
+
+async function persistFailedRunResult(
+  input: CloudRunRequest,
+  requestId: string,
+  lease: ActiveExecutionLease,
+  existingResult?: CloudRunResult,
+): Promise<CloudRunResult> {
+  if (!requestIdMatchesRun(input.runId, requestId)) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  const context = {
+    requestId,
+    profileScope: profilePaths(
+      root,
+      input.accountId,
+      input.applicationIdentityId,
+    ).scope,
+  };
+  const binding = durableResultIdentity(input);
+  const result = existingResult ?? createDurableFailedRunResult(binding);
+  if (result.receipt.status !== "failed") {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  assertDurableResultBinding(result, binding);
+  await withRegisteredResultWrite(lease, context, async (storage) => {
+    const existing = await readManagedResultState<unknown>(
+      storage,
+      context,
+      profileKey!,
+    );
+    if (existing) {
+      if (
+        existing.state !== "committed" ||
+        JSON.stringify(existing.result) !== JSON.stringify(result)
+      ) {
+        throw new ResultStoreError("result_promotion_conflict");
+      }
+      return;
+    }
+    await writeManagedResult(storage, context, result, profileKey!);
+  });
+  return result;
+}
+
 export function submissionReceiptAuthority(
   status: SubmissionReceipt["status"],
   lease: Pick<
@@ -1779,6 +2576,28 @@ async function evidenceObject(
 }
 
 async function validate(input: CloudRunRequest): Promise<CloudRunRequest> {
+  const expectedKeys = [
+    "accountId",
+    "applicationId",
+    "applicationIdentityId",
+    "browserProfileId",
+    "browserSessionId",
+    "job",
+    "packet",
+    "requestId",
+    "runId",
+    "url",
+  ];
+  const actualKeys =
+    input && typeof input === "object" && !Array.isArray(input)
+      ? Object.keys(input).sort()
+      : [];
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error("Invalid run request");
+  }
   for (const [name, value] of Object.entries({
     accountId: input.accountId,
     applicationIdentityId: input.applicationIdentityId,
@@ -1791,6 +2610,9 @@ async function validate(input: CloudRunRequest): Promise<CloudRunRequest> {
   }
   if (!/^[A-Za-z0-9:_-]{3,160}$/.test(input.browserProfileId))
     throw new Error("Invalid browserProfileId");
+  if (!requestIdMatchesRun(input.runId, input.requestId)) {
+    throw new Error("Invalid requestId");
+  }
   if (input.packet.applicationId !== input.applicationId)
     throw new Error("Application bundle mismatch");
   if (
@@ -2005,15 +2827,242 @@ export async function recoverDurableRunResult(
     encryptionKey,
   );
   if (result !== undefined) {
-    assertDurableResultBinding(result, {
+    const lookupBinding = {
       accountId: lookup.accountId,
       applicationId: lookup.applicationId,
       applicationIdentityId: lookup.applicationIdentityId,
       browserSessionId: lookup.browserSessionId,
       runId: lookup.runId,
-    });
+      requestId: lookup.requestId,
+    };
+    if (!parseSideEffectUnknownAuthority(result, lookupBinding)) {
+      assertDurableResultBinding(result, lookupBinding);
+    }
   }
   return result;
+}
+
+export async function recoverDurableSideEffectUnknown(
+  dataRoot: string,
+  encryptionKey: Buffer,
+  value: unknown,
+): Promise<string | undefined> {
+  const lookup = validateDurableRunResultRequest(value);
+  if (!isWorkflowCommandRequestId(lookup.requestId)) return undefined;
+  const profileScope = profilePaths(
+    dataRoot,
+    lookup.accountId,
+    lookup.applicationIdentityId,
+  ).scope;
+  const context = { requestId: lookup.requestId, profileScope };
+  const stored = await readResult<unknown>(dataRoot, context, encryptionKey);
+  if (stored !== undefined) {
+    if (parseSideEffectUnknownAuthority(stored, lookup)) {
+      return lookup.requestId;
+    }
+    assertDurableResultBinding(stored, lookup);
+    return undefined;
+  }
+  const scan = await scanRunCheckpoints<CloudRunRequest, RunEvent>(
+    dataRoot,
+    encryptionKey,
+    profileScope,
+  );
+  return recoverSideEffectUnknownFromScan(scan, profileScope, lookup);
+}
+
+async function recoverDurableSideEffectUnknownWithResidency(
+  lookup: DurableRunResultRequest,
+): Promise<boolean> {
+  if (!isWorkflowCommandRequestId(lookup.requestId)) return false;
+  const profileScope = profilePaths(
+    root,
+    lookup.accountId,
+    lookup.applicationIdentityId,
+  ).scope;
+  const context = { requestId: lookup.requestId, profileScope };
+  const stored = await runnerVolumeClient.withExistingResultResidency(
+    localResultScope(context),
+    (storage) =>
+      storage
+        ? readManagedResultState<unknown>(storage, context, profileKey!)
+        : Promise.resolve(undefined),
+  );
+  if (stored !== undefined) {
+    if (parseSideEffectUnknownAuthority(stored.result, lookup)) {
+      if (stored.state !== "committed") {
+        throw new ResultStoreError("result_promotion_conflict");
+      }
+      await settleDurableSideEffectUnknownCheckpoint(lookup);
+      return true;
+    }
+    assertDurableResultBinding(stored.result, lookup);
+    return false;
+  }
+  const scan = await scanManagedCloudRunCheckpoints(profileScope);
+  if (
+    recoverSideEffectUnknownFromScan(scan, profileScope, lookup) === undefined
+  ) {
+    return false;
+  }
+  const checkpoint = scan.checkpoints.find(
+    ({ checkpoint: candidate }) =>
+      candidate.workflow.requestId === lookup.requestId,
+  )?.checkpoint;
+  if (!checkpoint) throw new ProfileRecoveryBlockedError();
+  await reconcileStoredCheckpoint(checkpoint);
+  return true;
+}
+
+async function settleDurableSideEffectUnknownCheckpoint(
+  lookup: DurableRunResultRequest,
+): Promise<void> {
+  const profileScope = profilePaths(
+    root,
+    lookup.accountId,
+    lookup.applicationIdentityId,
+  ).scope;
+  const scan = await scanManagedCloudRunCheckpoints(profileScope);
+  if (scan.failures.length > 0) throw new ProfileRecoveryBlockedError();
+  const matching = scan.checkpoints.filter(
+    ({ checkpoint }) => checkpoint.workflow.requestId === lookup.requestId,
+  );
+  if (matching.length === 0) return;
+  recoverSideEffectUnknownFromScan(scan, profileScope, lookup);
+  await reconcileStoredCheckpoint(matching[0]!.checkpoint);
+  const verified = await scanManagedCloudRunCheckpoints(profileScope);
+  if (
+    verified.failures.length > 0 ||
+    verified.checkpoints.some(
+      ({ checkpoint }) => checkpoint.workflow.requestId === lookup.requestId,
+    )
+  ) {
+    throw new ProfileRecoveryBlockedError();
+  }
+}
+
+function recoverSideEffectUnknownFromScan(
+  scan: RunCheckpointScan<CloudRunRequest, RunEvent>,
+  profileScope: string,
+  lookup: DurableRunResultRequest,
+): string | undefined {
+  if (scan.failures.length > 0) throw new ProfileRecoveryBlockedError();
+  const matching = scan.checkpoints.filter(
+    ({ checkpoint }) => checkpoint.workflow.requestId === lookup.requestId,
+  );
+  if (matching.length === 0) return undefined;
+  if (matching.length !== 1) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  const checkpoint = matching[0]!.checkpoint;
+  if (
+    checkpoint.version !== CURRENT_CHECKPOINT_VERSION ||
+    checkpoint.profileScope !== profileScope ||
+    checkpoint.request.requestId !== lookup.requestId ||
+    checkpoint.request.accountId !== lookup.accountId ||
+    checkpoint.request.applicationId !== lookup.applicationId ||
+    checkpoint.request.applicationIdentityId !== lookup.applicationIdentityId ||
+    checkpoint.request.browserSessionId !== lookup.browserSessionId ||
+    checkpoint.request.runId !== lookup.runId
+  ) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  if (!isDurableSideEffectUnknownCheckpoint(checkpoint)) {
+    return undefined;
+  }
+  return lookup.requestId;
+}
+
+function durableResultLookup(
+  binding: DurableResultBinding,
+  requestId: string,
+): DurableRunResultRequest {
+  return { ...binding, requestId };
+}
+
+export function authoritativeRunnerResult(
+  value: unknown,
+  requestId: string,
+): Record<string, unknown> {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value) ||
+    !requestIdMatchesRun(
+      String((value as Record<string, unknown>).runId ?? ""),
+      requestId,
+    )
+  ) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  const result = value as Record<string, unknown>;
+  if (
+    Object.prototype.hasOwnProperty.call(result, "requestId") &&
+    result.requestId !== requestId
+  ) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  return { ...result, requestId };
+}
+
+export function createDurableSideEffectUnknownAuthority(
+  binding: DurableResultBinding,
+  requestId: string,
+): DurableSideEffectUnknownAuthority {
+  return {
+    schemaVersion: 2,
+    outcome: "side_effect_unknown",
+    accountId: binding.accountId,
+    applicationId: binding.applicationId,
+    applicationIdentityId: binding.applicationIdentityId,
+    browserSessionId: binding.browserSessionId,
+    runId: binding.runId,
+    requestId,
+  };
+}
+
+function parseSideEffectUnknownAuthority(
+  value: unknown,
+  lookup: DurableRunResultRequest,
+): DurableSideEffectUnknownAuthority | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return undefined;
+  const authority = value as Record<string, unknown>;
+  const keys = Object.keys(authority).sort();
+  const expected = [
+    "accountId",
+    "applicationId",
+    "applicationIdentityId",
+    "browserSessionId",
+    "outcome",
+    "requestId",
+    "runId",
+    "schemaVersion",
+  ].sort();
+  if (
+    keys.length !== expected.length ||
+    keys.some((key, index) => key !== expected[index]) ||
+    authority.schemaVersion !== 2 ||
+    authority.outcome !== "side_effect_unknown"
+  ) {
+    return undefined;
+  }
+  for (const field of [
+    "accountId",
+    "applicationId",
+    "applicationIdentityId",
+    "browserSessionId",
+    "runId",
+    "requestId",
+  ] as const) {
+    if (authority[field] !== lookup[field]) {
+      throw new ResultStoreError("result_promotion_conflict");
+    }
+  }
+  if (!isWorkflowCommandRequestId(String(authority.requestId))) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+  return authority as unknown as DurableSideEffectUnknownAuthority;
 }
 
 async function recoverDurableRunResultWithResidency(
@@ -2038,13 +3087,17 @@ async function recoverDurableRunResultWithResidency(
         encryptionKey,
       );
       if (result !== undefined) {
-        assertDurableResultBinding(result, {
+        const lookupBinding = {
           accountId: lookup.accountId,
           applicationId: lookup.applicationId,
           applicationIdentityId: lookup.applicationIdentityId,
           browserSessionId: lookup.browserSessionId,
           runId: lookup.runId,
-        });
+          requestId: lookup.requestId,
+        };
+        if (!parseSideEffectUnknownAuthority(result, lookupBinding)) {
+          assertDurableResultBinding(result, lookupBinding);
+        }
       }
       return result;
     },
@@ -2636,6 +3689,20 @@ export function publicRunnerFailure(error: unknown): {
       message: "This run is already active.",
     };
   }
+  if (error instanceof AmbiguityPersistenceError) {
+    return {
+      status: 503,
+      code: "ambiguity_persistence_failed",
+      message: "The application runner is temporarily unavailable.",
+    };
+  }
+  if (error instanceof TerminalResultPersistenceError) {
+    return {
+      status: 503,
+      code: "terminal_result_persistence_failed",
+      message: "The application runner is temporarily unavailable.",
+    };
+  }
   if (error instanceof LeasedRunError) {
     return {
       status: error.outcome === "submitted_result_pending" ? 503 : 500,
@@ -2657,6 +3724,38 @@ export function publicRunnerFailure(error: unknown): {
     status: 500,
     code: "runner_failed",
     message: "The application runner could not finish this run.",
+  };
+}
+
+export function publicRunnerFailureResponse(
+  error: unknown,
+  workflowCommandRequestId?: string,
+): {
+  status: number;
+  code: string;
+  body: Record<string, unknown>;
+} {
+  const failure = publicRunnerFailure(error);
+  if (
+    error instanceof DurableSideEffectUnknownError &&
+    failure.code === "side_effect_unknown" &&
+    workflowCommandRequestId !== undefined &&
+    isWorkflowCommandRequestId(workflowCommandRequestId)
+  ) {
+    return {
+      status: 500,
+      code: failure.code,
+      body: {
+        schemaVersion: 2,
+        outcome: "side_effect_unknown",
+        requestId: workflowCommandRequestId,
+      },
+    };
+  }
+  return {
+    status: failure.status,
+    code: failure.code,
+    body: { error: failure.message },
   };
 }
 
@@ -2688,6 +3787,7 @@ function json(response: ServerResponse, status: number, value: unknown): void {
   response.writeHead(status, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff",
   });
   response.end(JSON.stringify(value));
 }
@@ -2772,18 +3872,6 @@ export async function serializedKnownBrowserSessionMutation(
   return true;
 }
 
-function requestIdMatchesRun(
-  runId: string,
-  requestId: string,
-  resumeOnly = false,
-): boolean {
-  return (
-    (!resumeOnly && requestId === `${runId}:initial`) ||
-    (requestId.startsWith(`${runId}:resume:`) &&
-      /^:resume:[1-6]$/.test(requestId.slice(runId.length)))
-  );
-}
-
 async function serializedProfileMutation<T>(
   profileScope: string,
   operation: () => Promise<T>,
@@ -2856,9 +3944,7 @@ export function runnerProcessRuntimeGrantFromEnv(
       runnerBuildId,
       platform: runtimePlatform,
       architecture: runtimeArchitecture,
-      automationBundleSha256: required(
-        "BLUEY_JOBS_AUTOMATION_BUNDLE_SHA256",
-      ),
+      automationBundleSha256: required("BLUEY_JOBS_AUTOMATION_BUNDLE_SHA256"),
       playwrightVersion: required("BLUEY_JOBS_PLAYWRIGHT_VERSION"),
       chromiumRevision: required("BLUEY_JOBS_CHROMIUM_REVISION"),
       chromiumExecutableSha256: required(

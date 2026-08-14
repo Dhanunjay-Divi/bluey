@@ -47,12 +47,15 @@ afterEach(() => {
 describe("execution lease client", () => {
   it("signs every lease operation and keeps lease data in internal requests", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
-      if (String(input).endsWith("/claim")) return grantResponse();
-      if (String(input).endsWith("/irreversible")) return recordResponse("click_started");
-      return new Response(null, { status: 204 });
-    }) as typeof globalThis.fetch;
+    const fetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        if (String(input).endsWith("/claim")) return grantResponse();
+        if (String(input).endsWith("/irreversible"))
+          return recordResponse("click_started");
+        return new Response(null, { status: 204 });
+      },
+    ) as typeof globalThis.fetch;
     const client = createClient(fetch);
 
     const lease = await client.claim(CLAIM);
@@ -71,9 +74,13 @@ describe("execution lease client", () => {
     await lease.finish("submitted");
 
     expect(calls).toHaveLength(3);
-    expect(calls[0]?.url).toBe("https://jobs-api.example/api/jobs/internal/execution-leases/claim");
+    expect(calls[0]?.url).toBe(
+      "https://jobs-api.example/api/jobs/internal/execution-leases/claim",
+    );
     expect(calls[0]?.init).toMatchObject({ method: "POST", redirect: "error" });
-    expect(new Headers(calls[0]?.init?.headers).get("authorization")).toBeNull();
+    expect(
+      new Headers(calls[0]?.init?.headers).get("authorization"),
+    ).toBeNull();
     expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
       account_id: "account-123",
       application_id: "application-123",
@@ -99,48 +106,66 @@ describe("execution lease client", () => {
       outcome: "submitted",
     });
     for (const call of calls) expectSignedWorkerRequest(call, "runner-test-1");
-    expect(new Set(calls.map((call) => new Headers(call.init?.headers)
-      .get("x-bluey-jobs-worker-nonce"))).size).toBe(calls.length);
+    expect(
+      new Set(
+        calls.map((call) =>
+          new Headers(call.init?.headers).get("x-bluey-jobs-worker-nonce"),
+        ),
+      ).size,
+    ).toBe(calls.length);
     expect(JSON.stringify(lease)).not.toContain("lease-secret-value");
   });
 
   it.each([
     ["missing proof", undefined],
-    ["wrong provider control", {
-      ...finalSubmitProof(),
-      control: "lever_application_submit",
-    }],
-    ["unsorted documents", {
-      ...finalSubmitProof(),
-      documents: [
-        finalSubmitProof().documents[0],
-        { kind: "cover_letter", sha256: "b".repeat(64) },
-      ],
-    }],
-  ])("rejects %s before consuming the irreversible lease fence", async (_label, proof) => {
-    let irreversibleCalls = 0;
-    const fetch = vi.fn(async (input: string | URL | Request) => {
-      if (String(input).endsWith("/claim")) return grantResponse();
-      irreversibleCalls += 1;
-      return recordResponse("click_started");
-    }) as typeof globalThis.fetch;
-    const lease = await createClient(fetch).claim(CLAIM);
+    [
+      "wrong provider control",
+      {
+        ...finalSubmitProof(),
+        control: "lever_application_submit",
+      },
+    ],
+    [
+      "unsorted documents",
+      {
+        ...finalSubmitProof(),
+        documents: [
+          finalSubmitProof().documents[0],
+          { kind: "cover_letter", sha256: "b".repeat(64) },
+        ],
+      },
+    ],
+  ])(
+    "rejects %s before consuming the irreversible lease fence",
+    async (_label, proof) => {
+      let irreversibleCalls = 0;
+      const fetch = vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith("/claim")) return grantResponse();
+        irreversibleCalls += 1;
+        return recordResponse("click_started");
+      }) as typeof globalThis.fetch;
+      const lease = await createClient(fetch).claim(CLAIM);
 
-    await expect(lease.beforeFinalSubmit(proof as never)).rejects.toMatchObject({
-      code: "invalid_state",
-    });
+      await expect(
+        lease.beforeFinalSubmit(proof as never),
+      ).rejects.toMatchObject({
+        code: "invalid_state",
+      });
 
-    expect(irreversibleCalls).toBe(0);
-    expect(lease.finalSubmitAttempted).toBe(false);
-    await lease.finish("failed");
-  });
+      expect(irreversibleCalls).toBe(0);
+      expect(lease.finalSubmitAttempted).toBe(false);
+      await lease.finish("failed");
+    },
+  );
 
   it("reconciles an encrypted restart checkpoint with a signed bounded request", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
-      return recordResponse("side_effect_unknown");
-    }) as typeof globalThis.fetch;
+    const fetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        return recordResponse("side_effect_unknown");
+      },
+    ) as typeof globalThis.fetch;
     const client = createClient(fetch);
 
     await client.reconcileCheckpoint({
@@ -172,10 +197,12 @@ describe("execution lease client", () => {
 
   it("replays the exact submitted finish from durable checkpoint authority", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
-      return new Response(null, { status: 204 });
-    }) as typeof globalThis.fetch;
+    const fetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        return new Response(null, { status: 204 });
+      },
+    ) as typeof globalThis.fetch;
     const client = createClient(fetch);
 
     await client.replaySubmittedFinish({
@@ -202,10 +229,12 @@ describe("execution lease client", () => {
 
   it("omits the lease token only for a legacy v1 restart checkpoint", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
-    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-      calls.push({ url: String(input), init });
-      return recordResponse("released");
-    }) as typeof globalThis.fetch;
+    const fetch = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        calls.push({ url: String(input), init });
+        return recordResponse("released");
+      },
+    ) as typeof globalThis.fetch;
 
     await createClient(fetch).reconcileCheckpoint({
       accountId: "account-123",
@@ -234,14 +263,20 @@ describe("execution lease client", () => {
       if (url.endsWith("/claim")) return grantResponse();
       if (url.endsWith("/irreversible")) {
         irreversibleCalls += 1;
-        throw new Error(`network failure containing ${WORKER_SIGNING_KEY} and lease-secret-value`);
+        throw new Error(
+          `network failure containing ${WORKER_SIGNING_KEY} and lease-secret-value`,
+        );
       }
       return new Response(null, { status: 204 });
     }) as typeof globalThis.fetch;
     const lease = await createClient(fetch).claim(CLAIM);
 
-    const first = await lease.beforeFinalSubmit(finalSubmitProof()).catch((error: unknown) => error);
-    const second = await lease.beforeFinalSubmit(finalSubmitProof()).catch((error: unknown) => error);
+    const first = await lease
+      .beforeFinalSubmit(finalSubmitProof())
+      .catch((error: unknown) => error);
+    const second = await lease
+      .beforeFinalSubmit(finalSubmitProof())
+      .catch((error: unknown) => error);
 
     expect(first).toBeInstanceOf(ExecutionLeaseError);
     expect(String(first)).not.toContain(WORKER_SIGNING_KEY);
@@ -260,7 +295,9 @@ describe("execution lease client", () => {
     }) as typeof globalThis.fetch;
     const lease = await createClient(fetch).claim(CLAIM);
 
-    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+    await expect(
+      lease.beforeFinalSubmit(finalSubmitProof()),
+    ).rejects.toMatchObject({
       code: "invalid_response",
     });
     expect(lease.finalSubmitAttempted).toBe(true);
@@ -275,40 +312,45 @@ describe("execution lease client", () => {
     ["expiry-like denial", "expired", "request_failed", 409],
     ["timeout", "timeout", "timed_out", undefined],
   ] as const)(
-    "leaves no irreversible checkpoint or submit activation after %s",
+    "retains the irreversible-attempt checkpoint without submit activation after %s",
     async (_label, mode, expectedCode, expectedStatus) => {
       if (mode === "timeout") vi.useFakeTimers();
       const order: string[] = [];
-      const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
-        const url = String(input);
-        if (url.endsWith("/claim")) return grantResponse();
-        if (url.endsWith("/irreversible")) {
-          order.push("phase_b");
-          if (mode === "network") throw new Error("network unavailable");
-          if (mode === "malformed") {
-            return new Response("{", {
-              status: 200,
+      const fetch = vi.fn(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          const url = String(input);
+          if (url.endsWith("/claim")) return grantResponse();
+          if (url.endsWith("/irreversible")) {
+            order.push("phase_b");
+            if (mode === "network") throw new Error("network unavailable");
+            if (mode === "malformed") {
+              return new Response("{", {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              });
+            }
+            if (mode === "timeout") {
+              return new Promise<Response>((_resolve, reject) => {
+                init?.signal?.addEventListener(
+                  "abort",
+                  () => reject(new Error("authorization timed out")),
+                  { once: true },
+                );
+              });
+            }
+            return new Response(JSON.stringify({ error: mode }), {
+              status: mode === "expired" ? 409 : 403,
               headers: { "Content-Type": "application/json" },
             });
           }
-          if (mode === "timeout") {
-            return new Promise<Response>((_resolve, reject) => {
-              init?.signal?.addEventListener(
-                "abort",
-                () => reject(new Error("authorization timed out")),
-                { once: true },
-              );
-            });
-          }
-          return new Response(JSON.stringify({ error: mode }), {
-            status: mode === "expired" ? 409 : 403,
-            headers: { "Content-Type": "application/json" },
-          });
-        }
-        return new Response(null, { status: 204 });
-      }) as typeof globalThis.fetch;
-      const lease = await createClient(fetch, { requestTimeoutMs: 100 }).claim(CLAIM);
+          return new Response(null, { status: 204 });
+        },
+      ) as typeof globalThis.fetch;
+      const lease = await createClient(fetch, { requestTimeoutMs: 100 }).claim(
+        CLAIM,
+      );
       const writeCheckpoint = vi.fn(async () => {
+        expect(lease.finalSubmitAttempted).toBe(false);
         order.push("checkpoint");
       });
       const activate = vi.fn(() => {
@@ -318,7 +360,9 @@ describe("execution lease client", () => {
         lease,
         finalSubmitProof(),
         writeCheckpoint,
-      ).then(() => activate()).catch((error: unknown) => error);
+      )
+        .then(() => activate())
+        .catch((error: unknown) => error);
 
       if (mode === "timeout") await vi.advanceTimersByTimeAsync(100);
       const error = await failure;
@@ -329,8 +373,8 @@ describe("execution lease client", () => {
         code: expectedCode,
         ...(expectedStatus === undefined ? {} : { status: expectedStatus }),
       });
-      expect(order).toEqual(["phase_b"]);
-      expect(writeCheckpoint).not.toHaveBeenCalled();
+      expect(order).toEqual(["checkpoint", "phase_b"]);
+      expect(writeCheckpoint).toHaveBeenCalledOnce();
       expect(activate).not.toHaveBeenCalled();
       expect(lease.finalSubmitAttempted).toBe(true);
       expect(lease.finalSubmitAuthorized).toBe(false);
@@ -339,7 +383,7 @@ describe("execution lease client", () => {
     },
   );
 
-  it("writes the irreversible checkpoint only after successful Phase B authorization", async () => {
+  it("writes the irreversible-attempt checkpoint before successful Phase B authorization", async () => {
     const order: string[] = [];
     const fetch = vi.fn(async (input: string | URL | Request) => {
       const url = String(input);
@@ -352,7 +396,8 @@ describe("execution lease client", () => {
     }) as typeof globalThis.fetch;
     const lease = await createClient(fetch).claim(CLAIM);
     const writeCheckpoint = vi.fn(async () => {
-      expect(lease.finalSubmitAuthorized).toBe(true);
+      expect(lease.finalSubmitAttempted).toBe(false);
+      expect(lease.finalSubmitAuthorized).toBe(false);
       order.push("checkpoint");
     });
     const activate = vi.fn(() => {
@@ -365,10 +410,39 @@ describe("execution lease client", () => {
       writeCheckpoint,
     ).then(() => activate());
 
-    expect(order).toEqual(["phase_b", "checkpoint", "activation"]);
+    expect(order).toEqual(["checkpoint", "phase_b", "activation"]);
     expect(writeCheckpoint).toHaveBeenCalledOnce();
     expect(activate).toHaveBeenCalledOnce();
     expect(hasCloudIrreversibleCheckpointAuthority(lease)).toBe(true);
+    await lease.stopHeartbeat();
+  });
+
+  it("does not issue irreversible Phase B I/O when the attempt checkpoint cannot be persisted", async () => {
+    let irreversibleCalls = 0;
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) return grantResponse();
+      if (url.endsWith("/irreversible")) {
+        irreversibleCalls += 1;
+        return recordResponse("click_started");
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch).claim(CLAIM);
+
+    await expect(
+      authorizeCloudFinalSubmitBeforeCheckpoint(
+        lease,
+        finalSubmitProof(),
+        async () => {
+          throw new Error("checkpoint write failed");
+        },
+      ),
+    ).rejects.toThrow("checkpoint write failed");
+
+    expect(irreversibleCalls).toBe(0);
+    expect(lease.finalSubmitAttempted).toBe(false);
+    expect(lease.finalSubmitAuthorized).toBe(false);
     await lease.stopHeartbeat();
   });
 
@@ -399,76 +473,122 @@ describe("execution lease client", () => {
   it.each([
     ["missing", undefined],
     ["wrong run", { ...certifiedReceiptAuthority(), runId: "run-other" }],
-    ["wrong observed surface", {
-      ...certifiedReceiptAuthority(),
-      observedSurfaceSha256: "b".repeat(64),
-    }],
-    ["invalid signed layout observation", {
-      ...certifiedReceiptAuthority(),
-      layoutObservationSha256: "B".repeat(64),
-    }],
+    [
+      "wrong observed surface",
+      {
+        ...certifiedReceiptAuthority(),
+        observedSurfaceSha256: "b".repeat(64),
+      },
+    ],
+    [
+      "invalid signed layout observation",
+      {
+        ...certifiedReceiptAuthority(),
+        layoutObservationSha256: "B".repeat(64),
+      },
+    ],
     ["unknown field", { ...certifiedReceiptAuthority(), extra: true }],
-  ])("rejects %s certified Phase B authority before checkpoint", async (_label, authority) => {
-    const fetch = vi.fn(async (input: string | URL | Request) => {
-      const url = String(input);
-      if (url.endsWith("/claim")) return grantResponse();
-      if (url.endsWith("/irreversible")) {
-        return recordResponse("click_started", authority === undefined
-          ? {}
-          : { atsCertifiedReceiptAuthority: authority });
-      }
-      return new Response(null, { status: 204 });
-    }) as typeof globalThis.fetch;
-    const lease = await createClient(fetch).claim(CLAIM);
-    const checkpoint = vi.fn(async () => undefined);
+  ])(
+    "rejects %s certified Phase B authority before checkpoint",
+    async (_label, authority) => {
+      const fetch = vi.fn(async (input: string | URL | Request) => {
+        const url = String(input);
+        if (url.endsWith("/claim")) return grantResponse();
+        if (url.endsWith("/irreversible")) {
+          return recordResponse(
+            "click_started",
+            authority === undefined
+              ? {}
+              : { atsCertifiedReceiptAuthority: authority },
+          );
+        }
+        return new Response(null, { status: 204 });
+      }) as typeof globalThis.fetch;
+      const lease = await createClient(fetch).claim(CLAIM);
+      const checkpoint = vi.fn(async () => undefined);
 
-    await expect(authorizeCloudFinalSubmitBeforeCheckpoint(
-      lease,
-      certifiedFinalSubmitProof(),
-      checkpoint,
-    )).rejects.toMatchObject({ code: "invalid_response" });
+      await expect(
+        authorizeCloudFinalSubmitBeforeCheckpoint(
+          lease,
+          certifiedFinalSubmitProof(),
+          checkpoint,
+        ),
+      ).rejects.toMatchObject({ code: "invalid_response" });
 
-    expect(checkpoint).not.toHaveBeenCalled();
-    expect(lease.finalSubmitAuthorized).toBe(false);
-    expect(lease.atsCertifiedReceiptAuthority).toBeUndefined();
-    await lease.stopHeartbeat();
-  });
+      expect(checkpoint).toHaveBeenCalledOnce();
+      expect(lease.finalSubmitAuthorized).toBe(false);
+      expect(lease.atsCertifiedReceiptAuthority).toBeUndefined();
+      await lease.stopHeartbeat();
+    },
+  );
 
   it("times out stalled responses and rejects oversized or redirected responses", async () => {
     vi.useFakeTimers();
-    const stalledFetch = vi.fn((_input: string | URL | Request, init?: RequestInit) => (
-      new Promise<Response>((_resolve, reject) => {
-        init?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
-      })
-    )) as typeof globalThis.fetch;
-    const stalledClaim = createClient(stalledFetch, { requestTimeoutMs: 100 }).claim(CLAIM);
-    const stalledExpectation = expect(stalledClaim).rejects.toMatchObject({ code: "timed_out" });
+    const stalledFetch = vi.fn(
+      (_input: string | URL | Request, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted")),
+            { once: true },
+          );
+        }),
+    ) as typeof globalThis.fetch;
+    const stalledClaim = createClient(stalledFetch, {
+      requestTimeoutMs: 100,
+    }).claim(CLAIM);
+    const stalledExpectation = expect(stalledClaim).rejects.toMatchObject({
+      code: "timed_out",
+    });
     await vi.advanceTimersByTimeAsync(100);
     await stalledExpectation;
     vi.useRealTimers();
 
-    const oversized = createClient(vi.fn(async () => new Response("x".repeat(300), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    })) as typeof globalThis.fetch, { maxResponseBytes: 256 });
-    await expect(oversized.claim(CLAIM)).rejects.toMatchObject({ code: "response_too_large" });
+    const oversized = createClient(
+      vi.fn(
+        async () =>
+          new Response("x".repeat(300), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }),
+      ) as typeof globalThis.fetch,
+      { maxResponseBytes: 256 },
+    );
+    await expect(oversized.claim(CLAIM)).rejects.toMatchObject({
+      code: "response_too_large",
+    });
 
-    const redirected = createClient(vi.fn(async () => new Response("", {
-      status: 302,
-      headers: { Location: "https://elsewhere.example/lease" },
-    })) as typeof globalThis.fetch);
-    await expect(redirected.claim(CLAIM)).rejects.toMatchObject({ code: "redirect_blocked" });
+    const redirected = createClient(
+      vi.fn(
+        async () =>
+          new Response("", {
+            status: 302,
+            headers: { Location: "https://elsewhere.example/lease" },
+          }),
+      ) as typeof globalThis.fetch,
+    );
+    await expect(redirected.claim(CLAIM)).rejects.toMatchObject({
+      code: "redirect_blocked",
+    });
   });
 
   it("reports duplicate claims without exposing the server response", async () => {
-    const fetch = vi.fn(async () => new Response(JSON.stringify({
-      error: `owner ${WORKER_SIGNING_KEY} lease-secret-value https://private.example`,
-    }), {
-      status: 409,
-      headers: { "Content-Type": "application/json" },
-    })) as typeof globalThis.fetch;
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            error: `owner ${WORKER_SIGNING_KEY} lease-secret-value https://private.example`,
+          }),
+          {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          },
+        ),
+    ) as typeof globalThis.fetch;
 
-    const error = await createClient(fetch).claim(CLAIM).catch((caught: unknown) => caught);
+    const error = await createClient(fetch)
+      .claim(CLAIM)
+      .catch((caught: unknown) => caught);
 
     expect(error).toMatchObject({ code: "lease_unavailable", status: 409 });
     expect(String(error)).not.toContain(WORKER_SIGNING_KEY);
@@ -479,18 +599,26 @@ describe("execution lease client", () => {
   it.each([
     ["volume id", { volume_id: Buffer.alloc(32, 9).toString("base64url") }],
     ["enrollment epoch", { enrollment_epoch: 2 }],
-    ["process instance", { process_instance_id: Buffer.alloc(32, 8).toString("base64url") }],
+    [
+      "process instance",
+      { process_instance_id: Buffer.alloc(32, 8).toString("base64url") },
+    ],
     ["key fingerprint", { volume_key_fingerprint: "9".repeat(64) }],
     ["runtime grant", { runtime_grant_id: "other-runtime-grant" }],
     ["runtime digest", { runtime_sha256: "9".repeat(64) }],
     ["purge subject", { purge_subject: "not-canonical" }],
-  ])("rejects a claim grant with a mismatched %s binding", async (_label, override) => {
-    const fetch = vi.fn(async () => grantResponse(override)) as typeof globalThis.fetch;
+  ])(
+    "rejects a claim grant with a mismatched %s binding",
+    async (_label, override) => {
+      const fetch = vi.fn(async () =>
+        grantResponse(override),
+      ) as typeof globalThis.fetch;
 
-    await expect(createClient(fetch).claim(CLAIM)).rejects.toMatchObject({
-      code: "invalid_response",
-    });
-  });
+      await expect(createClient(fetch).claim(CLAIM)).rejects.toMatchObject({
+        code: "invalid_response",
+      });
+    },
+  );
 
   it("heartbeats while active, records failures, and cleans up on finish", async () => {
     vi.useFakeTimers();
@@ -500,12 +628,15 @@ describe("execution lease client", () => {
       if (url.endsWith("/claim")) return grantResponse();
       if (url.endsWith("/heartbeat")) {
         heartbeatCalls += 1;
-        if (heartbeatCalls === 1) throw new Error("transient heartbeat failure");
+        if (heartbeatCalls === 1)
+          throw new Error("transient heartbeat failure");
         return recordResponse("prepared");
       }
       return new Response(null, { status: 204 });
     }) as typeof globalThis.fetch;
-    const lease = await createClient(fetch, { heartbeatIntervalMs: 100 }).claim(CLAIM);
+    const lease = await createClient(fetch, { heartbeatIntervalMs: 100 }).claim(
+      CLAIM,
+    );
 
     await vi.advanceTimersByTimeAsync(100);
     expect(heartbeatCalls).toBe(1);
@@ -536,11 +667,15 @@ describe("execution lease client", () => {
       }
       return new Response(null, { status: 204 });
     }) as typeof globalThis.fetch;
-    const lease = await createClient(fetch, { heartbeatIntervalMs: 100 }).claim(CLAIM);
+    const lease = await createClient(fetch, { heartbeatIntervalMs: 100 }).claim(
+      CLAIM,
+    );
     await vi.advanceTimersByTimeAsync(100);
     expect(lease.heartbeatFailureCode).toBe("request_failed");
 
-    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({ status: 409 });
+    await expect(
+      lease.beforeFinalSubmit(finalSubmitProof()),
+    ).rejects.toMatchObject({ status: 409 });
 
     expect(irreversibleCalls).toBe(1);
     expect(lease.finalSubmitAttempted).toBe(true);
@@ -562,34 +697,48 @@ describe("execution lease client", () => {
 
   it("allows plaintext worker credentials only for explicit loopback development origins", () => {
     const fetch = vi.fn() as typeof globalThis.fetch;
-    expect(() => createClient(fetch, { origin: "http://jobs.internal:8080" }))
-      .toThrow("configuration");
-    expect(() => createClient(fetch, { origin: "http://example.com" }))
-      .toThrow("configuration");
+    expect(() =>
+      createClient(fetch, { origin: "http://jobs.internal:8080" }),
+    ).toThrow("configuration");
+    expect(() => createClient(fetch, { origin: "http://example.com" })).toThrow(
+      "configuration",
+    );
 
-    for (const origin of ["http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"]) {
+    for (const origin of [
+      "http://localhost:8080",
+      "http://127.0.0.1:8080",
+      "http://[::1]:8080",
+    ]) {
       expect(() => createClient(fetch, { origin })).not.toThrow();
     }
-    expect(() => createClient(fetch, { origin: "https://jobs.internal" })).not.toThrow();
+    expect(() =>
+      createClient(fetch, { origin: "https://jobs.internal" }),
+    ).not.toThrow();
   });
 
   it("loads the signing key from worker auth env without accepting the legacy token", () => {
-    expect(() => createExecutionLeaseClientFromEnv(runnerVolume(), {
-      BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
-      BLUEY_JOBS_WORKER_TOKEN: WORKER_SIGNING_KEY,
-      BLUEY_JOBS_RUNNER_ID: "runner-env-test",
-    })).toThrow("configuration");
-    expect(() => createExecutionLeaseClientFromEnv(runnerVolume(), {
-      BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
-      BLUEY_JOBS_WORKER_SIGNING_KEY: WORKER_SIGNING_KEY,
-      BLUEY_JOBS_RUNNER_ID: "runner-env-test",
-    })).not.toThrow();
+    expect(() =>
+      createExecutionLeaseClientFromEnv(runnerVolume(), {
+        BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
+        BLUEY_JOBS_WORKER_TOKEN: WORKER_SIGNING_KEY,
+        BLUEY_JOBS_RUNNER_ID: "runner-env-test",
+      }),
+    ).toThrow("configuration");
+    expect(() =>
+      createExecutionLeaseClientFromEnv(runnerVolume(), {
+        BLUEY_JOBS_API_ORIGIN: "https://jobs.internal",
+        BLUEY_JOBS_WORKER_SIGNING_KEY: WORKER_SIGNING_KEY,
+        BLUEY_JOBS_RUNNER_ID: "runner-env-test",
+      }),
+    ).not.toThrow();
   });
 });
 
 function createClient(
   fetch: typeof globalThis.fetch,
-  overrides: Partial<ConstructorParameters<typeof ExecutionLeaseClient>[0]> = {},
+  overrides: Partial<
+    ConstructorParameters<typeof ExecutionLeaseClient>[0]
+  > = {},
 ): ExecutionLeaseClient {
   return new ExecutionLeaseClient({
     origin: "https://jobs-api.example",
@@ -616,27 +765,36 @@ function finalSubmitProof() {
       providerJobKey: "greenhouse:acme:123",
       formIdentity: "greenhouse-form",
     },
-    files: [{
-      fieldName: "resume",
-      name: `resume-${"a".repeat(64)}.pdf`,
-      byteLength: 1,
-      sha256: "a".repeat(64),
-    }],
-    fields: [{
-      fieldName: "job_id",
-      valueByteLength: 3,
-      valueSha256: "d".repeat(64),
-    }],
-    partOrder: [{ kind: "field" as const, index: 0 }, { kind: "file" as const, index: 0 }],
+    files: [
+      {
+        fieldName: "resume",
+        name: `resume-${"a".repeat(64)}.pdf`,
+        byteLength: 1,
+        sha256: "a".repeat(64),
+      },
+    ],
+    fields: [
+      {
+        fieldName: "job_id",
+        valueByteLength: 3,
+        valueSha256: "d".repeat(64),
+      },
+    ],
+    partOrder: [
+      { kind: "field" as const, index: 0 },
+      { kind: "file" as const, index: 0 },
+    ],
     job: {
       approvedCanonicalUrl: "https://boards.greenhouse.io/acme/jobs/123",
       pageUrl: "https://boards.greenhouse.io/acme/jobs/123#app",
     },
-    documents: [{
-      kind: "resume" as const,
-      versionId: "resume-version-123",
-      sha256: "a".repeat(64),
-    }],
+    documents: [
+      {
+        kind: "resume" as const,
+        versionId: "resume-version-123",
+        sha256: "a".repeat(64),
+      },
+    ],
   };
 }
 
@@ -733,24 +891,27 @@ function expectSignedWorkerRequest(
 }
 
 function grantResponse(overrides: Record<string, unknown> = {}): Response {
-  return new Response(JSON.stringify({
-    run_id: "run-123",
-    lease_token: "lease-secret-value",
-    fence: 7,
-    lease_expires_at_ms: Date.now() + 60_000,
-    phase: "prepared",
-    purge_subject: PURGE_SUBJECT,
-    volume_id: VOLUME_ID,
-    enrollment_epoch: 1,
-    process_instance_id: PROCESS_INSTANCE_ID,
-    volume_key_fingerprint: VOLUME_KEY_FINGERPRINT,
-    runtime_grant_id: RUNTIME_GRANT_ID,
-    runtime_sha256: RUNTIME_SHA256,
-    ...overrides,
-  }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
+  return new Response(
+    JSON.stringify({
+      run_id: "run-123",
+      lease_token: "lease-secret-value",
+      fence: 7,
+      lease_expires_at_ms: Date.now() + 60_000,
+      phase: "prepared",
+      purge_subject: PURGE_SUBJECT,
+      volume_id: VOLUME_ID,
+      enrollment_epoch: 1,
+      process_instance_id: PROCESS_INSTANCE_ID,
+      volume_key_fingerprint: VOLUME_KEY_FINGERPRINT,
+      runtime_grant_id: RUNTIME_GRANT_ID,
+      runtime_sha256: RUNTIME_SHA256,
+      ...overrides,
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    },
+  );
 }
 
 function runnerVolume() {
@@ -766,17 +927,25 @@ function runnerVolume() {
 }
 
 function recordResponse(
-  phase: "prepared" | "click_started" | "released" | "side_effect_unknown" | "submitted",
+  phase:
+    | "prepared"
+    | "click_started"
+    | "released"
+    | "side_effect_unknown"
+    | "submitted",
   overrides: Record<string, unknown> = {},
 ): Response {
-  return new Response(JSON.stringify({
-    run_id: "run-123",
-    fence: 7,
-    lease_expires_at_ms: Date.now() + 60_000,
-    phase,
-    ...overrides,
-  }), {
-    status: 200,
-    headers: { "Content-Type": "application/json" },
-  });
+  return new Response(
+    JSON.stringify({
+      run_id: "run-123",
+      fence: 7,
+      lease_expires_at_ms: Date.now() + 60_000,
+      phase,
+      ...overrides,
+    }),
+    {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    },
+  );
 }

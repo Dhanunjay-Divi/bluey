@@ -11,7 +11,9 @@ export type JobsWorkerScope =
   | "intervention"
   | "receipt"
   | "runner-volume"
-  | "run-events";
+  | "run-events"
+  | "workflow-command-execution"
+  | "workflow-command-materialize";
 
 export interface JobsWorkerAuthInput {
   signingKey: string;
@@ -68,6 +70,13 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
 
 export function jobsWorkerScope(method: string, path: string): JobsWorkerScope | undefined {
   if (method.toUpperCase() !== "POST" || !path.startsWith("/api/jobs/internal/")) return undefined;
+  if (/^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/materialize$/.test(path)) {
+    return "workflow-command-materialize";
+  }
+  if (/^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/(?:finalize|intervention\/prepare)$/.test(path)
+    || /^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/intervention\/[A-Za-z0-9_-]{20,128}\/publish$/.test(path)) {
+    return "workflow-command-execution";
+  }
   if (path.includes("/runner-volumes/")) return "runner-volume";
   if (path.includes("/execution-leases/")) return "execution";
   if (path.includes("/discovery/") || path.includes("/global-discovery/")) return "discovery";

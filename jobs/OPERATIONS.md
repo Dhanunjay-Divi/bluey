@@ -8,7 +8,8 @@ Run these as separate deployable services:
 2. `@bluey/jobs-workflows` worker on the `bluey-jobs-applications` Temporal task queue.
 3. `@bluey/jobs-workflows` discovery worker via `npm run start:discovery --workspace @bluey/jobs-workflows`.
 4. `@bluey/jobs-workflows` global candidate-feed worker via `npm run start:global-discovery --workspace @bluey/jobs-workflows`.
-5. `@bluey/jobs-workflows` gateway for authenticated workflow start and resume requests.
+5. `@bluey/jobs-workflows` gateway for exact authenticated protocol-v2 workflow commands. The
+   unfinished cleanup library is not imported or route-registered by this process.
 6. `@bluey/jobs-runner` in a Chromium-capable container pool.
 7. The static Jobs portal under `/jobs`.
 
@@ -37,6 +38,17 @@ their start, intervention, restart-recovery, receipt, and rollback canaries pass
 The Jobs workspace masks Cloud plan runner access unless both that explicit
 release gate and a non-empty workflow credential are present. A plan entitlement
 must never be presented as runtime availability.
+Keep `BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0` until the paired command migrations, Jobs
+API, Temporal worker, and exact protocol-v2 gateway are deployed in that order and an authorized
+internal canary proves fresh start, exact replay, intervention-bound Update, response loss, and
+rollback. The API request path writes durable commands even while dispatch is parked; it never
+falls back to direct gateway delivery.
+Keep `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0`. Round 609 leaves the input- and per-RPC-bounded
+cleanup implementation as an unimported library scaffold: the gateway registers no
+`/workflow-cleanup` route, and changing the environment cannot enable one. Authenticated legacy
+Temporal inventory, a complete database cleanup dispatcher, and account-deletion integration are
+Phase 610 work. The database cleanup generation deliberately cannot complete from caller-supplied
+legacy-zero assertions and must not unblock hard deletion.
 Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
 account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
@@ -54,10 +66,48 @@ server-owned communication worker keeps decrypted OAuth credentials inside the
 API process and starts no provider write or lookup loop unless its exact flag is
 enabled.
 
-The Jobs API and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
-API and Temporal worker share `BLUEY_JOBS_WORKER_TOKEN`. The Temporal worker
-and browser pool share `BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated
-32-byte secrets and rotate them separately.
+The Jobs API command dispatcher and workflow gateway share `BLUEY_JOBS_WORKFLOW_TOKEN`. The Jobs
+API and Temporal worker use request-bound HMAC signatures from
+`BLUEY_JOBS_WORKER_SIGNING_KEY`; provision `BLUEY_JOBS_WORKER_SIGNING_KEY_PREVIOUS` only during a
+bounded rotation. `BLUEY_JOBS_WORKER_TOKEN` is retained only for debug-build legacy authentication
+and is not production worker authority. The Temporal worker and browser pool share
+`BLUEY_JOBS_RUNNER_TOKEN`. Use independently generated secrets of at least 32 bytes and rotate
+them separately. The workflow token is trimmed at configuration load and must be 32 through 8,192
+UTF-8 bytes in the RFC 6750 bearer grammar `[A-Za-z0-9._~+/-]+=*`; the Rust dispatcher and
+TypeScript gateway enforce the same rule. Whitespace, control characters, non-ASCII bytes, or
+interior padding fail configuration instead of reaching an HTTP header.
+
+### Phase 609 workflow-command rollout
+
+Treat durable command admission, command dispatch, future Temporal cleanup, and customer cloud
+distribution as four different authorities. A safe source/deployment order is:
+
+1. Back up and migrate PostgreSQL, then deploy every selected server binary that hosts Jobs routes
+   with `BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0`. The shared server and standalone Jobs API
+   both contain the same independently gated dispatcher; a deployment may select either topology.
+2. Deploy the protocol-v2 Temporal worker and command gateway with
+   `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0`. Verify the exact `/workflow-commands` body, response,
+   headers, task queue, failure converter, and worker/API signing-key rotation on private ingress;
+   verify `/workflow-cleanup` remains unregistered even if the cleanup environment is changed.
+3. Prove the production namespace has no unresolved protocol-v1 execution before customer cloud
+   rollout. A source search, empty local database, or caller boolean is not that proof.
+4. Under a separately approved internal canary, enable only command dispatch and prove a fresh
+   start, byte-identical replay after response loss, exact already-started identity, one
+   intervention-bound Update, trusted receipt terminalization, and rollback. Keep cloud Browser
+   distribution disabled throughout this internal canary.
+5. Disable dispatch again if any receipt echo, identity, history-privacy, retry, lease, or terminal
+   state differs. Do not delete the command, mint a replacement identity, release a charged packet,
+   or reopen an intervention to manufacture recovery.
+
+Setting the dispatcher flag back to `0` stops new claims; it does not erase or resolve commands
+already `delivering`, `delivery_unknown`, or accepted. Reconcile those exact identities before a
+rollback migration or deployment is considered complete.
+
+There is no cleanup rollout in Round 609. The cleanup flag and confirmation interval are reserved
+configuration only; the gateway does not import the scaffold or register its route, so environment
+changes cannot activate cleanup. They also cannot provide legacy inventory, durable dispatcher
+authority, account-deletion fencing, KMS evidence, or hosted retention proof. Phase 610 must
+implement and independently review the entire route-to-account-deletion path before rollout.
 
 ## Required environment
 
@@ -71,6 +121,14 @@ BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED=0
 # BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID=server-603.1
 # BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON='{"threshold":2,"keys":{"root-key-1":"<base64url-public-key>","root-key-2":"<base64url-public-key>"}}'
 BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED=0
+BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0
+# These bounded dispatcher settings are read only when dispatch is enabled.
+BLUEY_JOBS_WORKFLOW_COMMAND_POLL_SECONDS=5
+BLUEY_JOBS_WORKFLOW_COMMAND_LEASE_MS=30000
+# Reserved for Phase 610. The current gateway does not import or register cleanup,
+# so neither setting can enable a cleanup endpoint.
+BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0
+BLUEY_JOBS_WORKFLOW_CLEANUP_CONFIRMATION_MS=30000
 # Keep managed model generation disabled until provider credentials, the
 # global spend guard, and usage-ledger monitoring are verified in production.
 BLUEY_JOBS_MODEL_GENERATION_ENABLED=0
@@ -84,7 +142,12 @@ BLUEY_UPSTREAM_SPEND_LIMIT_CENTS=1000
 BLUEY_UPSTREAM_SPEND_WINDOW_HOURS=24
 BLUEY_JOBS_WORKFLOW_ORIGIN=https://jobs-workflows.internal
 BLUEY_JOBS_WORKFLOW_TOKEN=<random secret>
-BLUEY_JOBS_WORKER_TOKEN=<random secret>
+BLUEY_JOBS_WORKER_SIGNING_KEY=<independent random secret of at least 32 bytes>
+# BLUEY_JOBS_WORKER_SIGNING_KEY_PREVIOUS=<previous secret during bounded rotation>
+# Debug builds only; never use as production worker authority.
+BLUEY_JOBS_WORKER_TOKEN=<independent legacy debug token>
+BLUEY_JOBS_WORKFLOW_WORKER_ID=<stable Temporal workflow-worker replica ID>
+BLUEY_JOBS_TASK_QUEUE=bluey-jobs-applications
 BLUEY_JOBS_DISCOVERY_WORKER_ID=<stable deployment replica ID>
 BLUEY_JOBS_DISCOVERY_POLL_MS=5000
 BLUEY_JOBS_GLOBAL_DISCOVERY_WORKER_ID=<stable global-ingestion replica ID>
@@ -648,13 +711,25 @@ syncs the parent directory where the platform supports directory fsync. These
 records make Temporal activity retries idempotent even when a submit response
 is lost in transit.
 
+Protocol-v2 result reads require the exact request ID and the complete account, application,
+application-identity, browser-session, and run binding before a stored result can affect the
+workflow. A possible side effect is first persisted as a minimal encrypted, purgeable ambiguity
+tombstone; the runner must durably write that authority before returning the exact private
+`side_effect_unknown` response. Restart recovery checks durable results as well as checkpoint
+phase: a bound submitted result is promoted through the exact lease-finish replay, a bound failed
+result remains terminal, and an unresolved `final_submit_started` marker remains ambiguous rather
+than opening Chromium or replaying Submit. Before startup recovery reads or persists any result or
+ambiguity tombstone, it recomputes the profile scope from the frozen account and application
+identity and rejects any checkpoint stored under a different scope.
+
 Nonterminal browser work is also checkpointed in authenticated `BLUEYJP2`
 `run-checkpoint` envelopes under `run-checkpoints/<profile-scope>/`. The AAD and
 HKDF context bind both the hashed profile scope and hashed browser-session
 scope. A checkpoint contains the frozen request, bounded events, safe workflow
-phase, provider-review state, and non-secret lease fence/expiry/owner metadata;
-it never serializes the lease token or worker signing key. On startup the
-runner seals every valid crash-left `active/<profile-scope>` directory into its
+phase, provider-review state, lease fence/expiry/owner metadata, and—in the encrypted v2
+envelope only—the exact lease token needed for crash reconciliation. The token is never written
+outside that authenticated envelope or logged, and the worker signing key is never serialized. On
+startup the runner seals every valid crash-left `active/<profile-scope>` directory into its
 encrypted profile snapshot (or removes it if sealing fails) before opening the
 HTTP listener. It rehydrates only unexpired `prepared`, `needs_input`, and
 `provider_review` checkpoints. `final_submit_started`, activated, uncertain,
@@ -662,6 +737,20 @@ and otherwise ambiguous checkpoints remain `side_effect_unknown` and are never
 automatically replayed. Configure a stable `BLUEY_JOBS_RUNNER_ID` so a restarted
 replica can rotate its still-prepared server lease immediately; without one,
 recovery waits for the old prepared lease to expire.
+
+An exact committed `needs_input` result may remain recoverable after the ordinary checkpoint expiry
+because publication belongs to the Temporal workflow, not to the runner's checkpoint timer. The
+runner may restore that exact intervention only after revalidating current server authority and
+writing a fresh bounded checkpoint; expired state alone is never authority to publish or resume.
+Current restore is always attempted first. Only when that expired checkpoint's new lease claim is
+rejected with exact `lease_unavailable` authority may recovery use the frozen old lease token/fence
+to reconcile and remove it. A current checkpoint, another lease operation/code, timeout, transport
+failure, or reconciliation failure stays fail-closed and preserves the checkpoint.
+
+Browser release is cleanup after the submitted or terminal database state commits. HTTP 401 and
+403 from the runner are treated as repairable credential drift and keep the idempotent cleanup
+activity retrying; they are not permanent evidence that the browser was released. A bounded
+permanent cleanup rejection cannot downgrade the already committed canonical application state.
 
 ## Global candidate cold storage
 
@@ -1199,11 +1288,16 @@ revocations, circuit, target, adapter, layout, runner, Track authority, packet,
 documents, discovery evidence, and eligibility. It then reserves exact canary
 capacity, consumes the binding, and advances the fence once.
 
-Only a successful Phase B response permits the runner to write its durable
-marker and activate the one provider-scoped submit control. A bounded 4xx
-authorization denial writes no marker or click. HTTP 5xx, transport loss,
-timeout, malformed success, or any response that may conceal a committed Phase
-B transaction is terminal `side_effect_unknown` and is never retried.
+Immediately before the Phase B request, the runner writes an encrypted
+`final_submit_started` recovery marker. That conservative pre-I/O marker is not
+authorization, click authority, or evidence that the provider control was
+activated. Only a successful Phase B response may authorize and activate the
+one provider-scoped submit control. A bounded 4xx prevents activation but keeps
+the recovery marker until exact reconciliation, so response routing or
+lost-success ambiguity cannot erase the attempt boundary. HTTP 5xx, transport
+loss, timeout, malformed success, or any response that may conceal a committed
+Phase B transaction resolves conservatively through exact `side_effect_unknown`
+authority and is never retried as a fresh submit.
 
 Review-first and `beta_review` paths keep explicit packet and provider-final
 approval. An active signed provider-target certification does not force a

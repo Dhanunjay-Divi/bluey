@@ -7,7 +7,7 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_communication_dispatch, jobs_mailbox_sync, object_storage,
+    db, jobs_communication_dispatch, jobs_mailbox_sync, jobs_workflow_dispatch, object_storage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
@@ -74,6 +74,9 @@ async fn main() -> anyhow::Result<()> {
     let mailbox_sync_worker = jobs_mailbox_sync::spawn_mailbox_sync_worker(pool.clone());
     let communication_workers =
         jobs_communication_dispatch::spawn_communication_workers(pool.clone());
+    let workflow_command_dispatcher =
+        jobs_workflow_dispatch::spawn_jobs_workflow_command_dispatcher(pool.clone())
+            .context("start Jobs workflow command dispatcher")?;
 
     let cleanup_worker = object_storage::spawn_cleanup_worker(
         pool.clone(),
@@ -115,6 +118,9 @@ async fn main() -> anyhow::Result<()> {
         worker.abort();
     }
     communication_workers.abort();
+    if let Some(worker) = workflow_command_dispatcher {
+        worker.abort();
+    }
     spend_truth_janitor.abort();
     usage_reservation_janitor.abort();
     serve_result?;
