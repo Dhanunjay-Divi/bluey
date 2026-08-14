@@ -4,7 +4,7 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_communication_dispatch, jobs_global_archive, jobs_mailbox_sync,
+    db, jobs_communication_dispatch, jobs_global_archive, jobs_mailbox_sync, jobs_workflow_cleanup,
     jobs_workflow_dispatch,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -54,8 +54,6 @@ async fn main() -> anyhow::Result<()> {
         expired_usage_released,
         "startup managed usage reservation reconciliation completed"
     );
-    let usage_reservation_janitor =
-        db::usage_reservations::spawn_expired_usage_reservation_janitor(pool.clone());
     let startup_spend_cleanup = db::jobs_provider_cost_holds::prune_expired_spend_truth(&pool)
         .context("prune expired upstream spend truth at startup")?;
     tracing::info!(
@@ -63,6 +61,11 @@ async fn main() -> anyhow::Result<()> {
         cutover_baseline_rows_deleted = startup_spend_cleanup.cutover_baseline_rows_deleted,
         "startup upstream spend truth cleanup completed"
     );
+    let workflow_cleanup_dispatcher =
+        jobs_workflow_cleanup::spawn_jobs_workflow_cleanup_dispatcher(pool.clone())
+            .context("start Jobs workflow cleanup dispatcher")?;
+    let usage_reservation_janitor =
+        db::usage_reservations::spawn_expired_usage_reservation_janitor(pool.clone());
     let spend_truth_janitor = db::jobs_provider_cost_holds::spawn_spend_truth_janitor(pool.clone());
     let mailbox_sync_worker = jobs_mailbox_sync::spawn_mailbox_sync_worker(pool.clone());
     let communication_workers =
@@ -95,6 +98,9 @@ async fn main() -> anyhow::Result<()> {
     }
     communication_workers.abort();
     if let Some(worker) = workflow_command_dispatcher {
+        worker.abort();
+    }
+    if let Some(worker) = workflow_cleanup_dispatcher {
         worker.abort();
     }
     if let Some(worker) = global_archive_worker {

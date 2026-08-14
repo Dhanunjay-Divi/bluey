@@ -14203,11 +14203,25 @@ pub(super) mod runner_volume_purge_tests {
             .expect("racing enrollment exists")
             .active_instance_id
             .is_none());
+        let missing_workflow_cleanup = JobsWorkflowCleanupDeletionProof {
+            account_generation: 10,
+            cleanup_generation_id: "wfcleanupgen-v3-missing-test".to_string(),
+            target_set_digest: "7".repeat(64),
+            legacy_authority: JobsLegacyInventoryAuthorityRef {
+                inventory_generation_id: "wfinventory-v3-missing-test".to_string(),
+                query_digest: "8".repeat(64),
+            },
+            tombstone_id: "wfcleantomb-v3-missing-test".to_string(),
+            completion_digest: "9".repeat(64),
+        };
         assert!(
             crate::db::account_data::hard_delete_account_after_runner_purge(
                 &database.pool,
                 "acct-enrollment-race",
+                10,
                 &prepared.status.request_id,
+                "wfsweep-account-v3-missing-test",
+                &missing_workflow_cleanup,
             )
             .is_err()
         );

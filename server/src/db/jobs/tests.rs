@@ -16036,10 +16036,35 @@ mod tests {
                 _
             )) | Some(crate::db::account_data::BeginAccountDeletionResult::WaitingForUploads(_))
         ));
-        pool.get()
-            .unwrap()
-            .execute("DELETE FROM accounts WHERE id = 'acct-jobs'", [])
+        {
+            let mut conn = pool.get().unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            // The production account purge now also requires runner/workflow
+            // proofs outside this communication unit. Remove only this
+            // terminal action and its deletion-intent fixture before teardown
+            // so every production hard-delete guard remains exact.
+            tx.execute(
+                "DELETE FROM jobs_communication_actions WHERE id = ?1",
+                params![&action.id],
+            )
             .unwrap();
+            tx.execute(
+                "DELETE FROM account_deletion_intents WHERE account_id = 'acct-jobs'",
+                [],
+            )
+            .unwrap();
+            tx.execute("DELETE FROM accounts WHERE id = 'acct-jobs'", [])
+                .unwrap();
+            tx.execute(
+                "DELETE FROM jobs_workflow_cleanup_hard_delete_cascade_tokens
+                  WHERE account_id = 'acct-jobs'",
+                [],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        }
         let remaining: i64 = pool
             .get()
             .unwrap()

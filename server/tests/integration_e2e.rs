@@ -519,6 +519,170 @@ fn authorize_empty_legacy_runner_inventory(
     ready
 }
 
+fn canonical_workflow_cleanup_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => serde_json::to_string(value).unwrap(),
+        serde_json::Value::Array(values) => format!(
+            "[{}]",
+            values
+                .iter()
+                .map(canonical_workflow_cleanup_json)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        serde_json::Value::Object(fields) => {
+            let mut fields = fields
+                .iter()
+                .map(|(key, value)| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(key).unwrap(),
+                        canonical_workflow_cleanup_json(value)
+                    )
+                })
+                .collect::<Vec<_>>();
+            fields.sort();
+            format!("{{{}}}", fields.join(","))
+        }
+    }
+}
+
+fn workflow_cleanup_test_digest(domain: &[u8], value: &serde_json::Value) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(canonical_workflow_cleanup_json(value).as_bytes());
+    hex::encode(digest.finalize())
+}
+
+fn empty_workflow_inventory_receipt(
+    lease: &jobs::JobsLegacyInventoryPageLease,
+) -> serde_json::Value {
+    let targets = json!([]);
+    let targets_digest =
+        workflow_cleanup_test_digest(b"bluey-jobs-legacy-inventory-targets-v3\0", &targets);
+    let mut receipt = json!({
+        "schemaVersion": 3,
+        "operation": "legacy_inventory_page",
+        "cleanupRequestId": lease.cleanup_request_id,
+        "inventoryGenerationId": lease.inventory_generation_id,
+        "namespace": lease.namespace,
+        "workflowType": lease.workflow_type,
+        "visibilityCutoffMs": lease.visibility_cutoff_ms,
+        "queryDigest": lease.query_digest,
+        "scanPass": lease.scan_pass,
+        "pageIndex": lease.page_index,
+        "predecessorPageDigest": lease.predecessor_page_digest,
+        "pageToken": lease.page_token,
+        "cleanupFence": lease.cleanup_fence,
+        "outcome": "page",
+        "targetsDigest": targets_digest,
+        "targets": targets,
+        "nextPageToken": null,
+        "exhausted": true,
+    });
+    let page_digest =
+        workflow_cleanup_test_digest(b"bluey-jobs-legacy-inventory-page-v3\0", &receipt);
+    receipt["pageDigest"] = json!(page_digest);
+    receipt
+}
+
+async fn authorize_empty_workflow_cleanup_inventory(
+    pool: &DbPool,
+) -> jobs::JobsLegacyInventoryAuthorityRef {
+    const CONFIRMATION_AGE_MS: i64 = 1_000;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let prepared = jobs::prepare_jobs_legacy_inventory_generation(
+        pool,
+        &jobs::PrepareJobsLegacyInventoryGeneration {
+            namespace: "bluey-jobs-account-delete-test".to_string(),
+            visibility_cutoff_ms: 1_783_900_800_000,
+            confirmation_age_ms: CONFIRMATION_AGE_MS,
+            now_ms,
+        },
+    )
+    .unwrap();
+    if prepared.state == jobs::JobsLegacyInventoryState::Complete {
+        return prepared.authority;
+    }
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let Some(lease) = jobs::claim_jobs_workflow_cleanup_work(
+            pool,
+            "account-delete-cleanup-test-owner",
+            now_ms,
+            30_000,
+        )
+        .unwrap() else {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "empty workflow inventory did not become eligible on the DB clock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            continue;
+        };
+        let jobs::JobsWorkflowCleanupWorkLease::LegacyInventoryPage(page) = &lease else {
+            panic!("empty workflow inventory helper claimed unexpected target work");
+        };
+        assert_eq!(page.page_index, 0);
+        let receipt = empty_workflow_inventory_receipt(page);
+        jobs::mark_jobs_workflow_cleanup_request_started(pool, &lease, now_ms).unwrap();
+        let state = jobs::record_jobs_workflow_cleanup_receipt(
+            pool,
+            &lease,
+            &receipt,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .unwrap();
+        if state == jobs::JobsWorkflowCleanupReceiptState::InventoryComplete {
+            return prepared.authority;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "empty workflow inventory did not complete its two-pass proof"
+        );
+    }
+}
+
+fn confirmed_account_delete_request(access: &str) -> Request<Body> {
+    Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "confirm_text": "DELETE",
+                "accept_data_loss": true,
+                "accept_credit_loss": true
+            }))
+            .unwrap(),
+        ))
+        .unwrap()
+}
+
+async fn fence_account_deletion_then_revalidate_workflow_cleanup(harness: &Harness, access: &str) {
+    let response = harness
+        .router
+        .clone()
+        .oneshot(confirmed_account_delete_request(access))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(matches!(
+        pending["state"].as_str(),
+        Some("pending_workflow_cleanup" | "pending_workflow_cleanup_configuration")
+    ));
+    assert_eq!(pending["object_count_deleted"], 0);
+    authorize_empty_workflow_cleanup_inventory(&harness.pool).await;
+}
+
 struct TestEnvironmentGuard {
     previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
 }
@@ -8858,6 +9022,7 @@ async fn signup_after_account_delete_reuses_email_without_new_trial() {
     let account = Account::fetch_by_email(&h.pool, email)
         .unwrap()
         .expect("account should exist");
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, access).await;
     mount_empty_account_namespace_sweep(&object_store, &account.id).await;
 
     let req = Request::post("/account/delete")
@@ -10442,6 +10607,7 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_some());
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     mount_empty_account_namespace_sweep(&object_store, &account.id).await;
 
     let req = Request::post("/account/delete")
@@ -10472,6 +10638,203 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
 
 #[tokio::test]
 #[serial]
+async fn account_delete_without_cleanup_head_fences_then_later_binds_exact_authority() {
+    let h = boot_harness().await;
+    let email = "delete-workflow-cleanup-not-configured@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/account/delete")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "confirm_text": "DELETE",
+                        "accept_data_loss": true,
+                        "accept_credit_loss": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["state"], "pending_workflow_cleanup_configuration");
+    assert_eq!(pending["object_count_deleted"], 0);
+
+    let intent = bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
+        .unwrap()
+        .expect("missing cleanup configuration must still fence the account");
+    let runner_purge_count: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_runner_purge_requests WHERE account_id = ?1",
+            rusqlite::params![account.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(runner_purge_count, 0);
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let prepared = jobs::prepare_jobs_legacy_inventory_generation(
+        &h.pool,
+        &jobs::PrepareJobsLegacyInventoryGeneration {
+            namespace: "bluey-jobs-delete-test".to_string(),
+            visibility_cutoff_ms: 1_783_900_800_000,
+            confirmation_age_ms: 1_000,
+            now_ms,
+        },
+    )
+    .unwrap();
+    let rebound = bluey_server::db::account_data::begin_account_deletion_with_workflow_cleanup(
+        &h.pool,
+        &account.id,
+        now_ms + 1,
+        &prepared.authority,
+    )
+    .unwrap()
+    .expect("fenced account should still exist");
+    assert!(matches!(
+        rebound.deletion,
+        bluey_server::db::account_data::BeginAccountDeletionResult::Ready(_)
+    ));
+    let cleanup = rebound
+        .workflow_cleanup
+        .expect("retry must attach exact workflow cleanup authority");
+    assert_eq!(cleanup.account_generation, intent.requested_at_ms);
+    assert_eq!(cleanup.legacy_authority, prepared.authority);
+    assert_eq!(cleanup.object_sweep_deleted_count, 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_pending_workflow_cleanup_never_starts_object_or_runner_sweep() {
+    let object_store = MockServer::start().await;
+    let storage = account_delete_storage_config(object_store.uri());
+    let h = boot_harness_with_config(UpstreamKeys::default(), vec![], None, move |config| {
+        config.object_storage = Some(storage);
+    })
+    .await;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    jobs::prepare_jobs_legacy_inventory_generation(
+        &h.pool,
+        &jobs::PrepareJobsLegacyInventoryGeneration {
+            namespace: "bluey-jobs-pending-delete-test".to_string(),
+            visibility_cutoff_ms: 1_783_900_800_000,
+            confirmation_age_ms: 1_000,
+            now_ms,
+        },
+    )
+    .unwrap();
+    let email = "delete-pending-workflow-cleanup@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let object_key = format!(
+        "bluey-cloud/accounts/{}/context/pending-workflow-cleanup",
+        account.id
+    );
+    let sync = Request::post("/sync/batch")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "sessions": [{
+                    "session_id": "pending-workflow-cleanup-session",
+                    "title": "Pending workflow cleanup",
+                    "status": "active",
+                    "created_at_ms": 1000,
+                    "updated_at_ms": 2000
+                }],
+                "context_artifacts": [{
+                    "artifact_id": "pending-workflow-cleanup-artifact",
+                    "session_id": "pending-workflow-cleanup-session",
+                    "kind": "document",
+                    "title": "Must remain intact",
+                    "text_preview": "private bytes",
+                    "created_at_ms": 1400,
+                    "metadata": {"object_key": object_key}
+                }]
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        h.router.clone().oneshot(sync).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/account/delete")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "confirm_text": "DELETE",
+                        "accept_data_loss": true,
+                        "accept_credit_loss": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["state"], "pending_workflow_cleanup");
+    assert_eq!(pending["object_count_deleted"], 0);
+    assert!(pending["request_id"]
+        .as_str()
+        .is_some_and(|value| value.starts_with("wfcleanupgen-v3-")));
+
+    let intent = bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
+        .unwrap()
+        .expect("pending workflow cleanup must retain deletion fence");
+    let cleanup = jobs::get_jobs_workflow_cleanup_deletion_status(
+        &h.pool,
+        &account.id,
+        intent.requested_at_ms,
+    )
+    .unwrap()
+    .expect("pending deletion must retain workflow-cleanup binding");
+    assert!(!cleanup.complete);
+    assert_eq!(cleanup.object_sweep_deleted_count, 0);
+    let runner_purge_count: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_runner_purge_requests WHERE account_id = ?1",
+            rusqlite::params![account.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(runner_purge_count, 0);
+    assert!(object_store.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
 async fn account_delete_without_storage_preserves_account_and_deletion_fence() {
     configure_runner_volume_purge_test_policy();
     let h = boot_harness().await;
@@ -10479,12 +10842,14 @@ async fn account_delete_without_storage_preserves_account_and_deletion_fence() {
         &h.pool,
         "phase-602-storage-unavailable-delete-inventory",
     );
+    authorize_empty_workflow_cleanup_inventory(&h.pool).await;
     let email = "delete-storage-unavailable@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
         .unwrap()
         .expect("account should exist");
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     let request = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
@@ -10635,6 +11000,7 @@ async fn account_delete_uses_audit_fallback_and_sweeps_shared_namespace_once() {
         .mount(&object_store)
         .await;
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     let request = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
@@ -10676,6 +11042,7 @@ async fn account_delete_freezes_unattested_offline_volume_and_returns_durable_pe
         &harness.pool,
         "phase-602-offline-delete-inventory",
     );
+    authorize_empty_workflow_cleanup_inventory(&harness.pool).await;
     assert_eq!(fleet.non_destroyed_volume_count, 1);
     assert_eq!(fleet.storage_attestation_count, 0);
 
@@ -10693,6 +11060,7 @@ async fn account_delete_freezes_unattested_offline_volume_and_returns_durable_pe
             ))
             .unwrap()
     };
+    fence_account_deletion_then_revalidate_workflow_cleanup(&harness, &access).await;
     let response = harness
         .router
         .clone()
@@ -10759,6 +11127,7 @@ async fn account_delete_fences_then_waits_for_legacy_runner_reconciliation() {
         vec![admin_email.to_string()],
     )
     .await;
+    authorize_empty_workflow_cleanup_inventory(&h.pool).await;
     let admin_access = signup_and_login(&h, admin_email, "longenoughpw").await;
     let email = "delete-cloud-runner-cleanup@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
@@ -10796,6 +11165,7 @@ async fn account_delete_fences_then_waits_for_legacy_runner_reconciliation() {
             ))
             .unwrap()
     };
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     let response = h.router.clone().oneshot(delete_request()).await.unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     assert_eq!(response.headers().get("retry-after").unwrap(), "5");
@@ -11293,6 +11663,7 @@ async fn boot_account_delete_storage_harness(object_store: &MockServer) -> Harne
         &harness.pool,
         "phase-602-account-delete-storage-inventory",
     );
+    authorize_empty_workflow_cleanup_inventory(&harness.pool).await;
     harness
 }
 
@@ -11339,6 +11710,7 @@ async fn boot_jobs_portability_harness(object_store: &MockServer) -> Harness {
     })
     .await;
     authorize_empty_legacy_runner_inventory(&harness.pool, "phase-602-jobs-portability-inventory");
+    authorize_empty_workflow_cleanup_inventory(&harness.pool).await;
     harness
 }
 
@@ -11884,6 +12256,7 @@ async fn delete_account_removes_every_jobs_object_after_persisting_the_deletion_
         .mount(&object_store)
         .await;
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&harness, &fixture.access_token).await;
     let delete_request = || {
         Request::post("/account/delete")
             .header("authorization", format!("Bearer {}", fixture.access_token))
@@ -12005,6 +12378,7 @@ async fn delete_account_prefix_purge_failure_preserves_fence_and_database_rows()
         .mount(&object_store)
         .await;
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&harness, &fixture.access_token).await;
     let delete_request = || {
         Request::post("/account/delete")
             .header("authorization", format!("Bearer {}", fixture.access_token))
@@ -12771,6 +13145,7 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
     })
     .await;
     authorize_empty_legacy_runner_inventory(&h.pool, "phase-602-durable-upload-delete-inventory");
+    authorize_empty_workflow_cleanup_inventory(&h.pool).await;
     let email = "durable-object-upload@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -12911,6 +13286,7 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
         .expect(1)
         .mount(&object_store)
         .await;
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
@@ -13066,6 +13442,7 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
     })
     .await;
     authorize_empty_legacy_runner_inventory(&h.pool, "phase-602-artifact-object-delete-inventory");
+    authorize_empty_workflow_cleanup_inventory(&h.pool).await;
     let email = "delete-objects@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -13129,6 +13506,7 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
@@ -13149,6 +13527,19 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
     let ack: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(ack["object_count_deleted"], 1);
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+    let cascade_token_count: i64 = h
+        .pool
+        .get()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*)
+               FROM jobs_workflow_cleanup_hard_delete_cascade_tokens
+              WHERE account_id = ?1",
+            rusqlite::params![account.id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cascade_token_count, 0);
     let event_count: i64 = h
         .pool
         .get()
@@ -13165,10 +13556,304 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
 
 #[tokio::test]
 #[serial]
+async fn account_delete_retains_fence_when_workflow_authority_drifts_after_object_sweep_starts() {
+    let object_store = MockServer::start().await;
+    let h = boot_account_delete_storage_harness(&object_store).await;
+    let email = "delete-workflow-drift-after-sweep@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let object_key = format!(
+        "bluey-cloud/accounts/{}/context/workflow-drift-object",
+        account.id
+    );
+    let batch = json!({
+        "sessions": [{
+            "session_id": "workflow-drift-session",
+            "title": "Workflow drift",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000
+        }],
+        "context_artifacts": [{
+            "artifact_id": "workflow-drift-object",
+            "session_id": "workflow-drift-session",
+            "kind": "document",
+            "title": "Delete before drift",
+            "text_preview": "private bytes",
+            "created_at_ms": 1400,
+            "metadata": {
+                "object_key": object_key,
+                "object_size_bytes": 12,
+                "object_content_type": "text/plain",
+                "object_sha256": "abc"
+            }
+        }]
+    });
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/sync/batch")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
+    let drift_observed = Arc::new(AtomicUsize::new(0));
+    let responder_drift = Arc::clone(&drift_observed);
+    let drift_pool = h.pool.clone();
+    let drift_authority = jobs::current_jobs_legacy_inventory_authority(&h.pool)
+        .unwrap()
+        .expect("post-sweep drift test requires current legacy authority");
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(move |_request: &wiremock::Request| {
+            jobs::request_jobs_legacy_inventory_revalidation(
+                &drift_pool,
+                &drift_authority,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+            let lease = jobs::claim_jobs_workflow_cleanup_work(
+                &drift_pool,
+                "post-sweep-drift-test-owner",
+                chrono::Utc::now().timestamp_millis(),
+                30_000,
+            )
+            .unwrap()
+            .expect("late global revalidation must claim an inventory page");
+            assert!(matches!(
+                lease,
+                jobs::JobsWorkflowCleanupWorkLease::LegacyInventoryPage(_)
+            ));
+            responder_drift.store(1, Ordering::SeqCst);
+            ResponseTemplate::new(204)
+        })
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/account/delete")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "confirm_text": "DELETE",
+                        "accept_data_loss": true,
+                        "accept_credit_loss": true
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["state"], "pending_workflow_cleanup_revalidation");
+    assert_eq!(pending["object_count_deleted"], 1);
+    assert_eq!(drift_observed.load(Ordering::SeqCst), 1);
+    assert!(Account::fetch_by_id(&h.pool, &account.id)
+        .unwrap()
+        .is_some());
+    let intent = bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
+        .unwrap()
+        .expect("post-sweep drift must retain deletion fence");
+    let cleanup = jobs::get_jobs_workflow_cleanup_deletion_status(
+        &h.pool,
+        &account.id,
+        intent.requested_at_ms,
+    )
+    .unwrap()
+    .expect("post-sweep drift must retain cleanup state");
+    assert!(!cleanup.complete);
+    assert!(cleanup.object_sweep_started_at_ms.is_some());
+    assert_eq!(cleanup.object_sweep_deleted_count, 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_remembers_sweep_start_when_progress_write_fails_after_delete() {
+    let object_store = MockServer::start().await;
+    let h = boot_account_delete_storage_harness(&object_store).await;
+    let email = "delete-workflow-progress-loss@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let account = Account::fetch_by_email(&h.pool, email)
+        .unwrap()
+        .expect("account should exist");
+    let object_key = format!(
+        "bluey-cloud/accounts/{}/context/workflow-progress-loss-object",
+        account.id
+    );
+    let batch = json!({
+        "sessions": [{
+            "session_id": "workflow-progress-loss-session",
+            "title": "Workflow progress loss",
+            "status": "active",
+            "created_at_ms": 1000,
+            "updated_at_ms": 2000
+        }],
+        "context_artifacts": [{
+            "artifact_id": "workflow-progress-loss-object",
+            "session_id": "workflow-progress-loss-session",
+            "kind": "document",
+            "title": "Delete before progress loss",
+            "text_preview": "private bytes",
+            "created_at_ms": 1400,
+            "metadata": {
+                "object_key": object_key,
+                "object_size_bytes": 12,
+                "object_content_type": "text/plain",
+                "object_sha256": "abc"
+            }
+        }]
+    });
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::post("/sync/batch")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::from(serde_json::to_vec(&batch).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
+    let delete_observed = Arc::new(AtomicUsize::new(0));
+    let responder_observed = Arc::clone(&delete_observed);
+    let drift_pool = h.pool.clone();
+    let responder_account_id = account.id.clone();
+    let drift_authority = jobs::current_jobs_legacy_inventory_authority(&h.pool)
+        .unwrap()
+        .expect("progress-loss drift test requires current legacy authority");
+    Mock::given(method("DELETE"))
+        .and(path(format!("/bucket/{object_key}")))
+        .respond_with(move |_request: &wiremock::Request| {
+            let intent = bluey_server::db::account_data::account_deletion_intent(
+                &drift_pool,
+                &responder_account_id,
+            )
+            .unwrap()
+            .expect("external delete must observe the durable deletion fence");
+            let cleanup = jobs::get_jobs_workflow_cleanup_deletion_status(
+                &drift_pool,
+                &responder_account_id,
+                intent.requested_at_ms,
+            )
+            .unwrap()
+            .expect("external delete must observe sweep authorization");
+            assert!(cleanup.object_sweep_started_at_ms.is_some());
+            jobs::request_jobs_legacy_inventory_revalidation(
+                &drift_pool,
+                &drift_authority,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .unwrap();
+            let lease = jobs::claim_jobs_workflow_cleanup_work(
+                &drift_pool,
+                "progress-loss-drift-test-owner",
+                chrono::Utc::now().timestamp_millis(),
+                30_000,
+            )
+            .unwrap()
+            .expect("late global revalidation must claim an inventory page");
+            assert!(matches!(
+                lease,
+                jobs::JobsWorkflowCleanupWorkLease::LegacyInventoryPage(_)
+            ));
+            drift_pool
+                .get()
+                .unwrap()
+                .execute_batch(
+                    "CREATE TRIGGER fail_workflow_sweep_progress_after_delete
+                     BEFORE INSERT ON jobs_workflow_cleanup_object_sweep_progress
+                     BEGIN
+                       SELECT RAISE(ABORT, 'simulated progress response loss');
+                     END;",
+                )
+                .unwrap();
+            responder_observed.store(1, Ordering::SeqCst);
+            ResponseTemplate::new(204)
+        })
+        .expect(1)
+        .mount(&object_store)
+        .await;
+
+    let delete_request = || {
+        Request::post("/account/delete")
+            .header("authorization", format!("Bearer {access}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "confirm_text": "DELETE",
+                    "accept_data_loss": true,
+                    "accept_credit_loss": true
+                }))
+                .unwrap(),
+            ))
+            .unwrap()
+    };
+    let response = h.router.clone().oneshot(delete_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(delete_observed.load(Ordering::SeqCst), 1);
+
+    let intent = bluey_server::db::account_data::account_deletion_intent(&h.pool, &account.id)
+        .unwrap()
+        .expect("progress loss must retain the deletion fence");
+    let cleanup = jobs::get_jobs_workflow_cleanup_deletion_status(
+        &h.pool,
+        &account.id,
+        intent.requested_at_ms,
+    )
+    .unwrap()
+    .expect("progress loss must retain cleanup state");
+    assert!(!cleanup.complete);
+    assert!(cleanup.object_sweep_started_at_ms.is_some());
+    assert_eq!(cleanup.object_sweep_deleted_count, 0);
+
+    h.pool
+        .get()
+        .unwrap()
+        .execute_batch("DROP TRIGGER fail_workflow_sweep_progress_after_delete")
+        .unwrap();
+    let response = h.router.clone().oneshot(delete_request()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let pending: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(pending["state"], "pending_workflow_cleanup_revalidation");
+    assert_eq!(pending["object_count_deleted"], 0);
+    assert!(Account::fetch_by_id(&h.pool, &account.id)
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+#[serial]
 async fn delete_account_establishes_a_durable_fence_before_waiting_for_an_active_put() {
     configure_runner_volume_purge_test_policy();
     let h = boot_harness().await;
     authorize_empty_legacy_runner_inventory(&h.pool, "phase-602-active-put-delete-inventory");
+    authorize_empty_workflow_cleanup_inventory(&h.pool).await;
     let email = "delete-active-put@example.com";
     let access = signup_and_login(&h, email, "longenoughpw").await;
     let account = Account::fetch_by_email(&h.pool, email)
@@ -13201,6 +13886,7 @@ async fn delete_account_establishes_a_durable_fence_before_waiting_for_an_active
         )
         .unwrap();
 
+    fence_account_deletion_then_revalidate_workflow_cleanup(&h, &access).await;
     let req = Request::post("/account/delete")
         .header("authorization", format!("Bearer {access}"))
         .header("content-type", "application/json")
