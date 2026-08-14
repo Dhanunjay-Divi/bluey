@@ -8,8 +8,9 @@ Run these as separate deployable services:
 2. `@bluey/jobs-workflows` worker on the `bluey-jobs-applications` Temporal task queue.
 3. `@bluey/jobs-workflows` discovery worker via `npm run start:discovery --workspace @bluey/jobs-workflows`.
 4. `@bluey/jobs-workflows` global candidate-feed worker via `npm run start:global-discovery --workspace @bluey/jobs-workflows`.
-5. `@bluey/jobs-workflows` gateway for exact authenticated protocol-v2 workflow commands. The
-   unfinished cleanup library is not imported or route-registered by this process.
+5. `@bluey/jobs-workflows` gateway for exact authenticated protocol-v2 workflow commands and the
+   independently gated, stateless schema-v3 workflow-cleanup protocol. With cleanup disabled, the
+   authenticated cleanup path is not registered and returns 404.
 6. `@bluey/jobs-runner` in a Chromium-capable container pool.
 7. The static Jobs portal under `/jobs`.
 
@@ -43,12 +44,14 @@ API, Temporal worker, and exact protocol-v2 gateway are deployed in that order a
 internal canary proves fresh start, exact replay, intervention-bound Update, response loss, and
 rollback. The API request path writes durable commands even while dispatch is parked; it never
 falls back to direct gateway delivery.
-Keep `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0`. Round 609 leaves the input- and per-RPC-bounded
-cleanup implementation as an unimported library scaffold: the gateway registers no
-`/workflow-cleanup` route, and changing the environment cannot enable one. Authenticated legacy
-Temporal inventory, a complete database cleanup dispatcher, and account-deletion integration are
-Phase 610 work. The database cleanup generation deliberately cannot complete from caller-supplied
-legacy-zero assertions and must not unblock hard deletion.
+Keep `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0` until the complete Round 610 rollout described below
+has independent approval and hosted evidence. The route and Rust dispatcher recognize only the
+exact literal `true`; unset, `0`, `1`, case variants, and whitespace variants remain disabled.
+Disabled startup does not validate cleanup secrets, create inventory authority, or start a cleanup
+worker, and the authenticated `/workflow-cleanup` path remains 404. Enabled startup validates the
+private HTTPS origin, shared bearer token, exact Temporal namespace, owner-approved visibility
+cutoff, bounded lease/poll/confirmation settings, and fixed protocol-v1 query before any background
+worker starts. Configuration is not inventory evidence and never authorizes customer distribution.
 Install `ops/bluey-api-jobs-env.conf.example` as the main API service drop-in so
 account export, account deletion, and Jobs admin routes use the same data key.
 The standalone Jobs API binds to loopback by default; container deployments
@@ -87,10 +90,11 @@ distribution as four different authorities. A safe source/deployment order is:
    both contain the same independently gated dispatcher; a deployment may select either topology.
 2. Deploy the protocol-v2 Temporal worker and command gateway with
    `BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0`. Verify the exact `/workflow-commands` body, response,
-   headers, task queue, failure converter, and worker/API signing-key rotation on private ingress;
-   verify `/workflow-cleanup` remains unregistered even if the cleanup environment is changed.
-3. Prove the production namespace has no unresolved protocol-v1 execution before customer cloud
-   rollout. A source search, empty local database, or caller boolean is not that proof.
+   headers, task queue, failure converter, and worker/API signing-key rotation on private ingress.
+   Verify authenticated `/workflow-cleanup` is 404 while disabled and that malformed cleanup
+   enablement does not register the route.
+3. Complete the separate Phase 610 workflow-cleanup rollout below. A source search, an empty local
+   database, a caller boolean, or an earlier global zero receipt is not account-deletion proof.
 4. Under a separately approved internal canary, enable only command dispatch and prove a fresh
    start, byte-identical replay after response loss, exact already-started identity, one
    intervention-bound Update, trusted receipt terminalization, and rollback. Keep cloud Browser
@@ -103,11 +107,67 @@ Setting the dispatcher flag back to `0` stops new claims; it does not erase or r
 already `delivering`, `delivery_unknown`, or accepted. Reconcile those exact identities before a
 rollback migration or deployment is considered complete.
 
-There is no cleanup rollout in Round 609. The cleanup flag and confirmation interval are reserved
-configuration only; the gateway does not import the scaffold or register its route, so environment
-changes cannot activate cleanup. They also cannot provide legacy inventory, durable dispatcher
-authority, account-deletion fencing, KMS evidence, or hosted retention proof. Phase 610 must
-implement and independently review the entire route-to-account-deletion path before rollout.
+Round 609 itself did not authorize cleanup. Round 610 supplies the separately gated local-source
+path, but that does not retroactively create a production namespace inventory, hosted absence
+proof, provider retention evidence, deployment approval, or customer distribution authority.
+
+### Phase 610 workflow-cleanup rollout
+
+Treat schema installation, gateway registration, global protocol-v1 inventory, account-scoped
+protocol-v2 cleanup, account deletion, and Browser distribution as separate authorities. The safe
+rollout order is:
+
+1. Back up and migrate PostgreSQL with `032_jobs_workflow_cleanup_authority.sql` while workflow
+   command dispatch, workflow cleanup, and cloud Browser distribution all remain `0`. Replay the
+   complete migration chain and verify the schema, triggers, views, constraints, privacy columns,
+   and server binary agree before continuing.
+2. Deploy every selected server binary and the workflow gateway with cleanup still `0`. Both
+   `bluey-server` and `bluey-jobs-api` validate cleanup configuration before starting any background
+   worker if the exact flag is later enabled. Verify the disabled authenticated cleanup route is
+   404 and the generic unauthenticated boundary remains 401.
+3. Resolve and approve the one production Temporal namespace and protocol-v1 cutover timestamp.
+   Configure `BLUEY_JOBS_WORKFLOW_NAMESPACE` to equal `TEMPORAL_NAMESPACE`. The cleanup query is
+   fixed to `WorkflowType = "applicationWorkflow"`; the cutoff is bound cutover authority and is
+   not a `StartTime` visibility filter.
+4. In an internal, independently approved cleanup canary, enable only workflow cleanup. Keep
+   command dispatch and cloud Browser distribution `0`. Prove immutable page-chain replay,
+   continuation-token handling, bounded failure/retry, exact protocol-v1 run reconciliation, and
+   exact protocol-v2 type/memo/request/payload/first-run/known-run authority against the hosted
+   namespace.
+5. Drain every discovered protocol-v1 execution. A running protocol-v1 execution remains pending;
+   this batch does not force-terminate it. Closed protocol-v1 history can be deleted, but absence
+   needs exact Describe NotFound, History NotFound, and an exhaustive exact-run visibility zero.
+   Protocol-v2 cleanup may terminate only an exactly bound running execution before deleting its
+   history and proving the same three-part absence boundary.
+6. Complete two exhausted fixed-query scans separated by the database-owned confirmation age.
+   Every discovered target must have two current proof-epoch absence observations. Before the
+   global authority becomes complete, verify reversible legacy workflow/run ciphertext and page
+   tokens have been compacted; pseudonymous HMACs/digests remain for replay and deletion proof.
+7. Run a non-customer account-deletion canary. The first confirmed delete must atomically establish
+   the write fence, freeze the exact protocol-v2 target set, advance any completed global inventory
+   into a fresh database-time epoch, and return HTTP 202 `pending_workflow_cleanup` with zero object
+   deletes. Complete the new global epoch and exact account targets, then prove the runner-purge and
+   workflow-cleanup authorities are atomically bound before any object I/O.
+8. Inject response loss and authority drift during a multi-scope object sweep. The exact sorted
+   manifests and prefix sweeps must be authorized durably before I/O; partial progress must resume
+   without inventing deleted objects back into existence. Any proof drift after the sweep starts
+   must retain the fenced account and return `pending_workflow_cleanup_revalidation`; hard deletion
+   requires the same completed sweep, runner proof, workflow tombstone, and transaction-scoped
+   cascade token.
+9. Confirm the final response says only that the account and covered Bluey records were removed
+   from configured active storage. Do not turn Temporal API NotFound, object-store results, or a
+   database cascade into a claim about provider retention, archival, payload-codec/KMS destruction,
+   backups, or physical erasure.
+10. Disable cleanup and stop the rollout on any namespace/query/cutoff drift, malformed or repeated
+    page token, page-cap exhaustion, unexpected status, identity conflict, proof-epoch mismatch,
+    request/lease/fence mismatch, sweep-manifest mismatch, or hosted visibility inconsistency.
+    Reconcile the exact durable identity; never mint caller-owned zero evidence or bypass the
+    deletion fence.
+
+Source completion alone does not authorize step 1 or any later step. Round 610 did not deploy,
+contact a hosted Temporal namespace, mutate a real execution, run a production account deletion,
+or enable a release flag. Installed Bluey Browser packaging and distribution remain parked and are
+not a prerequisite for the browser-delivered portal plus managed cloud execution direction.
 
 ## Required environment
 
@@ -125,10 +185,15 @@ BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED=0
 # These bounded dispatcher settings are read only when dispatch is enabled.
 BLUEY_JOBS_WORKFLOW_COMMAND_POLL_SECONDS=5
 BLUEY_JOBS_WORKFLOW_COMMAND_LEASE_MS=30000
-# Reserved for Phase 610. The current gateway does not import or register cleanup,
-# so neither setting can enable a cleanup endpoint.
 BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED=0
-BLUEY_JOBS_WORKFLOW_CLEANUP_CONFIRMATION_MS=30000
+# Required only after an approved change to the exact literal `true`. The
+# workflow namespace must equal TEMPORAL_NAMESPACE. These values are inert
+# while cleanup remains disabled.
+# BLUEY_JOBS_WORKFLOW_NAMESPACE=<approved Temporal namespace>
+# BLUEY_JOBS_WORKFLOW_CLEANUP_VISIBILITY_CUTOFF_MS=<approved cutover milliseconds>
+# BLUEY_JOBS_WORKFLOW_CLEANUP_POLL_SECONDS=5
+# BLUEY_JOBS_WORKFLOW_CLEANUP_LEASE_MS=30000
+# BLUEY_JOBS_WORKFLOW_CLEANUP_CONFIRMATION_MS=30000
 # Keep managed model generation disabled until provider credentials, the
 # global spend guard, and usage-ledger monitoring are verified in production.
 BLUEY_JOBS_MODEL_GENERATION_ENABLED=0

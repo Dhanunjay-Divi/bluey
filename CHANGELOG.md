@@ -7,6 +7,24 @@ under `docs/release/`.
 
 ### Added
 
+- Added disabled-by-default Bluey Jobs workflow-cleanup authority as an exact prerequisite for
+  account hard deletion. The stateless schema-v3 private gateway exposes `/workflow-cleanup` only
+  for the exact literal enablement `true`; the Rust dispatcher validates configuration before any
+  background worker starts, persists request-start evidence before network I/O, and consumes only
+  lease-, fence-, request-, page-chain-, and proof-epoch-bound receipts. SQLite and PostgreSQL now
+  own a global fixed-query protocol-v1 inventory with two database-aged zero passes and exact
+  account-scoped protocol-v2 cleanup. A first account-deletion request fences writes, freezes the
+  v2 target set, advances any completed global inventory into a fresh database-time epoch, and
+  returns HTTP 202 until the resulting workflow proof is current. Reversible legacy workflow/run
+  identities and provider page tokens are encrypted while needed and compacted before completion;
+  only pseudonymous proof material remains afterward. Before object I/O, one atomic authorization
+  binds the exact current workflow proof, runner-purge proof, storage scopes, and object manifests;
+  partial sweep progress is durable, and hard deletion requires the same current proof plus a
+  transaction-scoped cascade token. The success response is limited to configured active storage
+  and explicitly does not certify provider retention or physical erasure. Installed Bluey Browser
+  work remains parked. Workflow-command dispatch, workflow cleanup, and cloud Browser distribution
+  remain `0`; no hosted Temporal inventory, provider mutation, deployment, canary, or production
+  state changed.
 - Added disabled-by-default, database-first Bluey Jobs workflow-command authority for managed
   start and intervention resume. Immutable encrypted commands, request-start evidence, fenced
   at-least-once dispatch, exact Temporal protocol-v2 identity, intervention-bound Updates,
@@ -21,9 +39,9 @@ under `docs/release/`.
   error fails closed. Startup persistence first proves the account/application-identity-derived
   profile scope. Closed Jobs API errors and bearer
   tokens are accepted only through their exact response/header and symmetric safe-token contracts.
-  The unfinished cleanup library is not imported or route-registered by the gateway and cannot be
-  enabled by environment; authenticated legacy Temporal inventory and account-deletion integration
-  remain Phase 610 work, so cleanup generations intentionally cannot complete.
+  At the Phase 609 boundary, the unfinished cleanup library was not imported or route-registered
+  and cleanup generations intentionally could not complete; the separately gated Phase 610
+  successor above now closes that local-source path without enabling it.
   Workflow-command dispatch, cleanup, and cloud Browser distribution remain `0`; no provider,
   tenant, credential, deployment, canary, or production state changed.
 - Added a disabled-by-default, revisioned Bluey Jobs operational-hold control
