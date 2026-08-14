@@ -7,20 +7,21 @@ import {
   workflowCleanupStartupNamespace,
   workflowGatewayToken,
   type GatewayCleanupExecutor,
-  type GatewayCommandExecutor,
 } from "../src/gateway.js";
 import { WORKFLOW_CLEANUP_MAX_RUN_IDS } from "../src/gateway-cleanup-service.js";
 
 const TOKEN = "gateway-token-0123456789abcdefgh";
 const execute = vi.fn();
+const reconcile = vi.fn();
 const executeCleanup = vi.fn();
 let server: Server;
 let origin: string;
 
 beforeEach(async () => {
   execute.mockReset();
+  reconcile.mockReset();
   executeCleanup.mockReset();
-  server = createGatewayHttpServer(TOKEN, { execute } as GatewayCommandExecutor);
+  server = createGatewayHttpServer(TOKEN, { execute, reconcile });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("Test gateway did not bind");
@@ -178,6 +179,68 @@ describe("workflow gateway HTTP boundary", () => {
     for (const name of ["content-type", "cache-control", "x-content-type-options"]) {
       expect(response.headers.get(name)?.includes(",")).toBe(false);
     }
+  });
+
+  it("routes historical lookup-only recovery through a physically distinct endpoint", async () => {
+    const command = {
+      schemaVersion: 2,
+      operation: "start",
+      requestId: `wfreq-v2-${"a".repeat(32)}`,
+      workflowId: `bluey-jobs-v2-${"b".repeat(32)}`,
+      payloadDigest: "c".repeat(64),
+    };
+    reconcile.mockResolvedValueOnce({
+      status: 202,
+      body: {
+        ...command,
+        outcome: "already_accepted",
+        temporalRunId: `run-${"d".repeat(32)}`,
+      },
+    });
+
+    const response = await gatewayRequest(
+      "/workflow-command-reconciliations",
+      JSON.stringify(command),
+    );
+
+    expect(response.status).toBe(202);
+    expect(reconcile).toHaveBeenCalledWith(command);
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("keeps command recovery reachable while managed runtime readiness is false", async () => {
+    await replaceServer(undefined, () => false);
+    const command = {
+      schemaVersion: 3,
+      operation: "start",
+      requestId: `wfreq-v3-${"a".repeat(32)}`,
+      workflowId: `bluey-jobs-v2-${"b".repeat(32)}`,
+      payloadDigest: "c".repeat(64),
+      managedCloud: { opaque: "service-validated" },
+    };
+    execute.mockResolvedValueOnce({
+      status: 202,
+      body: {
+        ...command,
+        outcome: "already_accepted",
+        temporalRunId: `run-${"d".repeat(32)}`,
+      },
+    });
+
+    const response = await commandRequest(JSON.stringify(command));
+
+    expect(response.status).toBe(202);
+    expect(execute).toHaveBeenCalledWith(command);
+    expect((await fetch(`${origin}/healthz`)).status).toBe(503);
+  });
+
+  it("keeps cleanup gated while managed runtime readiness is false", async () => {
+    await replaceServer({ executeCleanup } as GatewayCleanupExecutor, () => false);
+
+    const response = await gatewayRequest("/workflow-cleanup", "{}");
+
+    expect(response.status).toBe(503);
+    expect(executeCleanup).not.toHaveBeenCalled();
   });
 
   it("does not expose unfinished cleanup to unauthenticated requests", async () => {
@@ -411,15 +474,19 @@ function gatewayRequest(path: string, body: string): Promise<Response> {
   });
 }
 
-async function replaceServer(cleanupService: GatewayCleanupExecutor): Promise<void> {
+async function replaceServer(
+  cleanupService?: GatewayCleanupExecutor,
+  ready?: () => boolean,
+): Promise<void> {
   server.closeAllConnections();
   await new Promise<void>((resolve, reject) => {
     server.close((error) => error ? reject(error) : resolve());
   });
   server = createGatewayHttpServer(
     TOKEN,
-    { execute } as GatewayCommandExecutor,
+    { execute, reconcile },
     cleanupService,
+    ready,
   );
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();

@@ -629,6 +629,58 @@ mod tests {
             assert!(hold < protected, "{label} lock order is inverted");
         }
 
+        fn assert_managed_prelock_is_first_statement(
+            operation: &str,
+            fresh_path_start: &str,
+            label: &str,
+        ) {
+            let start_position = operation
+                .find(fresh_path_start)
+                .unwrap_or_else(|| panic!("missing {label} fresh-path start"));
+            let after_start = start_position + fresh_path_start.len();
+            let managed_prelock = after_start
+                + operation[after_start..]
+                    .find("lock_managed_cloud_workflow_admission_postgres_tx")
+                    .unwrap_or_else(|| panic!("missing {label} managed-cloud prelock"));
+            let prefix = &operation[after_start..managed_prelock];
+            assert!(
+                !prefix.contains(';'),
+                "{label} performs work before prelock"
+            );
+            for forbidden in ["lock_", ".query_", ".execute(", "FOR UPDATE", "FOR SHARE"] {
+                assert!(
+                    !prefix.contains(forbidden),
+                    "{label} acquires protected authority before managed prelock"
+                );
+            }
+        }
+
+        let managed_cloud = include_str!("managed_cloud_release_authority.rs");
+        let managed_prelock = operation(
+            managed_cloud,
+            "pub(crate) fn lock_managed_cloud_workflow_admission_postgres_tx(",
+            "fn sqlite_managed_cloud_command_marker(",
+            "managed-cloud workflow admission prelock",
+        );
+        let managed_prelock_body = managed_prelock
+            .split_once('{')
+            .expect("managed-cloud workflow admission prelock body")
+            .1;
+        let hold = managed_prelock_body
+            .find("lock_operational_hold_shared_postgres_tx")
+            .expect("managed-cloud prelock operational hold");
+        let registry = managed_prelock_body
+            .find("lock_managed_cloud_release_registry_postgres_tx")
+            .expect("managed-cloud prelock registry");
+        let ats = managed_prelock_body
+            .find("lock_postgres_ats_certification")
+            .expect("managed-cloud prelock ATS");
+        let fleet = managed_prelock_body
+            .find("jobs_runner_volume_fleet_state")
+            .expect("managed-cloud prelock fleet");
+        assert!(managed_prelock_body[..hold].trim().is_empty());
+        assert!(hold < registry && registry < ats && ats < fleet);
+
         let browser = include_str!("browser_release_authority.rs");
         assert_first_lock(
             operation(
@@ -713,7 +765,7 @@ mod tests {
         }
 
         let execution = include_str!("execution_leases.rs");
-        assert_first_lock(
+        assert_managed_prelock_is_first_statement(
             operation(
                 execution,
                 "fn claim_execution_lease_inner(",
@@ -721,8 +773,6 @@ mod tests {
                 "cloud runner claim",
             ),
             "let mut tx = conn.transaction()?;",
-            "lock_operational_hold_shared_postgres_tx(&mut tx)",
-            "lock_postgres_ats_certification(&mut tx)",
             "cloud runner claim",
         );
         let cloud_submit = operation(
@@ -731,11 +781,9 @@ mod tests {
             "fn execution_finish_allowed",
             "cloud final-submit admission",
         );
-        assert_first_lock(
+        assert_managed_prelock_is_first_statement(
             cloud_submit,
-            "let mut tx = conn.transaction()?;",
-            "lock_operational_hold_shared_postgres_tx(&mut tx)",
-            "lock_postgres_ats_certification(&mut tx)",
+            "let managed_requested = matches!(managed_cloud_context, Some((Some(_), _)));",
             "cloud final-submit admission",
         );
         let cloud_submit_postgres = cloud_submit
@@ -857,7 +905,10 @@ mod tests {
             let posting = operation
                 .find("FROM jobs_postings")
                 .unwrap_or_else(|| panic!("missing posting snapshot in {label}"));
-            assert!(fence < posting, "{label} reads posting before its account fence");
+            assert!(
+                fence < posting,
+                "{label} reads posting before its account fence"
+            );
             assert!(operation.contains("FOR SHARE"));
             assert!(!operation.contains("FOR UPDATE OF membership, source"));
         }
@@ -6647,7 +6698,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.upserted_count, 1);
-        assert_eq!(list_postings(&pool, "acct-jobs").unwrap()[0].track_id, "track-default");
+        assert_eq!(
+            list_postings(&pool, "acct-jobs").unwrap()[0].track_id,
+            "track-default"
+        );
     }
 
     #[test]
@@ -6665,10 +6719,12 @@ mod tests {
                 params![track.id, track_json],
             )
             .unwrap();
-        assert!(lease_due_discovery_source(&pool, "active-projection-worker")
-            .unwrap_err()
-            .to_string()
-            .contains("projection changed"));
+        assert!(
+            lease_due_discovery_source(&pool, "active-projection-worker")
+                .unwrap_err()
+                .to_string()
+                .contains("projection changed")
+        );
 
         let mut inactive = track;
         inactive.active = false;
@@ -6680,10 +6736,12 @@ mod tests {
                 params![inactive.id, inactive_json],
             )
             .unwrap();
-        assert!(lease_due_discovery_source(&pool, "inactive-projection-worker")
-            .unwrap_err()
-            .to_string()
-            .contains("projection changed"));
+        assert!(
+            lease_due_discovery_source(&pool, "inactive-projection-worker")
+                .unwrap_err()
+                .to_string()
+                .contains("projection changed")
+        );
     }
 
     #[test]
@@ -6715,9 +6773,11 @@ mod tests {
             None,
         );
 
-        assert!(lease_due_discovery_source(&pool, "inactive-bound-region-worker")
-            .unwrap()
-            .is_none());
+        assert!(
+            lease_due_discovery_source(&pool, "inactive-bound-region-worker")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -6742,14 +6802,9 @@ mod tests {
             &preferences,
         )
         .unwrap();
-        let (application, _) = prepare_application(
-            &pool,
-            "acct-jobs",
-            &posting.id,
-            "factual",
-            "review_first",
-        )
-        .unwrap();
+        let (application, _) =
+            prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
+                .unwrap();
         let mut curated = posting.clone();
         curated.source = "curated_feed:feed-simplify-new-grad".to_string();
         let curated_json = to_json(&curated, "curated authority-gap posting").unwrap();
@@ -6819,14 +6874,9 @@ mod tests {
 
         let mut conn = pool.get().unwrap();
         let tx = conn.transaction().unwrap();
-        let job_context = operational_hold_context_for_job_sqlite_tx(
-            &tx,
-            "acct-jobs",
-            &posting.id,
-            None,
-            None,
-        )
-        .unwrap();
+        let job_context =
+            operational_hold_context_for_job_sqlite_tx(&tx, "acct-jobs", &posting.id, None, None)
+                .unwrap();
         let application_context = operational_hold_context_for_application_sqlite_tx(
             &tx,
             "acct-jobs",

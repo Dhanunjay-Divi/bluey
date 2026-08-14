@@ -31,6 +31,7 @@ const WORKFLOW_CLEANUP_HARD_DELETE_AUTHORIZATION_DIGEST_DOMAIN: &[u8] =
     b"bluey-jobs-workflow-cleanup-hard-delete-authorization-v3\0";
 const WORKFLOW_CLEANUP_MAX_V2_KNOWN_RUNS: usize = 32;
 const WORKFLOW_CLEANUP_MAX_SWEEP_SCOPES: usize = 2;
+const WORKFLOW_CLEANUP_MAX_MANAGED_CLOUD_MEMO_BYTES: usize = 4_096;
 
 fn sqlite_workflow_cleanup_db_now_ms(tx: &rusqlite::Transaction<'_>) -> Result<i64> {
     Ok(tx.query_row(
@@ -104,6 +105,12 @@ pub struct JobsV2TargetCleanupLease {
     pub first_execution_run_id: Option<String>,
     pub start_request_id: String,
     pub start_payload_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_cloud_binding_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_cloud_release_memo_base64url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed_cloud_release_memo_sha256: Option<String>,
     pub known_run_ids: Vec<String>,
     pub target_digest: String,
     pub cleanup_fence: i64,
@@ -243,6 +250,12 @@ struct JobsV2TargetReceiptV3 {
     first_execution_run_id: Option<String>,
     start_request_id: String,
     start_payload_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_cloud_binding_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_cloud_release_memo_base64url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_cloud_release_memo_sha256: Option<String>,
     known_run_ids: Vec<String>,
     target_digest: String,
     cleanup_fence: i64,
@@ -272,6 +285,73 @@ fn workflow_cleanup_sorted_unique_identifiers(values: &[String], maximum: usize)
             .iter()
             .all(|value| workflow_command_opaque_identifier(value, 128))
         && values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn validate_workflow_cleanup_managed_cloud_memo(
+    binding_sha256: Option<&str>,
+    memo_base64url: Option<&str>,
+    memo_sha256: Option<&str>,
+) -> Result<()> {
+    let (Some(binding_sha256), Some(memo_base64url), Some(memo_sha256)) =
+        (binding_sha256, memo_base64url, memo_sha256)
+    else {
+        return if binding_sha256.is_none() && memo_base64url.is_none() && memo_sha256.is_none() {
+            Ok(())
+        } else {
+            Err(JobsWorkflowCommandError::InvalidState.into())
+        };
+    };
+    if !workflow_cleanup_digest(binding_sha256)
+        || !workflow_cleanup_digest(memo_sha256)
+        || memo_base64url.is_empty()
+    {
+        return Err(JobsWorkflowCommandError::InvalidState.into());
+    }
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(memo_base64url)
+        .map_err(|_| JobsWorkflowCommandError::InvalidState)?;
+    if bytes.is_empty()
+        || bytes.len() > WORKFLOW_CLEANUP_MAX_MANAGED_CLOUD_MEMO_BYTES
+        || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes) != memo_base64url
+        || hex::encode(Sha256::digest(&bytes)) != memo_sha256
+    {
+        return Err(JobsWorkflowCommandError::InvalidState.into());
+    }
+    let parsed: ManagedCloudReleaseMemoAuthority =
+        serde_json::from_slice(&bytes).map_err(|_| JobsWorkflowCommandError::InvalidState)?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| JobsWorkflowCommandError::InvalidState)?;
+    let object = value
+        .as_object()
+        .ok_or(JobsWorkflowCommandError::InvalidState)?;
+    let expected_keys = [
+        "activationExpiresAtMs",
+        "activationSha256",
+        "bindingSha256",
+        "channelSequence",
+        "cohortSha256",
+        "failureConverterSha256",
+        "headRevision",
+        "manifestSha256",
+        "readinessSha256",
+        "releaseId",
+        "releaseSequence",
+        "resolvedAtMs",
+        "scope",
+        "taskQueueSha256",
+        "transitionSha256",
+        "trustGeneration",
+        "version",
+    ];
+    if object.len() != expected_keys.len()
+        || expected_keys.iter().any(|key| !object.contains_key(*key))
+        || parsed.version != 1
+        || parsed.execution.binding_sha256 != binding_sha256
+        || serde_json::to_vec(&value)? != bytes
+    {
+        return Err(JobsWorkflowCommandError::InvalidState.into());
+    }
+    Ok(())
 }
 
 fn workflow_cleanup_legacy_workflow_id(value: &str) -> bool {
@@ -352,6 +432,9 @@ struct StoredV2TargetClaim {
     first_execution_run_id: Option<String>,
     start_request_id: String,
     start_payload_digest: String,
+    managed_cloud_binding_sha256: Option<String>,
+    managed_cloud_release_memo_base64url: Option<String>,
+    managed_cloud_release_memo_sha256: Option<String>,
     target_set_digest: String,
     cleanup_generation_id: String,
     namespace_ciphertext: String,
@@ -1637,7 +1720,11 @@ fn claim_jobs_v2_target_sqlite_tx(
         .query_row(
             "SELECT target.account_id, target.generation, target.workflow_id,
                     target.first_execution_run_id, target.start_request_id,
-                    target.start_payload_hmac_sha256, target.target_set_hmac_sha256,
+                    target.start_payload_hmac_sha256,
+                    target.managed_cloud_binding_sha256,
+                    target.managed_cloud_release_memo_base64url,
+                    target.managed_cloud_release_memo_sha256,
+                    target.target_set_hmac_sha256,
                     binding.cleanup_generation_id, legacy.namespace_ciphertext,
                     authority.known_run_set_digest_sha256,
                     authority.target_digest_sha256, authority.observation_pass,
@@ -1673,16 +1760,19 @@ fn claim_jobs_v2_target_sqlite_tx(
                     first_execution_run_id: row.get(3)?,
                     start_request_id: row.get(4)?,
                     start_payload_digest: row.get(5)?,
-                    target_set_digest: row.get(6)?,
-                    cleanup_generation_id: row.get(7)?,
-                    namespace_ciphertext: row.get(8)?,
-                    known_run_set_digest: row.get(9)?,
-                    target_digest: row.get(10)?,
-                    observation_pass: row.get(11)?,
-                    request_epoch: row.get(12)?,
-                    fence: row.get(13)?,
-                    request_id: row.get(14)?,
-                    first_request_started_at_ms: row.get(15)?,
+                    managed_cloud_binding_sha256: row.get(6)?,
+                    managed_cloud_release_memo_base64url: row.get(7)?,
+                    managed_cloud_release_memo_sha256: row.get(8)?,
+                    target_set_digest: row.get(9)?,
+                    cleanup_generation_id: row.get(10)?,
+                    namespace_ciphertext: row.get(11)?,
+                    known_run_set_digest: row.get(12)?,
+                    target_digest: row.get(13)?,
+                    observation_pass: row.get(14)?,
+                    request_epoch: row.get(15)?,
+                    fence: row.get(16)?,
+                    request_id: row.get(17)?,
+                    first_request_started_at_ms: row.get(18)?,
                 })
             },
         )
@@ -1690,6 +1780,11 @@ fn claim_jobs_v2_target_sqlite_tx(
     let Some(stored) = stored else {
         return Ok(None);
     };
+    validate_workflow_cleanup_managed_cloud_memo(
+        stored.managed_cloud_binding_sha256.as_deref(),
+        stored.managed_cloud_release_memo_base64url.as_deref(),
+        stored.managed_cloud_release_memo_sha256.as_deref(),
+    )?;
     let known_rows = {
         let mut statement = tx.prepare(
             "SELECT run_id_hmac_sha256, run_id_ciphertext,
@@ -1786,6 +1881,9 @@ fn claim_jobs_v2_target_sqlite_tx(
         first_execution_run_id: stored.first_execution_run_id,
         start_request_id: stored.start_request_id,
         start_payload_digest: stored.start_payload_digest,
+        managed_cloud_binding_sha256: stored.managed_cloud_binding_sha256,
+        managed_cloud_release_memo_base64url: stored.managed_cloud_release_memo_base64url,
+        managed_cloud_release_memo_sha256: stored.managed_cloud_release_memo_sha256,
         known_run_ids,
         target_digest: stored.target_digest,
         cleanup_fence: fence,
@@ -2034,7 +2132,11 @@ fn claim_jobs_v2_target_postgres_tx(
     let row = tx.query_opt(
         "SELECT target.account_id, target.generation, target.workflow_id,
                 target.first_execution_run_id, target.start_request_id,
-                target.start_payload_hmac_sha256, target.target_set_hmac_sha256,
+                target.start_payload_hmac_sha256,
+                target.managed_cloud_binding_sha256,
+                target.managed_cloud_release_memo_base64url,
+                target.managed_cloud_release_memo_sha256,
+                target.target_set_hmac_sha256,
                 binding.cleanup_generation_id, legacy.namespace_ciphertext,
                 authority.known_run_set_digest_sha256,
                 authority.target_digest_sha256, authority.observation_pass,
@@ -2073,17 +2175,25 @@ fn claim_jobs_v2_target_postgres_tx(
         first_execution_run_id: row.get(3),
         start_request_id: row.get(4),
         start_payload_digest: row.get(5),
-        target_set_digest: row.get(6),
-        cleanup_generation_id: row.get(7),
-        namespace_ciphertext: row.get(8),
-        known_run_set_digest: row.get(9),
-        target_digest: row.get(10),
-        observation_pass: row.get(11),
-        request_epoch: row.get(12),
-        fence: row.get(13),
-        request_id: row.get(14),
-        first_request_started_at_ms: row.get(15),
+        managed_cloud_binding_sha256: row.get(6),
+        managed_cloud_release_memo_base64url: row.get(7),
+        managed_cloud_release_memo_sha256: row.get(8),
+        target_set_digest: row.get(9),
+        cleanup_generation_id: row.get(10),
+        namespace_ciphertext: row.get(11),
+        known_run_set_digest: row.get(12),
+        target_digest: row.get(13),
+        observation_pass: row.get(14),
+        request_epoch: row.get(15),
+        fence: row.get(16),
+        request_id: row.get(17),
+        first_request_started_at_ms: row.get(18),
     };
+    validate_workflow_cleanup_managed_cloud_memo(
+        stored.managed_cloud_binding_sha256.as_deref(),
+        stored.managed_cloud_release_memo_base64url.as_deref(),
+        stored.managed_cloud_release_memo_sha256.as_deref(),
+    )?;
     // Preserve the explicit authority -> target order used by receipts and
     // hard deletion. Locking both joined relations is planner-dependent.
     tx.query_one(
@@ -2190,6 +2300,9 @@ fn claim_jobs_v2_target_postgres_tx(
         first_execution_run_id: stored.first_execution_run_id,
         start_request_id: stored.start_request_id,
         start_payload_digest: stored.start_payload_digest,
+        managed_cloud_binding_sha256: stored.managed_cloud_binding_sha256,
+        managed_cloud_release_memo_base64url: stored.managed_cloud_release_memo_base64url,
+        managed_cloud_release_memo_sha256: stored.managed_cloud_release_memo_sha256,
         known_run_ids,
         target_digest: stored.target_digest,
         cleanup_fence: fence,
@@ -2213,6 +2326,13 @@ pub fn mark_jobs_workflow_cleanup_request_started(
         || fence < 1
     {
         return Err(JobsWorkflowCommandError::InvalidRequest.into());
+    }
+    if let JobsWorkflowCleanupWorkLease::ReconcileV2Target(lease) = lease {
+        validate_workflow_cleanup_managed_cloud_memo(
+            lease.managed_cloud_binding_sha256.as_deref(),
+            lease.managed_cloud_release_memo_base64url.as_deref(),
+            lease.managed_cloud_release_memo_sha256.as_deref(),
+        )?;
     }
     let lease_hash = workflow_command_lease_token_sha256(token);
     crate::db::run_blocking_db(|| match pool {
@@ -2289,7 +2409,19 @@ pub fn mark_jobs_workflow_cleanup_request_started(
                         AND request_epoch = ?4 AND cleanup_fence = ?5
                         AND cleanup_request_id = ?6 AND lease_owner = ?7
                         AND lease_token_sha256 = ?8 AND lease_expires_at_ms = ?9
-                        AND lease_expires_at_ms >= ?1",
+                        AND lease_expires_at_ms >= ?1
+                        AND EXISTS (
+                          SELECT 1 FROM jobs_workflow_cleanup_targets target
+                           WHERE target.account_id =
+                                 jobs_workflow_cleanup_v2_target_authorities.account_id
+                             AND target.generation =
+                                 jobs_workflow_cleanup_v2_target_authorities.workflow_cleanup_generation
+                             AND target.workflow_id =
+                                 jobs_workflow_cleanup_v2_target_authorities.workflow_id
+                             AND target.managed_cloud_binding_sha256 IS ?10
+                             AND target.managed_cloud_release_memo_base64url IS ?11
+                             AND target.managed_cloud_release_memo_sha256 IS ?12
+                        )",
                     params![
                         authority_now_ms,
                         lease.workflow_id,
@@ -2300,6 +2432,9 @@ pub fn mark_jobs_workflow_cleanup_request_started(
                         lease.lease_owner,
                         lease_hash,
                         lease.lease_expires_at_ms,
+                        lease.managed_cloud_binding_sha256,
+                        lease.managed_cloud_release_memo_base64url,
+                        lease.managed_cloud_release_memo_sha256,
                     ],
                 )?,
             };
@@ -2382,7 +2517,22 @@ pub fn mark_jobs_workflow_cleanup_request_started(
                         AND request_epoch = $4 AND cleanup_fence = $5
                         AND cleanup_request_id = $6 AND lease_owner = $7
                         AND lease_token_sha256 = $8 AND lease_expires_at_ms = $9
-                        AND lease_expires_at_ms >= $1",
+                        AND lease_expires_at_ms >= $1
+                        AND EXISTS (
+                          SELECT 1 FROM jobs_workflow_cleanup_targets target
+                           WHERE target.account_id =
+                                 jobs_workflow_cleanup_v2_target_authorities.account_id
+                             AND target.generation =
+                                 jobs_workflow_cleanup_v2_target_authorities.workflow_cleanup_generation
+                             AND target.workflow_id =
+                                 jobs_workflow_cleanup_v2_target_authorities.workflow_id
+                             AND target.managed_cloud_binding_sha256
+                                 IS NOT DISTINCT FROM $10
+                             AND target.managed_cloud_release_memo_base64url
+                                 IS NOT DISTINCT FROM $11
+                             AND target.managed_cloud_release_memo_sha256
+                                 IS NOT DISTINCT FROM $12
+                        )",
                     &[
                         &authority_now_ms,
                         &lease.workflow_id,
@@ -2393,6 +2543,9 @@ pub fn mark_jobs_workflow_cleanup_request_started(
                         &lease.lease_owner,
                         &lease_hash,
                         &lease.lease_expires_at_ms,
+                        &lease.managed_cloud_binding_sha256,
+                        &lease.managed_cloud_release_memo_base64url,
+                        &lease.managed_cloud_release_memo_sha256,
                     ],
                 )?,
             };
@@ -2931,18 +3084,29 @@ fn workflow_cleanup_v2_target_digest(
     namespace: &str,
     target: &FrozenWorkflowCleanupTarget,
 ) -> Result<String> {
+    validate_workflow_cleanup_managed_cloud_memo(
+        target.managed_cloud_binding_sha256.as_deref(),
+        target.managed_cloud_release_memo_base64url.as_deref(),
+        target.managed_cloud_release_memo_sha256.as_deref(),
+    )?;
+    let mut authority = json!({
+        "cleanupGenerationId": cleanup_generation_id,
+        "firstExecutionRunId": target.first_execution_run_id,
+        "namespace": namespace,
+        "startPayloadDigest": target.payload_hmac_sha256,
+        "startRequestId": target.request_id,
+        "targetSetDigest": target_set_digest,
+        "workflowId": target.workflow_id,
+        "workflowType": WORKFLOW_V2_TYPE,
+    });
+    add_workflow_cleanup_managed_cloud_digest_fields(
+        &mut authority,
+        target.managed_cloud_binding_sha256.as_deref(),
+        target.managed_cloud_release_memo_sha256.as_deref(),
+    )?;
     workflow_cleanup_sha256(
         WORKFLOW_CLEANUP_V2_TARGET_DIGEST_DOMAIN,
-        &json!({
-            "cleanupGenerationId": cleanup_generation_id,
-            "firstExecutionRunId": target.first_execution_run_id,
-            "namespace": namespace,
-            "startPayloadDigest": target.payload_hmac_sha256,
-            "startRequestId": target.request_id,
-            "targetSetDigest": target_set_digest,
-            "workflowId": target.workflow_id,
-            "workflowType": WORKFLOW_V2_TYPE,
-        }),
+        &authority,
         "workflow v2 cleanup target",
     )
 }
@@ -2951,20 +3115,58 @@ fn workflow_cleanup_v2_target_digest_from_lease(
     lease: &JobsV2TargetCleanupLease,
     first_execution_run_id: Option<&str>,
 ) -> Result<String> {
+    validate_workflow_cleanup_managed_cloud_memo(
+        lease.managed_cloud_binding_sha256.as_deref(),
+        lease.managed_cloud_release_memo_base64url.as_deref(),
+        lease.managed_cloud_release_memo_sha256.as_deref(),
+    )?;
+    let mut authority = json!({
+        "cleanupGenerationId": lease.cleanup_generation_id,
+        "firstExecutionRunId": first_execution_run_id,
+        "namespace": lease.namespace,
+        "startPayloadDigest": lease.start_payload_digest,
+        "startRequestId": lease.start_request_id,
+        "targetSetDigest": lease.target_set_digest,
+        "workflowId": lease.workflow_id,
+        "workflowType": WORKFLOW_V2_TYPE,
+    });
+    add_workflow_cleanup_managed_cloud_digest_fields(
+        &mut authority,
+        lease.managed_cloud_binding_sha256.as_deref(),
+        lease.managed_cloud_release_memo_sha256.as_deref(),
+    )?;
     workflow_cleanup_sha256(
         WORKFLOW_CLEANUP_V2_TARGET_DIGEST_DOMAIN,
-        &json!({
-            "cleanupGenerationId": lease.cleanup_generation_id,
-            "firstExecutionRunId": first_execution_run_id,
-            "namespace": lease.namespace,
-            "startPayloadDigest": lease.start_payload_digest,
-            "startRequestId": lease.start_request_id,
-            "targetSetDigest": lease.target_set_digest,
-            "workflowId": lease.workflow_id,
-            "workflowType": WORKFLOW_V2_TYPE,
-        }),
+        &authority,
         "workflow v2 cleanup target",
     )
+}
+
+fn add_workflow_cleanup_managed_cloud_digest_fields(
+    authority: &mut Value,
+    binding_sha256: Option<&str>,
+    memo_sha256: Option<&str>,
+) -> Result<()> {
+    match (binding_sha256, memo_sha256) {
+        (None, None) => Ok(()),
+        (Some(binding_sha256), Some(memo_sha256))
+            if workflow_cleanup_digest(binding_sha256) && workflow_cleanup_digest(memo_sha256) =>
+        {
+            let object = authority
+                .as_object_mut()
+                .ok_or(JobsWorkflowCommandError::InvalidState)?;
+            object.insert(
+                "managedCloudBindingSha256".to_string(),
+                Value::String(binding_sha256.to_string()),
+            );
+            object.insert(
+                "managedCloudReleaseMemoSha256".to_string(),
+                Value::String(memo_sha256.to_string()),
+            );
+            Ok(())
+        }
+        _ => Err(JobsWorkflowCommandError::InvalidState.into()),
+    }
 }
 
 fn validate_jobs_legacy_inventory_page_receipt(
@@ -3126,6 +3328,10 @@ fn validate_jobs_v2_target_receipt(
         || receipt.workflow_id != lease.workflow_id
         || receipt.start_request_id != lease.start_request_id
         || receipt.start_payload_digest != lease.start_payload_digest
+        || receipt.managed_cloud_binding_sha256 != lease.managed_cloud_binding_sha256
+        || receipt.managed_cloud_release_memo_base64url
+            != lease.managed_cloud_release_memo_base64url
+        || receipt.managed_cloud_release_memo_sha256 != lease.managed_cloud_release_memo_sha256
         || receipt.known_run_ids != lease.known_run_ids
         || receipt.target_digest != lease.target_digest
         || receipt.cleanup_fence != lease.cleanup_fence
@@ -5784,7 +5990,9 @@ fn freeze_jobs_workflow_cleanup_targets_sqlite_tx(
                 .query_row(
                     "SELECT start_command_id, start_request_id,
                             start_payload_hmac_sha256, first_execution_run_id,
-                            target_state
+                            target_state, managed_cloud_binding_sha256,
+                            managed_cloud_release_memo_base64url,
+                            managed_cloud_release_memo_sha256
                        FROM jobs_workflow_cleanup_targets
                       WHERE account_id = ?1 AND generation = ?2
                         AND target_set_hmac_sha256 = ?3 AND workflow_id = ?4",
@@ -5796,6 +6004,9 @@ fn freeze_jobs_workflow_cleanup_targets_sqlite_tx(
                             row.get::<_, String>(2)?,
                             row.get::<_, Option<String>>(3)?,
                             row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
@@ -5807,6 +6018,9 @@ fn freeze_jobs_workflow_cleanup_targets_sqlite_tx(
                 || frozen.1 != target.request_id
                 || frozen.2 != target.payload_hmac_sha256
                 || frozen.3 != target.first_execution_run_id
+                || frozen.5 != target.managed_cloud_binding_sha256
+                || frozen.6 != target.managed_cloud_release_memo_base64url
+                || frozen.7 != target.managed_cloud_release_memo_sha256
             {
                 return Err(JobsWorkflowCommandError::IdentityConflict.into());
             }
@@ -5922,8 +6136,13 @@ fn freeze_jobs_workflow_cleanup_targets_sqlite_tx(
             "INSERT INTO jobs_workflow_cleanup_targets (
                 account_id, generation, target_set_hmac_sha256, workflow_id,
                 start_command_id, start_request_id, start_payload_hmac_sha256,
-                first_execution_run_id, target_state, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+                first_execution_run_id, managed_cloud_binding_sha256,
+                managed_cloud_release_memo_base64url,
+                managed_cloud_release_memo_sha256, target_state,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13
+             )",
             params![
                 account_id,
                 generation,
@@ -5933,6 +6152,9 @@ fn freeze_jobs_workflow_cleanup_targets_sqlite_tx(
                 target.request_id,
                 target.payload_hmac_sha256,
                 target.first_execution_run_id,
+                target.managed_cloud_binding_sha256,
+                target.managed_cloud_release_memo_base64url,
+                target.managed_cloud_release_memo_sha256,
                 target_state,
                 now_ms,
             ],
@@ -6030,7 +6252,9 @@ fn freeze_jobs_workflow_cleanup_targets_postgres_tx(
             let frozen = tx.query_opt(
                 "SELECT start_command_id, start_request_id,
                         start_payload_hmac_sha256, first_execution_run_id,
-                        target_state
+                        target_state, managed_cloud_binding_sha256,
+                        managed_cloud_release_memo_base64url,
+                        managed_cloud_release_memo_sha256
                    FROM jobs_workflow_cleanup_targets
                   WHERE account_id = $1 AND generation = $2
                     AND target_set_hmac_sha256 = $3 AND workflow_id = $4
@@ -6049,6 +6273,9 @@ fn freeze_jobs_workflow_cleanup_targets_postgres_tx(
                 || frozen.get::<_, String>(1) != target.request_id
                 || frozen.get::<_, String>(2) != target.payload_hmac_sha256
                 || frozen.get::<_, Option<String>>(3) != target.first_execution_run_id
+                || frozen.get::<_, Option<String>>(5) != target.managed_cloud_binding_sha256
+                || frozen.get::<_, Option<String>>(6) != target.managed_cloud_release_memo_base64url
+                || frozen.get::<_, Option<String>>(7) != target.managed_cloud_release_memo_sha256
             {
                 return Err(JobsWorkflowCommandError::IdentityConflict.into());
             }
@@ -6176,8 +6403,13 @@ fn freeze_jobs_workflow_cleanup_targets_postgres_tx(
             "INSERT INTO jobs_workflow_cleanup_targets (
                 account_id, generation, target_set_hmac_sha256, workflow_id,
                 start_command_id, start_request_id, start_payload_hmac_sha256,
-                first_execution_run_id, target_state, created_at_ms, updated_at_ms
-             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)",
+                first_execution_run_id, managed_cloud_binding_sha256,
+                managed_cloud_release_memo_base64url,
+                managed_cloud_release_memo_sha256, target_state,
+                created_at_ms, updated_at_ms
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13
+             )",
             &[
                 &account_id,
                 &generation,
@@ -6187,6 +6419,9 @@ fn freeze_jobs_workflow_cleanup_targets_postgres_tx(
                 &target.request_id,
                 &target.payload_hmac_sha256,
                 &target.first_execution_run_id,
+                &target.managed_cloud_binding_sha256,
+                &target.managed_cloud_release_memo_base64url,
+                &target.managed_cloud_release_memo_sha256,
                 &target_state,
                 &now_ms,
             ],
@@ -9176,5 +9411,55 @@ mod workflow_cleanup_authority_tests {
             &duplicate,
             WORKFLOW_CLEANUP_MAX_V2_KNOWN_RUNS
         ));
+    }
+
+    #[test]
+    fn managed_cloud_cleanup_memo_is_canonical_digest_and_binding_bound() {
+        let binding_sha256 = "1".repeat(64);
+        let memo = json!({
+            "activationExpiresAtMs": 1_800_000_000_000_i64,
+            "activationSha256": "2".repeat(64),
+            "bindingSha256": binding_sha256,
+            "channelSequence": 4,
+            "cohortSha256": "3".repeat(64),
+            "failureConverterSha256": "4".repeat(64),
+            "headRevision": 5,
+            "manifestSha256": "6".repeat(64),
+            "readinessSha256": "7".repeat(64),
+            "releaseId": "managed-cloud-release-test",
+            "releaseSequence": 8,
+            "resolvedAtMs": 1_700_000_000_000_i64,
+            "scope": {
+                "channel": "canary",
+                "environment": "staging",
+                "region": "us-east-1",
+            },
+            "taskQueueSha256": "8".repeat(64),
+            "transitionSha256": "9".repeat(64),
+            "trustGeneration": 2,
+            "version": 1,
+        });
+        let bytes = serde_json::to_vec(&memo).unwrap();
+        let base64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes);
+        let memo_sha256 = hex::encode(Sha256::digest(&bytes));
+        assert!(validate_workflow_cleanup_managed_cloud_memo(
+            Some(&"1".repeat(64)),
+            Some(&base64url),
+            Some(&memo_sha256),
+        )
+        .is_ok());
+        assert!(validate_workflow_cleanup_managed_cloud_memo(None, None, None).is_ok());
+        assert!(validate_workflow_cleanup_managed_cloud_memo(
+            Some(&"2".repeat(64)),
+            Some(&base64url),
+            Some(&memo_sha256),
+        )
+        .is_err());
+        assert!(validate_workflow_cleanup_managed_cloud_memo(
+            Some(&"1".repeat(64)),
+            Some(&base64url),
+            None,
+        )
+        .is_err());
     }
 }

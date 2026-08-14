@@ -17,6 +17,11 @@ import type {
   WorkflowCleanupResponse,
 } from "./contracts.js";
 import {
+  MANAGED_CLOUD_RELEASE_MEMO_KEY,
+  managedCloudReleaseMemoBytes,
+  parseManagedCloudReleaseMemo,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import {
   WORKFLOW_PROTOCOL_MEMO_KEY,
   WORKFLOW_TYPE_V2,
 } from "./gateway-service.js";
@@ -284,7 +289,7 @@ export function v2WorkflowTargetDigest(
     "cleanupFence" | "observationPass"
   >,
 ): string {
-  return domainDigest(V2_TARGET_DIGEST_DOMAIN, {
+  const authority: Record<string, unknown> = {
     cleanupGenerationId: request.cleanupGenerationId,
     targetSetDigest: request.targetSetDigest,
     namespace: request.namespace,
@@ -293,7 +298,13 @@ export function v2WorkflowTargetDigest(
     firstExecutionRunId: request.firstExecutionRunId,
     startRequestId: request.startRequestId,
     startPayloadDigest: request.startPayloadDigest,
-  });
+  };
+  if (request.managedCloudBindingSha256 !== undefined
+    && request.managedCloudReleaseMemoSha256 !== undefined) {
+    authority.managedCloudBindingSha256 = request.managedCloudBindingSha256;
+    authority.managedCloudReleaseMemoSha256 = request.managedCloudReleaseMemoSha256;
+  }
+  return domainDigest(V2_TARGET_DIGEST_DOMAIN, authority);
 }
 
 export function canonicalizeWorkflowCleanupEvidence(value: unknown): string {
@@ -864,8 +875,28 @@ function exactV2Memo(
   request: ReconcileV2WorkflowTargetRequest,
 ): boolean {
   const fields = recordOrUndefined(value);
-  if (!fields || !sameKeys(fields, [WORKFLOW_PROTOCOL_MEMO_KEY])) return false;
-  const payload = recordOrUndefined(fields[WORKFLOW_PROTOCOL_MEMO_KEY]);
+  const managedCloudMemo = managedCloudMemoBytes(request);
+  const expectedKeys = managedCloudMemo
+    ? [MANAGED_CLOUD_RELEASE_MEMO_KEY, WORKFLOW_PROTOCOL_MEMO_KEY]
+    : [WORKFLOW_PROTOCOL_MEMO_KEY];
+  if (!fields || !sameKeys(fields, expectedKeys)) return false;
+  if (!exactJsonPlainPayload(
+    fields[WORKFLOW_PROTOCOL_MEMO_KEY],
+    Buffer.from(JSON.stringify({
+      schemaVersion: 2,
+      requestId: request.startRequestId,
+      workflowId: request.workflowId,
+      payloadDigest: request.startPayloadDigest,
+    }), "utf8"),
+  )) {
+    return false;
+  }
+  return managedCloudMemo === undefined
+    || exactJsonPlainPayload(fields[MANAGED_CLOUD_RELEASE_MEMO_KEY], managedCloudMemo);
+}
+
+function exactJsonPlainPayload(value: unknown, expected: Uint8Array): boolean {
+  const payload = recordOrUndefined(value);
   const metadata = recordOrUndefined(payload?.metadata);
   const data = payload?.data;
   const payloadKeysAreExact = payload !== undefined
@@ -882,13 +913,7 @@ function exactV2Memo(
     || data.length > MAX_MEMO_BYTES) {
     return false;
   }
-  const expected = JSON.stringify({
-    schemaVersion: 2,
-    requestId: request.startRequestId,
-    workflowId: request.workflowId,
-    payloadDigest: request.startPayloadDigest,
-  });
-  return Buffer.from(data).equals(Buffer.from(expected, "utf8"));
+  return Buffer.from(data).equals(Buffer.from(expected));
 }
 
 function rawExecution(value: unknown): TemporalCleanupExecution {
@@ -1059,7 +1084,7 @@ function parseLegacyTarget(
 }
 
 function parseV2Target(record: Record<string, unknown>): ReconcileV2WorkflowTargetRequest {
-  const expectedKeys = [
+  const baseKeys = [
     "schemaVersion",
     "operation",
     "cleanupRequestId",
@@ -1076,6 +1101,13 @@ function parseV2Target(record: Record<string, unknown>): ReconcileV2WorkflowTarg
     "cleanupFence",
     "observationPass",
   ];
+  const managedKeys = [
+    "managedCloudBindingSha256",
+    "managedCloudReleaseMemoBase64url",
+    "managedCloudReleaseMemoSha256",
+  ];
+  const hasManagedCloudMemo = managedKeys.every((key) => key in record);
+  const expectedKeys = hasManagedCloudMemo ? [...baseKeys, ...managedKeys] : baseKeys;
   if (!sameKeys(record, expectedKeys)
     || record.schemaVersion !== WORKFLOW_CLEANUP_SCHEMA_VERSION
     || record.operation !== "reconcile_v2_target"
@@ -1089,6 +1121,7 @@ function parseV2Target(record: Record<string, unknown>): ReconcileV2WorkflowTarg
       || opaqueId(record.firstExecutionRunId, 128))
     || !opaqueId(record.startRequestId, 128)
     || !digest(record.startPayloadDigest)
+    || (hasManagedCloudMemo && !validManagedCloudMemoAuthority(record))
     || !sortedUniqueOpaqueIds(record.knownRunIds, WORKFLOW_CLEANUP_MAX_RUN_IDS)
     || ((record.firstExecutionRunId === null)
       !== ((record.knownRunIds as string[]).length === 0))
@@ -1100,6 +1133,45 @@ function parseV2Target(record: Record<string, unknown>): ReconcileV2WorkflowTarg
     throw new Error("Invalid workflow cleanup request");
   }
   return record as unknown as ReconcileV2WorkflowTargetRequest;
+}
+
+function validManagedCloudMemoAuthority(record: Record<string, unknown>): boolean {
+  if (!digest(record.managedCloudBindingSha256)
+    || !digest(record.managedCloudReleaseMemoSha256)
+    || typeof record.managedCloudReleaseMemoBase64url !== "string") {
+    return false;
+  }
+  const bytes = decodeCanonicalBase64url(
+    record.managedCloudReleaseMemoBase64url,
+    MAX_MEMO_BYTES,
+  );
+  if (!bytes
+    || createHash("sha256").update(bytes).digest("hex")
+      !== record.managedCloudReleaseMemoSha256) {
+    return false;
+  }
+  try {
+    const parsed = parseManagedCloudReleaseMemo(JSON.parse(bytes.toString("utf8")));
+    return parsed.bindingSha256 === record.managedCloudBindingSha256
+      && Buffer.from(managedCloudReleaseMemoBytes(parsed)).equals(bytes);
+  } catch {
+    return false;
+  }
+}
+
+function managedCloudMemoBytes(
+  request: ReconcileV2WorkflowTargetRequest,
+): Buffer | undefined {
+  if (request.managedCloudReleaseMemoBase64url === undefined) return undefined;
+  return decodeCanonicalBase64url(request.managedCloudReleaseMemoBase64url, MAX_MEMO_BYTES);
+}
+
+function decodeCanonicalBase64url(value: string, maximumBytes: number): Buffer | undefined {
+  if (!/^[A-Za-z0-9_-]+$/.test(value)) return undefined;
+  const decoded = Buffer.from(value, "base64url");
+  return decoded.length <= maximumBytes && decoded.toString("base64url") === value
+    ? decoded
+    : undefined;
 }
 
 function commonLegacyInventoryAuthority(record: Record<string, unknown>): boolean {

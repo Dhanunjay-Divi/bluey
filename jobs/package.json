@@ -11,6 +11,7 @@
   ],
   "scripts": {
     "build": "npm run build --workspace @bluey/jobs-automation && npm run build --workspace @bluey/jobs-browser && npm run build --workspace @bluey/jobs-runner && npm run build --workspace @bluey/jobs-workflows && npm run build --workspace @bluey/jobs-portal",
+    "test:managed-cloud-release": "node --test scripts/managed-cloud-release-gate.test.mjs",
     "test": "npm run build --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-browser && npm run test --workspace @bluey/jobs-runner && npm run test --workspace @bluey/jobs-workflows && npm run test --workspace @bluey/jobs-portal",
     "typecheck": "npm run build --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-browser && npm run typecheck --workspace @bluey/jobs-runner && npm run typecheck --workspace @bluey/jobs-workflows && npm run typecheck --workspace @bluey/jobs-portal"
   },

@@ -1043,25 +1043,23 @@ fn workflow_distribution_flag_enabled(name: &str) -> bool {
 }
 
 fn cloud_distribution_ready_sqlite_tx(tx: &rusqlite::Transaction<'_>) -> Result<bool> {
-    if cfg!(debug_assertions) {
-        return Ok(true);
+    if crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission().is_none() {
+        return Ok(false);
     }
     Ok(
         workflow_distribution_flag_enabled("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
-            && std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN")
-                .is_ok_and(|value| !value.trim().is_empty())
+            && crate::jobs_workflow_dispatch::workflow_command_dispatch_configured_for_admission()
             && sqlite_runner_volume_fleet_distribution_ready(tx)?,
     )
 }
 
 fn cloud_distribution_ready_postgres_tx(tx: &mut postgres::Transaction<'_>) -> Result<bool> {
-    if cfg!(debug_assertions) {
-        return Ok(true);
+    if crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission().is_none() {
+        return Ok(false);
     }
     Ok(
         workflow_distribution_flag_enabled("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
-            && std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN")
-                .is_ok_and(|value| !value.trim().is_empty())
+            && crate::jobs_workflow_dispatch::workflow_command_dispatch_configured_for_admission()
             && postgres_runner_volume_fleet_distribution_ready(tx)?,
     )
 }
@@ -1896,11 +1894,6 @@ pub fn stage_cloud_workflow_start(
             let mut connection = pool.get()?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &transaction,
-                &input.account_id,
-            )?;
-            require_no_workflow_cleanup_sqlite_tx(&transaction, &input.account_id)?;
             if let Some(existing) = transaction
                 .query_row(
                     &format!(
@@ -1915,9 +1908,24 @@ pub fn stage_cloud_workflow_start(
             {
                 let replay =
                     workflow_command_replay(existing, &frozen_command, &frozen_request_hmac)?;
+                let managed_cloud_scope =
+                    crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                        .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+                require_managed_cloud_workflow_binding_replay_sqlite_tx(
+                    &transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope),
+                )?;
                 transaction.commit()?;
                 return Ok(replay);
             }
+            let managed_cloud_scope =
+                crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                    .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &transaction,
+                &input.account_id,
+            )?;
+            require_no_workflow_cleanup_sqlite_tx(&transaction, &input.account_id)?;
             let cloud_browser: i64 = transaction.query_row(
                 "SELECT cloud_browser FROM jobs_entitlements WHERE account_id = ?1",
                 params![input.account_id],
@@ -1988,6 +1996,10 @@ pub fn stage_cloud_workflow_start(
                     &command,
                     &workflow_command_request_hmac(&command)?,
                 )?;
+                require_managed_cloud_workflow_binding_replay_sqlite_tx(
+                    &transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope.clone()),
+                )?;
                 transaction.commit()?;
                 return Ok(replay);
             }
@@ -2009,7 +2021,11 @@ pub fn stage_cloud_workflow_start(
             stage_attempt_reservation_sqlite_tx(&transaction, input, &application, &posting)?;
             stage_packet_metering_sqlite_tx(&transaction, input, &application)?;
             stage_start_rows_sqlite_tx(&transaction, input, &mut application)?;
-            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, &command)?;
+            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true)?;
+            bind_managed_cloud_workflow_sqlite_tx(
+                &transaction,
+                &managed_cloud_binding_input(&admission, managed_cloud_scope),
+            )?;
             transaction.commit()?;
             Ok(admission)
         }
@@ -2018,11 +2034,6 @@ pub fn stage_cloud_workflow_start(
             let mut transaction = connection.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut transaction)
                 .map_err(anyhow::Error::new)?;
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut transaction,
-                &input.account_id,
-            )?;
-            require_no_workflow_cleanup_postgres_tx(&mut transaction, &input.account_id)?;
             if let Some(existing) = transaction.query_opt(
                 &format!(
                     "SELECT {WORKFLOW_COMMAND_SELECT} FROM jobs_workflow_commands
@@ -2036,10 +2047,53 @@ pub fn stage_cloud_workflow_start(
                     &frozen_command,
                     &frozen_request_hmac,
                 )?;
+                let managed_cloud_scope =
+                    crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                        .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+                require_managed_cloud_workflow_binding_replay_postgres_tx(
+                    &mut transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope),
+                )?;
+                transaction.commit()?;
+                return Ok(replay);
+            }
+            let managed_cloud_scope =
+                crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                    .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+            lock_managed_cloud_workflow_admission_postgres_tx(
+                &mut transaction,
+                &managed_cloud_scope,
+            )?;
+            // The first replay lookup can race a concurrent first insert that
+            // is still uncommitted. The managed-cloud prelock serializes that
+            // insert, so repeat the immutable replay lookup immediately after
+            // acquiring it and before consulting any mutable launch state.
+            if let Some(existing) = transaction.query_opt(
+                &format!(
+                    "SELECT {WORKFLOW_COMMAND_SELECT} FROM jobs_workflow_commands
+                      WHERE account_id = $1 AND command_kind = 'start'
+                        AND idempotency_key_hmac_sha256 = $2 FOR SHARE"
+                ),
+                &[&input.account_id, &frozen_idempotency_hmac],
+            )? {
+                let replay = workflow_command_replay(
+                    postgres_workflow_command_row(&existing),
+                    &frozen_command,
+                    &frozen_request_hmac,
+                )?;
+                require_managed_cloud_workflow_binding_replay_postgres_tx(
+                    &mut transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope.clone()),
+                )?;
                 transaction.commit()?;
                 return Ok(replay);
             }
             lock_discovery_account_shared_postgres(&mut transaction, &input.account_id)?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut transaction,
+                &input.account_id,
+            )?;
+            require_no_workflow_cleanup_postgres_tx(&mut transaction, &input.account_id)?;
             let entitlement = transaction.query_one(
                 "SELECT cloud_browser FROM jobs_entitlements
                   WHERE account_id = $1 FOR UPDATE",
@@ -2106,6 +2160,10 @@ pub fn stage_cloud_workflow_start(
                     &command,
                     &workflow_command_request_hmac(&command)?,
                 )?;
+                require_managed_cloud_workflow_binding_replay_postgres_tx(
+                    &mut transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope.clone()),
+                )?;
                 transaction.commit()?;
                 return Ok(replay);
             }
@@ -2127,11 +2185,30 @@ pub fn stage_cloud_workflow_start(
             stage_attempt_reservation_postgres_tx(&mut transaction, input, &application, &posting)?;
             stage_packet_metering_postgres_tx(&mut transaction, input, &application)?;
             stage_start_rows_postgres_tx(&mut transaction, input, &mut application)?;
-            let admission = admit_jobs_workflow_command_postgres_tx(&mut transaction, &command)?;
+            let admission =
+                admit_jobs_workflow_command_postgres_tx(&mut transaction, &command, true)?;
+            bind_managed_cloud_workflow_postgres_tx(
+                &mut transaction,
+                &managed_cloud_binding_input(&admission, managed_cloud_scope),
+            )?;
             transaction.commit()?;
             Ok(admission)
         }
     })
+}
+
+fn managed_cloud_binding_input(
+    admission: &JobsWorkflowCommandAdmission,
+    scope: ManagedCloudScope,
+) -> ManagedCloudWorkflowBindingInput {
+    ManagedCloudWorkflowBindingInput {
+        command_id: admission.command.id.clone(),
+        account_id: admission.command.account_id.clone(),
+        application_id: admission.command.application_id.clone(),
+        run_id: admission.command.run_id.clone(),
+        workflow_id: admission.command.workflow_id.clone(),
+        scope,
+    }
 }
 
 fn validate_resume_start_material(
@@ -2575,11 +2652,6 @@ pub fn stage_cloud_workflow_resume(
             let mut connection = pool.get()?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &transaction,
-                &input.account_id,
-            )?;
-            require_no_workflow_cleanup_sqlite_tx(&transaction, &input.account_id)?;
             let idempotency_hmac = workflow_command_idempotency_hmac(&command)?;
             if let Some(existing) = transaction
                 .query_row(
@@ -2598,8 +2670,31 @@ pub fn stage_cloud_workflow_resume(
                     &command,
                     &workflow_command_request_hmac(&command)?,
                 )?;
+                let managed_cloud_scope =
+                    crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                        .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+                require_managed_cloud_workflow_binding_replay_sqlite_tx(
+                    &transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope),
+                )?;
                 transaction.commit()?;
                 return Ok(replay);
+            }
+            let managed_cloud_scope =
+                crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                    .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &transaction,
+                &input.account_id,
+            )?;
+            require_no_workflow_cleanup_sqlite_tx(&transaction, &input.account_id)?;
+            let cloud_browser: i64 = transaction.query_row(
+                "SELECT cloud_browser FROM jobs_entitlements WHERE account_id = ?1",
+                params![input.account_id],
+                |row| row.get(0),
+            )?;
+            if cloud_browser == 0 {
+                anyhow::bail!("cloud browser distribution is unavailable")
             }
             let (application, posting) = load_stage_application_sqlite_tx(
                 &transaction,
@@ -2666,7 +2761,11 @@ pub fn stage_cloud_workflow_resume(
             if changed != 1 {
                 anyhow::bail!("intervention changed before workflow resume admission")
             }
-            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, &command)?;
+            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true)?;
+            bind_managed_cloud_workflow_sqlite_tx(
+                &transaction,
+                &managed_cloud_binding_input(&admission, managed_cloud_scope),
+            )?;
             transaction.commit()?;
             Ok(admission)
         }
@@ -2675,11 +2774,6 @@ pub fn stage_cloud_workflow_resume(
             let mut transaction = connection.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut transaction)
                 .map_err(anyhow::Error::new)?;
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut transaction,
-                &input.account_id,
-            )?;
-            require_no_workflow_cleanup_postgres_tx(&mut transaction, &input.account_id)?;
             let idempotency_hmac = workflow_command_idempotency_hmac(&command)?;
             if let Some(existing) = transaction.query_opt(
                 &format!(
@@ -2694,8 +2788,60 @@ pub fn stage_cloud_workflow_resume(
                     &command,
                     &workflow_command_request_hmac(&command)?,
                 )?;
+                let managed_cloud_scope =
+                    crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                        .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+                require_managed_cloud_workflow_binding_replay_postgres_tx(
+                    &mut transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope),
+                )?;
                 transaction.commit()?;
                 return Ok(replay);
+            }
+            let managed_cloud_scope =
+                crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission()
+                    .ok_or_else(|| anyhow::anyhow!("managed cloud admission is unavailable"))?;
+            lock_managed_cloud_workflow_admission_postgres_tx(
+                &mut transaction,
+                &managed_cloud_scope,
+            )?;
+            // See the start path: the prelock is the first point at which a
+            // concurrent first insert is guaranteed visible. Preserve exact
+            // replay before account, entitlement, intervention, or readiness
+            // state can reject it.
+            if let Some(existing) = transaction.query_opt(
+                &format!(
+                    "SELECT {WORKFLOW_COMMAND_SELECT} FROM jobs_workflow_commands
+                      WHERE account_id = $1 AND command_kind = 'resume'
+                        AND idempotency_key_hmac_sha256 = $2 FOR SHARE"
+                ),
+                &[&input.account_id, &idempotency_hmac],
+            )? {
+                let replay = workflow_command_replay(
+                    postgres_workflow_command_row(&existing),
+                    &command,
+                    &workflow_command_request_hmac(&command)?,
+                )?;
+                require_managed_cloud_workflow_binding_replay_postgres_tx(
+                    &mut transaction,
+                    &managed_cloud_binding_input(&replay, managed_cloud_scope.clone()),
+                )?;
+                transaction.commit()?;
+                return Ok(replay);
+            }
+            lock_discovery_account_shared_postgres(&mut transaction, &input.account_id)?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut transaction,
+                &input.account_id,
+            )?;
+            require_no_workflow_cleanup_postgres_tx(&mut transaction, &input.account_id)?;
+            let entitlement = transaction.query_one(
+                "SELECT cloud_browser FROM jobs_entitlements
+                  WHERE account_id = $1 FOR UPDATE",
+                &[&input.account_id],
+            )?;
+            if !entitlement.get::<_, bool>(0) {
+                anyhow::bail!("cloud browser distribution is unavailable")
             }
             let (application, posting) = load_stage_application_postgres_tx(
                 &mut transaction,
@@ -2758,7 +2904,12 @@ pub fn stage_cloud_workflow_resume(
             if changed != 1 {
                 anyhow::bail!("intervention changed before workflow resume admission")
             }
-            let admission = admit_jobs_workflow_command_postgres_tx(&mut transaction, &command)?;
+            let admission =
+                admit_jobs_workflow_command_postgres_tx(&mut transaction, &command, true)?;
+            bind_managed_cloud_workflow_postgres_tx(
+                &mut transaction,
+                &managed_cloud_binding_input(&admission, managed_cloud_scope),
+            )?;
             transaction.commit()?;
             Ok(admission)
         }
@@ -3472,6 +3623,9 @@ struct FrozenWorkflowCleanupTarget {
     payload_hmac_sha256: String,
     first_execution_run_id: Option<String>,
     command_state: String,
+    managed_cloud_binding_sha256: Option<String>,
+    managed_cloud_release_memo_base64url: Option<String>,
+    managed_cloud_release_memo_sha256: Option<String>,
 }
 
 struct StoredWorkflowCleanupLeaseRow {
@@ -3512,12 +3666,15 @@ fn workflow_cleanup_targets_sqlite_tx(
     let mut statement = tx.prepare(
         "SELECT command.id, command.workflow_id, command.request_id,
                 command.payload_hmac_sha256, execution.first_execution_run_id,
-                command.state
+                command.state, binding.binding_sha256,
+                binding.release_memo_base64url, binding.release_memo_sha256
            FROM jobs_workflow_commands command
            LEFT JOIN jobs_workflow_executions execution
              ON execution.account_id = command.account_id
             AND execution.workflow_id = command.workflow_id
             AND execution.start_command_id = command.id
+           LEFT JOIN jobs_managed_cloud_workflow_bindings binding
+             ON binding.command_id = command.id
           WHERE command.account_id = ?1 AND command.command_kind = 'start'
             AND command.first_request_started_at_ms IS NOT NULL
           ORDER BY command.workflow_id",
@@ -3531,22 +3688,16 @@ fn workflow_cleanup_targets_sqlite_tx(
                 payload_hmac_sha256: row.get(3)?,
                 first_execution_run_id: row.get(4)?,
                 command_state: row.get(5)?,
+                managed_cloud_binding_sha256: row.get(6)?,
+                managed_cloud_release_memo_base64url: row.get(7)?,
+                managed_cloud_release_memo_sha256: row.get(8)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     let semantics = targets
         .iter()
-        .map(|target| {
-            json!({
-                "workflowId": target.workflow_id,
-                "startCommandId": target.command_id,
-                "startRequestId": target.request_id,
-                "startPayloadHmacSha256": target.payload_hmac_sha256,
-                "firstExecutionRunIdAtFreeze": target.first_execution_run_id,
-                "commandStateAtFreeze": target.command_state,
-            })
-        })
-        .collect::<Vec<_>>();
+        .map(frozen_workflow_cleanup_target_semantics)
+        .collect::<Result<Vec<_>>>()?;
     let digest = workflow_command_hmac(
         "cleanup-target-set",
         &json!({
@@ -3572,12 +3723,15 @@ fn workflow_cleanup_targets_postgres_tx(
         .query(
             "SELECT command.id, command.workflow_id, command.request_id,
                     command.payload_hmac_sha256, execution.first_execution_run_id,
-                    command.state
+                    command.state, binding.binding_sha256,
+                    binding.release_memo_base64url, binding.release_memo_sha256
                FROM jobs_workflow_commands command
                LEFT JOIN jobs_workflow_executions execution
                  ON execution.account_id = command.account_id
                 AND execution.workflow_id = command.workflow_id
                 AND execution.start_command_id = command.id
+               LEFT JOIN jobs_managed_cloud_workflow_bindings binding
+                 ON binding.command_id = command.id
               WHERE command.account_id = $1 AND command.command_kind = 'start'
                 AND command.first_request_started_at_ms IS NOT NULL
               ORDER BY command.workflow_id FOR SHARE OF command",
@@ -3591,21 +3745,15 @@ fn workflow_cleanup_targets_postgres_tx(
             payload_hmac_sha256: row.get(3),
             first_execution_run_id: row.get(4),
             command_state: row.get(5),
+            managed_cloud_binding_sha256: row.get(6),
+            managed_cloud_release_memo_base64url: row.get(7),
+            managed_cloud_release_memo_sha256: row.get(8),
         })
         .collect::<Vec<_>>();
     let semantics = targets
         .iter()
-        .map(|target| {
-            json!({
-                "workflowId": target.workflow_id,
-                "startCommandId": target.command_id,
-                "startRequestId": target.request_id,
-                "startPayloadHmacSha256": target.payload_hmac_sha256,
-                "firstExecutionRunIdAtFreeze": target.first_execution_run_id,
-                "commandStateAtFreeze": target.command_state,
-            })
-        })
-        .collect::<Vec<_>>();
+        .map(frozen_workflow_cleanup_target_semantics)
+        .collect::<Result<Vec<_>>>()?;
     let digest = workflow_command_hmac(
         "cleanup-target-set",
         &json!({
@@ -3618,6 +3766,41 @@ fn workflow_cleanup_targets_postgres_tx(
         WORKFLOW_COMMAND_PAYLOAD_MAX_BYTES,
     )?;
     Ok((digest, targets))
+}
+
+fn frozen_workflow_cleanup_target_semantics(target: &FrozenWorkflowCleanupTarget) -> Result<Value> {
+    let mut semantics = json!({
+        "workflowId": target.workflow_id,
+        "startCommandId": target.command_id,
+        "startRequestId": target.request_id,
+        "startPayloadHmacSha256": target.payload_hmac_sha256,
+        "firstExecutionRunIdAtFreeze": target.first_execution_run_id,
+        "commandStateAtFreeze": target.command_state,
+    });
+    match (
+        target.managed_cloud_binding_sha256.as_deref(),
+        target.managed_cloud_release_memo_base64url.as_deref(),
+        target.managed_cloud_release_memo_sha256.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(binding_sha256), Some(_), Some(memo_sha256))
+            if workflow_command_digest(binding_sha256) && workflow_command_digest(memo_sha256) =>
+        {
+            let object = semantics
+                .as_object_mut()
+                .ok_or(JobsWorkflowCommandError::InvalidState)?;
+            object.insert(
+                "managedCloudBindingSha256".to_string(),
+                Value::String(binding_sha256.to_string()),
+            );
+            object.insert(
+                "managedCloudReleaseMemoSha256".to_string(),
+                Value::String(memo_sha256.to_string()),
+            );
+        }
+        _ => return Err(JobsWorkflowCommandError::InvalidState.into()),
+    }
+    Ok(semantics)
 }
 
 fn workflow_cleanup_status_sqlite_tx(
@@ -3728,6 +3911,7 @@ fn workflow_cleanup_status_postgres_tx(
 pub(crate) fn admit_jobs_workflow_command_sqlite_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &NewJobsWorkflowCommand,
+    managed_cloud_authority_required: bool,
 ) -> Result<JobsWorkflowCommandAdmission> {
     validate_new_workflow_command(input)?;
     crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(tx, &input.account_id)?;
@@ -3786,10 +3970,11 @@ pub(crate) fn admit_jobs_workflow_command_sqlite_tx(
             id, account_id, application_id, run_id, workflow_id, intervention_id,
             command_kind, protocol_version, idempotency_key_hmac_sha256, request_id,
             request_hmac_sha256, payload_hmac_sha256, state, command_json,
-            attempt_count, fence, next_attempt_at_ms, created_at_ms, updated_at_ms
+            managed_cloud_authority_required, attempt_count, fence,
+            next_attempt_at_ms, created_at_ms, updated_at_ms
          ) VALUES (
             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-            'pending', ?13, 0, 0, ?14, ?14, ?14
+            'pending', ?13, ?14, 0, 0, ?15, ?15, ?15
          )",
         params![
             command_id,
@@ -3805,6 +3990,11 @@ pub(crate) fn admit_jobs_workflow_command_sqlite_tx(
             request_hmac_sha256,
             payload_hmac_sha256,
             command_json,
+            if managed_cloud_authority_required {
+                1_i64
+            } else {
+                0_i64
+            },
             input.now_ms,
         ],
     )?;
@@ -3825,6 +4015,7 @@ pub(crate) fn admit_jobs_workflow_command_sqlite_tx(
 pub(crate) fn admit_jobs_workflow_command_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
     input: &NewJobsWorkflowCommand,
+    managed_cloud_authority_required: bool,
 ) -> Result<JobsWorkflowCommandAdmission> {
     validate_new_workflow_command(input)?;
     lock_operational_hold_shared_postgres_tx(tx).map_err(anyhow::Error::new)?;
@@ -3889,10 +4080,11 @@ pub(crate) fn admit_jobs_workflow_command_postgres_tx(
             id, account_id, application_id, run_id, workflow_id, intervention_id,
             command_kind, protocol_version, idempotency_key_hmac_sha256, request_id,
             request_hmac_sha256, payload_hmac_sha256, state, command_json,
-            attempt_count, fence, next_attempt_at_ms, created_at_ms, updated_at_ms
+            managed_cloud_authority_required, attempt_count, fence,
+            next_attempt_at_ms, created_at_ms, updated_at_ms
          ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-            'pending', $13, 0, 0, $14, $14, $14
+            'pending', $13, $14, 0, 0, $15, $15, $15
          )",
         &[
             &command_id,
@@ -3908,6 +4100,7 @@ pub(crate) fn admit_jobs_workflow_command_postgres_tx(
             &request_hmac_sha256,
             &payload_hmac_sha256,
             &command_json,
+            &managed_cloud_authority_required,
             &input.now_ms,
         ],
     )?;
@@ -3933,14 +4126,15 @@ pub fn admit_jobs_workflow_command(
             let mut connection = pool.get()?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, input)?;
+            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, input, false)?;
             transaction.commit()?;
             Ok(admission)
         }
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
-            let admission = admit_jobs_workflow_command_postgres_tx(&mut transaction, input)?;
+            let admission =
+                admit_jobs_workflow_command_postgres_tx(&mut transaction, input, false)?;
             transaction.commit()?;
             Ok(admission)
         }
@@ -6766,6 +6960,31 @@ pub fn claim_jobs_workflow_command(
     now_ms: i64,
     lease_ms: i64,
 ) -> Result<Option<JobsWorkflowCommandLease>> {
+    claim_jobs_workflow_command_inner(pool, owner_id, now_ms, lease_ms, false)
+}
+
+/// Claims only commands that have already crossed request-start.
+///
+/// This path is deliberately narrower than ordinary dispatch so durable
+/// Describe/Update-result reconciliation can continue while new-effect
+/// dispatch is disabled. It never claims an unstarted command; historical v2
+/// rows remain eligible only for a dedicated lookup-only gateway endpoint.
+pub fn claim_jobs_workflow_command_reconciliation(
+    pool: &DbPool,
+    owner_id: &str,
+    now_ms: i64,
+    lease_ms: i64,
+) -> Result<Option<JobsWorkflowCommandLease>> {
+    claim_jobs_workflow_command_inner(pool, owner_id, now_ms, lease_ms, true)
+}
+
+fn claim_jobs_workflow_command_inner(
+    pool: &DbPool,
+    owner_id: &str,
+    now_ms: i64,
+    lease_ms: i64,
+    reconciliation_only: bool,
+) -> Result<Option<JobsWorkflowCommandLease>> {
     validate_workflow_command_lease_input(owner_id, now_ms, lease_ms)?;
     let lease_expires_at_ms = now_ms + lease_ms;
     let lease_token = workflow_command_random_lease_token();
@@ -6855,12 +7074,26 @@ pub fn claim_jobs_workflow_command(
                     )?;
                 }
             }
+            let candidate_state = if reconciliation_only {
+                "command.state IN ('pending', 'delivery_unknown')
+                   AND command.first_request_started_at_ms IS NOT NULL
+                   AND EXISTS (
+                     SELECT 1 FROM jobs_workflow_command_attempt_events started
+                      WHERE started.account_id = command.account_id
+                        AND started.command_id = command.id
+                        AND started.event_kind = 'request_started'
+                   )"
+            } else {
+                "command.state IN ('pending', 'delivery_unknown')
+                   AND command.managed_cloud_authority_required = 1
+                   AND command.first_request_started_at_ms IS NULL"
+            };
             let candidate = transaction
                 .query_row(
                     &format!(
                         "SELECT {WORKFLOW_COMMAND_SELECT}
                            FROM jobs_workflow_commands command
-                          WHERE command.state IN ('pending', 'delivery_unknown')
+                          WHERE {candidate_state}
                             AND command.next_attempt_at_ms <= ?1
                             AND command.fence < ?2
                             AND NOT EXISTS (
@@ -7023,11 +7256,26 @@ pub fn claim_jobs_workflow_command(
                 transaction.commit()?;
                 transaction = connection.transaction()?;
             }
+            let candidate_state = if reconciliation_only {
+                "command.state IN ('pending', 'delivery_unknown')
+                   AND command.first_request_started_at_ms IS NOT NULL
+                   AND EXISTS (
+                     SELECT 1 FROM jobs_workflow_command_attempt_events started
+                      WHERE started.account_id = command.account_id
+                        AND started.command_id = command.id
+                        AND started.event_kind = 'request_started'
+                   )"
+            } else {
+                "command.state IN ('pending', 'delivery_unknown')
+                   AND command.managed_cloud_authority_required
+                   AND command.first_request_started_at_ms IS NULL"
+            };
             let candidate_identity = transaction.query_opt(
-                "SELECT command.account_id, command.id AS command_id
+                &format!(
+                    "SELECT command.account_id, command.id AS command_id
                    FROM jobs_workflow_commands command
                    JOIN accounts account_row ON account_row.id = command.account_id
-                  WHERE command.state IN ('pending', 'delivery_unknown')
+                  WHERE {candidate_state}
                     AND command.next_attempt_at_ms <= $1 AND command.fence < $2
                     AND NOT EXISTS (
                       SELECT 1 FROM account_deletion_intents deletion
@@ -7038,7 +7286,8 @@ pub fn claim_jobs_workflow_command(
                        WHERE cleanup.account_id = command.account_id
                     )
                   ORDER BY command.next_attempt_at_ms, command.created_at_ms, command.id
-                  FOR UPDATE OF account_row SKIP LOCKED LIMIT 1",
+                  FOR UPDATE OF account_row SKIP LOCKED LIMIT 1"
+                ),
                 &[&now_ms, &WORKFLOW_COMMAND_SAFE_INTEGER_MAX],
             )?;
             let Some(candidate_identity) = candidate_identity else {
@@ -7057,7 +7306,7 @@ pub fn claim_jobs_workflow_command(
                     "SELECT {WORKFLOW_COMMAND_SELECT}
                        FROM jobs_workflow_commands command
                       WHERE command.account_id = $1 AND command.id = $2
-                        AND command.state IN ('pending', 'delivery_unknown')
+                        AND {candidate_state}
                         AND command.next_attempt_at_ms <= $3 AND command.fence < $4
                         AND NOT EXISTS (
                           SELECT 1 FROM account_deletion_intents deletion
@@ -7153,9 +7402,23 @@ pub fn mark_jobs_workflow_command_request_started(
     lease: &JobsWorkflowCommandLease,
     now_ms: i64,
 ) -> Result<JobsWorkflowCommand> {
+    mark_jobs_workflow_command_request_started_with_managed_cloud(pool, lease, now_ms)
+        .map(|(command, _)| command)
+}
+
+pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
+    pool: &DbPool,
+    lease: &JobsWorkflowCommandLease,
+    now_ms: i64,
+) -> Result<(
+    JobsWorkflowCommand,
+    Option<ManagedCloudRequestStartAuthority>,
+)> {
     if !(0..=WORKFLOW_COMMAND_SAFE_INTEGER_MAX).contains(&now_ms) {
         return Err(JobsWorkflowCommandError::InvalidRequest.into());
     }
+    let managed_cloud_scope =
+        crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut connection = pool.get()?;
@@ -7172,17 +7435,49 @@ pub fn mark_jobs_workflow_command_request_started(
                 )
                 .optional()?
                 .ok_or(JobsWorkflowCommandError::NotFound)?;
-            validate_workflow_command_lease(
+            let claimed = validate_workflow_command_lease(
                 &stored,
                 lease,
                 JobsWorkflowCommandState::Claimed,
                 now_ms,
-            )?;
+            )
+            .is_ok();
+            let delivering = validate_workflow_command_lease(
+                &stored,
+                lease,
+                JobsWorkflowCommandState::Delivering,
+                now_ms,
+            )
+            .is_ok();
+            if !claimed && !delivering {
+                return Err(JobsWorkflowCommandError::StaleLease.into());
+            }
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &transaction,
                 &stored.account_id,
             )?;
             require_no_workflow_cleanup_sqlite_tx(&transaction, &stored.account_id)?;
+            let managed_cloud = resolve_managed_cloud_request_start_sqlite_tx(
+                &transaction,
+                lease,
+                managed_cloud_scope.as_ref(),
+            )?;
+            if delivering {
+                if managed_cloud
+                    .as_ref()
+                    .is_none_or(|authority| !authority.attempt_replayed)
+                {
+                    return Err(JobsWorkflowCommandError::StaleLease.into());
+                }
+                transaction.commit()?;
+                return Ok((workflow_command_from_stored(stored)?, managed_cloud));
+            }
+            if managed_cloud
+                .as_ref()
+                .is_some_and(|authority| authority.attempt_replayed)
+            {
+                return Err(JobsWorkflowCommandError::StaleLease.into());
+            }
             transaction.execute(
                 "INSERT INTO jobs_workflow_command_attempt_events (
                     id, account_id, command_id, attempt_id, fence, event_phase,
@@ -7230,16 +7525,43 @@ pub fn mark_jobs_workflow_command_request_started(
                 sqlite_workflow_command_row,
             )?;
             transaction.commit()?;
-            workflow_command_from_stored(updated)
+            Ok((workflow_command_from_stored(updated)?, managed_cloud))
         }
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
+            let mut preflight = managed_cloud_request_start_preflight_postgres_tx(
+                &mut transaction,
+                &lease.command.id,
+            )?;
+            if preflight == ManagedCloudRequestStartPreflight::FreshEffect {
+                let scope = managed_cloud_scope
+                    .as_ref()
+                    .ok_or(ManagedCloudRegistryError::Unavailable)?;
+                lock_managed_cloud_workflow_admission_postgres_tx(&mut transaction, scope)?;
+                // A concurrent first request-start may have committed while
+                // this transaction waited on the release lock. Reclassify it
+                // before taking account/effect locks so recovery reuses the
+                // immutable original authority without consulting current
+                // flags, readiness, or activation state.
+                preflight = managed_cloud_request_start_preflight_postgres_tx(
+                    &mut transaction,
+                    &lease.command.id,
+                )?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut transaction,
                 &lease.command.account_id,
             )?;
             require_no_workflow_cleanup_postgres_tx(&mut transaction, &lease.command.account_id)?;
+            let resolver_scope = (preflight == ManagedCloudRequestStartPreflight::FreshEffect)
+                .then_some(managed_cloud_scope.as_ref())
+                .flatten();
+            let managed_cloud = resolve_managed_cloud_request_start_postgres_tx(
+                &mut transaction,
+                lease,
+                resolver_scope,
+            )?;
             let row = transaction
                 .query_opt(
                     &format!(
@@ -7251,12 +7573,39 @@ pub fn mark_jobs_workflow_command_request_started(
                 )?
                 .ok_or(JobsWorkflowCommandError::NotFound)?;
             let stored = postgres_workflow_command_row(&row);
-            validate_workflow_command_lease(
+            let claimed = validate_workflow_command_lease(
                 &stored,
                 lease,
                 JobsWorkflowCommandState::Claimed,
                 now_ms,
-            )?;
+            )
+            .is_ok();
+            let delivering = validate_workflow_command_lease(
+                &stored,
+                lease,
+                JobsWorkflowCommandState::Delivering,
+                now_ms,
+            )
+            .is_ok();
+            if !claimed && !delivering {
+                return Err(JobsWorkflowCommandError::StaleLease.into());
+            }
+            if delivering {
+                if managed_cloud
+                    .as_ref()
+                    .is_none_or(|authority| !authority.attempt_replayed)
+                {
+                    return Err(JobsWorkflowCommandError::StaleLease.into());
+                }
+                transaction.commit()?;
+                return Ok((workflow_command_from_stored(stored)?, managed_cloud));
+            }
+            if managed_cloud
+                .as_ref()
+                .is_some_and(|authority| authority.attempt_replayed)
+            {
+                return Err(JobsWorkflowCommandError::StaleLease.into());
+            }
             transaction.execute(
                 "INSERT INTO jobs_workflow_command_attempt_events (
                     id, account_id, command_id, attempt_id, fence, event_phase,
@@ -7304,7 +7653,10 @@ pub fn mark_jobs_workflow_command_request_started(
                 &[&stored.account_id, &stored.id],
             )?;
             transaction.commit()?;
-            workflow_command_from_stored(postgres_workflow_command_row(&updated))
+            Ok((
+                workflow_command_from_stored(postgres_workflow_command_row(&updated))?,
+                managed_cloud,
+            ))
         }
     })
 }
@@ -7741,6 +8093,93 @@ mod workflow_command_tests {
             JobsWorkflowTerminalReason::RunnerFailed
         )
         .valid());
+    }
+
+    #[test]
+    fn cloud_queue_and_request_start_never_downgrade_managed_authority() {
+        let source = include_str!("workflow_commands.rs");
+        let start = function_source(
+            source,
+            "pub fn stage_cloud_workflow_start(",
+            "fn managed_cloud_binding_input(",
+        );
+        let resume = function_source(
+            source,
+            "pub fn stage_cloud_workflow_resume(",
+            "fn workflow_command_random_lease_token(",
+        );
+        for admission in [start, resume] {
+            assert!(admission.contains("bind_managed_cloud_workflow_sqlite_tx"));
+            assert!(admission.contains("bind_managed_cloud_workflow_postgres_tx"));
+            assert!(admission.contains("require_managed_cloud_workflow_binding_replay_sqlite_tx"));
+            assert!(admission.contains("require_managed_cloud_workflow_binding_replay_postgres_tx"));
+            let postgres = &admission[admission
+                .find("DbPool::Postgres(_) =>")
+                .expect("Postgres admission branch")..];
+            let managed_cloud_prelock = postgres
+                .find("lock_managed_cloud_workflow_admission_postgres_tx")
+                .expect("managed-cloud prelock");
+            let account_write_fence = postgres
+                .find("require_active_account_write_fence_postgres_tx")
+                .expect("account write fence");
+            assert!(managed_cloud_prelock < account_write_fence);
+            assert!(postgres[managed_cloud_prelock..account_write_fence]
+                .contains("require_managed_cloud_workflow_binding_replay_postgres_tx"));
+        }
+
+        let request_start = function_source(
+            source,
+            "pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(",
+            "pub fn complete_jobs_workflow_command(",
+        );
+        for resolver in [
+            "resolve_managed_cloud_request_start_sqlite_tx",
+            "resolve_managed_cloud_request_start_postgres_tx",
+        ] {
+            assert!(request_start.contains(resolver));
+        }
+        assert!(request_start.contains("managed_cloud_scope.as_ref()"));
+        let request_start_postgres = &request_start[request_start
+            .find("DbPool::Postgres(_) =>")
+            .expect("Postgres request-start branch")..];
+        assert!(
+            request_start_postgres
+                .find("lock_managed_cloud_workflow_admission_postgres_tx")
+                .expect("Postgres release prelock")
+                < request_start_postgres
+                    .find("require_active_account_write_fence_postgres_tx")
+                    .expect("Postgres account fence")
+        );
+        assert!(
+            request_start_postgres
+                .find("require_active_account_write_fence_postgres_tx")
+                .expect("Postgres account fence")
+                < request_start_postgres
+                    .find("resolve_managed_cloud_request_start_postgres_tx")
+                    .expect("Postgres release resolver")
+        );
+    }
+
+    #[test]
+    fn effect_claim_is_managed_and_reconciliation_is_request_started_cleanup_exclusive() {
+        let source = include_str!("workflow_commands.rs");
+        let claim = function_source(
+            source,
+            "pub fn claim_jobs_workflow_command(",
+            "pub fn mark_jobs_workflow_command_request_started(",
+        );
+
+        assert!(claim.contains("pub fn claim_jobs_workflow_command_reconciliation("));
+        assert!(claim.contains("command.state IN ('pending', 'delivery_unknown')"));
+        assert!(claim.contains("command.managed_cloud_authority_required = 1"));
+        assert!(claim.contains("command.managed_cloud_authority_required\n"));
+        assert!(claim.contains("command.first_request_started_at_ms IS NOT NULL"));
+        assert!(claim.contains("command.first_request_started_at_ms IS NULL"));
+        assert!(claim.contains("started.event_kind = 'request_started'"));
+        assert!(claim.contains(
+            "NOT EXISTS (\n                              SELECT 1 FROM account_deletion_intents"
+        ));
+        assert!(claim.contains("NOT EXISTS (\n                              SELECT 1 FROM jobs_workflow_cleanup_generations"));
     }
 
     #[test]

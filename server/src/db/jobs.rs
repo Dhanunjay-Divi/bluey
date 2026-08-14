@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
 use unicode_general_category::{get_general_category, GeneralCategory};
+use unicode_normalization::UnicodeNormalization;
 
 use super::jobs_tailoring::tailor_resume;
 use super::DbPool;
@@ -2195,6 +2196,7 @@ include!("jobs/browser_release_authority.rs");
 include!("jobs/browser_release_trust.rs");
 include!("jobs/browser_release_registry.rs");
 include!("jobs/ats_certification_authority.rs");
+include!("jobs/managed_cloud_release_authority.rs");
 include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
 

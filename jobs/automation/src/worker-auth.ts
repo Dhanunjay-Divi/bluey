@@ -1,6 +1,7 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 
 const SIGNATURE_VERSION = "bluey-jobs-worker-v1";
+const MANAGED_CLOUD_SIGNATURE_VERSION = "bluey-jobs-worker-v2";
 const SIGNATURE_AUDIENCE = "bluey-jobs-api";
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
 
@@ -9,6 +10,7 @@ export type JobsWorkerScope =
   | "discovery"
   | "execution"
   | "intervention"
+  | "managed-cloud-runtime"
   | "receipt"
   | "runner-volume"
   | "run-events"
@@ -21,6 +23,7 @@ export interface JobsWorkerAuthInput {
   method: string;
   path: string;
   body?: string | Uint8Array;
+  origin?: string;
   timestamp?: number;
   nonce?: string;
 }
@@ -44,13 +47,20 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
   assertIdentifier(nonce, 24, 128, "nonce");
 
   const contentSha256 = createHash("sha256").update(input.body ?? "").digest("hex");
+  const managedCloudOrigin = scope === "managed-cloud-runtime"
+    ? normalizeManagedCloudWorkerOrigin(input.origin)
+    : undefined;
+  if (scope !== "managed-cloud-runtime" && input.origin !== undefined) {
+    throw new Error("Bluey Jobs worker origin is only valid for managed-cloud runtime requests");
+  }
   const canonical = [
-    SIGNATURE_VERSION,
+    managedCloudOrigin ? MANAGED_CLOUD_SIGNATURE_VERSION : SIGNATURE_VERSION,
     String(timestamp),
     nonce,
     input.workerId,
     SIGNATURE_AUDIENCE,
     scope,
+    ...(managedCloudOrigin ? [managedCloudOrigin] : []),
     method,
     input.path,
     contentSha256,
@@ -65,7 +75,34 @@ export function createJobsWorkerAuthHeaders(input: JobsWorkerAuthInput): Record<
     "x-bluey-jobs-worker-scope": scope,
     "x-bluey-jobs-worker-content-sha256": contentSha256,
     "x-bluey-jobs-worker-signature": signature,
+    ...(managedCloudOrigin
+      ? { "x-bluey-jobs-worker-origin": managedCloudOrigin }
+      : {}),
   };
+}
+
+export function normalizeManagedCloudWorkerOrigin(value: string | undefined): string {
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw new Error("Bluey Jobs managed-cloud worker origin is required");
+  }
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("Bluey Jobs managed-cloud worker origin is invalid");
+  }
+  const loopbackHttp = url.protocol === "http:"
+    && ["127.0.0.1", "localhost", "::1"].includes(url.hostname);
+  if ((url.protocol !== "https:" && !loopbackHttp)
+    || url.username
+    || url.password
+    || url.search
+    || url.hash
+    || !["", "/"].includes(url.pathname)) {
+    throw new Error("Bluey Jobs managed-cloud worker origin is invalid");
+  }
+  url.pathname = "";
+  return url.toString().replace(/\/$/, "");
 }
 
 export function jobsWorkerScope(method: string, path: string): JobsWorkerScope | undefined {
@@ -73,9 +110,16 @@ export function jobsWorkerScope(method: string, path: string): JobsWorkerScope |
   if (/^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/materialize$/.test(path)) {
     return "workflow-command-materialize";
   }
-  if (/^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/(?:finalize|intervention\/prepare)$/.test(path)
-    || /^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/intervention\/[A-Za-z0-9_-]{20,128}\/publish$/.test(path)) {
+  const workflowExecution =
+    /^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/(?:finalize|intervention\/prepare)$/;
+  const interventionPublish =
+    /^\/api\/jobs\/internal\/workflow-commands\/[A-Za-z0-9_-]{20,128}\/intervention\/[A-Za-z0-9_-]{20,128}\/publish$/;
+  if (workflowExecution.test(path) || interventionPublish.test(path)) {
     return "workflow-command-execution";
+  }
+  if (/^\/api\/jobs\/internal\/managed-cloud\/runtime-grants\/[A-Za-z0-9_-]{20,128}\/claim$/.test(path)
+    || /^\/api\/jobs\/internal\/managed-cloud\/runtime-instances\/[A-Za-z0-9_-]{20,128}\/heartbeats$/.test(path)) {
+    return "managed-cloud-runtime";
   }
   if (path.includes("/runner-volumes/")) return "runner-volume";
   if (path.includes("/execution-leases/")) return "execution";

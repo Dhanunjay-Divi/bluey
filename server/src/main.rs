@@ -7,8 +7,8 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_communication_dispatch, jobs_mailbox_sync, jobs_workflow_cleanup,
-    jobs_workflow_dispatch, object_storage,
+    db, jobs_communication_dispatch, jobs_mailbox_sync, jobs_managed_cloud_runtime,
+    jobs_workflow_cleanup, jobs_workflow_dispatch, object_storage,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
@@ -19,6 +19,8 @@ fn validate_runtime_config() -> anyhow::Result<()> {
         .context("validate Bluey Browser capability configuration")?;
     api::jobs_runner_volumes::validate_runtime_config()
         .context("validate managed runner-volume purge signing configuration")?;
+    jobs_managed_cloud_runtime::validate_runtime_config()
+        .context("validate managed cloud launch configuration")?;
     Ok(())
 }
 
@@ -106,6 +108,14 @@ async fn main() -> anyhow::Result<()> {
         .with_context(|| format!("bind {addr}"))?;
 
     tracing::info!(%addr, "listening");
+    let managed_cloud_runtime_reporters =
+        jobs_managed_cloud_runtime::start_jobs_api_managed_cloud_runtime_reporters(
+            pool.clone(),
+            &listener,
+            workflow_command_dispatcher.as_ref(),
+            workflow_cleanup_dispatcher.as_ref(),
+        )
+        .context("start managed-cloud Jobs API runtime reporters")?;
 
     let serve_result = axum::serve(
         listener,
@@ -114,6 +124,9 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("axum serve");
+    if let Some(reporters) = managed_cloud_runtime_reporters {
+        reporters.shutdown().await;
+    }
     if let Some(worker) = cleanup_worker {
         worker.abort();
     }

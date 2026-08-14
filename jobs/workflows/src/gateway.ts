@@ -8,9 +8,17 @@ import {
 } from "node:http";
 import { pathToFileURL } from "node:url";
 import { Client, Connection } from "@temporalio/client";
+import { managedCloudRuntimeConfig } from "@bluey/jobs-automation/managed-cloud-runtime";
+import {
+  ManagedCloudRuntimeApiClient,
+  claimManagedCloudRuntimeInstance,
+  managedCloudReadyObservation,
+  runManagedCloudRuntimeHeartbeats,
+} from "@bluey/jobs-automation/managed-cloud-runtime-client";
 import {
   createGatewayService,
   WORKFLOW_COMMAND_PATH,
+  WORKFLOW_COMMAND_RECONCILIATION_PATH,
   type GatewayServiceResult,
 } from "./gateway-service.js";
 import {
@@ -25,6 +33,7 @@ const MAX_COMMAND_BYTES = 16 * 1024;
 const MAX_CLEANUP_BYTES = 128 * 1024;
 
 export async function runGateway(): Promise<void> {
+  const runtimeConfig = managedCloudRuntimeConfig("workflow_gateway");
   const token = workflowGatewayToken(process.env.BLUEY_JOBS_WORKFLOW_TOKEN);
   const address = process.env.TEMPORAL_ADDRESS || "";
   const namespace = process.env.TEMPORAL_NAMESPACE || "";
@@ -38,6 +47,19 @@ export async function runGateway(): Promise<void> {
     process.env.BLUEY_JOBS_WORKFLOW_NAMESPACE,
     namespace,
   );
+  const taskQueue = process.env.BLUEY_JOBS_TASK_QUEUE || "bluey-jobs-applications";
+  const controller = new AbortController();
+  const stop = (): void => controller.abort();
+  const runtimeApi = runtimeConfig
+    ? new ManagedCloudRuntimeApiClient(runtimeConfig)
+    : undefined;
+  if (runtimeConfig) {
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  }
+  const runtimeInstance = runtimeApi
+    ? await claimManagedCloudRuntimeInstance(runtimeApi, controller.signal)
+    : undefined;
 
   const connection = await Connection.connect({
     address,
@@ -51,9 +73,13 @@ export async function runGateway(): Promise<void> {
       failureConverterPath: new URL("./failure-converter.js", import.meta.url).pathname,
     },
   });
+  let runtimeReady = runtimeConfig === undefined;
   const service = createGatewayService({
     client: client.workflow,
-    taskQueue: process.env.BLUEY_JOBS_TASK_QUEUE || "bluey-jobs-applications",
+    taskQueue,
+    ...(runtimeConfig
+      ? { runtimeIdentity: () => runtimeReady ? runtimeInstance : undefined }
+      : {}),
   });
   const cleanupService = cleanupNamespace
     ? createWorkflowCleanupService({
@@ -61,12 +87,62 @@ export async function runGateway(): Promise<void> {
       namespace: cleanupNamespace,
     })
     : undefined;
-  createGatewayHttpServer(token, service, cleanupService)
-    .listen(port, "0.0.0.0", () => console.log(`Bluey Jobs workflow gateway listening on ${port}`));
+  const server = createGatewayHttpServer(
+    token,
+    service,
+    cleanupService,
+    () => runtimeReady,
+  );
+  await listen(server, port);
+  console.log(`Bluey Jobs workflow gateway listening on ${port}`);
+  if (!runtimeConfig || !runtimeApi || !runtimeInstance) return;
+
+  try {
+    await runManagedCloudRuntimeHeartbeats(
+      runtimeApi,
+      runtimeInstance,
+      async (instance) => {
+        await connection.workflowService.describeNamespace({ namespace });
+        return managedCloudReadyObservation(
+          instance,
+          namespace,
+          taskQueue,
+          new URL("./failure-converter.js", import.meta.url),
+        );
+      },
+      runtimeConfig.heartbeatIntervalMs,
+      controller.signal,
+      { onReadinessChanged: (ready) => { runtimeReady = ready; } },
+    );
+  } finally {
+    runtimeReady = false;
+    controller.abort();
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    await close(server);
+    await connection.close();
+  }
+}
+
+function listen(server: Server, port: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, "0.0.0.0", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function close(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
 }
 
 export interface GatewayCommandExecutor {
   execute(value: unknown): Promise<GatewayServiceResult>;
+  reconcile(value: unknown): Promise<GatewayServiceResult>;
 }
 
 export interface GatewayCleanupExecutor {
@@ -77,19 +153,24 @@ export function createGatewayRequestHandler(
   token: string,
   service: GatewayCommandExecutor,
   cleanupService?: GatewayCleanupExecutor,
+  ready: () => boolean = () => true,
 ): RequestListener {
   const expectedToken = workflowGatewayToken(token);
   return async (request, response) => {
     if (request.method === "GET" && request.url === "/healthz") {
-      return json(response, 200, { ok: true });
+      return json(response, ready() ? 200 : 503, { ok: ready() });
     }
     if (!authorized(request, expectedToken)) {
       return json(response, 401, gatewayError("rejected", "invalid_request"));
     }
     const cleanupRoute = request.url === WORKFLOW_CLEANUP_PATH && cleanupService !== undefined;
     const commandRoute = request.url === WORKFLOW_COMMAND_PATH;
-    if (!cleanupRoute && !commandRoute) {
+    const commandReconciliationRoute = request.url === WORKFLOW_COMMAND_RECONCILIATION_PATH;
+    if (!cleanupRoute && !commandRoute && !commandReconciliationRoute) {
       return json(response, 404, gatewayError("rejected", "invalid_request"));
+    }
+    if (!ready() && cleanupRoute) {
+      return json(response, 503, cleanupGatewayError("rejected", "temporal_unavailable"));
     }
     if (request.method !== "POST") {
       return cleanupRoute
@@ -123,11 +204,17 @@ export function createGatewayRequestHandler(
     }
     let result: GatewayServiceResult;
     try {
-      result = await service.execute(parsed);
+      result = commandReconciliationRoute
+        ? await service.reconcile(parsed)
+        : await service.execute(parsed);
     } catch {
       result = {
         status: 503,
-        body: gatewayError("delivery_unknown", "temporal_unavailable"),
+        body: gatewayError(
+          "delivery_unknown",
+          "temporal_unavailable",
+          requestedGatewayProtocolVersion(parsed),
+        ),
       };
     }
     return json(response, result.status, result.body);
@@ -176,8 +263,9 @@ export function createGatewayHttpServer(
   token: string,
   service: GatewayCommandExecutor,
   cleanupService?: GatewayCleanupExecutor,
+  ready?: () => boolean,
 ): Server {
-  const server = createServer(createGatewayRequestHandler(token, service, cleanupService));
+  const server = createServer(createGatewayRequestHandler(token, service, cleanupService, ready));
   server.headersTimeout = 10_000;
   server.requestTimeout = 20_000;
   server.keepAliveTimeout = 5_000;
@@ -214,8 +302,16 @@ function isJsonContentType(value: string | undefined): boolean {
 function gatewayError(
   outcome: WorkflowGatewayError["outcome"],
   reason: WorkflowGatewayError["reason"],
+  schemaVersion: 2 | 3 = 2,
 ): WorkflowGatewayError {
-  return { schemaVersion: 2, outcome, reason };
+  return { schemaVersion, outcome, reason };
+}
+
+function requestedGatewayProtocolVersion(value: unknown): 2 | 3 {
+  return value && typeof value === "object" && !Array.isArray(value)
+    && (value as Record<string, unknown>).schemaVersion === 3
+    ? 3
+    : 2;
 }
 
 function cleanupGatewayError(

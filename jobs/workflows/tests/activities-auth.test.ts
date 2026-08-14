@@ -5,6 +5,9 @@ import {
   type ApplicationPacket,
   type NormalizedJob,
 } from "@bluey/jobs-automation";
+import type {
+  ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
 
 const WORKER_SIGNING_KEY = "workflow-signing-key-0123456789abcdef";
 const WORKER_ID = "workflow-worker-test";
@@ -97,6 +100,153 @@ describe("workflow activity worker authentication", () => {
       runId: "run-123",
       requestId: authority.requestId,
     });
+  });
+
+  it("carries exact release memo A through managed start materialization and runner POST", async () => {
+    const calls: FetchCall[] = [];
+    const command = opaqueAuthority();
+    const managedCloudRelease = managedCloudReleaseMemo();
+    vi.stubGlobal("fetch", vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith(`/${command.requestId}/materialize`)) {
+        return jsonResponse({
+          ...materializedStart(command),
+          managed_cloud_release: managedCloudRelease,
+        });
+      }
+      if (url === "https://jobs-runner.example/results") return runnerResultNotFoundResponse();
+      if (url === "https://jobs-runner.example/runs") {
+        return jsonResponse(runnerResult(
+          { status: "failed", issues: [] },
+          "cloud-application-123",
+          command.requestId,
+        ));
+      }
+      return new Response(null, { status: 204 });
+    }));
+    const activities = await import("../src/activities.js");
+
+    await expect(activities.executeManagedApplicationCommand({
+      command,
+      managedCloudRelease,
+    })).resolves.toEqual({ state: "failed" });
+
+    const materialize = calls[0];
+    expect(JSON.parse(String(materialize?.init?.body))).toEqual({
+      schema_version: 2,
+      workflow_id: command.workflowId,
+      payload_digest: command.payloadDigest,
+      operation: "start",
+      managed_cloud_release: managedCloudRelease,
+    });
+    const runnerStart = calls.find((call) => call.url === "https://jobs-runner.example/runs");
+    expect(Object.keys(JSON.parse(String(runnerStart?.init?.body)) as Record<string, unknown>).sort())
+      .toEqual([
+        "accountId",
+        "applicationId",
+        "applicationIdentityId",
+        "browserProfileId",
+        "browserSessionId",
+        "job",
+        "managedCloudRelease",
+        "packet",
+        "requestId",
+        "runId",
+        "url",
+      ]);
+    expect(JSON.parse(String(runnerStart?.init?.body))).toMatchObject({
+      requestId: command.requestId,
+      managedCloudRelease,
+    });
+  });
+
+  it("rejects a managed materialize memo mismatch before any runner I/O", async () => {
+    const command = opaqueAuthority();
+    const managedCloudRelease = managedCloudReleaseMemo();
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith(`/${command.requestId}/materialize`)) {
+        return jsonResponse({
+          ...materializedStart(command),
+          managed_cloud_release: {
+            ...managedCloudRelease,
+            manifestSha256: "0".repeat(64),
+          },
+        });
+      }
+      throw new Error("runner I/O must not occur after a release memo mismatch");
+    });
+    vi.stubGlobal("fetch", fetch);
+    const activities = await import("../src/activities.js");
+
+    await expect(activities.executeManagedApplicationCommand({
+      command,
+      managedCloudRelease,
+    })).rejects.toMatchObject({
+      message: "opaque_failure",
+      type: "identity_conflict",
+      nonRetryable: true,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects an open managed activity wrapper before any network request", async () => {
+    const command = opaqueAuthority();
+    const fetch = vi.fn();
+    vi.stubGlobal("fetch", fetch);
+    const activities = await import("../src/activities.js");
+
+    await expect(activities.executeManagedApplicationCommand({
+      command,
+      managedCloudRelease: managedCloudReleaseMemo(),
+      unexpected: true,
+    } as never)).rejects.toMatchObject({
+      message: "opaque_failure",
+      type: "invalid_authority",
+      nonRetryable: true,
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("recovers a managed durable result before any new runner effect", async () => {
+    const calls: FetchCall[] = [];
+    const command = opaqueAuthority();
+    const managedCloudRelease = managedCloudReleaseMemo();
+    vi.stubGlobal("fetch", vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith(`/${command.requestId}/materialize`)) {
+        return jsonResponse({
+          ...materializedStart(command),
+          managed_cloud_release: managedCloudRelease,
+        });
+      }
+      if (url === "https://jobs-runner.example/results") {
+        return jsonResponse(runnerResult(
+          { status: "failed", issues: [] },
+          "cloud-application-123",
+          command.requestId,
+        ));
+      }
+      throw new Error("no new runner or API effect is allowed after durable recovery");
+    }));
+    const activities = await import("../src/activities.js");
+
+    await expect(activities.executeManagedApplicationCommand({
+      command,
+      managedCloudRelease,
+    })).resolves.toEqual({ state: "failed" });
+
+    expect(calls.map((call) => call.url)).toEqual([
+      `https://jobs-api.example/api/jobs/internal/workflow-commands/${command.requestId}/materialize`,
+      "https://jobs-runner.example/results",
+    ]);
   });
 
   it("prepares then publishes an exact resume intervention with only opaque history values", async () => {
@@ -201,6 +351,78 @@ describe("workflow activity worker authentication", () => {
       payload_digest: command.payloadDigest,
       operation: "resume",
       intervention_id: command.interventionId,
+    });
+  });
+
+  it("carries exact release memo A through managed resume materialization and runner POST", async () => {
+    const calls: FetchCall[] = [];
+    const workflow = opaqueAuthority();
+    const command = {
+      schemaVersion: 2 as const,
+      requestId: `wfreq-v2-${"d".repeat(32)}`,
+      workflowId: workflow.workflowId,
+      payloadDigest: "e".repeat(64),
+      interventionId: `intervention-${"f".repeat(32)}`,
+    };
+    const managedCloudRelease = managedCloudReleaseMemo();
+    vi.stubGlobal("fetch", vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith(`/${command.requestId}/materialize`)) {
+        return jsonResponse({
+          ...materializedStart(command),
+          operation: "resume",
+          intervention_id: command.interventionId,
+          resolution: { action: "approve_submission" },
+          managed_cloud_release: managedCloudRelease,
+        });
+      }
+      if (url === "https://jobs-runner.example/results") return runnerResultNotFoundResponse();
+      if (url.endsWith("/resume")) {
+        return jsonResponse(runnerResult(
+          { status: "failed", issues: [] },
+          "cloud-application-123",
+          command.requestId,
+        ));
+      }
+      return new Response(null, { status: 204 });
+    }));
+    const activities = await import("../src/activities.js");
+
+    await expect(activities.resumeManagedApplicationCommand({
+      workflow,
+      command,
+      managedCloudRelease,
+    })).resolves.toEqual({ state: "failed" });
+
+    const materialize = calls[0];
+    expect(JSON.parse(String(materialize?.init?.body))).toEqual({
+      schema_version: 2,
+      workflow_id: command.workflowId,
+      payload_digest: command.payloadDigest,
+      operation: "resume",
+      intervention_id: command.interventionId,
+      managed_cloud_release: managedCloudRelease,
+    });
+    const runnerResume = calls.find((call) => call.url.endsWith("/resume"));
+    expect(Object.keys(JSON.parse(String(runnerResume?.init?.body)) as Record<string, unknown>).sort())
+      .toEqual([
+        "accountId",
+        "action",
+        "applicationId",
+        "applicationIdentityId",
+        "managedCloudRelease",
+        "profileScope",
+        "requestId",
+        "runId",
+      ]);
+    expect(JSON.parse(String(runnerResume?.init?.body))).toMatchObject({
+      action: "approve_submission",
+      requestId: command.requestId,
+      managedCloudRelease,
     });
   });
 
@@ -1734,6 +1956,28 @@ function opaqueAuthority() {
     requestId: `wfreq-v2-${"a".repeat(32)}`,
     workflowId: `bluey-jobs-v2-${"b".repeat(32)}`,
     payloadDigest: "c".repeat(64),
+  };
+}
+
+function managedCloudReleaseMemo(): ManagedCloudReleaseMemoAuthority {
+  return {
+    version: 1,
+    bindingSha256: "1".repeat(64),
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 2,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 1,
+    channelSequence: 2,
+    releaseId: "managed-cloud-release-test",
+    releaseSequence: 1,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_800_000_000_000,
+    resolvedAtMs: 1_750_000_000_000,
   };
 }
 

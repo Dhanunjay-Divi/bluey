@@ -14,6 +14,10 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  managedCloudReleaseMemoBytes,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import {
   AccountResidencyIndex,
   accountPurgeSubjectHash,
 } from "../src/account-residency.js";
@@ -87,6 +91,8 @@ const PROCESS_RUNTIME = {
 const PROCESS_RUNTIME_SHA256 = runnerProcessRuntimeSha256(PROCESS_RUNTIME);
 const PROFILE_SCOPE = "a".repeat(40);
 const SUBJECT = Buffer.alloc(32, 5).toString("base64url");
+const WORKFLOW_REQUEST_ID =
+  "wfreq-v2-12345678-1234-5678-9234-123456789abc";
 
 const cleanups: string[] = [];
 
@@ -161,6 +167,70 @@ describe("runner volume client", () => {
         runnerBuildId: "runner-602.01",
       }),
     ).toThrow("Runner volume configuration failed");
+  });
+
+  it("binds all-or-none managed release and runtime identity into the lease proof", async () => {
+    const fixture = await createFixture();
+    const client = createClient(fixture, successfulFetch(fixture, []));
+    const release = managedCloudRelease();
+    const releaseSha256 = createHash("sha256")
+      .update(managedCloudReleaseMemoBytes(release))
+      .digest("hex");
+    const proof = client.createExecutionLeaseClaimProof({
+      accountId: "account-123",
+      applicationId: "application-123",
+      runId: "run-123",
+      browserProfileId: "profile-123",
+      ownerId: WORKER_ID,
+      workflowRequestId: WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+      managedCloudReleaseSha256: releaseSha256,
+      managedCloudRuntimeInstanceId: "managed-runner-instance-1234",
+      managedCloudRuntimeInstanceEpoch: 3,
+    });
+
+    expect(proof.payloadSha256).toBe(
+      runnerVolumeHttpPayloadSha256(
+        "/api/jobs/internal/execution-leases/claim",
+        WORKER_ID,
+        [
+          "account_id=account-123",
+          "application_id=application-123",
+          "run_id=run-123",
+          "browser_profile_id=profile-123",
+          `owner_id=${WORKER_ID}`,
+          `volume_id=${fixture.identity.volumeId}`,
+          "enrollment_epoch=1",
+          `process_instance_id=${fixture.processInstanceId}`,
+          `runtime_grant_id=${RUNTIME_GRANT_ID}`,
+          `runtime_sha256=${PROCESS_RUNTIME_SHA256}`,
+          `workflow_request_id=${WORKFLOW_REQUEST_ID}`,
+          `managed_cloud_release_sha256=${releaseSha256}`,
+          "managed_cloud_runtime_instance_id=managed-runner-instance-1234",
+          "managed_cloud_runtime_instance_epoch=3",
+        ],
+      ),
+    );
+    expect(() => client.createExecutionLeaseClaimProof({
+      accountId: "account-123",
+      applicationId: "application-123",
+      runId: "run-123",
+      browserProfileId: "profile-123",
+      ownerId: WORKER_ID,
+      workflowRequestId: WORKFLOW_REQUEST_ID,
+    })).toThrow("configuration");
+    expect(() => client.createExecutionLeaseClaimProof({
+      accountId: "account-123",
+      applicationId: "application-123",
+      runId: "run-123",
+      browserProfileId: "profile-123",
+      ownerId: WORKER_ID,
+      workflowRequestId: WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+      managedCloudReleaseSha256: "0".repeat(64),
+      managedCloudRuntimeInstanceId: "managed-runner-instance-1234",
+      managedCloudRuntimeInstanceEpoch: 3,
+    })).toThrow("configuration");
   });
 
   it("uses the exact signed wire fields and binds residency before account writes", async () => {
@@ -1820,6 +1890,28 @@ describe("runner volume client", () => {
     expect(replay.processInstanceId).toBe(first.processInstanceId);
   });
 });
+
+function managedCloudRelease(): ManagedCloudReleaseMemoAuthority {
+  return {
+    version: 1,
+    bindingSha256: "1".repeat(64),
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 7,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 2,
+    channelSequence: 9,
+    releaseId: "managed-cloud-release-1234",
+    releaseSequence: 4,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_900_000_000_000,
+    resolvedAtMs: 1_800_000_000_000,
+  };
+}
 
 interface Fixture {
   root: RunnerDataRoot;

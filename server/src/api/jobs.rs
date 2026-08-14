@@ -299,6 +299,10 @@ pub fn worker_router() -> Router<AppState> {
             post(worker_heartbeat_execution_lease),
         )
         .route(
+            "/api/jobs/internal/execution-leases/:run_id/authorize-managed-effect",
+            post(worker_authorize_managed_execution_effect),
+        )
+        .route(
             "/api/jobs/internal/execution-leases/:run_id/irreversible",
             post(worker_start_irreversible_submission),
         )
@@ -510,12 +514,24 @@ fn jobs_local_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
         && runner_volume_fleet_distribution_ready(pool)
 }
 
-fn jobs_cloud_browser_distribution_enabled(pool: &crate::db::DbPool) -> bool {
-    cfg!(debug_assertions)
-        || (distribution_flag_enabled("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
-            && std::env::var("BLUEY_JOBS_WORKFLOW_TOKEN")
-                .is_ok_and(|value| !value.trim().is_empty())
-            && runner_volume_fleet_distribution_ready(pool))
+fn jobs_cloud_browser_distribution_enabled(pool: &crate::db::DbPool, account_id: &str) -> bool {
+    if !distribution_flag_enabled("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED")
+        || !crate::jobs_workflow_dispatch::workflow_command_dispatch_configured_for_admission()
+        || !runner_volume_fleet_distribution_ready(pool)
+    {
+        return false;
+    }
+    let Some(scope) = crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission() else {
+        return false;
+    };
+    jobs::resolve_managed_cloud_readiness(
+        pool,
+        &jobs::ManagedCloudReadinessQuery {
+            scope,
+            account_id: Some(account_id.to_string()),
+        },
+    )
+    .is_ok_and(|readiness| readiness.status.customer_admission)
 }
 
 fn apply_jobs_distribution_gates(
@@ -654,7 +670,7 @@ fn account_runner_availability(
     entitlement: &JobsEntitlement,
 ) -> Result<RunnerAvailability, ApiError> {
     let local_distribution_enabled = jobs_local_browser_distribution_enabled(pool);
-    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled(pool);
+    let cloud_distribution_enabled = jobs_cloud_browser_distribution_enabled(pool, account_id);
     let mut availability = build_runner_availability(
         entitlement,
         local_distribution_enabled,
@@ -5260,10 +5276,21 @@ struct WorkerExecutionLeaseClaimRequest {
     process_instance_id: String,
     runtime_grant_id: String,
     runtime_sha256: String,
+    #[serde(default)]
+    workflow_request_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    #[serde(default)]
+    managed_cloud_release_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_epoch: Option<i64>,
     volume_proof: jobs::RunnerVolumeAuthorityProof,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerExecutionLeaseAccessRequest {
     account_id: String,
     application_id: String,
@@ -5272,6 +5299,26 @@ struct WorkerExecutionLeaseAccessRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerManagedExecutionEffectRequest {
+    account_id: String,
+    application_id: String,
+    lease_token: String,
+    fence: i64,
+    #[serde(default)]
+    workflow_request_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    #[serde(default)]
+    managed_cloud_release_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_epoch: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerIrreversibleExecutionRequest {
     account_id: String,
     application_id: String,
@@ -5279,9 +5326,20 @@ struct WorkerIrreversibleExecutionRequest {
     fence: i64,
     action: String,
     final_submit_proof: jobs::FinalSubmitProof,
+    #[serde(default)]
+    workflow_request_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
+    #[serde(default)]
+    managed_cloud_release_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_id: Option<String>,
+    #[serde(default)]
+    managed_cloud_runtime_instance_epoch: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerFinishExecutionRequest {
     account_id: String,
     application_id: String,
@@ -5291,6 +5349,7 @@ struct WorkerFinishExecutionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerCheckpointReconciliationRequest {
     account_id: String,
     application_id: String,
@@ -5303,6 +5362,7 @@ struct WorkerCheckpointReconciliationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerBrowserProfileSnapshotAccessRequest {
     account_id: String,
     application_id: String,
@@ -5366,12 +5426,16 @@ enum WorkflowCommandMaterializeRequest {
         schema_version: i64,
         workflow_id: String,
         payload_digest: String,
+        #[serde(default)]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
     },
     Resume {
         schema_version: i64,
         workflow_id: String,
         payload_digest: String,
         intervention_id: String,
+        #[serde(default)]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
     },
 }
 
@@ -5386,6 +5450,8 @@ enum WorkflowCommandMaterializeResponse {
         workflow_input: Value,
         browser_session_id: String,
         result_request_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
     },
     Resume {
         schema_version: i64,
@@ -5397,6 +5463,8 @@ enum WorkflowCommandMaterializeResponse {
         browser_session_id: String,
         result_request_id: String,
         resolution: Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        managed_cloud_release: Option<jobs::ManagedCloudReleaseMemoAuthority>,
     },
 }
 
@@ -5960,6 +6028,7 @@ async fn worker_materialize_workflow_command(
             schema_version,
             workflow_id,
             payload_digest,
+            ..
         } => {
             *schema_version == 2
                 && command.protocol_version == 2
@@ -5973,6 +6042,7 @@ async fn worker_materialize_workflow_command(
             workflow_id,
             payload_digest,
             intervention_id,
+            ..
         } => {
             *schema_version == 2
                 && command.protocol_version == 2
@@ -5983,6 +6053,45 @@ async fn worker_materialize_workflow_command(
         }
     };
     if !exact_authority {
+        return workflow_command_error_response(
+            StatusCode::CONFLICT,
+            "identity_conflict",
+            "identity_conflict",
+        );
+    }
+
+    let expected_managed_cloud_release =
+        match jobs::get_managed_cloud_workflow_release_memo(&state.pool, &command) {
+            Ok(authority) => authority,
+            Err(jobs::ManagedCloudRegistryError::Storage(error)) => {
+                return workflow_command_database_error_response(error)
+            }
+            Err(jobs::ManagedCloudRegistryError::NotFound) => {
+                return workflow_command_error_response(
+                    StatusCode::NOT_FOUND,
+                    "rejected",
+                    "not_found",
+                )
+            }
+            Err(_) => {
+                return workflow_command_error_response(
+                    StatusCode::CONFLICT,
+                    "identity_conflict",
+                    "identity_conflict",
+                )
+            }
+        };
+    let requested_managed_cloud_release = match &req {
+        WorkflowCommandMaterializeRequest::Start {
+            managed_cloud_release,
+            ..
+        }
+        | WorkflowCommandMaterializeRequest::Resume {
+            managed_cloud_release,
+            ..
+        } => managed_cloud_release,
+    };
+    if requested_managed_cloud_release != &expected_managed_cloud_release {
         return workflow_command_error_response(
             StatusCode::CONFLICT,
             "identity_conflict",
@@ -6002,6 +6111,7 @@ async fn worker_materialize_workflow_command(
             workflow_input: material.workflow_input,
             browser_session_id: material.browser_session_id,
             result_request_id: material.result_request_id,
+            managed_cloud_release: expected_managed_cloud_release,
         },
         (
             WorkflowCommandMaterializeRequest::Resume {
@@ -6018,6 +6128,7 @@ async fn worker_materialize_workflow_command(
             browser_session_id: material.browser_session_id,
             result_request_id: material.result_request_id,
             resolution: material.resolution,
+            managed_cloud_release: expected_managed_cloud_release,
         },
         _ => {
             return workflow_command_error_response(
@@ -6043,12 +6154,14 @@ fn valid_workflow_command_materialize_request(req: &WorkflowCommandMaterializeRe
             schema_version,
             workflow_id,
             payload_digest,
+            ..
         } => (*schema_version, workflow_id, payload_digest, None),
         WorkflowCommandMaterializeRequest::Resume {
             schema_version,
             workflow_id,
             payload_digest,
             intervention_id,
+            ..
         } => (
             *schema_version,
             workflow_id,
@@ -6180,7 +6293,7 @@ async fn worker_claim_execution_lease(
     State(state): State<AppState>,
     Extension(worker): Extension<JobsWorkerIdentity>,
     Json(req): Json<WorkerExecutionLeaseClaimRequest>,
-) -> Result<Json<jobs::RunnerVolumeExecutionLeaseGrant>, ApiError> {
+) -> Result<Response, ApiError> {
     if req.run_id.trim().is_empty() {
         return bad_request("Invalid execution lease request.");
     }
@@ -6190,6 +6303,16 @@ async fn worker_claim_execution_lease(
         || req.volume_proof.process_instance_id != req.process_instance_id
     {
         return bad_request("Runner-volume lease proof does not match the claim.");
+    }
+    let managed_cloud = managed_execution_lease_authority_input(
+        req.workflow_request_id.as_deref(),
+        req.managed_cloud_release.as_ref(),
+        req.managed_cloud_release_sha256.as_deref(),
+        req.managed_cloud_runtime_instance_id.as_deref(),
+        req.managed_cloud_runtime_instance_epoch,
+    )?;
+    if managed_cloud.is_some() && worker.scope == "debug" {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
     let server_now_ms = jobs::now_ms();
     let payload_sha256 =
@@ -6206,6 +6329,14 @@ async fn worker_claim_execution_lease(
                 process_instance_id: &req.process_instance_id,
                 runtime_grant_id: &req.runtime_grant_id,
                 runtime_sha256: &req.runtime_sha256,
+                managed_cloud: managed_cloud.as_ref().map(|managed_cloud| {
+                    super::jobs_runner_volumes::RunnerVolumeManagedExecutionLeaseClaimPayload {
+                        workflow_request_id: &managed_cloud.workflow_request_id,
+                        managed_cloud_release_sha256: &managed_cloud.managed_cloud_release_sha256,
+                        runtime_instance_id: &managed_cloud.managed_cloud_runtime_instance_id,
+                        runtime_instance_epoch: managed_cloud.managed_cloud_runtime_instance_epoch,
+                    }
+                }),
             },
         );
     let authority = jobs::verify_runner_volume_authority_proof(
@@ -6232,7 +6363,7 @@ async fn worker_claim_execution_lease(
         process_instance_id: req.process_instance_id.clone(),
         now_ms: server_now_ms,
     };
-    jobs::claim_execution_lease_for_runner_volume_authorized(
+    jobs::claim_managed_execution_lease_for_runner_volume_authorized(
         &state.pool,
         &req.account_id,
         &req.application_id,
@@ -6243,9 +6374,95 @@ async fn worker_claim_execution_lease(
         &req.runtime_grant_id,
         &req.runtime_sha256,
         &authority,
+        managed_cloud.as_ref(),
+        &worker.worker_id,
+        &binding.worker_id,
     )
-    .map(Json)
+    .map(worker_execution_lease_json_response)
     .map_err(execution_lease_error)
+}
+
+fn worker_execution_lease_json_response(value: impl Serialize) -> Response {
+    let mut response = Json(value).into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
+fn managed_execution_lease_authority_input(
+    workflow_request_id: Option<&str>,
+    release: Option<&jobs::ManagedCloudReleaseMemoAuthority>,
+    release_sha256: Option<&str>,
+    runtime_instance_id: Option<&str>,
+    runtime_instance_epoch: Option<i64>,
+) -> Result<Option<jobs::ManagedCloudExecutionLeaseClaimInput>, ApiError> {
+    let authority = match (
+        workflow_request_id,
+        release,
+        release_sha256,
+        runtime_instance_id,
+        runtime_instance_epoch,
+    ) {
+        (None, None, None, None, None) => None,
+        (
+            Some(workflow_request_id),
+            Some(release),
+            Some(release_sha256),
+            Some(runtime_instance_id),
+            Some(runtime_instance_epoch),
+        ) => {
+            let exact_sha256 = jobs::managed_cloud_release_memo_sha256(release).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "Invalid managed-cloud execution authority.".to_string(),
+                )
+            })?;
+            if exact_sha256 != release_sha256
+                || !valid_managed_workflow_request_id(workflow_request_id)
+                || runtime_instance_epoch <= 0
+                || !(20..=128).contains(&runtime_instance_id.len())
+                || !runtime_instance_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "Invalid managed-cloud execution authority.".to_string(),
+                ));
+            }
+            Some(jobs::ManagedCloudExecutionLeaseClaimInput {
+                workflow_request_id: workflow_request_id.to_string(),
+                managed_cloud_release: release.clone(),
+                managed_cloud_release_sha256: release_sha256.to_string(),
+                managed_cloud_runtime_instance_id: runtime_instance_id.to_string(),
+                managed_cloud_runtime_instance_epoch: runtime_instance_epoch,
+            })
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Managed-cloud execution authority must be complete.".to_string(),
+            ));
+        }
+    };
+    Ok(authority)
+}
+
+fn valid_managed_workflow_request_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("wfreq-v2-") else {
+        return false;
+    };
+    uuid::Uuid::parse_str(suffix).is_ok_and(|request_id| {
+        request_id.get_version_num() == 5
+            && request_id.get_variant() == uuid::Variant::RFC4122
+            && request_id.hyphenated().to_string() == suffix
+    })
 }
 
 async fn worker_heartbeat_execution_lease(
@@ -6265,13 +6482,60 @@ async fn worker_heartbeat_execution_lease(
     .map_err(execution_lease_error)
 }
 
+async fn worker_authorize_managed_execution_effect(
+    State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
+    Path(run_id): Path<String>,
+    Json(req): Json<WorkerManagedExecutionEffectRequest>,
+) -> Result<Response, ApiError> {
+    if worker.scope == "debug" {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
+    }
+    let managed_cloud = managed_execution_lease_authority_input(
+        req.workflow_request_id.as_deref(),
+        req.managed_cloud_release.as_ref(),
+        req.managed_cloud_release_sha256.as_deref(),
+        req.managed_cloud_runtime_instance_id.as_deref(),
+        req.managed_cloud_runtime_instance_epoch,
+    )?
+    .ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Managed-cloud execution authority is required.".to_string(),
+        )
+    })?;
+    jobs::authorize_managed_execution_effect(
+        &state.pool,
+        &req.account_id,
+        &req.application_id,
+        &run_id,
+        &req.lease_token,
+        req.fence,
+        Some(&managed_cloud),
+        &worker.worker_id,
+    )
+    .map(worker_execution_lease_json_response)
+    .map_err(execution_lease_error)
+}
+
 async fn worker_start_irreversible_submission(
     State(state): State<AppState>,
+    Extension(worker): Extension<JobsWorkerIdentity>,
     Path(run_id): Path<String>,
     Json(req): Json<WorkerIrreversibleExecutionRequest>,
-) -> Result<Json<jobs::IrreversibleExecutionLeaseRecord>, ApiError> {
+) -> Result<Response, ApiError> {
     if req.action != "submit" {
         return bad_request("Invalid irreversible execution action.");
+    }
+    let managed_cloud = managed_execution_lease_authority_input(
+        req.workflow_request_id.as_deref(),
+        req.managed_cloud_release.as_ref(),
+        req.managed_cloud_release_sha256.as_deref(),
+        req.managed_cloud_runtime_instance_id.as_deref(),
+        req.managed_cloud_runtime_instance_epoch,
+    )?;
+    if managed_cloud.is_some() && worker.scope == "debug" {
+        return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
     let storage_config = state.config.object_storage.clone().ok_or((
         StatusCode::SERVICE_UNAVAILABLE,
@@ -6291,7 +6555,7 @@ async fn worker_start_irreversible_submission(
         now_ms,
         limits: storage.upload_limits(),
     };
-    jobs::start_irreversible_submission(
+    jobs::start_irreversible_submission_authorized(
         &state.pool,
         &req.account_id,
         &req.application_id,
@@ -6300,8 +6564,10 @@ async fn worker_start_irreversible_submission(
         req.fence,
         &req.final_submit_proof,
         &capacity,
+        managed_cloud.as_ref(),
+        &worker.worker_id,
     )
-    .map(Json)
+    .map(worker_execution_lease_json_response)
     .map_err(execution_lease_error)
 }
 
@@ -9930,6 +10196,34 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+
+    #[test]
+    fn execution_lease_success_responses_are_private_and_non_sniffable() {
+        let response = worker_execution_lease_json_response(json!({"lease_token": "secret"}));
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL),
+            Some(&HeaderValue::from_static("private, no-store"))
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options"),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
+    }
+
+    #[test]
+    fn managed_execution_lease_requires_the_canonical_workflow_request_id() {
+        assert!(valid_managed_workflow_request_id(
+            "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"
+        ));
+        for invalid in [
+            "wfreq-v2-01234567-89ab-4cde-8f01-23456789abcd",
+            "wfreq-v2-01234567-89AB-5CDE-8F01-23456789ABCD",
+            "wfreq-v2-01234567-89ab-5cde-7f01-23456789abcd",
+            "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd\nextra",
+        ] {
+            assert!(!valid_managed_workflow_request_id(invalid));
+        }
+    }
 
     #[test]
     fn workflow_finalization_accepts_only_closed_state_reason_prompt_pairs() {

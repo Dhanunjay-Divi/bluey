@@ -1,4 +1,7 @@
 import { describe, expect, it } from "vitest";
+import type {
+  ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
 import {
   decideRunnerInterventionResolution,
   parseRunnerInterventionResolution,
@@ -42,4 +45,53 @@ describe("runner intervention reapproval policy", () => {
       answers: { salary: "$150,000" },
     })).toThrow("unsupported data");
   });
+
+  it("requires exact release memo A only for managed-runtime resume payloads", () => {
+    const managedCloudRelease = managedCloudReleaseMemo();
+    expect(parseRunnerInterventionResolution({
+      ...base,
+      action: "approve_submission",
+      managedCloudRelease,
+    }, true)).toEqual({
+      ...base,
+      action: "approve_submission",
+      managedCloudRelease,
+    });
+    expect(() => parseRunnerInterventionResolution({
+      ...base,
+      action: "approve_submission",
+    }, true)).toThrow("managed-cloud release authority");
+    expect(() => parseRunnerInterventionResolution({
+      ...base,
+      action: "approve_submission",
+      managedCloudRelease,
+    })).toThrow("unsupported data");
+    expect(() => parseRunnerInterventionResolution({
+      ...base,
+      action: "approve_submission",
+      managedCloudRelease: { ...managedCloudRelease, extra: true },
+    }, true)).toThrow("managed-cloud release authority");
+  });
 });
+
+function managedCloudReleaseMemo(): ManagedCloudReleaseMemoAuthority {
+  return {
+    version: 1,
+    bindingSha256: "1".repeat(64),
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 7,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 2,
+    channelSequence: 9,
+    releaseId: "managed-cloud-release-1234",
+    releaseSequence: 4,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_900_000_000_000,
+    resolvedAtMs: 1_800_000_000_000,
+  };
+}

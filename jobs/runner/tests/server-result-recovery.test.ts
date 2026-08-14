@@ -32,6 +32,7 @@ import {
   DurableFailedRunResultError,
   DurableSideEffectUnknownError,
   leaveLeasedRunRetryable,
+  ManagedCloudRuntimeUnavailableError,
   persistAndAbortSideEffectUnknown,
   persistAndFinishFailedRun,
   publicRunnerFailureResponse,
@@ -155,6 +156,18 @@ describe("runner durable result recovery", () => {
       status: 500,
       code: "result_store_result_promotion_conflict",
       body: { error: expect.any(String) },
+    });
+  });
+
+  it("reports unavailable managed-cloud authority without erasing recovery state", () => {
+    expect(publicRunnerFailureResponse(
+      new ManagedCloudRuntimeUnavailableError(),
+    )).toEqual({
+      status: 503,
+      code: "managed_cloud_runtime_unavailable",
+      body: {
+        error: "The managed-cloud application runner is temporarily unavailable.",
+      },
     });
   });
 

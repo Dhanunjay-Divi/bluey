@@ -1,9 +1,14 @@
 import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   WorkflowNotFoundError,
   type WorkflowClient,
 } from "@temporalio/client";
+import {
+  MANAGED_CLOUD_RELEASE_MEMO_KEY,
+  managedCloudReleaseMemoBytes,
+} from "@bluey/jobs-automation/managed-cloud-execution";
 import {
   WORKFLOW_CLEANUP_PAGE_SIZE,
   WORKFLOW_CLEANUP_MAX_RUN_IDS,
@@ -37,6 +42,7 @@ const RUN_B = `temporal-run-${"c".repeat(32)}`;
 const RUN_C = `temporal-run-${"d".repeat(32)}`;
 const REQUEST_ID = `wfreq-v2-${"e".repeat(32)}`;
 const PAYLOAD_DIGEST = "f".repeat(64);
+const MANAGED_BINDING_DIGEST = "1".repeat(64);
 
 const describeExecution = vi.fn();
 const terminateExecution = vi.fn();
@@ -153,9 +159,42 @@ function v2Request(
   return merged;
 }
 
+function managedCloudCleanupAuthority(): Pick<
+  ReconcileV2WorkflowTargetRequest,
+  "managedCloudBindingSha256" | "managedCloudReleaseMemoBase64url" |
+  "managedCloudReleaseMemoSha256"
+> & { memoBytes: Buffer } {
+  const memoBytes = Buffer.from(managedCloudReleaseMemoBytes({
+    version: 1,
+    bindingSha256: MANAGED_BINDING_DIGEST,
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 7,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 2,
+    channelSequence: 8,
+    releaseId: "managed-cloud-release-1234",
+    releaseSequence: 4,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_800_000_000_000,
+    resolvedAtMs: 1_750_000_000_000,
+  }));
+  return {
+    managedCloudBindingSha256: MANAGED_BINDING_DIGEST,
+    managedCloudReleaseMemoBase64url: memoBytes.toString("base64url"),
+    managedCloudReleaseMemoSha256: createHash("sha256").update(memoBytes).digest("hex"),
+    memoBytes,
+  };
+}
+
 function rawMemo(
   override: Partial<Record<"schemaVersion" | "requestId" | "workflowId" | "payloadDigest", unknown>> = {},
   payloadOverride: Record<string, unknown> = {},
+  managedCloudMemo?: Uint8Array,
 ): Record<string, unknown> {
   const value = {
     schemaVersion: 2,
@@ -164,13 +203,20 @@ function rawMemo(
     payloadDigest: PAYLOAD_DIGEST,
     ...override,
   };
-  return {
+  const fields: Record<string, unknown> = {
     [WORKFLOW_PROTOCOL_MEMO_KEY]: {
       metadata: { encoding: Buffer.from("json/plain") },
       data: Buffer.from(JSON.stringify(value)),
       ...payloadOverride,
     },
   };
+  if (managedCloudMemo) {
+    fields[MANAGED_CLOUD_RELEASE_MEMO_KEY] = {
+      metadata: { encoding: Buffer.from("json/plain") },
+      data: Buffer.from(managedCloudMemo),
+    };
+  }
+  return fields;
 }
 
 function execution(
@@ -731,6 +777,43 @@ describe("stateless Temporal cleanup protocol v3", () => {
     expect(deleteExecution).not.toHaveBeenCalled();
   });
 
+  it("binds the exact managed-cloud release memo without weakening historical cleanup", async () => {
+    const { memoBytes, ...managedAuthority } = managedCloudCleanupAuthority();
+    const request = v2Request(managedAuthority);
+    describeExecution.mockResolvedValueOnce(
+      execution("applicationWorkflowV2", RUN_A, "RUNNING", {
+        memoFields: rawMemo({}, {}, memoBytes),
+      }),
+    );
+
+    const exact = await service().executeCleanup(request);
+
+    expect(exact.status).toBe(202);
+    expect(terminateExecution).toHaveBeenCalledWith(WORKFLOW_ID, RUN_A, RUN_A);
+    expect(deleteExecution).toHaveBeenCalledWith(WORKFLOW_ID, RUN_A);
+    const parsedMemo = JSON.parse(memoBytes.toString("utf8")) as Record<string, unknown>;
+    const reorderedMemo = Buffer.from(JSON.stringify({
+      version: parsedMemo.version,
+      ...parsedMemo,
+    }));
+
+    for (const [cleanupRequest, memoFields] of [
+      [request, rawMemo()],
+      [v2Request(), rawMemo({}, {}, memoBytes)],
+      [request, rawMemo({}, {}, reorderedMemo)],
+    ] as const) {
+      describeExecution.mockReset().mockResolvedValueOnce(
+        execution("applicationWorkflowV2", RUN_A, "RUNNING", { memoFields }),
+      );
+      terminateExecution.mockClear();
+      deleteExecution.mockClear();
+      const rejected = await service().executeCleanup(cleanupRequest);
+      expect(rejected.status).toBe(409);
+      expect(terminateExecution).not.toHaveBeenCalled();
+      expect(deleteExecution).not.toHaveBeenCalled();
+    }
+  });
+
   it("does not mutate when a visible v2 run cannot be exactly described", async () => {
     describeExecution
       .mockRejectedValueOnce(notFound())
@@ -1081,6 +1164,13 @@ describe("stateless Temporal cleanup protocol v3", () => {
     expect(parseWorkflowCleanupRequest(inventoryRequest())).toEqual(inventoryRequest());
     expect(parseWorkflowCleanupRequest(legacyRequest())).toEqual(legacyRequest());
     expect(parseWorkflowCleanupRequest(v2Request())).toEqual(v2Request());
+    const { memoBytes: _, ...managedAuthority } = managedCloudCleanupAuthority();
+    const managedRequest = v2Request(managedAuthority);
+    expect(parseWorkflowCleanupRequest(managedRequest)).toEqual(managedRequest);
+    expect(() => parseWorkflowCleanupRequest({
+      ...v2Request(),
+      managedCloudBindingSha256: MANAGED_BINDING_DIGEST,
+    })).toThrow("Invalid workflow cleanup request");
     expect(canonicalizeWorkflowCleanupEvidence({ z: [2, { b: true, a: null }], a: "x" }))
       .toBe('{"a":"x","z":[2,{"a":null,"b":true}]}');
     const maximumKnownRunIds = Array.from(

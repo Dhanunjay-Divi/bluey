@@ -12,6 +12,9 @@ import {
   type SubmissionReceipt,
 } from "@bluey/jobs-automation";
 import type {
+  ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import type {
   ApplicationWorkflowInput,
   ApplicationWorkflowResult,
   InterventionResolution,
@@ -71,8 +74,12 @@ const opaqueActivities = proxyActivities<OpaqueWorkflowActivities>({
  */
 export async function applicationWorkflowV2(
   authority: WorkflowCommandAuthority,
+  managedCloudRelease?: ManagedCloudReleaseMemoAuthority,
 ): Promise<{ state: "submitted" | "failed" | "side_effect_unknown" }> {
   assertWorkflowAuthority(authority);
+  if (managedCloudRelease !== undefined) {
+    assertManagedCloudReleaseMemo(managedCloudRelease);
+  }
   let openInterventionId: string | undefined;
   let pendingResolution: WorkflowResumeCommandAuthority | undefined;
   const acceptedUpdates = new Map<string, WorkflowUpdateReceipt>();
@@ -105,7 +112,12 @@ export async function applicationWorkflowV2(
   );
 
   let command: WorkflowCommandAuthority | WorkflowResumeCommandAuthority = authority;
-  let step = assertCommandStep(await opaqueActivities.executeApplicationCommand(authority));
+  let step = assertCommandStep(await (managedCloudRelease === undefined
+    ? opaqueActivities.executeApplicationCommand(authority)
+    : opaqueActivities.executeManagedApplicationCommand({
+      command: authority,
+      managedCloudRelease,
+    })));
 
   for (let interventionCount = 0; step.state === "intervention_prepared";) {
     openInterventionId = step.interventionId;
@@ -145,10 +157,16 @@ export async function applicationWorkflowV2(
     openInterventionId = undefined;
     pendingResolution = undefined;
     command = resumeCommand;
-    step = assertCommandStep(await opaqueActivities.resumeApplicationCommand({
-      workflow: authority,
-      command: resumeCommand,
-    }));
+    step = assertCommandStep(await (managedCloudRelease === undefined
+      ? opaqueActivities.resumeApplicationCommand({
+        workflow: authority,
+        command: resumeCommand,
+      })
+      : opaqueActivities.resumeManagedApplicationCommand({
+        workflow: authority,
+        command: resumeCommand,
+        managedCloudRelease,
+      })));
   }
   if (step.state === "submitted") return { state: "submitted" };
   return assertTerminalResult(await opaqueActivities.finalizeApplicationCommand({
@@ -202,6 +220,55 @@ function assertWorkflowAuthority(value: WorkflowCommandAuthority): void {
     || !OPAQUE_ID.test(value.requestId)
     || !OPAQUE_ID.test(value.workflowId)
     || !DIGEST.test(value.payloadDigest)) {
+    throwInvalidAuthority();
+  }
+}
+
+function assertManagedCloudReleaseMemo(value: ManagedCloudReleaseMemoAuthority): void {
+  if (!hasExactKeys(value, [
+    "activationExpiresAtMs",
+    "activationSha256",
+    "bindingSha256",
+    "channelSequence",
+    "cohortSha256",
+    "failureConverterSha256",
+    "headRevision",
+    "manifestSha256",
+    "readinessSha256",
+    "releaseId",
+    "releaseSequence",
+    "resolvedAtMs",
+    "scope",
+    "taskQueueSha256",
+    "transitionSha256",
+    "trustGeneration",
+    "version",
+  ])
+    || value.version !== 1
+    || !hasExactKeys(value.scope, ["channel", "environment", "region"])
+    || (value.scope.environment !== "staging" && value.scope.environment !== "production")
+    || (value.scope.channel !== "canary" && value.scope.channel !== "general")
+    || !/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/.test(value.scope.region)
+    || !OPAQUE_ID.test(value.releaseId)
+    || ![
+      value.activationSha256,
+      value.bindingSha256,
+      value.cohortSha256,
+      value.failureConverterSha256,
+      value.manifestSha256,
+      value.readinessSha256,
+      value.taskQueueSha256,
+      value.transitionSha256,
+    ].every((digest) => DIGEST.test(digest))
+    || ![
+      value.activationExpiresAtMs,
+      value.channelSequence,
+      value.headRevision,
+      value.releaseSequence,
+      value.resolvedAtMs,
+      value.trustGeneration,
+    ].every((number) => Number.isSafeInteger(number) && number > 0)
+    || value.resolvedAtMs >= value.activationExpiresAtMs) {
     throwInvalidAuthority();
   }
 }

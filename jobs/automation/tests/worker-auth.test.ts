@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createJobsWorkerAuthHeaders,
   jobsWorkerScope,
+  normalizeManagedCloudWorkerOrigin,
 } from "../src/worker-auth.js";
 
 const KEY = "0123456789abcdef0123456789abcdef";
@@ -70,8 +71,37 @@ describe("Bluey Jobs worker authentication", () => {
       "POST",
       "/api/jobs/internal/workflow-commands/wfreq:v2:1234567890/materialize",
     )).toBeUndefined();
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim",
+    )).toBe("managed-cloud-runtime");
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/managed-cloud/runtime-instances/cloud-instance-1234567890/heartbeats",
+    )).toBe("managed-cloud-runtime");
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/managed-cloud/runtime-grants/short/claim",
+    )).toBeUndefined();
     expect(jobsWorkerScope("GET", "/api/jobs/internal/discovery/lease")).toBeUndefined();
     expect(jobsWorkerScope("POST", "/api/jobs/internal/unknown")).toBeUndefined();
+  });
+
+  it("binds managed-cloud grants to the exact normalized API origin", () => {
+    const headers = createJobsWorkerAuthHeaders({
+      signingKey: KEY,
+      workerId: "workflow-gateway-runtime",
+      method: "POST",
+      path: "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim",
+      body: "{}",
+      origin: "https://JOBS-API.internal:443/",
+      timestamp: 1_750_000_000,
+      nonce: "abcdef0123456789abcdef0123456789",
+    });
+
+    expect(headers["x-bluey-jobs-worker-origin"]).toBe("https://jobs-api.internal");
+    expect(headers["x-bluey-jobs-worker-signature"])
+      .toBe("d2e4fb9caa257ad5c3af5aebc3f590c8d8e9a897abb7f40ae590c02d8019150f");
   });
 
   it("rejects credentials and paths the server cannot authenticate", () => {
@@ -87,5 +117,21 @@ describe("Bluey Jobs worker authentication", () => {
       method: "POST",
       path: "/api/jobs/internal/discovery/lease?limit=1",
     })).toThrow("not signable");
+    expect(() => createJobsWorkerAuthHeaders({
+      signingKey: KEY,
+      workerId: "workflow-gateway-runtime",
+      method: "POST",
+      path: "/api/jobs/internal/managed-cloud/runtime-grants/cloud-grant-1234567890/claim",
+      body: "{}",
+    })).toThrow("origin is required");
+    expect(() => createJobsWorkerAuthHeaders({
+      signingKey: KEY,
+      workerId: "worker-test",
+      method: "POST",
+      path: "/api/jobs/internal/discovery/lease",
+      origin: "https://jobs-api.internal",
+    })).toThrow("only valid");
+    expect(() => normalizeManagedCloudWorkerOrigin("https://jobs-api.internal/path"))
+      .toThrow("origin is invalid");
   });
 });

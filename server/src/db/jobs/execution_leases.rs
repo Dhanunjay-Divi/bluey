@@ -1,8 +1,6 @@
 type ExecutionLeaseResult<T> = std::result::Result<T, ExecutionLeaseError>;
 
-fn execution_lease_from_operational_hold_error(
-    error: OperationalHoldError,
-) -> ExecutionLeaseError {
+fn execution_lease_from_operational_hold_error(error: OperationalHoldError) -> ExecutionLeaseError {
     match error {
         OperationalHoldError::Storage(error) => ExecutionLeaseError::Storage(error),
         OperationalHoldError::InvalidRequest
@@ -10,6 +8,29 @@ fn execution_lease_from_operational_hold_error(
         | OperationalHoldError::Conflict
         | OperationalHoldError::IdentityConflict
         | OperationalHoldError::Held(_) => ExecutionLeaseError::Conflict,
+    }
+}
+
+fn execution_lease_from_managed_cloud_error(
+    error: ManagedCloudRegistryError,
+) -> ExecutionLeaseError {
+    match error {
+        ManagedCloudRegistryError::InvalidRequest => ExecutionLeaseError::InvalidRequest,
+        ManagedCloudRegistryError::NotFound => ExecutionLeaseError::NotFound,
+        ManagedCloudRegistryError::Storage(error) => ExecutionLeaseError::Storage(error),
+        ManagedCloudRegistryError::InvalidEnvelope
+        | ManagedCloudRegistryError::InvalidAuthority
+        | ManagedCloudRegistryError::IdentityConflict
+        | ManagedCloudRegistryError::CompareAndSwapConflict
+        | ManagedCloudRegistryError::SequenceRegression
+        | ManagedCloudRegistryError::DowngradeRequiresRollback
+        | ManagedCloudRegistryError::Revoked
+        | ManagedCloudRegistryError::Unavailable
+        | ManagedCloudRegistryError::CohortIneligible
+        | ManagedCloudRegistryError::GrantExpired
+        | ManagedCloudRegistryError::GrantConsumed
+        | ManagedCloudRegistryError::HeartbeatSequenceConflict
+        | ManagedCloudRegistryError::RecoveryNotAccepted => ExecutionLeaseError::Conflict,
     }
 }
 
@@ -33,6 +54,52 @@ pub struct IrreversibleExecutionLeaseRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ats_certified_receipt_authority: Option<AtsCertifiedReceiptAuthority>,
 }
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthorizedRunnerVolumeExecutionLeaseGrant {
+    #[serde(flatten)]
+    pub grant: RunnerVolumeExecutionLeaseGrant,
+    #[serde(flatten)]
+    pub managed_cloud: Option<ManagedCloudExecutionLeaseAuthority>,
+}
+
+impl std::ops::Deref for AuthorizedRunnerVolumeExecutionLeaseGrant {
+    type Target = RunnerVolumeExecutionLeaseGrant;
+
+    fn deref(&self) -> &Self::Target {
+        &self.grant
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthorizedExecutionLeaseRecord {
+    #[serde(flatten)]
+    pub lease: ExecutionLeaseRecord,
+    #[serde(flatten)]
+    pub managed_cloud: Option<ManagedCloudExecutionLeaseAuthority>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AuthorizedIrreversibleExecutionLeaseRecord {
+    #[serde(flatten)]
+    pub record: IrreversibleExecutionLeaseRecord,
+    #[serde(flatten)]
+    pub managed_cloud: Option<ManagedCloudExecutionLeaseAuthority>,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedExecutionLeaseClaimContext<'a> {
+    input: Option<&'a ManagedCloudExecutionLeaseClaimInput>,
+    authenticated_worker_id: &'a str,
+    volume_worker_id: &'a str,
+}
+
+type ExecutionLeaseClaimOutcome = (
+    ExecutionLeaseGrant,
+    Option<RunnerVolumeResidencyBinding>,
+    Option<TrustedRunnerProcessRuntimeAttestation>,
+    Option<ManagedCloudExecutionLeaseAuthority>,
+);
 
 impl std::ops::Deref for IrreversibleExecutionLeaseRecord {
     type Target = ExecutionLeaseRecord;
@@ -1154,8 +1221,9 @@ pub fn claim_execution_lease(
         None,
         None,
         None,
+        None,
     )
-    .map(|(lease, _, _)| lease)
+    .map(|(lease, _, _, _)| lease)
 }
 
 #[cfg(debug_assertions)]
@@ -1168,7 +1236,7 @@ pub fn claim_execution_lease_for_runner_volume(
     owner_id: &str,
     volume_binding: &BindRunnerVolumeResidencyRequest,
 ) -> ExecutionLeaseResult<RunnerVolumeExecutionLeaseGrant> {
-    let (lease, binding, _) = claim_execution_lease_inner(
+    let (lease, binding, _, _) = claim_execution_lease_inner(
         pool,
         account_id,
         application_id,
@@ -1176,6 +1244,7 @@ pub fn claim_execution_lease_for_runner_volume(
         supplied_browser_profile_id,
         owner_id,
         Some(volume_binding),
+        None,
         None,
         None,
     )?;
@@ -1205,7 +1274,7 @@ pub fn claim_execution_lease_for_runner_volume_authorized(
     expected_runtime_sha256: &str,
     volume_authority: &VerifiedRunnerVolumeAuthority,
 ) -> ExecutionLeaseResult<RunnerVolumeExecutionLeaseGrant> {
-    let (lease, binding, runtime) = claim_execution_lease_inner(
+    let (lease, binding, runtime, _) = claim_execution_lease_inner(
         pool,
         account_id,
         application_id,
@@ -1215,6 +1284,7 @@ pub fn claim_execution_lease_for_runner_volume_authorized(
         Some(volume_binding),
         Some((expected_runtime_grant_id, expected_runtime_sha256)),
         Some(volume_authority),
+        None,
     )?;
     let binding = binding.ok_or(ExecutionLeaseError::Conflict)?;
     let runtime = runtime.ok_or(ExecutionLeaseError::Conflict)?;
@@ -1231,6 +1301,55 @@ pub fn claim_execution_lease_for_runner_volume_authorized(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn claim_managed_execution_lease_for_runner_volume_authorized(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    supplied_browser_profile_id: &str,
+    owner_id: &str,
+    volume_binding: &BindRunnerVolumeResidencyRequest,
+    expected_runtime_grant_id: &str,
+    expected_runtime_sha256: &str,
+    volume_authority: &VerifiedRunnerVolumeAuthority,
+    managed_cloud: Option<&ManagedCloudExecutionLeaseClaimInput>,
+    authenticated_worker_id: &str,
+    volume_worker_id: &str,
+) -> ExecutionLeaseResult<AuthorizedRunnerVolumeExecutionLeaseGrant> {
+    let (lease, binding, runtime, managed_cloud) = claim_execution_lease_inner(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        supplied_browser_profile_id,
+        owner_id,
+        Some(volume_binding),
+        Some((expected_runtime_grant_id, expected_runtime_sha256)),
+        Some(volume_authority),
+        Some(ManagedExecutionLeaseClaimContext {
+            input: managed_cloud,
+            authenticated_worker_id,
+            volume_worker_id,
+        }),
+    )?;
+    let binding = binding.ok_or(ExecutionLeaseError::Conflict)?;
+    let runtime = runtime.ok_or(ExecutionLeaseError::Conflict)?;
+    Ok(AuthorizedRunnerVolumeExecutionLeaseGrant {
+        grant: RunnerVolumeExecutionLeaseGrant {
+            lease,
+            purge_subject: binding.purge_subject,
+            volume_id: binding.volume_id,
+            enrollment_epoch: binding.enrollment_epoch,
+            process_instance_id: binding.process_instance_id,
+            volume_key_fingerprint: binding.volume_key_fingerprint,
+            runtime_grant_id: runtime.runtime_grant_id,
+            runtime_sha256: runtime.runtime_sha256,
+        },
+        managed_cloud,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn claim_execution_lease_inner(
     pool: &DbPool,
     account_id: &str,
@@ -1241,11 +1360,8 @@ fn claim_execution_lease_inner(
     volume_binding: Option<&BindRunnerVolumeResidencyRequest>,
     expected_runtime: Option<(&str, &str)>,
     volume_authority: Option<&VerifiedRunnerVolumeAuthority>,
-) -> ExecutionLeaseResult<(
-    ExecutionLeaseGrant,
-    Option<RunnerVolumeResidencyBinding>,
-    Option<TrustedRunnerProcessRuntimeAttestation>,
-)> {
+    managed_cloud_context: Option<ManagedExecutionLeaseClaimContext<'_>>,
+) -> ExecutionLeaseResult<ExecutionLeaseClaimOutcome> {
     if !validate_execution_binding(account_id, 240)
         || !validate_execution_binding(application_id, 240)
         || !validate_execution_binding(run_id, 240)
@@ -1255,6 +1371,12 @@ fn claim_execution_lease_inner(
             .is_some_and(|binding| binding.account_id != account_id || binding.run_id != run_id)
         || (volume_authority.is_some() && expected_runtime.is_none())
         || (expected_runtime.is_some() && volume_binding.is_none())
+        || managed_cloud_context.is_some_and(|context| {
+            volume_binding.is_none()
+                || context.authenticated_worker_id != context.volume_worker_id
+                || volume_binding
+                    .is_some_and(|binding| binding.worker_id != context.volume_worker_id)
+        })
     {
         return Err(ExecutionLeaseError::InvalidRequest);
     }
@@ -1345,6 +1467,19 @@ fn claim_execution_lease_inner(
                     now_ms: now,
                 },
             )?;
+            let managed_cloud_authority = match managed_cloud_context {
+                Some(context) => resolve_managed_cloud_execution_lease_claim_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    context.input,
+                    context.authenticated_worker_id,
+                    context.volume_worker_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?,
+                None => None,
+            };
             let existing = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -1354,7 +1489,7 @@ fn claim_execution_lease_inner(
                     execution_lease_from_sqlite_row,
                 )
                 .optional()?;
-            let fence = if let Some(existing) = existing {
+            let (fence, bound_managed_cloud) = if let Some(existing) = existing {
                 if existing.account_id != account_id
                     || existing.application_id != application_id
                     || existing.browser_profile_id != browser_profile_id
@@ -1364,10 +1499,34 @@ fn claim_execution_lease_inner(
                     return Err(ExecutionLeaseError::Conflict);
                 }
                 let fence = sqlite_next_execution_fence(&tx, application_id, &browser_profile_id)?;
+                let bound_managed_cloud = managed_cloud_authority
+                    .clone()
+                    .map(|authority| {
+                        bind_managed_cloud_execution_lease_authority(
+                            authority,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                        )
+                    })
+                    .transpose()
+                    .map_err(execution_lease_from_managed_cloud_error)?;
                 if tx.execute(
                     "UPDATE jobs_execution_leases
                         SET owner_id = ?2, lease_token_sha256 = ?3, fence = ?4,
-                            lease_expires_at_ms = ?5, updated_at_ms = ?6
+                            lease_expires_at_ms = ?5, updated_at_ms = ?6,
+                            managed_cloud_workflow_request_id = ?8,
+                            managed_cloud_request_command_id = ?9,
+                            managed_cloud_execution_command_id = ?10,
+                            managed_cloud_binding_sha256 = ?11,
+                            managed_cloud_release_memo_base64url = ?12,
+                            managed_cloud_release_sha256 = ?13,
+                            managed_cloud_runtime_instance_id = ?14,
+                            managed_cloud_runtime_instance_epoch = ?15,
+                            managed_cloud_worker_id = ?16,
+                            managed_cloud_gateway_authority_base64url = ?17,
+                            managed_cloud_gateway_authority_sha256 = ?18,
+                            managed_cloud_lease_authority_sha256 = ?19
                       WHERE run_id = ?1 AND phase = 'prepared' AND fence = ?7",
                     params![
                         run_id,
@@ -1377,12 +1536,49 @@ fn claim_execution_lease_inner(
                         lease_expires_at_ms,
                         now,
                         existing.fence,
+                        bound_managed_cloud.as_ref().map(|bound| bound
+                            .authority
+                            .managed_cloud_workflow_request_id
+                            .as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.request_command_id.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.execution_command_id.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.binding_sha256.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_memo_base64url.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_sha256.as_str()),
+                        bound_managed_cloud.as_ref().map(|bound| {
+                            bound.authority.managed_cloud_runtime_instance_id.as_str()
+                        }),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_runtime_instance_epoch),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_worker_id.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_base64url.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_sha256.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.lease_authority_sha256.as_str()),
                     ],
                 )? != 1
                 {
                     return Err(ExecutionLeaseError::Conflict);
                 }
-                fence
+                (fence, bound_managed_cloud)
             } else {
                 tx.execute(
                     "UPDATE jobs_execution_leases
@@ -1405,12 +1601,37 @@ fn claim_execution_lease_inner(
                     return Err(ExecutionLeaseError::Conflict);
                 }
                 let fence = sqlite_next_execution_fence(&tx, application_id, &browser_profile_id)?;
+                let bound_managed_cloud = managed_cloud_authority
+                    .clone()
+                    .map(|authority| {
+                        bind_managed_cloud_execution_lease_authority(
+                            authority,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                        )
+                    })
+                    .transpose()
+                    .map_err(execution_lease_from_managed_cloud_error)?;
                 if let Err(error) = tx.execute(
                     "INSERT INTO jobs_execution_leases (
                         run_id, account_id, application_id, browser_profile_id, owner_id,
                         lease_token_sha256, fence, phase, lease_expires_at_ms,
-                        created_at_ms, updated_at_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', ?8, ?9, ?9)",
+                        created_at_ms, updated_at_ms,
+                        managed_cloud_workflow_request_id,
+                        managed_cloud_request_command_id,
+                        managed_cloud_execution_command_id,
+                        managed_cloud_binding_sha256,
+                        managed_cloud_release_memo_base64url,
+                        managed_cloud_release_sha256,
+                        managed_cloud_runtime_instance_id,
+                        managed_cloud_runtime_instance_epoch,
+                        managed_cloud_worker_id,
+                        managed_cloud_gateway_authority_base64url,
+                        managed_cloud_gateway_authority_sha256,
+                        managed_cloud_lease_authority_sha256
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', ?8, ?9, ?9,
+                        ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
                     params![
                         run_id,
                         account_id,
@@ -1421,6 +1642,43 @@ fn claim_execution_lease_inner(
                         fence,
                         lease_expires_at_ms,
                         now,
+                        bound_managed_cloud.as_ref().map(|bound| bound
+                            .authority
+                            .managed_cloud_workflow_request_id
+                            .as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.request_command_id.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.execution_command_id.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.binding_sha256.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_memo_base64url.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_sha256.as_str()),
+                        bound_managed_cloud.as_ref().map(|bound| {
+                            bound.authority.managed_cloud_runtime_instance_id.as_str()
+                        }),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_runtime_instance_epoch),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_worker_id.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_base64url.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_sha256.as_str()),
+                        bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.lease_authority_sha256.as_str()),
                     ],
                 ) {
                     if error.sqlite_error_code() == Some(rusqlite::ErrorCode::ConstraintViolation) {
@@ -1428,7 +1686,7 @@ fn claim_execution_lease_inner(
                     }
                     return Err(error.into());
                 }
-                fence
+                (fence, bound_managed_cloud)
             };
             let bound_volume = match (volume_binding, prepared_binding.as_ref()) {
                 (Some(binding), Some(prepared)) => Some(
@@ -1453,14 +1711,37 @@ fn claim_execution_lease_inner(
                 },
                 bound_volume,
                 trusted_runtime,
+                bound_managed_cloud.map(|bound| bound.authority),
             ))
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            if let Some(input) = managed_cloud_context.and_then(|context| context.input) {
+                lock_managed_cloud_workflow_admission_postgres_tx(
+                    &mut tx,
+                    &input.managed_cloud_release.execution.admission.scope,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
             lock_operational_hold_shared_postgres_tx(&mut tx)
                 .map_err(execution_lease_from_operational_hold_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            let managed_cloud_authority = match managed_cloud_context {
+                Some(context) => {
+                    resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prelock(
+                        &mut tx,
+                        account_id,
+                        application_id,
+                        run_id,
+                        context.input,
+                        context.authenticated_worker_id,
+                        context.volume_worker_id,
+                    )
+                    .map_err(execution_lease_from_managed_cloud_error)?
+                }
+                None => None,
+            };
             lock_postgres_ats_certification(&mut tx)
                 .map_err(execution_lease_from_ats_certification_error)?;
             let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
@@ -1548,7 +1829,7 @@ fn claim_execution_lease_inner(
                     &[&run_id],
                 )?
                 .map(execution_lease_from_pg_row);
-            let fence = if let Some(existing) = existing {
+            let (fence, bound_managed_cloud) = if let Some(existing) = existing {
                 if existing.account_id != account_id
                     || existing.application_id != application_id
                     || existing.browser_profile_id != browser_profile_id
@@ -1559,10 +1840,34 @@ fn claim_execution_lease_inner(
                 }
                 let fence =
                     postgres_next_execution_fence(&mut tx, application_id, &browser_profile_id)?;
+                let bound_managed_cloud = managed_cloud_authority
+                    .clone()
+                    .map(|authority| {
+                        bind_managed_cloud_execution_lease_authority(
+                            authority,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                        )
+                    })
+                    .transpose()
+                    .map_err(execution_lease_from_managed_cloud_error)?;
                 if tx.execute(
                     "UPDATE jobs_execution_leases
                         SET owner_id = $2, lease_token_sha256 = $3, fence = $4,
-                            lease_expires_at_ms = $5, updated_at_ms = $6
+                            lease_expires_at_ms = $5, updated_at_ms = $6,
+                            managed_cloud_workflow_request_id = $8,
+                            managed_cloud_request_command_id = $9,
+                            managed_cloud_execution_command_id = $10,
+                            managed_cloud_binding_sha256 = $11,
+                            managed_cloud_release_memo_base64url = $12,
+                            managed_cloud_release_sha256 = $13,
+                            managed_cloud_runtime_instance_id = $14,
+                            managed_cloud_runtime_instance_epoch = $15,
+                            managed_cloud_worker_id = $16,
+                            managed_cloud_gateway_authority_base64url = $17,
+                            managed_cloud_gateway_authority_sha256 = $18,
+                            managed_cloud_lease_authority_sha256 = $19
                       WHERE run_id = $1 AND phase = 'prepared' AND fence = $7",
                     &[
                         &run_id,
@@ -1572,12 +1877,48 @@ fn claim_execution_lease_inner(
                         &lease_expires_at_ms,
                         &now,
                         &existing.fence,
+                        &bound_managed_cloud.as_ref().map(|bound| {
+                            bound.authority.managed_cloud_workflow_request_id.as_str()
+                        }),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.request_command_id.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.execution_command_id.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.binding_sha256.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_memo_base64url.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_sha256.as_str()),
+                        &bound_managed_cloud.as_ref().map(|bound| {
+                            bound.authority.managed_cloud_runtime_instance_id.as_str()
+                        }),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_runtime_instance_epoch),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_worker_id.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_base64url.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_sha256.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.lease_authority_sha256.as_str()),
                     ],
                 )? != 1
                 {
                     return Err(ExecutionLeaseError::Conflict);
                 }
-                fence
+                (fence, bound_managed_cloud)
             } else {
                 tx.execute(
                     "UPDATE jobs_execution_leases
@@ -1602,12 +1943,37 @@ fn claim_execution_lease_inner(
                 }
                 let fence =
                     postgres_next_execution_fence(&mut tx, application_id, &browser_profile_id)?;
+                let bound_managed_cloud = managed_cloud_authority
+                    .clone()
+                    .map(|authority| {
+                        bind_managed_cloud_execution_lease_authority(
+                            authority,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                        )
+                    })
+                    .transpose()
+                    .map_err(execution_lease_from_managed_cloud_error)?;
                 if let Err(error) = tx.execute(
                     "INSERT INTO jobs_execution_leases (
                         run_id, account_id, application_id, browser_profile_id, owner_id,
                         lease_token_sha256, fence, phase, lease_expires_at_ms,
-                        created_at_ms, updated_at_ms
-                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'prepared', $8, $9, $9)",
+                        created_at_ms, updated_at_ms,
+                        managed_cloud_workflow_request_id,
+                        managed_cloud_request_command_id,
+                        managed_cloud_execution_command_id,
+                        managed_cloud_binding_sha256,
+                        managed_cloud_release_memo_base64url,
+                        managed_cloud_release_sha256,
+                        managed_cloud_runtime_instance_id,
+                        managed_cloud_runtime_instance_epoch,
+                        managed_cloud_worker_id,
+                        managed_cloud_gateway_authority_base64url,
+                        managed_cloud_gateway_authority_sha256,
+                        managed_cloud_lease_authority_sha256
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'prepared', $8, $9, $9,
+                        $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
                     &[
                         &run_id,
                         &account_id,
@@ -1618,6 +1984,42 @@ fn claim_execution_lease_inner(
                         &fence,
                         &lease_expires_at_ms,
                         &now,
+                        &bound_managed_cloud.as_ref().map(|bound| {
+                            bound.authority.managed_cloud_workflow_request_id.as_str()
+                        }),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.request_command_id.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.execution_command_id.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.binding_sha256.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_memo_base64url.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.release_sha256.as_str()),
+                        &bound_managed_cloud.as_ref().map(|bound| {
+                            bound.authority.managed_cloud_runtime_instance_id.as_str()
+                        }),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_runtime_instance_epoch),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.managed_cloud_worker_id.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_base64url.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.authority.gateway_authority_sha256.as_str()),
+                        &bound_managed_cloud
+                            .as_ref()
+                            .map(|bound| bound.lease_authority_sha256.as_str()),
                     ],
                 ) {
                     if error.code() == Some(&postgres::error::SqlState::UNIQUE_VIOLATION) {
@@ -1625,7 +2027,7 @@ fn claim_execution_lease_inner(
                     }
                     return Err(error.into());
                 }
-                fence
+                (fence, bound_managed_cloud)
             };
             let bound_volume = match (volume_binding, prepared_binding.as_ref()) {
                 (Some(binding), Some(prepared)) => Some(
@@ -1652,6 +2054,7 @@ fn claim_execution_lease_inner(
                 },
                 bound_volume,
                 trusted_runtime,
+                bound_managed_cloud.map(|bound| bound.authority),
             ))
         }
     })
@@ -1763,6 +2166,131 @@ fn require_current_runner_volume_identity_postgres_for_operation(
     }
     require_current_runner_volume_identity_binding_postgres_tx(tx, account_id, run_id, now)
         .map_err(execution_lease_from_runner_volume_error)
+}
+
+fn managed_execution_volume_worker_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    run_id: &str,
+    authenticated_worker_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<String> {
+    require_current_runner_volume_identity_sqlite_for_operation(tx, account_id, run_id, now)?;
+    let volume_worker_id = tx
+        .query_row(
+            "SELECT volume.worker_id
+               FROM jobs_execution_lease_volume_bindings binding
+               JOIN jobs_runner_volumes volume
+                 ON volume.volume_id = binding.volume_id
+                AND volume.current_epoch = binding.volume_epoch
+                AND volume.active_instance_id = binding.process_instance_id
+              WHERE binding.run_id = ?1 AND volume.status = 'active'
+                AND volume.instance_lease_expires_at_ms > ?2",
+            params![run_id, now],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    if volume_worker_id != authenticated_worker_id {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(volume_worker_id)
+}
+
+fn discover_managed_execution_volume_worker_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    run_id: &str,
+    authenticated_worker_id: &str,
+) -> ExecutionLeaseResult<String> {
+    let volume_worker_id = tx
+        .query_opt(
+            "SELECT volume.worker_id
+               FROM jobs_execution_lease_volume_bindings binding
+               JOIN jobs_runner_volumes volume ON volume.volume_id = binding.volume_id
+              WHERE binding.run_id = $1",
+            &[&run_id],
+        )?
+        .ok_or(ExecutionLeaseError::Conflict)?
+        .get::<_, String>(0);
+    if volume_worker_id != authenticated_worker_id {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(volume_worker_id)
+}
+
+fn revalidate_managed_execution_volume_worker_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    run_id: &str,
+    authenticated_worker_id: &str,
+    expected_volume_worker_id: &str,
+    now: i64,
+) -> ExecutionLeaseResult<()> {
+    let row = tx
+        .query_opt(
+            "SELECT volume.worker_id, subject.purge_subject,
+                    binding.purge_subject_sha256
+               FROM jobs_execution_lease_volume_bindings binding
+               JOIN jobs_runner_volumes volume
+                 ON volume.volume_id = binding.volume_id
+                AND volume.current_epoch = binding.volume_epoch
+                AND volume.active_instance_id = binding.process_instance_id
+               JOIN jobs_runner_volume_keys volume_key
+                 ON volume_key.volume_id = volume.volume_id
+                AND volume_key.enrollment_epoch = volume.current_epoch
+               JOIN jobs_runner_account_subjects subject
+                 ON subject.account_id = $2
+               JOIN jobs_runner_volume_residencies residency
+                 ON residency.purge_subject = subject.purge_subject
+                AND residency.volume_id = volume.volume_id
+                AND residency.volume_epoch = volume.current_epoch
+              WHERE binding.run_id = $1 AND volume.status = 'active'
+                AND volume.instance_lease_expires_at_ms > $3
+                AND volume.required_tombstone_generation =
+                    volume.reconciled_tombstone_generation
+                AND volume_key.retired_at_ms IS NULL
+                AND subject.legacy_unresolved = FALSE
+                AND residency.state = 'resident' AND residency.purge_generation = 0
+                AND NOT EXISTS (
+                    SELECT 1 FROM jobs_runner_purge_requests purge_request
+                     WHERE purge_request.account_id = $2
+                        OR purge_request.purge_subject = subject.purge_subject)
+                AND NOT EXISTS (
+                    SELECT 1 FROM jobs_runner_purge_tombstones tombstone
+                     WHERE tombstone.purge_subject = subject.purge_subject)
+                AND EXISTS (
+                    SELECT 1 FROM jobs_runner_volume_storage_attestations attestation
+                     WHERE attestation.volume_id = volume.volume_id
+                       AND attestation.enrollment_epoch = volume.current_epoch
+                       AND attestation.volume_key_fingerprint = volume_key.key_fingerprint
+                       AND attestation.process_instance_id = volume.active_instance_id
+                       AND attestation.enrollment_generation = volume.enrollment_generation
+                       AND attestation.required_tombstone_generation =
+                           volume.required_tombstone_generation
+                       AND attestation.reconciled_tombstone_generation =
+                           volume.reconciled_tombstone_generation
+                       AND NOT EXISTS (
+                           SELECT 1 FROM jobs_runner_volume_storage_attestations newer
+                            WHERE newer.volume_id = attestation.volume_id
+                              AND newer.enrollment_epoch = attestation.enrollment_epoch
+                              AND newer.attestation_generation >
+                                  attestation.attestation_generation))
+              FOR SHARE OF binding, volume, volume_key, subject, residency",
+            &[&run_id, &account_id, &now],
+        )?
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    let volume_worker_id: String = row.get(0);
+    let purge_subject: String = row.get(1);
+    let purge_subject_sha256: String = row.get(2);
+    if volume_worker_id != authenticated_worker_id
+        || volume_worker_id != expected_volume_worker_id
+        || runner_purge_subject_sha256(&purge_subject)
+            .map_err(execution_lease_from_runner_volume_error)?
+            != purge_subject_sha256
+    {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
 }
 
 pub fn heartbeat_execution_lease(
@@ -1886,6 +2414,168 @@ pub fn heartbeat_execution_lease(
                 lease_expires_at_ms,
                 phase: lease.phase,
             })
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn authorize_managed_execution_effect(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    lease_token: &str,
+    fence: i64,
+    managed_cloud: Option<&ManagedCloudExecutionLeaseClaimInput>,
+    authenticated_worker_id: &str,
+) -> ExecutionLeaseResult<AuthorizedExecutionLeaseRecord> {
+    validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
+    if !validate_execution_binding(authenticated_worker_id, 240) {
+        return Err(ExecutionLeaseError::InvalidRequest);
+    }
+    let lease_token_sha256 = execution_lease_token_hash(lease_token);
+    let now = now_ms();
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let volume_worker_id = match managed_cloud {
+                Some(_) => managed_execution_volume_worker_sqlite_tx(
+                    &tx,
+                    account_id,
+                    run_id,
+                    authenticated_worker_id,
+                    now,
+                )?,
+                None => authenticated_worker_id.to_string(),
+            };
+            let managed_cloud = resolve_managed_cloud_execution_effect_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                run_id,
+                fence,
+                &lease_token_sha256,
+                managed_cloud,
+                authenticated_worker_id,
+                &volume_worker_id,
+            )
+            .map_err(execution_lease_from_managed_cloud_error)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
+            let lease = tx
+                .query_row(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
+                       FROM jobs_execution_leases
+                      WHERE run_id = ?1 AND account_id = ?2 AND application_id = ?3",
+                    params![run_id, account_id, application_id],
+                    execution_lease_from_sqlite_row,
+                )
+                .optional()?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            if lease.fence != fence
+                || lease.lease_token_sha256 != lease_token_sha256
+                || lease.phase != "prepared"
+                || lease.lease_expires_at_ms <= now
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let record = AuthorizedExecutionLeaseRecord {
+                lease: ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: lease.phase,
+                },
+                managed_cloud,
+            };
+            tx.commit()?;
+            Ok(record)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            let managed_requested = managed_cloud.is_some();
+            if let Some(input) = managed_cloud {
+                lock_managed_cloud_workflow_admission_postgres_tx(
+                    &mut tx,
+                    &input.managed_cloud_release.execution.admission.scope,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
+            lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            let volume_worker_id = match managed_cloud {
+                Some(_) => discover_managed_execution_volume_worker_postgres_tx(
+                    &mut tx,
+                    run_id,
+                    authenticated_worker_id,
+                )?,
+                None => authenticated_worker_id.to_string(),
+            };
+            let managed_cloud = resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                fence,
+                &lease_token_sha256,
+                managed_cloud,
+                authenticated_worker_id,
+                &volume_worker_id,
+            )
+            .map_err(execution_lease_from_managed_cloud_error)?;
+            if !managed_requested {
+                require_current_runner_volume_binding_postgres_for_operation(
+                    &mut tx, account_id, run_id, now,
+                )?;
+            }
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let lease = tx
+                .query_opt(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
+                       FROM jobs_execution_leases
+                      WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                      FOR UPDATE",
+                    &[&run_id, &account_id, &application_id],
+                )?
+                .map(execution_lease_from_pg_row)
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            if lease.fence != fence
+                || lease.lease_token_sha256 != lease_token_sha256
+                || lease.phase != "prepared"
+                || lease.lease_expires_at_ms <= now
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if managed_requested {
+                revalidate_managed_execution_volume_worker_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    run_id,
+                    authenticated_worker_id,
+                    &volume_worker_id,
+                    now,
+                )?;
+            }
+            let record = AuthorizedExecutionLeaseRecord {
+                lease: ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: lease.phase,
+                },
+                managed_cloud,
+            };
+            tx.commit()?;
+            Ok(record)
         }
     })
 }
@@ -2248,7 +2938,65 @@ pub fn start_irreversible_submission(
     final_submit_proof: &FinalSubmitProof,
     capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
 ) -> ExecutionLeaseResult<IrreversibleExecutionLeaseRecord> {
+    start_irreversible_submission_inner(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        lease_token,
+        fence,
+        final_submit_proof,
+        capacity,
+        None,
+    )
+    .map(|record| record.record)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn start_irreversible_submission_authorized(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    lease_token: &str,
+    fence: i64,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    managed_cloud: Option<&ManagedCloudExecutionLeaseClaimInput>,
+    authenticated_worker_id: &str,
+) -> ExecutionLeaseResult<AuthorizedIrreversibleExecutionLeaseRecord> {
+    start_irreversible_submission_inner(
+        pool,
+        account_id,
+        application_id,
+        run_id,
+        lease_token,
+        fence,
+        final_submit_proof,
+        capacity,
+        Some((managed_cloud, authenticated_worker_id)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_irreversible_submission_inner(
+    pool: &DbPool,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    lease_token: &str,
+    fence: i64,
+    final_submit_proof: &FinalSubmitProof,
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    managed_cloud_context: Option<(Option<&ManagedCloudExecutionLeaseClaimInput>, &str)>,
+) -> ExecutionLeaseResult<AuthorizedIrreversibleExecutionLeaseRecord> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
+    if managed_cloud_context
+        .is_some_and(|(_, worker_id)| !validate_execution_binding(worker_id, 240))
+    {
+        return Err(ExecutionLeaseError::InvalidRequest);
+    }
+    let lease_token_sha256 = execution_lease_token_hash(lease_token);
     let now = now_ms();
     validate_submission_evidence_capacity_binding(
         account_id,
@@ -2261,9 +3009,6 @@ pub fn start_irreversible_submission(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx, account_id,
-            )?;
             let lease = tx
                 .query_row(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -2281,6 +3026,23 @@ pub fn start_irreversible_submission(
                 return Err(ExecutionLeaseError::Conflict);
             }
             if lease.phase == "click_started" {
+                let managed_cloud = match managed_cloud_context {
+                    Some((input, authenticated_worker_id)) => {
+                        load_managed_cloud_irreversible_effect_receipt_sqlite_tx(
+                            &tx,
+                            account_id,
+                            application_id,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                            input,
+                            authenticated_worker_id,
+                        )
+                        .map_err(execution_lease_from_managed_cloud_error)?
+                        .map(|receipt| receipt.authority)
+                    }
+                    None => None,
+                };
                 if final_submit_proof.schema_version != 4 {
                     return Err(ExecutionLeaseError::Conflict);
                 }
@@ -2303,8 +3065,41 @@ pub fn start_irreversible_submission(
                     Some(authority),
                 );
                 tx.commit()?;
-                return Ok(record);
+                return Ok(AuthorizedIrreversibleExecutionLeaseRecord {
+                    record,
+                    managed_cloud,
+                });
             }
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let managed_cloud = match managed_cloud_context {
+                Some((input, authenticated_worker_id)) => {
+                    let volume_worker_id = match input {
+                        Some(_) => managed_execution_volume_worker_sqlite_tx(
+                            &tx,
+                            account_id,
+                            run_id,
+                            authenticated_worker_id,
+                            now,
+                        )?,
+                        None => authenticated_worker_id.to_string(),
+                    };
+                    resolve_managed_cloud_execution_effect_sqlite_tx(
+                        &tx,
+                        account_id,
+                        application_id,
+                        run_id,
+                        fence,
+                        &lease_token_sha256,
+                        input,
+                        authenticated_worker_id,
+                        &volume_worker_id,
+                    )
+                    .map_err(execution_lease_from_managed_cloud_error)?
+                }
+                None => None,
+            };
             let hold_context = operational_hold_context_for_application_sqlite_tx(
                 &tx,
                 account_id,
@@ -2381,26 +3176,159 @@ pub fn start_irreversible_submission(
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            if let Some(authority) = managed_cloud.as_ref() {
+                insert_managed_cloud_irreversible_effect_receipt_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    fence,
+                    &lease_token_sha256,
+                    authority,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
             let lease_expires_at_ms = lease.lease_expires_at_ms;
             tx.commit()?;
-            Ok(irreversible_execution_lease_record(
-                run_id,
-                fence,
-                lease_expires_at_ms,
-                ats_certified_receipt_authority,
-            ))
+            Ok(AuthorizedIrreversibleExecutionLeaseRecord {
+                record: irreversible_execution_lease_record(
+                    run_id,
+                    fence,
+                    lease_expires_at_ms,
+                    ats_certified_receipt_authority,
+                ),
+                managed_cloud,
+            })
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            let discovered_lease = tx
+                .query_opt(
+                    "SELECT phase, lease_expires_at_ms FROM jobs_execution_leases
+                      WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                        AND fence = $4 AND lease_token_sha256 = $5",
+                    &[
+                        &run_id,
+                        &account_id,
+                        &application_id,
+                        &fence,
+                        &lease_token_sha256,
+                    ],
+                )?
+                .map(|row| (row.get::<_, String>(0), row.get::<_, i64>(1)));
+            if discovered_lease
+                .as_ref()
+                .is_some_and(|(phase, _)| phase == "click_started")
+            {
+                lock_postgres_ats_certification(&mut tx)
+                    .map_err(execution_lease_from_ats_certification_error)?;
+                let managed_cloud = match managed_cloud_context {
+                    Some((input, authenticated_worker_id)) => {
+                        load_managed_cloud_irreversible_effect_receipt_postgres_tx(
+                            &mut tx,
+                            account_id,
+                            application_id,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                            input,
+                            authenticated_worker_id,
+                        )
+                        .map_err(execution_lease_from_managed_cloud_error)?
+                        .map(|receipt| receipt.authority)
+                    }
+                    None => None,
+                };
+                let lease_expires_at_ms: i64 = tx
+                    .query_opt(
+                        "SELECT lease_expires_at_ms FROM jobs_execution_leases
+                          WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                            AND fence = $4 AND lease_token_sha256 = $5
+                            AND phase = 'click_started' FOR SHARE",
+                        &[
+                            &run_id,
+                            &account_id,
+                            &application_id,
+                            &fence,
+                            &lease_token_sha256,
+                        ],
+                    )?
+                    .ok_or(ExecutionLeaseError::NotFound)?
+                    .get(0);
+                if final_submit_proof.schema_version != 4 {
+                    return Err(ExecutionLeaseError::Conflict);
+                }
+                require_exact_stored_final_submit_proof_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    final_submit_proof,
+                )?;
+                let authority = recover_terminal_ats_authority_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                )?;
+                let record = AuthorizedIrreversibleExecutionLeaseRecord {
+                    record: irreversible_execution_lease_record(
+                        run_id,
+                        fence,
+                        lease_expires_at_ms,
+                        Some(authority),
+                    ),
+                    managed_cloud,
+                };
+                tx.commit()?;
+                return Ok(record);
+            }
+            let managed_requested = matches!(managed_cloud_context, Some((Some(_), _)));
+            if let Some((Some(input), _)) = managed_cloud_context {
+                lock_managed_cloud_workflow_admission_postgres_tx(
+                    &mut tx,
+                    &input.managed_cloud_release.execution.admission.scope,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
             lock_operational_hold_shared_postgres_tx(&mut tx)
                 .map_err(execution_lease_from_operational_hold_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            let managed_cloud = match managed_cloud_context {
+                Some((input, authenticated_worker_id)) => {
+                    let volume_worker_id = match input {
+                        Some(_) => discover_managed_execution_volume_worker_postgres_tx(
+                            &mut tx,
+                            run_id,
+                            authenticated_worker_id,
+                        )?,
+                        None => authenticated_worker_id.to_string(),
+                    };
+                    resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
+                        &mut tx,
+                        account_id,
+                        application_id,
+                        run_id,
+                        fence,
+                        &lease_token_sha256,
+                        input,
+                        authenticated_worker_id,
+                        &volume_worker_id,
+                    )
+                    .map_err(execution_lease_from_managed_cloud_error)?
+                }
+                None => None,
+            };
             lock_postgres_ats_certification(&mut tx)
                 .map_err(execution_lease_from_ats_certification_error)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
+            if !managed_requested {
+                require_current_runner_volume_binding_postgres_for_operation(
+                    &mut tx, account_id, run_id, now,
+                )?;
+            }
             let lease = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -2417,30 +3345,21 @@ pub fn start_irreversible_submission(
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            if let Some((Some(_), authenticated_worker_id)) = managed_cloud_context {
+                revalidate_managed_execution_volume_worker_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    run_id,
+                    authenticated_worker_id,
+                    &managed_cloud
+                        .as_ref()
+                        .ok_or(ExecutionLeaseError::Conflict)?
+                        .managed_cloud_worker_id,
+                    now,
+                )?;
+            }
             if lease.phase == "click_started" {
-                if final_submit_proof.schema_version != 4 {
-                    return Err(ExecutionLeaseError::Conflict);
-                }
-                require_exact_stored_final_submit_proof_postgres_tx(
-                    &mut tx,
-                    account_id,
-                    application_id,
-                    final_submit_proof,
-                )?;
-                let authority = recover_terminal_ats_authority_postgres_tx(
-                    &mut tx,
-                    account_id,
-                    application_id,
-                    run_id,
-                )?;
-                let record = irreversible_execution_lease_record(
-                    run_id,
-                    fence,
-                    lease.lease_expires_at_ms,
-                    Some(authority),
-                );
-                tx.commit()?;
-                return Ok(record);
+                return Err(ExecutionLeaseError::Conflict);
             }
             let hold_context = operational_hold_context_for_application_postgres_tx(
                 &mut tx,
@@ -2460,9 +3379,6 @@ pub fn start_irreversible_submission(
             if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
                 return Err(ExecutionLeaseError::Conflict);
             }
-            require_current_runner_volume_binding_postgres_for_operation(
-                &mut tx, account_id, run_id, now,
-            )?;
             let browser_profile_id =
                 postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
             if lease.browser_profile_id != browser_profile_id {
@@ -2518,14 +3434,29 @@ pub fn start_irreversible_submission(
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
+            if let Some(authority) = managed_cloud.as_ref() {
+                insert_managed_cloud_irreversible_effect_receipt_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    fence,
+                    &lease_token_sha256,
+                    authority,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
             let lease_expires_at_ms = lease.lease_expires_at_ms;
             tx.commit()?;
-            Ok(irreversible_execution_lease_record(
-                run_id,
-                fence,
-                lease_expires_at_ms,
-                ats_certified_receipt_authority,
-            ))
+            Ok(AuthorizedIrreversibleExecutionLeaseRecord {
+                record: irreversible_execution_lease_record(
+                    run_id,
+                    fence,
+                    lease_expires_at_ms,
+                    ats_certified_receipt_authority,
+                ),
+                managed_cloud,
+            })
         }
     })
 }

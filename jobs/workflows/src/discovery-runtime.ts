@@ -142,6 +142,8 @@ export class DiscoveryWorkerRuntime {
   private readonly sourceCache = new Map<string, SourceCacheEntry>();
   private curatedSnapshot?: CuratedSnapshot;
   private readonly stopController = new AbortController();
+  private lastPollCompletedAtMs = 0;
+  private lastPollFailedAtMs = 0;
   private stopping = false;
 
   constructor(options: DiscoveryWorkerRuntimeOptions) {
@@ -178,7 +180,9 @@ export class DiscoveryWorkerRuntime {
       while (!this.stopping) {
         try {
           await this.pollOnce();
+          this.lastPollCompletedAtMs = Date.now();
         } catch (error) {
+          this.lastPollFailedAtMs = Date.now();
           this.logger.log({
             event: "discovery_poll_failed",
             error_code: safePollErrorCode(error),
@@ -197,6 +201,12 @@ export class DiscoveryWorkerRuntime {
     if (this.stopping) return;
     this.stopping = true;
     this.stopController.abort();
+  }
+
+  managedCloudReady(nowMs: number = Date.now()): boolean {
+    const maximumAgeMs = Math.max(15_000, this.pollIntervalMs * 3);
+    return this.lastPollCompletedAtMs > this.lastPollFailedAtMs
+      && nowMs - this.lastPollCompletedAtMs <= maximumAgeMs;
   }
 
   async pollOnce(): Promise<DiscoveryPollOutcome> {

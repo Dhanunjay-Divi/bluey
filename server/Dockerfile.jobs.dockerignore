@@ -1,0 +1,14 @@
+**
+!Cargo.toml
+!Cargo.lock
+!crates/
+!crates/**
+!infra/
+!infra/**
+!server/
+!server/Cargo.toml
+!server/Cargo.lock
+!server/Dockerfile.jobs
+!server/Dockerfile.jobs.dockerignore
+!server/src/
+!server/src/**

@@ -18,6 +18,7 @@ import {
   type DurableRunPhase,
   type NormalizedJob,
 } from "@bluey/jobs-automation";
+import { parseManagedCloudReleaseMemo } from "@bluey/jobs-automation/managed-cloud-execution";
 import {
   decryptBytes,
   encryptBytes,
@@ -800,6 +801,16 @@ function validateCheckpoint(
     throw new Error("Cloud checkpoint session mismatch");
   if (!/^[A-Za-z0-9:_-]{3,160}$/.test(String(request.browserProfileId))) {
     throw new Error("Invalid cloud run checkpoint browser profile");
+  }
+  if (Object.prototype.hasOwnProperty.call(request, "managedCloudRelease")) {
+    if (checkpoint.version !== CURRENT_CHECKPOINT_VERSION) {
+      throw new Error("Invalid managed-cloud checkpoint authority");
+    }
+    try {
+      parseManagedCloudReleaseMemo(request.managedCloudRelease);
+    } catch {
+      throw new Error("Invalid managed-cloud checkpoint authority");
+    }
   }
   const packet = requireRecord(request.packet, "cloud checkpoint packet");
   const job = requireRecord(request.job, "cloud checkpoint job");

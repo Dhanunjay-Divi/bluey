@@ -12,9 +12,16 @@ import {
 } from "@bluey/jobs-automation";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
 import {
+  managedCloudReleaseMemoBytes,
+  parseManagedCloudReleaseMemo,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import {
   isSubmissionReceiptAuthority,
   type ApplicationWorkflowInput,
   type InterventionResolution,
+  type ManagedWorkflowCommandInput,
+  type ManagedWorkflowResumeCommandInput,
   type WorkflowCommandAuthority,
   type WorkflowCommandOperation,
   type WorkflowCommandStep,
@@ -117,6 +124,36 @@ async function requestApplicationRun(
   );
 }
 
+async function requestManagedApplicationRun(
+  input: ApplicationWorkflowInput & { browserSessionId: string },
+  resultRequestId: string,
+  managedCloudRelease: ManagedCloudReleaseMemoAuthority,
+): Promise<RunnerExecutionResult> {
+  const response = await fetch(`${runnerOrigin}/runs`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${runnerToken}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      accountId: input.accountId,
+      applicationId: input.applicationId,
+      applicationIdentityId: input.applicationIdentityId,
+      browserProfileId: input.browserProfileId,
+      browserSessionId: input.browserSessionId,
+      runId: input.idempotencyKey,
+      requestId: resultRequestId,
+      url: input.url,
+      packet: input.packet,
+      job: input.job,
+      managedCloudRelease,
+    }),
+    redirect: "error",
+    signal: AbortSignal.timeout(RUNNER_EXECUTION_TIMEOUT_MS),
+  });
+  await assertRunnerResponse(response, resultRequestId);
+  return workflowExecutionResult(
+    await readRunnerExecutionResult(response, { ...input, requestId: resultRequestId }),
+  );
+}
+
 export async function resumeApplication(input: ApplicationWorkflowInput & {
   browserSessionId: string;
   requestId: string;
@@ -168,6 +205,34 @@ async function requestApplicationResume(input: ApplicationWorkflowInput & {
   return workflowExecutionResult(await readRunnerExecutionResult(response, input));
 }
 
+async function requestManagedApplicationResume(input: ApplicationWorkflowInput & {
+  browserSessionId: string;
+  requestId: string;
+  resolution: InterventionResolution;
+}, managedCloudRelease: ManagedCloudReleaseMemoAuthority): Promise<RunnerExecutionResult> {
+  const response = await fetch(
+    `${runnerOrigin}/runs/${encodeURIComponent(input.browserSessionId)}/resume`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${runnerToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...input.resolution,
+        accountId: input.accountId,
+        applicationId: input.applicationId,
+        applicationIdentityId: input.applicationIdentityId,
+        runId: input.idempotencyKey,
+        requestId: input.requestId,
+        profileScope: runnerProfileScope(input.accountId, input.applicationIdentityId),
+        managedCloudRelease,
+      }),
+      redirect: "error",
+      signal: AbortSignal.timeout(RUNNER_EXECUTION_TIMEOUT_MS),
+    },
+  );
+  await assertRunnerResponse(response, input.requestId);
+  return workflowExecutionResult(await readRunnerExecutionResult(response, input));
+}
+
 /**
  * Protocol-v2 start activity. Its argument and return value are the complete
  * Temporal-visible contract; private command material is loaded and consumed
@@ -196,6 +261,50 @@ export async function executeApplicationCommand(
     await recordState(input, "running");
     try {
       execution = await requestApplicationRun(runnerInput, materialized.resultRequestId);
+    } catch (error) {
+      if (error instanceof RunnerSideEffectUnknown) return { state: "side_effect_unknown" };
+      throw error;
+    }
+  }
+  return finishOpaqueCommand(materialized, execution);
+}
+
+/** Managed-cloud start activity. Release memo A stays opaque in Temporal history. */
+export async function executeManagedApplicationCommand(
+  input: ManagedWorkflowCommandInput,
+): Promise<WorkflowCommandStep> {
+  const parsed = parseManagedWorkflowCommandInput(input);
+  const materialized = await materializeManagedWorkflowCommand(
+    parsed.command,
+    "start",
+    parsed.managedCloudRelease,
+  );
+  const workflowInput = materialized.workflowInput;
+  const runnerInput = {
+    ...workflowInput,
+    browserSessionId: materialized.browserSessionId,
+  };
+  let completed: RawRunnerExecutionResult | undefined;
+  try {
+    completed = await loadDurableRunnerExecution(
+      runnerInput,
+      materialized.resultRequestId,
+    );
+  } catch (error) {
+    if (error instanceof RunnerSideEffectUnknown) return { state: "side_effect_unknown" };
+    throw error;
+  }
+  let execution: RunnerExecutionResult;
+  if (completed) {
+    execution = workflowExecutionResult(completed);
+  } else {
+    await recordState(workflowInput, "running");
+    try {
+      execution = await requestManagedApplicationRun(
+        runnerInput,
+        materialized.resultRequestId,
+        parsed.managedCloudRelease,
+      );
     } catch (error) {
       if (error instanceof RunnerSideEffectUnknown) return { state: "side_effect_unknown" };
       throw error;
@@ -235,6 +344,52 @@ export async function resumeApplicationCommand(input: {
     await recordState(materialized.workflowInput, "running");
     try {
       execution = await requestApplicationResume(runnerInput);
+    } catch (error) {
+      if (error instanceof RunnerSideEffectUnknown) return { state: "side_effect_unknown" };
+      throw error;
+    }
+  }
+  return finishOpaqueCommand(materialized, execution);
+}
+
+/** Managed-cloud resume activity, bound to the workflow's immutable release memo A. */
+export async function resumeManagedApplicationCommand(
+  input: ManagedWorkflowResumeCommandInput,
+): Promise<WorkflowCommandStep> {
+  const parsed = parseManagedWorkflowResumeCommandInput(input);
+  assertResumeMatchesWorkflow(parsed.workflow, parsed.command);
+  const materialized = await materializeManagedWorkflowCommand(
+    parsed.command,
+    "resume",
+    parsed.managedCloudRelease,
+  );
+  if (!materialized.resolution) throw new Error("Opaque resolution authority is missing");
+  const runnerInput = {
+    ...materialized.workflowInput,
+    browserSessionId: materialized.browserSessionId,
+    requestId: materialized.resultRequestId,
+    resolution: materialized.resolution,
+  };
+  let completed: RawRunnerExecutionResult | undefined;
+  try {
+    completed = await loadDurableRunnerExecution(
+      runnerInput,
+      materialized.resultRequestId,
+    );
+  } catch (error) {
+    if (error instanceof RunnerSideEffectUnknown) return { state: "side_effect_unknown" };
+    throw error;
+  }
+  let execution: RunnerExecutionResult;
+  if (completed) {
+    execution = workflowExecutionResult(completed);
+  } else {
+    await recordState(materialized.workflowInput, "running");
+    try {
+      execution = await requestManagedApplicationResume(
+        runnerInput,
+        parsed.managedCloudRelease,
+      );
     } catch (error) {
       if (error instanceof RunnerSideEffectUnknown) return { state: "side_effect_unknown" };
       throw error;
@@ -324,6 +479,37 @@ async function materializeWorkflowCommand(
   }
 }
 
+async function materializeManagedWorkflowCommand(
+  authority: WorkflowCommandAuthority | WorkflowResumeCommandAuthority,
+  operation: WorkflowCommandOperation,
+  managedCloudRelease: ManagedCloudReleaseMemoAuthority,
+): Promise<MaterializedWorkflowCommand> {
+  assertOpaqueAuthority(authority, operation);
+  const path = `/api/jobs/internal/workflow-commands/${encodeURIComponent(
+    authority.requestId,
+  )}/materialize`;
+  const response = await workerRequest<unknown>(path, {
+    schema_version: 2,
+    workflow_id: authority.workflowId,
+    payload_digest: authority.payloadDigest,
+    operation,
+    ...(operation === "resume"
+      ? { intervention_id: (authority as WorkflowResumeCommandAuthority).interventionId }
+      : {}),
+    managed_cloud_release: managedCloudRelease,
+  });
+  try {
+    return parseManagedMaterializedWorkflowCommand(
+      response,
+      authority,
+      operation,
+      managedCloudRelease,
+    );
+  } catch {
+    throwClosedActivityFailure("identity_conflict");
+  }
+}
+
 function parseMaterializedWorkflowCommand(
   value: unknown,
   authority: WorkflowCommandAuthority | WorkflowResumeCommandAuthority,
@@ -389,6 +575,49 @@ function parseMaterializedWorkflowCommand(
     browserSessionId: record.browser_session_id,
     resultRequestId: record.result_request_id,
   };
+}
+
+function parseManagedMaterializedWorkflowCommand(
+  value: unknown,
+  authority: WorkflowCommandAuthority | WorkflowResumeCommandAuthority,
+  operation: WorkflowCommandOperation,
+  expectedManagedCloudRelease: ManagedCloudReleaseMemoAuthority,
+): MaterializedWorkflowCommand {
+  const record = objectRecord(value, "Jobs API returned invalid managed workflow command material");
+  const expectedKeys = operation === "start"
+    ? [
+      "browser_session_id",
+      "managed_cloud_release",
+      "operation",
+      "payload_digest",
+      "request_id",
+      "result_request_id",
+      "schema_version",
+      "workflow_id",
+      "workflow_input",
+    ]
+    : [
+      "browser_session_id",
+      "intervention_id",
+      "managed_cloud_release",
+      "operation",
+      "payload_digest",
+      "request_id",
+      "resolution",
+      "result_request_id",
+      "schema_version",
+      "workflow_id",
+      "workflow_input",
+    ];
+  if (!sameKeys(record, expectedKeys)
+    || !sameManagedCloudReleaseMemo(
+      record.managed_cloud_release,
+      expectedManagedCloudRelease,
+    )) {
+    throw new Error("Jobs API returned mismatched managed-cloud release authority");
+  }
+  const { managed_cloud_release: _, ...legacyResponse } = record;
+  return parseMaterializedWorkflowCommand(legacyResponse, authority, operation);
 }
 
 function parsePrivateWorkflowInput(value: unknown): ApplicationWorkflowInput {
@@ -666,6 +895,79 @@ function commandAuthorityBody(
 
 function workflowCommandPath(requestId: string, suffix: string): string {
   return `/api/jobs/internal/workflow-commands/${encodeURIComponent(requestId)}${suffix}`;
+}
+
+function parseManagedWorkflowCommandInput(
+  value: ManagedWorkflowCommandInput,
+): ManagedWorkflowCommandInput {
+  const record = managedActivityInputRecord(value);
+  if (!sameKeys(record, ["command", "managedCloudRelease"])) {
+    throwClosedActivityFailure("invalid_authority");
+  }
+  const command = record.command as WorkflowCommandAuthority;
+  try {
+    assertOpaqueAuthority(command, "start");
+  } catch {
+    throwClosedActivityFailure("invalid_authority");
+  }
+  return {
+    command,
+    managedCloudRelease: parseManagedCloudReleaseAuthority(record.managedCloudRelease),
+  };
+}
+
+function parseManagedWorkflowResumeCommandInput(
+  value: ManagedWorkflowResumeCommandInput,
+): ManagedWorkflowResumeCommandInput {
+  const record = managedActivityInputRecord(value);
+  if (!sameKeys(record, ["command", "managedCloudRelease", "workflow"])) {
+    throwClosedActivityFailure("invalid_authority");
+  }
+  const workflow = record.workflow as WorkflowCommandAuthority;
+  const command = record.command as WorkflowResumeCommandAuthority;
+  try {
+    assertOpaqueAuthority(workflow, "start");
+    assertOpaqueAuthority(command, "resume");
+  } catch {
+    throwClosedActivityFailure("invalid_authority");
+  }
+  return {
+    workflow,
+    command,
+    managedCloudRelease: parseManagedCloudReleaseAuthority(record.managedCloudRelease),
+  };
+}
+
+function managedActivityInputRecord(value: unknown): Record<string, unknown> {
+  try {
+    return objectRecord(value, "Invalid managed workflow activity input");
+  } catch {
+    throwClosedActivityFailure("invalid_authority");
+  }
+}
+
+function parseManagedCloudReleaseAuthority(
+  value: unknown,
+): ManagedCloudReleaseMemoAuthority {
+  try {
+    return parseManagedCloudReleaseMemo(value);
+  } catch {
+    throwClosedActivityFailure("invalid_authority");
+  }
+}
+
+function sameManagedCloudReleaseMemo(
+  value: unknown,
+  expected: ManagedCloudReleaseMemoAuthority,
+): boolean {
+  try {
+    const actualBytes = managedCloudReleaseMemoBytes(value);
+    const expectedBytes = managedCloudReleaseMemoBytes(expected);
+    return actualBytes.length === expectedBytes.length
+      && actualBytes.every((byte, index) => byte === expectedBytes[index]);
+  } catch {
+    return false;
+  }
 }
 
 function assertResumeMatchesWorkflow(

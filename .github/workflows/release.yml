@@ -133,11 +133,18 @@ jobs:
 
       - name: Build and smoke the managed runner image
         run: |
-          docker build --tag bluey-jobs-runner-release-gate --file jobs/runner/Dockerfile jobs
+          docker build \
+            --build-arg BLUEY_JOBS_BUILD_ID=jobs-runner-release-gate \
+            --build-arg BLUEY_JOBS_CONFIG_SCHEMA_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_MIGRATION_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_PROTOCOL_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --tag bluey-jobs-runner-release-gate --file jobs/runner/Dockerfile jobs
           docker run --rm \
-            --entrypoint node \
+            --entrypoint /usr/local/bin/node \
             --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
-            bluey-jobs-runner-release-gate scripts/native-runner-addon-smoke.mjs
+            --volume "$GITHUB_WORKSPACE/jobs/scripts/native-runner-addon-smoke.mjs:/app/scripts/native-runner-addon-smoke.mjs:ro" \
+            bluey-jobs-runner-release-gate /app/scripts/native-runner-addon-smoke.mjs
 
   build:
     needs: quality

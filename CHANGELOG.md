@@ -7,6 +7,24 @@ under `docs/release/`.
 
 ### Added
 
+- Added disabled-by-default Bluey Jobs managed-cloud launch authority for the browser-delivered,
+  no-install Background runner. The authority requires one canonical signed release to bind the
+  exact Jobs API, workflows, runner, and portal artifacts; schema, protocol, configuration,
+  Temporal, storage, and fleet identities; cohort and compatibility policy; runtime grants and
+  database-time heartbeats; and compare-and-swap activation, rollback, and revocation.
+  Start/resume admission derives live
+  role quorum and freezes release A transactionally, while materialization, Temporal activities,
+  execution-lease claim, checkpoint restore, resume, and the irreversible-effect boundary require
+  that same A plus a fresh compatible managed-runner B. Durable request-start recovery reuses the
+  original A and is lookup-only, so rollback, head loss, or disabled new-effect dispatch cannot
+  silently downgrade ambiguity into a second effect. The new build-once workflow defines closed
+  inventory and verification of stored OCI/static bytes, SBOM, provenance, and read-back evidence
+  without rebuilding.
+  Direct discovery, global discovery, and original-source verification remain outside this release
+  authority. Every customer release flag remains `0`; registry publication, signing credentials,
+  protected-environment approval, hosted PostgreSQL/Temporal and runner-capacity evidence,
+  read-only-rootfs and runtime-image attestation, customer cohort approval, canary, rollback, and
+  deployment remain parked external gates.
 - Added disabled-by-default Bluey Jobs workflow-cleanup authority as an exact prerequisite for
   account hard deletion. The stateless schema-v3 private gateway exposes `/workflow-cleanup` only
   for the exact literal enablement `true`; the Rust dispatcher validates configuration before any
