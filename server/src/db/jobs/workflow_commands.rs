@@ -4036,11 +4036,39 @@ pub fn get_materializable_jobs_workflow_command_by_request_id(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
+            let identity = transaction.query_opt(
+                "SELECT command.account_id, command.id
+                       FROM jobs_workflow_commands command
+                      WHERE command.request_id = $1
+                        AND command.state IN ('delivering', 'delivery_unknown', 'accepted')
+                        AND command.first_request_started_at_ms IS NOT NULL
+                        AND EXISTS (
+                          SELECT 1 FROM jobs_workflow_command_attempt_events event
+                           WHERE event.command_id = command.id
+                             AND event.event_kind = 'request_started'
+                        )
+                        AND NOT EXISTS (
+                          SELECT 1 FROM jobs_workflow_cleanup_generations cleanup
+                           WHERE cleanup.account_id = command.account_id
+                        )",
+                &[&request_id],
+            )?;
+            let Some(identity) = identity else {
+                transaction.commit()?;
+                return Ok(None);
+            };
+            let account_id: String = identity.get(0);
+            let command_id: String = identity.get(1);
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut transaction,
+                &account_id,
+            )?;
             let row = transaction.query_opt(
                 &format!(
                     "SELECT {WORKFLOW_COMMAND_SELECT}
                        FROM jobs_workflow_commands command
-                      WHERE command.request_id = $1
+                      WHERE command.account_id = $1 AND command.id = $2
+                        AND command.request_id = $3
                         AND command.state IN ('delivering', 'delivery_unknown', 'accepted')
                         AND command.first_request_started_at_ms IS NOT NULL
                         AND EXISTS (
@@ -4054,17 +4082,13 @@ pub fn get_materializable_jobs_workflow_command_by_request_id(
                         )
                       FOR SHARE"
                 ),
-                &[&request_id],
+                &[&account_id, &command_id, &request_id],
             )?;
             let Some(row) = row else {
                 transaction.commit()?;
                 return Ok(None);
             };
             let row = postgres_workflow_command_row(&row);
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut transaction,
-                &row.account_id,
-            )?;
             let command = workflow_command_from_stored(row)?;
             transaction.commit()?;
             Ok(Some(command))
@@ -6929,7 +6953,7 @@ pub fn claim_jobs_workflow_command(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
-            if let Some(expired) = transaction.query_opt(
+            let recovered_expired = if let Some(expired) = transaction.query_opt(
                 &format!(
                     "SELECT {WORKFLOW_COMMAND_SELECT}
                        FROM jobs_workflow_commands
@@ -6991,13 +7015,50 @@ pub fn claim_jobs_workflow_command(
                         &expired.fence,
                     ],
                 )?;
+                true
+            } else {
+                false
+            };
+            if recovered_expired {
+                transaction.commit()?;
+                transaction = connection.transaction()?;
             }
+            let candidate_identity = transaction.query_opt(
+                "SELECT command.account_id, command.id AS command_id
+                   FROM jobs_workflow_commands command
+                   JOIN accounts account_row ON account_row.id = command.account_id
+                  WHERE command.state IN ('pending', 'delivery_unknown')
+                    AND command.next_attempt_at_ms <= $1 AND command.fence < $2
+                    AND NOT EXISTS (
+                      SELECT 1 FROM account_deletion_intents deletion
+                       WHERE deletion.account_id = command.account_id
+                    )
+                    AND NOT EXISTS (
+                      SELECT 1 FROM jobs_workflow_cleanup_generations cleanup
+                       WHERE cleanup.account_id = command.account_id
+                    )
+                  ORDER BY command.next_attempt_at_ms, command.created_at_ms, command.id
+                  FOR UPDATE OF account_row SKIP LOCKED LIMIT 1",
+                &[&now_ms, &WORKFLOW_COMMAND_SAFE_INTEGER_MAX],
+            )?;
+            let Some(candidate_identity) = candidate_identity else {
+                transaction.commit()?;
+                return Ok(None);
+            };
+            let candidate_account_id: String = candidate_identity.get("account_id");
+            let candidate_command_id: String = candidate_identity.get("command_id");
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut transaction,
+                &candidate_account_id,
+            )?;
+            require_no_workflow_cleanup_postgres_tx(&mut transaction, &candidate_account_id)?;
             let candidate = transaction.query_opt(
                 &format!(
                     "SELECT {WORKFLOW_COMMAND_SELECT}
                        FROM jobs_workflow_commands command
-                      WHERE command.state IN ('pending', 'delivery_unknown')
-                        AND command.next_attempt_at_ms <= $1 AND command.fence < $2
+                      WHERE command.account_id = $1 AND command.id = $2
+                        AND command.state IN ('pending', 'delivery_unknown')
+                        AND command.next_attempt_at_ms <= $3 AND command.fence < $4
                         AND NOT EXISTS (
                           SELECT 1 FROM account_deletion_intents deletion
                            WHERE deletion.account_id = command.account_id
@@ -7006,20 +7067,20 @@ pub fn claim_jobs_workflow_command(
                           SELECT 1 FROM jobs_workflow_cleanup_generations cleanup
                            WHERE cleanup.account_id = command.account_id
                         )
-                      ORDER BY command.next_attempt_at_ms, command.created_at_ms, command.id
-                      FOR UPDATE SKIP LOCKED LIMIT 1"
+                      FOR UPDATE SKIP LOCKED"
                 ),
-                &[&now_ms, &WORKFLOW_COMMAND_SAFE_INTEGER_MAX],
+                &[
+                    &candidate_account_id,
+                    &candidate_command_id,
+                    &now_ms,
+                    &WORKFLOW_COMMAND_SAFE_INTEGER_MAX,
+                ],
             )?;
             let Some(candidate) = candidate else {
                 transaction.commit()?;
                 return Ok(None);
             };
             let candidate = postgres_workflow_command_row(&candidate);
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut transaction,
-                &candidate.account_id,
-            )?;
             let fence = candidate
                 .fence
                 .checked_add(1)
@@ -7174,6 +7235,11 @@ pub fn mark_jobs_workflow_command_request_started(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut transaction,
+                &lease.command.account_id,
+            )?;
+            require_no_workflow_cleanup_postgres_tx(&mut transaction, &lease.command.account_id)?;
             let row = transaction
                 .query_opt(
                     &format!(
@@ -7191,11 +7257,6 @@ pub fn mark_jobs_workflow_command_request_started(
                 JobsWorkflowCommandState::Claimed,
                 now_ms,
             )?;
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut transaction,
-                &stored.account_id,
-            )?;
-            require_no_workflow_cleanup_postgres_tx(&mut transaction, &stored.account_id)?;
             transaction.execute(
                 "INSERT INTO jobs_workflow_command_attempt_events (
                     id, account_id, command_id, attempt_id, fence, event_phase,
@@ -7593,6 +7654,15 @@ pub fn complete_jobs_workflow_command(
 mod workflow_command_tests {
     use super::*;
 
+    fn function_source<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        let start = source.find(start).expect("function start must exist");
+        let end = source[start..]
+            .find(end)
+            .map(|offset| start + offset)
+            .expect("function end must exist");
+        &source[start..end]
+    }
+
     fn cleanup_lease() -> JobsWorkflowCleanupLease {
         JobsWorkflowCleanupLease {
             account_id: "account-workflow-test-0001".to_string(),
@@ -7694,6 +7764,122 @@ mod workflow_command_tests {
             assert!(sql.contains("application_id"));
             assert!(sql.contains("status = 'open'"));
         }
+    }
+
+    #[test]
+    fn postgres_materialization_locks_account_before_exact_command() {
+        let source = include_str!("workflow_commands.rs");
+        let materialization = function_source(
+            source,
+            "pub fn get_materializable_jobs_workflow_command_by_request_id(",
+            "pub fn prepare_jobs_workflow_intervention(",
+        );
+        let postgres = &materialization[materialization
+            .find("DbPool::Postgres(_) =>")
+            .expect("Postgres materialization branch must exist")..];
+
+        let identity_lookup = postgres
+            .find("SELECT command.account_id, command.id")
+            .expect("nonlocking materialization identity lookup must exist");
+        let account_fence = postgres
+            .find("require_active_account_write_fence_postgres_tx(")
+            .expect("materialization account fence must exist");
+        let exact_command = postgres
+            .find("WHERE command.account_id = $1 AND command.id = $2")
+            .expect("exact materialization command recheck must exist");
+        let exact_command_lock = postgres[exact_command..]
+            .find("FOR SHARE")
+            .map(|offset| exact_command + offset)
+            .expect("exact materialization command must be share locked");
+
+        assert!(identity_lookup < account_fence);
+        assert!(account_fence < exact_command);
+        assert!(exact_command < exact_command_lock);
+        assert!(!postgres[identity_lookup..account_fence].contains("FOR SHARE"));
+        assert!(!postgres[identity_lookup..account_fence].contains("FOR UPDATE"));
+        for exact_recheck in [
+            "command.request_id = $3",
+            "command.first_request_started_at_ms IS NOT NULL",
+            "event.event_kind = 'request_started'",
+            "FROM jobs_workflow_cleanup_generations cleanup",
+        ] {
+            assert!(postgres[exact_command..exact_command_lock].contains(exact_recheck));
+        }
+    }
+
+    #[test]
+    fn postgres_claim_locks_candidate_account_before_exact_command() {
+        let source = include_str!("workflow_commands.rs");
+        let claim = function_source(
+            source,
+            "pub fn claim_jobs_workflow_command(",
+            "pub fn mark_jobs_workflow_command_request_started(",
+        );
+        let postgres = &claim[claim
+            .find("DbPool::Postgres(_) =>")
+            .expect("Postgres claim branch must exist")..];
+
+        let expired_command_lock = postgres
+            .find("FOR UPDATE SKIP LOCKED LIMIT 1")
+            .expect("expired command recovery lock must exist");
+        let recovery_boundary = postgres
+            .find("if recovered_expired {")
+            .expect("expired recovery transaction boundary must exist");
+        let fresh_transaction = postgres[recovery_boundary..]
+            .find("transaction = connection.transaction()?;")
+            .map(|offset| recovery_boundary + offset)
+            .expect("candidate claim must start a fresh transaction after recovery");
+        let account_candidate_lock = postgres
+            .find("FOR UPDATE OF account_row SKIP LOCKED LIMIT 1")
+            .expect("candidate claim must lock and skip locked accounts");
+        let account_fence = postgres
+            .find("require_active_account_write_fence_postgres_tx(")
+            .expect("candidate account fence validation must exist");
+        let exact_command = postgres
+            .find("WHERE command.account_id = $1 AND command.id = $2")
+            .expect("exact candidate command recheck must exist");
+        let exact_command_lock = postgres[exact_command..]
+            .find("FOR UPDATE SKIP LOCKED")
+            .map(|offset| exact_command + offset)
+            .expect("exact candidate command must be locked without waiting");
+
+        assert!(expired_command_lock < recovery_boundary);
+        assert!(recovery_boundary < fresh_transaction);
+        assert!(fresh_transaction < account_candidate_lock);
+        assert!(account_candidate_lock < account_fence);
+        assert!(account_fence < exact_command);
+        assert!(exact_command < exact_command_lock);
+        assert!(postgres.contains("JOIN accounts account_row"));
+    }
+
+    #[test]
+    fn postgres_request_start_locks_account_before_command_and_event() {
+        let source = include_str!("workflow_commands.rs");
+        let request_start = function_source(
+            source,
+            "pub fn mark_jobs_workflow_command_request_started(",
+            "pub fn complete_jobs_workflow_command(",
+        );
+        let postgres = &request_start[request_start
+            .find("DbPool::Postgres(_) =>")
+            .expect("Postgres request-start branch must exist")..];
+
+        let account_fence = postgres
+            .find("require_active_account_write_fence_postgres_tx(")
+            .expect("request-start account fence validation must exist");
+        let cleanup_fence = postgres
+            .find("require_no_workflow_cleanup_postgres_tx(")
+            .expect("request-start cleanup fence validation must exist");
+        let command_lock = postgres
+            .find("WHERE account_id = $1 AND id = $2 FOR UPDATE")
+            .expect("request-start exact command lock must exist");
+        let durable_start_event = postgres
+            .find("INSERT INTO jobs_workflow_command_attempt_events")
+            .expect("durable request-start event must exist");
+
+        assert!(account_fence < cleanup_fence);
+        assert!(cleanup_fence < command_lock);
+        assert!(command_lock < durable_start_event);
     }
 
     #[test]

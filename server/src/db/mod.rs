@@ -362,6 +362,8 @@ const SQLITE_JOBS_OPERATIONAL_HOLDS: &str =
     include_str!("../../../infra/sqlite/server-runtime/052_jobs_operational_holds.sql");
 const SQLITE_JOBS_WORKFLOW_COMMANDS: &str =
     include_str!("../../../infra/sqlite/server-runtime/053_jobs_workflow_commands.sql");
+const SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/054_jobs_workflow_cleanup_authority.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1702,6 +1704,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_OPERATIONAL_HOLDS,
     // 0053 - durable workflow start/resume commands and delivery evidence.
     SQLITE_JOBS_WORKFLOW_COMMANDS,
+    // 0054 - global legacy inventory and account-bound workflow cleanup authority.
+    SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2252,6 +2256,10 @@ const POSTGRES_JOBS_OPERATIONAL_HOLDS: &str =
 pub const JOBS_WORKFLOW_COMMANDS_MIGRATION_ID: &str = "031_jobs_workflow_commands.sql";
 const POSTGRES_JOBS_WORKFLOW_COMMANDS: &str =
     include_str!("../../../infra/postgres/server-runtime/031_jobs_workflow_commands.sql");
+pub const JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID: &str =
+    "032_jobs_workflow_cleanup_authority.sql";
+const POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
+    include_str!("../../../infra/postgres/server-runtime/032_jobs_workflow_cleanup_authority.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2364,6 +2372,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
         POSTGRES_JOBS_WORKFLOW_COMMANDS,
+    ),
+    (
+        JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
     ),
 ];
 
@@ -2941,6 +2953,649 @@ mod sqlite_migration_replay_tests {
             )
             .unwrap();
         assert_eq!(upgraded, (0, "{}".to_string()));
+    }
+
+    #[test]
+    fn workflow_cleanup_zero_observation_requires_the_exact_empty_exhausted_page() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-zero-proof-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                request_epoch, fence, request_id, first_request_started_at_ms,
+                lease_owner, lease_token_sha256, lease_expires_at_ms,
+                completion_epoch, created_at_ms, updated_at_ms
+             ) VALUES (900610, 'wfinventory-v3-tampered-zero', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 30000, ?1, ?3, ?4,
+                'scanning', 1, 0, ?5, 1000, 1, 1,
+                'wfcleanup-page-tampered-zero', 999, 'test-owner', ?6, 2000,
+                1, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "1".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900610, 'wfinventory-v3-tampered-zero', ?1, 1000)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_pages (
+                generation, completion_epoch, scan_pass, page_index,
+                request_epoch, fence, request_id, predecessor_page_digest_sha256,
+                input_page_token_ciphertext, input_page_token_hmac_sha256,
+                next_page_token_ciphertext, next_page_token_hmac_sha256,
+                page_target_count, page_targets_digest_sha256,
+                page_digest_sha256, evidence_digest_sha256, recorded_at_ms
+             ) VALUES (900610, 1, 1, 0, 1, 1,
+                'wfcleanup-page-tampered-zero', NULL, NULL, NULL, NULL, NULL,
+                1, ?1, ?2, ?3, 1000)",
+            rusqlite::params!["e".repeat(64), "f".repeat(64), "0".repeat(64)],
+        )
+        .unwrap();
+
+        let forged = conn.execute(
+            "INSERT INTO jobs_workflow_legacy_zero_observations (
+                generation, completion_epoch, scan_pass, final_page_index,
+                final_page_digest_sha256, zero_digest_sha256, recorded_at_ms
+             ) VALUES (900610, 1, 1, 0, ?1, ?2, 1000)",
+            rusqlite::params!["f".repeat(64), "1".repeat(64)],
+        );
+        assert!(forged.is_err());
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_cleanup_completion_epoch_requires_an_exact_clean_successor() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-completion-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                completion_epoch, completed_at_ms, completion_digest_sha256,
+                revalidate_after_ms, created_at_ms, updated_at_ms
+             ) VALUES (900611, 'wfinventory-v3-completion-epoch', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 1000, ?1, ?3, ?4,
+                'complete', 2, 0, ?5, 1000, 7, 1000, ?6, 2000, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "e".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        let mutate_complete = conn.execute(
+            "UPDATE jobs_workflow_legacy_inventory_generations
+                SET page_index = 1
+              WHERE generation = 900611",
+            [],
+        );
+        assert!(mutate_complete.is_err());
+
+        for epoch in [7_i64, 9_i64] {
+            let stale = conn.execute(
+                "UPDATE jobs_workflow_legacy_inventory_generations
+                    SET state = 'scanning', scan_pass = 1, page_index = 0,
+                        predecessor_page_digest_sha256 = ?1,
+                        completion_epoch = ?2, completed_at_ms = NULL,
+                        completion_digest_sha256 = NULL, revalidate_after_ms = NULL,
+                        next_attempt_at_ms = 1001, updated_at_ms = 1001
+                  WHERE generation = 900611",
+                rusqlite::params!["f".repeat(64), epoch],
+            );
+            assert!(stale.is_err(), "completion epoch {epoch} was accepted");
+        }
+
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_workflow_legacy_inventory_generations
+                    SET state = 'scanning', scan_pass = 1, page_index = 0,
+                        predecessor_page_digest_sha256 = ?1,
+                        request_epoch = 0, fence = 0, request_id = NULL,
+                        first_request_started_at_ms = NULL, last_outcome_code = NULL,
+                        lease_owner = NULL, lease_token_sha256 = NULL,
+                        lease_expires_at_ms = NULL, completion_epoch = 8,
+                        first_zero_observed_at_ms = NULL, completed_at_ms = NULL,
+                        completion_digest_sha256 = NULL, revalidate_after_ms = NULL,
+                        next_attempt_at_ms = 1001, updated_at_ms = 1001
+                  WHERE generation = 900611",
+                rusqlite::params!["f".repeat(64)],
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900611, 'wfinventory-v3-completion-epoch', ?1, 1001)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_workflow_legacy_inventory_head WHERE singleton_id = 1",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_workflow_legacy_inventory_generations
+                  WHERE generation = 900611",
+                [],
+            )
+            .is_err());
+        conn.execute(
+            "UPDATE jobs_workflow_legacy_inventory_generations
+                SET state = 'identity_conflict', updated_at_ms = 1002
+              WHERE generation = 900611",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_legacy_inventory_generations
+                    SET state = 'scanning', updated_at_ms = 1003
+                  WHERE generation = 900611",
+                [],
+            )
+            .is_err());
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_cleanup_legacy_proved_tuple_cannot_reuse_an_epoch() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-legacy-proof-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                request_epoch, fence, request_id, first_request_started_at_ms,
+                lease_owner, lease_token_sha256, lease_expires_at_ms,
+                completion_epoch, created_at_ms, updated_at_ms
+             ) VALUES (900612, 'wfinventory-v3-target-proof', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 1000, ?1, ?3, ?4,
+                'scanning', 1, 0, ?5, 1000, 1, 1,
+                'wfcleanup-page-target-proof', 999, 'test-owner', ?6, 3000,
+                1, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+                "1".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900612, 'wfinventory-v3-target-proof', ?1, 1000)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_pages (
+                generation, completion_epoch, scan_pass, page_index,
+                request_epoch, fence, request_id, predecessor_page_digest_sha256,
+                page_target_count, page_targets_digest_sha256,
+                page_digest_sha256, evidence_digest_sha256, recorded_at_ms
+             ) VALUES (900612, 1, 1, 0, 1, 1,
+                'wfcleanup-page-target-proof', NULL, 1, ?1, ?2, ?3, 1000)",
+            rusqlite::params!["e".repeat(64), "f".repeat(64), "0".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_targets (
+                generation, target_identity_hmac_sha256,
+                workflow_id_ciphertext, workflow_id_hmac_sha256,
+                run_id_ciphertext, run_id_hmac_sha256,
+                first_execution_run_id_ciphertext,
+                first_execution_run_id_hmac_sha256, target_digest_sha256,
+                discovered_completion_epoch, discovered_scan_pass,
+                discovered_page_index, discovered_page_digest_sha256,
+                observed_status, target_state, proof_epoch, observation_pass,
+                first_absence_observed_at_ms, next_attempt_at_ms,
+                absence_proved_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (900612, ?1, ?2, ?3, ?2, ?4, ?2, ?5, ?6,
+                1, 1, 0, ?7, 'closed', 'absence_proved', 4, 2,
+                1000, 2000, 2000, 1000, 2000)",
+            rusqlite::params![
+                "1".repeat(64),
+                ciphertext,
+                "2".repeat(64),
+                "3".repeat(64),
+                "4".repeat(64),
+                "5".repeat(64),
+                "f".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        let mutate_timestamp = conn.execute(
+            "UPDATE jobs_workflow_legacy_targets
+                SET first_absence_observed_at_ms = 999, updated_at_ms = 2001
+              WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+            rusqlite::params!["1".repeat(64)],
+        );
+        assert!(mutate_timestamp.is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET positive_reset_required = 1, updated_at_ms = 2001
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64)],
+            )
+            .is_err());
+        let reuse_epoch = conn.execute(
+            "UPDATE jobs_workflow_legacy_targets
+                SET target_state = 'delete_pending', updated_at_ms = 2001
+              WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+            rusqlite::params!["1".repeat(64)],
+        );
+        assert!(reuse_epoch.is_err());
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET workflow_id_ciphertext = NULL, run_id_ciphertext = NULL,
+                        first_execution_run_id_ciphertext = NULL,
+                        raw_ids_scrubbed = 1, updated_at_ms = 2001
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64)],
+            )
+            .unwrap(),
+            1
+        );
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET target_state = 'delete_pending', proof_epoch = 5,
+                        observation_pass = 1, first_absence_observed_at_ms = NULL,
+                        absence_proved_at_ms = NULL, request_id = NULL,
+                        first_request_started_at_ms = NULL, lease_owner = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        updated_at_ms = 2002
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64)],
+            )
+            .is_err());
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_workflow_legacy_targets
+                    SET target_state = 'delete_pending', proof_epoch = 5,
+                        observation_pass = 1, first_absence_observed_at_ms = NULL,
+                        absence_proved_at_ms = NULL, request_id = NULL,
+                        first_request_started_at_ms = NULL, lease_owner = NULL,
+                        lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
+                        workflow_id_ciphertext = ?2, run_id_ciphertext = ?2,
+                        first_execution_run_id_ciphertext = ?2,
+                        raw_ids_scrubbed = 0, updated_at_ms = 2002
+                  WHERE generation = 900612 AND target_identity_hmac_sha256 = ?1",
+                rusqlite::params!["1".repeat(64), ciphertext],
+            )
+            .unwrap(),
+            1
+        );
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn workflow_cleanup_v2_proved_tuple_and_run_set_are_epoch_bound() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-workflow-v2-proof-epoch-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).unwrap();
+        run_migrations(&pool).unwrap();
+        let account =
+            crate::db::accounts::Account::create(&pool, "v2-proof@bluey.test", "hash").unwrap();
+        let conn = pool.get().unwrap();
+        let ciphertext = format!("bluey-jobs:v1:{}", "x".repeat(24));
+        let workflow_id = "workflow-v2-proof-0001";
+        let request_id = "workflow-request-v2-proof-01";
+        let cleanup_request_id = "wfcleanup-v2-proof-request";
+        let target_set = "6".repeat(64);
+        let target_digest = "8".repeat(64);
+        conn.execute(
+            "INSERT INTO jobs_postings (
+                id, account_id, canonical_key, posting_json, source,
+                company, title, match_score, status, created_at_ms, updated_at_ms
+             ) VALUES ('posting-v2-proof', ?1, 'v2-proof', '{}', 'test',
+                'Bluey', 'Proof', 0, 'matched', 1000, 1000)",
+            rusqlite::params![account.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_applications (
+                id, account_id, job_id, state, application_json,
+                created_at_ms, updated_at_ms
+             ) VALUES ('application-v2-proof', ?1, 'posting-v2-proof',
+                'matched', '{}', 1000, 1000)",
+            rusqlite::params![account.id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_commands (
+                id, account_id, application_id, run_id, workflow_id,
+                command_kind, idempotency_key_hmac_sha256, request_id,
+                request_hmac_sha256, payload_hmac_sha256, state, command_json,
+                next_attempt_at_ms, created_at_ms, updated_at_ms
+             ) VALUES ('command-v2-proof', ?1, 'application-v2-proof',
+                'command-run-v2-proof-01', ?2, 'start', ?3, ?4, ?5, ?6,
+                'pending', ?7, 1000, 1000, 1000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "1".repeat(64),
+                request_id,
+                "2".repeat(64),
+                "3".repeat(64),
+                ciphertext,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_generations (
+                generation, inventory_generation_id, namespace_ciphertext,
+                namespace_hmac_sha256, workflow_type, visibility_cutoff_ms,
+                confirmation_age_ms, visibility_query_ciphertext,
+                query_digest_sha256, query_hmac_sha256, state, scan_pass,
+                page_index, predecessor_page_digest_sha256, next_attempt_at_ms,
+                completion_epoch, created_at_ms, updated_at_ms
+             ) VALUES (900613, 'wfinventory-v3-v2-proof', ?1, ?2,
+                'applicationWorkflow', 1783900800000, 1000, ?1, ?3, ?4,
+                'scanning', 1, 0, ?5, 1000, 1, 1000, 1000)",
+            rusqlite::params![
+                ciphertext,
+                "a".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64),
+                "d".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_legacy_inventory_head (
+                singleton_id, generation, inventory_generation_id,
+                query_digest_sha256, updated_at_ms
+             ) VALUES (1, 900613, 'wfinventory-v3-v2-proof', ?1, 1000)",
+            rusqlite::params!["b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_generations (
+                account_id, generation, state, target_set_hmac_sha256,
+                target_count, frozen_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1, 'frozen', ?2, 1, 1000, 1000, 1000)",
+            rusqlite::params![account.id, target_set],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_targets (
+                account_id, generation, target_set_hmac_sha256, workflow_id,
+                start_command_id, start_request_id, start_payload_hmac_sha256,
+                target_state, fence, cleanup_request_id, lease_owner,
+                lease_token_sha256, lease_expires_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1, ?2, ?3, 'command-v2-proof', ?4, ?5,
+                'cleanup_required', 1, ?6, 'test-owner', ?7, 5000, 1000, 1000)",
+            rusqlite::params![
+                account.id,
+                target_set,
+                workflow_id,
+                request_id,
+                "3".repeat(64),
+                cleanup_request_id,
+                "9".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_v2_target_authorities (
+                account_id, workflow_cleanup_generation, workflow_id,
+                known_run_epoch, known_run_set_digest_sha256,
+                target_digest_sha256, observation_pass, request_epoch,
+                cleanup_fence, cleanup_request_id, first_request_started_at_ms,
+                lease_owner, lease_token_sha256, lease_expires_at_ms,
+                next_attempt_at_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1, ?2, 1, ?3, ?4, 1, 1, 1, ?5, 1000,
+                'test-owner', ?6, 5000, 1000, 1000, 1000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "7".repeat(64),
+                target_digest,
+                cleanup_request_id,
+                "9".repeat(64),
+            ],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_workflow_cleanup_v2_run_observations (
+                    account_id, workflow_cleanup_generation, workflow_id,
+                    known_run_epoch, observation_pass, subject_kind,
+                    run_id_hmac_sha256, target_digest_sha256, request_epoch,
+                    cleanup_fence, cleanup_request_id, evidence_digest_sha256,
+                    describe_state, history_state, visibility_state, recorded_at_ms
+                 ) VALUES (?1, 1, ?2, 1, 1, 'workflow', ?3, ?4, 1, 1, ?5, ?6,
+                    'not_found', 'not_found', 'not_found', 1000)",
+                rusqlite::params![
+                    account.id,
+                    workflow_id,
+                    "0".repeat(64),
+                    target_digest,
+                    cleanup_request_id,
+                    "a".repeat(64),
+                ],
+            )
+            .is_err());
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_account_bindings (
+                account_id, account_generation, workflow_cleanup_generation,
+                cleanup_generation_id, target_set_hmac_sha256, legacy_generation,
+                legacy_inventory_generation_id, legacy_query_digest_sha256,
+                state, created_at_ms, updated_at_ms
+             ) VALUES (?1, 1000, 1, 'wfcleanup-v3-account-proof', ?2, 900613,
+                'wfinventory-v3-v2-proof', ?3, 'draining', 1000, 1000)",
+            rusqlite::params![account.id, target_set, "b".repeat(64)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_v2_run_observations (
+                account_id, workflow_cleanup_generation, workflow_id,
+                known_run_epoch, observation_pass, subject_kind,
+                run_id_hmac_sha256, target_digest_sha256, request_epoch,
+                cleanup_fence, cleanup_request_id, evidence_digest_sha256,
+                describe_state, history_state, visibility_state, recorded_at_ms
+             ) VALUES (?1, 1, ?2, 1, 1, 'workflow', ?3, ?4, 1, 1, ?5, ?6,
+                'not_found', 'not_found', 'not_found', 1000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "0".repeat(64),
+                target_digest,
+                cleanup_request_id,
+                "a".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                SET observation_pass = 2, first_absence_observed_at_ms = 1000,
+                    updated_at_ms = 1001
+              WHERE account_id = ?1 AND workflow_id = ?2",
+            rusqlite::params![account.id, workflow_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_cleanup_v2_run_observations (
+                account_id, workflow_cleanup_generation, workflow_id,
+                known_run_epoch, observation_pass, subject_kind,
+                run_id_hmac_sha256, target_digest_sha256, request_epoch,
+                cleanup_fence, cleanup_request_id, evidence_digest_sha256,
+                describe_state, history_state, visibility_state, recorded_at_ms
+             ) VALUES (?1, 1, ?2, 1, 2, 'workflow', ?3, ?4, 1, 1, ?5, ?6,
+                'not_found', 'not_found', 'not_found', 2000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                "0".repeat(64),
+                target_digest,
+                cleanup_request_id,
+                "b".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_workflow_execution_cleanup_observations (
+                id, account_id, workflow_id, generation,
+                target_set_hmac_sha256, observation_kind,
+                observed_execution_run_id, cleanup_fence,
+                cleanup_request_id, evidence_hmac_sha256, recorded_at_ms
+             ) VALUES ('wfcleanup-v2-absence-proof', ?1, ?2, 1, ?3,
+                'absence_proved', NULL, 1, ?4, ?5, 2000)",
+            rusqlite::params![
+                account.id,
+                workflow_id,
+                target_set,
+                cleanup_request_id,
+                "c".repeat(64),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE jobs_workflow_cleanup_targets
+                SET target_state = 'absence_proved', absence_proved_at_ms = 2000,
+                    lease_owner = NULL, lease_token_sha256 = NULL,
+                    lease_expires_at_ms = NULL, updated_at_ms = 2000
+              WHERE account_id = ?1 AND generation = 1 AND workflow_id = ?2",
+            rusqlite::params![account.id, workflow_id],
+        )
+        .unwrap();
+
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET observation_pass = 1, first_absence_observed_at_ms = NULL
+                  WHERE account_id = ?1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET target_digest_sha256 = ?1
+                  WHERE account_id = ?2 AND workflow_id = ?3",
+                rusqlite::params!["d".repeat(64), account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_targets
+                    SET absence_proved_at_ms = 2001
+                  WHERE account_id = ?1 AND generation = 1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET positive_reset_required = 1
+                  WHERE account_id = ?1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_targets
+                    SET first_execution_run_id = '00000000-0000-4000-8000-000000000001'
+                  WHERE account_id = ?1 AND generation = 1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE jobs_workflow_cleanup_v2_target_authorities
+                    SET known_run_epoch = 2, observation_pass = 1,
+                        first_absence_observed_at_ms = NULL,
+                        cleanup_request_id = NULL, first_request_started_at_ms = NULL,
+                        lease_owner = NULL, lease_token_sha256 = NULL,
+                        lease_expires_at_ms = NULL
+                  WHERE account_id = ?1 AND workflow_id = ?2",
+                rusqlite::params![account.id, workflow_id],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "INSERT INTO jobs_workflow_cleanup_v2_known_runs (
+                    account_id, workflow_cleanup_generation, workflow_id,
+                    run_id_hmac_sha256, run_id_ciphertext,
+                    discovered_request_epoch, discovered_cleanup_fence,
+                    run_identity_digest_sha256, created_at_ms
+                 ) VALUES (?1, 1, ?2, ?3, ?4, 1, 1, ?5, 2001)",
+                rusqlite::params![
+                    account.id,
+                    workflow_id,
+                    "e".repeat(64),
+                    ciphertext,
+                    "f".repeat(64),
+                ],
+            )
+            .is_err());
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -3683,17 +4338,19 @@ mod postgres_migration_tests {
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
         JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
         JOBS_OPERATIONAL_HOLDS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
-        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
         POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
         POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
         POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
         POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
-        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_COMMANDS,
-        POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS, SQLITE_ACCOUNT_DELETION_INTENTS,
-        SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
-        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
-        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+        POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
+        SQLITE_ACCOUNT_DELETION_INTENTS, SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
+        SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
+        SQLITE_JOBS_OPERATIONAL_HOLDS, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         SQLITE_JOBS_WORKFLOW_COMMANDS,
     };
 
@@ -3707,11 +4364,23 @@ mod postgres_migration_tests {
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
+        let postgres_authority = POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let sqlite_authority = SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
 
         assert!(POSTGRES_POST_JOBS_MIGRATIONS
             .iter()
             .any(|(id, sql)| *id == JOBS_WORKFLOW_COMMANDS_MIGRATION_ID
                 && *sql == POSTGRES_JOBS_WORKFLOW_COMMANDS));
+        assert!(POSTGRES_POST_JOBS_MIGRATIONS.iter().any(|(id, sql)| {
+            *id == JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID
+                && *sql == POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY
+        }));
         assert!(postgres.contains(
             "legacy_reconciled BOOLEAN NOT NULL DEFAULT FALSE CHECK(NOT legacy_reconciled)"
         ));
@@ -3727,6 +4396,145 @@ mod postgres_migration_tests {
             assert!(
                 schema.contains("firstExecutionRunId") || schema.contains("first_execution_run_id")
             );
+        }
+        let legacy_positive_reset_error =
+            "workflow legacy positive evidence requires a new proof epoch";
+        let v2_proof_tuple_error = "workflow v2 proof tuple must advance from immutable evidence";
+        for schema in [&postgres_authority, &sqlite_authority] {
+            assert!(schema.contains("jobs_workflow_legacy_inventory_pages"));
+            assert!(schema.contains("jobs_workflow_legacy_zero_observations"));
+            assert!(schema.contains("final_page_index"));
+            assert!(schema.contains("page_target_count = 0"));
+            assert!(schema.contains("page_index BETWEEN 0 AND 4095"));
+            assert!(schema.contains("raw_ciphertexts_scrubbed"));
+            assert!(schema.contains("raw_ids_scrubbed"));
+            assert!(schema.contains("positive_reset_required"));
+            assert!(schema.contains("workflow legacy page is not current request authority"));
+            assert!(schema.contains(legacy_positive_reset_error));
+            assert!(schema.contains("generation.state IN ('scanning', 'draining')"));
+            assert!(
+                schema.contains("workflow legacy completion epoch must advance and reopen cleanly")
+            );
+            assert!(
+                schema.contains("workflow legacy target terminal state requires a new proof epoch")
+            );
+            assert!(schema.contains("jobs_workflow_cleanup_v2_run_observations"));
+            assert!(schema.contains("known_run_epoch"));
+            assert!(schema.contains("workflow v2 known run set exceeds 32"));
+            assert!(schema.contains(v2_proof_tuple_error));
+            assert!(schema.contains("workflow v2 proved target is immutable"));
+            assert!(schema.contains("workflow v2 terminal positive-reset authority is immutable"));
+            assert!(schema.contains("first.recorded_at_ms = NEW.first_absence_observed_at_ms"));
+            assert!(schema.contains("NEW.absence_proved_at_ms >= second.recorded_at_ms"));
+            assert!(schema.contains("legacy.revalidate_after_ms"));
+            assert!(schema.contains("jobs_workflow_cleanup_object_sweep_scopes"));
+            assert!(schema.contains("jobs_workflow_cleanup_object_sweep_authorization_scopes"));
+            assert!(schema.contains("jobs_workflow_cleanup_hard_delete_cascade_tokens"));
+            assert!(schema.contains("ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED"));
+            assert!(schema.contains(
+                "NOT EXISTS (SELECT 1 FROM accounts account WHERE account.id = OLD.account_id)"
+            ));
+            assert!(schema.contains("OR EXISTS (SELECT 1 FROM jobs_workflow_commands"));
+        }
+        assert!(postgres_authority.contains("prefix_sweep BOOLEAN NOT NULL CHECK(prefix_sweep)"));
+        assert!(sqlite_authority.contains("prefix_sweep INTEGER NOT NULL CHECK(prefix_sweep = 1)"));
+        assert!(
+            postgres_authority
+                .matches("request_id ~ '^[A-Za-z0-9_-]{20,128}$'")
+                .count()
+                >= 6
+        );
+        assert!(
+            sqlite_authority
+                .matches("request_id NOT GLOB '*[^A-Za-z0-9_-]*'")
+                .count()
+                >= 6
+        );
+        assert!(!postgres_authority
+            .contains("FROM jobs_workflow_cleanup_object_sweep_authorizations authorization"));
+        let postgres_drop_hard_delete = postgres_authority
+            .find("DROP VIEW IF EXISTS jobs_workflow_cleanup_hard_delete_ready")
+            .unwrap();
+        let postgres_drop_ready_sweeps = postgres_authority
+            .find("DROP VIEW IF EXISTS jobs_workflow_cleanup_ready_object_sweeps")
+            .unwrap();
+        let postgres_drop_v2_proved = postgres_authority
+            .find("DROP VIEW IF EXISTS jobs_workflow_cleanup_v2_proved_targets")
+            .unwrap();
+        assert!(postgres_drop_hard_delete < postgres_drop_ready_sweeps);
+        assert!(postgres_drop_ready_sweeps < postgres_drop_v2_proved);
+        assert!(postgres_authority.contains(
+            "second.recorded_at_ms >= first.recorded_at_ms + generation.confirmation_age_ms"
+        ));
+        assert!(sqlite_authority.contains(
+            "second.recorded_at_ms >= first.recorded_at_ms + generation.confirmation_age_ms"
+        ));
+        assert!(postgres_authority
+            .contains("NEW.first_execution_run_id IS DISTINCT FROM OLD.first_execution_run_id"));
+        assert!(sqlite_authority
+            .contains("NEW.first_execution_run_id IS NOT OLD.first_execution_run_id"));
+        let postgres_v2_observation_start = concat!(
+            "CREATE OR REPLACE FUNCTION ",
+            "validate_jobs_workflow_cleanup_v2_observation_insert"
+        );
+        let postgres_v2_observation_guard = postgres_authority
+            .split(postgres_v2_observation_start)
+            .nth(1)
+            .unwrap()
+            .split(concat!(
+                "DROP TRIGGER IF EXISTS ",
+                "trg_jobs_workflow_cleanup_v2_observation_current_lease"
+            ))
+            .next()
+            .unwrap();
+        let sqlite_v2_observation_guard = sqlite_authority
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_cleanup_v2_observation_current_lease"
+            ))
+            .nth(1)
+            .unwrap()
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_cleanup_v2_target_proved_immutable"
+            ))
+            .next()
+            .unwrap();
+        for guard in [postgres_v2_observation_guard, sqlite_v2_observation_guard] {
+            assert!(guard.contains("JOIN jobs_workflow_cleanup_account_bindings binding"));
+            assert!(guard.contains("JOIN jobs_workflow_legacy_inventory_generations legacy"));
+        }
+        let postgres_legacy_proof_guard = postgres_authority
+            .split(concat!(
+                "CREATE OR REPLACE FUNCTION ",
+                "validate_jobs_workflow_legacy_target_proof_epoch_update"
+            ))
+            .nth(1)
+            .unwrap()
+            .split("DROP TRIGGER IF EXISTS trg_jobs_workflow_legacy_target_proof_epoch_guard")
+            .next()
+            .unwrap();
+        let sqlite_legacy_proof_guard = sqlite_authority
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_legacy_target_proof_epoch_guard"
+            ))
+            .nth(1)
+            .unwrap()
+            .split(concat!(
+                "CREATE TRIGGER IF NOT EXISTS ",
+                "trg_jobs_workflow_legacy_target_terminal_guard"
+            ))
+            .next()
+            .unwrap();
+        for guard in [postgres_legacy_proof_guard, sqlite_legacy_proof_guard] {
+            assert!(guard.contains("FROM jobs_workflow_legacy_inventory_head head"));
+            assert!(guard.contains("generation.generation = head.generation"));
+            assert!(
+                guard.contains("generation.inventory_generation_id = head.inventory_generation_id")
+            );
+            assert!(guard.contains("generation.query_digest_sha256 = head.query_digest_sha256"));
+            assert!(guard.contains("generation.state IN ('scanning', 'draining')"));
         }
     }
 

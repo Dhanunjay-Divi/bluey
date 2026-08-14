@@ -78,6 +78,12 @@ pub enum BeginAccountDeletionResult {
     WaitingForIrreversibleCommunications { active_actions: i64 },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeginAccountDeletionWithWorkflowCleanupResult {
+    pub deletion: BeginAccountDeletionResult,
+    pub workflow_cleanup: Option<jobs::JobsWorkflowCleanupDeletionStatus>,
+}
+
 impl BeginAccountDeletionResult {
     pub fn intent(&self) -> Option<&AccountDeletionIntent> {
         match self {
@@ -332,31 +338,50 @@ pub(crate) fn hard_delete_account_after_setup_failure(
     })
 }
 
-/// Hard-delete a fenced account only after the exact runner-volume purge
-/// request has completed and its indefinite tombstone is durable.
+/// Hard-delete a fenced account only after the exact runner-volume purge,
+/// workflow-cleanup tombstone, and authorized object sweep are durable.
 ///
 /// The caller must hold the account's exclusive object-lifecycle guard across
 /// its final object-store sweep and this transaction. This transaction
 /// independently reasserts the durable fence, drained uploads, absence of an
-/// unresolved irreversible submission, and the exact completed purge
-/// tombstone so no API or alternate call site can bypass the deletion gate.
+/// unresolved irreversible submission, the exact completed runner purge, the
+/// current workflow-cleanup proof, and the completed authorized object sweep
+/// so no alternate call site can bypass an erasure gate.
 pub(crate) fn hard_delete_account_after_runner_purge(
     pool: &DbPool,
     account_id: &str,
+    requested_at_ms: i64,
     purge_request_id: &str,
+    sweep_attempt_id: &str,
+    workflow_cleanup_proof: &jobs::JobsWorkflowCleanupDeletionProof,
 ) -> Result<bool> {
     anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
+    anyhow::ensure!(requested_at_ms >= 0, "requested_at_ms must be non-negative");
     anyhow::ensure!(
         !purge_request_id.trim().is_empty(),
         "purge_request_id is required"
     );
+    anyhow::ensure!(
+        !sweep_attempt_id.trim().is_empty(),
+        "sweep_attempt_id is required"
+    );
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => {
-            hard_delete_account_after_runner_purge_sqlite(pool, account_id, purge_request_id)
-        }
-        DbPool::Postgres(_) => {
-            hard_delete_account_after_runner_purge_postgres(pool, account_id, purge_request_id)
-        }
+        DbPool::Sqlite(_) => hard_delete_account_after_runner_purge_sqlite(
+            pool,
+            account_id,
+            requested_at_ms,
+            purge_request_id,
+            sweep_attempt_id,
+            workflow_cleanup_proof,
+        ),
+        DbPool::Postgres(_) => hard_delete_account_after_runner_purge_postgres(
+            pool,
+            account_id,
+            requested_at_ms,
+            purge_request_id,
+            sweep_attempt_id,
+            workflow_cleanup_proof,
+        ),
     })
 }
 
@@ -371,9 +396,36 @@ pub fn begin_account_deletion(
 ) -> Result<Option<BeginAccountDeletionResult>> {
     anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
     anyhow::ensure!(now_ms >= 0, "now_ms must be non-negative");
+    crate::db::run_blocking_db(|| {
+        let result = match pool {
+            DbPool::Sqlite(_) => begin_account_deletion_sqlite(pool, account_id, now_ms, None)?,
+            DbPool::Postgres(_) => begin_account_deletion_postgres(pool, account_id, now_ms, None)?,
+        };
+        Ok(result.map(|result| result.deletion))
+    })
+}
+
+/// Atomically establish the deletion intent and freeze its exact workflow
+/// cleanup generation against a preexisting global legacy authority.
+///
+/// Irreversible submission/communication blockers return without creating an
+/// account deletion intent or workflow-cleanup binding. A missing or drifted
+/// global authority rolls the whole transaction back.
+pub fn begin_account_deletion_with_workflow_cleanup(
+    pool: &DbPool,
+    account_id: &str,
+    now_ms: i64,
+    legacy_authority: &jobs::JobsLegacyInventoryAuthorityRef,
+) -> Result<Option<BeginAccountDeletionWithWorkflowCleanupResult>> {
+    anyhow::ensure!(!account_id.trim().is_empty(), "account_id is required");
+    anyhow::ensure!(now_ms >= 0, "now_ms must be non-negative");
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => begin_account_deletion_sqlite(pool, account_id, now_ms),
-        DbPool::Postgres(_) => begin_account_deletion_postgres(pool, account_id, now_ms),
+        DbPool::Sqlite(_) => {
+            begin_account_deletion_sqlite(pool, account_id, now_ms, Some(legacy_authority))
+        }
+        DbPool::Postgres(_) => {
+            begin_account_deletion_postgres(pool, account_id, now_ms, Some(legacy_authority))
+        }
     })
 }
 
@@ -979,7 +1031,8 @@ fn begin_account_deletion_sqlite(
     pool: &DbPool,
     account_id: &str,
     now_ms: i64,
-) -> Result<Option<BeginAccountDeletionResult>> {
+    legacy_authority: Option<&jobs::JobsLegacyInventoryAuthorityRef>,
+) -> Result<Option<BeginAccountDeletionWithWorkflowCleanupResult>> {
     let mut conn = pool
         .get()
         .context("get sqlite account-deletion connection")?;
@@ -1027,9 +1080,12 @@ fn begin_account_deletion_sqlite(
     )?;
     if active_submissions > 0 {
         tx.commit()?;
-        return Ok(Some(
-            BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
-        ));
+        return Ok(Some(BeginAccountDeletionWithWorkflowCleanupResult {
+            deletion: BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+                active_submissions,
+            },
+            workflow_cleanup: None,
+        }));
     }
 
     let active_actions: i64 = tx.query_row(
@@ -1040,9 +1096,12 @@ fn begin_account_deletion_sqlite(
     )?;
     if active_actions > 0 {
         tx.commit()?;
-        return Ok(Some(
-            BeginAccountDeletionResult::WaitingForIrreversibleCommunications { active_actions },
-        ));
+        return Ok(Some(BeginAccountDeletionWithWorkflowCleanupResult {
+            deletion: BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+                active_actions,
+            },
+            workflow_cleanup: None,
+        }));
     }
 
     let cutoff_ms = now_ms.saturating_sub(ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS);
@@ -1073,15 +1132,30 @@ fn begin_account_deletion_sqlite(
         params![account_id],
         account_deletion_intent_from_sqlite,
     )?;
+    let workflow_cleanup = legacy_authority
+        .map(|legacy_authority| {
+            jobs::freeze_jobs_workflow_cleanup_for_deletion_sqlite_tx(
+                &tx,
+                account_id,
+                intent.requested_at_ms,
+                legacy_authority,
+                now_ms,
+            )
+        })
+        .transpose()?;
     tx.commit()?;
-    Ok(Some(classify_account_deletion_intent(intent)))
+    Ok(Some(BeginAccountDeletionWithWorkflowCleanupResult {
+        deletion: classify_account_deletion_intent(intent),
+        workflow_cleanup,
+    }))
 }
 
 fn begin_account_deletion_postgres(
     pool: &DbPool,
     account_id: &str,
     now_ms: i64,
-) -> Result<Option<BeginAccountDeletionResult>> {
+    legacy_authority: Option<&jobs::JobsLegacyInventoryAuthorityRef>,
+) -> Result<Option<BeginAccountDeletionWithWorkflowCleanupResult>> {
     let mut conn = pool
         .get_pg()
         .context("get postgres account-deletion connection")?;
@@ -1129,9 +1203,12 @@ fn begin_account_deletion_postgres(
         .try_get(0)?;
     if active_submissions > 0 {
         tx.commit()?;
-        return Ok(Some(
-            BeginAccountDeletionResult::WaitingForIrreversibleSubmissions { active_submissions },
-        ));
+        return Ok(Some(BeginAccountDeletionWithWorkflowCleanupResult {
+            deletion: BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+                active_submissions,
+            },
+            workflow_cleanup: None,
+        }));
     }
 
     let active_actions: i64 = tx
@@ -1143,9 +1220,12 @@ fn begin_account_deletion_postgres(
         .get(0);
     if active_actions > 0 {
         tx.commit()?;
-        return Ok(Some(
-            BeginAccountDeletionResult::WaitingForIrreversibleCommunications { active_actions },
-        ));
+        return Ok(Some(BeginAccountDeletionWithWorkflowCleanupResult {
+            deletion: BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+                active_actions,
+            },
+            workflow_cleanup: None,
+        }));
     }
 
     let cutoff_ms = now_ms.saturating_sub(ACCOUNT_DELETION_FRESH_UPLOAD_WINDOW_MS);
@@ -1178,8 +1258,22 @@ fn begin_account_deletion_postgres(
         &[&account_id],
     )?;
     let intent = account_deletion_intent_from_pg(&row)?;
+    let workflow_cleanup = legacy_authority
+        .map(|legacy_authority| {
+            jobs::freeze_jobs_workflow_cleanup_for_deletion_postgres_tx(
+                &mut tx,
+                account_id,
+                intent.requested_at_ms,
+                legacy_authority,
+                now_ms,
+            )
+        })
+        .transpose()?;
     tx.commit()?;
-    Ok(Some(classify_account_deletion_intent(intent)))
+    Ok(Some(BeginAccountDeletionWithWorkflowCleanupResult {
+        deletion: classify_account_deletion_intent(intent),
+        workflow_cleanup,
+    }))
 }
 
 fn account_deletion_intent_sqlite(
@@ -1326,6 +1420,10 @@ fn hard_delete_account_after_setup_failure_sqlite(pool: &DbPool, account_id: &st
         params![account_id],
     )?;
     let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+    tx.execute(
+        DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_SQLITE,
+        params![account_id],
+    )?;
     tx.commit()?;
     Ok(deleted > 0)
 }
@@ -1358,14 +1456,29 @@ fn hard_delete_account_after_setup_failure_postgres(
     )
     .ok();
     let deleted = tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+    tx.execute(
+        DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_POSTGRES,
+        &[&account_id],
+    )?;
     tx.commit()?;
     Ok(deleted > 0)
 }
 
+// The account BEFORE DELETE guard creates this token for child delete guards.
+// Remove it only after the parent DELETE statement returns, when every FK
+// cascade has completed, and before the deferred token FK is checked at commit.
+const DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_SQLITE: &str =
+    "DELETE FROM jobs_workflow_cleanup_hard_delete_cascade_tokens WHERE account_id = ?1";
+const DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_POSTGRES: &str =
+    "DELETE FROM jobs_workflow_cleanup_hard_delete_cascade_tokens WHERE account_id = $1";
+
 fn hard_delete_account_after_runner_purge_sqlite(
     pool: &DbPool,
     account_id: &str,
+    requested_at_ms: i64,
     purge_request_id: &str,
+    sweep_attempt_id: &str,
+    workflow_cleanup_proof: &jobs::JobsWorkflowCleanupDeletionProof,
 ) -> Result<bool> {
     let mut conn = pool.get()?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1469,6 +1582,13 @@ fn hard_delete_account_after_runner_purge_sqlite(
         purge_is_complete,
         "runner-purge hard delete requires the exact completed purge tombstone"
     );
+    jobs::require_account_deletion_workflow_cleanup_complete_sqlite_tx(
+        &tx,
+        account_id,
+        requested_at_ms,
+        sweep_attempt_id,
+        workflow_cleanup_proof,
+    )?;
 
     tx.execute(
         "DELETE FROM stripe_webhook_events
@@ -1477,6 +1597,14 @@ fn hard_delete_account_after_runner_purge_sqlite(
         params![account_id],
     )?;
     let deleted = tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+    let cascade_token_deleted = tx.execute(
+        DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_SQLITE,
+        params![account_id],
+    )?;
+    anyhow::ensure!(
+        deleted == 1 && cascade_token_deleted == 1,
+        "runner-purge hard delete requires exactly one cascade token"
+    );
     tx.commit()?;
     Ok(deleted > 0)
 }
@@ -1495,7 +1623,10 @@ const POSTGRES_LOCK_ACCOUNT_FOR_RUNNER_PURGE_HARD_DELETE_SQL: &str =
 fn hard_delete_account_after_runner_purge_postgres(
     pool: &DbPool,
     account_id: &str,
+    requested_at_ms: i64,
     purge_request_id: &str,
+    sweep_attempt_id: &str,
+    workflow_cleanup_proof: &jobs::JobsWorkflowCleanupDeletionProof,
 ) -> Result<bool> {
     let mut conn = pool.get_pg()?;
     let mut tx = conn.transaction()?;
@@ -1629,6 +1760,13 @@ fn hard_delete_account_after_runner_purge_postgres(
         purge_is_complete,
         "runner-purge hard delete requires the exact completed purge tombstone"
     );
+    jobs::require_account_deletion_workflow_cleanup_complete_postgres_tx(
+        &mut tx,
+        account_id,
+        requested_at_ms,
+        sweep_attempt_id,
+        workflow_cleanup_proof,
+    )?;
 
     tx.execute(
         "DELETE FROM stripe_webhook_events
@@ -1637,6 +1775,14 @@ fn hard_delete_account_after_runner_purge_postgres(
         &[&account_id],
     )?;
     let deleted = tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+    let cascade_token_deleted = tx.execute(
+        DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_POSTGRES,
+        &[&account_id],
+    )?;
+    anyhow::ensure!(
+        deleted == 1 && cascade_token_deleted == 1,
+        "runner-purge hard delete requires exactly one cascade token"
+    );
     tx.commit()?;
     Ok(deleted > 0)
 }
@@ -2207,13 +2353,37 @@ mod tests {
         crate::db::run_blocking_db(|| -> Result<()> {
             match pool {
                 DbPool::Sqlite(_) => {
-                    pool.get()?
-                        .execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+                    let mut conn = pool.get()?;
+                    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                    // These lifecycle tests establish a fence only to exercise
+                    // writer serialization. Remove that test fixture before
+                    // teardown so the production hard-delete guard remains
+                    // strict and is never weakened for test cleanup.
+                    tx.execute(
+                        "DELETE FROM account_deletion_intents WHERE account_id = ?1",
+                        params![account_id],
+                    )?;
+                    tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])?;
+                    tx.execute(
+                        DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_SQLITE,
+                        params![account_id],
+                    )?;
+                    tx.commit()?;
                     Ok(())
                 }
                 DbPool::Postgres(_) => {
-                    pool.get_pg()?
-                        .execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+                    let mut conn = pool.get_pg()?;
+                    let mut tx = conn.transaction()?;
+                    tx.execute(
+                        "DELETE FROM account_deletion_intents WHERE account_id = $1",
+                        &[&account_id],
+                    )?;
+                    tx.execute("DELETE FROM accounts WHERE id = $1", &[&account_id])?;
+                    tx.execute(
+                        DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_POSTGRES,
+                        &[&account_id],
+                    )?;
+                    tx.commit()?;
                     Ok(())
                 }
             }
@@ -2432,32 +2602,108 @@ mod tests {
     #[test]
     fn irreversible_submission_outcomes_block_deletion_without_creating_a_fence() {
         let pool = test_pool();
+        let legacy = jobs::prepare_jobs_legacy_inventory_generation(
+            &pool,
+            &jobs::PrepareJobsLegacyInventoryGeneration {
+                namespace: "bluey-jobs-account-delete-test".to_string(),
+                visibility_cutoff_ms: 900_000,
+                confirmation_age_ms: 1_000,
+                now_ms: 900_000,
+            },
+        )
+        .unwrap();
         seed_irreversible_submissions(&pool, "acct-delete", "sqlite-irreversible");
 
+        let blocked = begin_account_deletion_with_workflow_cleanup(
+            &pool,
+            "acct-delete",
+            1_000_000,
+            &legacy.authority,
+        )
+        .unwrap()
+        .expect("account exists");
         assert_eq!(
-            begin_account_deletion(&pool, "acct-delete", 1_000_000).unwrap(),
-            Some(
-                BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
-                    active_submissions: 4,
-                }
-            )
+            blocked.deletion,
+            BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+                active_submissions: 4,
+            }
         );
+        assert!(blocked.workflow_cleanup.is_none());
         assert_eq!(
             account_deletion_intent(&pool, "acct-delete").unwrap(),
             None,
             "click_started and side_effect_unknown outcomes must not create deletion intent"
         );
+        let cleanup_binding_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_workflow_cleanup_account_bindings
+                  WHERE account_id = 'acct-delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleanup_binding_count, 0);
 
         finish_irreversible_submissions(&pool, "acct-delete");
+        let ready = begin_account_deletion_with_workflow_cleanup(
+            &pool,
+            "acct-delete",
+            1_000_001,
+            &legacy.authority,
+        )
+        .unwrap()
+        .expect("account exists");
         assert!(matches!(
-            begin_account_deletion(&pool, "acct-delete", 1_000_001)
-                .unwrap()
-                .unwrap(),
+            ready.deletion,
             BeginAccountDeletionResult::Ready(_)
         ));
+        assert!(ready.workflow_cleanup.is_some());
         assert!(account_deletion_intent(&pool, "acct-delete")
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn workflow_cleanup_authority_drift_rolls_back_the_deletion_intent() {
+        let pool = test_pool();
+        let prepared = jobs::prepare_jobs_legacy_inventory_generation(
+            &pool,
+            &jobs::PrepareJobsLegacyInventoryGeneration {
+                namespace: "bluey-jobs-account-drift-test".to_string(),
+                visibility_cutoff_ms: 900_000,
+                confirmation_age_ms: 1_000,
+                now_ms: 900_000,
+            },
+        )
+        .unwrap();
+        let mut stale = prepared.authority;
+        stale.query_digest = "9".repeat(64);
+
+        assert!(begin_account_deletion_with_workflow_cleanup(
+            &pool,
+            "acct-delete",
+            1_000_000,
+            &stale,
+        )
+        .is_err());
+        assert_eq!(
+            account_deletion_intent(&pool, "acct-delete").unwrap(),
+            None,
+            "authority mismatch must roll the deletion intent back"
+        );
+        let cleanup_binding_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_workflow_cleanup_account_bindings
+                  WHERE account_id = 'acct-delete'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cleanup_binding_count, 0);
     }
 
     #[test]
@@ -2769,13 +3015,25 @@ mod tests {
         let authority_check = function
             .find("request.legacy_inventory_generation = $3")
             .expect("exact locked authority check");
+        let workflow_cleanup_check = function
+            .find("require_account_deletion_workflow_cleanup_complete_postgres_tx")
+            .expect("exact workflow-cleanup and object-sweep check");
         let account_delete = function
             .find("DELETE FROM accounts WHERE id = $1")
             .expect("account deletion");
+        let cascade_token_cleanup = function
+            .find("DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_POSTGRES")
+            .expect("post-cascade token cleanup");
+        let commit = function.find("tx.commit()?").expect("transaction commit");
 
         assert!(fleet_lock < account_lock);
         assert!(account_lock < authority_check);
-        assert!(authority_check < account_delete);
+        assert!(authority_check < workflow_cleanup_check);
+        assert!(workflow_cleanup_check < account_delete);
+        assert!(account_delete < cascade_token_cleanup);
+        assert!(cascade_token_cleanup < commit);
+        assert!(function.contains("deleted == 1 && cascade_token_deleted == 1"));
+        assert!(function.contains("sweep_attempt_id"));
         for exact_authority_clause in [
             "request.legacy_inventory_reconciliation_id = $4",
             "request.legacy_inventory_authority_id = $5",
@@ -2786,7 +3044,46 @@ mod tests {
     }
 
     #[test]
-    fn hard_delete_requires_exact_completed_runner_purge_tombstone() {
+    fn postgres_cascade_token_lifetime_is_deferred_and_caller_owned() {
+        let migration = include_str!(
+            "../../../infra/postgres/server-runtime/032_jobs_workflow_cleanup_authority.sql"
+        );
+        assert!(migration.contains(
+            "FOREIGN KEY(account_id) REFERENCES accounts(id)\n    \
+             ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED"
+        ));
+        assert!(migration.contains(concat!(
+            "DROP TRIGGER IF EXISTS ",
+            "trg_jobs_workflow_account_delete_cascade_token_cleanup ON accounts;"
+        )));
+        assert!(!migration
+            .contains("CREATE TRIGGER trg_jobs_workflow_account_delete_cascade_token_cleanup"));
+        assert!(!migration
+            .contains("CREATE OR REPLACE FUNCTION cleanup_jobs_workflow_account_delete_token"));
+
+        let source = include_str!("account_data.rs");
+        let setup_failure = source
+            .split_once("fn hard_delete_account_after_setup_failure_postgres(")
+            .expect("PostgreSQL setup-failure hard-delete function")
+            .1
+            .split_once("\n// The account BEFORE DELETE guard")
+            .expect("end of PostgreSQL setup-failure hard-delete function")
+            .0;
+        let account_delete = setup_failure
+            .find("DELETE FROM accounts WHERE id = $1")
+            .expect("setup-failure account deletion");
+        let cascade_token_cleanup = setup_failure
+            .find("DELETE_WORKFLOW_CLEANUP_CASCADE_TOKEN_POSTGRES")
+            .expect("setup-failure cascade-token cleanup");
+        let commit = setup_failure
+            .find("tx.commit()?")
+            .expect("setup-failure commit");
+        assert!(account_delete < cascade_token_cleanup);
+        assert!(cascade_token_cleanup < commit);
+    }
+
+    #[test]
+    fn hard_delete_requires_exact_runner_and_workflow_cleanup_tombstones() {
         let pool = test_pool();
         let reconciling = jobs::record_runner_legacy_inventory_authority(
             &pool,
@@ -2835,11 +3132,28 @@ mod tests {
         assert!(account_deletion_intent(&pool, "acct-delete")
             .unwrap()
             .is_some());
+        let missing_workflow_proof = jobs::JobsWorkflowCleanupDeletionProof {
+            account_generation: 1_000_000,
+            cleanup_generation_id: "wfcleanupgen-v3-missing-proof".to_string(),
+            target_set_digest: "7".repeat(64),
+            legacy_authority: jobs::JobsLegacyInventoryAuthorityRef {
+                inventory_generation_id: "wfinventory-v3-missing-proof".to_string(),
+                query_digest: "8".repeat(64),
+            },
+            tombstone_id: "wfcleantomb-v3-missing-proof".to_string(),
+            completion_digest: "9".repeat(64),
+        };
 
         assert!(hard_delete_account_after_setup_failure(&pool, "acct-delete").is_err());
-        assert!(
-            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").is_err()
-        );
+        assert!(hard_delete_account_after_runner_purge(
+            &pool,
+            "acct-delete",
+            1_000_000,
+            "delete-request",
+            "wfsweep-account-v3-missing-test",
+            &missing_workflow_proof,
+        )
+        .is_err());
 
         let conn = pool.get().unwrap();
         conn.execute(
@@ -2864,9 +3178,15 @@ mod tests {
         )
         .unwrap();
         drop(conn);
-        assert!(
-            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").is_err()
-        );
+        assert!(hard_delete_account_after_runner_purge(
+            &pool,
+            "acct-delete",
+            1_000_000,
+            "delete-request",
+            "wfsweep-account-v3-missing-test",
+            &missing_workflow_proof,
+        )
+        .is_err());
 
         let conn = pool.get().unwrap();
         conn.execute(
@@ -2913,9 +3233,15 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(
-            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").is_err()
-        );
+        assert!(hard_delete_account_after_runner_purge(
+            &pool,
+            "acct-delete",
+            1_000_000,
+            "delete-request",
+            "wfsweep-account-v3-missing-test",
+            &missing_workflow_proof,
+        )
+        .is_err());
         pool.get()
             .unwrap()
             .execute(
@@ -2925,15 +3251,18 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
-            hard_delete_account_after_runner_purge(&pool, "acct-delete", "delete-request").unwrap()
-        );
+        assert!(hard_delete_account_after_runner_purge(
+            &pool,
+            "acct-delete",
+            1_000_000,
+            "delete-request",
+            "wfsweep-account-v3-missing-test",
+            &missing_workflow_proof,
+        )
+        .is_err());
         assert!(account_deletion_intent(&pool, "acct-delete")
             .unwrap()
-            .is_none());
-        assert!(begin_account_deletion(&pool, "acct-delete", 1_000_001)
-            .unwrap()
-            .is_none());
+            .is_some());
     }
 
     #[test]
@@ -2941,6 +3270,119 @@ mod tests {
         let pool = test_pool();
         assert!(hard_delete_account_after_setup_failure(&pool, "acct-active").unwrap());
         assert!(!hard_delete_account_after_setup_failure(&pool, "acct-active").unwrap());
+    }
+
+    #[test]
+    fn sqlite_cascade_token_survives_child_deletes_and_must_be_removed_before_commit() {
+        let (pool, path) = file_test_pool("cascade-token-lifetime");
+        let account_id = "acct-cascade-token";
+        insert_test_account(&pool, account_id);
+
+        {
+            let conn = pool.get().unwrap();
+            let obsolete_cleanup_trigger_count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type = 'trigger'
+                        AND name = 'trg_jobs_workflow_account_delete_cascade_token_cleanup'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(obsolete_cleanup_trigger_count, 0);
+            conn.execute_batch(
+                "CREATE TABLE account_data_cascade_token_children (
+                    account_id TEXT PRIMARY KEY
+                      REFERENCES accounts(id) ON DELETE CASCADE
+                 );
+                 CREATE TRIGGER account_data_test_account_delete_token
+                 BEFORE DELETE ON accounts
+                 WHEN OLD.id = 'acct-cascade-token'
+                 BEGIN
+                   INSERT INTO jobs_workflow_cleanup_hard_delete_cascade_tokens (
+                     account_id, account_generation, sweep_attempt_id,
+                     authorization_digest_sha256, created_at_ms
+                   ) VALUES (
+                     OLD.id, 1, 'wfsweep-cascade-token-lifetime',
+                     'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 1
+                   );
+                 END;
+                 CREATE TRIGGER account_data_test_child_delete_guard
+                 BEFORE DELETE ON account_data_cascade_token_children
+                 WHEN NOT EXISTS (
+                   SELECT 1 FROM jobs_workflow_cleanup_hard_delete_cascade_tokens token
+                    WHERE token.account_id = OLD.account_id
+                      AND NOT EXISTS (
+                        SELECT 1 FROM accounts account
+                         WHERE account.id = OLD.account_id
+                      )
+                 )
+                 BEGIN
+                   SELECT RAISE(ABORT, 'cascade token disappeared before child delete');
+                 END;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO account_data_cascade_token_children(account_id) VALUES (?1)",
+                params![account_id],
+            )
+            .unwrap();
+        }
+
+        {
+            let mut conn = pool.get().unwrap();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            assert_eq!(
+                tx.execute("DELETE FROM accounts WHERE id = ?1", params![account_id])
+                    .unwrap(),
+                1,
+                "the parent DELETE and guarded child cascade must finish before commit"
+            );
+            let error = tx
+                .commit()
+                .expect_err("omitting explicit token cleanup must fail the deferred FK");
+            assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+        }
+
+        let rolled_back: (i64, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM accounts WHERE id = ?1),
+                    (SELECT COUNT(*) FROM account_data_cascade_token_children
+                      WHERE account_id = ?1),
+                    (SELECT COUNT(*)
+                       FROM jobs_workflow_cleanup_hard_delete_cascade_tokens
+                      WHERE account_id = ?1)",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rolled_back, (1, 1, 0));
+
+        assert!(hard_delete_account_after_setup_failure(&pool, account_id).unwrap());
+        let committed: (i64, i64, i64) = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM accounts WHERE id = ?1),
+                    (SELECT COUNT(*) FROM account_data_cascade_token_children
+                      WHERE account_id = ?1),
+                    (SELECT COUNT(*)
+                       FROM jobs_workflow_cleanup_hard_delete_cascade_tokens
+                      WHERE account_id = ?1)",
+                params![account_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(committed, (0, 0, 0));
+
+        drop(pool);
+        remove_sqlite_test_files(&path);
     }
 
     #[test]

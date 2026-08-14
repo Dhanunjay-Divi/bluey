@@ -13,9 +13,16 @@ import {
   WORKFLOW_COMMAND_PATH,
   type GatewayServiceResult,
 } from "./gateway-service.js";
-import type { WorkflowGatewayError } from "./contracts.js";
+import {
+  createTemporalCleanupClient,
+  createWorkflowCleanupService,
+  WORKFLOW_CLEANUP_PATH,
+  type WorkflowCleanupServiceResult,
+} from "./gateway-cleanup-service.js";
+import type { WorkflowCleanupError, WorkflowGatewayError } from "./contracts.js";
 
 const MAX_COMMAND_BYTES = 16 * 1024;
+const MAX_CLEANUP_BYTES = 128 * 1024;
 
 export async function runGateway(): Promise<void> {
   const token = workflowGatewayToken(process.env.BLUEY_JOBS_WORKFLOW_TOKEN);
@@ -26,6 +33,11 @@ export async function runGateway(): Promise<void> {
   if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
     throw new Error("PORT must be a valid TCP port");
   }
+  const cleanupNamespace = workflowCleanupStartupNamespace(
+    process.env.BLUEY_JOBS_WORKFLOW_CLEANUP_ENABLED,
+    process.env.BLUEY_JOBS_WORKFLOW_NAMESPACE,
+    namespace,
+  );
 
   const connection = await Connection.connect({
     address,
@@ -43,7 +55,13 @@ export async function runGateway(): Promise<void> {
     client: client.workflow,
     taskQueue: process.env.BLUEY_JOBS_TASK_QUEUE || "bluey-jobs-applications",
   });
-  createGatewayHttpServer(token, service)
+  const cleanupService = cleanupNamespace
+    ? createWorkflowCleanupService({
+      client: createTemporalCleanupClient(client.workflow),
+      namespace: cleanupNamespace,
+    })
+    : undefined;
+  createGatewayHttpServer(token, service, cleanupService)
     .listen(port, "0.0.0.0", () => console.log(`Bluey Jobs workflow gateway listening on ${port}`));
 }
 
@@ -51,9 +69,14 @@ export interface GatewayCommandExecutor {
   execute(value: unknown): Promise<GatewayServiceResult>;
 }
 
+export interface GatewayCleanupExecutor {
+  executeCleanup(value: unknown): Promise<WorkflowCleanupServiceResult>;
+}
+
 export function createGatewayRequestHandler(
   token: string,
   service: GatewayCommandExecutor,
+  cleanupService?: GatewayCleanupExecutor,
 ): RequestListener {
   const expectedToken = workflowGatewayToken(token);
   return async (request, response) => {
@@ -63,24 +86,44 @@ export function createGatewayRequestHandler(
     if (!authorized(request, expectedToken)) {
       return json(response, 401, gatewayError("rejected", "invalid_request"));
     }
-    const execute = request.url === WORKFLOW_COMMAND_PATH
-      ? service.execute.bind(service)
-      : undefined;
-    if (request.method !== "POST" || !execute) {
+    const cleanupRoute = request.url === WORKFLOW_CLEANUP_PATH && cleanupService !== undefined;
+    const commandRoute = request.url === WORKFLOW_COMMAND_PATH;
+    if (!cleanupRoute && !commandRoute) {
       return json(response, 404, gatewayError("rejected", "invalid_request"));
     }
+    if (request.method !== "POST") {
+      return cleanupRoute
+        ? json(response, 404, cleanupGatewayError("rejected", "not_found"))
+        : json(response, 404, gatewayError("rejected", "invalid_request"));
+    }
     if (!isJsonContentType(request.headers["content-type"])) {
-      return json(response, 400, gatewayError("rejected", "invalid_request"));
+      return cleanupRoute
+        ? json(response, 400, cleanupGatewayError("rejected", "invalid_request"))
+        : json(response, 400, gatewayError("rejected", "invalid_request"));
     }
     let parsed: unknown;
     try {
-      parsed = await body(request);
+      parsed = await body(request, cleanupRoute ? MAX_CLEANUP_BYTES : MAX_COMMAND_BYTES);
     } catch {
-      return json(response, 400, gatewayError("rejected", "invalid_request"));
+      return cleanupRoute
+        ? json(response, 400, cleanupGatewayError("rejected", "invalid_request"))
+        : json(response, 400, gatewayError("rejected", "invalid_request"));
+    }
+    if (cleanupRoute) {
+      let result: WorkflowCleanupServiceResult;
+      try {
+        result = await cleanupService.executeCleanup(parsed);
+      } catch {
+        result = {
+          status: 503,
+          body: cleanupGatewayError("rejected", "temporal_unavailable"),
+        };
+      }
+      return json(response, result.status, result.body);
     }
     let result: GatewayServiceResult;
     try {
-      result = await execute(parsed);
+      result = await service.execute(parsed);
     } catch {
       result = {
         status: 503,
@@ -89,6 +132,33 @@ export function createGatewayRequestHandler(
     }
     return json(response, result.status, result.body);
   };
+}
+
+export function workflowCleanupEnabled(value: string | undefined): boolean {
+  return value === "true";
+}
+
+export function workflowCleanupNamespace(value: string | undefined): string {
+  if (typeof value !== "string"
+    || value.length < 1
+    || value.length > 255
+    || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) {
+    throw new Error("BLUEY_JOBS_WORKFLOW_NAMESPACE must be a valid Temporal namespace");
+  }
+  return value;
+}
+
+export function workflowCleanupStartupNamespace(
+  enabledValue: string | undefined,
+  cleanupNamespaceValue: string | undefined,
+  temporalNamespace: string,
+): string | undefined {
+  if (!workflowCleanupEnabled(enabledValue)) return undefined;
+  const cleanupNamespace = workflowCleanupNamespace(cleanupNamespaceValue);
+  if (cleanupNamespace !== temporalNamespace) {
+    throw new Error("BLUEY_JOBS_WORKFLOW_NAMESPACE must equal TEMPORAL_NAMESPACE");
+  }
+  return cleanupNamespace;
 }
 
 export function workflowGatewayToken(value: string | undefined): string {
@@ -105,8 +175,9 @@ export function workflowGatewayToken(value: string | undefined): string {
 export function createGatewayHttpServer(
   token: string,
   service: GatewayCommandExecutor,
+  cleanupService?: GatewayCleanupExecutor,
 ): Server {
-  const server = createServer(createGatewayRequestHandler(token, service));
+  const server = createServer(createGatewayRequestHandler(token, service, cleanupService));
   server.headersTimeout = 10_000;
   server.requestTimeout = 20_000;
   server.keepAliveTimeout = 5_000;
@@ -123,13 +194,13 @@ function authorized(request: IncomingMessage, token: string): boolean {
     && timingSafeEqual(supplied, expected);
 }
 
-async function body(request: IncomingMessage): Promise<unknown> {
+async function body(request: IncomingMessage, maximumBytes: number): Promise<unknown> {
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of request) {
     const value = Buffer.from(chunk);
     size += value.length;
-    if (size > MAX_COMMAND_BYTES) throw new Error("Invalid workflow command");
+    if (size > maximumBytes) throw new Error("Invalid workflow gateway request");
     chunks.push(value);
   }
   if (size === 0) throw new Error("Invalid workflow command");
@@ -145,6 +216,13 @@ function gatewayError(
   reason: WorkflowGatewayError["reason"],
 ): WorkflowGatewayError {
   return { schemaVersion: 2, outcome, reason };
+}
+
+function cleanupGatewayError(
+  outcome: WorkflowCleanupError["outcome"],
+  reason: WorkflowCleanupError["reason"],
+): WorkflowCleanupError {
+  return { schemaVersion: 3, outcome, reason };
 }
 
 function json(response: ServerResponse, status: number, value: unknown): void {

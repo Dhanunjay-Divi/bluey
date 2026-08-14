@@ -108,30 +108,125 @@ export interface WorkflowGatewayError {
   reason: WorkflowGatewayErrorReason;
 }
 
-export interface WorkflowCleanupAuthority {
-  schemaVersion: 2;
+export type WorkflowCleanupPass = 1 | 2;
+
+export interface LegacyWorkflowInventoryPageRequest {
+  schemaVersion: 3;
+  operation: "legacy_inventory_page";
   cleanupRequestId: string;
-  generation: number;
-  targetSetDigest: string;
+  inventoryGenerationId: string;
+  namespace: string;
+  workflowType: "applicationWorkflow";
+  visibilityCutoffMs: number;
+  queryDigest: string;
+  scanPass: WorkflowCleanupPass;
+  pageIndex: number;
+  predecessorPageDigest: string | null;
+  pageToken: string | null;
   cleanupFence: number;
-  workflowId: string;
-  startRequestId: string;
-  startPayloadDigest: string;
-  firstExecutionRunId?: string;
 }
 
+export interface LegacyWorkflowInventoryTarget {
+  workflowId: string;
+  runId: string;
+  firstExecutionRunId: string;
+  status:
+    | "RUNNING"
+    | "COMPLETED"
+    | "FAILED"
+    | "CANCELED"
+    | "TERMINATED"
+    | "CONTINUED_AS_NEW"
+    | "TIMED_OUT";
+}
+
+export interface LegacyWorkflowInventoryPageReceipt
+  extends LegacyWorkflowInventoryPageRequest {
+  outcome: "page";
+  pageDigest: string;
+  targetsDigest: string;
+  targets: LegacyWorkflowInventoryTarget[];
+  nextPageToken: string | null;
+  exhausted: boolean;
+}
+
+export interface ReconcileLegacyWorkflowTargetRequest {
+  schemaVersion: 3;
+  operation: "reconcile_legacy_target";
+  cleanupRequestId: string;
+  inventoryGenerationId: string;
+  namespace: string;
+  workflowType: "applicationWorkflow";
+  visibilityCutoffMs: number;
+  queryDigest: string;
+  scanPass: WorkflowCleanupPass;
+  workflowId: string;
+  runId: string;
+  firstExecutionRunId: string;
+  targetDigest: string;
+  cleanupFence: number;
+  observationPass: WorkflowCleanupPass;
+}
+
+export interface ReconcileV2WorkflowTargetRequest {
+  schemaVersion: 3;
+  operation: "reconcile_v2_target";
+  cleanupRequestId: string;
+  cleanupGenerationId: string;
+  targetSetDigest: string;
+  namespace: string;
+  workflowType: "applicationWorkflowV2";
+  workflowId: string;
+  firstExecutionRunId: string | null;
+  startRequestId: string;
+  startPayloadDigest: string;
+  knownRunIds: string[];
+  targetDigest: string;
+  cleanupFence: number;
+  observationPass: WorkflowCleanupPass;
+}
+
+export type WorkflowCleanupRequest =
+  | LegacyWorkflowInventoryPageRequest
+  | ReconcileLegacyWorkflowTargetRequest
+  | ReconcileV2WorkflowTargetRequest;
+
 export type WorkflowCleanupPendingReason =
+  | "workflow_running"
   | "termination_pending"
   | "history_delete_pending"
   | "visibility_pending"
   | "temporal_unavailable";
 
-export type WorkflowCleanupReceipt = WorkflowCleanupAuthority & {
+export type WorkflowCleanupReconcileReason =
+  | WorkflowCleanupPendingReason
+  | "absence_observed";
+
+export type WorkflowCleanupReconcileReceipt = (
+  | Omit<ReconcileLegacyWorkflowTargetRequest, "firstExecutionRunId">
+  | Omit<ReconcileV2WorkflowTargetRequest, "firstExecutionRunId">
+) & {
+  outcome: "pending" | "absence_observed";
+  reason: WorkflowCleanupReconcileReason;
+  firstExecutionRunId: string | null;
+  runIds: string[];
   evidenceDigest: string;
-} & (
-  | { outcome: "complete"; reason: "absence_proved" }
-  | { outcome: "pending"; reason: WorkflowCleanupPendingReason }
-);
+};
+
+export interface WorkflowCleanupError {
+  schemaVersion: 3;
+  outcome: "rejected" | "identity_conflict";
+  reason:
+    | "invalid_request"
+    | "not_found"
+    | "identity_conflict"
+    | "temporal_unavailable";
+}
+
+export type WorkflowCleanupResponse =
+  | LegacyWorkflowInventoryPageReceipt
+  | WorkflowCleanupReconcileReceipt
+  | WorkflowCleanupError;
 
 export type WorkflowTerminalState = "failed" | "side_effect_unknown";
 

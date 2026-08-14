@@ -9,6 +9,7 @@ use axum::{
     Extension, Json,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Write};
 
 use super::{jobs_runner_volumes, AppState};
@@ -868,10 +869,77 @@ pub async fn delete_account(
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    let initial_deletion = account_data::begin_account_deletion(
+    let legacy_workflow_authority = jobs::current_jobs_legacy_inventory_authority(&state.pool)
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to load workflow-cleanup legacy authority before deletion intent"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+    let Some(legacy_workflow_authority) = legacy_workflow_authority else {
+        // Cleanup rollout is disabled by default. Still establish the existing
+        // deletion/write fence so an accepted erasure request cannot create
+        // new mutable work while operators prepare the global authority.
+        let fenced = account_data::begin_account_deletion(
+            &state.pool,
+            &account.id,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to establish account-deletion fence before cleanup configuration"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        match fenced {
+            Some(account_data::BeginAccountDeletionResult::Ready(intent))
+            | Some(account_data::BeginAccountDeletionResult::WaitingForUploads(intent)) => {
+                let request_id =
+                    account_deletion_purge_request_id(&account.id, intent.requested_at_ms);
+                return Ok(pending_account_delete_without_purge_response(
+                    "pending_workflow_cleanup_configuration",
+                    &request_id,
+                    0,
+                    concat!(
+                        "Account deletion is securely fenced and pending managed workflow-cleanup ",
+                        "configuration. No account objects or runner volumes have been swept."
+                    ),
+                ));
+            }
+            Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+                active_submissions,
+            }) => {
+                tracing::info!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    active_submissions,
+                    "account deletion is waiting for an irreversible submission outcome"
+                );
+                return Err(StatusCode::CONFLICT);
+            }
+            Some(
+                account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+                    active_actions,
+                },
+            ) => {
+                tracing::info!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    active_actions,
+                    "account deletion is waiting for an irreversible communication outcome"
+                );
+                return Err(StatusCode::CONFLICT);
+            }
+            None => return Err(StatusCode::NOT_FOUND),
+        }
+    };
+    let initial_deletion = account_data::begin_account_deletion_with_workflow_cleanup(
         &state.pool,
         &account.id,
         chrono::Utc::now().timestamp_millis(),
+        &legacy_workflow_authority,
     )
     .map_err(|error| {
         tracing::warn!(
@@ -881,12 +949,23 @@ pub async fn delete_account(
         );
         axum::http::StatusCode::INTERNAL_SERVER_ERROR
     })?;
-    let (intent, uploads_pending) = match initial_deletion {
-        Some(account_data::BeginAccountDeletionResult::Ready(intent)) => (intent, false),
-        Some(account_data::BeginAccountDeletionResult::WaitingForUploads(intent)) => (intent, true),
-        Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
+    let Some(initial_deletion) = initial_deletion else {
+        return Err(axum::http::StatusCode::NOT_FOUND);
+    };
+    let account_data::BeginAccountDeletionWithWorkflowCleanupResult {
+        deletion,
+        workflow_cleanup,
+    } = initial_deletion;
+    let (intent, uploads_pending, workflow_cleanup) = match deletion {
+        account_data::BeginAccountDeletionResult::Ready(intent) => {
+            (intent, false, workflow_cleanup)
+        }
+        account_data::BeginAccountDeletionResult::WaitingForUploads(intent) => {
+            (intent, true, workflow_cleanup)
+        }
+        account_data::BeginAccountDeletionResult::WaitingForIrreversibleSubmissions {
             active_submissions,
-        }) => {
+        } => {
             tracing::info!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 active_submissions,
@@ -894,9 +973,9 @@ pub async fn delete_account(
             );
             return Err(axum::http::StatusCode::CONFLICT);
         }
-        Some(account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
+        account_data::BeginAccountDeletionResult::WaitingForIrreversibleCommunications {
             active_actions,
-        }) => {
+        } => {
             tracing::info!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                 active_actions,
@@ -904,8 +983,32 @@ pub async fn delete_account(
             );
             return Err(axum::http::StatusCode::CONFLICT);
         }
-        None => return Err(axum::http::StatusCode::NOT_FOUND),
     };
+
+    if workflow_cleanup.is_none() {
+        tracing::error!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            "account deletion intent committed without workflow-cleanup binding"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    let workflow_cleanup = jobs::verify_jobs_workflow_cleanup_deletion_ready(
+        &state.pool,
+        &account.id,
+        intent.requested_at_ms,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed to verify workflow cleanup after account deletion freeze"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    if workflow_cleanup.deletion_proof().is_none() {
+        return Ok(pending_workflow_cleanup_response(&workflow_cleanup));
+    }
 
     let purge_request_id = account_deletion_purge_request_id(&account.id, intent.requested_at_ms);
     let fleet = jobs::runner_volume_fleet_status(&state.pool).map_err(|error| {
@@ -920,6 +1023,7 @@ pub async fn delete_account(
         return Ok(pending_account_delete_without_purge_response(
             "pending_runner_legacy_inventory",
             &purge_request_id,
+            workflow_cleanup_object_count(&workflow_cleanup),
             concat!(
                 "Account deletion is securely fenced and pending authorized legacy runner ",
                 "inventory reconciliation. Your credentials are retained so you can check ",
@@ -996,6 +1100,7 @@ pub async fn delete_account(
                 return Ok(pending_account_delete_without_purge_response(
                     "pending_runner_legacy_inventory",
                     &purge_request_id,
+                    workflow_cleanup_object_count(&workflow_cleanup),
                     "Account deletion is securely fenced and pending a stable authorized legacy runner inventory.",
                 ));
             }
@@ -1045,6 +1150,7 @@ pub async fn delete_account(
             "pending_runner_volume_purge",
             &purge_request_id,
             &purge_status,
+            workflow_cleanup_object_count(&workflow_cleanup),
             concat!(
                 "Account deletion is securely pending managed runner-volume purge ",
                 "attestation. Your credentials are retained so you can check deletion status."
@@ -1061,6 +1167,7 @@ pub async fn delete_account(
             "pending_upload_drain",
             &purge_request_id,
             &purge_status,
+            workflow_cleanup_object_count(&workflow_cleanup),
             "Account deletion is securely pending active object-upload drain.",
         ));
     }
@@ -1102,6 +1209,7 @@ pub async fn delete_account(
                 "pending_upload_drain",
                 &purge_request_id,
                 &purge_status,
+                workflow_cleanup_object_count(&workflow_cleanup),
                 "Account deletion is securely pending active object-upload drain.",
             ));
         }
@@ -1139,6 +1247,14 @@ pub async fn delete_account(
                 runner_purge_account_delete_error_status(&error)
             },
         )?;
+    let final_runner_fleet = jobs::runner_volume_fleet_status(&state.pool).map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed to revalidate runner fleet before object sweep"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
     if final_purge_status.state != "complete"
         || final_purge_status.account_id.as_deref() != Some(account.id.as_str())
     {
@@ -1146,7 +1262,17 @@ pub async fn delete_account(
             "pending_runner_volume_purge",
             &purge_request_id,
             &final_purge_status,
+            workflow_cleanup_object_count(&workflow_cleanup),
             "Account deletion is securely pending managed runner-volume purge attestation.",
+        ));
+    }
+    if !runner_purge_matches_current_legacy_fleet(&final_runner_fleet, &final_purge_status) {
+        return Ok(pending_account_delete_response(
+            "pending_runner_legacy_inventory",
+            &purge_request_id,
+            &final_purge_status,
+            workflow_cleanup_object_count(&workflow_cleanup),
+            "Account deletion is securely pending renewed legacy runner inventory authority.",
         ));
     }
 
@@ -1174,34 +1300,6 @@ pub async fn delete_account(
             );
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    let mut object_count_deleted = 0usize;
-    if !object_refs.is_empty() {
-        for object_ref in &object_refs {
-            if !artifact_storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
-                tracing::error!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    artifact_id = %object_ref.artifact_id,
-                    "refusing account delete because artifact object key is outside account scope"
-                );
-                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        }
-        for object_ref in &object_refs {
-            artifact_storage
-                .delete(&object_ref.object_key)
-                .await
-                .map_err(|_| {
-                    tracing::warn!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        artifact_id = %object_ref.artifact_id,
-                        "failed to delete account artifact object"
-                    );
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE
-                })?;
-            object_count_deleted += 1;
-        }
-    }
-
     let diagnostic_object_refs = diagnostic_logs::object_refs_for_account(&state.pool, &account.id)
         .map_err(|e| {
             tracing::warn!(
@@ -1211,40 +1309,285 @@ pub async fn delete_account(
             );
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
         })?;
-    if !diagnostic_object_refs.is_empty() {
-        for object_ref in &diagnostic_object_refs {
-            if !audit_storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
-                tracing::error!(
-                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
-                    "refusing account delete because diagnostic log object key is outside account scope"
-                );
-                return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
-            }
+
+    for object_ref in &object_refs {
+        if !artifact_storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                artifact_id = %object_ref.artifact_id,
+                "refusing account delete because artifact object key is outside account scope"
+            );
+            return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         }
-        for object_ref in &diagnostic_object_refs {
-            audit_storage
-                .delete(&object_ref.object_key)
-                .await
-                .map_err(|_| {
-                    tracing::warn!(
-                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                        diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
-                        bytes = object_ref.bytes,
-                        sha256 = object_ref.sha256.as_deref().unwrap_or(""),
-                        "failed to delete account diagnostic log object"
-                    );
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE
-                })?;
-            object_count_deleted += 1;
+    }
+    for object_ref in &diagnostic_object_refs {
+        if !audit_storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
+            tracing::error!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
+                "refusing account delete because diagnostic log object key is outside account scope"
+            );
+            return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
         }
     }
 
-    let mut storage_namespaces = vec![("artifact", artifact_storage_config)];
-    if !same_object_storage_namespace(&storage_namespaces[0].1, &audit_storage_config) {
-        storage_namespaces.push(("audit", audit_storage_config));
+    let artifact_scope_id =
+        workflow_cleanup_object_sweep_scope_id(&account.id, &artifact_storage_config);
+    let audit_scope_id = workflow_cleanup_object_sweep_scope_id(&account.id, &audit_storage_config);
+    let mut manifest_objects = BTreeMap::<String, Vec<String>>::new();
+    manifest_objects
+        .entry(artifact_scope_id.clone())
+        .or_default()
+        .extend(
+            object_refs
+                .iter()
+                .map(|object_ref| object_ref.object_key.clone()),
+        );
+    manifest_objects
+        .entry(audit_scope_id.clone())
+        .or_default()
+        .extend(
+            diagnostic_object_refs
+                .iter()
+                .map(|object_ref| object_ref.object_key.clone()),
+        );
+    let sweep_manifests = manifest_objects
+        .into_iter()
+        .map(|(scope_id, mut object_keys)| {
+            object_keys.sort();
+            object_keys.dedup();
+            jobs::JobsWorkflowCleanupObjectSweepScopeManifest {
+                scope_id,
+                object_keys,
+                prefix_sweep: true,
+            }
+        })
+        .collect::<Vec<_>>();
+    let shared_storage_namespace =
+        same_object_storage_namespace(&artifact_storage_config, &audit_storage_config);
+    let mut storage_namespaces = vec![(
+        "artifact",
+        artifact_scope_id.clone(),
+        artifact_storage_config,
+    )];
+    if !shared_storage_namespace {
+        storage_namespaces.push(("audit", audit_scope_id.clone(), audit_storage_config));
     }
-    for (storage_scope, storage_config) in storage_namespaces {
+
+    // Build the candidate workflow proof. The atomic sweep-begin transaction
+    // below is the final runner-and-workflow authority check before I/O.
+    let pre_sweep_cleanup = jobs::verify_jobs_workflow_cleanup_deletion_ready(
+        &state.pool,
+        &account.id,
+        intent.requested_at_ms,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed exact workflow-cleanup recheck before account object sweep"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let Some(workflow_cleanup_proof) = pre_sweep_cleanup.deletion_proof() else {
+        return Ok(pending_workflow_cleanup_response(&pre_sweep_cleanup));
+    };
+    let account_sweep_attempt_id = workflow_cleanup_account_sweep_attempt_id(
+        &account.id,
+        intent.requested_at_ms,
+        &final_purge_status,
+        &workflow_cleanup_proof,
+        &sweep_manifests,
+    );
+    // This durably freezes the exact manifest and marks the sweep started
+    // before the first irreversible object delete. Ordinary authority drift
+    // returns a pending variant without authorizing any I/O.
+    let sweep_begin = jobs::begin_jobs_workflow_cleanup_object_sweep(
+        &state.pool,
+        &account.id,
+        intent.requested_at_ms,
+        &active_purge_request_id,
+        &account_sweep_attempt_id,
+        &sweep_manifests,
+        &workflow_cleanup_proof,
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .map_err(|error| {
+        tracing::warn!(
+            account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+            error = %error,
+            "failed to durably authorize the account object sweep"
+        );
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let authorized_sweep = match sweep_begin {
+        jobs::JobsWorkflowCleanupObjectSweepBeginResult::Authorized(status) => status,
+        jobs::JobsWorkflowCleanupObjectSweepBeginResult::PendingWorkflow(status) => {
+            return Ok(pending_workflow_cleanup_response(&status));
+        }
+        jobs::JobsWorkflowCleanupObjectSweepBeginResult::PendingRunner(status) => {
+            let refreshed_purge = jobs::runner_volume_purge_status(
+                &state.pool,
+                &active_purge_request_id,
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    purge_request_id = %active_purge_request_id,
+                    error = %error,
+                    "failed to refresh runner purge after atomic sweep authorization rejected it"
+                );
+                runner_purge_account_delete_error_status(&error)
+            })?;
+            let refreshed_fleet = jobs::runner_volume_fleet_status(&state.pool).map_err(|error| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    error = %error,
+                    "failed to refresh runner fleet after atomic sweep authorization rejected it"
+                );
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            let object_count_deleted = workflow_cleanup_object_count(&status);
+            if !runner_purge_matches_current_legacy_fleet(&refreshed_fleet, &refreshed_purge) {
+                return Ok(pending_account_delete_response(
+                    "pending_runner_legacy_inventory",
+                    &purge_request_id,
+                    &refreshed_purge,
+                    object_count_deleted,
+                    concat!(
+                        "Account deletion is securely fenced and pending renewed legacy runner ",
+                        "inventory authority. Any prior object-sweep progress is retained."
+                    ),
+                ));
+            }
+            return Ok(pending_account_delete_response(
+                "pending_runner_volume_purge",
+                &purge_request_id,
+                &refreshed_purge,
+                object_count_deleted,
+                concat!(
+                    "Account deletion is securely fenced and pending renewed runner-volume ",
+                    "purge authority. Any prior object-sweep progress is retained."
+                ),
+            ));
+        }
+    };
+    if authorized_sweep.deletion_proof().as_ref() != Some(&workflow_cleanup_proof) {
+        return Ok(pending_workflow_cleanup_response(&authorized_sweep));
+    }
+    let mut sweep_progress = authorized_sweep;
+
+    for object_ref in &object_refs {
+        artifact_storage
+            .delete(&object_ref.object_key)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    artifact_id = %object_ref.artifact_id,
+                    "failed to delete account artifact object"
+                );
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        let progress = jobs::record_jobs_workflow_cleanup_object_sweep_progress(
+            &state.pool,
+            &account.id,
+            intent.requested_at_ms,
+            &account_sweep_attempt_id,
+            &artifact_scope_id,
+            &object_ref.object_key,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to persist workflow-cleanup object sweep progress"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if progress.deletion_proof().as_ref() != Some(&workflow_cleanup_proof) {
+            return Ok(pending_workflow_cleanup_response(&progress));
+        }
+        sweep_progress = progress;
+    }
+
+    for object_ref in &diagnostic_object_refs {
+        audit_storage
+            .delete(&object_ref.object_key)
+            .await
+            .map_err(|_| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
+                    bytes = object_ref.bytes,
+                    sha256 = object_ref.sha256.as_deref().unwrap_or(""),
+                    "failed to delete account diagnostic log object"
+                );
+                axum::http::StatusCode::SERVICE_UNAVAILABLE
+            })?;
+        let progress = jobs::record_jobs_workflow_cleanup_object_sweep_progress(
+            &state.pool,
+            &account.id,
+            intent.requested_at_ms,
+            &account_sweep_attempt_id,
+            &audit_scope_id,
+            &object_ref.object_key,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to persist diagnostic object sweep progress"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if progress.deletion_proof().as_ref() != Some(&workflow_cleanup_proof) {
+            return Ok(pending_workflow_cleanup_response(&progress));
+        }
+        sweep_progress = progress;
+    }
+
+    for (storage_scope, scope_id, storage_config) in storage_namespaces {
+        let current_cleanup = jobs::verify_jobs_workflow_cleanup_deletion_ready(
+            &state.pool,
+            &account.id,
+            intent.requested_at_ms,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                "failed to revalidate workflow cleanup during object namespace sweep"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if current_cleanup.deletion_proof().as_ref() != Some(&workflow_cleanup_proof) {
+            return Ok(pending_workflow_cleanup_response(&current_cleanup));
+        }
+        sweep_progress = current_cleanup;
+        let completed_scope = jobs::get_jobs_workflow_cleanup_object_sweep_scope(
+            &state.pool,
+            &account.id,
+            intent.requested_at_ms,
+            &account_sweep_attempt_id,
+            &scope_id,
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                storage_scope,
+                "failed to read durable object namespace sweep result"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if completed_scope.is_some() {
+            continue;
+        }
         let storage = ObjectStorage::new(storage_config);
         let orphan_count = storage
             .delete_all_account_objects(&account.id)
@@ -1257,10 +1600,34 @@ pub async fn delete_account(
                 );
                 axum::http::StatusCode::SERVICE_UNAVAILABLE
             })?;
-        object_count_deleted = object_count_deleted
-            .checked_add(orphan_count)
-            .ok_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        let orphan_count = i64::try_from(orphan_count)
+            .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
+        let progress = jobs::record_jobs_workflow_cleanup_object_sweep_scope(
+            &state.pool,
+            &account.id,
+            intent.requested_at_ms,
+            &account_sweep_attempt_id,
+            &scope_id,
+            orphan_count,
+            orphan_count,
+            chrono::Utc::now().timestamp_millis(),
+        )
+        .map_err(|error| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error = %error,
+                storage_scope,
+                "failed to persist durable object namespace sweep result"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+        if progress.deletion_proof().as_ref() != Some(&workflow_cleanup_proof) {
+            return Ok(pending_workflow_cleanup_response(&progress));
+        }
+        sweep_progress = progress;
     }
+    let object_count_deleted = usize::try_from(sweep_progress.object_sweep_deleted_count)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     // Hard delete. ON DELETE CASCADE on the foreign keys (accounts ->
     // credit_batches, refresh_tokens, usage_events,
@@ -1269,31 +1636,46 @@ pub async fn delete_account(
     let deleted = match account_data::hard_delete_account_after_runner_purge(
         &state.pool,
         &account.id,
+        intent.requested_at_ms,
         &active_purge_request_id,
+        &account_sweep_attempt_id,
+        &workflow_cleanup_proof,
     ) {
         Ok(deleted) => deleted,
         Err(error) => {
+            let refreshed_cleanup = jobs::verify_jobs_workflow_cleanup_deletion_ready(
+                &state.pool,
+                &account.id,
+                intent.requested_at_ms,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .ok()
+            .or_else(|| {
+                jobs::get_jobs_workflow_cleanup_deletion_status(
+                    &state.pool,
+                    &account.id,
+                    intent.requested_at_ms,
+                )
+                .ok()
+                .flatten()
+            });
+            if let Some(refreshed_cleanup) = refreshed_cleanup {
+                if refreshed_cleanup.deletion_proof().as_ref() != Some(&workflow_cleanup_proof) {
+                    tracing::info!(
+                        account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                        cleanup_generation_id = %workflow_cleanup_proof.cleanup_generation_id,
+                        concat!(
+                            "account deletion retained its fence after workflow authority ",
+                            "changed during object sweep"
+                        )
+                    );
+                    return Ok(pending_workflow_cleanup_response(&refreshed_cleanup));
+                }
+            }
             let refreshed_fleet = jobs::runner_volume_fleet_status(&state.pool)
                 .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-            let legacy_inventory_drifted = refreshed_fleet.legacy_inventory_state != "ready"
-                || refreshed_fleet.legacy_inventory_generation
-                    != final_purge_status.legacy_inventory_generation
-                || refreshed_fleet
-                    .legacy_inventory_reconciliation_id
-                    .as_deref()
-                    != Some(
-                        final_purge_status
-                            .legacy_inventory_reconciliation_id
-                            .as_str(),
-                    )
-                || refreshed_fleet.legacy_inventory_authority_id.as_deref()
-                    != Some(final_purge_status.legacy_inventory_authority_id.as_str())
-                || refreshed_fleet.legacy_inventory_authority_sha256.as_deref()
-                    != Some(
-                        final_purge_status
-                            .legacy_inventory_authority_sha256
-                            .as_str(),
-                    );
+            let legacy_inventory_drifted =
+                !runner_purge_matches_current_legacy_fleet(&refreshed_fleet, &final_purge_status);
             if legacy_inventory_drifted {
                 tracing::info!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
@@ -1304,6 +1686,7 @@ pub async fn delete_account(
                     "pending_runner_legacy_inventory",
                     &purge_request_id,
                     &final_purge_status,
+                    object_count_deleted,
                     "Account deletion is securely pending renewed legacy runner inventory authority.",
                 ));
             }
@@ -1344,8 +1727,12 @@ pub async fn delete_account(
         retry_after_ms: None,
         deleted_at: Some(chrono::Utc::now().to_rfc3339()),
         object_count_deleted,
-        note: "All account data has been removed. Re-signup is allowed with the same email."
-            .to_string(),
+        note: concat!(
+            "Your account and the Bluey records covered by this verified deletion were removed ",
+            "from configured active storage. Re-signup is allowed with the same email; this ",
+            "response does not certify provider retention or physical erasure."
+        )
+        .to_string(),
     })
     .into_response())
 }
@@ -1354,6 +1741,80 @@ fn account_deletion_purge_request_id(account_id: &str, requested_at_ms: i64) -> 
     let material =
         format!("bluey-jobs-runner\0account-deletion-request-v1\0{account_id}\0{requested_at_ms}");
     format!("delete-{}", sha256_text(&material))
+}
+
+fn workflow_cleanup_account_sweep_attempt_id(
+    account_id: &str,
+    requested_at_ms: i64,
+    runner_purge: &jobs::RunnerPurgeRequestStatus,
+    proof: &jobs::JobsWorkflowCleanupDeletionProof,
+    manifests: &[jobs::JobsWorkflowCleanupObjectSweepScopeManifest],
+) -> String {
+    let manifest_binding = serde_json::Value::Array(
+        manifests
+            .iter()
+            .map(|manifest| {
+                serde_json::json!({
+                    "scopeId": &manifest.scope_id,
+                    "objectKeys": &manifest.object_keys,
+                    "prefixSweep": manifest.prefix_sweep,
+                })
+            })
+            .collect(),
+    )
+    .to_string();
+    let runner_binding = serde_json::json!({
+        "requestId": &runner_purge.request_id,
+        "purgeGeneration": runner_purge.purge_generation,
+        "legacyInventoryGeneration": runner_purge.legacy_inventory_generation,
+        "legacyInventoryReconciliationId": &runner_purge.legacy_inventory_reconciliation_id,
+        "legacyInventoryAuthorityId": &runner_purge.legacy_inventory_authority_id,
+        "legacyInventoryAuthoritySha256": &runner_purge.legacy_inventory_authority_sha256,
+        "state": &runner_purge.state,
+        "legacyUnresolvedCount": runner_purge.legacy_unresolved_count,
+        "requiredTargetCount": runner_purge.required_target_count,
+        "resolvedTargetCount": runner_purge.resolved_target_count,
+        "targetSetSha256": &runner_purge.target_set_sha256,
+        "completedAtMs": runner_purge.completed_at_ms,
+    })
+    .to_string();
+    let material = format!(
+        concat!(
+            "bluey-jobs-workflow-cleanup-account-sweep-attempt-v3\0",
+            "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}"
+        ),
+        account_id,
+        requested_at_ms,
+        proof.account_generation,
+        proof.cleanup_generation_id,
+        proof.target_set_digest,
+        proof.legacy_authority.inventory_generation_id,
+        proof.legacy_authority.query_digest,
+        proof.tombstone_id,
+        proof.completion_digest,
+        runner_binding,
+        manifest_binding,
+    );
+    let digest = sha256_text(&material);
+    format!("wfsweep-account-v3-{}", &digest[..32])
+}
+
+fn workflow_cleanup_object_sweep_scope_id(
+    account_id: &str,
+    storage: &ObjectStorageConfig,
+) -> String {
+    let material = format!(
+        concat!(
+            "bluey-jobs-workflow-cleanup-storage-scope-v3\0",
+            "{}\0{}\0{}\0{}"
+        ),
+        account_id,
+        storage.endpoint_url.trim_end_matches('/'),
+        storage.bucket,
+        storage.key_prefix.trim_matches('/'),
+    );
+    let digest = sha256_text(&material);
+    format!("wfscope-v3-{}", &digest[..32])
 }
 
 fn runner_purge_account_delete_error_status(error: &jobs::RunnerVolumePurgeError) -> StatusCode {
@@ -1365,6 +1826,20 @@ fn runner_purge_account_delete_error_status(error: &jobs::RunnerVolumePurgeError
         | jobs::RunnerVolumePurgeError::Unauthorized
         | jobs::RunnerVolumePurgeError::NotReady => StatusCode::INTERNAL_SERVER_ERROR,
     }
+}
+
+fn runner_purge_matches_current_legacy_fleet(
+    fleet: &jobs::RunnerVolumeFleetStatus,
+    purge: &jobs::RunnerPurgeRequestStatus,
+) -> bool {
+    fleet.legacy_inventory_state == "ready"
+        && fleet.legacy_inventory_generation == purge.legacy_inventory_generation
+        && fleet.legacy_inventory_reconciliation_id.as_deref()
+            == Some(purge.legacy_inventory_reconciliation_id.as_str())
+        && fleet.legacy_inventory_authority_id.as_deref()
+            == Some(purge.legacy_inventory_authority_id.as_str())
+        && fleet.legacy_inventory_authority_sha256.as_deref()
+            == Some(purge.legacy_inventory_authority_sha256.as_str())
 }
 
 fn complete_runner_purge_if_ready(
@@ -1413,6 +1888,7 @@ fn pending_account_delete_response(
     state: &str,
     deletion_request_id: &str,
     purge: &jobs::RunnerPurgeRequestStatus,
+    object_count_deleted: usize,
     note: &str,
 ) -> Response {
     let mut response = (
@@ -1426,7 +1902,7 @@ fn pending_account_delete_response(
             legacy_unresolved_count: Some(purge.legacy_unresolved_count),
             retry_after_ms: Some(ACCOUNT_DELETE_RETRY_AFTER_MS),
             deleted_at: None,
-            object_count_deleted: 0,
+            object_count_deleted,
             note: note.to_string(),
         }),
     )
@@ -1440,6 +1916,7 @@ fn pending_account_delete_response(
 fn pending_account_delete_without_purge_response(
     state: &str,
     request_id: &str,
+    object_count_deleted: usize,
     note: &str,
 ) -> Response {
     let mut response = (
@@ -1453,7 +1930,7 @@ fn pending_account_delete_without_purge_response(
             legacy_unresolved_count: None,
             retry_after_ms: Some(ACCOUNT_DELETE_RETRY_AFTER_MS),
             deleted_at: None,
-            object_count_deleted: 0,
+            object_count_deleted,
             note: note.to_string(),
         }),
     )
@@ -1462,6 +1939,57 @@ fn pending_account_delete_without_purge_response(
         .headers_mut()
         .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
     response
+}
+
+fn pending_workflow_cleanup_response(
+    cleanup: &jobs::JobsWorkflowCleanupDeletionStatus,
+) -> Response {
+    let sweep_started = cleanup.object_sweep_started_at_ms.is_some();
+    let state = if sweep_started {
+        "pending_workflow_cleanup_revalidation"
+    } else {
+        "pending_workflow_cleanup"
+    };
+    let object_count_deleted = workflow_cleanup_object_count(cleanup);
+    let note = if sweep_started {
+        concat!(
+            "Account deletion remains securely fenced after workflow authority changed during ",
+            "an authorized idempotent object sweep. Deleted objects are not recreated; exact ",
+            "workflow cleanup will be revalidated before hard deletion."
+        )
+    } else {
+        concat!(
+            "Account deletion is securely fenced and pending exact managed workflow cleanup. ",
+            "No account objects have been swept."
+        )
+    };
+    let mut response = (
+        StatusCode::ACCEPTED,
+        Json(DeleteAccountResponse {
+            deleted: false,
+            state: state.to_string(),
+            request_id: Some(cleanup.cleanup_generation_id.clone()),
+            required_target_count: None,
+            resolved_target_count: None,
+            legacy_unresolved_count: Some(cleanup.legacy_pending_count),
+            retry_after_ms: Some(ACCOUNT_DELETE_RETRY_AFTER_MS),
+            deleted_at: None,
+            object_count_deleted,
+            note: note.to_string(),
+        }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+}
+
+fn workflow_cleanup_object_count(cleanup: &jobs::JobsWorkflowCleanupDeletionStatus) -> usize {
+    u64::try_from(cleanup.object_sweep_deleted_count)
+        .ok()
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or_default()
 }
 
 async fn export_zip(
