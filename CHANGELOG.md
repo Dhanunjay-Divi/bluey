@@ -207,6 +207,12 @@ under `docs/release/`.
 
 ### Fixed
 
+- Raised the closed managed-cloud runtime-measurement file bound from 256 to 512 across candidate
+  construction, embedded runtime verification, and server release-evidence validation. The pinned
+  Playwright Chromium headless-shell tree alone exceeds the old bound, so managed-runner image
+  construction failed closed before the application and Node runtime were counted. Exact 512/513
+  boundary tests preserve a finite file set and the existing 128 KiB canonical envelope; no
+  measurement root, release flag, or hosted authority was relaxed.
 - Made Jobs provider write-grant upgrades advance their credential-refresh CAS
   timestamp even when both mutations occur in the same clock tick. A stale
   token refresh now deterministically loses authority instead of reaching a

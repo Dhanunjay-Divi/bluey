@@ -59,8 +59,13 @@ const MANAGED_CLOUD_RUNTIME_MEASUREMENT_AUDIENCE: &str =
     "bluey-jobs-managed-cloud-runtime-measurement-v1";
 const MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH: &str =
     "app/.bluey/managed-cloud-runtime-measurement.json";
+const MANAGED_CLOUD_MAX_RUNTIME_MEASUREMENT_FILES: usize = 512;
 const MANAGED_CLOUD_COHORT_MEMBER_DOMAIN: &[u8] = b"bluey-jobs-managed-cloud-cohort-member-v1\0";
 const MANAGED_CLOUD_HEARTBEAT_AUDIT_LIMIT: i64 = 64;
+
+fn managed_cloud_runtime_measurement_file_count_valid(count: usize) -> bool {
+    (1..=MANAGED_CLOUD_MAX_RUNTIME_MEASUREMENT_FILES).contains(&count)
+}
 
 const MANAGED_CLOUD_BASE_RUNTIME_ROLES: [&str; 6] = [
     "jobs_api",
@@ -1635,8 +1640,7 @@ pub fn inspect_managed_cloud_runtime_identity(
             .any(|candidate| !managed_cloud_runtime_role(candidate))
         || measurement.roles.windows(2).any(|pair| pair[0] >= pair[1])
         || !measurement.roles.iter().any(|candidate| candidate == role)
-        || measurement.measured_files.is_empty()
-        || measurement.measured_files.len() > 256
+        || !managed_cloud_runtime_measurement_file_count_valid(measurement.measured_files.len())
         || measurement
             .measured_files
             .windows(2)
@@ -2459,8 +2463,9 @@ fn validate_managed_cloud_verification_evidence(
                             .iter()
                             .map(String::as_str)
                             .eq(expected_runtime_roles.iter().copied())
-                        && !measurement.measured_files.is_empty()
-                        && measurement.measured_files.len() <= 256
+                        && managed_cloud_runtime_measurement_file_count_valid(
+                            measurement.measured_files.len(),
+                        )
                         && measurement.measured_files.windows(2).all(|pair| {
                             pair[0].path < pair[1].path && managed_cloud_hex64(&pair[0].sha256)
                         })
@@ -15711,6 +15716,14 @@ mod managed_cloud_release_authority_tests {
         assert!(recovery.managed_cloud.authorization.recovery_accepted);
         validate_managed_cloud_gateway_authority(&recovery.managed_cloud, &binding)
             .expect("validate recovery authority");
+    }
+
+    #[test]
+    fn managed_cloud_runtime_measurement_file_bound_is_closed() {
+        assert!(managed_cloud_runtime_measurement_file_count_valid(1));
+        assert!(managed_cloud_runtime_measurement_file_count_valid(512));
+        assert!(!managed_cloud_runtime_measurement_file_count_valid(0));
+        assert!(!managed_cloud_runtime_measurement_file_count_valid(513));
     }
 
     #[test]

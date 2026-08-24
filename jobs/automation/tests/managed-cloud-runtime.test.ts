@@ -150,8 +150,8 @@ describe("managed-cloud runtime configuration", () => {
     rmSync(unmeasuredPath);
   });
 
-  it("accepts exactly 256 measured files and rejects 257", () => {
-    const measuredFiles = Array.from({ length: 254 }, (_, index) => {
+  it("accepts exactly 512 measured files and rejects 513", () => {
+    const measuredFiles = Array.from({ length: 510 }, (_, index) => {
       const path = `app/workflows/dist/measured-${index.toString().padStart(3, "0")}.js`;
       const bytes = Buffer.from(`measured-${index}\n`);
       writeFileSync(join(MEASUREMENT_ROOT, path), bytes);

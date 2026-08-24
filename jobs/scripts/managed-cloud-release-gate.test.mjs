@@ -932,10 +932,10 @@ test("runtime identity is role-separated and derived from measured artifact byte
   );
 });
 
-test("runtime measurement accepts 256 exact files and rejects 257", () => {
-  const measuredFiles = Array.from({ length: 255 }, (_, index) => ({
+test("runtime measurement accepts 512 exact files and rejects 513", () => {
+  const measuredFiles = Array.from({ length: 511 }, (_, index) => ({
     path: `app/workflows/dist/measured-${index.toString().padStart(3, "0")}.js`,
-    sha256: index.toString(16).padStart(2, "0").repeat(32),
+    sha256: index.toString(16).padStart(64, "0"),
   })).concat({
     path: "usr/local/bin/node",
     sha256: "f".repeat(64),

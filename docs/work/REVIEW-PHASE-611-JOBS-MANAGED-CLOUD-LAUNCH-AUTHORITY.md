@@ -4,9 +4,9 @@
 > Phase 611 round contract, the current working tree, and the predecessor Phase 609/610
 > authority before review.
 
-**Commit range:** `89d6b820..working tree`
+**Commit range:** `89d6b820..branch tip`
 **Reviewer:** Codex (independent line-by-line review)
-**Date:** 2026-08-14
+**Date:** 2026-08-24
 
 ## Per-Task Review
 
@@ -80,8 +80,28 @@
   provenance, and release-hygiene checks are green.
 - The customer boundary is the browser-delivered portal plus managed execution; no installable
   Bluey Browser is required or introduced by this batch.
-- The 79-path working-tree inventory matches the implementation record, and `docs/reviews/` remains
+- The 80-path branch-diff inventory matches the implementation record, and `docs/reviews/` remains
   untouched.
+
+---
+
+### 611.5 — Managed-runner measurement capacity correction
+
+| Field | Value |
+|-------|-------|
+| Files | Release gate/runtime measurement source and tests, Rust release authority, FIX-693, changelog, implementation, and review evidence |
+| Source verdict | 🟢 accept |
+| Exact-tip verification verdict | 🟡 resource-capable gates required |
+
+**Findings:**
+
+- The pinned Playwright Chromium headless-shell payload alone contains 287 non-directory files, so
+  the former 256-file ceiling could not construct the intended managed-runner image.
+- Candidate construction, embedded runtime verification, and server release-evidence validation
+  now share the same finite 512-file contract, with exact 512/513 boundary coverage.
+- The 128 KiB canonical measurement-document limit, complete measurement roots, exact inventory,
+  per-file hashes, and release flags are unchanged; the correction does not weaken attestation.
+- The expanded gate fixture now emits valid 64-character digests for indexes above 255.
 
 ## Cross-Task Findings
 
@@ -92,9 +112,12 @@
 - Local source evidence does not claim hosted registry publication, signing ceremony, Temporal
   behavior, customer admission, real runner capacity, image-digest attestation, read-only-rootfs
   enforcement, canary execution, or rollback execution.
-- The final full Rust all-target test rerun passed with zero failures.
+- The baseline `423fba5c` full Rust all-target test rerun passed with zero failures; the corrected
+  tip still requires a resource-capable rerun.
 
 ## Build & Test Verification
+
+Baseline evidence at `423fba5c`, before the measurement-bound correction:
 
 ```text
 Jobs typecheck
@@ -145,10 +168,33 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
     jobs_runner_plan_matrix 2; usage schema 1
 ```
 
+Post-correction local evidence at the branch tip on 2026-08-24:
+
+```text
+managed-cloud release gate
+  PASS: 16 tests, including 512 accepted / 513 rejected
+
+Node strip-types syntax checks
+  PASS: managed-cloud-runtime.ts and its focused test
+
+cargo fmt --all -- --check
+  PASS
+
+git -P diff --check
+  PASS
+```
+
+Not rerun at the corrected tip: automation Vitest/typecheck, Cargo check/Clippy/tests, and the exact
+managed-runner Docker build/native smoke. The local disk had 5.0 GiB free, below the 8 GiB
+release-work floor, no PortableSSD was mounted, and Docker was unavailable. Exact-tip CI evidence
+must replace this conditional status; the baseline totals above cannot be inherited by the fix.
+
 ## Overall Verdict
 
-🟢 **ACCEPT** — The independent source review and complete local verification are green with no
-P0/P1 findings. Hosted launch evidence remains external and is not claimed by this verdict.
+🟡 **SOURCE FIX REVIEWED; RESOURCE-CAPABLE VERIFICATION REQUIRED** — Independent source review
+found no P0/P1 issue in the correction, and the lightweight local gates are green. The corrected
+tip is not accepted until automation, Rust, and exact managed-runner Docker/CI gates pass. Hosted
+launch evidence remains external and is not claimed by this verdict.
 
 ## Follow-ups for Next Batch
 

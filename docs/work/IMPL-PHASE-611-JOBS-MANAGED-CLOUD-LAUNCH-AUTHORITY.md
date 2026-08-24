@@ -49,33 +49,34 @@
 
 ## Files Created / Modified
 
-Final working-tree inventory: **79 paths**, including this implementation document and the
-Phase 611 review document. `M` means modified and `??` means created/untracked.
+Final branch-diff inventory: **80 paths** relative to Phase 610 base `89d6b820`, including this
+implementation document and the Phase 611 review document. `M` means modified and `A` means added.
 
 | Status | File | Purpose |
 |--------|------|---------|
 | M | `.github/workflows/jobs-ci.yml` | Run managed-cloud source and release-contract checks in Jobs CI |
 | M | `.github/workflows/release.yml` | Prevent the ordinary release path from bypassing the managed-cloud gate |
-| ?? | `.github/workflows/jobs-managed-cloud-release.yml` | Define manual candidate, authorize, promote, and rollback stages over stored bytes |
+| A | `.github/workflows/jobs-managed-cloud-release.yml` | Define manual candidate, authorize, promote, and rollback stages over stored bytes |
 | M | `CHANGELOG.md` | Record the bounded Phase 611 source result and parked launch evidence |
-| ?? | `docs/rounds/ROUND-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Freeze the product, authority, recovery, release, and external-evidence contract |
-| ?? | `docs/work/FIX-690-jobs-managed-availability-dispatch-authority.md` | Record the loose availability/dispatch root cause and fix |
-| ?? | `docs/work/FIX-691-jobs-request-start-recovery-authority.md` | Record the recovery downgrade/new-effect root cause and fix |
-| ?? | `docs/work/FIX-692-jobs-managed-runner-release-effect-boundary.md` | Record the missing runner release-bound effect authority and fix |
-| ?? | `docs/work/IMPL-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Inventory implementation, validation state, deviations, and follow-ups |
-| ?? | `docs/work/REVIEW-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Record independent review evidence, remaining external gates, and verdict |
-| ?? | `infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql` | Add PostgreSQL release, runtime, readiness, command, request-start, and execution authority |
-| ?? | `infra/sqlite/server-runtime/055_jobs_managed_cloud_release_authority.sql` | Add the paired SQLite authority, parity constraints, and guards |
+| A | `docs/rounds/ROUND-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Freeze the product, authority, recovery, release, and external-evidence contract |
+| A | `docs/work/FIX-690-jobs-managed-availability-dispatch-authority.md` | Record the loose availability/dispatch root cause and fix |
+| A | `docs/work/FIX-691-jobs-request-start-recovery-authority.md` | Record the recovery downgrade/new-effect root cause and fix |
+| A | `docs/work/FIX-692-jobs-managed-runner-release-effect-boundary.md` | Record the missing runner release-bound effect authority and fix |
+| A | `docs/work/FIX-693-jobs-managed-runner-measurement-bound.md` | Record the impossible runner measurement ceiling and cross-language bounded correction |
+| A | `docs/work/IMPL-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Inventory implementation, validation state, deviations, and follow-ups |
+| A | `docs/work/REVIEW-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Record independent review evidence, remaining external gates, and verdict |
+| A | `infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql` | Add PostgreSQL release, runtime, readiness, command, request-start, and execution authority |
+| A | `infra/sqlite/server-runtime/055_jobs_managed_cloud_release_authority.sql` | Add the paired SQLite authority, parity constraints, and guards |
 | M | `jobs/.dockerignore` | Close managed image build contexts to intended runtime inputs |
 | M | `jobs/package.json` | Expose the managed-cloud release gate command |
 | M | `jobs/automation/package.json` | Export and build shared managed-cloud runtime/release modules |
-| ?? | `jobs/automation/src/managed-cloud-execution.ts` | Canonicalize and validate release A plus current runtime B execution authority |
-| ?? | `jobs/automation/src/managed-cloud-runtime-client.ts` | Claim grants and send fenced runtime heartbeats to Jobs API |
-| ?? | `jobs/automation/src/managed-cloud-runtime.ts` | Parse exact role-scoped runtime configuration and readiness observations |
+| A | `jobs/automation/src/managed-cloud-execution.ts` | Canonicalize and validate release A plus current runtime B execution authority |
+| A | `jobs/automation/src/managed-cloud-runtime-client.ts` | Claim grants and send fenced runtime heartbeats to Jobs API |
+| A | `jobs/automation/src/managed-cloud-runtime.ts` | Parse exact role-scoped runtime configuration and readiness observations |
 | M | `jobs/automation/src/worker-auth.ts` | Sign the new exact managed runtime and effect-boundary routes |
-| ?? | `jobs/automation/tests/managed-cloud-execution.test.ts` | Cover canonical A+B execution authority and mismatch rejection |
-| ?? | `jobs/automation/tests/managed-cloud-runtime-client.test.ts` | Cover exact runtime HTTP/auth and fail-closed response parsing |
-| ?? | `jobs/automation/tests/managed-cloud-runtime.test.ts` | Cover role-scoped configuration and heartbeat observations |
+| A | `jobs/automation/tests/managed-cloud-execution.test.ts` | Cover canonical A+B execution authority and mismatch rejection |
+| A | `jobs/automation/tests/managed-cloud-runtime-client.test.ts` | Cover exact runtime HTTP/auth and fail-closed response parsing |
+| A | `jobs/automation/tests/managed-cloud-runtime.test.ts` | Cover role-scoped configuration and heartbeat observations |
 | M | `jobs/automation/tests/worker-auth.test.ts` | Cover authentication for every new internal managed route |
 | M | `jobs/runner/Dockerfile` | Produce the pinned rootless closed managed-runner image/runtime inventory |
 | M | `jobs/runner/src/execution-lease.ts` | Bind claim, pre-effect authorization, and irreversible marker to exact A+B |
@@ -86,12 +87,12 @@ Phase 611 review document. `M` means modified and `??` means created/untracked.
 | M | `jobs/runner/tests/container-hardening.test.ts` | Verify the closed rootless managed-runner container contract |
 | M | `jobs/runner/tests/execution-lease.test.ts` | Cover claim, A+B echo, pre-effect authorization, and fencing |
 | M | `jobs/runner/tests/intervention-policy.test.ts` | Cover managed release-bound resume and unchanged legacy parsing |
-| ?? | `jobs/runner/tests/managed-cloud-effect-boundary.test.ts` | Cover end-to-end pre-I/O A+B mismatch, staleness, and recovery separation |
+| A | `jobs/runner/tests/managed-cloud-effect-boundary.test.ts` | Cover end-to-end pre-I/O A+B mismatch, staleness, and recovery separation |
 | M | `jobs/runner/tests/run-checkpoint-store.test.ts` | Cover durable managed release state and exact restore mismatch |
 | M | `jobs/runner/tests/runner-volume-client.test.ts` | Cover managed volume proof fields and canonical release digest |
 | M | `jobs/runner/tests/server-result-recovery.test.ts` | Prove result recovery does not depend on mutable B |
-| ?? | `jobs/scripts/managed-cloud-release-gate.mjs` | Build/verify closed contracts and stored artifact inventories without rebuilding |
-| ?? | `jobs/scripts/managed-cloud-release-gate.test.mjs` | Cover canonical release, artifact, promotion, and rollback gates |
+| A | `jobs/scripts/managed-cloud-release-gate.mjs` | Build/verify closed contracts and stored artifact inventories without rebuilding |
+| A | `jobs/scripts/managed-cloud-release-gate.test.mjs` | Cover canonical release, artifact, promotion, and rollback gates |
 | M | `jobs/workflows/Dockerfile` | Produce the pinned rootless closed workflows image/runtime inventory |
 | M | `jobs/workflows/src/activities.ts` | Materialize and carry original A through managed-only application activities |
 | M | `jobs/workflows/src/contracts.ts` | Add exact schema-v3 managed command/reconciliation and release memo contracts |
@@ -110,23 +111,23 @@ Phase 611 review document. `M` means modified and `??` means created/untracked.
 | M | `jobs/workflows/tests/gateway-service.test.ts` | Prove recovery-only paths never create a Temporal effect |
 | M | `jobs/workflows/tests/workflows.test.ts` | Cover deterministic A propagation only through managed branches |
 | M | `ops/bluey-jobs.env.example` | Document every default-off gate and exact managed runtime configuration |
-| ?? | `server/Dockerfile.jobs` | Build the pinned rootless Jobs API candidate image |
-| ?? | `server/Dockerfile.jobs.dockerignore` | Close the Jobs API image context to production runtime inputs |
+| A | `server/Dockerfile.jobs` | Build the pinned rootless Jobs API candidate image |
+| A | `server/Dockerfile.jobs.dockerignore` | Close the Jobs API image context to production runtime inputs |
 | M | `server/src/api/jobs.rs` | Derive public availability, admit/materialize A, and serve managed execution leases |
-| ?? | `server/src/api/jobs_managed_cloud_releases.rs` | Serve closed administrative release and internal runtime control-plane routes |
+| A | `server/src/api/jobs_managed_cloud_releases.rs` | Serve closed administrative release and internal runtime control-plane routes |
 | M | `server/src/api/jobs_runner_volumes.rs` | Bind managed volume proof to release A and runtime B identity |
 | M | `server/src/api/jobs_worker_auth.rs` | Authenticate exact runtime, reconciliation, lease, and effect-boundary paths |
 | M | `server/src/api/mod.rs` | Register the managed-cloud API authority module |
 | M | `server/src/bin/bluey-jobs-api.rs` | Validate/start managed reporters and independent dispatch/recovery loops |
 | M | `server/src/db/jobs.rs` | Export and integrate managed release/execution authority |
 | M | `server/src/db/jobs/execution_leases.rs` | Bind managed execution-lease claim, authorization, irreversible-effect, runtime-correlation, and receipt-replay authority |
-| ?? | `server/src/db/jobs/managed_cloud_release_authority.rs` | Own signed release, runtime, readiness, admission, request-start, and effect validation |
+| A | `server/src/db/jobs/managed_cloud_release_authority.rs` | Own signed release, runtime, readiness, admission, request-start, and effect validation |
 | M | `server/src/db/jobs/runner_volume_purge.rs` | Preserve managed release binding across volume cleanup/deletion authority |
 | M | `server/src/db/jobs/tests.rs` | Verify nested managed prelock and protected PostgreSQL admission lock ordering |
 | M | `server/src/db/jobs/workflow_cleanup.rs` | Bind cleanup of managed workflows to the original release memo |
 | M | `server/src/db/jobs/workflow_commands.rs` | Order admission/replay, persist original A, and split effect from recovery claims |
 | M | `server/src/db/mod.rs` | Register paired migrations and extend replay/parity/schema guards |
-| ?? | `server/src/jobs_managed_cloud_runtime.rs` | Measure, claim, heartbeat, drain, and fence Jobs API embedded runtime roles |
+| A | `server/src/jobs_managed_cloud_runtime.rs` | Measure, claim, heartbeat, drain, and fence Jobs API embedded runtime roles |
 | M | `server/src/jobs_workflow_cleanup.rs` | Carry and validate the original managed release memo during cleanup |
 | M | `server/src/jobs_workflow_dispatch.rs` | Recheck new-effect A and run independent exact lookup-only reconciliation |
 | M | `server/src/lib.rs` | Export the managed-cloud runtime module |
@@ -136,8 +137,8 @@ Phase 611 review document. `M` means modified and `??` means created/untracked.
 
 ## Build & Test
 
-Frozen JavaScript and release-contract evidence confirmed after the final managed runner wire
-correlation changes:
+Baseline JavaScript and release-contract evidence at `423fba5c`, before the measurement-bound
+correction:
 
 ```text
 node --test jobs/scripts/managed-cloud-release-gate.test.mjs
@@ -158,7 +159,8 @@ managed-cloud contract generation
   NOTE: Vite emitted only its existing advisory for chunks larger than 500 kB
 ```
 
-Frozen Rust and repository evidence confirmed after the final PostgreSQL lock-order correction:
+Baseline Rust and repository evidence at `423fba5c`, after the final PostgreSQL lock-order
+correction:
 
 ```text
 cargo fmt --all -- --check
@@ -198,6 +200,27 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
 The independent line-by-line review is green with no remaining P0/P1 finding, and the completed
 full all-target Rust rerun passed with zero failures.
 
+Post-correction local evidence at the branch tip on 2026-08-24:
+
+```text
+node --test jobs/scripts/managed-cloud-release-gate.test.mjs
+  PASS: 16 tests, including 512 files accepted and 513 rejected
+
+Node strip-types syntax checks
+  PASS: managed-cloud-runtime.ts and its focused test
+
+cargo fmt --all -- --check
+  PASS
+
+git -P diff --check
+  PASS
+```
+
+The automation Vitest suite, Cargo check/Clippy/tests, and exact managed-runner Docker build/smoke
+were not rerun at the corrected tip: the local disk had 5.0 GiB free, below the 8 GiB release-work
+floor, no PortableSSD was mounted, and Docker was unavailable. A resource-capable successor must
+record exact-tip results; the baseline totals above must not be treated as proof for the correction.
+
 Hosted container publication, immutable registry/static read-back, Temporal task-queue behavior,
 live runner capacity, runtime image-digest attestation, read-only-rootfs policy, customer cohort,
 canary, and rollback are external-only gates and cannot be converted into local test claims.
@@ -228,7 +251,7 @@ canary, and rollback are external-only gates and cannot be converted into local 
 
 ## Review Checklist (for reviewer)
 
-- [x] Final `git status` exactly matches the 79-path implementation inventory
+- [x] Final branch diff contains exactly 80 inventoried paths and the handoff worktree is clean
 - [x] Files match the Round 611 scope with no unrelated or `docs/reviews/` changes
 - [x] New-effect availability requires exact live release and role quorum with no debug bypass
 - [x] Idempotent replay precedes mutable admission checks and preserves original A
@@ -238,4 +261,5 @@ canary, and rollback are external-only gates and cannot be converted into local 
 - [x] Paired schema parity, focused tests, builds, privacy, flags, provenance, and diff checks pass
 - [x] All customer flags remain `0` and hosted evidence is not claimed from local source
 - [x] No TODO lacks a tracked follow-up
-- [x] Full all-target Rust rerun passes with zero failures
+- [x] Baseline `423fba5c` full all-target Rust rerun passes with zero failures
+- [ ] Corrected branch tip passes automation Vitest, Rust check/Clippy/tests, and exact managed-runner Docker/CI gates

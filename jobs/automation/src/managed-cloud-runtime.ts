@@ -19,7 +19,7 @@ const SHA256 = /^[a-f0-9]{64}$/;
 const SOURCE_COMMIT = /^[a-f0-9]{40}$/;
 const TOKEN = /^[A-Za-z0-9_-]{43}$/;
 const MAX_MEASUREMENT_BYTES = 128 * 1024;
-const MAX_MEASURED_FILES = 256;
+const MAX_MEASURED_FILES = 512;
 const RUNTIME_MEASUREMENT_AUDIENCE =
   "bluey-jobs-managed-cloud-runtime-measurement-v1";
 const RUNTIME_MEASUREMENT_PATH =
