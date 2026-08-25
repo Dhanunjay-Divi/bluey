@@ -7,6 +7,21 @@ under `docs/release/`.
 
 ### Added
 
+- Added a read-only Bluey Jobs Career Command Center as the new portal home, composing current
+  server workspace truth into setup readiness, rolling 24-hour matches, human interventions,
+  discovery-source health, evidence-backed outcomes, Gmail/Outlook/calendar connection state,
+  explicit LinkedIn unavailability, plan usage, managed-runner availability, and prioritized
+  navigation-only next actions. The original responsive surface preserves five mobile tabs,
+  retains preview query state, distinguishes prepared/sent/submitted/ambiguous states, and adds no
+  provider command or server mutation. Setup readiness distinguishes authoritative, actionable,
+  reported-only, and optional state; resume/legacy Track references stay fail-closed, mailbox
+  correlation is excluded from required readiness, stale source health is shared with Matches,
+  and Today's focus respects active Tracks plus latest pass/restore feedback without claiming
+  eligibility. Added the Phase 612B GiraffyReach second-pass record,
+  including one explicitly synthetic resume parse and preparation test that stopped at a `Saved`
+  tracker item without OAuth, missing-skill injection, external communication, applied status, or
+  employer submission. Round 613 canonical role/skill/location and Career Track enforcement
+  remains mandatory; no release flag, deployment, credential, or production authority changed.
 - Added the Phase 612 GiraffyReach clean-room product/source audit and Bluey Jobs implementation
   authority. The audit separates public and normal authenticated observations from marketing
   claims and unknowns; documents direct-employer, curated, recruiter-email, Dice, and LinkedIn

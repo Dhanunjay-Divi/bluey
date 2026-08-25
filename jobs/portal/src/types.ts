@@ -179,7 +179,7 @@ export interface JobPosting {
   matched_reasons: string[];
   missing_requirements: string[];
   posted_at_ms?: number;
-  last_verified_at_ms?: number;
+  last_verified_at_ms?: number | null;
   availability_status: "active" | "expired" | "unknown" | string;
   status: string;
   created_at_ms: number;

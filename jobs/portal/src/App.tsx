@@ -54,12 +54,19 @@ const AutomationView = lazy(() => import("./views/AutomationView").then((module)
   default: module.AutomationView,
 })));
 const SettingsView = lazy(() => import("./views/SettingsView").then((module) => ({ default: module.SettingsView })));
+const CareerCommandCenterView = lazy(() => import("./views/CareerCommandCenterView").then((module) => ({
+  default: module.CareerCommandCenterView,
+})));
 
 const previewState = portalPreviewState(window.location.search);
 const isPreview = previewState.enabled;
 const previewScenario = previewState.scenario;
 const previewSearch = previewState.search;
 const initialPreviewWorkspace = previewWorkspaceForScenario(previewWorkspace, previewScenario);
+
+export function jobsPortalHomeDestination(search = ""): string {
+  return `/overview${search}`;
+}
 
 type ResumeUploadRequestId = ReturnType<Crypto["randomUUID"]>;
 
@@ -972,7 +979,16 @@ export default function App() {
       {toast && <div className="toast" role="status">{toast}</div>}
       <Suspense fallback={<div className="view-loading"><LoaderCircle className="spin" size={20} /><span>Opening view...</span></div>}>
       <Routes>
-        <Route index element={<Navigate to={`matches${previewSearch}`} replace />} />
+        <Route index element={<Navigate to={jobsPortalHomeDestination(previewSearch)} replace />} />
+        <Route
+          path="overview"
+          element={
+            <CareerCommandCenterView
+              workspace={workspace}
+              previewSearch={previewSearch}
+            />
+          }
+        />
         <Route
           path="matches"
           element={
@@ -1060,7 +1076,10 @@ export default function App() {
             />
           }
         />
-        <Route path="*" element={<Navigate to={`matches${previewSearch}`} replace />} />
+        <Route
+          path="*"
+          element={<Navigate to={jobsPortalHomeDestination(previewSearch)} replace />}
+        />
       </Routes>
       </Suspense>
     </AppShell>

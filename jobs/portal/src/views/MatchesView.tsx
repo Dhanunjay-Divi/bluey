@@ -42,6 +42,10 @@ import { effectiveSubmissionMode } from "../lib/application-flow";
 import { portalEligibilityDecision } from "../lib/ats-certification";
 import { isJobPassed, matchPassReasons } from "../lib/candidate-events";
 import {
+  discoverySourceAction,
+  discoverySourceState,
+} from "../lib/discovery-source";
+import {
   clearMatchViewFilters,
   filterMatches,
   hasMatchViewFilters,
@@ -518,26 +522,6 @@ function DiscoverySourceStateIcon({ state }: { state: DiscoverySourceHealth }) {
   if (state === "paused") return <CirclePause size={15} aria-hidden="true" />;
   if (state === "degraded") return <TriangleAlert size={15} aria-hidden="true" />;
   return <Clock3 size={15} aria-hidden="true" />;
-}
-
-export const DISCOVERY_SOURCE_STALE_AFTER_MS = 12 * 60 * 60 * 1_000;
-
-export function discoverySourceState(
-  source: Pick<DiscoverySource, "status" | "health" | "last_success_at_ms">,
-  nowMs = Date.now(),
-): DiscoverySourceHealth {
-  if (source.status === "paused") return "paused";
-  if (source.health !== "healthy") return source.health;
-  if (!source.last_success_at_ms) return "waiting";
-  if (source.last_success_at_ms < nowMs - DISCOVERY_SOURCE_STALE_AFTER_MS) return "degraded";
-  return "healthy";
-}
-
-export function discoverySourceAction(state: DiscoverySourceHealth): string {
-  if (state === "degraded") return "Updates are delayed. Bluey is retrying; add an urgent job link meanwhile.";
-  if (state === "paused") return "Contact support to resume it. Paste urgent roles meanwhile.";
-  if (state === "waiting") return "Waiting for the first sync.";
-  return "No action needed.";
 }
 
 export function jobEligibility(job: JobPosting) {

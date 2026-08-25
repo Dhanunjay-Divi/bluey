@@ -1,5 +1,9 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { MemoryRouter } from "react-router-dom";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { ApiError } from "./api";
+import { AppShell } from "./components/AppShell";
 import { previewWorkspace } from "./data/preview";
 import type { CareerProfile, MailboxConnection, UploadResumeSourceResponse } from "./types";
 
@@ -9,19 +13,61 @@ let ResumeUploadAttemptLineage: typeof import("./App").ResumeUploadAttemptLineag
 let uploadResumeSourceWithLineage: typeof import("./App").uploadResumeSourceWithLineage;
 let openMailboxCommunicationAuthorization:
   typeof import("./App").openMailboxCommunicationAuthorization;
+let jobsPortalHomeDestination: typeof import("./App").jobsPortalHomeDestination;
 
 beforeAll(async () => {
   vi.stubGlobal("window", {
     location: { search: "", origin: "https://jobs.bluey.example" },
+    matchMedia: () => ({ matches: false }),
+  });
+  vi.stubGlobal("localStorage", {
+    getItem: () => null,
+    setItem: () => undefined,
+    removeItem: () => undefined,
   });
   const app = await import("./App");
   ResumeUploadAttemptLineage = app.ResumeUploadAttemptLineage;
   uploadResumeSourceWithLineage = app.uploadResumeSourceWithLineage;
   openMailboxCommunicationAuthorization = app.openMailboxCommunicationAuthorization;
+  jobsPortalHomeDestination = app.jobsPortalHomeDestination;
 });
 
 afterAll(() => {
   vi.unstubAllGlobals();
+});
+
+describe("Jobs portal home route", () => {
+  it("uses Overview as the canonical basename-relative home", () => {
+    expect(jobsPortalHomeDestination()).toBe("/overview");
+    expect(jobsPortalHomeDestination("?preview=1&scenario=many-matches"))
+      .toBe("/overview?preview=1&scenario=many-matches");
+  });
+
+  it("exposes Overview in both navigation layouts without growing the mobile tab bar", () => {
+    const markup = renderToStaticMarkup(createElement(
+      MemoryRouter,
+      { initialEntries: ["/overview?preview=1"] },
+      createElement(
+        AppShell,
+        {
+          account: { email: "taylor@example.com", balance_cents: 2450 },
+          workspace: previewWorkspace,
+          onRefresh: () => undefined,
+          preview: true,
+          previewSearch: "?preview=1",
+          children: createElement("p", null, "Command center"),
+        },
+      ),
+    ));
+    const desktopNavigation = markup.match(/<nav class="desktop-nav"[\s\S]*?<\/nav>/)?.[0] || "";
+    const mobileNavigation = markup.match(/<nav class="mobile-nav"[\s\S]*?<\/nav>/)?.[0] || "";
+
+    expect(desktopNavigation).toContain('href="/overview?preview=1"');
+    expect(desktopNavigation).toContain('href="/settings?preview=1"');
+    expect(mobileNavigation).toContain('href="/overview?preview=1"');
+    expect(mobileNavigation).not.toContain('href="/settings?preview=1"');
+    expect(mobileNavigation.match(/ href=/g)).toHaveLength(5);
+  });
 });
 
 describe("resume source upload request lineage", () => {
