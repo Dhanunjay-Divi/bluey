@@ -7,6 +7,14 @@ under `docs/release/`.
 
 ### Added
 
+- Added the Phase 612 GiraffyReach clean-room product/source audit and Bluey Jobs implementation
+  authority. The audit separates public and normal authenticated observations from marketing
+  claims and unknowns; documents direct-employer, curated, recruiter-email, Dice, and LinkedIn
+  source cohorts; verifies current production versus Phase 611 source-gated capability; identifies
+  the unmerged role/skill/location authority defects as launch-blocking; and defines an independent
+  source control plane, evidence/canonicalization contracts, market/resume/C2C/agent product plan,
+  successor batches, measurements, and acceptance gates. No account setting, provider, source,
+  application code, release flag, deployment, or production state changed.
 - Added disabled-by-default Bluey Jobs managed-cloud launch authority for the browser-delivered,
   no-install Background runner. The authority requires one canonical signed release to bind the
   exact Jobs API, workflows, runner, and portal artifacts; schema, protocol, configuration,
