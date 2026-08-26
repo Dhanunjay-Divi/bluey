@@ -51,11 +51,8 @@ describe("career command center summary", () => {
       detail: "The workspace reports a resume reference, but this view has no authoritative asset read-back.",
     });
     expect(summary.readiness.find((item) => item.id === "tracks")).toMatchObject({
-      state: "reported",
-      detail: (
-        "2 active Tracks have a verified identity binding. Canonical role, location, policy, "
-        + "and resume binding are not proven here."
-      ),
+      state: "needs_action",
+      detail: "2 of 2 active Tracks need canonical policy review before queue or Auto-submit.",
     });
     expect(summary.readiness.find((item) => item.id === "inbox")?.state).toBe("optional");
     expect(summary.inbox.connected.map((connection) => connection.provider)).toEqual(["gmail"]);
@@ -103,7 +100,7 @@ describe("career command center summary", () => {
       state: "needs_action",
       detail: "The source resume binding is incomplete; re-import it before preparation.",
     });
-    expect(summary.readiness.find((item) => item.id === "tracks")?.state).toBe("reported");
+    expect(summary.readiness.find((item) => item.id === "tracks")?.state).toBe("needs_action");
   });
 
   it("keeps a plausible but unverified resume reference reported rather than ready", () => {
@@ -132,11 +129,94 @@ describe("career command center summary", () => {
     const summary = commandCenterSummary(workspace({ tracks: [legacyTrack] }), now);
 
     expect(summary.readiness.find((item) => item.id === "tracks")).toMatchObject({
-      state: "reported",
+      state: "needs_action",
     });
     expect(summary.readiness.find((item) => item.id === "tracks")?.detail).toContain(
-      "not proven here",
+      "canonical policy review",
     );
+  });
+
+  it("promotes only exact current Track policy revisions to ready", () => {
+    const sourceResumeSha256 = "1".repeat(64);
+    const tracks = previewWorkspace.tracks.map((track, index) => ({
+      ...track,
+      policy: {
+        ...track.policy,
+        authority: {
+          taxonomy_version: "bluey-jobs-taxonomy-v1-2026-08-25",
+    taxonomy_sha256: "facdb3593457b6585ea83c9f735c42616e7cf03caa6e0369be9154f542dd7254",
+          taxonomy_activation_epoch: 1,
+          canonicalizer_schema_version: 1,
+          canonicalizer_sha256: "7".repeat(64),
+          account_input_generation: index + 1,
+          account_input_transition_sha256: "8".repeat(64),
+          account_input_semantic_sha256: "b".repeat(64),
+          track_input_generation: index + 1,
+          track_input_transition_sha256: "9".repeat(64),
+          track_semantic_sha256: "a".repeat(64),
+          canonical_role_id: index === 0 ? "software-engineer" : "frontend-engineer",
+          canonical_role_family_id: "software-engineering",
+          canonical_location_ids: [
+            "country:US",
+            "subdivision:US-NY",
+            "metro:US-NY-new-york-metro",
+            "city:US-NY-new-york",
+          ],
+          source_resume_asset_id: previewWorkspace.profile.source_resume_asset_id,
+          source_resume_sha256: sourceResumeSha256,
+          applicationIdentityId: track.application_identity_id || "",
+          application_identity_sha256: "b".repeat(64),
+          job_preferences_sha256: "c".repeat(64),
+          policy_revision_id: `track-policy-${index + 1}`,
+          policy_revision_no: index + 1,
+          canonical_policy_sha256: "d".repeat(64),
+          policy_head_generation: index + 1,
+          policy_head_transition_sha256: "e".repeat(64),
+          policy_review_receipt_id: `track-policy-review-${index + 1}`,
+          policy_review_receipt_sha256: "f".repeat(64),
+          review_state: "approved",
+          review_reason_codes: [],
+        },
+      },
+    }));
+
+    const summary = commandCenterSummary(workspace({
+      profile: {
+        ...previewWorkspace.profile,
+        source_resume_sha256: sourceResumeSha256,
+      },
+      tracks,
+    }), now);
+
+    expect(summary.readiness.find((item) => item.id === "tracks")).toMatchObject({
+      state: "ready",
+      detail: (
+        "2 active Tracks have an approved canonical role, location, identity, preferences, "
+        + "and resume policy revision."
+      ),
+    });
+
+    const identityDrift = tracks.map((track, index) => index === 0
+      ? {
+          ...track,
+          policy: {
+            ...track.policy,
+            authority: {
+              ...track.policy.authority,
+              applicationIdentityId: "identity-career",
+            },
+          },
+        }
+      : track);
+    const driftedSummary = commandCenterSummary(workspace({
+      profile: {
+        ...previewWorkspace.profile,
+        source_resume_sha256: sourceResumeSha256,
+      },
+      tracks: identityDrift,
+    }), now);
+    expect(driftedSummary.readiness.find((item) => item.id === "tracks")?.state)
+      .toBe("needs_action");
   });
 
   it("orders blocking application decisions ahead of reviews and fresh matches", () => {

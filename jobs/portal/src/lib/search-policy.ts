@@ -1,4 +1,9 @@
 import type { EmploymentEntry } from "../types";
+import {
+  classifyPostingRole,
+  resolveTargetRole,
+  type TargetRoleResolution,
+} from "./canonical-taxonomy";
 
 export const BLUEY_DAILY_APPLICATION_LIMIT = 10;
 export const BLUEY_AUTO_SUBMIT_THRESHOLD = 80;
@@ -10,13 +15,12 @@ export interface ExperienceRange {
   maximum: number;
 }
 
-type CareerRoleFamily =
-  | "software_engineering"
-  | "data_engineering"
-  | "data_science_ml"
-  | "product_management"
-  | "clinical_research"
-  | "generic";
+export interface RoleExperienceAssessment {
+  range: ExperienceRange;
+  target_role: TargetRoleResolution;
+  review_required: boolean;
+  relevant_entry_count: number;
+}
 
 export function experienceRange(employment: EmploymentEntry[], now = new Date()): ExperienceRange {
   const currentMonth = now.getUTCFullYear() * 12 + now.getUTCMonth();
@@ -49,60 +53,35 @@ export function roleExperienceRange(
   targetRole: string,
   now = new Date(),
 ): ExperienceRange {
-  const targetFamily = inferCareerRoleFamily(targetRole);
-  const relevant = targetFamily === "generic"
-    ? employment
-    : employment.filter((entry) => (
-      inferCareerRoleFamily(`${entry.title} ${entry.highlights.join(" ")}`) === targetFamily
-    ));
-  return experienceRange(relevant, now);
+  // Existing presentation callers keep the range shape; authority callers must inspect the assessment.
+  return roleExperienceAssessment(employment, targetRole, now).range;
 }
 
-function inferCareerRoleFamily(value: string): CareerRoleFamily {
-  const text = ` ${normalizeCareerText(value)} `;
-  if (containsCareerPhrase(text, [" data engineer ", " data platform ", " analytics engineer ", " etl ", " data warehouse ", " de "])) {
-    return "data_engineering";
+export function roleExperienceAssessment(
+  employment: EmploymentEntry[],
+  targetRole: string,
+  now = new Date(),
+): RoleExperienceAssessment {
+  const target = resolveTargetRole(targetRole);
+  if (target.status !== "resolved") {
+    return {
+      range: experienceRange(employment, now),
+      target_role: target,
+      review_required: true,
+      relevant_entry_count: employment.length,
+    };
   }
-  if (containsCareerPhrase(text, [" machine learning ", " data scientist ", " applied scientist ", " artificial intelligence ", " ml engineer ", " mle "])) {
-    return "data_science_ml";
-  }
-  if (containsCareerPhrase(text, [" product manager ", " product management ", " product owner ", " pm "])) {
-    return "product_management";
-  }
-  if (containsCareerPhrase(text, [" clinical research ", " clinical operations ", " clinical trial ", " research coordinator ", " cra ", " crc "])) {
-    return "clinical_research";
-  }
-  if (containsCareerPhrase(text, [
-    " software ",
-    " developer ",
-    " frontend ",
-    " front end ",
-    " backend ",
-    " back end ",
-    " full stack ",
-    " fullstack ",
-    " devops ",
-    " site reliability ",
-    " cloud engineer ",
-    " application engineer ",
-    " swe ",
-    " sde ",
-  ])) {
-    return "software_engineering";
-  }
-  return "generic";
-}
 
-function normalizeCareerText(value: string): string {
-  return value
-    .toLocaleLowerCase()
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function containsCareerPhrase(value: string, phrases: string[]): boolean {
-  return phrases.some((phrase) => value.includes(phrase));
+  const relevant = employment.filter((entry) => {
+    const postingRole = classifyPostingRole(entry.title);
+    return postingRole.status === "known" && postingRole.family_id === target.role.family_id;
+  });
+  return {
+    range: experienceRange(relevant, now),
+    target_role: target,
+    review_required: false,
+    relevant_entry_count: relevant.length,
+  };
 }
 
 function parseCareerMonth(value: string): number | null {

@@ -134,6 +134,38 @@ export interface CareerTrackPolicy {
   employment_types: string[];
   engagement_types: string[];
   work_authorizations: string[];
+  authority?: CareerTrackPolicyAuthority;
+}
+
+export interface CareerTrackPolicyAuthority {
+  taxonomy_version: string;
+  taxonomy_sha256: string;
+  taxonomy_activation_epoch: number;
+  canonicalizer_schema_version: number;
+  canonicalizer_sha256: string;
+  account_input_generation: number;
+  account_input_transition_sha256: string;
+  account_input_semantic_sha256: string;
+  track_input_generation: number;
+  track_input_transition_sha256: string;
+  track_semantic_sha256: string;
+  canonical_role_id: string;
+  canonical_role_family_id: string;
+  canonical_location_ids: string[];
+  source_resume_asset_id: string;
+  source_resume_sha256: string;
+  applicationIdentityId: string;
+  application_identity_sha256: string;
+  job_preferences_sha256: string;
+  policy_revision_id: string;
+  policy_revision_no: number;
+  canonical_policy_sha256: string;
+  policy_head_generation: number;
+  policy_head_transition_sha256: string;
+  policy_review_receipt_id: string;
+  policy_review_receipt_sha256: string;
+  review_state: string;
+  review_reason_codes: string[];
 }
 
 export interface CareerTrack {

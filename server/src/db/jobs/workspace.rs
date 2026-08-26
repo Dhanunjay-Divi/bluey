@@ -87,6 +87,7 @@ pub fn account_export(
     }
     Ok(Some(JobsAccountExport {
         workspace,
+        canonical_track_policy_ledger: export_canonical_track_policy_ledger(pool, account_id)?,
         resume_versions: list_resume_versions(pool, account_id)?,
         attempt_reservations: list_attempt_reservations(pool, account_id)?,
         run_events: list_account_run_events(pool, account_id)?,

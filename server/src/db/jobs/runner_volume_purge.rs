@@ -12569,8 +12569,37 @@ pub(super) mod runner_volume_purge_tests {
     ) -> (String, String, String) {
         let identity = ensure_primary_application_identity(pool, account_id, email)
             .expect("create runner test identity");
+        let now = now_ms();
+        let source = ResumeSourceAsset {
+            id: format!("resume-source-{account_id}"),
+            file_name: "fixture-source-resume.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            file_type: "pdf".to_string(),
+            storage_key: format!("accounts/{account_id}/jobs/fixture-source-resume.pdf"),
+            sha256: "e".repeat(64),
+            size_bytes: 1_024,
+            page_count: Some(1),
+            template_status: "converted_layout".to_string(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let mut profile = default_profile(email);
+        profile.onboarding_complete = true;
+        profile.source_resume_name = source.file_name.clone();
+        profile.source_resume_asset_id = source.id.clone();
+        profile.source_resume_sha256 = source.sha256.clone();
+        profile.source_resume_media_type = source.media_type.clone();
+        profile.source_resume_template_status = source.template_status.clone();
+        let (_, profile) = save_resume_source_asset(pool, account_id, &source, &profile)
+            .expect("save runner test source resume");
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let preferences = save_preferences(pool, account_id, &preferences)
+            .expect("save runner test preferences");
         let track_id = format!("track-{suffix}");
-        upsert_track(
+        let track = upsert_track(
             pool,
             account_id,
             &CareerTrack {
@@ -12591,13 +12620,8 @@ pub(super) mod runner_volume_purge_tests {
             },
         )
         .expect("create runner test track");
-        let profile = default_profile(email);
-        save_profile(pool, account_id, &profile).expect("save runner test profile");
-        let preferences = JobPreferences {
-            sponsorship: "not_required".to_string(),
-            ..JobPreferences::default()
-        };
-        save_preferences(pool, account_id, &preferences).expect("save runner test preferences");
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert!(track.policy.authority.policy_revision_no > 0);
         let checked_at_ms = now_ms();
         let canonical_url = format!("https://boards.greenhouse.io/acme/jobs/{suffix}");
         let mut posting = JobPosting {

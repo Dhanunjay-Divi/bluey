@@ -297,7 +297,7 @@ function releaseFixture() {
     manifestGeneration: 611,
     manifestId: "manifest-611-001",
     migrationSetSha256: "d".repeat(64),
-    postgresMigrationHead: "033_jobs_managed_cloud_release_authority.sql",
+    postgresMigrationHead: "034_jobs_canonical_taxonomy_authority.sql",
     protocolSetSha256: "e".repeat(64),
     protocols: MANAGED_CLOUD_PROTOCOL_IDS.map((protocolId, index) => ({
       protocolId,
@@ -308,7 +308,7 @@ function releaseFixture() {
     releaseId: RELEASE_ID,
     releaseSequence: 611001,
     sourceCommit: SOURCE_COMMIT,
-    sqliteMigrationHead: "055_jobs_managed_cloud_release_authority.sql",
+    sqliteMigrationHead: "056_jobs_canonical_taxonomy_authority.sql",
     verificationEvidenceSha256: "f".repeat(64),
     version: 1,
   };
@@ -435,30 +435,30 @@ function releaseContractFixture() {
   };
   const migrationFiles = {
     postgres: [sourceFile(
-      "infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql",
+      "infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql",
       "b",
     )],
     sqlite: [sourceFile(
-      "infra/sqlite/server-runtime/055_jobs_managed_cloud_release_authority.sql",
+      "infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql",
       "c",
     )],
   };
   const migrationContract = {
     audience: MANAGED_CLOUD_AUDIENCES.migrationContract,
     paritySha256: sha256(canonicalJsonBytes({
-      postgres: ["033_jobs_managed_cloud_release_authority.sql"],
-      sqlite: ["055_jobs_managed_cloud_release_authority.sql"],
+      postgres: ["034_jobs_canonical_taxonomy_authority.sql"],
+      sqlite: ["056_jobs_canonical_taxonomy_authority.sql"],
     })),
     postgres: {
       files: migrationFiles.postgres,
-      head: "033_jobs_managed_cloud_release_authority.sql",
+      head: "034_jobs_canonical_taxonomy_authority.sql",
       name: "postgres",
       setSha256: sha256(canonicalJsonBytes(migrationFiles.postgres)),
     },
     schemaVersion: 1,
     sqlite: {
       files: migrationFiles.sqlite,
-      head: "055_jobs_managed_cloud_release_authority.sql",
+      head: "056_jobs_canonical_taxonomy_authority.sql",
       name: "sqlite",
       setSha256: sha256(canonicalJsonBytes(migrationFiles.sqlite)),
     },
@@ -795,7 +795,7 @@ test("release-v1 validates the exact artifacts, capabilities, migrations, and pr
   assert.throws(
     () => validateReleaseManifest({
       ...manifest,
-      sqliteMigrationHead: "055_jobs_managed_cloud_release_authority",
+      sqliteMigrationHead: "056_jobs_canonical_taxonomy_authority",
     }),
     /migration heads/,
   );
@@ -902,7 +902,7 @@ test("release contracts prove full source sets without configured runtime identi
 
   const suffixlessMigration = structuredClone(fixture);
   suffixlessMigration.migrationContract.sqlite.head =
-    "055_jobs_managed_cloud_release_authority";
+    "056_jobs_canonical_taxonomy_authority";
   assert.throws(
     () => validateManagedCloudReleaseContracts(suffixlessMigration),
     /wrong identity or head/,

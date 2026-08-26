@@ -29,6 +29,7 @@ const TEST_SECRET: &str = "jobs-runner-plan-matrix-secret-32-bytes";
 const JOBS_DATA_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const TEST_BROWSER_SERVER_RELEASE_ID: &str = "server-603.1";
 const TEST_BROWSER_RELEASE_KEY_INDEX: usize = 6;
+const MATRIX_SOURCE_RESUME_BYTES: &[u8] = b"Exact source resume bytes for runner plan tests";
 
 struct BrowserBuildProofFixture {
     descriptor: String,
@@ -433,8 +434,32 @@ impl TestContext {
     }
 
     fn prepare(&self, account: &Account, label: &str) -> JobApplication {
-        let profile = jobs::default_profile(&account.email);
-        jobs::save_profile(&self.pool, &account.id, &profile).expect("save matrix profile");
+        let mut profile = jobs::default_profile(&account.email);
+        let source_sha256 = hex::encode(Sha256::digest(MATRIX_SOURCE_RESUME_BYTES));
+        let source_resume = jobs::ResumeSourceAsset {
+            id: format!("matrix-source-resume-{label}"),
+            file_name: "matrix-source-resume.txt".to_string(),
+            media_type: "text/plain".to_string(),
+            file_type: "txt".to_string(),
+            storage_key: format!(
+                "bluey-cloud/accounts/{}/jobs/resumes/matrix-source-resume-{label}/sha256/{source_sha256}.txt",
+                account.id
+            ),
+            sha256: source_sha256,
+            size_bytes: MATRIX_SOURCE_RESUME_BYTES.len() as i64,
+            page_count: None,
+            template_status: "text_only".to_string(),
+            created_at_ms: chrono::Utc::now().timestamp_millis(),
+            updated_at_ms: chrono::Utc::now().timestamp_millis(),
+        };
+        profile.source_resume_name = source_resume.file_name.clone();
+        profile.source_resume_asset_id = source_resume.id.clone();
+        profile.source_resume_sha256 = source_resume.sha256.clone();
+        profile.source_resume_media_type = source_resume.media_type.clone();
+        profile.source_resume_template_status = source_resume.template_status.clone();
+        let (_, profile) =
+            jobs::save_resume_source_asset(&self.pool, &account.id, &source_resume, &profile)
+                .expect("save matrix source resume");
         let identity =
             jobs::ensure_primary_application_identity(&self.pool, &account.id, &account.email)
                 .expect("create matrix application identity");

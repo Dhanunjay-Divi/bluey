@@ -34,18 +34,34 @@ fn current_execution_authorized_sqlite(
     else {
         return Ok(false);
     };
-    let Some(track) = tx
+    let Some((authoritative_track_id, authoritative_active, mut track)) = tx
         .query_row(
-            "SELECT track_json FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+            "SELECT id, active, track_json FROM jobs_tracks
+              WHERE account_id = ?1 AND id = ?2",
             params![account_id, posting.track_id],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, String>(2)?,
+                ))
+            },
         )
         .optional()?
-        .map(|raw| parse_json::<CareerTrack>(raw, "Jobs execution Career Track"))
+        .map(|(id, active, raw)| {
+            parse_json::<CareerTrack>(raw, "Jobs execution Career Track")
+                .map(|track| (id, active, track))
+        })
         .transpose()?
     else {
         return Ok(false);
     };
+    track.id = authoritative_track_id;
+    if track.active != authoritative_active
+        || validate_track_policy_ledger_sqlite(tx, account_id, &track).is_err()
+    {
+        return Ok(false);
+    }
     let Some(identity_id) = frozen_receipt_string(application, "/application_identity/id") else {
         return Ok(false);
     };
@@ -189,27 +205,44 @@ fn current_execution_authorized_postgres(
     application: &JobApplication,
     runner: ExecutionAuthorityRunner,
 ) -> Result<bool> {
+    lock_discovery_account_shared_postgres(tx, account_id)?;
+    lock_account_policy_inputs_postgres(tx, account_id, false)?;
     let Some(profile_row) = tx.query_opt(
         "SELECT profile_json FROM jobs_profiles WHERE account_id = $1",
         &[&account_id],
-    )? else {
+    )?
+    else {
         return Ok(false);
     };
     let profile: CareerProfile = parse_json(profile_row.get(0), "Jobs execution profile")?;
     let Some(posting_row) = tx.query_opt(
         "SELECT posting_json FROM jobs_postings WHERE account_id = $1 AND id = $2",
         &[&account_id, &application.job_id],
-    )? else {
+    )?
+    else {
         return Ok(false);
     };
     let posting: JobPosting = parse_json(posting_row.get(0), "Jobs execution posting")?;
     let Some(track_row) = tx.query_opt(
-        "SELECT track_json FROM jobs_tracks WHERE account_id = $1 AND id = $2",
+        "SELECT id, active, track_json FROM jobs_tracks
+          WHERE account_id = $1 AND id = $2 FOR SHARE",
         &[&account_id, &posting.track_id],
-    )? else {
+    )?
+    else {
         return Ok(false);
     };
-    let track: CareerTrack = parse_json(track_row.get(0), "Jobs execution Career Track")?;
+    let authoritative_track_id: String = track_row.get(0);
+    let authoritative_active = track_row.get::<_, i32>(1) != 0;
+    let mut track: CareerTrack = parse_json(track_row.get(2), "Jobs execution Career Track")?;
+    track.id = authoritative_track_id;
+    if track.active != authoritative_active
+        || validate_track_policy_ledger_postgres(tx, account_id, &track).is_err()
+    {
+        return Ok(false);
+    }
+    if application.submission_mode == "auto_submit" {
+        lock_auto_submit_authority_postgres(tx, account_id, &track.id, false)?;
+    }
     let Some(identity_id) = frozen_receipt_string(application, "/application_identity/id") else {
         return Ok(false);
     };
@@ -218,7 +251,8 @@ fn current_execution_authorized_postgres(
            FROM jobs_application_identities
           WHERE account_id = $1 AND id = $2",
         &[&account_id, &identity_id],
-    )? else {
+    )?
+    else {
         return Ok(false);
     };
     let identity = parse_application_identity_row(
@@ -244,7 +278,8 @@ fn current_execution_authorized_postgres(
                     authorized_at_ms, revoked_at_ms
                FROM jobs_auto_submit_authorizations
               WHERE account_id = $1 AND career_track_id = $2
-                AND revoked_at_ms IS NULL",
+                AND revoked_at_ms IS NULL
+              FOR SHARE",
             &[&account_id, &track.id],
         )?
         .map(|row| StoredAutoSubmitAuthorization {
@@ -361,6 +396,11 @@ fn current_execution_authority_matches(
         .or_else(|| frozen_receipt_string(application, "/evidence_revision/id"));
     let frozen_evidence_hash = frozen_receipt_string(application, "/evidence_content_hash")
         .or_else(|| frozen_receipt_string(application, "/evidence_revision/content_hash"));
+    let current_track_policy_authority = serde_json::to_value(&track.policy.authority)
+        .context("encode current Career Track policy authority")?;
+    let frozen_track_policy_authority = application
+        .receipt
+        .pointer("/career_track_policy_authority");
     if frozen_track.as_deref() != Some(track.id.as_str())
         || posting.track_id != track.id
         || !track.active
@@ -369,6 +409,7 @@ fn current_execution_authority_matches(
         || frozen_email.as_deref() != Some(identity.email.as_str())
         || identity.verification_status != "verified"
         || application.resume_version_id.is_none()
+        || frozen_track_policy_authority != Some(&current_track_policy_authority)
     {
         return Ok(false);
     }
@@ -405,6 +446,7 @@ fn current_execution_authority_matches(
             facts,
             track,
             identity,
+            preferences,
         )? {
             return Ok(false);
         }
@@ -413,13 +455,10 @@ fn current_execution_authority_matches(
             value.get("kind").and_then(Value::as_str) == Some("track_auto_submit")
                 && value.get("authorization_id").and_then(Value::as_str)
                     == Some(authorization.id.as_str())
-                && value.get("career_track_id").and_then(Value::as_str)
-                    == Some(track.id.as_str())
+                && value.get("career_track_id").and_then(Value::as_str) == Some(track.id.as_str())
                 && value.get("revision_no").and_then(Value::as_i64)
                     == Some(authorization.revision_no)
-                && value
-                    .get("authority_fingerprint")
-                    .and_then(Value::as_str)
+                && value.get("authority_fingerprint").and_then(Value::as_str)
                     == Some(authorization.authority_fingerprint.as_str())
         });
         if !admission_matches {
@@ -428,14 +467,8 @@ fn current_execution_authority_matches(
     }
 
     let experience = role_experience_evidence(profile, Some(track), posting);
-    let evidence = build_profile_evidence_revision(
-        account_id,
-        profile,
-        facts,
-        track,
-        identity,
-        &experience,
-    )?;
+    let evidence =
+        build_profile_evidence_revision(account_id, profile, facts, track, identity, &experience)?;
     Ok(frozen_evidence_id.as_deref() == Some(evidence.id.as_str())
         && frozen_evidence_hash.as_deref() == Some(evidence.content_hash.as_str()))
 }
@@ -480,8 +513,7 @@ fn stored_execution_evidence_matches_sqlite(
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     Ok(stored_evidence.is_some_and(|(track_id, content_hash)| {
-        frozen_receipt_string(application, "/career_track_id").as_deref()
-            == Some(track_id.as_str())
+        frozen_receipt_string(application, "/career_track_id").as_deref() == Some(track_id.as_str())
             && content_hash == evidence_hash
     }) && resume_exists
         && claim_count > 0
@@ -529,8 +561,7 @@ fn stored_execution_evidence_matches_postgres(
     Ok(stored_evidence.is_some_and(|row| {
         let track_id: String = row.get(0);
         let content_hash: String = row.get(1);
-        frozen_receipt_string(application, "/career_track_id").as_deref()
-            == Some(track_id.as_str())
+        frozen_receipt_string(application, "/career_track_id").as_deref() == Some(track_id.as_str())
             && content_hash == evidence_hash
     }) && resume_exists
         && claim_count > 0

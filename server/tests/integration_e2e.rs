@@ -56,6 +56,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 const TEST_BROWSER_SERVER_RELEASE_ID: &str = "server-603.1";
 const TEST_BROWSER_RELEASE_KEY_INDEX: usize = 6;
+const EXECUTION_LEASE_SOURCE_RESUME_BYTES: &[u8] =
+    b"Exact source resume bytes for execution integration tests";
 
 struct BrowserBuildProofFixture {
     descriptor: String,
@@ -2290,6 +2292,348 @@ async fn standalone_jobs_router_exposes_health_and_protects_customer_data() {
     assert_eq!(main_api_route.status(), StatusCode::NOT_FOUND);
 }
 
+fn jobs_policy_write_counts(pool: &DbPool, account_id: &str) -> (i64, i64, i64, i64) {
+    let conn = pool.get().unwrap();
+    conn.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM jobs_profiles WHERE account_id = ?1),
+            (SELECT COUNT(*) FROM jobs_preferences WHERE account_id = ?1),
+            (SELECT COUNT(*) FROM jobs_tracks WHERE account_id = ?1),
+            (SELECT COUNT(*) FROM jobs_discovery_sources WHERE account_id = ?1)",
+        rusqlite::params![account_id],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_taxonomy_http_contract_authenticates_and_fences_track_mutations() {
+    let harness = boot_harness().await;
+    let email = "jobs-taxonomy-contract@example.com";
+    let access = signup_and_login(&harness, email, "valid-password-123").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .unwrap();
+
+    let unauthorized = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/taxonomy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    let taxonomy = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/taxonomy")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(taxonomy.status(), StatusCode::OK);
+    let taxonomy_body = axum::body::to_bytes(taxonomy.into_body(), 256 * 1024)
+        .await
+        .unwrap();
+    let taxonomy: serde_json::Value = serde_json::from_slice(&taxonomy_body).unwrap();
+    let taxonomy_version = taxonomy["taxonomyVersion"].as_str().unwrap();
+    let taxonomy_sha256 = taxonomy["taxonomySha256"].as_str().unwrap();
+    assert_eq!(
+        taxonomy_version,
+        bluey_server::jobs_taxonomy::taxonomy_version()
+    );
+    assert_eq!(
+        taxonomy_sha256,
+        bluey_server::jobs_taxonomy::taxonomy_sha256()
+    );
+    assert_eq!(
+        taxonomy["registry"]["taxonomy_version"],
+        taxonomy["taxonomyVersion"]
+    );
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        (0, 0, 0, 0)
+    );
+
+    let valid_track = json!({
+        "id": "phase-613-http-track",
+        "name": "Software engineering",
+        "role": "Software Engineer",
+        "locations": ["New York, NY"],
+        "remote_preference": "hybrid_ok",
+        "policy": {
+            "employment_types": ["full_time"]
+        },
+        "active": true
+    });
+    let missing_binding = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/tracks")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&valid_track).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(missing_binding.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        (0, 0, 0, 0)
+    );
+
+    let stale_binding = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/tracks")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .header("x-bluey-jobs-taxonomy-version", taxonomy_version)
+                .header("x-bluey-jobs-taxonomy-sha256", "0".repeat(64))
+                .body(Body::from(serde_json::to_vec(&valid_track).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_binding.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        (0, 0, 0, 0)
+    );
+
+    for (field, value) in [("remote_preference", "Remote or hybrid"), ("role", "PM")] {
+        let mut invalid_track = valid_track.clone();
+        invalid_track[field] = json!(value);
+        let invalid = harness
+            .jobs_router
+            .clone()
+            .oneshot(
+                Request::post("/api/jobs/tracks")
+                    .header("authorization", format!("Bearer {access}"))
+                    .header("content-type", "application/json")
+                    .header("x-bluey-jobs-taxonomy-version", taxonomy_version)
+                    .header("x-bluey-jobs-taxonomy-sha256", taxonomy_sha256)
+                    .body(Body::from(serde_json::to_vec(&invalid_track).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            jobs_policy_write_counts(&harness.pool, &account.id),
+            (0, 0, 0, 0)
+        );
+    }
+
+    let created = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/tracks")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .header("x-bluey-jobs-taxonomy-version", taxonomy_version)
+                .header("x-bluey-jobs-taxonomy-sha256", taxonomy_sha256)
+                .body(Body::from(serde_json::to_vec(&valid_track).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::OK);
+    let created_body = axum::body::to_bytes(created.into_body(), 128 * 1024)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+    assert_eq!(created["id"], "phase-613-http-track");
+    assert_eq!(created["role"], "Software Engineer");
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        (0, 0, 1, 1)
+    );
+
+    let mut update = valid_track.clone();
+    update["name"] = json!("Changed without current taxonomy");
+    let stale_update = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::put("/api/jobs/tracks/phase-613-http-track")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .header("x-bluey-jobs-taxonomy-version", taxonomy_version)
+                .header("x-bluey-jobs-taxonomy-sha256", "0".repeat(64))
+                .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_update.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        jobs::list_tracks(&harness.pool, &account.id).unwrap()[0].name,
+        "Software engineering"
+    );
+
+    update["name"] = json!("Platform engineering");
+    let updated = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::put("/api/jobs/tracks/phase-613-http-track")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .header("x-bluey-jobs-taxonomy-version", taxonomy_version)
+                .header("x-bluey-jobs-taxonomy-sha256", taxonomy_sha256)
+                .body(Body::from(serde_json::to_vec(&update).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), StatusCode::OK);
+    assert_eq!(
+        jobs::list_tracks(&harness.pool, &account.id).unwrap()[0].name,
+        "Platform engineering"
+    );
+
+    let before_invalid_onboarding = jobs_policy_write_counts(&harness.pool, &account.id);
+    let invalid_onboarding = json!({
+        "profile": {
+            "full_name": "Taylor Rivera",
+            "current_location": "New York, NY",
+            "education": [{ "school": "State University" }]
+        },
+        "preferences": {
+            "location_policy": "ask",
+            "daily_limit": 10,
+            "time_zone_offset_minutes": 0
+        },
+        "track": {
+            "id": "phase-613-invalid-onboarding-track",
+            "name": "Ambiguous product role",
+            "role": "TPM",
+            "locations": ["New York, NY"],
+            "remote_preference": "remote_or_hybrid",
+            "policy": { "employment_types": ["full_time"] },
+            "active": true
+        }
+    });
+    let invalid_onboarding = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::post("/api/jobs/onboarding/complete")
+                .header("authorization", format!("Bearer {access}"))
+                .header("content-type", "application/json")
+                .header("x-bluey-jobs-taxonomy-version", taxonomy_version)
+                .header("x-bluey-jobs-taxonomy-sha256", taxonomy_sha256)
+                .body(Body::from(serde_json::to_vec(&invalid_onboarding).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid_onboarding.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        before_invalid_onboarding
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn jobs_track_write_is_retry_safe_when_curated_source_enrollment_fails_late() {
+    let harness = boot_harness().await;
+    let email = "jobs-track-late-enrollment@example.com";
+    let access = signup_and_login(&harness, email, "valid-password-123").await;
+    let account = Account::fetch_by_email(&harness.pool, email)
+        .unwrap()
+        .unwrap();
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER test_reject_curated_source
+             BEFORE INSERT ON jobs_discovery_sources
+             WHEN NEW.provider = 'curated_feed'
+             BEGIN
+               SELECT RAISE(ABORT, 'injected curated source enrollment failure');
+             END;",
+        )
+        .unwrap();
+    let track = json!({
+        "id": "phase-613-retry-safe-track",
+        "name": "Software engineering",
+        "role": "Software Engineer",
+        "locations": ["New York, NY"],
+        "remote_preference": "hybrid_ok",
+        "policy": { "employment_types": ["full_time"] },
+        "active": true
+    });
+
+    for _ in 0..2 {
+        let response = harness
+            .jobs_router
+            .clone()
+            .oneshot(
+                Request::post("/api/jobs/tracks")
+                    .header("authorization", format!("Bearer {access}"))
+                    .header("content-type", "application/json")
+                    .header(
+                        "x-bluey-jobs-taxonomy-version",
+                        bluey_server::jobs_taxonomy::taxonomy_version(),
+                    )
+                    .header(
+                        "x-bluey-jobs-taxonomy-sha256",
+                        bluey_server::jobs_taxonomy::taxonomy_sha256(),
+                    )
+                    .body(Body::from(serde_json::to_vec(&track).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        (0, 0, 1, 0),
+        "a retry must reuse the stable Track ID without duplicating policy state",
+    );
+
+    harness
+        .pool
+        .get()
+        .unwrap()
+        .execute_batch("DROP TRIGGER test_reject_curated_source;")
+        .unwrap();
+    let workspace = harness
+        .jobs_router
+        .clone()
+        .oneshot(
+            Request::get("/api/jobs/workspace")
+                .header("authorization", format!("Bearer {access}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(workspace.status(), StatusCode::OK);
+    assert_eq!(
+        jobs_policy_write_counts(&harness.pool, &account.id),
+        (0, 0, 1, 1),
+        "the next safe workspace read repairs managed source enrollment",
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn jobs_discovery_worker_requires_auth_and_persists_a_complete_snapshot() {
@@ -2519,8 +2863,32 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
     let account = Account::fetch_by_email(&harness.pool, email)
         .unwrap()
         .unwrap();
-    let profile = jobs::default_profile(&account.email);
-    jobs::save_profile(&harness.pool, &account.id, &profile).unwrap();
+    let mut profile = jobs::default_profile(&account.email);
+    let source_resume_sha256 = hex::encode(Sha256::digest(EXECUTION_LEASE_SOURCE_RESUME_BYTES));
+    let source_resume = jobs::ResumeSourceAsset {
+        id: "execution-lease-source-resume".to_string(),
+        file_name: "execution-lease-source-resume.txt".to_string(),
+        media_type: "text/plain".to_string(),
+        file_type: "txt".to_string(),
+        storage_key: format!(
+            "bluey-cloud/accounts/{}/jobs/resumes/execution-lease-source-resume/sha256/{}.txt",
+            account.id, source_resume_sha256
+        ),
+        sha256: source_resume_sha256,
+        size_bytes: EXECUTION_LEASE_SOURCE_RESUME_BYTES.len() as i64,
+        page_count: None,
+        template_status: "text_only".to_string(),
+        created_at_ms: chrono::Utc::now().timestamp_millis(),
+        updated_at_ms: chrono::Utc::now().timestamp_millis(),
+    };
+    profile.source_resume_name = source_resume.file_name.clone();
+    profile.source_resume_asset_id = source_resume.id.clone();
+    profile.source_resume_sha256 = source_resume.sha256.clone();
+    profile.source_resume_media_type = source_resume.media_type.clone();
+    profile.source_resume_template_status = source_resume.template_status.clone();
+    let (_, profile) =
+        jobs::save_resume_source_asset(&harness.pool, &account.id, &source_resume, &profile)
+            .unwrap();
     let identity =
         jobs::ensure_primary_application_identity(&harness.pool, &account.id, &account.email)
             .unwrap();
@@ -2607,7 +2975,16 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         )
         .await
         .unwrap();
-    assert_eq!(approved.status(), StatusCode::OK);
+    if approved.status() != StatusCode::OK {
+        let status = approved.status();
+        let body = axum::body::to_bytes(approved.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        panic!(
+            "execution lease fixture approval failed with {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     let application = jobs::get_application(&harness.pool, &account.id, &application.id)
         .unwrap()
         .unwrap();
@@ -11183,13 +11560,14 @@ async fn seed_jobs_portability_fixture(harness: &Harness) -> JobsPortabilityFixt
     .await;
     let access_token = auth["access_token"].as_str().unwrap().to_string();
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let resume_source_id = "portability-resume-source";
-    let resume_source_bytes = b"Exact source resume bytes for account export".to_vec();
+    let resume_source = jobs::get_resume_source_asset(&harness.pool, &evidence.account_id)
+        .unwrap()
+        .unwrap();
+    let resume_source_id = resume_source.id;
+    let resume_source_bytes = EXECUTION_LEASE_SOURCE_RESUME_BYTES.to_vec();
     let resume_source_sha256 = hex::encode(Sha256::digest(&resume_source_bytes));
-    let resume_source_key = format!(
-        "bluey-cloud/accounts/{}/jobs/resumes/{resume_source_id}/sha256/{resume_source_sha256}.txt",
-        evidence.account_id
-    );
+    assert_eq!(resume_source.sha256, resume_source_sha256);
+    let resume_source_key = resume_source.storage_key;
     let browser_profile_id = "portability-browser-profile";
     let browser_profile_bytes = b"BLUEYJP2 encrypted browser profile export bytes".to_vec();
     let browser_profile_sha256 = hex::encode(Sha256::digest(&browser_profile_bytes));
@@ -11199,23 +11577,6 @@ async fn seed_jobs_portability_fixture(harness: &Harness) -> JobsPortabilityFixt
     );
 
     let connection = harness.pool.get().unwrap();
-    connection
-        .execute(
-            "INSERT INTO jobs_resume_source_assets (
-                id, account_id, file_name, media_type, file_type, storage_key,
-                sha256, size_bytes, page_count, template_status, created_at_ms, updated_at_ms
-             ) VALUES (?1, ?2, 'source-resume.txt', 'text/plain', 'txt', ?3, ?4, ?5,
-                       NULL, 'text_only', ?6, ?6)",
-            rusqlite::params![
-                resume_source_id,
-                &evidence.account_id,
-                &resume_source_key,
-                &resume_source_sha256,
-                resume_source_bytes.len() as i64,
-                now_ms,
-            ],
-        )
-        .unwrap();
     connection
         .execute(
             "INSERT INTO jobs_browser_profile_snapshots (
@@ -11554,6 +11915,9 @@ async fn account_export_zip_includes_legacy_jobs_evidence_without_size_or_media_
             "image/png",
         ),
     ];
+    let source_resume = jobs::get_resume_source_asset(&harness.pool, &fixture.account_id)
+        .unwrap()
+        .unwrap();
     for (_, object_key, bytes, media_type) in legacy_objects {
         Mock::given(method("GET"))
             .and(path(format!("/bucket/{object_key}")))
@@ -11562,6 +11926,15 @@ async fn account_export_zip_includes_legacy_jobs_evidence_without_size_or_media_
             .mount(&object_store)
             .await;
     }
+    Mock::given(method("GET"))
+        .and(path(format!("/bucket/{}", source_resume.storage_key)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(EXECUTION_LEASE_SOURCE_RESUME_BYTES, "text/plain"),
+        )
+        .expect(1)
+        .mount(&object_store)
+        .await;
 
     let response = harness
         .router
@@ -11574,7 +11947,16 @@ async fn account_export_zip_includes_legacy_jobs_evidence_without_size_or_media_
         )
         .await
         .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
+    if status != StatusCode::OK {
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        panic!(
+            "legacy Jobs evidence export failed with {status}: {}",
+            String::from_utf8_lossy(&body)
+        );
+    }
     let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
         .await
         .unwrap();
@@ -11586,7 +11968,7 @@ async fn account_export_zip_includes_legacy_jobs_evidence_without_size_or_media_
         .read_to_string(&mut manifest_text)
         .unwrap();
     let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap();
-    assert_eq!(manifest["objects"].as_array().unwrap().len(), 3);
+    assert_eq!(manifest["objects"].as_array().unwrap().len(), 4);
     for (artifact_id, object_key, bytes, _) in legacy_objects {
         assert!(!manifest_text.contains(object_key));
         let exported = manifest["objects"]
@@ -11606,6 +11988,22 @@ async fn account_export_zip_includes_legacy_jobs_evidence_without_size_or_media_
             .unwrap();
         assert_eq!(exported_bytes, bytes);
     }
+    let exported_source = manifest["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["artifact_id"] == source_resume.id)
+        .expect("the Track-bound source resume must be represented in the export manifest");
+    assert_eq!(exported_source["size_bytes"], source_resume.size_bytes);
+    assert_eq!(exported_source["content_type"], source_resume.media_type);
+    assert_eq!(exported_source["sha256"], source_resume.sha256);
+    let mut exported_source_bytes = Vec::new();
+    archive
+        .by_name(exported_source["zip_path"].as_str().unwrap())
+        .unwrap()
+        .read_to_end(&mut exported_source_bytes)
+        .unwrap();
+    assert_eq!(exported_source_bytes, EXECUTION_LEASE_SOURCE_RESUME_BYTES);
 }
 
 #[tokio::test]

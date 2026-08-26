@@ -3282,12 +3282,21 @@ pub fn save_application_identity(
                     value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "identity",
+                &value.id,
+                value.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let is_default = i32::from(value.is_default);
             if value.is_default {
                 tx.execute(
@@ -3319,6 +3328,13 @@ pub fn save_application_identity(
                     &value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "identity",
+                &value.id,
+                value.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(value)
         }
@@ -3342,14 +3358,93 @@ pub fn delete_application_identity(
         anyhow::bail!("choose another email for the Career Track before removing this one")
     }
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
-            params![account_id, identity_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
-            &[&account_id, &identity_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let is_default: i64 = tx
+                .query_row(
+                    "SELECT is_default FROM jobs_application_identities
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, identity_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context("application email not found")?;
+            anyhow::ensure!(is_default == 0, "choose another default application email first");
+            let bound = {
+                let mut stmt = tx.prepare(
+                    "SELECT track_json FROM jobs_tracks WHERE account_id = ?1 ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map(params![account_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|raw| parse_json::<CareerTrack>(raw, "Career Track"))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .any(|track| {
+                        track.application_identity_id.as_deref() == Some(identity_id)
+                    })
+            };
+            anyhow::ensure!(!bound, "choose another email for the Career Track first");
+            let changed = tx.execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
+                params![account_id, identity_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_sqlite(
+                    &tx,
+                    account_id,
+                    "identity",
+                    identity_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
+            let is_default: i32 = tx
+                .query_opt(
+                    "SELECT is_default FROM jobs_application_identities
+                      WHERE account_id = $1 AND id = $2",
+                    &[&account_id, &identity_id],
+                )?
+                .context("application email not found")?
+                .get(0);
+            anyhow::ensure!(is_default == 0, "choose another default application email first");
+            let bound = tx
+                .query(
+                    "SELECT track_json FROM jobs_tracks
+                      WHERE account_id = $1 ORDER BY id",
+                    &[&account_id],
+                )?
+                .into_iter()
+                .map(|row| parse_json::<CareerTrack>(row.get(0), "Career Track"))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|track| track.application_identity_id.as_deref() == Some(identity_id));
+            anyhow::ensure!(!bound, "choose another email for the Career Track first");
+            let changed = tx.execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
+                &[&account_id, &identity_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_postgres(
+                    &mut tx,
+                    account_id,
+                    "identity",
+                    identity_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
     })
 }
 
@@ -3487,6 +3582,13 @@ pub fn verify_application_identity(
                   WHERE account_id = ?1 AND id = ?2",
                 params![account_id, identity_id, payload, identity.updated_at_ms],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "identity",
+                identity_id,
+                identity.updated_at_ms,
+            )?;
             tx.execute(
                 "DELETE FROM jobs_identity_verifications WHERE account_id = ?1 AND identity_id = ?2",
                 params![account_id, identity_id],
@@ -3497,6 +3599,8 @@ pub fn verify_application_identity(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let row = tx
                 .query_opt(
                     "SELECT otp_hash, attempts, expires_at_ms FROM jobs_identity_verifications
@@ -3538,6 +3642,13 @@ pub fn verify_application_identity(
                     identity_json = $3, updated_at_ms = $4
                   WHERE account_id = $1 AND id = $2",
                 &[&account_id, &identity_id, &payload, &identity.updated_at_ms],
+            )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "identity",
+                identity_id,
+                identity.updated_at_ms,
             )?;
             tx.execute(
                 "DELETE FROM jobs_identity_verifications WHERE account_id = $1 AND identity_id = $2",

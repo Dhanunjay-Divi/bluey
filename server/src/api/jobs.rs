@@ -111,6 +111,7 @@ const MAX_WORKSPACE_DISCOVERY_BACKFILL_POSTINGS: usize = 250;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/jobs/workspace", get(workspace))
+        .route("/api/jobs/taxonomy", get(taxonomy))
         .route("/api/jobs/onboarding/complete", post(complete_onboarding))
         .route("/api/jobs/profile", get(profile).put(save_profile))
         .route(
@@ -284,6 +285,46 @@ pub fn router() -> Router<AppState> {
         .route("/api/jobs/entitlements", get(entitlements))
         .route("/api/jobs/runs/:run_id/events", get(run_events))
         .route_layer(axum::middleware::from_fn(require_jobs_beta))
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobsTaxonomyResponse {
+    pub taxonomy_version: &'static str,
+    pub taxonomy_sha256: String,
+    pub registry: Value,
+}
+
+pub async fn taxonomy() -> Result<Json<JobsTaxonomyResponse>, ApiError> {
+    let registry =
+        crate::jobs_taxonomy::registry_json().map_err(|error| internal(anyhow::anyhow!(error)))?;
+    Ok(Json(JobsTaxonomyResponse {
+        taxonomy_version: crate::jobs_taxonomy::taxonomy_version(),
+        taxonomy_sha256: crate::jobs_taxonomy::taxonomy_sha256(),
+        registry,
+    }))
+}
+
+const JOBS_TAXONOMY_VERSION_HEADER: &str = "x-bluey-jobs-taxonomy-version";
+const JOBS_TAXONOMY_SHA256_HEADER: &str = "x-bluey-jobs-taxonomy-sha256";
+
+fn require_current_taxonomy_write(headers: &HeaderMap) -> Result<(), ApiError> {
+    let version = headers
+        .get(JOBS_TAXONOMY_VERSION_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let digest = headers
+        .get(JOBS_TAXONOMY_SHA256_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if version == Some(crate::jobs_taxonomy::taxonomy_version())
+        && digest == Some(crate::jobs_taxonomy::taxonomy_sha256().as_str())
+    {
+        return Ok(());
+    }
+    Err((
+        StatusCode::CONFLICT,
+        "Career Track taxonomy changed. Refresh Bluey Jobs and review this Track before saving."
+            .to_string(),
+    ))
 }
 
 pub fn worker_router() -> Router<AppState> {
@@ -792,17 +833,26 @@ fn schedule_global_candidate_materialization(
     }));
 }
 
+fn ensure_managed_curated_discovery_source_best_effort(
+    pool: &crate::db::DbPool,
+    account_id: &str,
+    reason: &'static str,
+) {
+    if let Err(error) = jobs::ensure_managed_curated_discovery_source(pool, account_id) {
+        tracing::warn!(
+            account_fingerprint = %discovery_log_fingerprint(account_id),
+            reason,
+            error_category = discovery_enrollment_error_category(&error),
+            "Jobs saved the requested policy and will retry managed curated discovery enrollment"
+        );
+    }
+}
+
 pub async fn workspace(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<JobsWorkspace>, ApiError> {
-    if let Err(error) = jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id) {
-        tracing::warn!(
-            account_fingerprint = %discovery_log_fingerprint(&account.id),
-            error_category = discovery_enrollment_error_category(&error),
-            "Jobs workspace could not ensure managed curated discovery"
-        );
-    }
+    ensure_managed_curated_discovery_source_best_effort(&state.pool, &account.id, "workspace_load");
     schedule_global_candidate_materialization(
         state.pool.clone(),
         account.id.clone(),
@@ -874,8 +924,10 @@ pub struct CompleteOnboardingRequest {
 pub async fn complete_onboarding(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    headers: HeaderMap,
     Json(mut input): Json<CompleteOnboardingRequest>,
 ) -> Result<Json<JobsWorkspace>, ApiError> {
+    require_current_taxonomy_write(&headers)?;
     input.profile.onboarding_step = 6;
     input.profile.onboarding_complete = true;
     validate_profile(&input.profile)?;
@@ -886,9 +938,28 @@ pub async fn complete_onboarding(
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     enforce_track_limit(&input.track, &current, &entitlement)?;
 
+    // Persist policy-relevant profile semantics before constructing the Track
+    // policy, while leaving onboarding visibly incomplete until every later
+    // write succeeds. The final completion write changes transport state only,
+    // so the semantic-input ledger treats it as an exact no-op. A retry after
+    // any partial failure therefore cannot resurrect or churn policy authority.
+    let mut semantic_profile = input.profile.clone();
+    semantic_profile.onboarding_step = 0;
+    semantic_profile.onboarding_complete = false;
+    jobs::save_profile(&state.pool, &account.id, &semantic_profile).map_err(internal)?;
     jobs::save_preferences(&state.pool, &account.id, &input.preferences).map_err(internal)?;
-    jobs::upsert_track(&state.pool, &account.id, &input.track).map_err(internal)?;
-    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    jobs::upsert_track_with_limit(
+        &state.pool,
+        &account.id,
+        &input.track,
+        entitlement.track_limit,
+    )
+    .map_err(|error| track_write_error(error, &entitlement))?;
+    ensure_managed_curated_discovery_source_best_effort(
+        &state.pool,
+        &account.id,
+        "onboarding_complete",
+    );
     // Persist completion last. Retrying after any earlier write is idempotent,
     // while a partial request can never make the portal skip onboarding.
     jobs::save_profile(&state.pool, &account.id, &input.profile).map_err(internal)?;
@@ -990,14 +1061,22 @@ pub async fn tracks(
 pub async fn save_track(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
+    headers: HeaderMap,
     Json(track): Json<CareerTrack>,
 ) -> Result<Json<CareerTrack>, ApiError> {
+    require_current_taxonomy_write(&headers)?;
     validate_track(&track)?;
     let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     enforce_track_limit(&track, &current, &entitlement)?;
-    let saved = jobs::upsert_track(&state.pool, &account.id, &track).map_err(internal)?;
-    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    let saved =
+        jobs::upsert_track_with_limit(&state.pool, &account.id, &track, entitlement.track_limit)
+            .map_err(|error| track_write_error(error, &entitlement))?;
+    ensure_managed_curated_discovery_source_best_effort(
+        &state.pool,
+        &account.id,
+        "career_track_created",
+    );
     Ok(Json(saved))
 }
 
@@ -1005,16 +1084,25 @@ pub async fn update_track(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(track_id): Path<String>,
+    headers: HeaderMap,
     Json(mut track): Json<CareerTrack>,
 ) -> Result<Json<CareerTrack>, ApiError> {
+    require_current_taxonomy_write(&headers)?;
     track.id = track_id;
     validate_track(&track)?;
     let current = jobs::list_tracks(&state.pool, &account.id).map_err(internal)?;
     if !current.iter().any(|item| item.id == track.id) {
         return Err((StatusCode::NOT_FOUND, "Career Track not found.".to_string()));
     }
-    let saved = jobs::upsert_track(&state.pool, &account.id, &track).map_err(internal)?;
-    jobs::ensure_managed_curated_discovery_source(&state.pool, &account.id).map_err(internal)?;
+    let entitlement = jobs::get_entitlement(&state.pool, &account.id).map_err(internal)?;
+    let saved =
+        jobs::upsert_track_with_limit(&state.pool, &account.id, &track, entitlement.track_limit)
+            .map_err(|error| track_write_error(error, &entitlement))?;
+    ensure_managed_curated_discovery_source_best_effort(
+        &state.pool,
+        &account.id,
+        "career_track_updated",
+    );
     Ok(Json(saved))
 }
 
@@ -9792,6 +9880,18 @@ fn validate_preferences(preferences: &JobPreferences) -> Result<(), ApiError> {
     ) {
         return bad_request("Choose how Bluey should handle job locations.");
     }
+    if !matches!(
+        preferences.remote_preference.as_str(),
+        "remote_only" | "remote_or_hybrid" | "hybrid_ok" | "onsite_ok" | "any"
+    ) {
+        return bad_request("Choose a supported workplace preference.");
+    }
+    if !matches!(
+        preferences.sponsorship.as_str(),
+        "ask" | "required" | "not_required" | "any"
+    ) {
+        return bad_request("Choose how Bluey should handle sponsorship.");
+    }
     if !(1..=50).contains(&preferences.daily_limit) {
         return bad_request("Choose a daily application limit from 1 to 50.");
     }
@@ -9816,8 +9916,31 @@ fn validate_preferences(preferences: &JobPreferences) -> Result<(), ApiError> {
 }
 
 fn validate_track(track: &CareerTrack) -> Result<(), ApiError> {
+    if track.id.trim().is_empty() {
+        return bad_request(
+            "This Career Track is missing its retry-safe ID. Refresh Bluey Jobs and try again.",
+        );
+    }
     if track.name.trim().is_empty() || track.role.trim().is_empty() {
         return bad_request("Give this Career Track a name and target role.");
+    }
+    if !matches!(
+        track.remote_preference.as_str(),
+        "remote_only" | "remote_or_hybrid" | "hybrid_ok" | "onsite_ok" | "any"
+    ) {
+        return bad_request("Choose a supported Career Track workplace preference.");
+    }
+    if let crate::jobs_taxonomy::TargetRoleResolution::Ambiguous {
+        candidate_role_ids, ..
+    } = crate::jobs_taxonomy::resolve_target_role(&track.role)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Choose a full target role; this abbreviation could mean {}.",
+                candidate_role_ids.join(", ")
+            ),
+        ));
     }
     if track
         .policy
@@ -9855,6 +9978,22 @@ fn enforce_track_limit(
         ));
     }
     Ok(())
+}
+
+fn track_write_error(error: anyhow::Error, entitlement: &JobsEntitlement) -> ApiError {
+    if error
+        .downcast_ref::<jobs::CareerTrackLimitExceeded>()
+        .is_some()
+    {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            format!(
+                "Your {} plan includes {} Career Track Agent(s).",
+                entitlement.plan, entitlement.track_limit
+            ),
+        );
+    }
+    internal(error)
 }
 
 fn validate_posting(posting: &JobPosting) -> Result<(), ApiError> {
@@ -10196,6 +10335,53 @@ pub(super) fn internal(error: anyhow::Error) -> ApiError {
 mod tests {
     use super::*;
     use crate::db::jobs::CareerTrackPolicy;
+
+    #[test]
+    fn career_track_writes_require_the_exact_taxonomy_binding() {
+        let missing = require_current_taxonomy_write(&HeaderMap::new()).unwrap_err();
+        assert_eq!(missing.0, StatusCode::CONFLICT);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            JOBS_TAXONOMY_VERSION_HEADER,
+            HeaderValue::from_static(crate::jobs_taxonomy::taxonomy_version()),
+        );
+        headers.insert(
+            JOBS_TAXONOMY_SHA256_HEADER,
+            HeaderValue::from_str(&crate::jobs_taxonomy::taxonomy_sha256()).unwrap(),
+        );
+        require_current_taxonomy_write(&headers).unwrap();
+
+        headers.insert(
+            JOBS_TAXONOMY_SHA256_HEADER,
+            HeaderValue::from_static(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        );
+        let stale = require_current_taxonomy_write(&headers).unwrap_err();
+        assert_eq!(stale.0, StatusCode::CONFLICT);
+        assert!(stale.1.contains("review"));
+    }
+
+    #[test]
+    fn taxonomy_response_uses_the_authenticated_portal_contract() {
+        let response = JobsTaxonomyResponse {
+            taxonomy_version: crate::jobs_taxonomy::taxonomy_version(),
+            taxonomy_sha256: crate::jobs_taxonomy::taxonomy_sha256(),
+            registry: crate::jobs_taxonomy::registry_json().unwrap(),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(
+            value.get("taxonomyVersion").and_then(Value::as_str),
+            Some(crate::jobs_taxonomy::taxonomy_version())
+        );
+        assert_eq!(
+            value.get("taxonomySha256").and_then(Value::as_str),
+            Some(crate::jobs_taxonomy::taxonomy_sha256().as_str())
+        );
+        assert!(value.get("registry").is_some());
+        assert!(value.get("taxonomy_version").is_none());
+    }
 
     #[test]
     fn execution_lease_success_responses_are_private_and_non_sniffable() {
@@ -10962,6 +11148,55 @@ mod tests {
             &test_entitlement(1),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn career_track_validation_rejects_unknown_workplace_values_and_ambiguous_roles() {
+        let missing_id = validate_track(&test_track("")).unwrap_err();
+        assert_eq!(missing_id.0, StatusCode::BAD_REQUEST);
+        assert!(missing_id.1.contains("retry-safe ID"));
+
+        let mut track = test_track("validated-track");
+        track.remote_preference = "Remote or hybrid".to_string();
+        let invalid_remote = validate_track(&track).unwrap_err();
+        assert_eq!(invalid_remote.0, StatusCode::BAD_REQUEST);
+        assert!(invalid_remote.1.contains("workplace preference"));
+
+        track.remote_preference = "remote_or_hybrid".to_string();
+        track.role = "PM".to_string();
+        let ambiguous_role = validate_track(&track).unwrap_err();
+        assert_eq!(ambiguous_role.0, StatusCode::BAD_REQUEST);
+        assert!(ambiguous_role.1.contains("full target role"));
+        assert!(ambiguous_role.1.contains("product-manager"));
+
+        track.role = "Founder in residence".to_string();
+        validate_track(&track).expect("unknown custom roles remain reviewable");
+    }
+
+    #[test]
+    fn preferences_default_missing_safety_policy_and_reject_unknown_values() {
+        let partial: JobPreferences = serde_json::from_value(json!({
+            "location_policy": "ask",
+            "daily_limit": 10,
+            "time_zone_offset_minutes": 0
+        }))
+        .unwrap();
+        assert_eq!(partial.remote_preference, "hybrid_ok");
+        assert_eq!(partial.sponsorship, "ask");
+        validate_preferences(&partial).unwrap();
+
+        let mut invalid = partial.clone();
+        invalid.remote_preference = String::new();
+        assert!(validate_preferences(&invalid)
+            .unwrap_err()
+            .1
+            .contains("workplace preference"));
+        invalid.remote_preference = "hybrid_ok".to_string();
+        invalid.sponsorship = String::new();
+        assert!(validate_preferences(&invalid)
+            .unwrap_err()
+            .1
+            .contains("sponsorship"));
     }
 
     #[test]

@@ -3,7 +3,10 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { compareJobsSchemas } from "./check-jobs-schema-parity.mjs";
+import {
+  checkPhase613MigrationRegistration,
+  compareJobsSchemas,
+} from "./check-jobs-schema-parity.mjs";
 import {
   inventoryPackageLock,
   parseProvenanceRows,
@@ -66,6 +69,14 @@ function operationalHoldsParitySchema(integerType) {
     integerType === "INTEGER"
       ? "infra/sqlite/server-runtime/052_jobs_operational_holds.sql"
       : "infra/postgres/server-runtime/030_jobs_operational_holds.sql";
+  return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
+}
+
+function phase613ParitySchema(integerType) {
+  const migrationPath =
+    integerType === "INTEGER"
+      ? "infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql"
+      : "infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql";
   return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
 }
 
@@ -331,6 +342,7 @@ function jobsParitySchema(integerType) {
     ${atsCertificationParitySchema(integerType)}
     ${communicationExecutionParitySchema(integerType)}
     ${operationalHoldsParitySchema(integerType)}
+    ${phase613ParitySchema(integerType)}
   `;
 }
 
@@ -374,6 +386,42 @@ function assertOperationalHoldDriftRejected({
       issue.includes(`${dialect} operational-hold invariant ${invariant}`),
     ),
     `${dialect} ${invariant} drift must fail the operational-hold semantic guard; ` +
+      `issues=${JSON.stringify(issues)}`,
+  );
+}
+
+function assertPhase613DriftRejected({
+  dialect,
+  invariant,
+  original,
+  replacement,
+  sqlite,
+  postgres,
+}) {
+  const phase613Migration = phase613ParitySchema(
+    dialect === "SQLite" ? "INTEGER" : "BIGINT",
+  );
+  const mutatedMigration = replaceFirstForGuardTest(
+    phase613Migration,
+    original,
+    replacement,
+    invariant,
+  );
+  const source = dialect === "SQLite" ? sqlite : postgres;
+  assert(
+    source.includes(phase613Migration),
+    `${dialect} guard fixture must contain the Phase 613 migration`,
+  );
+  const mutated = source.replace(phase613Migration, () => mutatedMigration);
+  const issues =
+    dialect === "SQLite"
+      ? compareJobsSchemas(mutated, postgres)
+      : compareJobsSchemas(sqlite, mutated);
+  assert(
+    issues.some((issue) =>
+      issue.includes(`${dialect} Phase 613 invariant ${invariant}`),
+    ),
+    `${dialect} ${invariant} drift must fail the Phase 613 semantic guard; ` +
       `issues=${JSON.stringify(issues)}`,
   );
 }
@@ -554,6 +602,238 @@ function testSchemaParity() {
   ]) {
     assertOperationalHoldDriftRejected({ ...mutation, sqlite, postgres });
   }
+
+  for (const mutation of [
+    {
+      dialect: "Postgres",
+      invariant: "taxonomy version bounded length",
+      original:
+        "  taxonomy_version                       TEXT NOT NULL\n" +
+        "    CHECK(length(taxonomy_version) BETWEEN 1 AND 64),",
+      replacement:
+        "  taxonomy_version                       TEXT NOT NULL\n" +
+        "    CHECK(length(taxonomy_version) <= 64),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "taxonomy activation timestamp safe-integer range",
+      original:
+        "  activated_at_ms                        BIGINT NOT NULL\n" +
+        "    CHECK(activated_at_ms BETWEEN 0 AND 9007199254740991),",
+      replacement:
+        "  activated_at_ms                        BIGINT NOT NULL\n" +
+        "    CHECK(activated_at_ms >= 0),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "account input generation safe-integer range",
+      original:
+        "  account_id                             TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  account_id                             TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "account previous input generation safe-integer range",
+      original:
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation BETWEEN 0 AND 9007199254740991),",
+      replacement:
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation >= 0),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "account input timestamp safe-integer range",
+      original:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms BETWEEN 0 AND 9007199254740991),\n" +
+        "  UNIQUE(account_id, input_generation),",
+      replacement:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms >= 0),\n" +
+        "  UNIQUE(account_id, input_generation),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "Track input generation safe-integer range",
+      original:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "Track previous input generation safe-integer range",
+      original:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation BETWEEN 0 AND 9007199254740991),",
+      replacement:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation >= 0),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "Track input timestamp safe-integer range",
+      original:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms BETWEEN 0 AND 9007199254740991),\n" +
+        "  UNIQUE(account_id, career_track_id, input_generation),",
+      replacement:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms >= 0),\n" +
+        "  UNIQUE(account_id, career_track_id, input_generation),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision taxonomy activation epoch safe-integer range",
+      original:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision canonicalizer version safe-integer range",
+      original:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch BETWEEN 1 AND 9007199254740991),\n" +
+        "  canonicalizer_schema_version           BIGINT NOT NULL\n" +
+        "    CHECK(canonicalizer_schema_version BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch BETWEEN 1 AND 9007199254740991),\n" +
+        "  canonicalizer_schema_version           BIGINT NOT NULL\n" +
+        "    CHECK(canonicalizer_schema_version >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision account input generation safe-integer range",
+      original:
+        "  account_input_generation               BIGINT NOT NULL\n" +
+        "    CHECK(account_input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  account_input_generation               BIGINT NOT NULL\n" +
+        "    CHECK(account_input_generation >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision Track input generation safe-integer range",
+      original:
+        "  track_input_generation                 BIGINT NOT NULL\n" +
+        "    CHECK(track_input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  track_input_generation                 BIGINT NOT NULL\n" +
+        "    CHECK(track_input_generation >= 1),",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "policy head advances exactly one generation",
+      original: "NEW.head_generation <> OLD.head_generation + 1",
+      replacement: "NEW.head_generation <= OLD.head_generation",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy head predecessor transition binds old head",
+      original:
+        "NEW.predecessor_head_transition_sha256 <> OLD.head_transition_sha256",
+      replacement:
+        "NEW.predecessor_head_transition_sha256 = OLD.head_transition_sha256",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy head binds immutable event review receipt",
+      original: "AND event.review_receipt_id = NEW.review_receipt_id",
+      replacement: "AND event.review_receipt_id <> NEW.review_receipt_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "taxonomy activation changed-tuple requirement",
+      original:
+        "AND NOT (\n" +
+        "             predecessor.taxonomy_version = NEW.taxonomy_version",
+      replacement:
+        "AND (\n" +
+        "             predecessor.taxonomy_version = NEW.taxonomy_version",
+    },
+  ]) {
+    assertPhase613DriftRejected({ ...mutation, sqlite, postgres });
+  }
+
+  const missingTrackPolicyTable = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_track_policy_taxonomy_activation_events \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingTrackPolicyTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingTrackPolicyIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_track_policy_account_input_transitions_history[\s\S]*?input_generation DESC\s*\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingTrackPolicyIndex).some((issue) =>
+      issue.includes(
+        "Postgres jobs_track_policy_account_input_transitions required index",
+      ),
+    ),
+  );
+
+  const migrationRunner = fs.readFileSync(
+    path.join(repoRoot, "server/src/db/mod.rs"),
+    "utf8",
+  );
+  assert.deepEqual(checkPhase613MigrationRegistration(migrationRunner), []);
+  const missingSqliteMigrationRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n];",
+    "];",
+    "SQLite 056 migration registration",
+  );
+  assert(
+    checkPhase613MigrationRegistration(missingSqliteMigrationRegistration).some(
+      (issue) => issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresMigrationRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n" +
+      "    ),\n",
+    "",
+    "Postgres 034 migration registration",
+  );
+  assert(
+    checkPhase613MigrationRegistration(
+      missingPostgresMigrationRegistration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
 
   const missingAtsBindingTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS jobs_application_ats_certification_bindings \([\s\S]*?\n\);/,

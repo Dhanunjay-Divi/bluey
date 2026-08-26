@@ -257,6 +257,8 @@ fn prepare_application_inner(
     )?;
     let tailored_resume = tailor_resume(&profile, &posting, mode);
     let truth_fingerprint = candidate_truth_fingerprint(&profile);
+    let career_track_policy_authority = serde_json::to_value(&track.policy.authority)
+        .context("encode Career Track policy authority")?;
     let content = json!({
         "target": {
             "job_id": posting.id,
@@ -286,6 +288,7 @@ fn prepare_application_inner(
             "generated_for_job_id": posting.id,
             "application_identity_id": application_identity.id,
             "career_track_id": posting.track_id,
+            "career_track_policy_authority": career_track_policy_authority.clone(),
             "candidate_truth_fingerprint": truth_fingerprint,
             "candidate_truth_fingerprint_version": 1,
             "confirmed_facts_fingerprint": confirmed_facts_fingerprint,
@@ -352,6 +355,7 @@ fn prepare_application_inner(
         "job_snapshot": posting,
         "resume_version_id": Value::Null,
         "career_track_id": posting.track_id,
+        "career_track_policy_authority": career_track_policy_authority,
         "candidate_truth_fingerprint": truth_fingerprint,
         "candidate_truth_fingerprint_version": 1,
         "confirmed_facts_fingerprint": confirmed_facts_fingerprint,

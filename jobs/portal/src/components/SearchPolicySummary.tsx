@@ -3,7 +3,7 @@ import type { CareerProfile } from "../types";
 import {
   BLUEY_DAILY_APPLICATION_LIMIT,
   BLUEY_MAX_POSTING_AGE_DAYS,
-  roleExperienceRange,
+  roleExperienceAssessment,
 } from "../lib/search-policy";
 
 export function SearchPolicySummary({
@@ -15,10 +15,13 @@ export function SearchPolicySummary({
   role?: string;
   compact?: boolean;
 }) {
-  const experience = roleExperienceRange(profile.employment, role);
+  const assessment = roleExperienceAssessment(profile.employment, role);
+  const experience = assessment.range;
   const experienceCopy = !role
     ? "Relevant experience only · usually 1 year below to 2 years above"
-    : experience.years > 0
+    : assessment.review_required
+      ? `Review required before Bluey sets an experience range for ${role}`
+      : experience.years > 0
       ? `${experience.minimum}-${experience.maximum} years for ${role}`
       : `Entry-level ${role} openings until relevant experience is added`;
   return <section className={`search-policy-summary ${compact ? "compact" : ""}`} aria-label="Bluey search policy">

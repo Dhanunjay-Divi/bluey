@@ -596,29 +596,47 @@ CREATE TABLE IF NOT EXISTS jobs_managed_cloud_request_start_authorities (
 );
 
 ALTER TABLE jobs_workflow_cleanup_targets
-  ADD COLUMN managed_cloud_binding_sha256 TEXT
+  ADD COLUMN IF NOT EXISTS managed_cloud_binding_sha256 TEXT
     CHECK(managed_cloud_binding_sha256 IS NULL
       OR managed_cloud_binding_sha256 ~ '^[0-9a-f]{64}$'),
-  ADD COLUMN managed_cloud_release_memo_base64url TEXT
+  ADD COLUMN IF NOT EXISTS managed_cloud_release_memo_base64url TEXT
     CHECK(managed_cloud_release_memo_base64url IS NULL OR (
       length(managed_cloud_release_memo_base64url) BETWEEN 1 AND 174763
       AND managed_cloud_release_memo_base64url ~ '^[A-Za-z0-9_-]+$')),
-  ADD COLUMN managed_cloud_release_memo_sha256 TEXT
+  ADD COLUMN IF NOT EXISTS managed_cloud_release_memo_sha256 TEXT
     CHECK(managed_cloud_release_memo_sha256 IS NULL
-      OR managed_cloud_release_memo_sha256 ~ '^[0-9a-f]{64}$'),
-  ADD CONSTRAINT fk_jobs_cleanup_target_managed_cloud_binding
-    FOREIGN KEY(start_command_id,managed_cloud_binding_sha256,
-      managed_cloud_release_memo_sha256)
-    REFERENCES jobs_managed_cloud_workflow_bindings(
-      command_id,binding_sha256,release_memo_sha256) ON DELETE RESTRICT,
-  ADD CONSTRAINT ck_jobs_cleanup_target_managed_cloud_binding_complete CHECK(
-    (managed_cloud_binding_sha256 IS NULL
-      AND managed_cloud_release_memo_base64url IS NULL
-      AND managed_cloud_release_memo_sha256 IS NULL)
-    OR (managed_cloud_binding_sha256 IS NOT NULL
-      AND managed_cloud_release_memo_base64url IS NOT NULL
-      AND managed_cloud_release_memo_sha256 IS NOT NULL)
-  );
+      OR managed_cloud_release_memo_sha256 ~ '^[0-9a-f]{64}$');
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid='jobs_workflow_cleanup_targets'::regclass
+       AND conname='fk_jobs_cleanup_target_managed_cloud_binding'
+  ) THEN
+    ALTER TABLE jobs_workflow_cleanup_targets
+      ADD CONSTRAINT fk_jobs_cleanup_target_managed_cloud_binding
+      FOREIGN KEY(start_command_id,managed_cloud_binding_sha256,
+        managed_cloud_release_memo_sha256)
+      REFERENCES jobs_managed_cloud_workflow_bindings(
+        command_id,binding_sha256,release_memo_sha256) ON DELETE RESTRICT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid='jobs_workflow_cleanup_targets'::regclass
+       AND conname='ck_jobs_cleanup_target_managed_cloud_binding_complete'
+  ) THEN
+    ALTER TABLE jobs_workflow_cleanup_targets
+      ADD CONSTRAINT ck_jobs_cleanup_target_managed_cloud_binding_complete CHECK(
+        (managed_cloud_binding_sha256 IS NULL
+          AND managed_cloud_release_memo_base64url IS NULL
+          AND managed_cloud_release_memo_sha256 IS NULL)
+        OR (managed_cloud_binding_sha256 IS NOT NULL
+          AND managed_cloud_release_memo_base64url IS NOT NULL
+          AND managed_cloud_release_memo_sha256 IS NOT NULL)
+      );
+  END IF;
+END $$;
 
 CREATE UNIQUE INDEX IF NOT EXISTS
   idx_jobs_workflow_commands_managed_cloud_request_identity
@@ -631,71 +649,103 @@ CREATE UNIQUE INDEX IF NOT EXISTS
   ON jobs_managed_cloud_runtime_instances(runtime_instance_id,instance_epoch,worker_id);
 
 ALTER TABLE jobs_execution_leases
-  ADD COLUMN managed_cloud_workflow_request_id TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_workflow_request_id TEXT CHECK(
     managed_cloud_workflow_request_id IS NULL OR
     managed_cloud_workflow_request_id ~
       '^wfreq-v2-[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'),
-  ADD COLUMN managed_cloud_request_command_id TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_request_command_id TEXT CHECK(
     managed_cloud_request_command_id IS NULL OR
     managed_cloud_request_command_id ~ '^[A-Za-z0-9_-]{20,128}$'),
-  ADD COLUMN managed_cloud_execution_command_id TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_execution_command_id TEXT CHECK(
     managed_cloud_execution_command_id IS NULL OR
     managed_cloud_execution_command_id ~ '^[A-Za-z0-9_-]{20,128}$'),
-  ADD COLUMN managed_cloud_binding_sha256 TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_binding_sha256 TEXT CHECK(
     managed_cloud_binding_sha256 IS NULL OR
     managed_cloud_binding_sha256 ~ '^[0-9a-f]{64}$'),
-  ADD COLUMN managed_cloud_release_memo_base64url TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_release_memo_base64url TEXT CHECK(
     managed_cloud_release_memo_base64url IS NULL OR (
       length(managed_cloud_release_memo_base64url) BETWEEN 1 AND 174763
       AND managed_cloud_release_memo_base64url ~ '^[A-Za-z0-9_-]+$')),
-  ADD COLUMN managed_cloud_release_sha256 TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_release_sha256 TEXT CHECK(
     managed_cloud_release_sha256 IS NULL OR
     managed_cloud_release_sha256 ~ '^[0-9a-f]{64}$'),
-  ADD COLUMN managed_cloud_runtime_instance_id TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_runtime_instance_id TEXT CHECK(
     managed_cloud_runtime_instance_id IS NULL OR
     managed_cloud_runtime_instance_id ~ '^[A-Za-z0-9_-]{20,128}$'),
-  ADD COLUMN managed_cloud_runtime_instance_epoch BIGINT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_runtime_instance_epoch BIGINT CHECK(
     managed_cloud_runtime_instance_epoch IS NULL OR
     managed_cloud_runtime_instance_epoch BETWEEN 1 AND 9007199254740991),
-  ADD COLUMN managed_cloud_worker_id TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_worker_id TEXT CHECK(
     managed_cloud_worker_id IS NULL OR
     managed_cloud_worker_id ~ '^[A-Za-z0-9_-]{20,128}$'),
-  ADD COLUMN managed_cloud_gateway_authority_base64url TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_gateway_authority_base64url TEXT CHECK(
     managed_cloud_gateway_authority_base64url IS NULL OR (
       length(managed_cloud_gateway_authority_base64url) BETWEEN 1 AND 174763
       AND managed_cloud_gateway_authority_base64url ~ '^[A-Za-z0-9_-]+$')),
-  ADD COLUMN managed_cloud_gateway_authority_sha256 TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_gateway_authority_sha256 TEXT CHECK(
     managed_cloud_gateway_authority_sha256 IS NULL OR
     managed_cloud_gateway_authority_sha256 ~ '^[0-9a-f]{64}$'),
-  ADD COLUMN managed_cloud_lease_authority_sha256 TEXT CHECK(
+  ADD COLUMN IF NOT EXISTS managed_cloud_lease_authority_sha256 TEXT CHECK(
     managed_cloud_lease_authority_sha256 IS NULL OR
-    managed_cloud_lease_authority_sha256 ~ '^[0-9a-f]{64}$'),
-  ADD CONSTRAINT ck_jobs_execution_lease_managed_cloud_complete CHECK(
-    num_nonnulls(
-      managed_cloud_workflow_request_id,managed_cloud_request_command_id,
-      managed_cloud_execution_command_id,managed_cloud_binding_sha256,
-      managed_cloud_release_memo_base64url,managed_cloud_release_sha256,
-      managed_cloud_runtime_instance_id,managed_cloud_runtime_instance_epoch,
-      managed_cloud_worker_id,
-      managed_cloud_gateway_authority_base64url,
-      managed_cloud_gateway_authority_sha256,
-      managed_cloud_lease_authority_sha256
-    ) IN (0,12)),
-  ADD CONSTRAINT fk_jobs_execution_lease_managed_cloud_request
-    FOREIGN KEY(managed_cloud_request_command_id,managed_cloud_workflow_request_id)
-    REFERENCES jobs_workflow_commands(id,request_id) ON DELETE CASCADE,
-  ADD CONSTRAINT fk_jobs_execution_lease_managed_cloud_binding
-    FOREIGN KEY(managed_cloud_execution_command_id,managed_cloud_binding_sha256,
-      managed_cloud_release_memo_base64url,managed_cloud_release_sha256)
-    REFERENCES jobs_managed_cloud_workflow_bindings(
-      command_id,binding_sha256,release_memo_base64url,release_memo_sha256)
-    ON DELETE CASCADE,
-  ADD CONSTRAINT fk_jobs_execution_lease_managed_cloud_runtime
-    FOREIGN KEY(managed_cloud_runtime_instance_id,managed_cloud_runtime_instance_epoch,
-      managed_cloud_worker_id)
-    REFERENCES jobs_managed_cloud_runtime_instances(
-      runtime_instance_id,instance_epoch,worker_id)
-    ON DELETE RESTRICT;
+    managed_cloud_lease_authority_sha256 ~ '^[0-9a-f]{64}$');
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid='jobs_execution_leases'::regclass
+       AND conname='ck_jobs_execution_lease_managed_cloud_complete'
+  ) THEN
+    ALTER TABLE jobs_execution_leases
+      ADD CONSTRAINT ck_jobs_execution_lease_managed_cloud_complete CHECK(
+        num_nonnulls(
+          managed_cloud_workflow_request_id,managed_cloud_request_command_id,
+          managed_cloud_execution_command_id,managed_cloud_binding_sha256,
+          managed_cloud_release_memo_base64url,managed_cloud_release_sha256,
+          managed_cloud_runtime_instance_id,managed_cloud_runtime_instance_epoch,
+          managed_cloud_worker_id,
+          managed_cloud_gateway_authority_base64url,
+          managed_cloud_gateway_authority_sha256,
+          managed_cloud_lease_authority_sha256
+        ) IN (0,12));
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid='jobs_execution_leases'::regclass
+       AND conname='fk_jobs_execution_lease_managed_cloud_request'
+  ) THEN
+    ALTER TABLE jobs_execution_leases
+      ADD CONSTRAINT fk_jobs_execution_lease_managed_cloud_request
+      FOREIGN KEY(managed_cloud_request_command_id,managed_cloud_workflow_request_id)
+      REFERENCES jobs_workflow_commands(id,request_id) ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid='jobs_execution_leases'::regclass
+       AND conname='fk_jobs_execution_lease_managed_cloud_binding'
+  ) THEN
+    ALTER TABLE jobs_execution_leases
+      ADD CONSTRAINT fk_jobs_execution_lease_managed_cloud_binding
+      FOREIGN KEY(managed_cloud_execution_command_id,managed_cloud_binding_sha256,
+        managed_cloud_release_memo_base64url,managed_cloud_release_sha256)
+      REFERENCES jobs_managed_cloud_workflow_bindings(
+        command_id,binding_sha256,release_memo_base64url,release_memo_sha256)
+      ON DELETE CASCADE;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_catalog.pg_constraint
+     WHERE conrelid='jobs_execution_leases'::regclass
+       AND conname='fk_jobs_execution_lease_managed_cloud_runtime'
+  ) THEN
+    ALTER TABLE jobs_execution_leases
+      ADD CONSTRAINT fk_jobs_execution_lease_managed_cloud_runtime
+      FOREIGN KEY(managed_cloud_runtime_instance_id,managed_cloud_runtime_instance_epoch,
+        managed_cloud_worker_id)
+      REFERENCES jobs_managed_cloud_runtime_instances(
+        runtime_instance_id,instance_epoch,worker_id)
+      ON DELETE RESTRICT;
+  END IF;
+END $$;
 
 -- A single immutable receipt freezes the exact latest effect authority at the
 -- prepared -> click_started boundary. Response-loss replay reads these bytes

@@ -93,8 +93,9 @@ pub fn save_profile(
     let payload = to_json(&value, "Jobs profile")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "INSERT INTO jobs_profiles (
                     account_id, profile_json, onboarding_step, onboarding_complete,
                     created_at_ms, updated_at_ms
@@ -112,12 +113,23 @@ pub fn save_profile(
                     value.updated_at_ms
                 ],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "profile",
+                "profile",
+                value.updated_at_ms,
+            )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let onboarding_complete = i32::from(value.onboarding_complete);
-            conn.execute(
+            tx.execute(
                 "INSERT INTO jobs_profiles (
                     account_id, profile_json, onboarding_step, onboarding_complete,
                     created_at_ms, updated_at_ms
@@ -135,6 +147,14 @@ pub fn save_profile(
                     &value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "profile",
+                "profile",
+                value.updated_at_ms,
+            )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -223,8 +243,9 @@ pub fn upsert_fact(pool: &DbPool, account_id: &str, fact: &CareerFact) -> Result
     let payload = to_json(&value.value, "Jobs fact value")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            conn.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
                 "INSERT INTO jobs_facts (
                     id, account_id, category, label, value_json, source,
                     verification_status, confirmed_at_ms, confirmed_by,
@@ -256,11 +277,23 @@ pub fn upsert_fact(pool: &DbPool, account_id: &str, fact: &CareerFact) -> Result
                     value.updated_at_ms,
                 ],
             )?;
+            anyhow::ensure!(changed == 1, "career fact belongs to another account");
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "fact",
+                &value.id,
+                value.updated_at_ms,
+            )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
+            let changed = tx.execute(
                 "INSERT INTO jobs_facts (
                     id, account_id, category, label, value_json, source,
                     verification_status, confirmed_at_ms, confirmed_by,
@@ -292,6 +325,15 @@ pub fn upsert_fact(pool: &DbPool, account_id: &str, fact: &CareerFact) -> Result
                     &value.updated_at_ms,
                 ],
             )?;
+            anyhow::ensure!(changed == 1, "career fact belongs to another account");
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "fact",
+                &value.id,
+                value.updated_at_ms,
+            )?;
+            tx.commit()?;
             Ok(value)
         }
     })
@@ -362,6 +404,7 @@ pub fn upsert_user_fact(
                    AND jobs_facts.source = 'user_entry'",
                 params![id, account_id, category, label, payload, now, created_at_ms],
             )?;
+            advance_account_input_generation_sqlite(&tx, account_id, "fact", &id, now)?;
             tx.commit()?;
             Ok(CareerFact {
                 id,
@@ -380,6 +423,8 @@ pub fn upsert_user_fact(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let existing = if let Some(id) = requested_id {
                 tx.query_opt(
                         "SELECT id, category, label, value_json, source, verification_status,
@@ -437,6 +482,7 @@ pub fn upsert_user_fact(
                     &created_at_ms,
                 ],
             )?;
+            advance_account_input_generation_postgres(&mut tx, account_id, "fact", &id, now)?;
             tx.commit()?;
             Ok(CareerFact {
                 id,
@@ -457,14 +503,46 @@ pub fn upsert_user_fact(
 
 pub fn delete_fact(pool: &DbPool, account_id: &str, fact_id: &str) -> Result<bool> {
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_facts WHERE account_id = ?1 AND id = ?2",
-            params![account_id, fact_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_facts WHERE account_id = $1 AND id = $2",
-            &[&account_id, &fact_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let changed = tx.execute(
+                "DELETE FROM jobs_facts WHERE account_id = ?1 AND id = ?2",
+                params![account_id, fact_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_sqlite(
+                    &tx,
+                    account_id,
+                    "fact",
+                    fact_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
+            let changed = tx.execute(
+                "DELETE FROM jobs_facts WHERE account_id = $1 AND id = $2",
+                &[&account_id, &fact_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_postgres(
+                    &mut tx,
+                    account_id,
+                    "fact",
+                    fact_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
     })
 }
 
@@ -519,7 +597,9 @@ pub fn save_preferences(
     let payload = to_json(&value, "Jobs preferences")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            pool.get()?.execute(
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
                 "INSERT INTO jobs_preferences(account_id, preferences_json, updated_at_ms)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(account_id) DO UPDATE SET
@@ -527,10 +607,22 @@ pub fn save_preferences(
                     updated_at_ms = excluded.updated_at_ms",
                 params![account_id, payload, value.updated_at_ms],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "preferences",
+                "preferences",
+                value.updated_at_ms,
+            )?;
+            tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
-            pool.get_pg()?.execute(
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
+            tx.execute(
                 "INSERT INTO jobs_preferences(account_id, preferences_json, updated_at_ms)
                  VALUES ($1, $2, $3)
                  ON CONFLICT(account_id) DO UPDATE SET
@@ -538,37 +630,97 @@ pub fn save_preferences(
                     updated_at_ms = EXCLUDED.updated_at_ms",
                 &[&account_id, &payload, &value.updated_at_ms],
             )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "preferences",
+                "preferences",
+                value.updated_at_ms,
+            )?;
+            tx.commit()?;
             Ok(value)
         }
     })
 }
 
 pub fn list_tracks(pool: &DbPool, account_id: &str) -> Result<Vec<CareerTrack>> {
-    crate::db::run_blocking_db(|| {
-        match pool {
+    crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
-            let conn = pool.get()?;
-            let mut stmt = conn.prepare(
-                "SELECT track_json FROM jobs_tracks WHERE account_id = ?1 ORDER BY active DESC, updated_at_ms DESC",
-            )?;
-            let raws = stmt
-                .query_map(params![account_id], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            raws.into_iter()
-                .map(|raw| parse_json(raw, "Career Track"))
-                .collect()
+            let mut conn = pool.get()?;
+            let tx = conn.transaction()?;
+            let mut tracks = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, track_json, active FROM jobs_tracks
+                      WHERE account_id = ?1
+                      ORDER BY active DESC, updated_at_ms DESC",
+                )?;
+                let rows = stmt
+                    .query_map(params![account_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)? != 0,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|(authoritative_id, raw, authoritative_active)| {
+                        let mut track = parse_json::<CareerTrack>(raw, "Career Track")?;
+                        track.id = authoritative_id;
+                        let activation_drift = track.active != authoritative_active;
+                        track.active = authoritative_active;
+                        if track.policy.authority.review_state == "approved"
+                            && (activation_drift
+                                || validate_track_policy_ledger_sqlite(&tx, account_id, &track)
+                                    .is_err())
+                        {
+                            downgrade_track_policy_ledger(&mut track);
+                        }
+                        Ok(track)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            tx.commit()?;
+            tracks.shrink_to_fit();
+            Ok(tracks)
         }
-        DbPool::Postgres(_) => pool
-            .get_pg()?
-            .query(
-                "SELECT track_json FROM jobs_tracks WHERE account_id = $1 ORDER BY active DESC, updated_at_ms DESC",
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            let rows = tx.query(
+                "SELECT id, track_json, active FROM jobs_tracks
+                  WHERE account_id = $1
+                  ORDER BY active DESC, updated_at_ms DESC
+                  FOR SHARE",
                 &[&account_id],
-            )?
-            .into_iter()
-            .map(|row| parse_json(row.get(0), "Career Track"))
-            .collect(),
-    }
+            )?;
+            let mut tracks = Vec::with_capacity(rows.len());
+            for row in rows {
+                let authoritative_id: String = row.get(0);
+                let authoritative_active = row.get::<_, i32>(2) != 0;
+                let mut track: CareerTrack = parse_json(row.get(1), "Career Track")?;
+                track.id = authoritative_id;
+                let activation_drift = track.active != authoritative_active;
+                track.active = authoritative_active;
+                if track.policy.authority.review_state == "approved"
+                    && (activation_drift
+                        || validate_track_policy_ledger_postgres(&mut tx, account_id, &track)
+                            .is_err())
+                {
+                    downgrade_track_policy_ledger(&mut track);
+                }
+                tracks.push(track);
+            }
+            tx.commit()?;
+            Ok(tracks)
+        }
     })
+}
+
+fn downgrade_track_policy_ledger(track: &mut CareerTrack) {
+    track.policy.authority.review_state = "needs_review".to_string();
+    track.policy.authority.review_reason_codes = vec!["policy_ledger_review_required".to_string()];
 }
 
 fn require_track_mutation_unleased_sqlite(
@@ -582,12 +734,7 @@ fn require_track_mutation_unleased_sqlite(
              WHERE account_id = ?1 AND (provider = ?2 OR track_id = ?3)
                AND lease_token IS NOT NULL AND lease_expires_at_ms > ?4
          )",
-        params![
-            account_id,
-            CURATED_DISCOVERY_PROVIDER,
-            track_id,
-            now_ms()
-        ],
+        params![account_id, CURATED_DISCOVERY_PROVIDER, track_id, now_ms()],
         |row| row.get(0),
     )?;
     if leased {
@@ -619,31 +766,92 @@ fn require_track_mutation_unleased_postgres(
     Ok(())
 }
 
-fn lock_track_account_postgres(
+#[derive(Debug, Error, PartialEq, Eq)]
+#[error("Career Track active limit exceeded")]
+pub struct CareerTrackLimitExceeded;
+
+fn require_active_track_limit_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    track_id: &str,
+    activating: bool,
+    active_track_limit: i64,
+) -> Result<()> {
+    if !activating {
+        return Ok(());
+    }
+    let existing_active = tx
+        .query_row(
+            "SELECT active FROM jobs_tracks WHERE account_id = ?1 AND id = ?2",
+            params![account_id, track_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()?;
+    if existing_active == Some(1) {
+        return Ok(());
+    }
+    let active_count: i64 = tx.query_row(
+        "SELECT COUNT(*) FROM jobs_tracks WHERE account_id = ?1 AND active = 1",
+        params![account_id],
+        |row| row.get(0),
+    )?;
+    if active_count >= active_track_limit.max(0) {
+        return Err(CareerTrackLimitExceeded.into());
+    }
+    Ok(())
+}
+
+fn require_active_track_limit_postgres(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
+    track_id: &str,
+    activating: bool,
+    active_track_limit: i64,
 ) -> Result<()> {
-    if tx
+    if !activating {
+        return Ok(());
+    }
+    let existing_active = tx
         .query_opt(
-            "SELECT 1 FROM accounts WHERE id = $1 FOR KEY SHARE",
+            "SELECT active FROM jobs_tracks WHERE account_id = $1 AND id = $2 FOR UPDATE",
+            &[&account_id, &track_id],
+        )?
+        .map(|row| row.get::<_, i32>(0));
+    if existing_active == Some(1) {
+        return Ok(());
+    }
+    let active_count = tx
+        .query_one(
+            "SELECT COUNT(*) FROM jobs_tracks WHERE account_id = $1 AND active = 1",
             &[&account_id],
         )?
-        .is_none()
-    {
-        anyhow::bail!("account not found")
+        .get::<_, i64>(0);
+    if active_count >= active_track_limit.max(0) {
+        return Err(CareerTrackLimitExceeded.into());
     }
     Ok(())
 }
 
 pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Result<CareerTrack> {
-    let mut value = track.clone();
-    if let Some(identity_id) = value.application_identity_id.as_deref() {
-        let identity = get_application_identity(pool, account_id, identity_id)?
-            .ok_or_else(|| anyhow::anyhow!("application email not found"))?;
-        if identity.verification_status != "verified" {
-            anyhow::bail!("verify the application email before using it on a Career Track")
-        }
-    }
+    upsert_track_with_optional_limit(pool, account_id, track, None)
+}
+
+pub fn upsert_track_with_limit(
+    pool: &DbPool,
+    account_id: &str,
+    track: &CareerTrack,
+    active_track_limit: i64,
+) -> Result<CareerTrack> {
+    upsert_track_with_optional_limit(pool, account_id, track, Some(active_track_limit))
+}
+
+fn upsert_track_with_optional_limit(
+    pool: &DbPool,
+    account_id: &str,
+    track: &CareerTrack,
+    active_track_limit: Option<i64>,
+) -> Result<CareerTrack> {
+    let mut value = normalize_canonical_track(track)?;
     if value.id.trim().is_empty() {
         value.id = uuid::Uuid::new_v4().to_string();
     }
@@ -652,13 +860,16 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
         value.created_at_ms = now;
     }
     value.updated_at_ms = now;
-    let payload = to_json(&value, "Career Track")?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             require_track_mutation_unleased_sqlite(&tx, account_id, &value.id)?;
-            tx.execute(
+            if let Some(limit) = active_track_limit {
+                require_active_track_limit_sqlite(&tx, account_id, &value.id, value.active, limit)?;
+            }
+            let payload = to_json(&value, "Career Track")?;
+            let changed = tx.execute(
                 "INSERT INTO jobs_tracks(id, account_id, track_json, active, created_at_ms, updated_at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(id) DO UPDATE SET
@@ -675,6 +886,68 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
                     value.updated_at_ms,
                 ],
             )?;
+            if changed != 1 {
+                anyhow::bail!("Career Track ID is already assigned to another account")
+            }
+            let account_generation = ensure_account_input_generation_sqlite(&tx, account_id, now)?;
+            let track_generation =
+                advance_track_input_generation_sqlite(&tx, account_id, &value, now)?;
+            let generations = CanonicalPolicyGenerations {
+                activation: load_taxonomy_activation_sqlite(&tx)?,
+                account: account_generation,
+                track: track_generation,
+            };
+            let (profile, preferences, identity, resume_asset_verified) =
+                canonical_track_policy_inputs_sqlite(&tx, account_id, &value)?;
+            let record = prepare_canonical_track_policy_record(
+                account_id,
+                &mut value,
+                &profile,
+                &preferences,
+                identity.as_ref(),
+                resume_asset_verified,
+                &generations,
+            )?;
+            if let Some(record) = record {
+                let head =
+                    persist_track_policy_revision_sqlite(&tx, account_id, &value.id, &record, now)?;
+                value.policy.authority.policy_revision_id = head.revision_id;
+                value.policy.authority.policy_revision_no = head.revision_no;
+                value.policy.authority.canonical_policy_sha256 = head.canonical_policy_sha256;
+                value.policy.authority.policy_head_generation = head.head_generation;
+                value.policy.authority.policy_head_transition_sha256 = head.head_transition_sha256;
+                value.policy.authority.policy_review_receipt_id = head.review_receipt_id;
+                value.policy.authority.policy_review_receipt_sha256 = head.review_receipt_sha256;
+                value.policy.authority.taxonomy_activation_epoch = record.taxonomy_activation_epoch;
+                value.policy.authority.canonicalizer_schema_version =
+                    record.canonicalizer_schema_version;
+                value.policy.authority.canonicalizer_sha256 = record.canonicalizer_sha256.clone();
+                value.policy.authority.account_input_generation = record.account_input_generation;
+                value.policy.authority.account_input_transition_sha256 =
+                    record.account_input_transition_sha256.clone();
+                value.policy.authority.account_input_semantic_sha256 =
+                    record.account_semantic_sha256.clone();
+                value.policy.authority.track_input_generation = record.track_input_generation;
+                value.policy.authority.track_input_transition_sha256 =
+                    record.track_input_transition_sha256.clone();
+                value.policy.authority.track_semantic_sha256 = record.track_semantic_sha256.clone();
+                value.policy.authority.review_state = "approved".to_string();
+                value.policy.authority.review_reason_codes.clear();
+            }
+            let authoritative_payload = to_json(&value, "Career Track authority")?;
+            let changed = tx.execute(
+                "UPDATE jobs_tracks SET track_json = ?3, updated_at_ms = ?4
+                  WHERE account_id = ?1 AND id = ?2",
+                params![
+                    account_id,
+                    value.id,
+                    authoritative_payload,
+                    value.updated_at_ms
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("Career Track changed while policy authority was recorded")
+            }
             tx.commit()?;
             Ok(value)
         }
@@ -683,9 +956,19 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_discovery_account_postgres(&mut tx, account_id)?;
-            lock_track_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             require_track_mutation_unleased_postgres(&mut tx, account_id, &value.id)?;
-            tx.execute(
+            if let Some(limit) = active_track_limit {
+                require_active_track_limit_postgres(
+                    &mut tx,
+                    account_id,
+                    &value.id,
+                    value.active,
+                    limit,
+                )?;
+            }
+            let payload = to_json(&value, "Career Track")?;
+            let changed = tx.execute(
                 "INSERT INTO jobs_tracks(id, account_id, track_json, active, created_at_ms, updated_at_ms)
                  VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT(id) DO UPDATE SET
@@ -702,6 +985,70 @@ pub fn upsert_track(pool: &DbPool, account_id: &str, track: &CareerTrack) -> Res
                     &value.updated_at_ms,
                 ],
             )?;
+            if changed != 1 {
+                anyhow::bail!("Career Track ID is already assigned to another account")
+            }
+            let account_generation =
+                ensure_account_input_generation_postgres(&mut tx, account_id, now)?;
+            let track_generation =
+                advance_track_input_generation_postgres(&mut tx, account_id, &value, now)?;
+            let generations = CanonicalPolicyGenerations {
+                activation: load_taxonomy_activation_postgres(&mut tx)?,
+                account: account_generation,
+                track: track_generation,
+            };
+            let (profile, preferences, identity, resume_asset_verified) =
+                canonical_track_policy_inputs_postgres(&mut tx, account_id, &value)?;
+            let record = prepare_canonical_track_policy_record(
+                account_id,
+                &mut value,
+                &profile,
+                &preferences,
+                identity.as_ref(),
+                resume_asset_verified,
+                &generations,
+            )?;
+            if let Some(record) = record {
+                let head = persist_track_policy_revision_postgres(
+                    &mut tx, account_id, &value.id, &record, now,
+                )?;
+                value.policy.authority.policy_revision_id = head.revision_id;
+                value.policy.authority.policy_revision_no = head.revision_no;
+                value.policy.authority.canonical_policy_sha256 = head.canonical_policy_sha256;
+                value.policy.authority.policy_head_generation = head.head_generation;
+                value.policy.authority.policy_head_transition_sha256 = head.head_transition_sha256;
+                value.policy.authority.policy_review_receipt_id = head.review_receipt_id;
+                value.policy.authority.policy_review_receipt_sha256 = head.review_receipt_sha256;
+                value.policy.authority.taxonomy_activation_epoch = record.taxonomy_activation_epoch;
+                value.policy.authority.canonicalizer_schema_version =
+                    record.canonicalizer_schema_version;
+                value.policy.authority.canonicalizer_sha256 = record.canonicalizer_sha256.clone();
+                value.policy.authority.account_input_generation = record.account_input_generation;
+                value.policy.authority.account_input_transition_sha256 =
+                    record.account_input_transition_sha256.clone();
+                value.policy.authority.account_input_semantic_sha256 =
+                    record.account_semantic_sha256.clone();
+                value.policy.authority.track_input_generation = record.track_input_generation;
+                value.policy.authority.track_input_transition_sha256 =
+                    record.track_input_transition_sha256.clone();
+                value.policy.authority.track_semantic_sha256 = record.track_semantic_sha256.clone();
+                value.policy.authority.review_state = "approved".to_string();
+                value.policy.authority.review_reason_codes.clear();
+            }
+            let authoritative_payload = to_json(&value, "Career Track authority")?;
+            let changed = tx.execute(
+                "UPDATE jobs_tracks SET track_json = $3, updated_at_ms = $4
+                  WHERE account_id = $1 AND id = $2",
+                &[
+                    &account_id,
+                    &value.id,
+                    &authoritative_payload,
+                    &value.updated_at_ms,
+                ],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("Career Track changed while policy authority was recorded")
+            }
             tx.commit()?;
             Ok(value)
         }
@@ -771,7 +1118,7 @@ pub fn delete_track(pool: &DbPool, account_id: &str, track_id: &str) -> Result<b
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_discovery_account_postgres(&mut tx, account_id)?;
-            lock_track_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             require_track_mutation_unleased_postgres(&mut tx, account_id, track_id)?;
             let exists = tx
                 .query_opt(
@@ -1159,12 +1506,8 @@ fn prepare_snapshot_posting(
             value.posted_at_ms = existing.posted_at_ms;
         }
     }
-    let (score, reasons, missing) = score_posting(
-        &value,
-        context.profile,
-        context.preferences,
-        context.track,
-    );
+    let (score, reasons, missing) =
+        score_posting(&value, context.profile, context.preferences, context.track);
     value.match_score = score;
     value.matched_reasons = reasons;
     value.missing_requirements = missing;
@@ -1187,4 +1530,73 @@ fn prepare_snapshot_posting(
         context.track,
     ));
     Ok(value)
+}
+
+#[cfg(test)]
+mod profile_postings_p3_tests {
+    use super::*;
+
+    #[test]
+    fn unapproved_track_reason_codes_are_persisted() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-track-reasons-test-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).expect("open Track reason test pool");
+        crate::db::run_migrations(&pool).expect("migrate Track reason test pool");
+        pool.get()
+            .expect("Track reason test connection")
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-track-reasons', 'track-reasons@example.com', 'hash', 0)",
+                [],
+            )
+            .expect("insert Track reason test account");
+
+        let track = upsert_track(
+            &pool,
+            "acct-track-reasons",
+            &CareerTrack {
+                id: "track-needs-review".to_string(),
+                name: "Software engineering".to_string(),
+                role: "Software Engineer".to_string(),
+                locations: vec!["New York, NY".to_string()],
+                remote_preference: "hybrid_ok".to_string(),
+                application_identity_id: None,
+                policy: CareerTrackPolicy::default(),
+                active: true,
+                match_count: 0,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .expect("save unapproved Career Track");
+        let expected = vec![
+            "application_identity_required".to_string(),
+            "source_resume_review_required".to_string(),
+        ];
+        assert_eq!(track.policy.authority.review_state, "needs_review");
+        assert_eq!(track.policy.authority.review_reason_codes, expected);
+
+        let raw: String = pool
+            .get()
+            .expect("stored Track connection")
+            .query_row(
+                "SELECT track_json FROM jobs_tracks
+                  WHERE account_id = ?1 AND id = ?2",
+                params!["acct-track-reasons", "track-needs-review"],
+                |row| row.get(0),
+            )
+            .expect("load stored Track payload");
+        let stored: CareerTrack =
+            parse_json(raw, "stored unapproved Career Track").expect("parse stored Track payload");
+        assert_eq!(stored.policy.authority.review_state, "needs_review");
+        assert_eq!(stored.policy.authority.review_reason_codes, expected);
+
+        let listed = list_tracks(&pool, "acct-track-reasons")
+            .expect("list unapproved Career Track")
+            .remove(0);
+        assert_eq!(listed.policy.authority.review_reason_codes, expected);
+    }
 }

@@ -247,9 +247,9 @@ const RUNTIME_MEASUREMENT_PATH =
 const RUNTIME_IDENTITY_DOMAIN =
   "bluey-jobs-managed-cloud-runtime-identity-v1\0";
 const SQLITE_MIGRATION_HEAD =
-  "055_jobs_managed_cloud_release_authority.sql";
+  "056_jobs_canonical_taxonomy_authority.sql";
 const POSTGRES_MIGRATION_HEAD =
-  "033_jobs_managed_cloud_release_authority.sql";
+  "034_jobs_canonical_taxonomy_authority.sql";
 const JOBS_LOCK_EVIDENCE_PATH = "evidence/build/jobs-package-lock.json";
 const SERVER_LOCK_EVIDENCE_PATH = "evidence/build/server-cargo-lock";
 const REQUIRED_CANDIDATE_FILES = Object.freeze([

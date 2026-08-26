@@ -68,6 +68,10 @@ export function jobsPortalHomeDestination(search = ""): string {
   return `/overview${search}`;
 }
 
+export function trackSaveToast(wasExisting: boolean): string {
+  return wasExisting ? "Career Track updated." : "Career Track started.";
+}
+
 type ResumeUploadRequestId = ReturnType<Crypto["randomUUID"]>;
 
 type ResumeSourceUploader = (
@@ -177,6 +181,359 @@ function canonicalResumeUploadValue(value: unknown): string {
   return JSON.stringify(value) ?? "undefined";
 }
 
+const PORTAL_AUTHORITY_REFRESH_REASON = "portal_authority_refresh_required";
+
+/**
+ * Immediately fail closed while the portal reads the server's current policy projection.
+ * Every account-semantic mutation invalidates every Track because each reviewed
+ * policy binds the account-wide semantic-input generation.
+ */
+export function invalidateWorkspacePolicyAuthority(
+  workspace: JobsWorkspace,
+): JobsWorkspace {
+  return invalidateWorkspacePolicyAuthorityForTracks(
+    workspace,
+    new Set(workspace.tracks.map((track) => track.id)),
+  );
+}
+
+function invalidateWorkspacePolicyAuthorityForTracks(
+  workspace: JobsWorkspace,
+  affectedTrackIds: ReadonlySet<string>,
+): JobsWorkspace {
+  return {
+    ...workspace,
+    tracks: workspace.tracks.map((track) => {
+      if (!affectedTrackIds.has(track.id) || !track.policy.authority) return track;
+      const reviewReasonCodes = Array.from(new Set([
+        ...track.policy.authority.review_reason_codes,
+        PORTAL_AUTHORITY_REFRESH_REASON,
+      ]));
+      return {
+        ...track,
+        policy: {
+          ...track.policy,
+          authority: {
+            ...track.policy.authority,
+            review_state: "needs_review",
+            review_reason_codes: reviewReasonCodes,
+          },
+        },
+      };
+    }),
+    auto_submit_authorizations: workspace.auto_submit_authorizations.map((authorization) =>
+      affectedTrackIds.has(authorization.career_track_id) && authorization.status === "active"
+        ? { ...authorization, status: "needs_review" }
+        : authorization),
+  };
+}
+
+type JobsWorkspaceStateSetter = (
+  update: (current: JobsWorkspace | null) => JobsWorkspace | null,
+) => void;
+
+interface WorkspaceAuthorityRefreshToken {
+  authorityEpoch: number;
+  refreshGeneration: number;
+}
+
+interface WorkspaceAuthorityMutationCycle {
+  settlement: Promise<void>;
+  resolve(): void;
+  reject(error: unknown): void;
+}
+
+interface WorkspaceAuthorityMutationToken {
+  authorityEpoch: number;
+  cycle: WorkspaceAuthorityMutationCycle;
+}
+
+interface WorkspaceAuthorityReadbackToken extends WorkspaceAuthorityRefreshToken {
+  cycle: WorkspaceAuthorityMutationCycle;
+}
+
+/**
+ * Orders workspace reads against authority-sensitive writes. A write advances
+ * the authority epoch before its network request begins, so an older refresh
+ * can never reinstall a pre-write approved projection. Concurrent writes keep
+ * authority fail-closed and share one readback after every write has settled.
+ */
+export class WorkspaceAuthorityEpoch {
+  private authorityEpoch = 0;
+  private refreshGeneration = 0;
+  private readonly activeMutationEpochs = new Set<number>();
+  private currentMutationCycle: WorkspaceAuthorityMutationCycle | null = null;
+  private readbackCycle: WorkspaceAuthorityMutationCycle | null = null;
+
+  beginRefresh(): WorkspaceAuthorityRefreshToken {
+    this.refreshGeneration += 1;
+    return {
+      authorityEpoch: this.authorityEpoch,
+      refreshGeneration: this.refreshGeneration,
+    };
+  }
+
+  beginMutation(): WorkspaceAuthorityMutationToken {
+    this.authorityEpoch += 1;
+    this.activeMutationEpochs.add(this.authorityEpoch);
+    const cycle = this.currentMutationCycle ?? this.createMutationCycle();
+    this.currentMutationCycle = cycle;
+    return { authorityEpoch: this.authorityEpoch, cycle };
+  }
+
+  finishMutation(
+    token: WorkspaceAuthorityMutationToken,
+  ): WorkspaceAuthorityReadbackToken | null {
+    if (!this.activeMutationEpochs.delete(token.authorityEpoch)) {
+      throw new Error("Workspace authority mutation was already settled.");
+    }
+    return this.acquireMutationReadback(token.cycle);
+  }
+
+  completeMutationReadback(
+    token: WorkspaceAuthorityReadbackToken,
+    installed: boolean,
+  ): WorkspaceAuthorityReadbackToken | null {
+    this.releaseMutationReadback(token);
+    if (installed && this.canInstall(token)) {
+      token.cycle.resolve();
+      if (this.currentMutationCycle === token.cycle) this.currentMutationCycle = null;
+      return null;
+    }
+    return this.acquireMutationReadback(token.cycle);
+  }
+
+  failMutationReadback(
+    token: WorkspaceAuthorityReadbackToken,
+    error: unknown,
+  ): WorkspaceAuthorityReadbackToken | null {
+    const currentFailure = this.canInstall(token);
+    this.releaseMutationReadback(token);
+    if (currentFailure) {
+      token.cycle.reject(error);
+      if (this.currentMutationCycle === token.cycle) this.currentMutationCycle = null;
+      return null;
+    }
+    return this.acquireMutationReadback(token.cycle);
+  }
+
+  canInstall(token: WorkspaceAuthorityRefreshToken): boolean {
+    return token.authorityEpoch === this.authorityEpoch
+      && token.refreshGeneration === this.refreshGeneration
+      && this.activeMutationEpochs.size === 0;
+  }
+
+  private createMutationCycle(): WorkspaceAuthorityMutationCycle {
+    let resolve: () => void = () => undefined;
+    let reject: (error: unknown) => void = () => undefined;
+    const settlement = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    void settlement.catch(() => undefined);
+    return { settlement, resolve, reject };
+  }
+
+  private acquireMutationReadback(
+    cycle: WorkspaceAuthorityMutationCycle,
+  ): WorkspaceAuthorityReadbackToken | null {
+    if (
+      this.currentMutationCycle !== cycle
+      || this.activeMutationEpochs.size > 0
+      || this.readbackCycle
+    ) return null;
+    this.readbackCycle = cycle;
+    return { ...this.beginRefresh(), cycle };
+  }
+
+  private releaseMutationReadback(token: WorkspaceAuthorityReadbackToken): void {
+    if (this.readbackCycle !== token.cycle) {
+      throw new Error("Workspace authority readback was already settled.");
+    }
+    this.readbackCycle = null;
+  }
+}
+
+export function installWorkspaceAtAuthorityEpoch(
+  setWorkspace: JobsWorkspaceStateSetter,
+  authorityEpoch: WorkspaceAuthorityEpoch,
+  token: WorkspaceAuthorityRefreshToken,
+  nextWorkspace: JobsWorkspace,
+): boolean {
+  if (!authorityEpoch.canInstall(token)) return false;
+  setWorkspace(() => ({
+    ...nextWorkspace,
+    runner_availability: runnerAvailabilityOrLocked(nextWorkspace.runner_availability),
+  }));
+  return true;
+}
+
+export function workspaceAfterAutoSubmitAuthorization(
+  workspace: JobsWorkspace,
+  saved: AutoSubmitAuthorization,
+): JobsWorkspace {
+  return {
+    ...workspace,
+    auto_submit_authorizations: [
+      saved,
+      ...workspace.auto_submit_authorizations.filter(
+        (authorization) => authorization.career_track_id !== saved.career_track_id,
+      ),
+    ],
+  };
+}
+
+export function workspaceAfterAutoSubmitRevocation(
+  workspace: JobsWorkspace,
+  trackId: string,
+): JobsWorkspace {
+  return {
+    ...workspace,
+    auto_submit_authorizations: workspace.auto_submit_authorizations.filter(
+      (authorization) => authorization.career_track_id !== trackId,
+    ),
+  };
+}
+
+export function workspaceAfterTrackDeletion(
+  workspace: JobsWorkspace,
+  trackId: string,
+): JobsWorkspace {
+  return {
+    ...workspace,
+    tracks: workspace.tracks.filter((item) => item.id !== trackId),
+    auto_submit_authorizations: workspace.auto_submit_authorizations.filter(
+      (authorization) => authorization.career_track_id !== trackId,
+    ),
+    matches: workspace.matches.map((job) =>
+      job.track_id === trackId ? { ...job, track_id: "" } : job),
+  };
+}
+
+interface WorkspacePolicyMutationOptions {
+  preview: boolean;
+  loadWorkspace?: () => Promise<JobsWorkspace>;
+  invalidateWorkspace?: (workspace: JobsWorkspace) => JobsWorkspace;
+}
+
+async function driveWorkspacePolicyAuthorityReadback(
+  setWorkspace: JobsWorkspaceStateSetter,
+  authorityEpoch: WorkspaceAuthorityEpoch,
+  initialReadbackToken: WorkspaceAuthorityReadbackToken | null,
+  preview: boolean,
+  loadWorkspace: () => Promise<JobsWorkspace>,
+): Promise<void> {
+  let readbackToken = initialReadbackToken;
+  while (readbackToken) {
+    const currentReadbackToken = readbackToken;
+    if (preview) {
+      readbackToken = authorityEpoch.completeMutationReadback(
+        currentReadbackToken,
+        authorityEpoch.canInstall(currentReadbackToken),
+      );
+      continue;
+    }
+    try {
+      const nextWorkspace = await loadWorkspace();
+      const installed = installWorkspaceAtAuthorityEpoch(
+        setWorkspace,
+        authorityEpoch,
+        currentReadbackToken,
+        nextWorkspace,
+      );
+      readbackToken = authorityEpoch.completeMutationReadback(
+        currentReadbackToken,
+        installed,
+      );
+    } catch (requestError) {
+      readbackToken = authorityEpoch.failMutationReadback(
+        currentReadbackToken,
+        requestError,
+      );
+    }
+  }
+}
+
+export async function runWorkspacePolicyAuthorityMutation<T>(
+  setWorkspace: JobsWorkspaceStateSetter,
+  authorityEpoch: WorkspaceAuthorityEpoch,
+  mutate: () => Promise<T>,
+  updateWorkspace: (current: JobsWorkspace, result: T) => JobsWorkspace,
+  {
+    preview,
+    loadWorkspace = jobsApi.workspace,
+    invalidateWorkspace = invalidateWorkspacePolicyAuthority,
+  }: WorkspacePolicyMutationOptions,
+): Promise<T> {
+  const mutationToken = authorityEpoch.beginMutation();
+  setWorkspace((current) => current ? invalidateWorkspace(current) : current);
+
+  let result: T | undefined;
+  let mutationFailed = false;
+  let mutationError: unknown;
+  try {
+    result = await mutate();
+    setWorkspace((current) => current
+      ? invalidateWorkspace(updateWorkspace(current, result as T))
+      : current);
+  } catch (requestError) {
+    mutationFailed = true;
+    mutationError = requestError;
+  }
+
+  const readbackToken = authorityEpoch.finishMutation(mutationToken);
+  await driveWorkspacePolicyAuthorityReadback(
+    setWorkspace,
+    authorityEpoch,
+    readbackToken,
+    preview,
+    loadWorkspace,
+  );
+
+  let readbackFailed = false;
+  let readbackError: unknown;
+  try {
+    await mutationToken.cycle.settlement;
+  } catch (requestError) {
+    readbackFailed = true;
+    readbackError = requestError;
+  }
+
+  if (mutationFailed) throw mutationError;
+  if (readbackFailed) throw readbackError;
+  return result as T;
+}
+
+interface WorkspacePolicyReconciliationOptions {
+  preview: boolean;
+  loadWorkspace?: () => Promise<JobsWorkspace>;
+  authorityEpoch?: WorkspaceAuthorityEpoch;
+}
+
+export async function reconcileWorkspacePolicyAuthority(
+  setWorkspace: JobsWorkspaceStateSetter,
+  updateWorkspace: (current: JobsWorkspace) => JobsWorkspace,
+  {
+    preview,
+    loadWorkspace = jobsApi.workspace,
+    authorityEpoch = new WorkspaceAuthorityEpoch(),
+  }: WorkspacePolicyReconciliationOptions,
+): Promise<void> {
+  const mutationToken = authorityEpoch.beginMutation();
+  setWorkspace((current) => current
+    ? invalidateWorkspacePolicyAuthority(updateWorkspace(current))
+    : current);
+  const readbackToken = authorityEpoch.finishMutation(mutationToken);
+  await driveWorkspacePolicyAuthorityReadback(
+    setWorkspace,
+    authorityEpoch,
+    readbackToken,
+    preview,
+    loadWorkspace,
+  );
+  await mutationToken.cycle.settlement;
+}
+
 export default function App() {
   const [workspace, setWorkspace] = useState<JobsWorkspace | null>(isPreview ? initialPreviewWorkspace : null);
   const [account, setAccount] = useState<AccountSummary | null>(
@@ -187,26 +544,50 @@ export default function App() {
   const [error, setError] = useState("");
   const [toast, setToast] = useState("");
   const resumeUploadAttempts = useRef(new ResumeUploadAttemptLineage());
+  const workspaceAuthorityEpoch = useRef(new WorkspaceAuthorityEpoch());
+  const workspaceRefreshGeneration = useRef(0);
   const navigate = useNavigate();
 
   const refresh = useCallback(async () => {
     if (isPreview) return;
+    const refreshGeneration = ++workspaceRefreshGeneration.current;
+    const refreshToken = workspaceAuthorityEpoch.current.beginRefresh();
     setLoading(true);
     setError("");
     try {
       const [nextWorkspace, nextAccount] = await Promise.all([jobsApi.workspace(), jobsApi.account()]);
-      setWorkspace({
-        ...nextWorkspace,
-        runner_availability: runnerAvailabilityOrLocked(nextWorkspace.runner_availability),
-      });
-      setAccount(nextAccount);
+      if (installWorkspaceAtAuthorityEpoch(
+        setWorkspace,
+        workspaceAuthorityEpoch.current,
+        refreshToken,
+        nextWorkspace,
+      )) setAccount(nextAccount);
     } catch (requestError) {
-      const message = requestError instanceof Error ? requestError.message : "Bluey Jobs could not load.";
-      setError(message);
+      if (workspaceAuthorityEpoch.current.canInstall(refreshToken)) {
+        const message = requestError instanceof Error ? requestError.message : "Bluey Jobs could not load.";
+        setError(message);
+      }
     } finally {
-      setLoading(false);
+      if (refreshGeneration === workspaceRefreshGeneration.current) {
+        setLoading(false);
+      }
     }
   }, [isPreview]);
+
+  const runAuthoritySensitiveWorkspaceMutation = useCallback(
+    <T,>(
+      mutate: () => Promise<T>,
+      updateWorkspace: (current: JobsWorkspace, result: T) => JobsWorkspace,
+      invalidateWorkspace = invalidateWorkspacePolicyAuthority,
+    ) => runWorkspacePolicyAuthorityMutation(
+      setWorkspace,
+      workspaceAuthorityEpoch.current,
+      mutate,
+      updateWorkspace,
+      { preview: isPreview, invalidateWorkspace },
+    ),
+    [isPreview],
+  );
 
   useEffect(() => {
     if (!isPreview && accessToken()) void refresh();
@@ -244,26 +625,26 @@ export default function App() {
         ...preferences,
         time_zone_offset_minutes: -new Date().getTimezoneOffset(),
       };
-      if (isPreview) {
-        setWorkspace((current) =>
-          current ? { ...current, profile, preferences: localizedPreferences } : current,
-        );
-        return;
-      }
       try {
-        const [savedProfile, savedPreferences] = await Promise.all([
-          jobsApi.saveProfile(profile),
-          jobsApi.savePreferences(localizedPreferences),
-        ]);
-        setWorkspace((current) =>
-          current ? { ...current, profile: savedProfile, preferences: savedPreferences } : current,
+        await runAuthoritySensitiveWorkspaceMutation(
+          async () => isPreview
+            ? [profile, localizedPreferences] as const
+            : Promise.all([
+                jobsApi.saveProfile(profile),
+                jobsApi.savePreferences(localizedPreferences),
+              ]),
+          (current, [savedProfile, savedPreferences]) => ({
+            ...current,
+            profile: savedProfile,
+            preferences: savedPreferences,
+          }),
         );
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : "Could not save setup progress.");
         throw requestError;
       }
     },
-    [],
+    [isPreview, runAuthoritySensitiveWorkspaceMutation],
   );
 
   const saveOnboarding = useCallback(
@@ -273,72 +654,67 @@ export default function App() {
         ...preferences,
         time_zone_offset_minutes: -new Date().getTimezoneOffset(),
       };
-      if (isPreview) {
-        setWorkspace((current) =>
-          current
-            ? {
-                ...current,
-                profile,
-                preferences: localizedPreferences,
-                tracks: current.tracks.some((item) => item.id === track.id)
-                  ? current.tracks.map((item) => (item.id === track.id ? track : item))
-                  : [track, ...current.tracks],
-              }
-            : current,
-        );
-        navigate(`/matches${previewSearch}`);
-        return;
-      }
       try {
-        const completedWorkspace = await jobsApi.completeOnboarding(
-          profile,
-          localizedPreferences,
-          track,
+        await runAuthoritySensitiveWorkspaceMutation(
+          async () => isPreview
+            ? null
+            : jobsApi.completeOnboarding(profile, localizedPreferences, track),
+          (current, completedWorkspace) => completedWorkspace ?? {
+            ...current,
+            profile,
+            preferences: localizedPreferences,
+            tracks: current.tracks.some((item) => item.id === track.id)
+              ? current.tracks.map((item) => (item.id === track.id ? track : item))
+              : [track, ...current.tracks],
+          },
         );
-        setWorkspace(completedWorkspace);
         setToast("Career Profile ready. Bluey is finding your first matches.");
-        navigate("/matches");
+        navigate(`/matches${previewSearch}`);
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : "Could not save your Career Profile.");
         throw requestError;
       }
     },
-    [navigate],
+    [isPreview, navigate, runAuthoritySensitiveWorkspaceMutation],
   );
 
   const saveProfile = useCallback(async (profile: CareerProfile) => {
-    const saved = isPreview ? profile : await jobsApi.saveProfile(profile);
-    setWorkspace((current) => (current ? { ...current, profile: saved } : current));
+    await runAuthoritySensitiveWorkspaceMutation(
+      async () => isPreview ? profile : jobsApi.saveProfile(profile),
+      (current, saved) => ({ ...current, profile: saved }),
+    );
     setToast("Career Profile saved.");
-  }, [isPreview]);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const importResumeSource = useCallback(
     async (file: File, profile: CareerProfile, pageCount?: number): Promise<CareerProfile> => {
       setError("");
       try {
-        let saved: CareerProfile;
-        if (isPreview) {
-          const extension = file.name.split(".").pop()?.toLowerCase() || "";
-          saved = {
-            ...profile,
-            source_resume_name: file.name,
-            source_resume_asset_id: `preview-resume-${Date.now()}`,
-            source_resume_sha256: "preview",
-            source_resume_media_type: extension === "docx"
-              ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-              : extension === "pdf" ? "application/pdf" : "text/plain",
-            source_resume_template_status: extension === "docx" ? "exact_docx" : "ats_layout",
-          };
-        } else {
-          const result = await uploadResumeSourceWithLineage(
-            resumeUploadAttempts.current,
-            file,
-            profile,
-            pageCount,
-          );
-          saved = result.profile;
-        }
-        setWorkspace((current) => (current ? { ...current, profile: saved } : current));
+        const saved = await runAuthoritySensitiveWorkspaceMutation(
+          async () => {
+            if (isPreview) {
+              const extension = file.name.split(".").pop()?.toLowerCase() || "";
+              return {
+                ...profile,
+                source_resume_name: file.name,
+                source_resume_asset_id: `preview-resume-${Date.now()}`,
+                source_resume_sha256: "preview",
+                source_resume_media_type: extension === "docx"
+                  ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                  : extension === "pdf" ? "application/pdf" : "text/plain",
+                source_resume_template_status: extension === "docx" ? "exact_docx" : "ats_layout",
+              };
+            }
+            const result = await uploadResumeSourceWithLineage(
+              resumeUploadAttempts.current,
+              file,
+              profile,
+              pageCount,
+            );
+            return result.profile;
+          },
+          (current, nextProfile) => ({ ...current, profile: nextProfile }),
+        );
         setToast(saved.source_resume_template_status === "exact_docx"
           ? "Resume imported. Bluey will preserve its Word layout for tailored downloads."
           : "Resume imported. Bluey will use a clean ATS layout for tailored downloads.");
@@ -348,7 +724,7 @@ export default function App() {
         throw requestError;
       }
     },
-    [],
+    [isPreview, runAuthoritySensitiveWorkspaceMutation],
   );
 
   const savePreferences = useCallback(async (preferences: JobPreferences) => {
@@ -356,92 +732,75 @@ export default function App() {
       ...preferences,
       time_zone_offset_minutes: -new Date().getTimezoneOffset(),
     };
-    const saved = isPreview ? localized : await jobsApi.savePreferences(localized);
-    setWorkspace((current) => (current ? { ...current, preferences: saved } : current));
+    await runAuthoritySensitiveWorkspaceMutation(
+      async () => isPreview ? localized : jobsApi.savePreferences(localized),
+      (current, saved) => ({ ...current, preferences: saved }),
+    );
     setToast("Job preferences saved.");
-  }, [isPreview]);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const saveTrack = useCallback(async (track: CareerTrack) => {
-    const saved = isPreview
-      ? { ...track, id: track.id || `track-${Date.now()}`, updated_at_ms: Date.now() }
-      : await jobsApi.saveTrack(track);
-    setWorkspace((current) =>
-      current
-        ? {
-            ...current,
-            tracks: [saved, ...current.tracks.filter((item) => item.id !== saved.id)],
-            auto_submit_authorizations: current.auto_submit_authorizations.map((authorization) =>
-              authorization.career_track_id === saved.id
-                ? { ...authorization, status: "needs_review" }
-                : authorization,
-            ),
-          }
-        : current,
+    const wasExisting = workspace?.tracks.some((item) => item.id === track.id) ?? false;
+    const affectedTrackId = track.id;
+    await runAuthoritySensitiveWorkspaceMutation(
+      async () => isPreview
+        ? { ...track, id: track.id || `track-${Date.now()}`, updated_at_ms: Date.now() }
+        : jobsApi.saveTrack(track),
+      (current, saved) => ({
+        ...current,
+        tracks: [saved, ...current.tracks.filter((item) => item.id !== saved.id)],
+        auto_submit_authorizations: current.auto_submit_authorizations.map((authorization) =>
+          authorization.career_track_id === saved.id
+            ? { ...authorization, status: "needs_review" }
+            : authorization),
+      }),
+      (current) => affectedTrackId
+        ? invalidateWorkspacePolicyAuthorityForTracks(current, new Set([affectedTrackId]))
+        : invalidateWorkspacePolicyAuthority(current),
     );
-    setToast(track.id ? "Career Track updated." : "Career Track started.");
-  }, []);
+    setToast(trackSaveToast(wasExisting));
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation, workspace?.tracks]);
 
   const authorizeTrackAutoSubmit = useCallback(async (track: CareerTrack) => {
-    const saved: AutoSubmitAuthorization = isPreview
-      ? {
-          id: `auto-submit-${track.id}-${Date.now()}`,
-          career_track_id: track.id,
-          application_identity_id: track.application_identity_id || "",
-          source_resume_asset_id: workspace?.profile.source_resume_asset_id || "",
-          revision_no: 1,
-          authorized_at_ms: Date.now(),
-          status: "active",
-        }
-      : await jobsApi.authorizeTrackAutoSubmit(track.id);
-    setWorkspace((current) =>
-      current
+    await runAuthoritySensitiveWorkspaceMutation(
+      async (): Promise<AutoSubmitAuthorization> => isPreview
         ? {
-            ...current,
-            auto_submit_authorizations: [
-              saved,
-              ...current.auto_submit_authorizations.filter(
-                (authorization) => authorization.career_track_id !== track.id,
-              ),
-            ],
+            id: `auto-submit-${track.id}-${Date.now()}`,
+            career_track_id: track.id,
+            application_identity_id: track.application_identity_id || "",
+            source_resume_asset_id: workspace?.profile.source_resume_asset_id || "",
+            revision_no: 1,
+            authorized_at_ms: Date.now(),
+            status: "active",
           }
-        : current,
+        : jobsApi.authorizeTrackAutoSubmit(track.id),
+      workspaceAfterAutoSubmitAuthorization,
+      (current) => current,
     );
     setToast(`Auto-submit enabled for ${track.name}.`);
-  }, [workspace?.profile.source_resume_asset_id]);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation, workspace?.profile.source_resume_asset_id]);
 
   const revokeTrackAutoSubmit = useCallback(async (track: CareerTrack) => {
-    if (!isPreview) await jobsApi.revokeTrackAutoSubmit(track.id);
-    setWorkspace((current) =>
-      current
-        ? {
-            ...current,
-            auto_submit_authorizations: current.auto_submit_authorizations.filter(
-              (authorization) => authorization.career_track_id !== track.id,
-            ),
-          }
-        : current,
+    await runAuthoritySensitiveWorkspaceMutation(
+      async () => {
+        if (!isPreview) await jobsApi.revokeTrackAutoSubmit(track.id);
+      },
+      (current) => workspaceAfterAutoSubmitRevocation(current, track.id),
+      (current) => current,
     );
     setToast(`Auto-submit turned off for ${track.name}.`);
-  }, []);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const deleteTrack = useCallback(async (track: CareerTrack) => {
-    if (!isPreview) await jobsApi.deleteTrack(track.id);
-    setWorkspace((current) =>
-      current
-        ? {
-            ...current,
-            tracks: current.tracks.filter((item) => item.id !== track.id),
-            auto_submit_authorizations: current.auto_submit_authorizations.filter(
-              (authorization) => authorization.career_track_id !== track.id,
-            ),
-            matches: current.matches.map((job) =>
-              job.track_id === track.id ? { ...job, track_id: "" } : job,
-            ),
-          }
-        : current,
+    await runAuthoritySensitiveWorkspaceMutation(
+      async () => {
+        if (!isPreview) await jobsApi.deleteTrack(track.id);
+      },
+      (current) => workspaceAfterTrackDeletion(current, track.id),
+      (current) => current,
     );
     setToast(`${track.name} deleted.`);
-  }, []);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const addJob = useCallback(
     async (input: UserJobInput) => {
@@ -663,40 +1022,53 @@ export default function App() {
   );
 
   const createApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
-    const saved = isPreview
-      ? { ...identity, id: `identity-${Date.now()}`, verification_status: "pending" as const, is_default: false, created_at_ms: Date.now(), updated_at_ms: Date.now() }
-      : await jobsApi.createApplicationIdentity(identity);
-    setWorkspace((current) => current ? {
-      ...current,
-      application_identities: [saved, ...current.application_identities.filter((item) => item.id !== saved.id)],
-    } : current);
+    const saved = await runAuthoritySensitiveWorkspaceMutation(
+      async () => isPreview
+        ? { ...identity, id: `identity-${Date.now()}`, verification_status: "pending" as const, is_default: false, created_at_ms: Date.now(), updated_at_ms: Date.now() }
+        : jobsApi.createApplicationIdentity(identity),
+      (current, nextIdentity) => ({
+        ...current,
+        application_identities: [
+          nextIdentity,
+          ...current.application_identities.filter((item) => item.id !== nextIdentity.id),
+        ],
+      }),
+    );
     setToast(`Verification sent to ${saved.email}.`);
     return saved;
-  }, []);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const updateApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
-    const saved = isPreview ? { ...identity, updated_at_ms: Date.now() } : await jobsApi.updateApplicationIdentity(identity);
-    setWorkspace((current) => current ? {
-      ...current,
-      application_identities: current.application_identities.map((item) => item.id === saved.id
-        ? saved
-        : saved.is_default ? { ...item, is_default: false } : item),
-    } : current);
+    const saved = await runAuthoritySensitiveWorkspaceMutation(
+      async () => isPreview
+        ? { ...identity, updated_at_ms: Date.now() }
+        : jobsApi.updateApplicationIdentity(identity),
+      (current, nextIdentity) => ({
+        ...current,
+        application_identities: current.application_identities.map((item) =>
+          item.id === nextIdentity.id
+            ? nextIdentity
+            : nextIdentity.is_default ? { ...item, is_default: false } : item),
+      }),
+    );
     setToast(saved.is_default ? `${saved.email} is now the default.` : "Application email updated.");
     return saved;
-  }, []);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const verifyApplicationIdentity = useCallback(async (identity: ApplicationIdentity, code: string) => {
-    const saved = isPreview
-      ? { ...identity, verification_status: "verified" as const, updated_at_ms: Date.now() }
-      : await jobsApi.verifyApplicationIdentity(identity.id, code);
-    setWorkspace((current) => current ? {
-      ...current,
-      application_identities: current.application_identities.map((item) => item.id === saved.id ? saved : item),
-    } : current);
+    const saved = await runAuthoritySensitiveWorkspaceMutation(
+      async () => isPreview
+        ? { ...identity, verification_status: "verified" as const, updated_at_ms: Date.now() }
+        : jobsApi.verifyApplicationIdentity(identity.id, code),
+      (current, nextIdentity) => ({
+        ...current,
+        application_identities: current.application_identities.map((item) =>
+          item.id === nextIdentity.id ? nextIdentity : item),
+      }),
+    );
     setToast(`${saved.email} verified.`);
     return saved;
-  }, []);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const resendApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
     if (!isPreview) await jobsApi.resendApplicationIdentity(identity.id);
@@ -704,13 +1076,19 @@ export default function App() {
   }, []);
 
   const deleteApplicationIdentity = useCallback(async (identity: ApplicationIdentity) => {
-    if (!isPreview) await jobsApi.deleteApplicationIdentity(identity.id);
-    setWorkspace((current) => current ? {
-      ...current,
-      application_identities: current.application_identities.filter((item) => item.id !== identity.id),
-    } : current);
+    await runAuthoritySensitiveWorkspaceMutation(
+      async () => {
+        if (!isPreview) await jobsApi.deleteApplicationIdentity(identity.id);
+      },
+      (current) => ({
+        ...current,
+        application_identities: current.application_identities.filter(
+          (item) => item.id !== identity.id,
+        ),
+      }),
+    );
     setToast(`${identity.email} removed.`);
-  }, []);
+  }, [isPreview, runAuthoritySensitiveWorkspaceMutation]);
 
   const mailboxOAuthProviders = useCallback(async (): Promise<MailboxProviderAvailability[]> => {
     if (isPreview) {

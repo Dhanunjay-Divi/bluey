@@ -37,8 +37,8 @@ const MANAGED_CLOUD_TEMPORAL_EVIDENCE_AUDIENCE: &str =
 const MANAGED_CLOUD_ROOT_TRUST_ANCHOR_ENV: &str = "BLUEY_JOBS_MANAGED_CLOUD_ROOT_TRUST_ANCHOR_JSON";
 const MANAGED_CLOUD_ROOT_TRUST_ANCHOR_SHA256_ENV: &str =
     "BLUEY_JOBS_MANAGED_CLOUD_ROOT_TRUST_ANCHOR_SHA256";
-const MANAGED_CLOUD_SQLITE_MIGRATION_HEAD: &str = "055_jobs_managed_cloud_release_authority.sql";
-const MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD: &str = "033_jobs_managed_cloud_release_authority.sql";
+const MANAGED_CLOUD_SQLITE_MIGRATION_HEAD: &str = "056_jobs_canonical_taxonomy_authority.sql";
+const MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD: &str = "034_jobs_canonical_taxonomy_authority.sql";
 const MANAGED_CLOUD_MAX_ENVELOPE_BYTES: usize = 128 * 1024;
 const MANAGED_CLOUD_MAX_CONTENT_INVENTORY_BYTES: usize = 12 * 1024 * 1024;
 const MANAGED_CLOUD_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
@@ -9822,6 +9822,7 @@ fn require_postgres_managed_cloud_effect_admission(
     now_ms: i64,
 ) -> ManagedCloudResult<ManagedCloudAdmissionAuthority> {
     lock_managed_cloud_workflow_admission_postgres_tx(tx, &input.scope)?;
+    lock_discovery_account_shared_postgres(tx, &input.account_id).map_err(managed_cloud_storage)?;
     require_postgres_managed_cloud_effect_admission_after_prelock(tx, input, now_ms)
 }
 
@@ -15833,6 +15834,23 @@ mod managed_cloud_release_authority_tests {
     #[test]
     fn managed_cloud_execution_effect_is_fresh_without_rewriting_claim_tuple() {
         let source = include_str!("managed_cloud_release_authority.rs");
+        let admission_wrapper = source
+            .split_once("fn require_postgres_managed_cloud_effect_admission(")
+            .expect("PostgreSQL managed-cloud admission wrapper")
+            .1
+            .split_once("fn require_postgres_managed_cloud_effect_admission_after_prelock(")
+            .expect("PostgreSQL managed-cloud admission wrapper boundary")
+            .0;
+        let release_lock = admission_wrapper
+            .find("lock_managed_cloud_workflow_admission_postgres_tx")
+            .expect("managed-cloud release lock");
+        let discovery_lock = admission_wrapper
+            .find("lock_discovery_account_shared_postgres")
+            .expect("shared discovery-account lock");
+        let admission = admission_wrapper
+            .find("require_postgres_managed_cloud_effect_admission_after_prelock")
+            .expect("post-lock admission");
+        assert!(release_lock < discovery_lock && discovery_lock < admission);
         let effect = source
             .split_once("pub(crate) fn resolve_managed_cloud_execution_effect_sqlite_tx(")
             .expect("SQLite execution-effect resolver")

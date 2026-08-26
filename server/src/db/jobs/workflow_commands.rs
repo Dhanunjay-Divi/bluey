@@ -7549,6 +7549,7 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                     &lease.command.id,
                 )?;
             }
+            lock_discovery_account_shared_postgres(&mut transaction, &lease.command.account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut transaction,
                 &lease.command.account_id,
@@ -8122,7 +8123,11 @@ mod workflow_command_tests {
             let account_write_fence = postgres
                 .find("require_active_account_write_fence_postgres_tx")
                 .expect("account write fence");
-            assert!(managed_cloud_prelock < account_write_fence);
+            let discovery_lock = postgres
+                .find("lock_discovery_account_shared_postgres")
+                .expect("shared discovery-account lock");
+            assert!(managed_cloud_prelock < discovery_lock);
+            assert!(discovery_lock < account_write_fence);
             assert!(postgres[managed_cloud_prelock..account_write_fence]
                 .contains("require_managed_cloud_workflow_binding_replay_postgres_tx"));
         }
@@ -8146,6 +8151,14 @@ mod workflow_command_tests {
             request_start_postgres
                 .find("lock_managed_cloud_workflow_admission_postgres_tx")
                 .expect("Postgres release prelock")
+                < request_start_postgres
+                    .find("lock_discovery_account_shared_postgres")
+                    .expect("Postgres shared discovery-account lock")
+        );
+        assert!(
+            request_start_postgres
+                .find("lock_discovery_account_shared_postgres")
+                .expect("Postgres shared discovery-account lock")
                 < request_start_postgres
                     .find("require_active_account_write_fence_postgres_tx")
                     .expect("Postgres account fence")

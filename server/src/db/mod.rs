@@ -367,6 +367,8 @@ const SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
 const SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
     "../../../infra/sqlite/server-runtime/055_jobs_managed_cloud_release_authority.sql"
 );
+const SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str =
+    include_str!("../../../infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1711,6 +1713,9 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
     // 0055 - signed managed-cloud release, activation, runtime, and admission authority.
     SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
+    // 0056 - immutable canonical Career Track policy revisions, review receipts,
+    // and exact compare-and-swap heads.
+    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1721,7 +1726,7 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
 }
 
 fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
-    let conn = pool.get().context("get conn")?;
+    let mut conn = pool.get().context("get conn")?;
     for (i, sql) in MIGRATIONS.iter().enumerate() {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
@@ -2197,6 +2202,8 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
              'managed-cloud command authority marker is immutable');
          END;",
     )?;
+    jobs::activate_canonical_taxonomy_authority_sqlite(&mut conn)
+        .context("activate SQLite Career Track taxonomy authority")?;
     ensure_column(
         &conn,
         "jobs_communication_actions",
@@ -2741,6 +2748,11 @@ pub const JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID: &str =
 const POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
     "../../../infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql"
 );
+pub const JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID: &str =
+    "034_jobs_canonical_taxonomy_authority.sql";
+const POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql"
+);
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2862,6 +2874,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
     ),
+    (
+        JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+    ),
 ];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
@@ -2950,6 +2966,8 @@ fn run_postgres_migrations_inner(pool: &DbPool) -> Result<()> {
     if embedding_type != "vector" {
         anyhow::bail!("cloud_rag_chunks.embedding is {embedding_type}, expected vector");
     }
+    jobs::activate_canonical_taxonomy_authority_postgres(&mut conn)
+        .context("activate PostgreSQL Career Track taxonomy authority")?;
 
     tracing::info!(
         backend = pool.backend_name(),
@@ -3001,7 +3019,8 @@ mod blocking_boundary_tests {
 mod sqlite_migration_replay_tests {
     use super::{
         ensure_column, open_pool, run_migrations, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
+        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+        SQLITE_JOBS_OPERATIONAL_HOLDS,
     };
 
     #[allow(clippy::too_many_arguments)]
@@ -3039,6 +3058,796 @@ mod sqlite_migration_replay_tests {
                 recorded_at_ms,
             ],
         )
+    }
+
+    #[test]
+    fn canonical_track_policy_schema_is_immutable_exact_and_cas_monotonic() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (id TEXT PRIMARY KEY);
+             CREATE TABLE jobs_tracks (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE
+             );
+             CREATE TABLE jobs_application_identities (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+               verification_status TEXT NOT NULL
+             );
+             CREATE TABLE jobs_resume_source_assets (
+               id TEXT PRIMARY KEY,
+               account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
+               sha256 TEXT NOT NULL
+             );",
+        )
+        .unwrap();
+        conn.execute_batch(SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY)
+            .unwrap();
+        conn.execute_batch(SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY)
+            .expect("canonical policy migration replay must be safe");
+
+        for table in [
+            "jobs_track_policy_revisions",
+            "jobs_track_policy_review_receipts",
+            "jobs_track_policy_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must not seed policy authority");
+        }
+
+        conn.execute_batch(
+            "INSERT INTO accounts(id) VALUES ('account-policy-001');
+             INSERT INTO jobs_tracks(id, account_id)
+               VALUES ('track-policy-001', 'account-policy-001');
+             INSERT INTO jobs_application_identities(
+               id, account_id, verification_status
+             ) VALUES ('identity-verified-001', 'account-policy-001', 'verified');
+             INSERT INTO jobs_resume_source_assets(id, account_id, sha256)
+               VALUES (
+                 'source-resume-asset-001', 'account-policy-001',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+               );
+             INSERT INTO jobs_track_policy_taxonomy_activation_events (
+               activation_epoch, previous_activation_epoch, taxonomy_version,
+               taxonomy_digest_sha256, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, activation_transition_sha256,
+               predecessor_activation_transition_sha256, activated_at_ms
+             ) VALUES (
+               1, 0, '2026.08.1',
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+               1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               '9999999999999999999999999999999999999999999999999999999999999999',
+               NULL, 90
+             );
+             INSERT INTO jobs_track_policy_taxonomy_activation_head
+             SELECT 1, activation_epoch, previous_activation_epoch, taxonomy_version,
+                    taxonomy_digest_sha256, canonicalizer_schema_version,
+                    canonicalizer_digest_sha256, activation_transition_sha256,
+                    predecessor_activation_transition_sha256, activated_at_ms
+               FROM jobs_track_policy_taxonomy_activation_events
+              WHERE activation_epoch = 1;
+             INSERT INTO jobs_track_policy_account_input_transitions (
+               input_transition_id, account_id, input_generation,
+               previous_input_generation, input_kind, input_subject_sha256,
+               account_semantic_sha256, input_transition_sha256,
+               predecessor_input_transition_sha256, changed_at_ms
+             ) VALUES (
+               'account-input-transition-001', 'account-policy-001', 1, 0,
+               'baseline',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               NULL, 91
+             );
+             INSERT INTO jobs_track_policy_account_input_heads
+             SELECT account_id, input_generation, previous_input_generation,
+                    input_transition_id, input_kind, input_subject_sha256,
+                    account_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_account_input_transitions
+              WHERE input_transition_id = 'account-input-transition-001';
+             INSERT INTO jobs_track_policy_track_input_transitions (
+               input_transition_id, account_id, career_track_id, input_generation,
+               previous_input_generation, track_semantic_sha256,
+               input_transition_sha256, predecessor_input_transition_sha256,
+               changed_at_ms
+             ) VALUES (
+               'track-input-transition-001', 'account-policy-001',
+               'track-policy-001', 1, 0,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               NULL, 92
+             );
+             INSERT INTO jobs_track_policy_track_input_heads
+             SELECT account_id, career_track_id, input_generation,
+                    previous_input_generation, input_transition_id,
+                    track_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_track_input_transitions
+              WHERE input_transition_id = 'track-input-transition-001';",
+        )
+        .unwrap();
+
+        let revision_insert = "INSERT INTO jobs_track_policy_revisions (
+               revision_id, account_id, career_track_id, revision_no,
+               taxonomy_version, taxonomy_digest_sha256, canonical_policy_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256,
+               canonical_policy_ciphertext, canonical_role_id, canonical_role_family,
+               verified_application_identity_id,
+               verified_application_identity_sha256, source_resume_asset_id,
+               source_resume_sha256, job_preferences_sha256, predecessor_revision_id,
+               predecessor_revision_no, predecessor_policy_sha256,
+               compatibility_classification, review_state, created_by, created_at_ms
+             ) VALUES (
+               ?1, 'account-policy-001', 'track-policy-001', ?2,
+               '2026.08.1', ?3, ?4, 1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               ?5, 'software-engineer', 'software-engineering',
+               'identity-verified-001', ?6, 'source-resume-asset-001', ?7,
+               ?8, ?9, ?10, ?11, ?12, 'approved', 'candidate-owner', ?13
+             )";
+        let taxonomy_sha = "b".repeat(64);
+        let identity_sha = "c".repeat(64);
+        let resume_sha = "a".repeat(64);
+        let first_policy_sha = "d".repeat(64);
+        let second_policy_sha = "e".repeat(64);
+        let stale_policy_sha = "6".repeat(64);
+        let preferences_sha = "5".repeat(64);
+        let policy_ciphertext = format!("bluey-jobs:v1:{}", "A".repeat(40));
+        let receipt_ciphertext = format!("bluey-jobs:v1:{}", "B".repeat(40));
+
+        let wrong_resume = conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000001",
+                1_i64,
+                taxonomy_sha,
+                first_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                "f".repeat(64),
+                preferences_sha,
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                "initial",
+                100_i64,
+            ],
+        );
+        assert!(
+            wrong_resume.is_err(),
+            "source-resume SHA drift must fail closed"
+        );
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000001",
+                1_i64,
+                taxonomy_sha,
+                first_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                Option::<String>::None,
+                Option::<i64>::None,
+                Option::<String>::None,
+                "initial",
+                100_i64,
+            ],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "UPDATE jobs_track_policy_revisions
+                    SET canonical_role_id = 'changed'
+                  WHERE revision_id = 'policy-revision-000001'",
+                [],
+            )
+            .is_err());
+
+        let head_insert = "INSERT INTO jobs_track_policy_heads (
+               account_id, career_track_id, head_generation,
+               previous_head_generation, policy_revision_id, policy_revision_no,
+               canonical_policy_sha256, taxonomy_digest_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256,
+               verified_application_identity_sha256, source_resume_sha256,
+               job_preferences_sha256, review_receipt_id, review_receipt_sha256,
+               head_transition_sha256, predecessor_head_transition_sha256,
+               updated_by, updated_at_ms
+             ) VALUES (
+               'account-policy-001', 'track-policy-001', 1, 0,
+               'policy-revision-000001', 1, ?1, ?2, 1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               ?3, ?4, ?5, ?6, ?7, ?8, NULL,
+               'candidate-owner', 120
+             )";
+        let head_transition_insert = "INSERT INTO jobs_track_policy_head_transitions (
+               account_id, career_track_id, head_generation,
+               previous_head_generation, policy_revision_id, policy_revision_no,
+               canonical_policy_sha256, taxonomy_digest_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256, verified_application_identity_sha256,
+               source_resume_sha256, job_preferences_sha256,
+               review_receipt_id, review_receipt_sha256, head_transition_sha256,
+               predecessor_head_transition_sha256, updated_by, updated_at_ms
+             ) VALUES (
+               'account-policy-001', 'track-policy-001', ?1, ?2, ?3, ?4,
+               ?5,
+               'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+               1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc',
+               'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+               '5555555555555555555555555555555555555555555555555555555555555555',
+               ?6, ?7, ?8, ?9, 'candidate-owner', ?10
+             )";
+        assert!(
+            conn.execute(
+                head_transition_insert,
+                rusqlite::params![
+                    1_i64,
+                    0_i64,
+                    "policy-revision-000001",
+                    1_i64,
+                    first_policy_sha,
+                    "policy-review-receipt-001",
+                    "2".repeat(64),
+                    "1".repeat(64),
+                    Option::<String>::None,
+                    120_i64,
+                ],
+            )
+            .is_err(),
+            "an approved revision still needs an exact review receipt"
+        );
+
+        let receipt_insert = "INSERT INTO jobs_track_policy_review_receipts (
+               review_receipt_id, review_receipt_sha256,
+               canonical_review_receipt_ciphertext, account_id, career_track_id,
+               policy_revision_id, policy_revision_no, canonical_policy_sha256,
+               taxonomy_digest_sha256, verified_application_identity_sha256,
+               taxonomy_activation_epoch, canonicalizer_schema_version,
+               canonicalizer_digest_sha256, account_input_generation,
+               account_input_transition_sha256, account_semantic_sha256,
+               track_input_generation, track_input_transition_sha256,
+               track_semantic_sha256,
+               source_resume_sha256, job_preferences_sha256,
+               reviewer_id, decision, decided_at_ms
+             ) VALUES (
+               ?1, ?2, ?3, 'account-policy-001', 'track-policy-001', ?4, ?5,
+               ?6, ?7, ?8, 1, 1,
+               '0000000000000000000000000000000000000000000000000000000000000000',
+               1,
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               1,
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               ?9, ?10, 'candidate-owner', 'approved', ?11
+             )";
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-001",
+                "2".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000001",
+                1_i64,
+                first_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                110_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                1_i64,
+                0_i64,
+                "policy-revision-000001",
+                1_i64,
+                first_policy_sha,
+                "policy-review-receipt-001",
+                "2".repeat(64),
+                "1".repeat(64),
+                Option::<String>::None,
+                120_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_insert,
+            rusqlite::params![
+                first_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-review-receipt-001",
+                "2".repeat(64),
+                "1".repeat(64),
+            ],
+        )
+        .unwrap();
+
+        assert!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET updated_at_ms = 121
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+            )
+            .is_err(),
+            "a stale/non-advancing head update must fail closed"
+        );
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000002",
+                2_i64,
+                taxonomy_sha,
+                second_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-revision-000001",
+                1_i64,
+                first_policy_sha,
+                "review_required",
+                100_i64,
+            ],
+        )
+        .expect("successive policy revisions may share the same millisecond");
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-002",
+                "3".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000002",
+                2_i64,
+                second_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                140_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                2_i64,
+                1_i64,
+                "policy-revision-000002",
+                2_i64,
+                second_policy_sha,
+                "policy-review-receipt-002",
+                "3".repeat(64),
+                "4".repeat(64),
+                "1".repeat(64),
+                150_i64,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET head_generation = 2, previous_head_generation = 1,
+                        policy_revision_id = 'policy-revision-000002',
+                        policy_revision_no = 2, canonical_policy_sha256 = ?1,
+                        job_preferences_sha256 = ?2,
+                        review_receipt_id = 'policy-review-receipt-002',
+                        review_receipt_sha256 = ?3,
+                        head_transition_sha256 = ?4,
+                        predecessor_head_transition_sha256 = ?5,
+                        updated_at_ms = 150
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'
+                    AND head_generation = 1 AND head_transition_sha256 = ?5",
+                rusqlite::params![
+                    second_policy_sha,
+                    preferences_sha,
+                    "3".repeat(64),
+                    "4".repeat(64),
+                    "1".repeat(64)
+                ],
+            )
+            .unwrap(),
+            1
+        );
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000003",
+                3_i64,
+                taxonomy_sha,
+                first_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-revision-000002",
+                2_i64,
+                second_policy_sha,
+                "review_required",
+                160_i64,
+            ],
+        )
+        .expect("a later revision may intentionally revert to prior policy bytes");
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-003",
+                "7".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000003",
+                3_i64,
+                first_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                170_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                3_i64,
+                2_i64,
+                "policy-revision-000003",
+                3_i64,
+                first_policy_sha,
+                "policy-review-receipt-003",
+                "7".repeat(64),
+                "8".repeat(64),
+                "4".repeat(64),
+                180_i64,
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET head_generation = 3, previous_head_generation = 2,
+                        policy_revision_id = 'policy-revision-000003',
+                        policy_revision_no = 3, canonical_policy_sha256 = ?1,
+                        job_preferences_sha256 = ?2,
+                        review_receipt_id = 'policy-review-receipt-003',
+                        review_receipt_sha256 = ?3,
+                        head_transition_sha256 = ?4,
+                        predecessor_head_transition_sha256 = ?5,
+                        updated_at_ms = 180
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'
+                    AND head_generation = 2 AND head_transition_sha256 = ?5",
+                rusqlite::params![
+                    first_policy_sha,
+                    preferences_sha,
+                    "7".repeat(64),
+                    "8".repeat(64),
+                    "4".repeat(64)
+                ],
+            )
+            .unwrap(),
+            1,
+            "a reviewed reversion must advance rather than overwrite history"
+        );
+        let reverted_head: (i64, i64, String) = conn
+            .query_row(
+                "SELECT head_generation, policy_revision_no, canonical_policy_sha256
+                   FROM jobs_track_policy_heads
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(reverted_head, (3, 3, first_policy_sha.clone()));
+
+        conn.execute(
+            revision_insert,
+            rusqlite::params![
+                "policy-revision-000004",
+                4_i64,
+                taxonomy_sha,
+                stale_policy_sha,
+                policy_ciphertext,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                "policy-revision-000003",
+                3_i64,
+                first_policy_sha,
+                "review_required",
+                190_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            receipt_insert,
+            rusqlite::params![
+                "policy-review-receipt-004",
+                "9".repeat(64),
+                receipt_ciphertext,
+                "policy-revision-000004",
+                4_i64,
+                stale_policy_sha,
+                taxonomy_sha,
+                identity_sha,
+                resume_sha,
+                preferences_sha,
+                200_i64,
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            head_transition_insert,
+            rusqlite::params![
+                4_i64,
+                3_i64,
+                "policy-revision-000004",
+                4_i64,
+                stale_policy_sha,
+                "policy-review-receipt-004",
+                "9".repeat(64),
+                "a".repeat(64),
+                "8".repeat(64),
+                210_i64,
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            conn.execute(
+                "UPDATE jobs_resume_source_assets
+                    SET id = 'source-resume-asset-002', sha256 = ?1
+                  WHERE account_id = 'account-policy-001'",
+                rusqlite::params!["f".repeat(64)],
+            )
+            .expect("resume replacement must not rewrite or block immutable policy history"),
+            1
+        );
+
+        assert!(
+            conn.execute(
+                "UPDATE jobs_track_policy_heads
+                    SET head_generation = 4, previous_head_generation = 3,
+                        policy_revision_id = 'policy-revision-000004',
+                        policy_revision_no = 4, canonical_policy_sha256 = ?1,
+                        job_preferences_sha256 = ?2,
+                        review_receipt_id = 'policy-review-receipt-004',
+                        review_receipt_sha256 = ?3,
+                        head_transition_sha256 = ?4,
+                        predecessor_head_transition_sha256 = ?5,
+                        updated_at_ms = 210
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'
+                    AND head_generation = 3 AND head_transition_sha256 = ?5",
+                rusqlite::params![
+                    stale_policy_sha,
+                    preferences_sha,
+                    "9".repeat(64),
+                    "a".repeat(64),
+                    "8".repeat(64)
+                ],
+            )
+            .is_err(),
+            "a head must not advance after its bound resume asset is replaced"
+        );
+        for (table, expected) in [
+            ("jobs_track_policy_revisions", 4_i64),
+            ("jobs_track_policy_review_receipts", 4_i64),
+            ("jobs_track_policy_heads", 1_i64),
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(
+                count, expected,
+                "resume replacement must preserve {table} history"
+            );
+        }
+        let head_generation: i64 = conn
+            .query_row(
+                "SELECT head_generation FROM jobs_track_policy_heads
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            head_generation, 3,
+            "resume drift must leave the head intact"
+        );
+
+        assert!(conn
+            .execute(
+                "UPDATE jobs_track_policy_review_receipts
+                    SET reviewer_id = 'other-reviewer'
+                  WHERE review_receipt_id = 'policy-review-receipt-001'",
+                [],
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_track_policy_heads
+                  WHERE account_id = 'account-policy-001'
+                    AND career_track_id = 'track-policy-001'",
+                [],
+            )
+            .is_err());
+
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_track_policy_revisions
+                  WHERE revision_id = 'policy-revision-000001'",
+                [],
+            )
+            .is_err());
+
+        assert_eq!(
+            conn.execute("DELETE FROM jobs_tracks WHERE id = 'track-policy-001'", [],)
+                .expect("Career Track deletion must cascade its immutable tenant evidence"),
+            1
+        );
+        for table in [
+            "jobs_track_policy_revisions",
+            "jobs_track_policy_review_receipts",
+            "jobs_track_policy_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must follow Career Track deletion");
+        }
+        let remaining_account: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE id = 'account-policy-001'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining_account, 1,
+            "Track deletion must not delete its account"
+        );
+        assert_eq!(
+            conn.execute("DELETE FROM accounts WHERE id = 'account-policy-001'", [],)
+                .unwrap(),
+            1
+        );
+
+        conn.execute_batch(
+            "INSERT INTO accounts(id) VALUES ('account-policy-002');
+             INSERT INTO jobs_tracks(id, account_id)
+               VALUES ('track-policy-002', 'account-policy-002');
+             INSERT INTO jobs_application_identities(
+               id, account_id, verification_status
+             ) VALUES ('identity-verified-002', 'account-policy-002', 'verified');
+             INSERT INTO jobs_resume_source_assets(id, account_id, sha256)
+               VALUES (
+                 'source-resume-asset-002', 'account-policy-002',
+                 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+               );
+             INSERT INTO jobs_track_policy_account_input_transitions (
+               input_transition_id, account_id, input_generation,
+               previous_input_generation, input_kind, input_subject_sha256,
+               account_semantic_sha256, input_transition_sha256,
+               predecessor_input_transition_sha256, changed_at_ms
+             ) VALUES (
+               'account-input-transition-002', 'account-policy-002', 1, 0,
+               'baseline',
+               '6666666666666666666666666666666666666666666666666666666666666666',
+               '7777777777777777777777777777777777777777777777777777777777777777',
+               '8888888888888888888888888888888888888888888888888888888888888888',
+               NULL, 91
+             );
+             INSERT INTO jobs_track_policy_account_input_heads
+             SELECT account_id, input_generation, previous_input_generation,
+                    input_transition_id, input_kind, input_subject_sha256,
+                    account_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_account_input_transitions
+              WHERE input_transition_id = 'account-input-transition-002';
+             INSERT INTO jobs_track_policy_track_input_transitions (
+               input_transition_id, account_id, career_track_id, input_generation,
+               previous_input_generation, track_semantic_sha256,
+               input_transition_sha256, predecessor_input_transition_sha256,
+               changed_at_ms
+             ) VALUES (
+               'track-input-transition-002', 'account-policy-002',
+               'track-policy-002', 1, 0,
+               '4444444444444444444444444444444444444444444444444444444444444444',
+               '3333333333333333333333333333333333333333333333333333333333333333',
+               NULL, 92
+             );
+             INSERT INTO jobs_track_policy_track_input_heads
+             SELECT account_id, career_track_id, input_generation,
+                    previous_input_generation, input_transition_id,
+                    track_semantic_sha256, input_transition_sha256,
+                    predecessor_input_transition_sha256, changed_at_ms
+               FROM jobs_track_policy_track_input_transitions
+              WHERE input_transition_id = 'track-input-transition-002';",
+        )
+        .unwrap();
+        assert_eq!(
+            conn.execute("DELETE FROM accounts WHERE id = 'account-policy-002'", [])
+                .expect("account deletion must cascade through a live Track and its evidence"),
+            1
+        );
+        for table in [
+            "accounts",
+            "jobs_tracks",
+            "jobs_application_identities",
+            "jobs_resume_source_assets",
+            "jobs_track_policy_account_input_transitions",
+            "jobs_track_policy_account_input_heads",
+            "jobs_track_policy_track_input_transitions",
+            "jobs_track_policy_track_input_heads",
+            "jobs_track_policy_revisions",
+            "jobs_track_policy_review_receipts",
+            "jobs_track_policy_heads",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} must follow direct account deletion");
+        }
     }
 
     #[test]
@@ -4906,21 +5715,23 @@ mod postgres_migration_tests {
     use super::{
         ACCOUNT_DELETION_INTENTS_MIGRATION_ID, JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL_MIGRATION_ID,
         JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
-        JOBS_OPERATIONAL_HOLDS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
-        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
+        JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
+        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
-        POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
+        MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
         POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
+        POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
         POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
         SQLITE_ACCOUNT_DELETION_INTENTS, SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
         SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
-        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
-        SQLITE_JOBS_OPERATIONAL_HOLDS, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
-        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
-        SQLITE_JOBS_WORKFLOW_COMMANDS,
+        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+        SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
+        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY, SQLITE_JOBS_WORKFLOW_COMMANDS,
     };
 
     #[test]
@@ -5126,6 +5937,161 @@ mod postgres_migration_tests {
                     .any(|line| line.to_ascii_lowercase().contains("target: postgres")),
                 "{version} would be skipped by scripts/bluey-postgres-migrate.sh"
             );
+        }
+    }
+
+    #[test]
+    fn managed_cloud_release_authority_postgres_migration_is_replay_safe() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID)
+            .expect("managed-cloud release authority must be a runtime PostgreSQL migration");
+        assert_eq!(*version, "033_jobs_managed_cloud_release_authority.sql");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY);
+
+        let added_columns = postgres_sql
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("ADD COLUMN"))
+            .collect::<Vec<_>>();
+        assert_eq!(added_columns.len(), 16);
+        assert!(added_columns
+            .iter()
+            .all(|line| line.starts_with("ADD COLUMN IF NOT EXISTS ")));
+
+        let normalized = postgres_sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for (table, constraint) in [
+            (
+                "jobs_workflow_cleanup_targets",
+                "fk_jobs_cleanup_target_managed_cloud_binding",
+            ),
+            (
+                "jobs_workflow_cleanup_targets",
+                "ck_jobs_cleanup_target_managed_cloud_binding_complete",
+            ),
+            (
+                "jobs_execution_leases",
+                "ck_jobs_execution_lease_managed_cloud_complete",
+            ),
+            (
+                "jobs_execution_leases",
+                "fk_jobs_execution_lease_managed_cloud_request",
+            ),
+            (
+                "jobs_execution_leases",
+                "fk_jobs_execution_lease_managed_cloud_binding",
+            ),
+            (
+                "jobs_execution_leases",
+                "fk_jobs_execution_lease_managed_cloud_runtime",
+            ),
+        ] {
+            let guard = format!("conrelid='{table}'::regclass AND conname='{constraint}'");
+            assert!(
+                normalized.contains(&guard),
+                "PostgreSQL migration must catalog-guard {constraint} on {table}"
+            );
+            assert_eq!(
+                normalized
+                    .matches(&format!("ADD CONSTRAINT {constraint}"))
+                    .count(),
+                1,
+                "PostgreSQL migration must define {constraint} exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_taxonomy_authority_is_paired_immutable_and_current_head() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .last()
+            .expect("canonical taxonomy authority must be the PostgreSQL head");
+        assert_eq!(*version, JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID);
+        assert_eq!(*version, "034_jobs_canonical_taxonomy_authority.sql");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY);
+        assert_eq!(
+            MIGRATIONS.last().copied(),
+            Some(SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY),
+            "canonical taxonomy authority must be the SQLite head"
+        );
+
+        for required in [
+            "CREATE TABLE IF NOT EXISTS jobs_track_policy_revisions",
+            "CREATE TABLE IF NOT EXISTS jobs_track_policy_review_receipts",
+            "CREATE TABLE IF NOT EXISTS jobs_track_policy_heads",
+            "taxonomy_version",
+            "taxonomy_digest_sha256",
+            "canonical_policy_sha256",
+            "canonical_policy_ciphertext",
+            "canonical_review_receipt_ciphertext",
+            "bluey-jobs:v1:",
+            "canonical_role_id",
+            "canonical_role_family",
+            "verified_application_identity_id",
+            "verified_application_identity_sha256",
+            "source_resume_asset_id",
+            "source_resume_sha256",
+            "job_preferences_sha256",
+            "predecessor_revision_id",
+            "predecessor_revision_no",
+            "predecessor_policy_sha256",
+            "compatibility_classification",
+            "review_state",
+            "reviewer_id",
+            "decision",
+            "decided_at_ms",
+            "review_receipt_id",
+            "review_receipt_sha256",
+            "head_generation",
+            "previous_head_generation",
+            "head_transition_sha256",
+            "predecessor_head_transition_sha256",
+            "trg_jobs_track_policy_revisions_no_update",
+            "trg_jobs_track_policy_revisions_no_delete",
+            "trg_jobs_track_policy_review_receipts_no_update",
+            "trg_jobs_track_policy_review_receipts_no_delete",
+            "trg_jobs_track_policy_heads_validate_insert",
+            "trg_jobs_track_policy_heads_monotonic",
+            "trg_jobs_track_policy_heads_no_delete",
+            "Career Track policy head must advance by exact CAS",
+            "identity.verification_status = 'verified'",
+            "asset.sha256 = NEW.source_resume_sha256",
+            "revision.review_state = 'approved'",
+            "receipt.decision = 'approved'",
+            "ON DELETE CASCADE",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL canonical taxonomy migration missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY.contains(required),
+                "SQLite canonical taxonomy migration missing {required}"
+            );
+        }
+
+        for schema in [postgres_sql, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY] {
+            assert_eq!(
+                schema
+                    .lines()
+                    .filter(|line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_track_policy_"))
+                    .count(),
+                10
+            );
+            assert!(!schema.contains("INSERT INTO jobs_track_policy_"));
+            assert!(schema.contains("UNIQUE(account_id, career_track_id, revision_no)"));
+            assert!(
+                !schema.contains("UNIQUE(account_id, career_track_id, canonical_policy_sha256)")
+            );
+            assert!(schema.contains("predecessor_revision_no = revision_no - 1"));
+            assert!(schema.contains("predecessor.created_at_ms <= NEW.created_at_ms"));
+            assert!(schema.contains("CHECK(head_generation = policy_revision_no)"));
+            assert!(schema.contains("NEW.head_generation <> OLD.head_generation + 1"));
+            assert!(schema
+                .contains("NEW.predecessor_head_transition_sha256 <> OLD.head_transition_sha256"));
         }
     }
 

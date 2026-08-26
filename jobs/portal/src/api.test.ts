@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { jobsApi } from "./api";
 import { previewWorkspace } from "./data/preview";
+import {
+  CANONICAL_TAXONOMY,
+  canonicalTaxonomyDescriptor,
+} from "./lib/canonical-taxonomy";
+import type { CareerTrackPolicyAuthority } from "./types";
 
 class MemoryStorage implements Storage {
   private readonly values = new Map<string, string>();
@@ -67,6 +72,49 @@ function communicationActionResponse(status = "awaiting_approval") {
   };
 }
 
+async function currentTaxonomyHttpResponse() {
+  const descriptor = await canonicalTaxonomyDescriptor();
+  if (!descriptor.digest_sha256) throw new Error("canonical taxonomy digest is unavailable");
+  return {
+    taxonomyVersion: descriptor.taxonomy_version,
+    taxonomySha256: descriptor.digest_sha256,
+    registry: CANONICAL_TAXONOMY,
+  };
+}
+
+function policyAuthority(applicationIdentityId: string): CareerTrackPolicyAuthority {
+  return {
+    taxonomy_version: "bluey-jobs-taxonomy-v1-2026-08-25",
+    taxonomy_sha256: "1".repeat(64),
+    taxonomy_activation_epoch: 1,
+    canonicalizer_schema_version: 1,
+    canonicalizer_sha256: "2".repeat(64),
+    account_input_generation: 1,
+    account_input_transition_sha256: "3".repeat(64),
+    account_input_semantic_sha256: "4".repeat(64),
+    track_input_generation: 1,
+    track_input_transition_sha256: "5".repeat(64),
+    track_semantic_sha256: "6".repeat(64),
+    canonical_role_id: "software-engineer",
+    canonical_role_family_id: "software-engineering",
+    canonical_location_ids: ["country:US"],
+    source_resume_asset_id: "resume-one",
+    source_resume_sha256: "7".repeat(64),
+    applicationIdentityId,
+    application_identity_sha256: "8".repeat(64),
+    job_preferences_sha256: "9".repeat(64),
+    policy_revision_id: "revision-one",
+    policy_revision_no: 1,
+    canonical_policy_sha256: "a".repeat(64),
+    policy_head_generation: 1,
+    policy_head_transition_sha256: "b".repeat(64),
+    policy_review_receipt_id: "receipt-one",
+    policy_review_receipt_sha256: "c".repeat(64),
+    review_state: "approved",
+    review_reason_codes: [],
+  };
+}
+
 describe("Jobs API authentication", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -114,6 +162,194 @@ describe("Jobs API authentication", () => {
       "/api/jobs/workspace:Bearer dummy-fresh-access-token",
       "/account/me:Bearer dummy-fresh-access-token",
     ]));
+  });
+
+  it("maps and defaults the server policy identity binding at the API boundary", async () => {
+    const firstAuthority = policyAuthority("identity-primary");
+    const secondAuthority = policyAuthority("");
+    const { applicationIdentityId: firstIdentityId, ...firstWireAuthority } = firstAuthority;
+    const { applicationIdentityId: _missingIdentityId, ...secondWireAuthority } = secondAuthority;
+    const wireWorkspace = {
+      ...previewWorkspace,
+      tracks: previewWorkspace.tracks.map((track, index) => ({
+        ...track,
+        policy: {
+          ...track.policy,
+          authority: index === 0
+            ? { ...firstWireAuthority, application_identity_id: firstIdentityId }
+            : secondWireAuthority,
+        },
+      })),
+    };
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(wireWorkspace)));
+
+    const workspace = await jobsApi.workspace();
+
+    expect(workspace.tracks[0].policy.authority?.applicationIdentityId)
+      .toBe("identity-primary");
+    expect(workspace.tracks[0].policy.authority).not.toHaveProperty(
+      "application_identity_id",
+    );
+    expect(workspace.tracks[1].policy.authority?.applicationIdentityId).toBe("");
+  });
+
+  it("validates the authenticated taxonomy before a Track write and sends its exact binding", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const taxonomy = await currentTaxonomyHttpResponse();
+    const track = {
+      ...previewWorkspace.tracks[0],
+      id: "track-client-created",
+      created_at_ms: 0,
+      policy: {
+        ...previewWorkspace.tracks[0].policy,
+        authority: policyAuthority("identity-primary"),
+      },
+    };
+    const savedTrack = { ...track };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => (
+      String(input) === "/api/jobs/taxonomy"
+        ? Response.json(taxonomy)
+        : Response.json(savedTrack)
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(jobsApi.saveTrack(track)).resolves.toEqual(savedTrack);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(calls.map(([path]) => path)).toEqual([
+      "/api/jobs/taxonomy",
+      "/api/jobs/tracks",
+    ]);
+    expect(calls[0][1].method).toBeUndefined();
+    expect(calls[1][1].method).toBe("POST");
+    expect(new Headers(calls[0][1].headers).get("Authorization")).toBe(
+      "Bearer dummy-access-token",
+    );
+    const writeHeaders = new Headers(calls[1][1].headers);
+    expect(writeHeaders.get("Authorization")).toBe("Bearer dummy-access-token");
+    expect(writeHeaders.get("X-Bluey-Jobs-Taxonomy-Version")).toBe(
+      taxonomy.taxonomyVersion,
+    );
+    expect(writeHeaders.get("X-Bluey-Jobs-Taxonomy-SHA256")).toBe(
+      taxonomy.taxonomySha256,
+    );
+    const writtenTrack = JSON.parse(String(calls[1][1].body)) as {
+      policy: { authority: Record<string, unknown> };
+    };
+    expect(writtenTrack.policy.authority.application_identity_id).toBe("identity-primary");
+    expect(writtenTrack.policy.authority).not.toHaveProperty("applicationIdentityId");
+  });
+
+  it("validates the authenticated taxonomy before the onboarding write", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const taxonomy = await currentTaxonomyHttpResponse();
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => (
+      String(input) === "/api/jobs/taxonomy"
+        ? Response.json(taxonomy)
+        : Response.json(previewWorkspace)
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(jobsApi.completeOnboarding(
+      previewWorkspace.profile,
+      previewWorkspace.preferences,
+      previewWorkspace.tracks[0],
+    )).resolves.toEqual(previewWorkspace);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(calls.map(([path]) => path)).toEqual([
+      "/api/jobs/taxonomy",
+      "/api/jobs/onboarding/complete",
+    ]);
+    expect(calls[1][1].method).toBe("POST");
+    const writeHeaders = new Headers(calls[1][1].headers);
+    expect(writeHeaders.get("X-Bluey-Jobs-Taxonomy-Version")).toBe(
+      taxonomy.taxonomyVersion,
+    );
+    expect(writeHeaders.get("X-Bluey-Jobs-Taxonomy-SHA256")).toBe(
+      taxonomy.taxonomySha256,
+    );
+  });
+
+  it.each([
+    {
+      label: "Track",
+      write: () => jobsApi.saveTrack({
+        ...previewWorkspace.tracks[0],
+        id: "track-client-created",
+        created_at_ms: 0,
+      }),
+    },
+    {
+      label: "onboarding",
+      write: () => jobsApi.completeOnboarding(
+        previewWorkspace.profile,
+        previewWorkspace.preferences,
+        previewWorkspace.tracks[0],
+      ),
+    },
+  ])("refuses stale or malformed taxonomy before the $label write", async ({ write }) => {
+    localStorage.setItem("bluey_access_token", "dummy-access-token");
+    const taxonomy = await currentTaxonomyHttpResponse();
+    for (const invalidTaxonomy of [
+      { ...taxonomy, taxonomySha256: "0".repeat(64) },
+      { ...taxonomy, registry: {} },
+    ]) {
+      const fetchMock = vi.fn(async (_input: RequestInfo | URL) => (
+        Response.json(invalidTaxonomy)
+      ));
+      vi.stubGlobal("fetch", fetchMock);
+
+      await expect(write()).rejects.toMatchObject({ status: 409 });
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(String(fetchMock.mock.calls[0][0])).toBe("/api/jobs/taxonomy");
+    }
+  });
+
+  it("refreshes authentication on the taxonomy read before issuing the bound Track write", async () => {
+    localStorage.setItem("bluey_access_token", "dummy-expired-access-token");
+    localStorage.setItem("bluey_refresh_token", "dummy-refresh-token-one");
+    const taxonomy = await currentTaxonomyHttpResponse();
+    const track = {
+      ...previewWorkspace.tracks[0],
+      id: "track-client-created",
+      created_at_ms: 0,
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input);
+      if (path === "/auth/refresh") {
+        return Response.json({
+          access_token: "dummy-fresh-access-token",
+          refresh_token: "dummy-refresh-token-two",
+        });
+      }
+      const authorization = new Headers(init?.headers).get("Authorization");
+      if (authorization !== "Bearer dummy-fresh-access-token") {
+        return Response.json({ message: "expired" }, { status: 401 });
+      }
+      return path === "/api/jobs/taxonomy"
+        ? Response.json(taxonomy)
+        : Response.json(track);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await jobsApi.saveTrack(track);
+
+    const calls = fetchMock.mock.calls as unknown as Array<[string, RequestInit]>;
+    expect(calls.map(([path]) => path)).toEqual([
+      "/api/jobs/taxonomy",
+      "/auth/refresh",
+      "/api/jobs/taxonomy",
+      "/api/jobs/tracks",
+    ]);
+    expect(new Headers(calls[3][1].headers).get("Authorization")).toBe(
+      "Bearer dummy-fresh-access-token",
+    );
+    expect(new Headers(calls[3][1].headers).get("X-Bluey-Jobs-Taxonomy-SHA256")).toBe(
+      taxonomy.taxonomySha256,
+    );
   });
 
   it("sends the narrow owner confirmation for an uncertain submission", async () => {

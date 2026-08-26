@@ -10,6 +10,7 @@ import type {
 } from "../types";
 import { isJobPassed } from "./candidate-events";
 import { discoverySourceState } from "./discovery-source";
+import { isApprovedTrackPolicyAuthority } from "./track-policy-authority";
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1_000;
 
@@ -107,6 +108,14 @@ export function commandCenterSummary(
     Boolean(track.application_identity_id)
       && verifiedIdentityIds.has(track.application_identity_id ?? ""),
   );
+  const approvedPolicyTracks = identityBoundTracks.filter((track) => {
+    return isApprovedTrackPolicyAuthority(track.policy.authority, {
+      ...workspace.profile,
+      applicationIdentityId: track.application_identity_id,
+    });
+  });
+  const allActiveTracksApproved = activeTracks.length > 0
+    && approvedPolicyTracks.length === activeTracks.length;
   const unconfirmedFacts = workspace.facts.filter(
     (fact) => fact.verification_status !== "confirmed",
   );
@@ -144,12 +153,16 @@ export function commandCenterSummary(
     {
       id: "tracks",
       label: "Career Track setup",
-      detail: identityBoundTracks.length > 0
-        ? `${identityBoundTracks.length} active ${
-          identityBoundTracks.length === 1 ? "Track has" : "Tracks have"
-        } a verified identity binding. Canonical role, location, policy, and resume binding are not proven here.`
-        : "Create an active Track and bind it to a verified application identity.",
-      state: identityBoundTracks.length > 0 ? "reported" : "needs_action",
+      detail: allActiveTracksApproved
+        ? `${approvedPolicyTracks.length} active ${
+          approvedPolicyTracks.length === 1 ? "Track has" : "Tracks have"
+        } an approved canonical role, location, identity, preferences, and resume policy revision.`
+        : activeTracks.length > 0 && identityBoundTracks.length > 0
+          ? `${activeTracks.length - approvedPolicyTracks.length} of ${activeTracks.length} active ${
+            activeTracks.length === 1 ? "Track needs" : "Tracks need"
+          } canonical policy review before queue or Auto-submit.`
+          : "Create an active Track and bind it to a verified application identity.",
+      state: allActiveTracksApproved ? "ready" : "needs_action",
       href: commandCenterHref("/settings", previewSearch),
     },
     {

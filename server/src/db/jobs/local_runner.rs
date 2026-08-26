@@ -383,6 +383,7 @@ pub fn claim_authorized_local_run_ticket(
                 tx.commit()?;
                 return Ok(None);
             };
+            lock_discovery_account_shared_postgres(&mut tx, &account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx,
                 &account_id,

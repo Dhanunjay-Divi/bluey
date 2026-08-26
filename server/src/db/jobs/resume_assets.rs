@@ -145,12 +145,16 @@ fn save_resume_source_asset_internal(
             if let Some(authority) = upload_authority.as_ref() {
                 if let Some(current) = previous.as_ref().filter(|current| current.id == asset.id) {
                     if current != asset {
-                        return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict
-                            .into());
+                        return Err(
+                            crate::db::object_uploads::UploadControlError::IdempotencyConflict
+                                .into(),
+                        );
                     }
-                    let stored_profile = load_resume_profile_sqlite_tx(&tx, account_id)?
-                        .ok_or(crate::db::object_uploads::UploadControlError::IdempotencyConflict)?;
+                    let stored_profile = load_resume_profile_sqlite_tx(&tx, account_id)?.ok_or(
+                        crate::db::object_uploads::UploadControlError::IdempotencyConflict,
+                    )?;
                     validate_resume_profile_binding(&stored_profile, current)?;
+                    validate_current_resume_replay_semantic_ledger_sqlite(&tx, account_id)?;
                     tx.commit()?;
                     return Ok(ResumeSourcePublication {
                         previous: None,
@@ -162,18 +166,16 @@ fn save_resume_source_asset_internal(
                 if previous.as_ref().map(|current| current.id.as_str())
                     != authority.expected_previous.as_deref()
                 {
-                    return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict
-                        .into());
+                    return Err(
+                        crate::db::object_uploads::UploadControlError::IdempotencyConflict.into(),
+                    );
                 }
             }
             let current_profile = load_resume_profile_sqlite_tx(&tx, account_id)?;
             let committed_profile = match upload_authority.as_ref() {
-                Some(authority) => prepare_resume_profile(
-                    current_profile.as_ref(),
-                    &profile,
-                    asset,
-                    authority,
-                )?,
+                Some(authority) => {
+                    prepare_resume_profile(current_profile.as_ref(), &profile, asset, authority)?
+                }
                 None => profile.clone(),
             };
             let profile_json = to_json(&committed_profile, "Jobs profile")?;
@@ -233,10 +235,9 @@ fn save_resume_source_asset_internal(
                     asset.updated_at_ms,
                 )?;
                 if cleanup.is_none() {
-                    let adopted = legacy_resume_source_upload(account_id, previous, asset.updated_at_ms);
-                    crate::db::object_uploads::adopt_ready_account_object_sqlite_tx(
-                        &tx, &adopted,
-                    )?;
+                    let adopted =
+                        legacy_resume_source_upload(account_id, previous, asset.updated_at_ms);
+                    crate::db::object_uploads::adopt_ready_account_object_sqlite_tx(&tx, &adopted)?;
                     if crate::db::object_uploads::schedule_account_object_cleanup_sqlite_tx(
                         &tx,
                         account_id,
@@ -245,11 +246,20 @@ fn save_resume_source_asset_internal(
                     )?
                     .is_none()
                     {
-                        return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict
-                            .into());
+                        return Err(
+                            crate::db::object_uploads::UploadControlError::IdempotencyConflict
+                                .into(),
+                        );
                     }
                 }
             }
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "resume",
+                &asset.id,
+                asset.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(ResumeSourcePublication {
                 previous,
@@ -261,21 +271,29 @@ fn save_resume_source_asset_internal(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            // The discovery-account advisory lock is the outer policy-write fence. Within it,
+            // acquire the account's object-lifecycle write fence before any account child row.
+            // Account deletion takes the same parent row before cascading through children, so
+            // taking policy-input child locks first and later upgrading KEY SHARE to UPDATE can
+            // deadlock instead of producing one serialized publication-or-deletion outcome.
             let published_upload = if let Some(upload_id) = upload_id {
-                Some(crate::db::object_uploads::publish_account_object_postgres_tx(
-                    &mut tx,
-                    upload_id,
-                    account_id,
-                    &asset.storage_key,
-                    asset.updated_at_ms,
-                )?)
+                Some(
+                    crate::db::object_uploads::publish_account_object_postgres_tx(
+                        &mut tx,
+                        upload_id,
+                        account_id,
+                        &asset.storage_key,
+                        asset.updated_at_ms,
+                    )?,
+                )
             } else {
                 crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                    &mut tx,
-                    account_id,
+                    &mut tx, account_id,
                 )?;
                 None
             };
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let previous = tx
                 .query_opt(
                     "SELECT id, file_name, media_type, file_type, storage_key, sha256,
@@ -292,12 +310,17 @@ fn save_resume_source_asset_internal(
             if let Some(authority) = upload_authority.as_ref() {
                 if let Some(current) = previous.as_ref().filter(|current| current.id == asset.id) {
                     if current != asset {
-                        return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict
-                            .into());
+                        return Err(
+                            crate::db::object_uploads::UploadControlError::IdempotencyConflict
+                                .into(),
+                        );
                     }
                     let stored_profile = load_resume_profile_postgres_tx(&mut tx, account_id)?
-                        .ok_or(crate::db::object_uploads::UploadControlError::IdempotencyConflict)?;
+                        .ok_or(
+                            crate::db::object_uploads::UploadControlError::IdempotencyConflict,
+                        )?;
                     validate_resume_profile_binding(&stored_profile, current)?;
+                    validate_current_resume_replay_semantic_ledger_postgres(&mut tx, account_id)?;
                     tx.commit()?;
                     return Ok(ResumeSourcePublication {
                         previous: None,
@@ -309,18 +332,16 @@ fn save_resume_source_asset_internal(
                 if previous.as_ref().map(|current| current.id.as_str())
                     != authority.expected_previous.as_deref()
                 {
-                    return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict
-                        .into());
+                    return Err(
+                        crate::db::object_uploads::UploadControlError::IdempotencyConflict.into(),
+                    );
                 }
             }
             let current_profile = load_resume_profile_postgres_tx(&mut tx, account_id)?;
             let committed_profile = match upload_authority.as_ref() {
-                Some(authority) => prepare_resume_profile(
-                    current_profile.as_ref(),
-                    &profile,
-                    asset,
-                    authority,
-                )?,
+                Some(authority) => {
+                    prepare_resume_profile(current_profile.as_ref(), &profile, asset, authority)?
+                }
                 None => profile.clone(),
             };
             let profile_json = to_json(&committed_profile, "Jobs profile")?;
@@ -374,14 +395,16 @@ fn save_resume_source_asset_internal(
                 .as_ref()
                 .filter(|previous| previous.storage_key != asset.storage_key)
             {
-                let cleanup = crate::db::object_uploads::schedule_account_object_cleanup_postgres_tx(
-                    &mut tx,
-                    account_id,
-                    &previous.storage_key,
-                    asset.updated_at_ms,
-                )?;
+                let cleanup =
+                    crate::db::object_uploads::schedule_account_object_cleanup_postgres_tx(
+                        &mut tx,
+                        account_id,
+                        &previous.storage_key,
+                        asset.updated_at_ms,
+                    )?;
                 if cleanup.is_none() {
-                    let adopted = legacy_resume_source_upload(account_id, previous, asset.updated_at_ms);
+                    let adopted =
+                        legacy_resume_source_upload(account_id, previous, asset.updated_at_ms);
                     crate::db::object_uploads::adopt_ready_account_object_postgres_tx(
                         &mut tx, &adopted,
                     )?;
@@ -393,11 +416,20 @@ fn save_resume_source_asset_internal(
                     )?
                     .is_none()
                     {
-                        return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict
-                            .into());
+                        return Err(
+                            crate::db::object_uploads::UploadControlError::IdempotencyConflict
+                                .into(),
+                        );
                     }
                 }
             }
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "resume",
+                &asset.id,
+                asset.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(ResumeSourcePublication {
                 previous,
@@ -439,11 +471,7 @@ fn validate_resume_source_upload(
             }
             Some(value.clone())
         }
-        _ => {
-            return Err(
-                crate::db::object_uploads::UploadControlError::IdempotencyConflict.into(),
-            )
-        }
+        _ => return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict.into()),
     };
     let profile_mode = metadata
         .get("profile_mode")
@@ -467,11 +495,7 @@ fn validate_resume_source_upload(
             }
             Some(value.clone())
         }
-        _ => {
-            return Err(
-                crate::db::object_uploads::UploadControlError::IdempotencyConflict.into(),
-            )
-        }
+        _ => return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict.into()),
     };
     if (profile_mode == "replace" && requested_profile_sha256.is_none())
         || (profile_mode == "merge_source" && requested_profile_sha256.is_some())
@@ -481,11 +505,7 @@ fn validate_resume_source_upload(
     let expected_previous = match metadata.get("replaces_source_asset_id") {
         Some(Value::Null) => None,
         Some(Value::String(value)) if !value.is_empty() => Some(value.clone()),
-        _ => {
-            return Err(
-                crate::db::object_uploads::UploadControlError::IdempotencyConflict.into(),
-            )
-        }
+        _ => return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict.into()),
     };
     if metadata.len() != 12
         || metadata.get("artifact_class").and_then(Value::as_str) != Some("jobs_resume_source")
@@ -539,11 +559,7 @@ fn prepare_resume_profile(
             requested.clone()
         }
         "merge_source" => current.cloned().unwrap_or_else(|| requested.clone()),
-        _ => {
-            return Err(
-                crate::db::object_uploads::UploadControlError::IdempotencyConflict.into(),
-            )
-        }
+        _ => return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict.into()),
     };
     profile.source_resume_name = asset.file_name.clone();
     profile.source_resume_asset_id = asset.id.clone();
@@ -570,15 +586,48 @@ fn resume_requested_profile_sha256(profile: &CareerProfile) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(profile)?)))
 }
 
-fn validate_resume_profile_binding(profile: &CareerProfile, asset: &ResumeSourceAsset) -> Result<()> {
+fn validate_resume_profile_binding(
+    profile: &CareerProfile,
+    asset: &ResumeSourceAsset,
+) -> Result<()> {
     if profile.source_resume_asset_id != asset.id
         || profile.source_resume_name != asset.file_name
-        || !profile.source_resume_sha256.eq_ignore_ascii_case(&asset.sha256)
+        || !profile
+            .source_resume_sha256
+            .eq_ignore_ascii_case(&asset.sha256)
         || profile.source_resume_media_type != asset.media_type
         || profile.source_resume_template_status != asset.template_status
     {
         return Err(crate::db::object_uploads::UploadControlError::IdempotencyConflict.into());
     }
+    Ok(())
+}
+
+fn validate_current_resume_replay_semantic_ledger_sqlite(
+    conn: &rusqlite::Connection,
+    account_id: &str,
+) -> Result<()> {
+    let head = validate_account_input_head_sqlite(conn, account_id)
+        .context("validate exact resume replay semantic-input head")?;
+    let current_semantic_sha256 = account_semantic_sha256_sqlite(conn, account_id)?;
+    anyhow::ensure!(
+        head.semantic_sha256.as_deref() == Some(current_semantic_sha256.as_str()),
+        "account semantic-input generation is stale"
+    );
+    Ok(())
+}
+
+fn validate_current_resume_replay_semantic_ledger_postgres<C: postgres::GenericClient>(
+    client: &mut C,
+    account_id: &str,
+) -> Result<()> {
+    let head = validate_account_input_head_postgres(client, account_id)
+        .context("validate exact resume replay semantic-input head")?;
+    let current_semantic_sha256 = account_semantic_sha256_postgres(client, account_id)?;
+    anyhow::ensure!(
+        head.semantic_sha256.as_deref() == Some(current_semantic_sha256.as_str()),
+        "account semantic-input generation is stale"
+    );
     Ok(())
 }
 
@@ -593,7 +642,8 @@ fn load_resume_profile_sqlite_tx(
             |row| row.get::<_, String>(0),
         )
         .optional()?;
-    raw.map(|value| parse_json(value, "Jobs profile")).transpose()
+    raw.map(|value| parse_json(value, "Jobs profile"))
+        .transpose()
 }
 
 fn load_resume_profile_postgres_tx(
@@ -606,7 +656,8 @@ fn load_resume_profile_postgres_tx(
             &[&account_id],
         )?
         .map(|row| row.get::<_, String>(0));
-    raw.map(|value| parse_json(value, "Jobs profile")).transpose()
+    raw.map(|value| parse_json(value, "Jobs profile"))
+        .transpose()
 }
 
 fn legacy_resume_source_upload(
@@ -676,4 +727,136 @@ fn resume_source_asset_from_pg_row(row: postgres::Row) -> Result<ResumeSourceAss
         created_at_ms: row.try_get(9)?,
         updated_at_ms: row.try_get(10)?,
     })
+}
+
+#[cfg(test)]
+mod resume_assets_p3_tests {
+    use super::*;
+
+    #[test]
+    fn exact_resume_replay_requires_current_semantic_input_ledger() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-resume-replay-ledger-test-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).expect("open resume replay ledger test pool");
+        crate::db::run_migrations(&pool).expect("migrate resume replay ledger test pool");
+        pool.get()
+            .expect("resume replay ledger test connection")
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-resume-replay', 'resume-replay@example.com', 'hash', 0)",
+                [],
+            )
+            .expect("insert resume replay ledger test account");
+
+        let mut requested_profile = default_profile("resume-replay@example.com");
+        requested_profile.headline = "Original profile".to_string();
+        requested_profile.onboarding_complete = true;
+        let requested_profile_sha256 =
+            resume_requested_profile_sha256(&requested_profile).expect("hash requested profile");
+        let now = now_ms();
+        let asset_id = "resume-replay-ledger";
+        let logical_id = format!("jobs-resume-source:{asset_id}");
+        let object_key = format!("accounts/acct-resume-replay/jobs/resume-sources/{asset_id}.pdf");
+        let reservation = crate::db::object_uploads::reserve_account_object_upload(
+            &pool,
+            &crate::db::object_uploads::NewObjectUpload {
+                account_id: "acct-resume-replay".to_string(),
+                object_kind: crate::db::object_uploads::ObjectKind::Artifact,
+                logical_id: logical_id.clone(),
+                session_id: None,
+                storage_scope: crate::db::object_uploads::StorageScope::Artifact,
+                object_key: object_key.clone(),
+                size_bytes: 128,
+                sha256: "a".repeat(64),
+                content_type: "application/pdf".to_string(),
+                expires_at_ms: i64::MAX,
+                metadata_json: json!({
+                    "artifact_class": "jobs_resume_source",
+                    "jobs_resume_source_asset_id": asset_id,
+                    "request_id": asset_id,
+                    "profile_mode": "replace",
+                    "base_profile_sha256": null,
+                    "requested_profile_sha256": requested_profile_sha256,
+                    "replaces_source_asset_id": null,
+                    "file_name": "resume.pdf",
+                    "file_type": "pdf",
+                    "media_type": "application/pdf",
+                    "page_count": 2,
+                    "retention_policy": "account_lifetime_until_deletion",
+                }),
+                now_ms: now,
+                limits: crate::object_storage::UploadLimits {
+                    max_object_bytes: 1024 * 1024,
+                    max_account_bytes: 16 * 1024 * 1024,
+                    max_daily_bytes: 16 * 1024 * 1024,
+                    max_account_objects: 100,
+                },
+            },
+        )
+        .expect("reserve resume replay upload");
+        crate::db::object_uploads::begin_upload_put(&pool, &reservation.upload.id, now)
+            .expect("begin resume replay upload");
+        crate::db::object_uploads::release_verified_upload_put(&pool, &reservation.upload.id, now)
+            .expect("verify resume replay upload");
+        let asset = ResumeSourceAsset {
+            id: asset_id.to_string(),
+            file_name: "resume.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            file_type: "pdf".to_string(),
+            storage_key: object_key,
+            sha256: "a".repeat(64),
+            size_bytes: 128,
+            page_count: Some(2),
+            template_status: "converted_layout".to_string(),
+            created_at_ms: reservation.upload.created_at_ms,
+            updated_at_ms: reservation.upload.created_at_ms,
+        };
+
+        let first = publish_resume_source_asset(
+            &pool,
+            "acct-resume-replay",
+            &asset,
+            &requested_profile,
+            &reservation.upload.id,
+        )
+        .expect("publish source resume");
+        assert!(!first.replayed);
+        let replay = publish_resume_source_asset(
+            &pool,
+            "acct-resume-replay",
+            &asset,
+            &requested_profile,
+            &reservation.upload.id,
+        )
+        .expect("replay source resume against current ledger");
+        assert!(replay.replayed);
+
+        let mut tampered_profile = first.profile;
+        tampered_profile.headline = "Unrecorded semantic edit".to_string();
+        let tampered_payload =
+            to_json(&tampered_profile, "tampered resume replay profile").expect("serialize tamper");
+        pool.get()
+            .expect("tamper connection")
+            .execute(
+                "UPDATE jobs_profiles SET profile_json = ?2 WHERE account_id = ?1",
+                params!["acct-resume-replay", tampered_payload],
+            )
+            .expect("tamper profile without advancing its semantic ledger");
+
+        let error = publish_resume_source_asset(
+            &pool,
+            "acct-resume-replay",
+            &asset,
+            &requested_profile,
+            &reservation.upload.id,
+        )
+        .expect_err("exact replay must reject a stale semantic-input ledger");
+        assert!(
+            format!("{error:#}").contains("account semantic-input generation is stale"),
+            "unexpected exact replay error: {error:#}"
+        );
+    }
 }

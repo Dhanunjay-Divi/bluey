@@ -1,4 +1,48 @@
 import type { JobPosting, JobsWorkspace, ResumeVersion, UserJobInput } from "../types";
+import { canonicalSkillMatchesText, isCanonicalSkillValue } from "./canonical-taxonomy";
+
+/**
+ * Preview-only compatibility matching for free-form profile skills. The literal fallback never
+ * classifies a value into the canonical taxonomy and must not be used for policy decisions.
+ */
+export function previewProfileSkillMatchesText(text: string, skillValue: string): boolean {
+  if (canonicalSkillMatchesText(text, skillValue)) return true;
+  if (isCanonicalSkillValue(skillValue)) return false;
+  return customSkillLiteralMatchesText(text, skillValue);
+}
+
+function customSkillLiteralMatchesText(text: string, skillValue: string): boolean {
+  const haystack = text.toLowerCase();
+  const needle = skillValue.trim().toLowerCase();
+  if (!haystack || !needle) return false;
+
+  let fromIndex = 0;
+  while (fromIndex <= haystack.length - needle.length) {
+    const start = haystack.indexOf(needle, fromIndex);
+    if (start < 0) return false;
+    const end = start + needle.length;
+    if (hasCustomSkillBoundaries(haystack, start, end)) return true;
+    fromIndex = start + 1;
+  }
+  return false;
+}
+
+function hasCustomSkillBoundaries(value: string, start: number, end: number): boolean {
+  const before = value.slice(0, start).match(/.$/u)?.[0];
+  const after = value.slice(end).match(/^./u)?.[0];
+  return !isCustomSkillWordCharacter(before)
+    && !isCustomSkillWordCharacter(after)
+    && !isCustomSkillSymbolContinuation(before)
+    && !isCustomSkillSymbolContinuation(after);
+}
+
+function isCustomSkillWordCharacter(value: string | undefined): boolean {
+  return value !== undefined && /^[\p{L}\p{N}_]$/u.test(value);
+}
+
+function isCustomSkillSymbolContinuation(value: string | undefined): boolean {
+  return value === "#" || value === "+";
+}
 
 export function previewPosting(input: UserJobInput): JobPosting {
   const now = Date.now();
@@ -56,8 +100,10 @@ export function previewResume(
   const track = workspace.tracks.find((item) => item.id === job.track_id);
   const applicationIdentity = workspace.application_identities.find((item) => item.id === track?.application_identity_id)
     || workspace.application_identities.find((item) => item.is_default && item.verification_status === "verified");
-  const normalizedDescription = job.description.toLowerCase();
-  const matchedSkills = workspace.profile.skills.filter((skill) => normalizedDescription.includes(skill.toLowerCase())).slice(0, 3);
+  const postingSkillText = `${job.title}\n${job.description}`;
+  const matchedSkills = workspace.profile.skills
+    .filter((skill) => previewProfileSkillMatchesText(postingSkillText, skill))
+    .slice(0, 3);
   const summary = mode === "enhance" && workspace.profile.summary.trim() && matchedSkills.length
     ? `${/[.!?]$/.test(workspace.profile.summary.trim()) ? workspace.profile.summary.trim() : `${workspace.profile.summary.trim()}.`} Relevant strengths include ${matchedSkills.join(", ")}.`
     : workspace.profile.summary;

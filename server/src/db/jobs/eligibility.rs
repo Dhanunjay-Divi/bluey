@@ -555,6 +555,13 @@ fn build_job_eligibility(
     let mut hard_failures = Vec::new();
     let mut review_reasons = Vec::new();
     let mut passed_checks = Vec::new();
+    let mut track_policy_ready = false;
+    let mut role_match_proven = false;
+    let mut location_match_proven = false;
+    let mut employment_type_match_proven = preferences.employment_types.is_empty();
+    let mut engagement_type_match_proven = preferences.engagement_types.is_empty();
+    let mut track_employment_type_match_proven = true;
+    let mut track_engagement_type_match_proven = true;
     let experience_evidence = role_experience_evidence(profile, track, posting);
     let experience_requirement = experience_requirement(posting);
 
@@ -577,24 +584,55 @@ fn build_job_eligibility(
         Some(track) => {
             passed_checks.push("career_track_active".to_string());
             passed_checks.push("application_identity_bound".to_string());
-            let posting_family = posting_role_family(posting);
-            if posting_family != ROLE_FAMILY_GENERIC
-                && experience_evidence.role_family != ROLE_FAMILY_GENERIC
-                && posting_family != experience_evidence.role_family
-            {
+            let authority = &track.policy.authority;
+            let preferences_sha256 = job_preferences_policy_sha256(preferences).ok();
+            track_policy_ready = authority.review_state == "approved"
+                && authority.taxonomy_version == crate::jobs_taxonomy::taxonomy_version()
+                && authority.taxonomy_sha256 == crate::jobs_taxonomy::taxonomy_sha256()
+                && authority.source_resume_asset_id == profile.source_resume_asset_id
+                && authority.source_resume_sha256 == profile.source_resume_sha256
+                && preferences_sha256.as_deref() == Some(authority.job_preferences_sha256.as_str());
+            if track_policy_ready {
+                passed_checks.push("career_track_policy_current".to_string());
+            } else {
                 push_reason(
-                    &mut hard_failures,
-                    "role_family_mismatch",
-                    "This role belongs to a different Career Track.",
+                    &mut review_reasons,
+                    "career_track_policy_review_required",
+                    "Review this Career Track after any role, location, identity, resume, or Jobs setting changes before a runner can use it.",
                 );
-            } else if posting.track_id != track.id {
+            }
+            if posting.track_id != track.id {
                 push_reason(
                     &mut hard_failures,
                     "career_track_binding_changed",
                     "This job is not bound to the selected Career Track.",
                 );
             } else {
-                passed_checks.push("role_family_aligned".to_string());
+                match crate::jobs_taxonomy::classify_posting_role(&posting.title) {
+                    crate::jobs_taxonomy::PostingRoleClassification::Known {
+                        family_id, ..
+                    } if experience_evidence.role_family != ROLE_FAMILY_GENERIC
+                        && family_id != experience_evidence.role_family =>
+                    {
+                        push_reason(
+                            &mut hard_failures,
+                            "role_family_mismatch",
+                            "This role belongs to a different Career Track.",
+                        );
+                    }
+                    crate::jobs_taxonomy::PostingRoleClassification::Known { .. } => {
+                        role_match_proven = true;
+                        passed_checks.push("role_family_aligned".to_string());
+                    }
+                    crate::jobs_taxonomy::PostingRoleClassification::Ambiguous { .. }
+                    | crate::jobs_taxonomy::PostingRoleClassification::Unknown { .. } => {
+                        push_reason(
+                            &mut review_reasons,
+                            "posting_role_review_required",
+                            "Bluey could not prove this posting belongs to the selected canonical role family.",
+                        );
+                    }
+                }
             }
         }
     }
@@ -684,32 +722,43 @@ fn build_job_eligibility(
         }
     }
 
-    if let Some(reason) = location_failure(posting, profile, preferences) {
-        if preferences.location_policy == "ask" {
+    match canonical_location_decision(posting, profile, preferences, track) {
+        CanonicalLocationDecision::Allowed => {
+            location_match_proven = true;
+            passed_checks.push("location_allowed".to_string());
+        }
+        CanonicalLocationDecision::Denied(reason) if preferences.location_policy == "ask" => {
             push_reason(&mut review_reasons, "location_needs_confirmation", &reason);
-        } else {
+        }
+        CanonicalLocationDecision::Denied(reason) => {
             push_reason(&mut hard_failures, "location_mismatch", &reason);
         }
-    } else {
-        passed_checks.push("location_allowed".to_string());
+        CanonicalLocationDecision::ReviewRequired(reason) => {
+            push_reason(
+                &mut review_reasons,
+                "location_taxonomy_review_required",
+                &reason,
+            );
+        }
     }
 
     if !preferences.employment_types.is_empty() {
         match candidate_employment_type(posting) {
-            Some(kind)
+            CandidateCategoryClassification::Known(kind)
                 if preferences
                     .employment_types
                     .iter()
                     .any(|allowed| normalize_candidate_employment_type(allowed) == Some(kind)) =>
             {
+                employment_type_match_proven = true;
                 passed_checks.push("employment_type_allowed".to_string());
             }
-            Some(_) => push_reason(
+            CandidateCategoryClassification::Known(_) => push_reason(
                 &mut hard_failures,
                 "employment_type_mismatch",
                 "This job uses an employment type you did not select.",
             ),
-            None => push_reason(
+            CandidateCategoryClassification::Unknown(_) => push_reason(
                 &mut review_reasons,
                 "employment_type_unverified",
                 "Bluey must confirm this job's employment type before Auto-submit.",
@@ -719,19 +768,20 @@ fn build_job_eligibility(
 
     if !preferences.engagement_types.is_empty() {
         match candidate_engagement_type(posting) {
-            Some(kind)
+            CandidateCategoryClassification::Known(kind)
                 if preferences.engagement_types.iter().any(|allowed| {
                     normalize_candidate_engagement_type(allowed) == Some(kind)
                 }) =>
             {
+                engagement_type_match_proven = true;
                 passed_checks.push("engagement_type_allowed".to_string());
             }
-            Some(_) => push_reason(
+            CandidateCategoryClassification::Known(_) => push_reason(
                 &mut hard_failures,
                 "engagement_type_mismatch",
                 "This job uses an engagement type you did not select.",
             ),
-            None => push_reason(
+            CandidateCategoryClassification::Unknown(_) => push_reason(
                 &mut review_reasons,
                 "engagement_type_unverified",
                 "Bluey must confirm whether this role is W2, C2C, 1099, or direct hire before Auto-submit.",
@@ -739,23 +789,49 @@ fn build_job_eligibility(
         }
     }
 
-    if let Some(reason) = track_employment_type_failure(posting, track) {
-        push_reason(
-            &mut hard_failures,
-            "track_employment_type_mismatch",
-            &reason,
-        );
-    } else if track.is_some() {
-        passed_checks.push("track_employment_type_allowed".to_string());
+    match track_employment_type_decision(posting, track) {
+        Some(CandidatePolicyFilterDecision::Allowed) => {
+            passed_checks.push("track_employment_type_allowed".to_string());
+        }
+        Some(CandidatePolicyFilterDecision::Mismatch(reason)) => {
+            track_employment_type_match_proven = false;
+            push_reason(
+                &mut hard_failures,
+                "track_employment_type_mismatch",
+                &reason,
+            );
+        }
+        Some(CandidatePolicyFilterDecision::ReviewRequired(reason)) => {
+            track_employment_type_match_proven = false;
+            push_reason(
+                &mut review_reasons,
+                "track_employment_type_unverified",
+                &reason,
+            );
+        }
+        None => {}
     }
-    if let Some(reason) = track_engagement_type_failure(posting, track) {
-        push_reason(
-            &mut hard_failures,
-            "track_engagement_type_mismatch",
-            &reason,
-        );
-    } else if track.is_some() {
-        passed_checks.push("track_engagement_type_allowed".to_string());
+    match track_engagement_type_decision(posting, track) {
+        Some(CandidatePolicyFilterDecision::Allowed) => {
+            passed_checks.push("track_engagement_type_allowed".to_string());
+        }
+        Some(CandidatePolicyFilterDecision::Mismatch(reason)) => {
+            track_engagement_type_match_proven = false;
+            push_reason(
+                &mut hard_failures,
+                "track_engagement_type_mismatch",
+                &reason,
+            );
+        }
+        Some(CandidatePolicyFilterDecision::ReviewRequired(reason)) => {
+            track_engagement_type_match_proven = false;
+            push_reason(
+                &mut review_reasons,
+                "track_engagement_type_unverified",
+                &reason,
+            );
+        }
+        None => {}
     }
     if let Some(reason) = track_work_authorization_failure(profile, posting, track) {
         push_reason(&mut hard_failures, "work_authorization_mismatch", &reason);
@@ -797,34 +873,36 @@ fn build_job_eligibility(
         );
     }
 
-    if preferences.sponsorship == "required" {
-        if clearly_blocks_sponsorship(posting) {
-            push_reason(
-                &mut hard_failures,
-                "sponsorship_unavailable",
-                "This job appears to reject sponsorship.",
-            );
-        } else if clearly_offers_sponsorship(posting) {
+    match preferences.sponsorship.as_str() {
+        "required" if clearly_blocks_sponsorship(posting) => push_reason(
+            &mut hard_failures,
+            "sponsorship_unavailable",
+            "This job appears to reject sponsorship.",
+        ),
+        "required" if clearly_offers_sponsorship(posting) => {
             passed_checks.push("sponsorship_available".to_string());
-        } else {
-            push_reason(
-                &mut review_reasons,
-                "sponsorship_needs_confirmation",
-                "Sponsorship support must be confirmed before Auto-submit.",
-            );
         }
-    } else if preferences.sponsorship == "ask" {
-        if clearly_offers_sponsorship(posting) {
+        "required" => push_reason(
+            &mut review_reasons,
+            "sponsorship_needs_confirmation",
+            "Sponsorship support must be confirmed before Auto-submit.",
+        ),
+        "ask" if clearly_offers_sponsorship(posting) => {
             passed_checks.push("sponsorship_available".to_string());
-        } else {
-            push_reason(
-                &mut review_reasons,
-                "sponsorship_answer_required",
-                "Confirm the sponsorship answer before Auto-submit.",
-            );
         }
-    } else {
-        passed_checks.push("sponsorship_policy_passed".to_string());
+        "ask" => push_reason(
+            &mut review_reasons,
+            "sponsorship_answer_required",
+            "Confirm the sponsorship answer before Auto-submit.",
+        ),
+        "not_required" | "any" => {
+            passed_checks.push("sponsorship_policy_passed".to_string());
+        }
+        _ => push_reason(
+            &mut hard_failures,
+            "sponsorship_policy_invalid",
+            "The saved sponsorship policy is invalid and must be reviewed.",
+        ),
     }
 
     let active_company_key = normalize_company_key(&posting.company);
@@ -921,6 +999,13 @@ fn build_job_eligibility(
         && discovery_gate.can_queue
         && hard_failures.is_empty()
         && queue_capable
+        && track_policy_ready
+        && role_match_proven
+        && location_match_proven
+        && employment_type_match_proven
+        && engagement_type_match_proven
+        && track_employment_type_match_proven
+        && track_engagement_type_match_proven
         && !live_verification_missing;
     let can_auto_submit = can_queue
         && capability == "certified"
@@ -1043,61 +1128,97 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn location_failure(
+enum CanonicalLocationDecision {
+    Allowed,
+    Denied(String),
+    ReviewRequired(String),
+}
+
+fn canonical_location_decision(
     posting: &JobPosting,
     profile: &CareerProfile,
     preferences: &JobPreferences,
-) -> Option<String> {
-    let workplace = format!("{} {}", posting.workplace, posting.location).to_ascii_lowercase();
-    let is_remote = workplace.contains("remote");
-    let is_hybrid = workplace.contains("hybrid");
-    let is_onsite = workplace.contains("on-site")
-        || workplace.contains("onsite")
-        || workplace.contains("on site");
-
-    if (preferences.location_policy == "remote_only"
-        || preferences.remote_preference == "remote_only")
-        && !is_remote
+    track: Option<&CareerTrack>,
+) -> CanonicalLocationDecision {
+    let workplace =
+        crate::jobs_taxonomy::classify_posting_workplace(&posting.workplace, &posting.location);
+    let workplace_kind = match workplace {
+        crate::jobs_taxonomy::WorkplaceClassification::Known { kind, .. } => kind,
+        crate::jobs_taxonomy::WorkplaceClassification::Unknown { .. } => {
+            return CanonicalLocationDecision::ReviewRequired(
+                "Bluey could not prove one unambiguous posting workplace type.".to_string(),
+            );
+        }
+    };
+    let remote_preference = track
+        .map(|track| track.remote_preference.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(preferences.remote_preference.as_str());
+    if !remote_preference.trim().is_empty()
+        && !matches!(
+            remote_preference,
+            "remote_only" | "remote_or_hybrid" | "hybrid_ok" | "onsite_ok" | "any"
+        )
     {
-        return Some("Your settings allow remote jobs only.".to_string());
-    }
-    if preferences.remote_preference == "remote_or_hybrid" && is_onsite && !is_hybrid {
-        return Some(
-            "Your settings allow remote or hybrid jobs, not on-site-only jobs.".to_string(),
+        return CanonicalLocationDecision::ReviewRequired(
+            "Bluey could not prove this Career Track's workplace preference.".to_string(),
         );
     }
 
-    if preferences.desired_locations.is_empty() || is_remote {
-        return None;
+    if (preferences.location_policy == "remote_only" || remote_preference == "remote_only")
+        && workplace_kind != crate::jobs_taxonomy::WorkplaceKind::Remote
+    {
+        return CanonicalLocationDecision::Denied(
+            "Your Career Track allows remote jobs only.".to_string(),
+        );
     }
-    let posting_location = normalized_location(&posting.location);
-    let mut allowed_locations = preferences.desired_locations.clone();
-    if preferences.location_policy == "local" && !profile.current_location.trim().is_empty() {
+    if remote_preference == "remote_or_hybrid"
+        && workplace_kind == crate::jobs_taxonomy::WorkplaceKind::Onsite
+    {
+        return CanonicalLocationDecision::Denied(
+            "Your Career Track allows remote or hybrid jobs, not on-site-only jobs.".to_string(),
+        );
+    }
+
+    let mut allowed_locations = track
+        .filter(|track| !track.locations.is_empty())
+        .map(|track| track.locations.clone())
+        .unwrap_or_else(|| preferences.desired_locations.clone());
+    if track.is_none()
+        && preferences.location_policy == "local"
+        && !profile.current_location.trim().is_empty()
+    {
         allowed_locations.push(profile.current_location.clone());
     }
-    let matches_location = allowed_locations.iter().any(|candidate| {
-        let candidate = normalized_location(candidate);
-        !candidate.is_empty()
-            && (posting_location.contains(&candidate) || candidate.contains(&posting_location))
-    });
-    (!matches_location).then(|| {
-        format!(
-            "{} is outside your selected job locations.",
-            if posting.location.trim().is_empty() {
-                "This location"
-            } else {
-                posting.location.trim()
-            }
-        )
-    })
-}
-
-fn normalized_location(value: &str) -> String {
-    value
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect()
+    match crate::jobs_taxonomy::geography_allows(
+        &posting.location,
+        &allowed_locations,
+        &posting.workplace,
+    ) {
+        crate::jobs_taxonomy::GeographyMatchDecision::Allowed { .. } => {
+            CanonicalLocationDecision::Allowed
+        }
+        crate::jobs_taxonomy::GeographyMatchDecision::Denied { .. } => {
+            CanonicalLocationDecision::Denied(format!(
+                "{} is outside your selected job locations.",
+                if posting.location.trim().is_empty() {
+                    "This location"
+                } else {
+                    posting.location.trim()
+                }
+            ))
+        }
+        crate::jobs_taxonomy::GeographyMatchDecision::ReviewRequired { .. } => {
+            CanonicalLocationDecision::ReviewRequired(format!(
+                "Bluey could not prove that {} belongs to this Career Track's typed geography.",
+                if posting.location.trim().is_empty() {
+                    "this posting location"
+                } else {
+                    posting.location.trim()
+                }
+            ))
+        }
+    }
 }
 
 fn eligibility_error_message(decision: &JobEligibilityDecision) -> String {
@@ -1265,11 +1386,8 @@ fn score_posting(
     let mut score = 25i64;
     let mut reasons = Vec::new();
     let mut missing = Vec::new();
-    let title = posting.title.to_lowercase();
-    let description = posting.description.to_lowercase();
-    let location = posting.location.to_lowercase();
 
-    let target_roles = track
+    let target_roles: Vec<_> = track
         .map(|value| vec![value.role.as_str()])
         .unwrap_or_else(|| {
             preferences
@@ -1277,44 +1395,69 @@ fn score_posting(
                 .iter()
                 .map(String::as_str)
                 .collect()
-        });
-    let role_text_matches = target_roles.iter().any(|role| {
-        let role = role.to_lowercase();
-        !role.trim().is_empty() && (title.contains(&role) || role.contains(&title))
-    });
-    let target_family = canonical_role_family(track, posting);
-    let posting_family = posting_role_family(posting);
-    if role_text_matches {
+        })
+        .into_iter()
+        .filter_map(
+            |role| match crate::jobs_taxonomy::resolve_target_role(role) {
+                crate::jobs_taxonomy::TargetRoleResolution::Known {
+                    role_id, family_id, ..
+                } => Some((role_id, family_id)),
+                crate::jobs_taxonomy::TargetRoleResolution::Ambiguous { .. }
+                | crate::jobs_taxonomy::TargetRoleResolution::CustomReview { .. } => None,
+            },
+        )
+        .collect();
+    let posting_role = crate::jobs_taxonomy::classify_posting_role(&posting.title);
+    let (exact_role_match, family_role_match, proven_role_mismatch) = match &posting_role {
+        crate::jobs_taxonomy::PostingRoleClassification::Known {
+            family_id,
+            matched_role_ids,
+            ..
+        } => (
+            target_roles
+                .iter()
+                .any(|(role_id, _)| matched_role_ids.contains(role_id)),
+            target_roles
+                .iter()
+                .any(|(_, target_family_id)| target_family_id == family_id),
+            !target_roles.is_empty()
+                && target_roles
+                    .iter()
+                    .all(|(_, target_family_id)| target_family_id != family_id),
+        ),
+        crate::jobs_taxonomy::PostingRoleClassification::Ambiguous { .. }
+        | crate::jobs_taxonomy::PostingRoleClassification::Unknown { .. } => (false, false, false),
+    };
+    if exact_role_match {
         score += 25;
         reasons.push("Role matches this Career Track".to_string());
-    } else if target_family == posting_family && target_family != ROLE_FAMILY_GENERIC {
+    } else if family_role_match {
         score += 15;
         reasons.push("Role family matches this Career Track".to_string());
-    } else if target_family != ROLE_FAMILY_GENERIC && posting_family != ROLE_FAMILY_GENERIC {
+    } else if proven_role_mismatch {
         score -= 20;
         missing.push("Role belongs to a different Career Track".to_string());
     }
 
+    let posting_skill_text = format!("{}\n{}", posting.title, posting.description);
     let matching_skills: Vec<String> = profile
         .skills
         .iter()
-        .filter(|skill| description.contains(&skill.to_lowercase()))
+        .filter(|skill| crate::jobs_taxonomy::skill_matches_text(&posting_skill_text, skill))
         .take(5)
         .cloned()
         .collect();
     if !matching_skills.is_empty() {
         score += (matching_skills.len() as i64 * 5).min(25);
         reasons.push(format!("Matches {} profile skills", matching_skills.len()));
-    } else if !profile.skills.is_empty() && !description.is_empty() {
+    } else if !profile.skills.is_empty() && !posting.description.is_empty() {
         missing.push("No direct skill overlap found yet".to_string());
     }
 
-    if preferences.desired_locations.iter().any(|candidate| {
-        let candidate = candidate.to_lowercase();
-        location.contains(&candidate) || candidate.contains(&location)
-    }) || (preferences.remote_preference.contains("remote")
-        && (posting.workplace.eq_ignore_ascii_case("remote") || location.contains("remote")))
-    {
+    if matches!(
+        canonical_location_decision(posting, profile, preferences, track),
+        CanonicalLocationDecision::Allowed
+    ) {
         score += 15;
         reasons.push("Location preference fits".to_string());
     }

@@ -14,6 +14,13 @@ fn build_profile_evidence_revision(
     let mut candidate_profile = profile.clone();
     candidate_profile.email.clear();
     candidate_profile.updated_at_ms = 0;
+    // Track timestamps and match counts are transport/derived projection data.
+    // They can advance during a semantic no-op read/write and must not revoke a
+    // prepared application's immutable candidate-evidence binding.
+    let mut candidate_track = track.clone();
+    candidate_track.match_count = 0;
+    candidate_track.created_at_ms = 0;
+    candidate_track.updated_at_ms = 0;
     let mut confirmed_facts = facts
         .iter()
         .filter(|fact| fact.verification_status == "confirmed")
@@ -25,7 +32,7 @@ fn build_profile_evidence_revision(
         "schema_version": JOBS_EVIDENCE_SCHEMA_VERSION,
         "profile": candidate_profile,
         "confirmed_facts": confirmed_facts,
-        "career_track": track,
+        "career_track": candidate_track,
         "application_identity": {
             "id": identity.id,
             "email": identity.email,

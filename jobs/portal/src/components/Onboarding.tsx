@@ -105,7 +105,7 @@ export function Onboarding({ workspace, error, onImportResume, onProgress, onCom
   const [pendingResume, setPendingResume] = useState<{ file: File; pageCount?: number }>();
   const [resumeStart, setResumeStart] = useState<"import" | "build">("import");
   const fileRef = useRef<HTMLInputElement>(null);
-  const trackId = useRef(workspace.tracks[0]?.id || "onboarding-primary-track");
+  const trackId = useRef(workspace.tracks[0]?.id || crypto.randomUUID());
 
   const progress = ((step + 1) / steps.length) * 100;
   const track = useMemo<CareerTrack>(

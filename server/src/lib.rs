@@ -29,6 +29,7 @@ pub mod jobs_mailbox_sync;
 pub mod jobs_managed_cloud_runtime;
 pub(crate) mod jobs_provider_auth;
 pub mod jobs_resume_template;
+pub mod jobs_taxonomy;
 pub mod jobs_workflow_cleanup;
 pub mod jobs_workflow_dispatch;
 pub mod mail;

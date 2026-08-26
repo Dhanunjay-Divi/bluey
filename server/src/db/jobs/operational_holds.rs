@@ -275,7 +275,10 @@ impl std::fmt::Debug for OperationalHoldState {
             .field("event_sha256", &self.event_sha256)
             .field("state", &self.state)
             .field("reason_code", &self.reason_code)
-            .field("reason_ref", &self.reason_ref.as_ref().map(|_| "[redacted]"))
+            .field(
+                "reason_ref",
+                &self.reason_ref.as_ref().map(|_| "[redacted]"),
+            )
             .field("recorded_by", &"[redacted]")
             .field("recorded_at_ms", &self.recorded_at_ms)
             .finish()
@@ -361,7 +364,10 @@ impl std::fmt::Debug for OperationalHoldBlock {
             .field("scope_kind", &self.scope_kind)
             .field("scope_id", &"[redacted]")
             .field("reason_code", &self.reason_code)
-            .field("reason_ref", &self.reason_ref.as_ref().map(|_| "[redacted]"))
+            .field(
+                "reason_ref",
+                &self.reason_ref.as_ref().map(|_| "[redacted]"),
+            )
             .field("head_revision", &self.head_revision)
             .finish()
     }
@@ -1167,9 +1173,8 @@ fn resolve_operational_hold_refs_sqlite(
         )
         .map_err(OperationalHoldError::from)?
         .map(|row| {
-            let event = validated_operational_hold_head_event(
-                row.map_err(OperationalHoldError::from)?,
-            )?;
+            let event =
+                validated_operational_hold_head_event(row.map_err(OperationalHoldError::from)?)?;
             Ok((
                 event.scope_id.clone(),
                 operational_hold_scope_ref(event.scope_kind, &event.scope_id)?,
@@ -1934,9 +1939,11 @@ pub(crate) fn validated_operational_hold_active_counts_sqlite(
     let rows = statement
         .query_map([], operational_hold_canonical_head_from_sqlite_row)
         .map_err(OperationalHoldError::from)?;
-    operational_hold_active_counts(rows.map(|row| {
-        validated_operational_hold_head_event(row.map_err(OperationalHoldError::from)?)
-    }))
+    operational_hold_active_counts(
+        rows.map(|row| {
+            validated_operational_hold_head_event(row.map_err(OperationalHoldError::from)?)
+        }),
+    )
 }
 
 pub(crate) fn validated_operational_hold_active_counts_postgres(
@@ -1960,9 +1967,9 @@ pub(crate) fn validated_operational_hold_active_counts_postgres(
         )
         .map_err(OperationalHoldError::from)?;
     operational_hold_active_counts(rows.into_iter().map(|row| {
-        validated_operational_hold_head_event(
-            operational_hold_canonical_head_from_postgres_row(row),
-        )
+        validated_operational_hold_head_event(operational_hold_canonical_head_from_postgres_row(
+            row,
+        ))
     }))
 }
 
@@ -2055,9 +2062,7 @@ pub(crate) fn evaluate_operational_capability_sqlite_tx(
         parameters.push(scope_kind.clone());
         parameters.push(scope_id.clone());
     }
-    let mut statement = tx
-        .prepare(&sql)
-        .map_err(OperationalHoldError::from)?;
+    let mut statement = tx.prepare(&sql).map_err(OperationalHoldError::from)?;
     let rows = statement
         .query_map(
             rusqlite::params_from_iter(parameters.iter()),
@@ -2065,9 +2070,8 @@ pub(crate) fn evaluate_operational_capability_sqlite_tx(
         )
         .map_err(OperationalHoldError::from)?;
     for row in rows {
-        let event = validated_operational_hold_head_event(
-            row.map_err(OperationalHoldError::from)?,
-        )?;
+        let event =
+            validated_operational_hold_head_event(row.map_err(OperationalHoldError::from)?)?;
         if event.transition == OperationalHoldTransition::Held
             && context.matches(event.scope_kind, &event.scope_id)
         {
@@ -2261,6 +2265,26 @@ fn add_application_context_values(
     }
     if let Some(region) = operational_region(&values.posting.location) {
         context.insert_scope(OperationalHoldScopeKind::Region, region)?;
+    }
+    if let crate::jobs_taxonomy::GeographyClassification::Known { normalized, .. } =
+        crate::jobs_taxonomy::normalize_geography(&values.posting.location)
+    {
+        for canonical_region in normalized.canonical_ids() {
+            context.insert_scope(OperationalHoldScopeKind::Region, &canonical_region)?;
+        }
+    }
+    if let crate::jobs_taxonomy::WorkplaceClassification::Known { kind, .. } =
+        crate::jobs_taxonomy::classify_posting_workplace(
+            &values.posting.workplace,
+            &values.posting.location,
+        )
+    {
+        let workplace_scope = match kind {
+            crate::jobs_taxonomy::WorkplaceKind::Remote => "workplace:remote",
+            crate::jobs_taxonomy::WorkplaceKind::Hybrid => "workplace:hybrid",
+            crate::jobs_taxonomy::WorkplaceKind::Onsite => "workplace:onsite",
+        };
+        context.insert_scope(OperationalHoldScopeKind::Region, workplace_scope)?;
     }
     let derived_ats_provider = operational_posting_ats_provider(values.posting);
     if let Some(application_json) = values.application_json {
@@ -2518,10 +2542,10 @@ pub(crate) fn operational_hold_context_for_application_postgres_tx(
         )
         .map_err(OperationalHoldError::from)?
     {
-        has_managed_curated_membership |=
-            source_row.get::<_, String>(1) == CURATED_DISCOVERY_PROVIDER
-                && source_row.get::<_, String>(2) == CURATED_DISCOVERY_SOURCE_KEY
-                && source_row.get::<_, String>(3).is_empty();
+        has_managed_curated_membership |= source_row.get::<_, String>(1)
+            == CURATED_DISCOVERY_PROVIDER
+            && source_row.get::<_, String>(2) == CURATED_DISCOVERY_SOURCE_KEY
+            && source_row.get::<_, String>(3).is_empty();
         context.insert_scope(
             OperationalHoldScopeKind::DiscoverySource,
             &source_row.get::<_, String>(0),
@@ -2660,10 +2684,10 @@ pub(crate) fn operational_hold_context_for_job_postgres_tx(
         )
         .map_err(OperationalHoldError::from)?
     {
-        has_managed_curated_membership |=
-            source_row.get::<_, String>(1) == CURATED_DISCOVERY_PROVIDER
-                && source_row.get::<_, String>(2) == CURATED_DISCOVERY_SOURCE_KEY
-                && source_row.get::<_, String>(3).is_empty();
+        has_managed_curated_membership |= source_row.get::<_, String>(1)
+            == CURATED_DISCOVERY_PROVIDER
+            && source_row.get::<_, String>(2) == CURATED_DISCOVERY_SOURCE_KEY
+            && source_row.get::<_, String>(3).is_empty();
         context.insert_scope(
             OperationalHoldScopeKind::DiscoverySource,
             &source_row.get::<_, String>(0),
@@ -2915,7 +2939,10 @@ mod operational_hold_tests {
             (OperationalHoldScopeKind::RunnerKind, "browser"),
             (OperationalHoldScopeKind::MailboxProvider, "imap"),
             (OperationalHoldScopeKind::AtsAdapter, "adapter with spaces"),
-            (OperationalHoldScopeKind::ModelProvider, "provider with spaces"),
+            (
+                OperationalHoldScopeKind::ModelProvider,
+                "provider with spaces",
+            ),
             (OperationalHoldScopeKind::Model, "model with spaces"),
             (OperationalHoldScopeKind::EmployerDomain, "not-a-domain"),
             (OperationalHoldScopeKind::Region, "person@example.test"),
@@ -3369,11 +3396,7 @@ mod operational_hold_tests {
             )
             .unwrap();
         assert!(matches!(
-            require_operational_capability(
-                &pool,
-                OperationalCapability::Generation,
-                &context,
-            ),
+            require_operational_capability(&pool, OperationalCapability::Generation, &context,),
             Err(OperationalHoldError::Storage(_))
         ));
         assert!(crate::db::metrics::jobs_readiness_snapshot(&pool).is_err());
@@ -3665,11 +3688,12 @@ mod operational_hold_tests {
 
     #[test]
     fn application_context_uses_employer_identity_and_exact_ats_authority() {
-        let posting = operational_posting(
+        let mut posting = operational_posting(
             "Acme Incorporated",
             "curated_feed",
             "https://boards.greenhouse.io/acme/jobs/123",
         );
+        posting.location = "New York, NY".to_string();
         let mut context = OperationalHoldContext::new();
         add_application_context_values(
             &mut context,
@@ -3697,6 +3721,14 @@ mod operational_hold_tests {
         ));
         assert!(context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
         assert!(!context.matches(OperationalHoldScopeKind::AtsProvider, "curated_feed"));
+        assert!(context.matches(OperationalHoldScopeKind::Region, "new york, ny"));
+        assert!(context.matches(OperationalHoldScopeKind::Region, "country:us"));
+        assert!(context.matches(OperationalHoldScopeKind::Region, "subdivision:us-ny"));
+        assert!(context.matches(
+            OperationalHoldScopeKind::Region,
+            "metro:us-ny-new-york-metro"
+        ));
+        assert!(context.matches(OperationalHoldScopeKind::Region, "city:us-ny-new-york"));
 
         let application = JobApplication {
             id: "application-operational".to_string(),
@@ -3738,6 +3770,52 @@ mod operational_hold_tests {
         .unwrap();
         assert!(certified_context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
         assert!(certified_context.matches(OperationalHoldScopeKind::AtsAdapter, "2026.07.1-beta.1"));
+    }
+
+    #[test]
+    fn application_context_uses_separate_typed_workplace_evidence() {
+        let mut posting = operational_posting(
+            "Acme Incorporated",
+            "curated_feed",
+            "https://boards.greenhouse.io/acme/jobs/remote-123",
+        );
+        posting.location = "United States".to_string();
+        posting.workplace = "remote".to_string();
+        let mut remote_context = OperationalHoldContext::new();
+        add_application_context_values(
+            &mut remote_context,
+            OperationalApplicationContextValues {
+                account_id: "acct-operational",
+                posting: &posting,
+                application_json: None,
+                runner_kind: None,
+                model_provider: None,
+                model: None,
+            },
+        )
+        .unwrap();
+        assert!(remote_context.matches(OperationalHoldScopeKind::Region, "country:us"));
+        assert!(remote_context.matches(OperationalHoldScopeKind::Region, "workplace:remote"));
+
+        for unsupported in ["not remote", "remote or hybrid"] {
+            posting.workplace = unsupported.to_string();
+            let mut context = OperationalHoldContext::new();
+            add_application_context_values(
+                &mut context,
+                OperationalApplicationContextValues {
+                    account_id: "acct-operational",
+                    posting: &posting,
+                    application_json: None,
+                    runner_kind: None,
+                    model_provider: None,
+                    model: None,
+                },
+            )
+            .unwrap();
+            assert!(context.matches(OperationalHoldScopeKind::Region, "country:us"));
+            assert!(!context.matches(OperationalHoldScopeKind::Region, "workplace:remote"));
+            assert!(!context.matches(OperationalHoldScopeKind::Region, "workplace:hybrid"));
+        }
     }
 
     #[test]

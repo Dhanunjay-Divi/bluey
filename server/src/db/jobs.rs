@@ -403,7 +403,7 @@ pub struct JobPreferences {
     pub desired_locations: Vec<String>,
     #[serde(default = "default_location_policy")]
     pub location_policy: String,
-    #[serde(default)]
+    #[serde(default = "default_remote_preference")]
     pub remote_preference: String,
     #[serde(default)]
     pub employment_types: Vec<String>,
@@ -411,7 +411,7 @@ pub struct JobPreferences {
     pub engagement_types: Vec<String>,
     #[serde(default)]
     pub minimum_compensation: Option<i64>,
-    #[serde(default)]
+    #[serde(default = "default_sponsorship_policy")]
     pub sponsorship: String,
     #[serde(default)]
     pub excluded_companies: Vec<String>,
@@ -435,11 +435,11 @@ impl Default for JobPreferences {
             desired_roles: Vec::new(),
             desired_locations: Vec::new(),
             location_policy: default_location_policy(),
-            remote_preference: "hybrid_ok".to_string(),
+            remote_preference: default_remote_preference(),
             employment_types: vec!["full_time".to_string()],
             engagement_types: Vec::new(),
             minimum_compensation: None,
-            sponsorship: "ask".to_string(),
+            sponsorship: default_sponsorship_policy(),
             excluded_companies: Vec::new(),
             excluded_titles: Vec::new(),
             daily_limit: default_daily_limit(),
@@ -447,6 +447,105 @@ impl Default for JobPreferences {
             max_posting_age_days: default_max_posting_age_days(),
             time_zone_offset_minutes: 0,
             updated_at_ms: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CareerTrackPolicyAuthority {
+    #[serde(default)]
+    pub taxonomy_version: String,
+    #[serde(default)]
+    pub taxonomy_sha256: String,
+    #[serde(default)]
+    pub taxonomy_activation_epoch: i64,
+    #[serde(default)]
+    pub canonicalizer_schema_version: i64,
+    #[serde(default)]
+    pub canonicalizer_sha256: String,
+    #[serde(default)]
+    pub account_input_generation: i64,
+    #[serde(default)]
+    pub account_input_transition_sha256: String,
+    #[serde(default)]
+    pub account_input_semantic_sha256: String,
+    #[serde(default)]
+    pub track_input_generation: i64,
+    #[serde(default)]
+    pub track_input_transition_sha256: String,
+    #[serde(default)]
+    pub track_semantic_sha256: String,
+    #[serde(default)]
+    pub canonical_role_id: String,
+    #[serde(default)]
+    pub canonical_role_family_id: String,
+    #[serde(default)]
+    pub canonical_location_ids: Vec<String>,
+    #[serde(default)]
+    pub source_resume_asset_id: String,
+    #[serde(default)]
+    pub source_resume_sha256: String,
+    #[serde(default)]
+    pub application_identity_id: String,
+    #[serde(default)]
+    pub application_identity_sha256: String,
+    #[serde(default)]
+    pub job_preferences_sha256: String,
+    #[serde(default)]
+    pub policy_revision_id: String,
+    #[serde(default)]
+    pub policy_revision_no: i64,
+    #[serde(default)]
+    pub canonical_policy_sha256: String,
+    #[serde(default)]
+    pub policy_head_generation: i64,
+    #[serde(default)]
+    pub policy_head_transition_sha256: String,
+    #[serde(default)]
+    pub policy_review_receipt_id: String,
+    #[serde(default)]
+    pub policy_review_receipt_sha256: String,
+    #[serde(default = "default_track_policy_review_state")]
+    pub review_state: String,
+    #[serde(default)]
+    pub review_reason_codes: Vec<String>,
+}
+
+fn default_track_policy_review_state() -> String {
+    "legacy_unreviewed".to_string()
+}
+
+impl Default for CareerTrackPolicyAuthority {
+    fn default() -> Self {
+        Self {
+            taxonomy_version: String::new(),
+            taxonomy_sha256: String::new(),
+            taxonomy_activation_epoch: 0,
+            canonicalizer_schema_version: 0,
+            canonicalizer_sha256: String::new(),
+            account_input_generation: 0,
+            account_input_transition_sha256: String::new(),
+            account_input_semantic_sha256: String::new(),
+            track_input_generation: 0,
+            track_input_transition_sha256: String::new(),
+            track_semantic_sha256: String::new(),
+            canonical_role_id: String::new(),
+            canonical_role_family_id: String::new(),
+            canonical_location_ids: Vec::new(),
+            source_resume_asset_id: String::new(),
+            source_resume_sha256: String::new(),
+            application_identity_id: String::new(),
+            application_identity_sha256: String::new(),
+            job_preferences_sha256: String::new(),
+            policy_revision_id: String::new(),
+            policy_revision_no: 0,
+            canonical_policy_sha256: String::new(),
+            policy_head_generation: 0,
+            policy_head_transition_sha256: String::new(),
+            policy_review_receipt_id: String::new(),
+            policy_review_receipt_sha256: String::new(),
+            review_state: default_track_policy_review_state(),
+            review_reason_codes: Vec::new(),
         }
     }
 }
@@ -463,6 +562,8 @@ pub struct CareerTrackPolicy {
     pub engagement_types: Vec<String>,
     #[serde(default)]
     pub work_authorizations: Vec<String>,
+    #[serde(default)]
+    pub authority: CareerTrackPolicyAuthority,
 }
 
 impl Default for CareerTrackPolicy {
@@ -473,6 +574,7 @@ impl Default for CareerTrackPolicy {
             employment_types: vec!["full_time".to_string()],
             engagement_types: Vec::new(),
             work_authorizations: Vec::new(),
+            authority: CareerTrackPolicyAuthority::default(),
         }
     }
 }
@@ -1878,6 +1980,7 @@ pub struct JobsWorkspace {
 #[derive(Debug, Clone, Serialize)]
 pub struct JobsAccountExport {
     pub workspace: JobsWorkspace,
+    pub canonical_track_policy_ledger: CanonicalTrackPolicyLedgerExport,
     pub resume_versions: Vec<ResumeVersion>,
     pub attempt_reservations: Vec<AttemptReservation>,
     pub run_events: Vec<RunEvent>,
@@ -1929,6 +2032,14 @@ fn default_max_posting_age_days() -> i64 {
 }
 
 fn default_location_policy() -> String {
+    "ask".to_string()
+}
+
+fn default_remote_preference() -> String {
+    "hybrid_ok".to_string()
+}
+
+fn default_sponsorship_policy() -> String {
     "ask".to_string()
 }
 
@@ -2169,6 +2280,7 @@ fn parse_json_lossy<T: DeserializeOwned>(raw: &str) -> Option<T> {
 }
 
 include!("jobs/candidate_policy.rs");
+include!("jobs/taxonomy_policy.rs");
 include!("jobs/resume_truth.rs");
 include!("jobs/evidence.rs");
 include!("jobs/profile_postings.rs");

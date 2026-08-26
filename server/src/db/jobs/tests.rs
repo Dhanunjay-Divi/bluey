@@ -50,6 +50,52 @@ mod tests {
         pool
     }
 
+    fn execution_policy_fixture(
+        pool: &DbPool,
+        account_id: &str,
+        email: &str,
+        track_id: &str,
+    ) -> (CareerProfile, JobPreferences) {
+        let now = now_ms();
+        let source = get_resume_source_asset(pool, account_id)
+            .unwrap()
+            .unwrap_or_else(|| ResumeSourceAsset {
+                id: format!("resume-source-{account_id}"),
+                file_name: "fixture-source-resume.pdf".to_string(),
+                media_type: "application/pdf".to_string(),
+                file_type: "pdf".to_string(),
+                storage_key: format!("accounts/{account_id}/jobs/fixture-source-resume.pdf"),
+                sha256: "e".repeat(64),
+                size_bytes: 1_024,
+                page_count: Some(1),
+                template_status: "converted_layout".to_string(),
+                created_at_ms: now,
+                updated_at_ms: now,
+            });
+        let mut profile = default_profile(email);
+        profile.onboarding_complete = true;
+        profile.source_resume_name = source.file_name.clone();
+        profile.source_resume_asset_id = source.id.clone();
+        profile.source_resume_sha256 = source.sha256.clone();
+        profile.source_resume_media_type = source.media_type.clone();
+        profile.source_resume_template_status = source.template_status.clone();
+        let (_, profile) = save_resume_source_asset(pool, account_id, &source, &profile).unwrap();
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let preferences = save_preferences(pool, account_id, &preferences).unwrap();
+        let track = list_tracks(pool, account_id)
+            .unwrap()
+            .into_iter()
+            .find(|track| track.id == track_id)
+            .expect("execution fixture Career Track exists");
+        let track = upsert_track(pool, account_id, &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert!(track.policy.authority.policy_revision_no > 0);
+        (profile, preferences)
+    }
+
     fn append_account_operational_hold(
         pool: &DbPool,
         capability: OperationalCapability,
@@ -357,7 +403,8 @@ mod tests {
         require_live_verification: bool,
     ) -> JobEligibilityDecision {
         let profile = default_profile("jobs@example.com");
-        let track = CareerTrack {
+        let preferences = JobPreferences::default();
+        let mut track = CareerTrack {
             id: "track-default".to_string(),
             name: "Software engineering".to_string(),
             role: "Software Engineer".to_string(),
@@ -373,10 +420,17 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         };
+        track.policy.authority.review_state = "approved".to_string();
+        track.policy.authority.taxonomy_version = crate::jobs_taxonomy::taxonomy_version().into();
+        track.policy.authority.taxonomy_sha256 = crate::jobs_taxonomy::taxonomy_sha256();
+        track.policy.authority.source_resume_asset_id = profile.source_resume_asset_id.clone();
+        track.policy.authority.source_resume_sha256 = profile.source_resume_sha256.clone();
+        track.policy.authority.job_preferences_sha256 =
+            job_preferences_policy_sha256(&preferences).expect("canonical test preferences");
         build_job_eligibility(
             posting,
             &profile,
-            &JobPreferences::default(),
+            &preferences,
             &[],
             require_live_verification,
             None,
@@ -389,6 +443,72 @@ mod tests {
         assert_eq!(
             DISCOVERY_ACCOUNT_LOCK_SQL,
             "SELECT pg_advisory_xact_lock(hashtextextended('jobs-discovery-account:' || $1, 0))"
+        );
+    }
+
+    #[test]
+    fn postgres_auto_submit_execution_and_revocation_share_one_lock_order() {
+        fn assert_ordered(source: &str, needles: &[&str], label: &str) {
+            let mut previous = 0;
+            for needle in needles {
+                let position = source
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("missing {needle:?} in {label}"));
+                assert!(position >= previous, "{label} lock order is inverted");
+                previous = position;
+            }
+        }
+
+        let execution = include_str!("execution_authority.rs")
+            .split("fn current_execution_authorized_postgres(")
+            .nth(1)
+            .expect("PostgreSQL execution authority implementation")
+            .split("fn current_execution_authority_matches(")
+            .next()
+            .expect("bounded PostgreSQL execution authority implementation");
+        assert_ordered(
+            execution,
+            &[
+                "lock_discovery_account_shared_postgres(tx, account_id)",
+                "lock_account_policy_inputs_postgres(tx, account_id, false)",
+                "lock_auto_submit_authority_postgres(tx, account_id, &track.id, false)",
+            ],
+            "PostgreSQL Auto-submit execution validation",
+        );
+        let authorization_query = execution
+            .split("let auto_submit_authorization =")
+            .nth(1)
+            .expect("bounded PostgreSQL active Auto-submit authority query")
+            .split("let preferences =")
+            .next()
+            .expect("bounded PostgreSQL active Auto-submit authority query");
+        assert_ordered(
+            authorization_query,
+            &["FROM jobs_auto_submit_authorizations", "FOR SHARE"],
+            "PostgreSQL active Auto-submit authority row lock",
+        );
+
+        let revoke = include_str!("auto_submit.rs")
+            .split("pub fn revoke_auto_submit(")
+            .nth(1)
+            .expect("Auto-submit revocation implementation")
+            .split("pub fn require_valid_auto_submit_authorization(")
+            .next()
+            .expect("bounded Auto-submit revocation implementation")
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL Auto-submit revocation implementation");
+        assert_ordered(
+            revoke,
+            &[
+                "let mut tx = conn.transaction()?",
+                "lock_discovery_account_shared_postgres(&mut tx, account_id)",
+                "lock_account_policy_inputs_postgres(&mut tx, account_id, false)",
+                "lock_auto_submit_authority_postgres(&mut tx, account_id, track_id, true)",
+                "UPDATE jobs_auto_submit_authorizations",
+                "tx.commit()?",
+            ],
+            "PostgreSQL Auto-submit revocation",
         );
     }
 
@@ -427,6 +547,12 @@ mod tests {
         let ticket = submit
             .find("postgres_local_run_authority")
             .expect("ticket authority before registry lock");
+        let discovery_lock = submit
+            .find("lock_discovery_account_shared_postgres(&mut tx, &account_id)")
+            .expect("shared discovery-account lock");
+        let account_fence = submit
+            .find("require_active_account_write_fence_postgres_tx")
+            .expect("active account write fence");
         let shared_lock = submit
             .find("postgres_lock_browser_release_registry_shared(&mut tx)")
             .expect("shared registry lock");
@@ -436,6 +562,7 @@ mod tests {
         let capacity = submit
             .find("reserve_submission_evidence_capacity_postgres_tx")
             .expect("capacity reservation after release authority");
+        assert!(discovery_lock < account_fence && account_fence < ticket);
         assert!(ticket < shared_lock && shared_lock < release && release < capacity);
 
         let replay = submit_source
@@ -1275,11 +1402,72 @@ mod tests {
         profile.source_resume_template_status = first_asset.template_status.clone();
         let (_, profile) =
             save_resume_source_asset(&pool, "acct-jobs", &first_asset, &profile).unwrap();
+        let track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let track = upsert_track(&pool, "acct-jobs", &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert_eq!(track.policy.authority.policy_revision_no, 1);
 
         let authorization =
             authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").unwrap();
         assert_eq!(authorization.status, "active");
         assert_eq!(authorization.source_resume_asset_id, first_asset.id);
+
+        let mut changed_preferences = get_preferences(&pool, "acct-jobs").unwrap();
+        changed_preferences
+            .excluded_titles
+            .push("Staffing-only role".to_string());
+        save_preferences(&pool, "acct-jobs", &changed_preferences).unwrap();
+        let changed_policy =
+            list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(changed_policy[0].status, "needs_review");
+        assert!(
+            authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").is_err()
+        );
+        let changed_track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        assert_eq!(changed_track.policy.authority.review_state, "needs_review");
+        let changed_track = upsert_track(&pool, "acct-jobs", &changed_track).unwrap();
+        assert_eq!(changed_track.policy.authority.review_state, "approved");
+        assert_eq!(changed_track.policy.authority.policy_revision_no, 2);
+        let conn = pool.get().unwrap();
+        let (compatibility, review_state): (String, String) = conn
+            .query_row(
+                "SELECT compatibility_classification, review_state
+                   FROM jobs_track_policy_revisions
+                  WHERE account_id = ?1 AND career_track_id = ?2 AND revision_no = 2",
+                rusqlite::params!["acct-jobs", "track-default"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(compatibility, "review_required");
+        assert_eq!(review_state, "approved");
+        let approved_receipts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_track_policy_review_receipts
+                  WHERE account_id = ?1 AND career_track_id = ?2
+                    AND policy_revision_no = 2 AND decision = 'approved'",
+                rusqlite::params!["acct-jobs", "track-default"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(approved_receipts, 1);
+        drop(conn);
+        let same_track = upsert_track(&pool, "acct-jobs", &changed_track).unwrap();
+        assert_eq!(same_track.policy.authority.policy_revision_no, 2);
+        let revision_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_track_policy_revisions
+                  WHERE account_id = ?1 AND career_track_id = ?2",
+                rusqlite::params!["acct-jobs", "track-default"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_count, 2, "no-op policy saves must reuse the head");
+        let reauthorized =
+            authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").unwrap();
+        assert_eq!(reauthorized.status, "active");
+        assert_eq!(reauthorized.revision_no, authorization.revision_no + 1);
 
         let replacement_asset = ResumeSourceAsset {
             id: "resume-source-two".to_string(),
@@ -1957,13 +2145,8 @@ mod tests {
     }
 
     fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
-        let profile = default_profile("jobs@example.com");
-        save_profile(pool, "acct-jobs", &profile).unwrap();
-        let preferences = JobPreferences {
-            sponsorship: "not_required".to_string(),
-            ..JobPreferences::default()
-        };
-        save_preferences(pool, "acct-jobs", &preferences).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
         let posting = upsert_posting(
             pool,
             "acct-jobs",
@@ -2331,8 +2514,10 @@ mod tests {
         let identity = get_application_identity(pool, "acct-jobs", &identity_id)
             .unwrap()
             .expect("certified application identity row");
+        let preferences = get_preferences(pool, "acct-jobs").unwrap();
         let authorization_fingerprint =
-            auto_submit_authority_fingerprint(&profile, &facts, &track, &identity).unwrap();
+            auto_submit_authority_fingerprint(&profile, &facts, &track, &identity, &preferences)
+                .unwrap();
         let source_resume_asset_id = profile.source_resume_asset_id;
         pool.get()
             .unwrap()
@@ -3714,13 +3899,8 @@ mod tests {
         pool: &DbPool,
         suffix: &str,
     ) -> (JobApplication, String, String, String) {
-        let profile = default_profile("jobs@example.com");
-        save_profile(pool, "acct-jobs", &profile).unwrap();
-        let preferences = JobPreferences {
-            sponsorship: "not_required".to_string(),
-            ..JobPreferences::default()
-        };
-        save_preferences(pool, "acct-jobs", &preferences).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
         set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
         let posting = upsert_posting(
             pool,
@@ -6574,6 +6754,103 @@ mod tests {
         assert!(ensure_managed_curated_discovery_source(&pool, "acct-jobs")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn track_readback_uses_the_relational_activation_authority() {
+        let pool = test_pool();
+        let track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let mut stale_projection = track.clone();
+        stale_projection.active = true;
+        let stale_json = to_json(&stale_projection, "stale Career Track").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?2, active = 0 WHERE id = ?1",
+                params![track.id, stale_json],
+            )
+            .unwrap();
+
+        let projected = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        assert!(!projected.active);
+
+        let mut stale_projection = projected;
+        stale_projection.active = false;
+        let stale_json = to_json(&stale_projection, "stale Career Track").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?2, active = 1 WHERE id = ?1",
+                params![stale_projection.id, stale_json],
+            )
+            .unwrap();
+
+        assert!(list_tracks(&pool, "acct-jobs").unwrap().remove(0).active);
+    }
+
+    #[test]
+    fn track_id_collision_cannot_return_a_cross_account_phantom_save() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let existing = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+
+        let error = upsert_track(&pool, "acct-other", &existing).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already assigned to another account"));
+        assert!(list_tracks(&pool, "acct-other").unwrap().is_empty());
+        assert_eq!(list_tracks(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_track_creates_cannot_exceed_the_active_plan_limit() {
+        let pool = test_pool();
+        let template = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for index in 0..2 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            let mut track = template.clone();
+            track.id = format!("concurrent-track-{index}");
+            track.name = format!("Concurrent track {index}");
+            track.created_at_ms = 0;
+            track.updated_at_ms = 0;
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                upsert_track_with_limit(&pool, "acct-jobs", &track, 2)
+            }));
+        }
+        barrier.wait();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one concurrent create must lose the plan-limit race");
+        assert_eq!(
+            error.downcast_ref::<CareerTrackLimitExceeded>(),
+            Some(&CareerTrackLimitExceeded)
+        );
+        assert_eq!(
+            list_tracks(&pool, "acct-jobs")
+                .unwrap()
+                .into_iter()
+                .filter(|track| track.active)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -10489,6 +10766,85 @@ mod tests {
         let (second_application, second_run, second_profile) =
             execution_lease_fixture(&pool, "profile-second");
         assert_eq!(first_profile, second_profile);
+        let current_track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        assert_eq!(
+            first_application
+                .receipt
+                .pointer("/career_track_policy_authority"),
+            Some(&serde_json::to_value(&current_track.policy.authority).unwrap()),
+            "a second fixture must not mutate the first application's policy authority"
+        );
+        let first_posting = get_posting(&pool, "acct-jobs", &first_application.job_id)
+            .unwrap()
+            .unwrap();
+        let first_eligibility = evaluate_job_eligibility(
+            &pool,
+            "acct-jobs",
+            &first_posting,
+            true,
+            Some(&first_application.id),
+        )
+        .unwrap();
+        assert!(first_eligibility.can_queue_cloud, "{first_eligibility:#?}");
+        let current_profile = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        let current_facts = list_facts(&pool, "acct-jobs").unwrap();
+        let identity_id = first_application
+            .receipt
+            .pointer("/application_identity/id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let current_identity = get_application_identity(&pool, "acct-jobs", identity_id)
+            .unwrap()
+            .unwrap();
+        let experience =
+            role_experience_evidence(&current_profile, Some(&current_track), &first_posting);
+        let current_evidence = build_profile_evidence_revision(
+            "acct-jobs",
+            &current_profile,
+            &current_facts,
+            &current_track,
+            &current_identity,
+            &experience,
+        )
+        .unwrap();
+        assert_eq!(
+            first_application
+                .receipt
+                .pointer("/evidence_revision_id")
+                .and_then(Value::as_str),
+            Some(current_evidence.id.as_str()),
+            "a second fixture must not change the first application's evidence revision"
+        );
+        assert_eq!(
+            first_application
+                .receipt
+                .pointer("/evidence_content_hash")
+                .and_then(Value::as_str),
+            Some(current_evidence.content_hash.as_str()),
+            "a second fixture must not change the first application's evidence content"
+        );
+        let mut authority_conn = pool.get().unwrap();
+        let authority_tx = authority_conn.transaction().unwrap();
+        assert!(
+            stored_execution_evidence_matches_sqlite(
+                &authority_tx,
+                "acct-jobs",
+                &first_application,
+            )
+            .unwrap(),
+            "the first application must retain its immutable resume/evidence binding"
+        );
+        assert!(
+            current_execution_authorized_sqlite(
+                &authority_tx,
+                "acct-jobs",
+                &first_application,
+                ExecutionAuthorityRunner::Cloud,
+            )
+            .unwrap(),
+            "the first application must retain exact execution authority"
+        );
+        authority_tx.commit().unwrap();
         let first = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -10758,8 +11114,8 @@ mod tests {
     #[test]
     fn queueing_rechecks_that_a_recent_job_is_still_open() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
         let mut posting = upsert_posting(
             &pool,
             "acct-jobs",
@@ -10769,7 +11125,7 @@ mod tests {
                 now_ms() - 2 * DAY_MS,
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, _) =
@@ -10787,7 +11143,7 @@ mod tests {
             "acct-jobs",
             &posting,
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let queued = update_application(&pool, "acct-jobs", &application.id, "queued", None)
@@ -10830,8 +11186,8 @@ mod tests {
     #[test]
     fn submitted_applications_require_verified_runner_finalization() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
@@ -10841,7 +11197,7 @@ mod tests {
                 now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, resume) =
@@ -12254,7 +12610,7 @@ mod tests {
     }
 
     #[test]
-    fn active_ats_status_enables_only_certified_runners_and_requires_a_loaded_binding() {
+    fn active_ats_status_cannot_elevate_an_unreviewed_track_or_uncertified_runner() {
         let now = now_ms();
         let posting = test_posting("https://boards.greenhouse.io/acme/jobs/posting-1", now, now);
         let profile = default_profile("jobs@example.com");
@@ -12314,13 +12670,17 @@ mod tests {
         let mut certified = baseline.clone();
         apply_ats_certification_status(&posting, &mut certified, &status, true);
         assert_eq!(certified.capability, "certified");
-        assert!(certified.can_auto_submit);
-        assert!(certified.can_queue_local);
+        assert!(!certified.can_auto_submit);
+        assert!(!certified.can_queue_local);
         assert!(!certified.can_queue_cloud);
         assert!(!certified
             .review_reasons
             .iter()
             .any(|reason| reason.code == "ats_review_required"));
+        assert!(certified
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "career_track_policy_review_required"));
         assert_eq!(
             certified.ats_certification.certified_runner_kinds,
             vec!["local"]
@@ -12543,10 +12903,191 @@ mod tests {
         let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
         assert!(decision.can_prepare, "unexpected decision: {decision:#?}");
         assert!(!decision.can_auto_submit);
+        assert!(!decision.can_queue_local);
+        assert!(!decision.can_queue_cloud);
         assert!(decision
             .review_reasons
             .iter()
             .any(|reason| reason.code == "engagement_type_unverified"));
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "track_engagement_type_unverified"));
+        assert!(!decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "track_engagement_type_allowed"));
+    }
+
+    #[test]
+    fn typed_job_categories_gate_queue_authority_and_preserve_positive_controls() {
+        let pool = test_pool();
+        let (profile, _) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
+        let preferences = JobPreferences {
+            desired_locations: vec!["New York, NY".to_string()],
+            employment_types: vec!["full_time".to_string()],
+            engagement_types: vec!["w2".to_string()],
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.policy.employment_types = vec!["full_time".to_string()];
+        track.policy.engagement_types = vec!["w2".to_string()];
+        let track = upsert_track(&pool, "acct-jobs", &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+
+        let mut exact = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/exact-full-time-w2",
+            now_ms(),
+            now_ms(),
+        );
+        exact.employment_type = "full_time w2".to_string();
+        let exact = upsert_posting(&pool, "acct-jobs", &exact, &profile, &preferences).unwrap();
+        let exact_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &exact, true, None).unwrap();
+        assert!(exact_decision.can_queue_local, "{exact_decision:#?}");
+        assert!(exact_decision.can_queue_cloud, "{exact_decision:#?}");
+        for check in [
+            "employment_type_allowed",
+            "engagement_type_allowed",
+            "track_employment_type_allowed",
+            "track_engagement_type_allowed",
+        ] {
+            assert!(
+                exact_decision
+                    .passed_checks
+                    .iter()
+                    .any(|value| value == check),
+                "missing {check}: {exact_decision:#?}"
+            );
+        }
+
+        let mut unknown_employment = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/unknown-employment-w2",
+            now_ms(),
+            now_ms(),
+        );
+        unknown_employment.employment_type = "w2".to_string();
+        let unknown_employment = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &unknown_employment,
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let unknown_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &unknown_employment, true, None).unwrap();
+        assert!(unknown_decision.can_prepare, "{unknown_decision:#?}");
+        assert!(!unknown_decision.can_queue_local);
+        assert!(!unknown_decision.can_queue_cloud);
+        for code in [
+            "employment_type_unverified",
+            "track_employment_type_unverified",
+        ] {
+            assert!(
+                unknown_decision
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == code),
+                "missing {code}: {unknown_decision:#?}"
+            );
+        }
+        assert!(!unknown_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "track_employment_type_allowed"));
+
+        let mut negated_internship = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/internship-not-offered",
+            now_ms(),
+            now_ms(),
+        );
+        negated_internship.employment_type = "internship".to_string();
+        negated_internship.description =
+            "Internship is not offered. Build reliable products.".to_string();
+        let negated_internship = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &negated_internship,
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let negated_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &negated_internship, true, None).unwrap();
+        assert!(!negated_decision.can_queue_local);
+        assert!(!negated_decision.can_queue_cloud);
+        for code in [
+            "employment_type_unverified",
+            "track_employment_type_unverified",
+        ] {
+            assert!(
+                negated_decision
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == code),
+                "missing {code}: {negated_decision:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negated_c2c_evidence_never_satisfies_c2c_only_track() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            desired_locations: vec!["New York, NY".to_string()],
+            employment_types: vec!["contract".to_string()],
+            engagement_types: vec!["c2c".to_string()],
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.policy.employment_types = vec!["contract".to_string()];
+        track.policy.engagement_types = vec!["c2c".to_string()];
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+
+        for (suffix, description) in [
+            ("no-c2c-w2-only", "No C2C; W2 only."),
+            ("c2c-do-not-accept", "We do not accept C2C."),
+            ("c2c-not-supported", "C2C is not supported."),
+        ] {
+            let mut posting = test_posting(
+                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
+                now_ms(),
+                now_ms(),
+            );
+            posting.employment_type = "contract c2c".to_string();
+            posting.description = format!("{description} Build reliable products.");
+            let posting =
+                upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+            let decision =
+                evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+            assert!(decision.can_prepare, "{decision:#?}");
+            assert!(!decision.can_queue_local);
+            assert!(!decision.can_queue_cloud);
+            for code in [
+                "engagement_type_unverified",
+                "track_engagement_type_unverified",
+            ] {
+                assert!(
+                    decision
+                        .review_reasons
+                        .iter()
+                        .any(|reason| reason.code == code),
+                    "missing {code}: {decision:#?}"
+                );
+            }
+            assert!(!decision
+                .passed_checks
+                .iter()
+                .any(|check| check == "track_engagement_type_allowed"));
+        }
     }
 
     #[test]
@@ -12680,6 +13221,114 @@ mod tests {
     }
 
     #[test]
+    fn workplace_evidence_cannot_bypass_remote_only_queue_authority() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            desired_locations: vec!["Remote - United States".to_string()],
+            location_policy: "remote_only".to_string(),
+            remote_preference: "remote_only".to_string(),
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.locations = vec!["Remote - United States".to_string()];
+        track.remote_preference = "remote_only".to_string();
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+
+        let mut hybrid = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/hybrid-not-remote",
+            now_ms(),
+            now_ms(),
+        );
+        hybrid.location = "United States".to_string();
+        hybrid.workplace = "hybrid".to_string();
+        let hybrid = upsert_posting(&pool, "acct-jobs", &hybrid, &profile, &preferences).unwrap();
+        let hybrid_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &hybrid, true, None).unwrap();
+        assert!(!hybrid_decision.can_queue_local);
+        assert!(!hybrid_decision.can_queue_cloud);
+        assert!(hybrid_decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "location_mismatch"));
+
+        for (suffix, workplace) in [
+            ("negated", "not remote"),
+            ("cannot-be-remote", "cannot be remote"),
+            ("remote-disallowed", "does not allow remote"),
+            ("mixed", "remote or hybrid"),
+            ("unknown", "flexible"),
+        ] {
+            let mut posting = test_posting(
+                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}-workplace"),
+                now_ms(),
+                now_ms(),
+            );
+            posting.location = "United States".to_string();
+            posting.workplace = workplace.to_string();
+            let posting =
+                upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+            let decision =
+                evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+            assert!(
+                !decision.can_queue_local,
+                "unexpected local queue for {workplace}"
+            );
+            assert!(
+                !decision.can_queue_cloud,
+                "unexpected cloud queue for {workplace}"
+            );
+            assert!(
+                decision
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == "location_taxonomy_review_required"),
+                "missing typed workplace review for {workplace}: {decision:#?}"
+            );
+        }
+
+        let mut excluded = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/remote-outside-us",
+            now_ms(),
+            now_ms(),
+        );
+        excluded.location = "Remote outside United States".to_string();
+        excluded.workplace = "remote".to_string();
+        let excluded =
+            upsert_posting(&pool, "acct-jobs", &excluded, &profile, &preferences).unwrap();
+        let excluded_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &excluded, true, None).unwrap();
+        assert!(!excluded_decision.can_queue_local);
+        assert!(!excluded_decision.can_queue_cloud);
+        assert!(excluded_decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "location_taxonomy_review_required"));
+        assert!(!excluded_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "location_allowed"));
+
+        let mut remote = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/proven-remote",
+            now_ms(),
+            now_ms(),
+        );
+        remote.location = "United States".to_string();
+        remote.workplace = "remote".to_string();
+        let remote = upsert_posting(&pool, "acct-jobs", &remote, &profile, &preferences).unwrap();
+        let remote_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &remote, true, None).unwrap();
+        assert!(remote_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "location_allowed"));
+    }
+
+    #[test]
     fn attempt_reservations_enforce_company_and_daily_limits_atomically() {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
@@ -12791,45 +13440,26 @@ mod tests {
     #[test]
     fn application_updates_enforce_state_machine_and_submission_mode() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
+        let now = now_ms();
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &verified_test_posting(
-                JobPosting {
-                    id: String::new(),
-                    canonical_key: String::new(),
-                    source: "greenhouse".to_string(),
-                    external_id: String::new(),
-                    company: "Acme".to_string(),
-                    title: "Engineer".to_string(),
-                    location: "Remote".to_string(),
-                    workplace: "remote".to_string(),
-                    canonical_url: "https://boards.greenhouse.io/acme/jobs/state-machine"
-                        .to_string(),
-                    description: String::new(),
-                    compensation: String::new(),
-                    employment_type: String::new(),
-                    track_id: "track-default".to_string(),
-                    match_score: 84,
-                    matched_reasons: Vec::new(),
-                    missing_requirements: Vec::new(),
-                    posted_at_ms: Some(now_ms()),
-                    last_verified_at_ms: Some(now_ms()),
-                    availability_status: "active".to_string(),
-                    status: "matched".to_string(),
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                    discovery_evidence: JobDiscoveryEvidence::default(),
-                    eligibility: None,
-                },
-                now_ms(),
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/state-machine",
+                now,
+                now,
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
+        let eligibility =
+            evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+        assert!(eligibility.can_queue_local, "{eligibility:#?}");
+        assert!(eligibility.can_queue_cloud, "{eligibility:#?}");
+        assert!(!eligibility.can_auto_submit, "{eligibility:#?}");
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
@@ -16744,6 +17374,22 @@ mod tests {
                 .and_then(Value::as_str),
             Some("applications@example.com")
         );
+        let frozen_policy = application
+            .receipt
+            .pointer("/career_track_policy_authority")
+            .expect("application receipt must freeze the exact Track policy authority");
+        assert_eq!(
+            resume
+                .content
+                .pointer("/provenance/career_track_policy_authority"),
+            Some(frozen_policy)
+        );
+        assert_eq!(
+            frozen_policy
+                .get("taxonomy_version")
+                .and_then(Value::as_str),
+            Some(crate::jobs_taxonomy::taxonomy_version())
+        );
     }
 
     #[test]
@@ -19468,8 +20114,8 @@ mod tests {
     #[test]
     fn jobs_export_includes_durable_data_but_omits_ephemeral_secrets() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
@@ -19479,7 +20125,7 @@ mod tests {
                 now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, resume) =
@@ -19570,14 +20216,29 @@ mod tests {
             .unwrap();
         assert_eq!(export.resume_versions.len(), 1);
         assert_eq!(export.workspace.application_evidence.len(), 1);
+        assert_eq!(export.canonical_track_policy_ledger.revisions.len(), 1);
+        assert_eq!(
+            export.canonical_track_policy_ledger.review_receipts.len(),
+            1
+        );
+        assert_eq!(export.canonical_track_policy_ledger.heads.len(), 1);
+        assert!(export.canonical_track_policy_ledger.revisions[0]
+            .canonical_policy_json
+            .contains("New York, NY"));
         assert!(export.workspace.browser_sessions[0].takeover_url.is_none());
         let serialized = serde_json::to_string(&export).unwrap();
+        assert!(!serialized.contains(ENCRYPTED_PAYLOAD_PREFIX));
         assert!(!serialized.contains("secret-capability"));
         assert!(!serialized.contains("export-ticket-secret"));
         assert!(!serialized.contains("must-not-export"));
 
         let refs = crate::db::account_data::artifact_object_refs(&pool, "acct-jobs").unwrap();
-        assert_eq!(refs.len(), 4);
+        assert_eq!(refs.len(), 5);
+        assert!(refs.iter().any(|reference| {
+            reference.object_key == "accounts/acct-jobs/jobs/fixture-source-resume.pdf"
+                && reference.content_type.as_deref() == Some("application/pdf")
+                && reference.size_bytes == Some(1_024)
+        }));
         assert!(refs.iter().any(|reference| reference.object_key
             == "accounts/acct-jobs/jobs/export/resume.pdf"
             && reference.size_bytes == Some(42)));
