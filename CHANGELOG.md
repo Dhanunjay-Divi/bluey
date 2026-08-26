@@ -7,6 +7,15 @@ under `docs/release/`.
 
 ### Added
 
+- Added the frozen Phase 613 Bluey Jobs role, skill, and typed-geography registry plus a paired
+  SQLite/PostgreSQL ten-table Career Track policy authority. Global taxonomy/canonicalizer
+  activations, policy-relevant account inputs, Track semantics, encrypted policy revisions and
+  review receipts, and compare-and-swap head transitions are generation-bound so taxonomy,
+  identity, resume, preference, or Track `A -> B -> A` drift cannot revive an old approval.
+  Queueing, Auto-submit, final execution, public-ATS category/continuation handling, and portal
+  readiness now require positive current authority. Stable client Track IDs, transaction-bound plan
+  limits, and retryable post-write curated enrollment prevent duplicate or falsely failed Track
+  creation. All production flags and external effects remain parked.
 - Added a read-only Bluey Jobs Career Command Center as the new portal home, composing current
   server workspace truth into setup readiness, rolling 24-hour matches, human interventions,
   discovery-source health, evidence-backed outcomes, Gmail/Outlook/calendar connection state,
@@ -230,6 +239,30 @@ under `docs/release/`.
 
 ### Fixed
 
+- Closed Phase 613 review defects FIX-694 through FIX-711: monotonic taxonomy/account/Track replay
+  and execution fences; fail-closed canonical classification; typed public-ATS evidence; portal
+  mutation/read-back ordering; retry-safe Track writes; PostgreSQL Auto-submit revocation,
+  Track-head, managed-migration, safe-integer CHECK, and resume-publication/deletion ordering;
+  complete owner export; durable review reasons; exact resume replay; transport-stable evidence;
+  semantic preservation of arbitrary Career Fact value keys; bounded public-ATS cursor-v2 ordered
+  prefix/overlap/total validation with exact post-filter dedupe/cross-list history; and referentially
+  complete public many-match previews.
+- Reconciled the final Phase 613 local evidence: PostgreSQL 17.10 plus pgvector 0.8.3 passed 13/13;
+  Rust passed 1,401 library and 1,517/1,517 all-target tests after clean fmt/check/Clippy; all five
+  Jobs workspaces passed typecheck and production build, while portal passed 349/349 across 28
+  files and built 2,299 modules with only the existing size advisory;
+  automation passed 680 with one existing conditional skip, including public ATS 39/39; aggregate
+  Jobs Vitest passed 1,847 with that skip across 144 passing files and one skipped file; schema
+  parity remained 81 tables/74 indexes; privacy passed across 2,622 tracked and 2,347 text paths;
+  provenance passed at
+  663 lock entries, 631 unique package versions, one audited override, and 14 pinned repositories;
+  and native-storage, Browser-release, managed-release, and account-deletion guards passed 14/14,
+  10/10, 16/16, and 3/3 respectively. Local preview QA passed, but read-only deployed preview QA
+  still exposed a stale recursive `/matches/matches` route and pre-fix unknown-company
+  presentation. Release status therefore remains conditional yellow pending
+  exact-tip CI, Docker/Linux image/native smoke, current deployed-bundle read-back, hosted
+  migration/network/canary/rollback/deployment evidence, and production flag read-back. Release
+  configuration remains `0`; no live flag read-back is claimed.
 - Raised the closed managed-cloud runtime-measurement file bound from 256 to 512 across candidate
   construction, embedded runtime verification, and server release-evidence validation. The pinned
   Playwright Chromium headless-shell tree alone exceeds the old bound, so managed-runner image
