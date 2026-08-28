@@ -2941,7 +2941,7 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         eligibility: None,
     };
     posting_input.canonical_key = jobs::canonical_job_key(&posting_input);
-    posting_input.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+    posting_input.discovery_evidence = JobDiscoveryEvidence::provider_verified_original_source(
         posting_input.canonical_key.clone(),
         "greenhouse:acme".to_string(),
         Some("boards.greenhouse.io".to_string()),
@@ -3005,10 +3005,13 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         },
     )
     .unwrap();
-    let application =
+    let mut application =
         jobs::assign_application_run(&harness.pool, &account.id, &application.id, &run_id)
             .unwrap()
             .unwrap();
+    application.state = "queued".to_string();
+    application.updated_at_ms = chrono::Utc::now().timestamp_millis();
+    persist_test_application(harness, &account.id, &application);
     let identity_id = application
         .receipt
         .pointer("/application_identity/id")

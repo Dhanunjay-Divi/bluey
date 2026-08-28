@@ -369,6 +369,9 @@ const SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
 );
 const SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str =
     include_str!("../../../infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql");
+const SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1716,6 +1719,9 @@ const MIGRATIONS: &[&str] = &[
     // 0056 - immutable canonical Career Track policy revisions, review receipts,
     // and exact compare-and-swap heads.
     SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
+    // 0057 - replay-safe original-source assignment, receipt, transition,
+    // lease, circuit, quarantine, and exact current-head authority.
+    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -2648,6 +2654,11 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
             ON legal_acceptances(email_hash, created_at);
         "#,
     )?;
+    // Run this after every legacy ensure-column/trigger refresh above. A SQLite table rename
+    // reparses all triggers, so the one-time immutable-ledger swap must only happen once those
+    // replay-era compatibility columns exist.
+    ensure_sqlite_original_source_verification_hold_capability(&mut conn)
+        .context("widen SQLite operational-hold capability authority")?;
     tracing::info!(
         backend = pool.backend_name(),
         count = MIGRATIONS.len(),
@@ -2752,6 +2763,11 @@ pub const JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID: &str =
     "034_jobs_canonical_taxonomy_authority.sql";
 const POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str = include_str!(
     "../../../infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql"
+);
+pub const JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID: &str =
+    "035_jobs_original_source_verification_authority.sql";
+const POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql"
 );
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
@@ -2878,6 +2894,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
         JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
     ),
+    (
+        JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+    ),
 ];
 
 fn run_postgres_migrations(pool: &DbPool) -> Result<()> {
@@ -2996,6 +3016,156 @@ fn ensure_column(
     Ok(())
 }
 
+const SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1: &str = concat!(
+    "'all', 'discovery', 'generation', 'application_queue', 'runner_claim',\n    ",
+    "'final_submit', 'mailbox_sync', 'communication_dispatch'",
+);
+const SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V2: &str = concat!(
+    "'all', 'discovery', 'original_source_verification', 'generation',\n    ",
+    "'application_queue', 'runner_claim', 'final_submit', 'mailbox_sync',\n    ",
+    "'communication_dispatch'",
+);
+
+/// Migration 052 predates the dedicated original-source verifier hold. SQLite replays every
+/// bundled SQL file at startup, so 057 cannot safely perform an unconditional table rebuild.
+/// Instead, the normal migration runner widens the two immutable-ledger CHECKs exactly once after
+/// detecting the legacy schema. The replacement is transactional, compares both complete row
+/// sets before swapping table names, validates foreign keys, and becomes a no-op on later starts.
+fn ensure_sqlite_original_source_verification_hold_capability(
+    conn: &mut rusqlite::Connection,
+) -> Result<()> {
+    let event_schema: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table'
+          AND name = 'jobs_operational_hold_events'",
+        [],
+        |row| row.get(0),
+    )?;
+    let head_schema: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table'
+          AND name = 'jobs_operational_hold_heads'",
+        [],
+        |row| row.get(0),
+    )?;
+    let event_is_v2 = event_schema.contains("'original_source_verification'");
+    let head_is_v2 = head_schema.contains("'original_source_verification'");
+    if event_is_v2 && head_is_v2 {
+        return Ok(());
+    }
+    if event_is_v2 != head_is_v2
+        || event_schema
+            .matches(SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1)
+            .count()
+            != 1
+        || head_schema
+            .matches(SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1)
+            .count()
+            != 1
+        || SQLITE_JOBS_OPERATIONAL_HOLDS
+            .matches(SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1)
+            .count()
+            != 2
+    {
+        anyhow::bail!("SQLite operational-hold capability schema is not an exact v1/v2 authority")
+    }
+
+    let widened_sql = SQLITE_JOBS_OPERATIONAL_HOLDS.replace(
+        SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V1,
+        SQLITE_OPERATIONAL_HOLD_CAPABILITIES_V2,
+    );
+    let staging_sql = widened_sql
+        .replace(
+            "jobs_operational_hold_events",
+            "jobs_operational_hold_events_phase614",
+        )
+        .replace(
+            "jobs_operational_hold_heads",
+            "jobs_operational_hold_heads_phase614",
+        );
+
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    conn.pragma_update(None, "foreign_keys", false)?;
+    let migration = (|| -> Result<()> {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS jobs_operational_hold_heads_phase614;
+             DROP TABLE IF EXISTS jobs_operational_hold_events_phase614;",
+        )?;
+        tx.execute_batch(&staging_sql)?;
+        tx.execute_batch(
+            "INSERT INTO jobs_operational_hold_events_phase614 (
+               event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+               scope_kind, scope_id, revision_no, previous_revision_no, predecessor_event_id,
+               transition, reason_code, reason_ref, recorded_by, recorded_at_ms
+             ) SELECT
+               event_id, event_ref, event_sha256, canonical_event_base64url, capability,
+               scope_kind, scope_id, revision_no, previous_revision_no, predecessor_event_id,
+               transition, reason_code, reason_ref, recorded_by, recorded_at_ms
+             FROM jobs_operational_hold_events
+             ORDER BY capability, scope_kind, scope_id, revision_no;
+             INSERT INTO jobs_operational_hold_heads_phase614 (
+               capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+               current_event_ref, state, updated_by, updated_at_ms
+             ) SELECT
+               capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+               current_event_ref, state, updated_by, updated_at_ms
+             FROM jobs_operational_hold_heads
+             ORDER BY capability, scope_kind, scope_id;",
+        )?;
+        let changed: i64 = tx.query_row(
+            "SELECT
+               EXISTS(SELECT * FROM jobs_operational_hold_events
+                      EXCEPT SELECT * FROM jobs_operational_hold_events_phase614)
+             + EXISTS(SELECT * FROM jobs_operational_hold_events_phase614
+                      EXCEPT SELECT * FROM jobs_operational_hold_events)
+             + EXISTS(SELECT * FROM jobs_operational_hold_heads
+                      EXCEPT SELECT * FROM jobs_operational_hold_heads_phase614)
+             + EXISTS(SELECT * FROM jobs_operational_hold_heads_phase614
+                      EXCEPT SELECT * FROM jobs_operational_hold_heads)",
+            [],
+            |row| row.get(0),
+        )?;
+        if changed != 0 {
+            anyhow::bail!("SQLite operational-hold ledger changed during capability migration")
+        }
+
+        tx.execute_batch(
+            "DROP TABLE jobs_operational_hold_heads;
+             DROP TABLE jobs_operational_hold_events;
+             ALTER TABLE jobs_operational_hold_events_phase614
+               RENAME TO jobs_operational_hold_events;
+             ALTER TABLE jobs_operational_hold_heads_phase614
+               RENAME TO jobs_operational_hold_heads;
+             DROP INDEX IF EXISTS idx_jobs_operational_hold_events_phase614_history;
+             DROP INDEX IF EXISTS idx_jobs_operational_hold_heads_phase614_lookup;
+             DROP INDEX IF EXISTS idx_jobs_operational_hold_heads_phase614_refs;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_events_phase614_validate_insert;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_events_phase614_no_update;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_events_phase614_no_delete;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_heads_phase614_validate_insert;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_heads_phase614_monotonic;
+             DROP TRIGGER IF EXISTS trg_jobs_operational_hold_heads_phase614_no_delete;",
+        )?;
+        tx.execute_batch(&widened_sql)?;
+        let foreign_key_violation = tx
+            .prepare("PRAGMA foreign_key_check")?
+            .query([])?
+            .next()?
+            .is_some();
+        if foreign_key_violation {
+            anyhow::bail!("SQLite operational-hold capability migration broke a foreign key")
+        }
+        tx.commit()?;
+        Ok(())
+    })();
+    let restored = conn.pragma_update(None, "foreign_keys", foreign_keys_enabled);
+    match (migration, restored) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod blocking_boundary_tests {
     use super::{in_db_blocking_context, run_blocking_db};
@@ -3018,7 +3188,8 @@ mod blocking_boundary_tests {
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
     use super::{
-        ensure_column, open_pool, run_migrations, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
+        ensure_column, ensure_sqlite_original_source_verification_hold_capability, open_pool,
+        run_migrations, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
         SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
         SQLITE_JOBS_OPERATIONAL_HOLDS,
     };
@@ -4007,6 +4178,85 @@ mod sqlite_migration_replay_tests {
             .execute(
                 "DELETE FROM jobs_operational_hold_heads
                   WHERE capability = 'all' AND scope_kind = 'global' AND scope_id = '*'",
+                [],
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn original_source_hold_capability_upgrade_preserves_ledger_and_replays_as_noop() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        conn.execute_batch(SQLITE_JOBS_OPERATIONAL_HOLDS).unwrap();
+        insert_operational_hold_event(
+            &conn,
+            "hold-before-phase-614",
+            &"a".repeat(64),
+            1,
+            None,
+            None,
+            "held",
+            "incident",
+            "operator-1",
+            100,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO jobs_operational_hold_heads (
+               capability, scope_kind, scope_id, scope_ref, head_revision, current_event_id,
+               current_event_ref, state, updated_by, updated_at_ms
+             ) VALUES ('all', 'global', '*', ?1, 1, 'hold-before-phase-614', ?2,
+                       'held', 'operator-1', 100)",
+            rusqlite::params![
+                format!("scope-{}", "b".repeat(64)),
+                format!("event-{}", "a".repeat(64)),
+            ],
+        )
+        .unwrap();
+
+        ensure_sqlite_original_source_verification_hold_capability(&mut conn).unwrap();
+        ensure_sqlite_original_source_verification_hold_capability(&mut conn).unwrap();
+
+        for table in [
+            "jobs_operational_hold_events",
+            "jobs_operational_hold_heads",
+        ] {
+            let schema: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(schema.contains("'original_source_verification'"));
+        }
+        let old_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_operational_hold_events
+                  WHERE event_id = 'hold-before-phase-614'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let old_heads: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_operational_hold_heads
+                  WHERE current_event_id = 'hold-before-phase-614'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((old_events, old_heads), (1, 1));
+        let foreign_key_violations: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(foreign_key_violations, 0);
+        assert!(conn
+            .execute(
+                "DELETE FROM jobs_operational_hold_events
+                  WHERE event_id = 'hold-before-phase-614'",
                 [],
             )
             .is_err());
@@ -5717,21 +5967,24 @@ mod postgres_migration_tests {
         JOBS_ATS_CERTIFICATION_AUTHORITY_MIGRATION_ID, JOBS_BROWSER_RELEASE_AUTHORITY_MIGRATION_ID,
         JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
         JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
+        JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
         JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
         MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
         POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
         POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
         POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
-        POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
+        POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
         SQLITE_ACCOUNT_DELETION_INTENTS, SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
         SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
         SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
         SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
-        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
-        SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY, SQLITE_JOBS_WORKFLOW_COMMANDS,
+        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+        SQLITE_JOBS_WORKFLOW_COMMANDS,
     };
 
     #[test]
@@ -6007,16 +6260,13 @@ mod postgres_migration_tests {
     #[test]
     fn canonical_taxonomy_authority_is_paired_immutable_and_current_head() {
         let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
-            .last()
-            .expect("canonical taxonomy authority must be the PostgreSQL head");
+            .iter()
+            .find(|(id, _)| *id == JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID)
+            .expect("canonical taxonomy authority must be registered");
         assert_eq!(*version, JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID);
         assert_eq!(*version, "034_jobs_canonical_taxonomy_authority.sql");
         assert_eq!(*postgres_sql, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY);
-        assert_eq!(
-            MIGRATIONS.last().copied(),
-            Some(SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY),
-            "canonical taxonomy authority must be the SQLite head"
-        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY));
 
         for required in [
             "CREATE TABLE IF NOT EXISTS jobs_track_policy_revisions",
@@ -6092,6 +6342,65 @@ mod postgres_migration_tests {
             assert!(schema.contains("NEW.head_generation <> OLD.head_generation + 1"));
             assert!(schema
                 .contains("NEW.predecessor_head_transition_sha256 <> OLD.head_transition_sha256"));
+        }
+    }
+
+    #[test]
+    fn original_source_verification_authority_is_paired_replay_safe_and_current_head() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .last()
+            .expect("original-source verification authority must be the PostgreSQL head");
+        assert_eq!(
+            *version,
+            JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID
+        );
+        assert_eq!(
+            *postgres_sql,
+            POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY
+        );
+        assert_eq!(
+            MIGRATIONS.last().copied(),
+            Some(SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY)
+        );
+        for schema in [
+            *postgres_sql,
+            SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+        ] {
+            assert_eq!(
+                schema
+                    .lines()
+                    .filter(|line| line.starts_with(
+                        "CREATE TABLE IF NOT EXISTS jobs_original_source_verification_"
+                    ))
+                    .count(),
+                7
+            );
+            for required in [
+                "jobs_original_source_verification_assignments",
+                "jobs_original_source_verification_attempts",
+                "jobs_original_source_verification_events",
+                "jobs_original_source_verification_observations",
+                "jobs_original_source_verification_receipts",
+                "jobs_original_source_verification_transitions",
+                "jobs_original_source_verification_heads",
+                "jobs_managed_cloud_manifest_source_verification_protocols",
+                "jobs_managed_cloud_manifest_original_source_verifier_identities",
+                "jobs_managed_cloud_original_source_verifier_runtime_grants",
+                "jobs_managed_cloud_original_source_verifier_grant_revocations",
+                "jobs_managed_cloud_original_source_verifier_runtime_instances",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+                "jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit",
+                "runtime_session_token_sha256",
+                "completion_request_sha256",
+                "original-source head must advance by exact CAS",
+            ] {
+                assert!(schema.contains(required), "migration missing {required}");
+            }
+            assert!(schema.contains("protocol_version"));
+            assert!(schema.contains("source_verification"));
+            assert!(schema.contains("original_source_verifier"));
+            assert!(schema.contains("jobs-workflows"));
+            assert!(!schema.contains("INSERT INTO jobs_original_source_verification_"));
         }
     }
 

@@ -1,4 +1,23 @@
 const MAX_APPLICATION_COVER_LETTER_CHARS: usize = 4_000;
+const PENDING_AUTO_QUEUE_APPROVAL_KEY: &str = "_bluey_pending_auto_queue_approval_v1";
+
+fn prepared_application_persistence_projection(
+    application: &JobApplication,
+) -> Result<JobApplication> {
+    let mut persisted = application.clone();
+    if application.state == "queued"
+        && application.submission_mode == "auto_submit"
+        && application.receipt.get("approved_execution").is_none()
+    {
+        persisted.state = "awaiting_review".to_string();
+        persisted
+            .receipt
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?
+            .insert(PENDING_AUTO_QUEUE_APPROVAL_KEY.to_string(), json!(true));
+    }
+    Ok(persisted)
+}
 
 pub fn list_applications(pool: &DbPool, account_id: &str) -> Result<Vec<JobApplication>> {
     crate::db::run_blocking_db(|| match pool {
@@ -207,15 +226,20 @@ fn prepare_application_inner(
     submission_mode: &str,
 ) -> Result<PreparedApplicationDraft> {
     let profile = get_profile(pool, account_id, "")?;
-    let posting =
+    let stored_posting =
         get_posting(pool, account_id, job_id)?.ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    let original_source_projection =
+        resolve_original_source_verification_projection(pool, account_id, &stored_posting)?;
+    let posting =
+        posting_with_original_source_projection(&stored_posting, &original_source_projection);
+    let original_source_expected_head = original_source_projection.expected_head.clone();
     let posting_fingerprint = posting_snapshot_fingerprint(&posting)?;
     let existing = find_application_for_job_with_revision(pool, account_id, job_id)?;
     let existing_application = existing
         .as_ref()
         .map(|(application, _)| application.clone());
     let expected_application = existing.as_ref().map(|(_, revision)| revision.clone());
-    let eligibility = evaluate_job_eligibility(
+    let eligibility = evaluate_job_eligibility_with_projected_source(
         pool,
         account_id,
         &posting,
@@ -361,6 +385,7 @@ fn prepare_application_inner(
         "confirmed_facts_fingerprint": confirmed_facts_fingerprint,
         "confirmed_facts_fingerprint_version": 1,
         "job_snapshot_fingerprint": posting_fingerprint,
+        "original_source_verification": original_source_expected_head,
         "evidence_revision_id": evidence_revision.id,
         "evidence_content_hash": evidence_revision.content_hash,
         "application_identity": {
@@ -436,8 +461,15 @@ pub fn finalize_prepared_application_kit(
     if application.state != "preparing" {
         anyhow::bail!("application is not waiting for resume generation")
     }
-    let posting = get_posting(pool, account_id, &application.job_id)?
+    let stored_posting = get_posting(pool, account_id, &application.job_id)?
         .ok_or_else(|| anyhow::anyhow!("job not found"))?;
+    let original_source_projection =
+        resolve_original_source_verification_projection(pool, account_id, &stored_posting)?;
+    if !original_source_projection_matches_application(&application, &original_source_projection)? {
+        anyhow::bail!("original-source verification changed during resume generation")
+    }
+    let posting =
+        posting_with_original_source_projection(&stored_posting, &original_source_projection);
     let expected_posting_fingerprint = posting_snapshot_fingerprint(&prepared.posting)?;
     if posting_snapshot_fingerprint(&posting)? != expected_posting_fingerprint {
         anyhow::bail!("job posting changed while the application packet was generated")
@@ -548,7 +580,7 @@ pub fn finalize_prepared_application_kit(
 
     let checksum_source = format!("{}|{}|{}", account_id, posting.id, content);
     let checksum = hex::encode(Sha256::digest(checksum_source.as_bytes()));
-    let mut eligibility = evaluate_job_eligibility(
+    let mut eligibility = evaluate_job_eligibility_with_projected_source(
         pool,
         account_id,
         &posting,
@@ -676,7 +708,7 @@ fn commit_prepared_application(
                     "candidate profile changed while the application packet was generated"
                 )
             }
-            let current_posting: JobPosting = tx
+            let stored_current_posting: JobPosting = tx
                 .query_row(
                     "SELECT posting_json FROM jobs_postings
                       WHERE account_id = ?1 AND id = ?2",
@@ -687,6 +719,22 @@ fn commit_prepared_application(
                 .map(|raw| parse_json(raw, "Jobs posting during application finalization"))
                 .transpose()?
                 .ok_or_else(|| anyhow::anyhow!("job not found during application finalization"))?;
+            let original_source_projection =
+                resolve_original_source_verification_projection_sqlite_tx(
+                    &tx,
+                    account_id,
+                    &stored_current_posting,
+                )?;
+            if !original_source_projection_matches_application(
+                application,
+                &original_source_projection,
+            )? {
+                anyhow::bail!("original-source verification changed during resume generation")
+            }
+            let current_posting = posting_with_original_source_projection(
+                &stored_current_posting,
+                &original_source_projection,
+            );
             if posting_snapshot_fingerprint(&current_posting)? != expected_posting_fingerprint {
                 anyhow::bail!("job posting changed while the application packet was generated")
             }
@@ -927,7 +975,8 @@ fn commit_prepared_application(
             );
             receipt.insert("claim_ids".to_string(), json!(claim_ids));
             persist_claim_evidence_sqlite(&tx, account_id, &resume.id, claim_evidence)?;
-            let payload = to_json(application, "job application")?;
+            let persisted_application = prepared_application_persistence_projection(application)?;
+            let payload = to_json(&persisted_application, "job application")?;
             let changed = match expected {
                 Some(expected) => tx.execute(
                     "UPDATE jobs_applications SET resume_version_id = ?5, state = ?6,
@@ -939,11 +988,11 @@ fn commit_prepared_application(
                         application.job_id,
                         expected.id,
                         expected.state,
-                        application.resume_version_id,
-                        application.state,
+                        persisted_application.resume_version_id,
+                        persisted_application.state,
                         payload,
-                        application.updated_at_ms,
-                        application.submitted_at_ms,
+                        persisted_application.updated_at_ms,
+                        persisted_application.submitted_at_ms,
                         expected.updated_at_ms,
                         expected.payload,
                     ],
@@ -955,15 +1004,15 @@ fn commit_prepared_application(
                      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                      ON CONFLICT(account_id, job_id) DO NOTHING",
                     params![
-                        application.id,
+                        persisted_application.id,
                         account_id,
-                        application.job_id,
-                        application.resume_version_id,
-                        application.state,
+                        persisted_application.job_id,
+                        persisted_application.resume_version_id,
+                        persisted_application.state,
                         payload,
-                        application.created_at_ms,
-                        application.updated_at_ms,
-                        application.submitted_at_ms,
+                        persisted_application.created_at_ms,
+                        persisted_application.updated_at_ms,
+                        persisted_application.submitted_at_ms,
                     ],
                 )?,
             };
@@ -997,7 +1046,7 @@ fn commit_prepared_application(
                     "candidate profile changed while the application packet was generated"
                 )
             }
-            let current_posting: JobPosting = tx
+            let stored_current_posting: JobPosting = tx
                 .query_opt(
                     "SELECT posting_json FROM jobs_postings
                       WHERE account_id = $1 AND id = $2 FOR SHARE",
@@ -1011,6 +1060,22 @@ fn commit_prepared_application(
                 })
                 .transpose()?
                 .ok_or_else(|| anyhow::anyhow!("job not found during application finalization"))?;
+            let original_source_projection =
+                resolve_original_source_verification_projection_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    &stored_current_posting,
+                )?;
+            if !original_source_projection_matches_application(
+                application,
+                &original_source_projection,
+            )? {
+                anyhow::bail!("original-source verification changed during resume generation")
+            }
+            let current_posting = posting_with_original_source_projection(
+                &stored_current_posting,
+                &original_source_projection,
+            );
             if posting_snapshot_fingerprint(&current_posting)? != expected_posting_fingerprint {
                 anyhow::bail!("job posting changed while the application packet was generated")
             }
@@ -1253,7 +1318,8 @@ fn commit_prepared_application(
             );
             receipt.insert("claim_ids".to_string(), json!(claim_ids));
             persist_claim_evidence_postgres(&mut tx, account_id, &resume.id, claim_evidence)?;
-            let payload = to_json(application, "job application")?;
+            let persisted_application = prepared_application_persistence_projection(application)?;
+            let payload = to_json(&persisted_application, "job application")?;
             let changed = match expected {
                 Some(expected) => tx.execute(
                     "UPDATE jobs_applications SET resume_version_id = $5, state = $6,
@@ -1265,11 +1331,11 @@ fn commit_prepared_application(
                         &application.job_id,
                         &expected.id,
                         &expected.state,
-                        &application.resume_version_id,
-                        &application.state,
+                        &persisted_application.resume_version_id,
+                        &persisted_application.state,
                         &payload,
-                        &application.updated_at_ms,
-                        &application.submitted_at_ms,
+                        &persisted_application.updated_at_ms,
+                        &persisted_application.submitted_at_ms,
                         &expected.updated_at_ms,
                         &expected.payload,
                     ],
@@ -1281,15 +1347,15 @@ fn commit_prepared_application(
                      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                      ON CONFLICT(account_id, job_id) DO NOTHING",
                     &[
-                        &application.id,
+                        &persisted_application.id,
                         &account_id,
-                        &application.job_id,
-                        &application.resume_version_id,
-                        &application.state,
+                        &persisted_application.job_id,
+                        &persisted_application.resume_version_id,
+                        &persisted_application.state,
                         &payload,
-                        &application.created_at_ms,
-                        &application.updated_at_ms,
-                        &application.submitted_at_ms,
+                        &persisted_application.created_at_ms,
+                        &persisted_application.updated_at_ms,
+                        &persisted_application.submitted_at_ms,
                     ],
                 )?,
             };
@@ -1438,6 +1504,321 @@ fn find_application_for_job_with_revision(
     })
 }
 
+fn queue_admission_runner_kinds(
+    application_state: &str,
+    reserved_runner: Option<&str>,
+    local_entitled: bool,
+    cloud_entitled: bool,
+) -> Vec<&'static str> {
+    match reserved_runner {
+        Some("local") if local_entitled => vec!["local"],
+        Some("cloud") if cloud_entitled => vec!["cloud"],
+        Some("local" | "cloud") => Vec::new(),
+        Some("unassigned") | None if application_state == "queued" => {
+            let mut runners = Vec::with_capacity(2);
+            if local_entitled {
+                runners.push("local");
+            }
+            if cloud_entitled {
+                runners.push("cloud");
+            }
+            runners
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod queue_admission_tests {
+    use super::{
+        prepared_application_persistence_projection, queue_admission_runner_kinds, JobApplication,
+        PENDING_AUTO_QUEUE_APPROVAL_KEY,
+    };
+    use serde_json::json;
+
+    fn test_application(state: &str, submission_mode: &str) -> JobApplication {
+        JobApplication {
+            id: "application".to_string(),
+            job_id: "job".to_string(),
+            resume_version_id: Some("resume".to_string()),
+            state: state.to_string(),
+            submission_mode: submission_mode.to_string(),
+            match_score: 100,
+            answers: Vec::new(),
+            cover_letter: String::new(),
+            receipt: json!({}),
+            run_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            submitted_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn auto_submit_preparation_persists_a_non_effect_capable_intermediate() {
+        let application = test_application("queued", "auto_submit");
+
+        let persisted = prepared_application_persistence_projection(&application).unwrap();
+
+        assert_eq!(application.state, "queued");
+        assert_eq!(persisted.state, "awaiting_review");
+        assert_eq!(
+            persisted
+                .receipt
+                .get(PENDING_AUTO_QUEUE_APPROVAL_KEY)
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn already_approved_auto_submit_preparation_keeps_queued_state() {
+        let mut application = test_application("queued", "auto_submit");
+        application.receipt["approved_execution"] = json!({});
+
+        let persisted = prepared_application_persistence_projection(&application).unwrap();
+
+        assert_eq!(persisted.state, "queued");
+        assert!(persisted
+            .receipt
+            .get(PENDING_AUTO_QUEUE_APPROVAL_KEY)
+            .is_none());
+    }
+
+    #[test]
+    fn queued_unassigned_admission_uses_only_current_entitlements() {
+        assert_eq!(
+            queue_admission_runner_kinds("queued", Some("unassigned"), true, false),
+            vec!["local"]
+        );
+        assert_eq!(
+            queue_admission_runner_kinds("queued", None, false, true),
+            vec!["cloud"]
+        );
+        assert!(queue_admission_runner_kinds("queued", None, false, false).is_empty());
+    }
+
+    #[test]
+    fn reserved_runner_cannot_fall_over_to_a_different_entitlement() {
+        assert!(queue_admission_runner_kinds("queued", Some("local"), false, true).is_empty());
+        assert!(queue_admission_runner_kinds("queued", Some("cloud"), true, false).is_empty());
+    }
+
+    #[test]
+    fn running_admission_requires_an_exact_entitled_runner() {
+        assert!(queue_admission_runner_kinds("running", Some("unassigned"), true, true).is_empty());
+        assert!(queue_admission_runner_kinds("running", None, true, true).is_empty());
+        assert_eq!(
+            queue_admission_runner_kinds("running", Some("local"), true, true),
+            vec!["local"]
+        );
+    }
+}
+
+fn add_candidate_queue_hold_scopes(
+    context: &mut OperationalHoldContext,
+    application: &JobApplication,
+) -> Result<()> {
+    let Some(certification) = application
+        .receipt
+        .pointer("/approved_execution/admission/ats_certification")
+    else {
+        return Ok(());
+    };
+    let certification = certification
+        .as_object()
+        .ok_or_else(|| anyhow::anyhow!("invalid frozen Jobs ATS certification context"))?;
+    let provider = certification
+        .get("provider")
+        .and_then(Value::as_str)
+        .and_then(operational_known_ats_provider)
+        .ok_or_else(|| anyhow::anyhow!("invalid frozen Jobs ATS provider context"))?;
+    let adapter = certification
+        .get("adapter_version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("invalid frozen Jobs ATS adapter context"))?;
+    context
+        .insert_scope(OperationalHoldScopeKind::AtsProvider, provider)
+        .map_err(anyhow::Error::new)?;
+    context
+        .insert_scope(OperationalHoldScopeKind::AtsAdapter, adapter)
+        .map_err(anyhow::Error::new)?;
+    Ok(())
+}
+
+fn require_application_queue_admission_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<()> {
+    let _approved_execution = approved_submission_snapshot(account_id, application)?;
+    let stored_posting: JobPosting = tx
+        .query_row(
+            "SELECT posting_json FROM jobs_postings
+              WHERE account_id = ?1 AND id = ?2",
+            params![account_id, application.job_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| parse_json(raw, "Jobs posting during application queueing"))
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("job not found during application queueing"))?;
+    let projection =
+        resolve_original_source_verification_projection_sqlite_tx(tx, account_id, &stored_posting)?;
+    if !original_source_projection_matches_application(application, &projection)? {
+        anyhow::bail!("original-source verification changed before application queueing")
+    }
+
+    let (local_entitled, cloud_entitled): (i64, i64) = tx
+        .query_row(
+            "SELECT local_browser, cloud_browser FROM jobs_entitlements
+              WHERE account_id = ?1",
+            params![account_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("Jobs runner entitlement is unavailable"))?;
+    let reserved_runner = tx
+        .query_row(
+            "SELECT runner FROM jobs_attempt_reservations
+              WHERE account_id = ?1 AND application_id = ?2
+                AND status IN ('reserved', 'running', 'side_effect_unknown')",
+            params![account_id, application.id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let runners = queue_admission_runner_kinds(
+        &application.state,
+        reserved_runner.as_deref(),
+        local_entitled != 0,
+        cloud_entitled != 0,
+    );
+    if runners.is_empty() {
+        anyhow::bail!("current Jobs entitlement does not permit application queueing")
+    }
+
+    for runner in runners {
+        let mut hold_context = operational_hold_context_for_application_sqlite_tx(
+            tx,
+            account_id,
+            &application.id,
+            Some(runner),
+            None,
+            None,
+        )
+        .map_err(anyhow::Error::new)?;
+        add_candidate_queue_hold_scopes(&mut hold_context, application)?;
+        match require_operational_capability_sqlite_tx(
+            tx,
+            OperationalCapability::ApplicationQueue,
+            &hold_context,
+        ) {
+            Ok(()) => {}
+            Err(OperationalHoldError::Held(_)) => continue,
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+        let runner = match runner {
+            "local" => ExecutionAuthorityRunner::Local,
+            "cloud" => ExecutionAuthorityRunner::Cloud,
+            _ => unreachable!("queue admission runners are closed above"),
+        };
+        if current_execution_authorized_sqlite(tx, account_id, application, runner)? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("current Jobs authority does not permit application queueing")
+}
+
+fn require_application_queue_admission_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<()> {
+    let _approved_execution = approved_submission_snapshot(account_id, application)?;
+    let stored_posting: JobPosting = tx
+        .query_opt(
+            "SELECT posting_json FROM jobs_postings
+              WHERE account_id = $1 AND id = $2 FOR SHARE",
+            &[&account_id, &application.job_id],
+        )?
+        .map(|row| {
+            parse_json(
+                row.get::<_, String>(0),
+                "Jobs posting during application queueing",
+            )
+        })
+        .transpose()?
+        .ok_or_else(|| anyhow::anyhow!("job not found during application queueing"))?;
+    let projection = resolve_original_source_verification_projection_postgres_tx(
+        tx,
+        account_id,
+        &stored_posting,
+    )?;
+    if !original_source_projection_matches_application(application, &projection)? {
+        anyhow::bail!("original-source verification changed before application queueing")
+    }
+
+    let entitlement = tx
+        .query_opt(
+            "SELECT local_browser, cloud_browser FROM jobs_entitlements
+              WHERE account_id = $1 FOR SHARE",
+            &[&account_id],
+        )?
+        .ok_or_else(|| anyhow::anyhow!("Jobs runner entitlement is unavailable"))?;
+    let local_entitled = entitlement.get::<_, i32>(0) != 0;
+    let cloud_entitled = entitlement.get::<_, i32>(1) != 0;
+    let reserved_runner = tx
+        .query_opt(
+            "SELECT runner FROM jobs_attempt_reservations
+              WHERE account_id = $1 AND application_id = $2
+                AND status IN ('reserved', 'running', 'side_effect_unknown')
+              FOR SHARE",
+            &[&account_id, &application.id],
+        )?
+        .map(|row| row.get::<_, String>(0));
+    let runners = queue_admission_runner_kinds(
+        &application.state,
+        reserved_runner.as_deref(),
+        local_entitled,
+        cloud_entitled,
+    );
+    if runners.is_empty() {
+        anyhow::bail!("current Jobs entitlement does not permit application queueing")
+    }
+
+    for runner in runners {
+        let mut hold_context = operational_hold_context_for_application_postgres_tx(
+            tx,
+            account_id,
+            &application.id,
+            Some(runner),
+            None,
+            None,
+        )
+        .map_err(anyhow::Error::new)?;
+        add_candidate_queue_hold_scopes(&mut hold_context, application)?;
+        match require_operational_capability_postgres_tx(
+            tx,
+            OperationalCapability::ApplicationQueue,
+            &hold_context,
+        ) {
+            Ok(()) => {}
+            Err(OperationalHoldError::Held(_)) => continue,
+            Err(error) => return Err(anyhow::Error::new(error)),
+        }
+        let runner = match runner {
+            "local" => ExecutionAuthorityRunner::Local,
+            "cloud" => ExecutionAuthorityRunner::Cloud,
+            _ => unreachable!("queue admission runners are closed above"),
+        };
+        if current_execution_authorized_postgres(tx, account_id, application, runner)? {
+            return Ok(());
+        }
+    }
+    anyhow::bail!("current Jobs authority does not permit application queueing")
+}
+
 fn save_application(
     pool: &DbPool,
     account_id: &str,
@@ -1452,6 +1833,9 @@ fn save_application(
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
+            if matches!(application.state.as_str(), "queued" | "running") {
+                require_application_queue_admission_sqlite_tx(&tx, account_id, application)?;
+            }
             tx.execute(
                 "INSERT INTO jobs_applications (
                     id, account_id, job_id, resume_version_id, state,
@@ -1481,9 +1865,22 @@ fn save_application(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            if matches!(application.state.as_str(), "queued" | "running") {
+                lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+                let _source_verification_authority =
+                    postgres_original_source_verification_authority_for_account_tx(
+                        &mut tx, account_id,
+                    )
+                    .map_err(anyhow::Error::new)?;
+                lock_postgres_ats_certification(&mut tx).map_err(anyhow::Error::new)?;
+                lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
+            if matches!(application.state.as_str(), "queued" | "running") {
+                require_application_queue_admission_postgres_tx(&mut tx, account_id, application)?;
+            }
             tx.execute(
                 "INSERT INTO jobs_applications (
                     id, account_id, job_id, resume_version_id, state,
@@ -1577,7 +1974,28 @@ pub fn replace_application_receipt(
     let Some(mut application) = get_application(pool, account_id, application_id)? else {
         return Ok(None);
     };
+    let pending_auto_queue = application.state == "awaiting_review"
+        && application.submission_mode == "auto_submit"
+        && application
+            .receipt
+            .get(PENDING_AUTO_QUEUE_APPROVAL_KEY)
+            .and_then(Value::as_bool)
+            == Some(true);
+    let approved_execution_added = receipt.get("approved_execution").is_some();
     application.receipt = receipt;
+    if pending_auto_queue && approved_execution_added {
+        validate_application_transition(&application.state, "queued")?;
+        application.state = "queued".to_string();
+        if let Some(receipt) = application.receipt.as_object_mut() {
+            receipt.remove(PENDING_AUTO_QUEUE_APPROVAL_KEY);
+        }
+    } else if pending_auto_queue {
+        application
+            .receipt
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("application receipt must be an object"))?
+            .insert(PENDING_AUTO_QUEUE_APPROVAL_KEY.to_string(), json!(true));
+    }
     application.updated_at_ms = now_ms();
     save_application(pool, account_id, &application).map(Some)
 }

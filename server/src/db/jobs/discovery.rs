@@ -960,12 +960,31 @@ pub fn save_verified_import_posting_with_source(
                     import_run_id,
                 ],
             )?;
+            if let Some(authority) =
+                sqlite_original_source_verification_scheduling_authority_for_account_tx(
+                    &tx, account_id,
+                )?
+            {
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    &tx,
+                    account_id,
+                    &saved,
+                    &authority,
+                )?;
+            }
             tx.commit()?;
             Ok(saved)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Managed-release authority uses a process-wide advisory fence. Resolve it before
+            // taking the account/source locks so verifier publication and discovery ingestion
+            // share one lock order instead of forming managed->source/source->managed cycles.
+            let source_verification_authority =
+                postgres_original_source_verification_scheduling_authority_for_account_tx(
+                    &mut tx, account_id,
+                )?;
             lock_discovery_account_postgres(&mut tx, account_id)?;
             enforce_discovery_source_authority_postgres(
                 &mut tx,
@@ -1090,6 +1109,14 @@ pub fn save_verified_import_posting_with_source(
                     &import_run_id,
                 ],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                    &mut tx,
+                    account_id,
+                    &saved,
+                    &authority,
+                )?;
+            }
             tx.commit()?;
             Ok(saved)
         }
@@ -1858,6 +1885,14 @@ fn publish_discovery_snapshot(
                 params![source.id, replay_key, snapshot_hash],
             )?;
 
+            let source_verification_authority = if source.provider != CURATED_DISCOVERY_PROVIDER {
+                sqlite_original_source_verification_scheduling_authority_for_account_tx(
+                    &tx,
+                    &source.account_id,
+                )?
+            } else {
+                None
+            };
             let mut seen = Vec::with_capacity(normalized.len());
             for (external_id, (posting, content_hash)) in normalized {
                 let membership_job_id: Option<String> = tx
@@ -1966,6 +2001,14 @@ fn publish_discovery_snapshot(
                         content_hash, observed_at_ms, run_id, posting.availability_status,
                     ],
                 )?;
+                if let Some(authority) = source_verification_authority.as_ref() {
+                    ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                        &tx,
+                        &source.account_id,
+                        &saved,
+                        authority,
+                    )?;
+                }
                 seen.push(external_id.clone());
             }
             let closed_count = close_missing_snapshot_memberships_sqlite(
@@ -1974,6 +2017,7 @@ fn publish_discovery_snapshot(
                 &run_id,
                 observed_at_ms,
                 &seen,
+                source_verification_authority.as_ref(),
                 profile,
                 preferences,
                 applications,
@@ -2032,6 +2076,16 @@ fn publish_discovery_snapshot(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Keep managed-release advisory authority ahead of discovery/source row locks. The
+            // verifier terminal path uses that same order when it republishes source truth.
+            let source_verification_authority = if source.provider != CURATED_DISCOVERY_PROVIDER {
+                postgres_original_source_verification_scheduling_authority_for_account_tx(
+                    &mut tx,
+                    &source.account_id,
+                )?
+            } else {
+                None
+            };
             lock_discovery_account_postgres(&mut tx, &source.account_id)?;
             let tx_now = now_ms();
             let fresh = tx.query_opt(
@@ -2217,6 +2271,14 @@ fn publish_discovery_snapshot(
                         &posting.availability_status,
                     ],
                 )?;
+                if let Some(authority) = source_verification_authority.as_ref() {
+                    ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                        &mut tx,
+                        &source.account_id,
+                        &saved,
+                        authority,
+                    )?;
+                }
                 seen.push(external_id.clone());
             }
             let closed_count = close_missing_snapshot_memberships_postgres(
@@ -2225,6 +2287,7 @@ fn publish_discovery_snapshot(
                 &run_id,
                 observed_at_ms,
                 &seen,
+                source_verification_authority.as_ref(),
                 profile,
                 preferences,
                 applications,
@@ -2290,6 +2353,7 @@ fn close_missing_snapshot_memberships_sqlite(
     _run_id: &str,
     observed_at_ms: i64,
     seen: &[String],
+    source_verification_authority: Option<&ManagedCloudOriginalSourceVerificationAuthority>,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -2396,6 +2460,14 @@ fn close_missing_snapshot_memberships_sqlite(
                   WHERE account_id = ?1 AND id = ?2",
                 params![source.account_id, job_id, payload, observed_at_ms],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    tx,
+                    &source.account_id,
+                    &posting,
+                    authority,
+                )?;
+            }
         }
         if !still_unknown {
             closed += 1;
@@ -2411,6 +2483,7 @@ fn close_missing_snapshot_memberships_postgres(
     _run_id: &str,
     observed_at_ms: i64,
     seen: &[String],
+    source_verification_authority: Option<&ManagedCloudOriginalSourceVerificationAuthority>,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -2517,6 +2590,14 @@ fn close_missing_snapshot_memberships_postgres(
                   WHERE account_id = $1 AND id = $2",
                 &[&source.account_id, &job_id, &payload, &observed_at_ms],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                    tx,
+                    &source.account_id,
+                    &posting,
+                    authority,
+                )?;
+            }
         }
         if !still_unknown {
             closed += 1;

@@ -10,6 +10,7 @@ const POSTGRES_OPERATIONAL_HOLD_SHARED_LOCK_SQL: &str =
 pub enum OperationalCapability {
     All,
     Discovery,
+    OriginalSourceVerification,
     Generation,
     ApplicationQueue,
     RunnerClaim,
@@ -19,8 +20,9 @@ pub enum OperationalCapability {
 }
 
 impl OperationalCapability {
-    pub const CONCRETE: [Self; 7] = [
+    pub const CONCRETE: [Self; 8] = [
         Self::Discovery,
+        Self::OriginalSourceVerification,
         Self::Generation,
         Self::ApplicationQueue,
         Self::RunnerClaim,
@@ -33,6 +35,7 @@ impl OperationalCapability {
         match self {
             Self::All => "all",
             Self::Discovery => "discovery",
+            Self::OriginalSourceVerification => "original_source_verification",
             Self::Generation => "generation",
             Self::ApplicationQueue => "application_queue",
             Self::RunnerClaim => "runner_claim",
@@ -46,6 +49,7 @@ impl OperationalCapability {
         match value {
             "all" => Ok(Self::All),
             "discovery" => Ok(Self::Discovery),
+            "original_source_verification" => Ok(Self::OriginalSourceVerification),
             "generation" => Ok(Self::Generation),
             "application_queue" => Ok(Self::ApplicationQueue),
             "runner_claim" => Ok(Self::RunnerClaim),

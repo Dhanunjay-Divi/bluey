@@ -686,7 +686,10 @@ impl JobDiscoveryEvidence {
         }
     }
 
-    pub fn verified_original_source(
+    /// Test-only legacy materialization. Production execution authority must
+    /// never be minted from mutable posting JSON.
+    #[cfg(test)]
+    pub(crate) fn verified_original_source(
         canonical_job_id: String,
         employer_id: String,
         application_domain: Option<String>,
@@ -700,6 +703,7 @@ impl JobDiscoveryEvidence {
             checked_at_ms,
             evidence_hash,
         );
+        evidence.provenance = "test_fixture_original_source".to_string();
         evidence.employer_verification_status = "verified".to_string();
         evidence.scam_risk_status = "clear".to_string();
         evidence
@@ -707,8 +711,9 @@ impl JobDiscoveryEvidence {
 
     /// Record a fresh snapshot from an allowlisted hosted ATS without
     /// overstating independent employer or scam verification. This evidence
-    /// is sufficient for a review-first packet, but unattended queueing still
-    /// requires `verified_original_source` evidence from the risk pipeline.
+    /// is sufficient for a review-first packet, but never for unattended
+    /// queueing. Execution-grade source authority is relational and
+    /// release-bound; it is not stored in caller-mutable posting JSON.
     pub fn provider_verified_original_source(
         canonical_job_id: String,
         employer_id: String,
@@ -2309,6 +2314,7 @@ include!("jobs/browser_release_trust.rs");
 include!("jobs/browser_release_registry.rs");
 include!("jobs/ats_certification_authority.rs");
 include!("jobs/managed_cloud_release_authority.rs");
+include!("jobs/original_source_verification.rs");
 include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
 

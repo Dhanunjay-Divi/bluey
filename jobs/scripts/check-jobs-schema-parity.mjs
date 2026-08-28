@@ -15,7 +15,27 @@ export const PHASE_613_PARITY_TABLES = [
   "jobs_track_policy_track_input_transitions",
 ];
 
-const PHASE_613_SEMANTIC_TABLES = new Set(PHASE_613_PARITY_TABLES);
+export const PHASE_614_PARITY_TABLES = [
+  "jobs_managed_cloud_manifest_original_source_verifier_identities",
+  "jobs_managed_cloud_manifest_source_verification_protocols",
+  "jobs_managed_cloud_original_source_verifier_grant_revocations",
+  "jobs_managed_cloud_original_source_verifier_runtime_grants",
+  "jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit",
+  "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+  "jobs_managed_cloud_original_source_verifier_runtime_instances",
+  "jobs_original_source_verification_assignments",
+  "jobs_original_source_verification_attempts",
+  "jobs_original_source_verification_events",
+  "jobs_original_source_verification_heads",
+  "jobs_original_source_verification_observations",
+  "jobs_original_source_verification_receipts",
+  "jobs_original_source_verification_transitions",
+];
+
+const SEMANTIC_PARITY_TABLES = new Set([
+  ...PHASE_613_PARITY_TABLES,
+  ...PHASE_614_PARITY_TABLES,
+]);
 
 export const JOBS_PARITY_TABLES = [
   "account_deletion_intents",
@@ -90,6 +110,7 @@ export const JOBS_PARITY_TABLES = [
   "jobs_runner_volumes",
   "jobs_submission_evidence_capacity",
   ...PHASE_613_PARITY_TABLES,
+  ...PHASE_614_PARITY_TABLES,
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
@@ -456,6 +477,31 @@ const REQUIRED_INDEX_SIGNATURES = new Map([
       "idx_jobs_track_policy_head_transitions_history on jobs_track_policy_head_transitions (account_id, career_track_id, head_generation desc)",
     ],
   ],
+  [
+    "jobs_managed_cloud_original_source_verifier_runtime_instances",
+    [
+      "unique idx_jobs_managed_cloud_original_source_verifier_runtime_instance_epoch_worker on jobs_managed_cloud_original_source_verifier_runtime_instances (runtime_instance_id, instance_epoch, worker_id)",
+    ],
+  ],
+  [
+    "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+    [
+      "idx_jobs_managed_cloud_original_source_verifier_runtime_heartbeat_readiness on jobs_managed_cloud_original_source_verifier_runtime_heartbeats (activation_sha256, role, health_state, heartbeat_at_ms desc)",
+    ],
+  ],
+  [
+    "jobs_original_source_verification_assignments",
+    [
+      "idx_jobs_original_source_assignment_due on jobs_original_source_verification_assignments (state, next_attempt_at_ms, circuit_open_until_ms, created_at_ms)",
+      "unique idx_jobs_original_source_assignment_active on jobs_original_source_verification_assignments (account_id, job_id) where state not in ('superseded', 'cancelled')",
+    ].sort(),
+  ],
+  [
+    "jobs_original_source_verification_events",
+    [
+      "unique idx_jobs_original_source_event_request on jobs_original_source_verification_events (assignment_id, completion_request_id) where completion_request_id is not null",
+    ],
+  ],
 ]);
 
 const PHASE_613_INDEX_NAMES = [
@@ -467,6 +513,15 @@ const PHASE_613_INDEX_NAMES = [
   "idx_jobs_track_policy_revisions_history",
   "idx_jobs_track_policy_review_receipts_revision",
   "idx_jobs_track_policy_track_input_transitions_history",
+];
+
+const PHASE_614_INDEX_NAMES = [
+  "idx_jobs_managed_cloud_original_source_verifier_runtime_heartbeat_readiness",
+  "idx_jobs_managed_cloud_original_source_verifier_runtime_instance_epoch_worker",
+  "idx_jobs_original_source_assignment_active",
+  "idx_jobs_original_source_assignment_due",
+  "idx_jobs_original_source_event_request",
+  "idx_jobs_postings_account_id_unique",
 ];
 
 function balancedBody(sql, openingParen) {
@@ -637,6 +692,36 @@ function requireSinglePhase613TableDeclarations(issues, dialect, sql) {
     if (count !== 1) {
       issues.push(
         `${dialect} Phase 613 table ${tableName} must be declared exactly once; found ${count}`,
+      );
+    }
+  }
+}
+
+function requireSinglePhase614IndexDeclarations(issues, dialect, sql) {
+  for (const indexName of PHASE_614_INDEX_NAMES) {
+    const expression = new RegExp(
+      `CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+${indexName}\\b`,
+      "gi",
+    );
+    const count = [...sql.matchAll(expression)].length;
+    if (count !== 1) {
+      issues.push(
+        `${dialect} Phase 614 index ${indexName} must be declared exactly once; found ${count}`,
+      );
+    }
+  }
+}
+
+function requireSinglePhase614TableDeclarations(issues, dialect, sql) {
+  for (const tableName of PHASE_614_PARITY_TABLES) {
+    const expression = new RegExp(
+      `CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${tableName}\\s*\\(`,
+      "gi",
+    );
+    const count = [...sql.matchAll(expression)].length;
+    if (count !== 1) {
+      issues.push(
+        `${dialect} Phase 614 table ${tableName} must be declared exactly once; found ${count}`,
       );
     }
   }
@@ -2575,10 +2660,10 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
     const postgresTable = extractTable(postgresSource, tableName);
     if (!sqliteTable || !postgresTable) continue;
 
-    const sqliteComparableTable = PHASE_613_SEMANTIC_TABLES.has(tableName)
+    const sqliteComparableTable = SEMANTIC_PARITY_TABLES.has(tableName)
       ? extractColumnShapes(sqliteTable)
       : sqliteTable;
-    const postgresComparableTable = PHASE_613_SEMANTIC_TABLES.has(tableName)
+    const postgresComparableTable = SEMANTIC_PARITY_TABLES.has(tableName)
       ? extractColumnShapes(postgresTable)
       : postgresTable;
     const tableDifference = firstDifference(
@@ -2587,7 +2672,7 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
     );
     if (tableDifference) {
       issues.push(
-        `${tableName} ${PHASE_613_SEMANTIC_TABLES.has(tableName) ? "column" : "definition"} ${tableDifference.index + 1} differs: SQLite=${JSON.stringify(tableDifference.left ?? "<missing>")} Postgres=${JSON.stringify(tableDifference.right ?? "<missing>")}`,
+        `${tableName} ${SEMANTIC_PARITY_TABLES.has(tableName) ? "column" : "definition"} ${tableDifference.index + 1} differs: SQLite=${JSON.stringify(tableDifference.left ?? "<missing>")} Postgres=${JSON.stringify(tableDifference.right ?? "<missing>")}`,
       );
     }
 
@@ -2626,6 +2711,16 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
   requireSinglePhase613IndexDeclarations(issues, "Postgres", postgresSource);
   requireSinglePhase613TableDeclarations(issues, "SQLite", sqliteSource);
   requireSinglePhase613TableDeclarations(issues, "Postgres", postgresSource);
+  requireSinglePhase614IndexDeclarations(issues, "SQLite", sqliteSource);
+  requireSinglePhase614IndexDeclarations(issues, "Postgres", postgresSource);
+  requireSinglePhase614TableDeclarations(issues, "SQLite", sqliteSource);
+  requireSinglePhase614TableDeclarations(issues, "Postgres", postgresSource);
+  requireIndexesPresent(issues, "SQLite", sqliteSource, "jobs_postings", [
+    "unique idx_jobs_postings_account_id_unique on jobs_postings (account_id, id)",
+  ]);
+  requireIndexesPresent(issues, "Postgres", postgresSource, "jobs_postings", [
+    "unique idx_jobs_postings_account_id_unique on jobs_postings (account_id, id)",
+  ]);
   phase613SqliteRequirements(issues, sqliteSource);
   phase613PostgresRequirements(issues, postgresSource);
 
@@ -2687,6 +2782,60 @@ export function checkPhase613MigrationRegistration(runnerSource) {
   ) {
     issues.push(
       "server Postgres migration runner must register 034_jobs_canonical_taxonomy_authority.sql exactly once",
+    );
+  }
+  return issues;
+}
+
+export function checkPhase614MigrationRegistration(runnerSource) {
+  const issues = [];
+  const sqliteDeclaration =
+    /const\s+SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/sqlite\/server-runtime\/057_jobs_original_source_verification_authority\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(sqliteDeclaration)].length !== 1) {
+    issues.push(
+      "server SQLite migration runner must include 057_jobs_original_source_verification_authority.sql exactly once",
+    );
+  }
+  const sqliteMigrations = extractRustArrayBody(runnerSource, "MIGRATIONS");
+  if (
+    !sqliteMigrations ||
+    (
+      sqliteMigrations.match(
+        /\bSQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY\b/g,
+      ) ?? []
+    ).length !== 1
+  ) {
+    issues.push(
+      "server SQLite migration runner must register 057_jobs_original_source_verification_authority.sql exactly once",
+    );
+  }
+
+  const postgresIdDeclaration =
+    /pub\s+const\s+JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID\s*:\s*&str\s*=\s*"035_jobs_original_source_verification_authority\.sql"\s*;/g;
+  if ([...runnerSource.matchAll(postgresIdDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must declare 035_jobs_original_source_verification_authority.sql exactly once",
+    );
+  }
+  const postgresDeclaration =
+    /const\s+POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/postgres\/server-runtime\/035_jobs_original_source_verification_authority\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(postgresDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must include 035_jobs_original_source_verification_authority.sql exactly once",
+    );
+  }
+  const postgresMigrations = extractRustArrayBody(
+    runnerSource,
+    "POSTGRES_POST_JOBS_MIGRATIONS",
+  );
+  const postgresRegistration =
+    /\(\s*JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID\s*,\s*POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY\s*,?\s*\)/g;
+  if (
+    !postgresMigrations ||
+    [...postgresMigrations.matchAll(postgresRegistration)].length !== 1
+  ) {
+    issues.push(
+      "server Postgres migration runner must register 035_jobs_original_source_verification_authority.sql exactly once",
     );
   }
   return issues;
@@ -2790,6 +2939,14 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql",
   );
+  const sqliteOriginalSourceVerificationAuthorityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+  );
+  const postgresOriginalSourceVerificationAuthorityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -2803,6 +2960,7 @@ function main() {
     sqliteCommunicationExecutionPath,
     sqliteOperationalHoldsPath,
     sqliteCanonicalTaxonomyAuthorityPath,
+    sqliteOriginalSourceVerificationAuthorityPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -2819,12 +2977,14 @@ function main() {
     postgresCommunicationExecutionPath,
     postgresOperationalHoldsPath,
     postgresCanonicalTaxonomyAuthorityPath,
+    postgresOriginalSourceVerificationAuthorityPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
   const issues = compareJobsSchemas(sqliteSource, postgresSource);
   issues.push(
     ...checkPhase613MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
+    ...checkPhase614MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
   );
 
   const includePath =

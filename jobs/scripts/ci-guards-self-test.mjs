@@ -5,6 +5,7 @@ import path from "node:path";
 
 import {
   checkPhase613MigrationRegistration,
+  checkPhase614MigrationRegistration,
   compareJobsSchemas,
 } from "./check-jobs-schema-parity.mjs";
 import {
@@ -427,8 +428,20 @@ function assertPhase613DriftRejected({
 }
 
 function testSchemaParity() {
-  const sqlite = jobsParitySchema("INTEGER");
-  const postgres = jobsParitySchema("BIGINT");
+  const sqlite = `${jobsParitySchema("INTEGER")}\n${fs.readFileSync(
+    path.join(
+      repoRoot,
+      "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+    ),
+    "utf8",
+  )}`;
+  const postgres = `${jobsParitySchema("BIGINT")}\n${fs.readFileSync(
+    path.join(
+      repoRoot,
+      "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+    ),
+    "utf8",
+  )}`;
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
 
   for (const mutation of [
@@ -807,10 +820,16 @@ function testSchemaParity() {
     "utf8",
   );
   assert.deepEqual(checkPhase613MigrationRegistration(migrationRunner), []);
+  assert.deepEqual(checkPhase614MigrationRegistration(migrationRunner), []);
   const missingSqliteMigrationRegistration = replaceFirstForGuardTest(
     migrationRunner,
-    "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n];",
-    "];",
+    "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n" +
+      "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
+      "    // lease, circuit, quarantine, and exact current-head authority.\n" +
+      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n];",
+    "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
+      "    // lease, circuit, quarantine, and exact current-head authority.\n" +
+      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n];",
     "SQLite 056 migration registration",
   );
   assert(
@@ -830,6 +849,33 @@ function testSchemaParity() {
   assert(
     checkPhase613MigrationRegistration(
       missingPostgresMigrationRegistration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
+  const missingSqlitePhase614Registration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n];",
+    "];",
+    "SQLite 057 migration registration",
+  );
+  assert(
+    checkPhase614MigrationRegistration(missingSqlitePhase614Registration).some(
+      (issue) => issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresPhase614Registration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    ),\n",
+    "",
+    "Postgres 035 migration registration",
+  );
+  assert(
+    checkPhase614MigrationRegistration(
+      missingPostgresPhase614Registration,
     ).some((issue) =>
       issue.includes("Postgres migration runner must register"),
     ),

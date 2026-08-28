@@ -27,6 +27,7 @@ export * from "./playwright-page.js";
 export * from "./documents.js";
 export * from "./discovery-quality.js";
 export * from "./network.js";
+export * from "./original-source-verification.js";
 export * from "./recovery.js";
 export * from "./source-catalog.js";
 export * from "./visual-observation.js";

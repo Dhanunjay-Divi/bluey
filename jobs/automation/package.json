@@ -42,6 +42,10 @@
     "./managed-cloud-execution": {
       "types": "./dist/managed-cloud-execution.d.ts",
       "import": "./dist/managed-cloud-execution.js"
+    },
+    "./original-source-verification": {
+      "types": "./dist/original-source-verification.d.ts",
+      "import": "./dist/original-source-verification.js"
     }
   },
   "scripts": {

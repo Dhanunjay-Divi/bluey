@@ -388,7 +388,7 @@ mod tests {
         let application_domain = reqwest::Url::parse(&posting.canonical_url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_string));
-        posting.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+        posting.discovery_evidence = JobDiscoveryEvidence::provider_verified_original_source(
             posting.canonical_key.clone(),
             format!("{}:test", posting.source),
             application_domain,
@@ -2147,29 +2147,23 @@ mod tests {
     fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
         let (profile, preferences) =
             execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
-        let posting = upsert_posting(
-            pool,
-            "acct-jobs",
-            &test_posting(
-                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
-                now_ms(),
-                now_ms(),
-            ),
-            &profile,
-            &preferences,
-        )
-        .unwrap();
+        let mut posting_input = test_posting(
+            &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
+            now_ms(),
+            now_ms(),
+        );
+        posting_input.discovery_evidence =
+            JobDiscoveryEvidence::provider_verified_original_source(
+            posting_input.canonical_key.clone(),
+            format!("{}:test", posting_input.source),
+            Some("boards.greenhouse.io".to_string()),
+            now_ms(),
+            "a".repeat(64),
+        );
+        let posting =
+            upsert_posting(pool, "acct-jobs", &posting_input, &profile, &preferences).unwrap();
         let (application, _) =
             prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
-        let application = update_application(
-            pool,
-            "acct-jobs",
-            &application.id,
-            "queued",
-            Some("review_first"),
-        )
-        .unwrap()
-        .unwrap();
         let run_id = format!("cloud-run-{suffix}");
         upsert_browser_session(
             pool,
@@ -2265,15 +2259,39 @@ mod tests {
             "packet": approved_packet,
             "job": approved_job,
         });
-        application = replace_application_receipt(
-            pool,
-            "acct-jobs",
-            &application.id,
-            application.receipt.clone(),
-        )
-        .unwrap()
-        .unwrap();
+        application =
+            persist_preapproved_queued_application_fixture(pool, "acct-jobs", application);
         (application, run_id, browser_profile_id)
+    }
+
+    fn persist_preapproved_queued_application_fixture(
+        pool: &DbPool,
+        account_id: &str,
+        mut application: JobApplication,
+    ) -> JobApplication {
+        assert!(application.receipt.get("approved_execution").is_some());
+        assert_eq!(application.state, "awaiting_review");
+        application.state = "queued".to_string();
+        application.updated_at_ms = now_ms();
+        let payload = serde_json::to_string(&application).unwrap();
+        let changed = pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications
+                    SET state = ?3, application_json = ?4, updated_at_ms = ?5
+                  WHERE account_id = ?1 AND id = ?2",
+                params![
+                    account_id,
+                    application.id,
+                    application.state,
+                    payload,
+                    application.updated_at_ms,
+                ],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        application
     }
 
     struct FinalSubmissionFixture {
@@ -3902,29 +3920,23 @@ mod tests {
         let (profile, preferences) =
             execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
         set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
-        let posting = upsert_posting(
-            pool,
-            "acct-jobs",
-            &test_posting(
-                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
-                now_ms(),
-                now_ms(),
-            ),
-            &profile,
-            &preferences,
-        )
-        .unwrap();
+        let mut posting_input = test_posting(
+            &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
+            now_ms(),
+            now_ms(),
+        );
+        posting_input.discovery_evidence =
+            JobDiscoveryEvidence::provider_verified_original_source(
+            posting_input.canonical_key.clone(),
+            format!("{}:test", posting_input.source),
+            Some("boards.greenhouse.io".to_string()),
+            now_ms(),
+            "a".repeat(64),
+        );
+        let posting =
+            upsert_posting(pool, "acct-jobs", &posting_input, &profile, &preferences).unwrap();
         let (application, _) =
             prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
-        let application = update_application(
-            pool,
-            "acct-jobs",
-            &application.id,
-            "queued",
-            Some("review_first"),
-        )
-        .unwrap()
-        .unwrap();
         let run_id = format!("local-run-{suffix}");
         upsert_browser_session(
             pool,
@@ -4003,14 +4015,25 @@ mod tests {
             "packet": approved_packet,
             "job": approved_job,
         });
-        application = replace_application_receipt(
-            pool,
-            "acct-jobs",
-            &application.id,
-            application.receipt.clone(),
-        )
-        .unwrap()
-        .unwrap();
+        application =
+            persist_preapproved_queued_application_fixture(pool, "acct-jobs", application);
+        let reserved_at_ms = now_ms();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+                    id, account_id, application_id, company_key, period_key,
+                    runner, status, reserved_at_ms, updated_at_ms
+                 ) VALUES (?1, 'acct-jobs', ?2, ?3, 'test-period',
+                           'local', 'reserved', ?4, ?4)",
+                params![
+                    format!("attempt-{}", application.id),
+                    application.id,
+                    format!("test-company-{suffix}"),
+                    reserved_at_ms,
+                ],
+            )
+            .unwrap();
         let ticket_hash = format!("ticket-hash-{suffix}");
         save_local_run_ticket(
             pool,
@@ -8251,6 +8274,19 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(membership_job_ids, vec![feed_lead.id]);
+        let verifier_assignments: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_original_source_verification_assignments",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            verifier_assignments, 0,
+            "feature-off v1 imports must not schedule v2 verifier work"
+        );
     }
 
     #[test]
@@ -10950,7 +10986,7 @@ mod tests {
     }
 
     #[test]
-    fn current_original_source_evidence_allows_preparation_and_queueing() {
+    fn current_provider_source_evidence_allows_preparation_but_not_queueing() {
         let posting = test_posting(
             "https://boards.greenhouse.io/acme/jobs/current-evidence",
             now_ms(),
@@ -10958,8 +10994,20 @@ mod tests {
         );
         let decision = discovery_decision(&posting, true);
         assert!(decision.can_prepare, "{decision:?}");
-        assert!(decision.can_queue_local, "{decision:?}");
-        assert!(decision.can_queue_cloud, "{decision:?}");
+        assert!(!decision.can_queue_local, "{decision:?}");
+        assert!(!decision.can_queue_cloud, "{decision:?}");
+        for reason in [
+            "employer_identity_review_required",
+            "job_risk_review_required",
+        ] {
+            assert!(
+                decision
+                    .review_reasons
+                    .iter()
+                    .any(|candidate| candidate.code == reason),
+                "missing {reason}: {decision:#?}"
+            );
+        }
     }
 
     #[test]
@@ -10992,20 +11040,49 @@ mod tests {
     }
 
     #[test]
-    fn stale_original_source_evidence_requires_refresh_before_queueing() {
+    fn stale_original_source_evidence_requires_refresh_before_preparation() {
         let posting = test_posting(
             "https://boards.greenhouse.io/acme/jobs/stale-evidence",
             now_ms(),
             now_ms() - 2 * DAY_MS,
         );
         let decision = discovery_decision(&posting, false);
-        assert!(decision.can_prepare, "{decision:?}");
+        assert!(!decision.can_prepare, "{decision:?}");
         assert!(!decision.can_queue_local);
         assert!(!decision.can_queue_cloud);
         assert!(decision
             .review_reasons
             .iter()
             .any(|reason| reason.code == "original_source_refresh_required"));
+    }
+
+    #[test]
+    fn original_source_verdict_vocabulary_fails_closed_consistently() {
+        for status in [
+            "closed",
+            "verified_closed",
+            "mismatch",
+            "identity_mismatch",
+            "materially_changed",
+            "source_untrusted",
+            "expired",
+            "quarantined",
+            "redirected_to_unknown",
+        ] {
+            let mut posting = test_posting(
+                "https://boards.greenhouse.io/acme/jobs/rejected-evidence",
+                now_ms(),
+                now_ms(),
+            );
+            posting.discovery_evidence.original_source_status = status.to_string();
+            let decision = discovery_decision(&posting, false);
+            assert!(!decision.can_prepare, "status={status} {decision:?}");
+            assert!(!decision.can_queue_local, "status={status} {decision:?}");
+            assert!(decision
+                .hard_failures
+                .iter()
+                .any(|reason| reason.code == "original_source_rejected"));
+        }
     }
 
     #[test]
@@ -11112,7 +11189,7 @@ mod tests {
     }
 
     #[test]
-    fn queueing_rechecks_that_a_recent_job_is_still_open() {
+    fn queueing_rechecks_source_freshness_and_requires_independent_review_authority() {
         let pool = test_pool();
         let (profile, preferences) =
             execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
@@ -11122,7 +11199,7 @@ mod tests {
             &test_posting(
                 "https://boards.greenhouse.io/acme/jobs/recheck",
                 now_ms() - 2 * DAY_MS,
-                now_ms() - 2 * DAY_MS,
+                now_ms(),
             ),
             &profile,
             &preferences,
@@ -11132,24 +11209,38 @@ mod tests {
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
 
-        let stale_verification =
-            update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
-        assert!(stale_verification.to_string().contains("still open"));
+        let stale_at_ms = now_ms() - 2 * DAY_MS;
+        posting.last_verified_at_ms = Some(stale_at_ms);
+        posting = verified_test_posting(posting, stale_at_ms);
+        posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let stale_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, Some(&application.id))
+                .unwrap();
+        assert!(!stale_decision.can_queue_local);
+        assert!(!stale_decision.can_queue_cloud);
+        assert!(stale_decision.review_reasons.iter().any(|reason| {
+            matches!(
+                reason.code.as_str(),
+                "live_verification_required" | "original_source_refresh_required"
+            )
+        }));
+        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
 
         posting.last_verified_at_ms = Some(now_ms());
         posting = verified_test_posting(posting, now_ms());
-        upsert_posting(
-            &pool,
-            "acct-jobs",
-            &posting,
-            &profile,
-            &preferences,
-        )
-        .unwrap();
-        let queued = update_application(&pool, "acct-jobs", &application.id, "queued", None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(queued.state, "queued");
+        posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let current_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, Some(&application.id))
+                .unwrap();
+        assert!(!current_decision.can_queue_local);
+        assert!(!current_decision.can_queue_cloud);
+        assert!(current_decision.review_reasons.iter().any(|reason| {
+            matches!(
+                reason.code.as_str(),
+                "employer_identity_review_required" | "job_risk_review_required"
+            )
+        }));
+        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
     }
 
     #[test]
@@ -11203,8 +11294,6 @@ mod tests {
         let (application, resume) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
-        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap();
-        update_application(&pool, "acct-jobs", &application.id, "running", None).unwrap();
 
         let resume_evidence = ApplicationEvidence {
             id: "resume-evidence".to_string(),
@@ -11262,7 +11351,7 @@ mod tests {
         let unchanged = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
-        assert_eq!(unchanged.state, "running");
+        assert_eq!(unchanged.state, "awaiting_review");
         assert!(unchanged.submitted_at_ms.is_none());
     }
 
@@ -12920,7 +13009,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_job_categories_gate_queue_authority_and_preserve_positive_controls() {
+    fn typed_job_categories_preserve_positive_controls_without_minting_queue_authority() {
         let pool = test_pool();
         let (profile, _) =
             execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
@@ -12947,8 +13036,9 @@ mod tests {
         let exact = upsert_posting(&pool, "acct-jobs", &exact, &profile, &preferences).unwrap();
         let exact_decision =
             evaluate_job_eligibility(&pool, "acct-jobs", &exact, true, None).unwrap();
-        assert!(exact_decision.can_queue_local, "{exact_decision:#?}");
-        assert!(exact_decision.can_queue_cloud, "{exact_decision:#?}");
+        assert!(exact_decision.can_prepare, "{exact_decision:#?}");
+        assert!(!exact_decision.can_queue_local, "{exact_decision:#?}");
+        assert!(!exact_decision.can_queue_cloud, "{exact_decision:#?}");
         for check in [
             "employment_type_allowed",
             "engagement_type_allowed",
@@ -13457,24 +13547,34 @@ mod tests {
         .unwrap();
         let eligibility =
             evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
-        assert!(eligibility.can_queue_local, "{eligibility:#?}");
-        assert!(eligibility.can_queue_cloud, "{eligibility:#?}");
+        assert!(eligibility.can_prepare, "{eligibility:#?}");
+        assert!(!eligibility.can_queue_local, "{eligibility:#?}");
+        assert!(!eligibility.can_queue_cloud, "{eligibility:#?}");
         assert!(!eligibility.can_auto_submit, "{eligibility:#?}");
+        for reason in [
+            "employer_identity_review_required",
+            "job_risk_review_required",
+        ] {
+            assert!(
+                eligibility
+                    .review_reasons
+                    .iter()
+                    .any(|candidate| candidate.code == reason),
+                "missing {reason}: {eligibility:#?}"
+            );
+        }
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
 
-        let queued = update_application(
+        let queue_without_approved_execution = update_application(
             &pool,
             "acct-jobs",
             &application.id,
             "queued",
             Some("auto_submit"),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(queued.state, "queued");
-        assert_eq!(queued.submission_mode, "auto_submit");
+        );
+        assert!(queue_without_approved_execution.is_err());
 
         let invalid_transition =
             update_application(&pool, "acct-jobs", &application.id, "submitted", None);
@@ -13484,7 +13584,7 @@ mod tests {
             &pool,
             "acct-jobs",
             &application.id,
-            "running",
+            "awaiting_review",
             Some("surprise_me"),
         );
         assert!(invalid_mode.is_err());
@@ -13492,8 +13592,8 @@ mod tests {
         let unchanged = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
-        assert_eq!(unchanged.state, "queued");
-        assert_eq!(unchanged.submission_mode, "auto_submit");
+        assert_eq!(unchanged.state, "awaiting_review");
+        assert_eq!(unchanged.submission_mode, "review_first");
     }
 
     #[test]
@@ -21291,14 +21391,12 @@ mod tests {
         let pool = test_pool();
         let (mut application, run_id, browser_profile_id) =
             execution_lease_fixture(&pool, "answer-cloud");
-        application.receipt.as_object_mut().unwrap().insert(
-            "approved_execution".to_string(),
-            json!({"schema_version": 2, "checksum": "approved-cloud-checksum"}),
-        );
-        application =
-            replace_application_receipt(&pool, "acct-jobs", &application.id, application.receipt)
-                .unwrap()
-                .unwrap();
+        let approved_checksum = application
+            .receipt
+            .pointer("/approved_execution/checksum")
+            .and_then(Value::as_str)
+            .expect("fixture approved execution checksum")
+            .to_string();
         let lease = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -21309,7 +21407,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lease.phase, "prepared");
-        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running").unwrap();
+        assert_eq!(
+            list_attempt_reservations(&pool, "acct-jobs").unwrap()[0].status,
+            "running"
+        );
         application = update_application(&pool, "acct-jobs", &application.id, "running", None)
             .unwrap()
             .unwrap();
@@ -21356,7 +21457,7 @@ mod tests {
                 .receipt
                 .pointer("/packet_revision/invalidated_packet_checksum")
                 .and_then(Value::as_str),
-            Some("approved-cloud-checksum")
+            Some(approved_checksum.as_str())
         );
         assert_eq!(
             revision
@@ -21432,14 +21533,6 @@ mod tests {
         let pool = test_pool();
         let (mut application, run_id, ticket_hash, _) =
             local_run_authority_fixture(&pool, "answer-local");
-        application.receipt.as_object_mut().unwrap().insert(
-            "approved_execution".to_string(),
-            json!({"schema_version": 2, "checksum": "approved-local-checksum"}),
-        );
-        application =
-            replace_application_receipt(&pool, "acct-jobs", &application.id, application.receipt)
-                .unwrap()
-                .unwrap();
         assert!(claim_local_run_ticket(&pool, &run_id, &ticket_hash)
             .unwrap()
             .is_some());

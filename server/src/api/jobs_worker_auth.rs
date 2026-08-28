@@ -28,6 +28,7 @@ const ATS_LAYOUT_OBSERVATION_SIGNED_BODY_BYTES: usize = 256 * 1024;
 const WORKFLOW_COMMAND_SIGNED_BODY_BYTES: usize = 16 * 1024;
 const WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES: usize = 256 * 1024;
 const MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES: usize = 64 * 1024;
+const ORIGINAL_SOURCE_VERIFICATION_SIGNED_BODY_BYTES: usize = 256 * 1024;
 const ATS_LAYOUT_OBSERVATION_PATH: &str =
     "/api/jobs/internal/ats-certifications/layout-observations";
 
@@ -242,6 +243,8 @@ fn worker_scope(method: &str, path: &str) -> Option<&'static str> {
         Some("workflow-command-execution")
     } else if managed_cloud_runtime_path(path) {
         Some("managed-cloud-runtime")
+    } else if original_source_verification_path(path) {
+        Some("original-source-verification")
     } else if path == ATS_LAYOUT_OBSERVATION_PATH {
         Some("ats-layout-observation")
     } else if path.contains("/runner-volumes/") {
@@ -268,6 +271,8 @@ fn signed_body_limit(path: &str) -> usize {
         WORKFLOW_INTERVENTION_PREPARE_SIGNED_BODY_BYTES
     } else if managed_cloud_runtime_path(path) {
         MANAGED_CLOUD_RUNTIME_SIGNED_BODY_BYTES
+    } else if original_source_verification_path(path) {
+        ORIGINAL_SOURCE_VERIFICATION_SIGNED_BODY_BYTES
     } else if workflow_command_materialize_path(path) || workflow_command_execution_path(path) {
         WORKFLOW_COMMAND_SIGNED_BODY_BYTES
     } else if path == ATS_LAYOUT_OBSERVATION_PATH {
@@ -305,6 +310,22 @@ fn managed_cloud_runtime_path(path: &str) -> bool {
         .and_then(|rest| rest.strip_suffix("/heartbeats"))
         .is_some_and(|instance_id| valid_workflow_identifier(instance_id, 20, 128));
     grant_claim || heartbeat
+}
+
+fn original_source_verification_path(path: &str) -> bool {
+    const PREFIX: &str = "/api/jobs/internal/original-source-verifications/";
+    if path == concat!("/api/jobs/internal/original-source-verifications/", "lease") {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix(PREFIX) else {
+        return false;
+    };
+    ["/heartbeat", "/complete", "/fail"]
+        .into_iter()
+        .any(|suffix| {
+            rest.strip_suffix(suffix)
+                .is_some_and(|assignment_id| valid_workflow_identifier(assignment_id, 20, 128))
+        })
 }
 
 fn workflow_command_execution_path(path: &str) -> bool {
@@ -392,6 +413,7 @@ fn unauthorized() -> AuthError {
 fn legacy_debug_token_valid(request: &Request<Body>) -> bool {
     if request.uri().path() == ATS_LAYOUT_OBSERVATION_PATH
         || managed_cloud_runtime_path(request.uri().path())
+        || original_source_verification_path(request.uri().path())
         || managed_execution_effect_authorization_path(request.uri().path())
     {
         return false;
@@ -458,6 +480,23 @@ mod tests {
         assert_eq!(
             worker_scope("POST", "/api/jobs/internal/global-discovery/lease"),
             Some("discovery")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/original-source-verifications/lease"
+            ),
+            Some("original-source-verification")
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/original-source-verifications/",
+                    "source-verification-assignment-123/heartbeat"
+                )
+            ),
+            Some("original-source-verification")
         );
         assert_eq!(
             worker_scope("POST", "/api/jobs/internal/execution-leases/run/heartbeat"),
@@ -545,6 +584,23 @@ mod tests {
             None
         );
         assert_eq!(
+            worker_scope(
+                "POST",
+                "/api/jobs/internal/original-source-verifications/short/complete"
+            ),
+            None
+        );
+        assert_eq!(
+            worker_scope(
+                "POST",
+                concat!(
+                    "/api/jobs/internal/original-source-verifications/",
+                    "source-verification-assignment-123/unknown"
+                )
+            ),
+            None
+        );
+        assert_eq!(
             worker_scope("GET", "/api/jobs/internal/discovery/lease"),
             None
         );
@@ -567,6 +623,10 @@ mod tests {
         assert_eq!(
             signed_body_limit("/api/jobs/internal/discovery/lease"),
             DEFAULT_SIGNED_BODY_BYTES
+        );
+        assert_eq!(
+            signed_body_limit("/api/jobs/internal/original-source-verifications/lease"),
+            ORIGINAL_SOURCE_VERIFICATION_SIGNED_BODY_BYTES
         );
         assert_eq!(
             signed_body_limit(ATS_LAYOUT_OBSERVATION_PATH),
@@ -632,6 +692,24 @@ mod tests {
         assert!(managed_execution_effect_authorization_path(
             request.uri().path()
         ));
+        assert!(!legacy_debug_token_valid(&request));
+        match prior {
+            Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", value),
+            None => std::env::remove_var("BLUEY_JOBS_WORKER_TOKEN"),
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[serial_test::serial]
+    fn original_source_verification_never_accepts_the_legacy_debug_bearer() {
+        let prior = std::env::var_os("BLUEY_JOBS_WORKER_TOKEN");
+        std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", "legacy-debug-token");
+        let request = Request::post("/api/jobs/internal/original-source-verifications/lease")
+            .header("authorization", "Bearer legacy-debug-token")
+            .body(Body::empty())
+            .unwrap();
+        assert!(original_source_verification_path(request.uri().path()));
         assert!(!legacy_debug_token_valid(&request));
         match prior {
             Some(value) => std::env::set_var("BLUEY_JOBS_WORKER_TOKEN", value),

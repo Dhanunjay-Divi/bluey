@@ -1723,9 +1723,14 @@ fn claim_execution_lease_inner(
                     &input.managed_cloud_release.execution.admission.scope,
                 )
                 .map_err(execution_lease_from_managed_cloud_error)?;
+            } else {
+                lock_operational_hold_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_operational_hold_error)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_managed_cloud_error)?;
+                lock_postgres_ats_certification(&mut tx)
+                    .map_err(execution_lease_from_ats_certification_error)?;
             }
-            lock_operational_hold_shared_postgres_tx(&mut tx)
-                .map_err(execution_lease_from_operational_hold_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             let managed_cloud_authority = match managed_cloud_context {
                 Some(context) => {
@@ -1742,8 +1747,6 @@ fn claim_execution_lease_inner(
                 }
                 None => None,
             };
-            lock_postgres_ats_certification(&mut tx)
-                .map_err(execution_lease_from_ats_certification_error)?;
             let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
                 (Some(binding), Some(subject)) => Some(
                     prepare_runner_volume_lease_binding_postgres_tx(&mut tx, binding, subject)
@@ -3290,9 +3293,14 @@ fn start_irreversible_submission_inner(
                     &input.managed_cloud_release.execution.admission.scope,
                 )
                 .map_err(execution_lease_from_managed_cloud_error)?;
+            } else {
+                lock_operational_hold_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_operational_hold_error)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_managed_cloud_error)?;
+                lock_postgres_ats_certification(&mut tx)
+                    .map_err(execution_lease_from_ats_certification_error)?;
             }
-            lock_operational_hold_shared_postgres_tx(&mut tx)
-                .map_err(execution_lease_from_operational_hold_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             let managed_cloud = match managed_cloud_context {
                 Some((input, authenticated_worker_id)) => {
@@ -3319,8 +3327,6 @@ fn start_irreversible_submission_inner(
                 }
                 None => None,
             };
-            lock_postgres_ats_certification(&mut tx)
-                .map_err(execution_lease_from_ats_certification_error)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;

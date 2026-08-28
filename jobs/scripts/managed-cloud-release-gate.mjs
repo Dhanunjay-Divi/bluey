@@ -27,6 +27,7 @@ import { pathToFileURL } from "node:url";
 
 export const MANAGED_CLOUD_AUDIENCES = Object.freeze({
   activation: "bluey-jobs-managed-cloud-activation-v1",
+  activationV2: "bluey-jobs-managed-cloud-activation-v2",
   authorization: "bluey-jobs-managed-cloud-authorization-v1",
   builderPolicy: "bluey-jobs-managed-cloud-builder-policy-v1",
   candidate: "bluey-jobs-managed-cloud-candidate-v1",
@@ -39,6 +40,7 @@ export const MANAGED_CLOUD_AUDIENCES = Object.freeze({
   failureConverterEvidence:
     "bluey-jobs-managed-cloud-failure-converter-evidence-v1",
   manifest: "bluey-jobs-managed-cloud-release-v1",
+  manifestV2: "bluey-jobs-managed-cloud-release-v2",
   migrationContract: "bluey-jobs-managed-cloud-migration-contract-v1",
   promotion: "bluey-jobs-managed-cloud-promotion-v1",
   portalReadbackEvidence:
@@ -208,6 +210,12 @@ export const MANAGED_CLOUD_PROTOCOL_IDS = Object.freeze([
   "workflow_command",
 ]);
 
+export const MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS = Object.freeze([
+  ...MANAGED_CLOUD_PROTOCOL_IDS.slice(0, 9),
+  "source_verification",
+  ...MANAGED_CLOUD_PROTOCOL_IDS.slice(9),
+]);
+
 const MANAGED_CLOUD_BASE_CANARY_CHECK_IDS = Object.freeze([
   "artifact-registry-readback",
   "jobs-api-readiness",
@@ -250,6 +258,10 @@ const SQLITE_MIGRATION_HEAD =
   "056_jobs_canonical_taxonomy_authority.sql";
 const POSTGRES_MIGRATION_HEAD =
   "034_jobs_canonical_taxonomy_authority.sql";
+const SQLITE_SUCCESSOR_MIGRATION_HEAD =
+  "057_jobs_original_source_verification_authority.sql";
+const POSTGRES_SUCCESSOR_MIGRATION_HEAD =
+  "035_jobs_original_source_verification_authority.sql";
 const JOBS_LOCK_EVIDENCE_PATH = "evidence/build/jobs-package-lock.json";
 const SERVER_LOCK_EVIDENCE_PATH = "evidence/build/server-cargo-lock";
 const REQUIRED_CANDIDATE_FILES = Object.freeze([
@@ -289,7 +301,7 @@ const REQUIRED_ROLLBACK_FILES = Object.freeze([
   "target-promotion",
 ]);
 
-const PROTOCOL_SPECS = Object.freeze([
+const BASE_PROTOCOL_SPECS = Object.freeze([
   Object.freeze({
     id: "ats_certification",
     sourcePaths: Object.freeze([
@@ -397,6 +409,65 @@ const PROTOCOL_SPECS = Object.freeze([
     version: 2,
   }),
 ]);
+
+const SOURCE_VERIFICATION_PROTOCOL_SPEC = Object.freeze({
+  id: "source_verification",
+  sourcePaths: Object.freeze([
+    "jobs/automation/src/original-source-verification.ts",
+    "jobs/automation/src/worker-auth.ts",
+    "jobs/workflows/src/original-source-verification-api.ts",
+    "jobs/workflows/src/original-source-verification-runtime.ts",
+    "jobs/workflows/src/original-source-verifier.ts",
+    "server/src/api/jobs_original_source_verifications.rs",
+    "server/src/api/jobs_worker_auth.rs",
+    "server/src/db/mod.rs",
+    "server/src/db/jobs/eligibility.rs",
+    "server/src/db/jobs/operational_holds.rs",
+    "server/src/db/jobs/original_source_verification.rs",
+    "server/src/jobs_ats_target.rs",
+  ]),
+  version: 1,
+});
+
+const SUCCESSOR_PROTOCOL_SPECS = Object.freeze([
+  ...BASE_PROTOCOL_SPECS.slice(0, 9),
+  SOURCE_VERIFICATION_PROTOCOL_SPEC,
+  ...BASE_PROTOCOL_SPECS.slice(9),
+]);
+
+function protocolSpecsForVersion(version) {
+  if (version === 1) return BASE_PROTOCOL_SPECS;
+  if (version === 2) return SUCCESSOR_PROTOCOL_SPECS;
+  fail("Managed-cloud contract version is invalid");
+}
+
+function migrationHeadsForVersion(version) {
+  if (version === 1) {
+    return {
+      postgres: POSTGRES_MIGRATION_HEAD,
+      sqlite: SQLITE_MIGRATION_HEAD,
+    };
+  }
+  if (version === 2) {
+    return {
+      postgres: POSTGRES_SUCCESSOR_MIGRATION_HEAD,
+      sqlite: SQLITE_SUCCESSOR_MIGRATION_HEAD,
+    };
+  }
+  fail("Managed-cloud contract version is invalid");
+}
+
+function manifestAudienceForVersion(version) {
+  if (version === 1) return MANAGED_CLOUD_AUDIENCES.manifest;
+  if (version === 2) return MANAGED_CLOUD_AUDIENCES.manifestV2;
+  fail("Managed-cloud release version is invalid");
+}
+
+function activationAudienceForVersion(version) {
+  if (version === 1) return MANAGED_CLOUD_AUDIENCES.activation;
+  if (version === 2) return MANAGED_CLOUD_AUDIENCES.activationV2;
+  fail("Managed-cloud activation version is invalid");
+}
 
 const CONFIG_ROLE_ROOTS = Object.freeze([
   Object.freeze({
@@ -804,6 +875,22 @@ function expectedRuntimeRolesForComponent(componentId, capabilities) {
   return roles;
 }
 
+export function deriveManagedCloudRequiredRuntimePaths(componentId, capabilities) {
+  const contract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
+  const paths = [...(contract?.requiredPaths ?? ["index.html"])];
+  if (
+    componentId === "jobs-workflows" &&
+    capabilities.some(
+      (entry) =>
+        entry.componentId === "jobs-workflows" &&
+        entry.capability === "original_source_verifier",
+    )
+  ) {
+    paths.push("app/workflows/dist/original-source-verifier.js");
+  }
+  return [...new Set(paths)].sort();
+}
+
 function runtimeMeasurementDocument({
   buildId,
   componentId,
@@ -869,6 +956,7 @@ export function deriveManagedCloudRuntimeIdentitySha256(
     "global_discovery_worker",
     "jobs_api",
     "managed_runner",
+    "original_source_verifier",
     "workflow_cleanup_dispatcher",
     "workflow_command_dispatcher",
     "workflow_gateway",
@@ -2323,7 +2411,7 @@ function validateBuilderPolicyContract(builderPolicy) {
   return files;
 }
 
-function validateMigrationContract(migrationContract) {
+function validateMigrationContract(migrationContract, contractVersion) {
   requireExactKeys(
     migrationContract,
     ["audience", "paritySha256", "postgres", "schemaVersion", "sqlite"],
@@ -2336,9 +2424,10 @@ function validateMigrationContract(migrationContract) {
     fail("Migration contract audience or version is invalid");
   }
   const dialects = {};
+  const expectedHeads = migrationHeadsForVersion(contractVersion);
   for (const [name, expectedHead] of [
-    ["postgres", POSTGRES_MIGRATION_HEAD],
-    ["sqlite", SQLITE_MIGRATION_HEAD],
+    ["postgres", expectedHeads.postgres],
+    ["sqlite", expectedHeads.sqlite],
   ]) {
     const dialect = requireObject(
       migrationContract[name],
@@ -2378,29 +2467,30 @@ function validateMigrationContract(migrationContract) {
   return migrationContract;
 }
 
-function validateProtocolContract(protocolContract, releaseProtocols) {
+function validateProtocolContract(protocolContract, releaseProtocols, contractVersion) {
   requireExactKeys(
     protocolContract,
     ["audience", "protocols", "schemaVersion"],
     "protocol contract",
   );
   if (
-    protocolContract.schemaVersion !== 1 ||
+    protocolContract.schemaVersion !== contractVersion ||
     protocolContract.audience !== MANAGED_CLOUD_AUDIENCES.protocolContract
   ) {
     fail("Protocol contract audience or version is invalid");
   }
+  const specs = protocolSpecsForVersion(contractVersion);
   const protocols = requireArray(
     protocolContract.protocols,
     "protocol contract protocols",
-    PROTOCOL_SPECS.length,
+    specs.length,
   );
-  if (protocols.length !== PROTOCOL_SPECS.length) {
-    fail("Protocol contract must contain the exact Phase 611 protocol set");
+  if (protocols.length !== specs.length) {
+    fail("Protocol contract must contain the exact versioned protocol set");
   }
   const projected = [];
   for (const [index, protocol] of protocols.entries()) {
-    const spec = PROTOCOL_SPECS[index];
+    const spec = specs[index];
     requireExactKeys(
       protocol,
       [
@@ -2581,10 +2671,18 @@ export function validateManagedCloudReleaseContracts({
   migrationContract,
   protocolContract,
 }) {
+  const contractVersion = manifest.version ?? protocolContract.schemaVersion;
+  if (
+    ![1, 2].includes(contractVersion) ||
+    protocolContract.schemaVersion !== contractVersion ||
+    (manifest.version !== undefined && manifest.version !== contractVersion)
+  ) {
+    fail("Release contracts do not share one exact version");
+  }
   validateBuilderPolicyContract(builderPolicy);
   validateConfigContract(configContract);
-  validateMigrationContract(migrationContract);
-  validateProtocolContract(protocolContract, manifest.protocols);
+  validateMigrationContract(migrationContract, contractVersion);
+  validateProtocolContract(protocolContract, manifest.protocols, contractVersion);
   if (
     sha256(canonicalJsonBytes(configContract)) !== manifest.configSchemaSha256 ||
     sha256(canonicalJsonBytes(migrationContract)) !==
@@ -2608,9 +2706,15 @@ function classifyConfigVariable(name) {
   return "configuration";
 }
 
-export async function createManagedCloudContracts(repoRoot, outputDirectory) {
+export async function createManagedCloudContracts(
+  repoRoot,
+  outputDirectory,
+  contractVersion = 1,
+) {
   const root = resolve(repoRoot);
   const output = resolve(outputDirectory);
+  const protocolSpecs = protocolSpecsForVersion(contractVersion);
+  const expectedMigrationHeads = migrationHeadsForVersion(contractVersion);
   await requireEmptyOutputDirectory(output);
 
   const builderSources = await createSourceSet(root, BUILDER_POLICY_PATHS);
@@ -2627,7 +2731,7 @@ export async function createManagedCloudContracts(repoRoot, outputDirectory) {
   };
 
   const protocols = [];
-  for (const spec of PROTOCOL_SPECS) {
+  for (const spec of protocolSpecs) {
     const sources = await createSourceSet(root, spec.sourcePaths);
     protocols.push({
       protocolId: spec.id,
@@ -2642,7 +2746,7 @@ export async function createManagedCloudContracts(repoRoot, outputDirectory) {
   const protocolContract = {
     audience: MANAGED_CLOUD_AUDIENCES.protocolContract,
     protocols,
-    schemaVersion: 1,
+    schemaVersion: contractVersion,
   };
 
   const sqliteFiles = await listSourceFiles(
@@ -2655,7 +2759,12 @@ export async function createManagedCloudContracts(repoRoot, outputDirectory) {
   );
   async function migrationDialect(name, paths) {
     const sqlPaths = paths.filter((path) => path.endsWith(".sql")).sort();
-    const sourceSet = await createSourceSet(root, sqlPaths);
+    const expectedHead = expectedMigrationHeads[name];
+    const headIndex = sqlPaths.findIndex((path) => basename(path) === expectedHead);
+    if (headIndex < 0) {
+      fail(name + " migration contract is missing its versioned head");
+    }
+    const sourceSet = await createSourceSet(root, sqlPaths.slice(0, headIndex + 1));
     if (sourceSet.files.length === 0) {
       fail(name + " migration contract is empty");
     }
@@ -2738,7 +2847,7 @@ export async function createManagedCloudContracts(repoRoot, outputDirectory) {
   };
 }
 
-function requireFeatureAuthority(featureAuthority) {
+function requireFeatureAuthority(featureAuthority, contractVersion) {
   requireExactKeys(
     featureAuthority,
     [
@@ -2761,20 +2870,24 @@ function requireFeatureAuthority(featureAuthority) {
   ) {
     fail("Managed cloud base authorities must be enabled atomically");
   }
-  if (
-    featureAuthority.directDiscovery ||
-    featureAuthority.globalDiscovery ||
-    featureAuthority.sourceVerification
-  ) {
+  if (featureAuthority.directDiscovery || featureAuthority.globalDiscovery) {
     fail(
-      "Phase 611 reserves conditional discovery and source verification without enabling them",
+      "Managed cloud reserves conditional discovery without enabling it",
     );
+  }
+  const exactVersion = contractVersion
+    ?? (featureAuthority.sourceVerification ? 2 : 1);
+  if (
+    ![1, 2].includes(exactVersion) ||
+    featureAuthority.sourceVerification !== (exactVersion === 2)
+  ) {
+    fail("Source verification must use the exact v1=false or v2=true contract");
   }
   return featureAuthority;
 }
 
-function expectedCapabilities(featureAuthority) {
-  requireFeatureAuthority(featureAuthority);
+function expectedCapabilities(featureAuthority, contractVersion) {
+  requireFeatureAuthority(featureAuthority, contractVersion);
   const capabilities = MANAGED_CLOUD_BASE_CAPABILITIES.map((entry) => ({
     capability: entry.capability,
     componentId: entry.componentId,
@@ -2791,6 +2904,12 @@ function expectedCapabilities(featureAuthority) {
       componentId: "jobs-workflows",
     });
   }
+  if (featureAuthority.sourceVerification) {
+    capabilities.push({
+      capability: "original_source_verifier",
+      componentId: "jobs-workflows",
+    });
+  }
   return capabilities.sort((left, right) => {
     const componentOrder = left.componentId.localeCompare(
       right.componentId,
@@ -2800,8 +2919,8 @@ function expectedCapabilities(featureAuthority) {
   });
 }
 
-function requireCapabilities(capabilities, featureAuthority) {
-  const expected = expectedCapabilities(featureAuthority);
+function requireCapabilities(capabilities, featureAuthority, contractVersion) {
+  const expected = expectedCapabilities(featureAuthority, contractVersion);
   requireArray(capabilities, "capabilities", expected.length);
   if (capabilities.length !== expected.length) {
     fail("Release capability count does not match signed feature authority");
@@ -2914,13 +3033,14 @@ function requireReleaseComponents(
   return components;
 }
 
-function requireProtocols(protocols) {
-  requireArray(protocols, "protocols", MANAGED_CLOUD_PROTOCOL_IDS.length);
-  if (protocols.length !== MANAGED_CLOUD_PROTOCOL_IDS.length) {
+function requireProtocols(protocols, contractVersion) {
+  const specs = protocolSpecsForVersion(contractVersion);
+  requireArray(protocols, "protocols", specs.length);
+  if (protocols.length !== specs.length) {
     fail(
       "Release must bind exactly " +
-        MANAGED_CLOUD_PROTOCOL_IDS.length +
-        " Phase 611 protocols",
+        specs.length +
+        " versioned protocols",
     );
   }
   for (const [index, protocol] of protocols.entries()) {
@@ -2930,10 +3050,10 @@ function requireProtocols(protocols) {
       "protocols[" + index + "]",
     );
     if (
-      protocol.protocolId !== MANAGED_CLOUD_PROTOCOL_IDS[index] ||
-      protocol.protocolVersion !== PROTOCOL_SPECS[index].version
+      protocol.protocolId !== specs[index].id ||
+      protocol.protocolVersion !== specs[index].version
     ) {
-      fail("Release protocols must use the exact sorted Phase 611 set");
+      fail("Release protocols must use the exact sorted versioned set");
     }
     requireInteger(protocol.protocolVersion, "protocolVersion", 1);
     requireHex64(protocol.schemaSha256, "protocol.schemaSha256");
@@ -2979,8 +3099,8 @@ export function validateReleaseManifest(manifest) {
     "release manifest",
   );
   if (
-    manifest.version !== 1 ||
-    manifest.audience !== MANAGED_CLOUD_AUDIENCES.manifest
+    ![1, 2].includes(manifest.version) ||
+    manifest.audience !== manifestAudienceForVersion(manifest.version)
   ) {
     fail("Release audience or version is invalid");
   }
@@ -2994,9 +3114,10 @@ export function validateReleaseManifest(manifest) {
   requireInteger(manifest.publishedAtMs, "publishedAtMs");
   requireString(manifest.sqliteMigrationHead, "sqliteMigrationHead");
   requireString(manifest.postgresMigrationHead, "postgresMigrationHead");
+  const expectedMigrationHeads = migrationHeadsForVersion(manifest.version);
   if (
-    manifest.sqliteMigrationHead !== SQLITE_MIGRATION_HEAD ||
-    manifest.postgresMigrationHead !== POSTGRES_MIGRATION_HEAD
+    manifest.sqliteMigrationHead !== expectedMigrationHeads.sqlite ||
+    manifest.postgresMigrationHead !== expectedMigrationHeads.postgres
   ) {
     fail("Release migration heads must be the exact current SQL filenames");
   }
@@ -3010,7 +3131,7 @@ export function validateReleaseManifest(manifest) {
   ]) {
     requireHex64(manifest[key], key);
   }
-  requireFeatureAuthority(manifest.featureAuthority);
+  requireFeatureAuthority(manifest.featureAuthority, manifest.version);
   if (
     sha256(canonicalJsonBytes(manifest.featureAuthority)) !==
     manifest.featureAuthoritySha256
@@ -3023,8 +3144,12 @@ export function validateReleaseManifest(manifest) {
     manifest.sourceCommit,
     manifest.configSchemaSha256,
   );
-  requireCapabilities(manifest.capabilities, manifest.featureAuthority);
-  requireProtocols(manifest.protocols);
+  requireCapabilities(
+    manifest.capabilities,
+    manifest.featureAuthority,
+    manifest.version,
+  );
+  requireProtocols(manifest.protocols, manifest.version);
   if (
     sha256(
       canonicalJsonBytes(
@@ -3308,7 +3433,10 @@ async function descriptorBuildToComponent(
   const runtimePath = runtimeContract.requiredEnvironment
     ?.find((entry) => entry.startsWith("PATH="))
     ?.slice("PATH=".length) ?? runtimeContract.runtimePath;
-  const requiredPaths = [...runtimeContract.requiredPaths];
+  const requiredPaths = deriveManagedCloudRequiredRuntimePaths(
+    componentId,
+    capabilities,
+  );
   if (componentId === "jobs-runner") {
     requiredPaths.push(
       ...inventory.entries
@@ -3321,6 +3449,18 @@ async function descriptorBuildToComponent(
     );
   }
   requiredPaths.sort();
+  if (
+    componentId === "jobs-workflows" &&
+    requiredPaths.includes("app/workflows/dist/original-source-verifier.js") &&
+    !inventory.entries.some(
+      (entry) =>
+        entry.path === "app/workflows/dist/original-source-verifier.js" &&
+        entry.type === "file" &&
+        entry.sizeBytes > 0,
+    )
+  ) {
+    fail("jobs-workflows successor runtime is missing original-source verifier entrypoint");
+  }
   const runtimeRoles = expectedRuntimeRolesForComponent(
     componentId,
     capabilities,
@@ -3432,8 +3572,9 @@ export async function assembleManagedCloudCandidate({
     "release descriptor",
   );
   if (
-    descriptor.version !== 1 ||
-    descriptor.audience !== "bluey-jobs-managed-cloud-release-descriptor-v1"
+    ![1, 2].includes(descriptor.version) ||
+    descriptor.audience !==
+      `bluey-jobs-managed-cloud-release-descriptor-v${descriptor.version}`
   ) {
     fail("Release descriptor audience or version is invalid");
   }
@@ -3446,7 +3587,10 @@ export async function assembleManagedCloudCandidate({
     descriptor.sourceDateEpoch,
     "sourceDateEpoch",
   );
-  const featureAuthority = requireFeatureAuthority(descriptor.featureAuthority);
+  const featureAuthority = requireFeatureAuthority(
+    descriptor.featureAuthority,
+    descriptor.version,
+  );
   const contractNames = [
     "builder-policy.json",
     "config-contract.json",
@@ -3478,17 +3622,15 @@ export async function assembleManagedCloudCandidate({
       "protocol contract",
     )
   ).value;
-  if (
-    protocolContract.version !== 1 &&
-    protocolContract.schemaVersion !== 1
-  ) {
+  if (protocolContract.schemaVersion !== descriptor.version) {
     fail("Protocol contract version is invalid");
   }
+  const protocolSpecs = protocolSpecsForVersion(descriptor.version);
   const protocols = requireProtocols(
     requireArray(
       protocolContract.protocols,
       "protocol contract protocols",
-      MANAGED_CLOUD_PROTOCOL_IDS.length,
+      protocolSpecs.length,
     )
       .map((protocol) => ({
         protocolId: protocol.protocolId,
@@ -3498,8 +3640,9 @@ export async function assembleManagedCloudCandidate({
       .sort((left, right) =>
         left.protocolId.localeCompare(right.protocolId, "en"),
       ),
+    descriptor.version,
   );
-  const capabilities = expectedCapabilities(featureAuthority);
+  const capabilities = expectedCapabilities(featureAuthority, descriptor.version);
   const buildRecords = await Promise.all(
     requireArray(descriptor.builds, "descriptor.builds", 4).map((build) =>
       descriptorBuildToComponent(build, {
@@ -3568,7 +3711,7 @@ export async function assembleManagedCloudCandidate({
     verificationEvidence,
   );
   const manifest = {
-    audience: MANAGED_CLOUD_AUDIENCES.manifest,
+    audience: manifestAudienceForVersion(descriptor.version),
     capabilities,
     components,
     componentSetSha256: await hashFile(join(output, "component-inventory.json")),
@@ -3603,7 +3746,7 @@ export async function assembleManagedCloudCandidate({
     verificationEvidenceSha256: await hashFile(
       join(output, "verification-evidence.json"),
     ),
-    version: 1,
+    version: descriptor.version,
   };
   validateReleaseManifest(manifest);
   await writeCanonicalJson(join(output, "release-manifest.json"), manifest);
@@ -3927,7 +4070,10 @@ export async function validateManagedCloudCandidate(candidateDirectory) {
           .find((entry) => entry.startsWith("PATH="))
           ?.slice("PATH=".length)
       : null;
-    const baseRequiredPaths = runtimeContract?.requiredPaths ?? ["index.html"];
+    const baseRequiredPaths = deriveManagedCloudRequiredRuntimePaths(
+      component.componentId,
+      manifest.capabilities,
+    );
     const evidenceRequiredPaths = requireSortedUniqueStrings(
       evidence.requiredPaths,
       component.componentId + ".requiredPaths",
@@ -3980,6 +4126,18 @@ export async function validateManagedCloudCandidate(candidateDirectory) {
       component.artifactKind,
     );
     const { value: inventory } = await readCanonicalJson(inventoryPath);
+    if (
+      component.componentId === "jobs-workflows" &&
+      baseRequiredPaths.includes("app/workflows/dist/original-source-verifier.js") &&
+      !inventory.entries.some(
+        (entry) =>
+          entry.path === "app/workflows/dist/original-source-verifier.js" &&
+          entry.type === "file" &&
+          entry.sizeBytes > 0,
+      )
+    ) {
+      fail("jobs-workflows successor runtime is missing original-source verifier entrypoint");
+    }
     const attachedInventory = validatedAttachments.decoded.get(
       component.componentId,
     );
@@ -4066,8 +4224,10 @@ const TRUST_ROLES = Object.freeze([
 ]);
 const SIGNED_TARGET_AUDIENCES = Object.freeze([
   MANAGED_CLOUD_AUDIENCES.activation,
+  MANAGED_CLOUD_AUDIENCES.activationV2,
   MANAGED_CLOUD_AUDIENCES.cohort,
   MANAGED_CLOUD_AUDIENCES.manifest,
+  MANAGED_CLOUD_AUDIENCES.manifestV2,
   MANAGED_CLOUD_AUDIENCES.rollback,
   MANAGED_CLOUD_AUDIENCES.trustPolicy,
 ]);
@@ -4694,7 +4854,7 @@ export async function authorizeManagedCloudCandidate({
   );
   const signerKeyIds = verifyManagedCloudSignatureSet({
     expectedRole: "release",
-    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.manifest,
+    expectedTargetAudience: manifestAudienceForVersion(validated.manifest.version),
     expectedTargetBytes: manifestBytes,
     policy,
     signatureSet,
@@ -4788,7 +4948,7 @@ export async function validateAuthorizedManagedCloudCandidate(
   );
   const signerKeyIds = verifyManagedCloudSignatureSet({
     expectedRole: "release",
-    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.manifest,
+    expectedTargetAudience: manifestAudienceForVersion(validated.manifest.version),
     expectedTargetBytes: manifestBytes,
     policy,
     signatureSet,
@@ -4842,6 +5002,9 @@ export function deriveRequiredRuntimeRoles(featureAuthority) {
   }
   if (featureAuthority.globalDiscovery) {
     roles.push("global_discovery_worker");
+  }
+  if (featureAuthority.sourceVerification) {
+    roles.push("original_source_verifier");
   }
   return roles.sort();
 }
@@ -5053,13 +5216,16 @@ function requireEvidenceEnvelope(
   return value;
 }
 
-function expectedCanaryCheckIds(featureAuthority) {
+export function deriveManagedCloudCanaryCheckIds(featureAuthority) {
   const ids = [...MANAGED_CLOUD_BASE_CANARY_CHECK_IDS];
   if (featureAuthority.directDiscovery) {
     ids.push("discovery-worker-readiness");
   }
   if (featureAuthority.globalDiscovery) {
     ids.push("global-discovery-worker-readiness");
+  }
+  if (featureAuthority.sourceVerification) {
+    ids.push("original-source-verifier-readiness");
   }
   return ids.sort();
 }
@@ -5101,7 +5267,7 @@ async function readActivationEvidence(
         authorized.candidate.manifestSha256,
         "canary evidence",
       );
-      const expectedIds = expectedCanaryCheckIds(
+      const expectedIds = deriveManagedCloudCanaryCheckIds(
         activation.featureAuthority,
       );
       const ids = [];
@@ -5374,8 +5540,9 @@ function validateActivation(
     "activation",
   );
   if (
-    activation.version !== 1 ||
-    activation.audience !== MANAGED_CLOUD_AUDIENCES.activation
+    ![1, 2].includes(activation.version) ||
+    activation.audience !== activationAudienceForVersion(activation.version) ||
+    activation.version !== authorized.manifest.version
   ) {
     fail("Activation audience or version is invalid");
   }
@@ -5419,7 +5586,7 @@ function validateActivation(
   ]) {
     requireHex64(activation[key], "activation." + key);
   }
-  requireFeatureAuthority(activation.featureAuthority);
+  requireFeatureAuthority(activation.featureAuthority, activation.version);
   if (
     canonicalJsonBytes(activation.featureAuthority).compare(
       canonicalJsonBytes(authorized.manifest.featureAuthority),
@@ -5654,7 +5821,7 @@ export async function promoteManagedCloudCandidate({
   );
   const activationSignerKeyIds = verifyManagedCloudSignatureSet({
     expectedRole: authorityRoleForChannel(activation.scope.channel),
-    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.activation,
+    expectedTargetAudience: activationAudienceForVersion(activation.version),
     expectedTargetBytes: await readFile(activationFile),
     policy: authorized.policy,
     signatureSet: activationSignatures,
@@ -5767,7 +5934,7 @@ export async function validateManagedCloudPromotion(
   );
   const activationSignerKeyIds = verifyManagedCloudSignatureSet({
     expectedRole: authorityRoleForChannel(activation.scope.channel),
-    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.activation,
+    expectedTargetAudience: activationAudienceForVersion(activation.version),
     expectedTargetBytes: await readFile(join(root, "activation.json")),
     policy: authorized.policy,
     signatureSet: activationSignatures,
@@ -6224,6 +6391,9 @@ async function main(argv) {
     await createManagedCloudContracts(
       requireOption(options, "repo"),
       requireOption(options, "out"),
+      options.version === undefined
+        ? 1
+        : requireInteger(Number(options.version), "--version", 1),
     );
     return;
   }

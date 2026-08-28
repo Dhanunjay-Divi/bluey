@@ -383,6 +383,10 @@ pub fn claim_authorized_local_run_ticket(
                 tx.commit()?;
                 return Ok(None);
             };
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
+            lock_postgres_ats_certification(&mut tx)?;
             lock_discovery_account_shared_postgres(&mut tx, &account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx,
@@ -622,8 +626,10 @@ fn local_run_submit_authorization_inner(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
-            lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
             lock_postgres_ats_certification(&mut tx)?;
+            lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)?;
             let ticket_identity = tx
                 .query_opt(
                     "SELECT account_id, status FROM jobs_local_run_tickets

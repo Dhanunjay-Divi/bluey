@@ -47,8 +47,18 @@ fn apply_posting_discovery_evidence(
             "Bluey blocked this posting after an employer or job-risk check.",
         );
     }
-    if matches!(original_status.as_str(), "closed" | "mismatch")
-        || !evidence.original_source_mismatched_fields.is_empty()
+    if matches!(
+        original_status.as_str(),
+        "closed"
+            | "verified_closed"
+            | "mismatch"
+            | "identity_mismatch"
+            | "materially_changed"
+            | "source_untrusted"
+            | "expired"
+            | "quarantined"
+            | "redirected_to_unknown"
+    ) || !evidence.original_source_mismatched_fields.is_empty()
     {
         push_reason(
             hard_failures,
@@ -167,7 +177,18 @@ fn apply_posting_discovery_evidence(
             "original_source_refresh_required",
             "Bluey must refresh the original employer posting before a runner starts.",
         );
-    } else if !matches!(original_status.as_str(), "closed" | "mismatch") {
+    } else if !matches!(
+        original_status.as_str(),
+        "closed"
+            | "verified_closed"
+            | "mismatch"
+            | "identity_mismatch"
+            | "materially_changed"
+            | "source_untrusted"
+            | "expired"
+            | "quarantined"
+            | "redirected_to_unknown"
+    ) {
         push_reason(
             review_reasons,
             "original_source_unverified",
@@ -175,7 +196,8 @@ fn apply_posting_discovery_evidence(
         );
     }
 
-    let original_source_provenance = evidence.provenance == "original_source";
+    let original_source_provenance =
+        evidence.provenance == "original_source" || test_fixture_original_source(evidence);
     if evidence.provenance == "external_feed" {
         push_reason(
             review_reasons,
@@ -196,7 +218,7 @@ fn apply_posting_discovery_evidence(
         && canonical_verified
         && employer_bound
         && scam_screened
-        && original_evidence_present
+        && original_evidence_current
         && !evidence.requires_original_revalidation;
     let unattended_original = reviewable_original && employer_verified && scam_clear;
     DiscoveryExecutionGate {
@@ -365,6 +387,203 @@ pub fn posting_age_days(posting: &JobPosting, at_ms: i64) -> i64 {
 }
 
 pub fn evaluate_job_eligibility(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    require_live_verification: bool,
+    existing_application_id: Option<&str>,
+) -> Result<JobEligibilityDecision> {
+    let projection = resolve_original_source_verification_projection(pool, account_id, posting)?;
+    let posting = posting_with_original_source_projection(posting, &projection);
+    evaluate_job_eligibility_with_projected_source(
+        pool,
+        account_id,
+        &posting,
+        require_live_verification,
+        existing_application_id,
+    )
+}
+
+fn posting_with_original_source_projection(
+    posting: &JobPosting,
+    projection: &OriginalSourceVerificationProjection,
+) -> JobPosting {
+    let mut projected = posting.clone();
+    // Posting JSON is mutable compatibility material. Never allow its legacy
+    // execution-grade labels to stand in for relational employer/risk
+    // authority, even while the v2 verifier release is inactive.
+    sanitize_mutable_execution_labels(&mut projected.discovery_evidence);
+    if projection.feature_active {
+        merge_original_source_projection(
+            &mut projected.discovery_evidence,
+            projection.evidence.as_ref(),
+        );
+    }
+    projected
+}
+
+fn sanitize_mutable_execution_labels(evidence: &mut JobDiscoveryEvidence) {
+    if test_fixture_original_source(evidence) {
+        return;
+    }
+    if evidence
+        .employer_verification_status
+        .trim()
+        .eq_ignore_ascii_case("verified")
+    {
+        evidence.employer_verification_status = "unknown".to_string();
+    }
+    if evidence
+        .scam_risk_status
+        .trim()
+        .eq_ignore_ascii_case("clear")
+    {
+        evidence.scam_risk_status = "unknown".to_string();
+    }
+}
+
+fn test_fixture_original_source(evidence: &JobDiscoveryEvidence) -> bool {
+    #[cfg(test)]
+    {
+        evidence.provenance == "test_fixture_original_source"
+    }
+    #[cfg(not(test))]
+    {
+        let _ = evidence;
+        false
+    }
+}
+
+fn merge_original_source_projection(
+    target: &mut JobDiscoveryEvidence,
+    source: Option<&JobDiscoveryEvidence>,
+) {
+    let employer_status = target
+        .employer_verification_status
+        .trim()
+        .to_ascii_lowercase();
+    let employer_rejected = matches!(employer_status.as_str(), "mismatch" | "impersonated");
+    let scam_blocked = target
+        .scam_risk_status
+        .trim()
+        .eq_ignore_ascii_case("blocked");
+    let canonical_status = target.canonical_status.trim().to_ascii_lowercase();
+    let canonical_rejected = matches!(
+        canonical_status.as_str(),
+        "duplicate" | "repost" | "invalid" | "malformed"
+    );
+    let Some(source) = source else {
+        target.original_source_status = "unknown".to_string();
+        target.original_source_checked_at_ms = None;
+        target.original_source_snapshot_expires_at_ms = None;
+        target.original_source_evidence_hash = None;
+        target.original_source_mismatched_fields.clear();
+        target.requires_original_revalidation = true;
+        return;
+    };
+
+    target.provenance = source.provenance.clone();
+    if !canonical_rejected {
+        target.canonical_status = source.canonical_status.clone();
+        target.canonical_job_id = source.canonical_job_id.clone();
+    }
+    if !employer_rejected {
+        target.employer_verification_status = source.employer_verification_status.clone();
+        target.employer_id = source.employer_id.clone();
+        target.canonical_employer_domain = source.canonical_employer_domain.clone();
+        target.application_domain = source.application_domain.clone();
+    }
+    if !scam_blocked {
+        target.scam_risk_status = source.scam_risk_status.clone();
+    }
+    target.original_source_status = source.original_source_status.clone();
+    target.original_source_checked_at_ms = source.original_source_checked_at_ms;
+    target.original_source_snapshot_expires_at_ms = source.original_source_snapshot_expires_at_ms;
+    target.original_source_evidence_hash = source.original_source_evidence_hash.clone();
+    target.original_source_mismatched_fields = source.original_source_mismatched_fields.clone();
+    target.requires_original_revalidation = source.requires_original_revalidation;
+}
+
+#[cfg(test)]
+mod original_source_projection_tests {
+    use super::*;
+
+    #[test]
+    fn mutable_execution_labels_are_never_relational_authority() {
+        let mut evidence = JobDiscoveryEvidence {
+            employer_verification_status: " VERIFIED ".to_string(),
+            scam_risk_status: "CLEAR".to_string(),
+            ..JobDiscoveryEvidence::default()
+        };
+
+        sanitize_mutable_execution_labels(&mut evidence);
+
+        assert_eq!(evidence.employer_verification_status, "unknown");
+        assert_eq!(evidence.scam_risk_status, "unknown");
+    }
+
+    #[test]
+    fn source_projection_never_erases_independent_hard_denials() {
+        let mut target = JobDiscoveryEvidence {
+            canonical_status: "invalid".to_string(),
+            employer_verification_status: "impersonated".to_string(),
+            scam_risk_status: "blocked".to_string(),
+            scam_signals: vec![DiscoveryScamSignal {
+                code: "lookalike_domain".to_string(),
+                source: "risk_engine".to_string(),
+            }],
+            ..JobDiscoveryEvidence::default()
+        };
+        let source = JobDiscoveryEvidence::provider_verified_original_source(
+            "canonical-job".to_string(),
+            "employer".to_string(),
+            Some("jobs.example.com".to_string()),
+            1_800_000_000_000,
+            "a".repeat(64),
+        );
+
+        merge_original_source_projection(&mut target, Some(&source));
+
+        assert_eq!(target.canonical_status, "invalid");
+        assert_eq!(target.employer_verification_status, "impersonated");
+        assert_eq!(target.scam_risk_status, "blocked");
+        assert_eq!(target.scam_signals.len(), 1);
+        assert_eq!(target.original_source_status, "verified_open");
+    }
+}
+
+fn application_original_source_expected_head(
+    application: &JobApplication,
+) -> Result<Option<OriginalSourceVerificationExpectedHead>> {
+    let Some(value) = application.receipt.get("original_source_verification") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .context("decode frozen original-source verification head")
+}
+
+fn original_source_projection_matches_application(
+    application: &JobApplication,
+    projection: &OriginalSourceVerificationProjection,
+) -> Result<bool> {
+    let expected = application_original_source_expected_head(application)?;
+    Ok(if projection.feature_active {
+        projection.evidence.is_some()
+            && projection.expected_head.as_ref().is_some_and(|current| {
+                expected
+                    .as_ref()
+                    .is_some_and(|expected| expected == current)
+            })
+    } else {
+        expected.is_none()
+    })
+}
+
+fn evaluate_job_eligibility_with_projected_source(
     pool: &DbPool,
     account_id: &str,
     posting: &JobPosting,
@@ -1641,6 +1860,11 @@ pub fn reserve_application_attempt(
                 &hold_context,
             )
             .map_err(anyhow::Error::new)?;
+            ensure_original_source_application_authority_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+            )?;
             if let Some(existing) = tx
                 .query_row(
                     "SELECT id, application_id, company_key, period_key, runner, status,
@@ -1750,6 +1974,8 @@ pub fn reserve_application_attempt(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
             tx.query_one(
                 "SELECT account_id FROM jobs_entitlements WHERE account_id = $1 FOR UPDATE",
@@ -1770,6 +1996,11 @@ pub fn reserve_application_attempt(
                 &hold_context,
             )
             .map_err(anyhow::Error::new)?;
+            ensure_original_source_application_authority_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+            )?;
             if let Some(row) = tx.query_opt(
                 "SELECT id, application_id, company_key, period_key, runner, status,
                         reserved_at_ms, updated_at_ms
@@ -1900,6 +2131,11 @@ pub fn update_attempt_reservation_status(
                     |row| row.get(0),
                 )?;
                 ensure_discovery_authority_in_sqlite_tx(&tx, account_id, &job_id, now)?;
+                ensure_original_source_application_authority_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                )?;
             }
             let changed = tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = ?3, updated_at_ms = ?4
@@ -1912,6 +2148,12 @@ pub fn update_attempt_reservation_status(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            if status == "running" {
+                lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                    .map_err(anyhow::Error::new)?;
+                lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
@@ -1924,6 +2166,11 @@ pub fn update_attempt_reservation_status(
                     )?
                     .get(0);
                 ensure_discovery_authority_in_pg_tx(&mut tx, account_id, &job_id, now)?;
+                ensure_original_source_application_authority_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                )?;
             }
             let changed = tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = $3, updated_at_ms = $4
@@ -1934,6 +2181,82 @@ pub fn update_attempt_reservation_status(
             Ok(changed)
         }
     })
+}
+
+fn ensure_original_source_application_authority_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<()> {
+    let (job_id, application_json, posting_json) = tx
+        .query_row(
+            "SELECT application.job_id, application.application_json, posting.posting_json
+               FROM jobs_applications application
+               JOIN jobs_postings posting
+                 ON posting.account_id = application.account_id
+                AND posting.id = application.job_id
+              WHERE application.account_id = ?1 AND application.id = ?2",
+            params![account_id, application_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("application or job not found"))?;
+    let application = parse_application_json(
+        application_json,
+        application_id,
+        &job_id,
+        "Jobs original-source queue authority application",
+    )?;
+    let posting: JobPosting =
+        parse_json(posting_json, "Jobs original-source queue authority posting")?;
+    let projection =
+        resolve_original_source_verification_projection_sqlite_tx(tx, account_id, &posting)?;
+    if !original_source_projection_matches_application(&application, &projection)? {
+        anyhow::bail!("original-source verification changed before application queueing")
+    }
+    Ok(())
+}
+
+fn ensure_original_source_application_authority_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<()> {
+    let row = tx
+        .query_opt(
+            "SELECT application.job_id, application.application_json, posting.posting_json
+               FROM jobs_applications application
+               JOIN jobs_postings posting
+                 ON posting.account_id = application.account_id
+                AND posting.id = application.job_id
+              WHERE application.account_id = $1 AND application.id = $2
+              FOR SHARE OF application, posting",
+            &[&account_id, &application_id],
+        )?
+        .ok_or_else(|| anyhow::anyhow!("application or job not found"))?;
+    let job_id: String = row.get(0);
+    let application = parse_application_json(
+        row.get(1),
+        application_id,
+        &job_id,
+        "Jobs original-source queue authority application",
+    )?;
+    let posting: JobPosting = parse_json(
+        row.get::<_, String>(2),
+        "Jobs original-source queue authority posting",
+    )?;
+    let projection =
+        resolve_original_source_verification_projection_postgres_tx(tx, account_id, &posting)?;
+    if !original_source_projection_matches_application(&application, &projection)? {
+        anyhow::bail!("original-source verification changed before application queueing")
+    }
+    Ok(())
 }
 
 fn ensure_discovery_authority_in_sqlite_tx(

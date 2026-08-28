@@ -12596,8 +12596,8 @@ pub(super) mod runner_volume_purge_tests {
             sponsorship: "not_required".to_string(),
             ..JobPreferences::default()
         };
-        let preferences = save_preferences(pool, account_id, &preferences)
-            .expect("save runner test preferences");
+        let preferences =
+            save_preferences(pool, account_id, &preferences).expect("save runner test preferences");
         let track_id = format!("track-{suffix}");
         let track = upsert_track(
             pool,
@@ -12663,15 +12663,6 @@ pub(super) mod runner_volume_purge_tests {
         let (application, _) =
             prepare_application(pool, account_id, &posting.id, "factual", "review_first")
                 .expect("prepare runner test application");
-        let application = update_application(
-            pool,
-            account_id,
-            &application.id,
-            "queued",
-            Some("review_first"),
-        )
-        .expect("queue runner test application")
-        .expect("runner test application exists");
         let run_id = format!("cloud-run-{suffix}");
         upsert_browser_session(
             pool,
@@ -12766,9 +12757,28 @@ pub(super) mod runner_volume_purge_tests {
             "packet": approved_packet,
             "job": approved_job,
         });
-        replace_application_receipt(pool, account_id, &application.id, application.receipt)
-            .expect("persist runner fixture approval")
-            .expect("runner fixture application remains");
+        assert_eq!(application.state, "awaiting_review");
+        application.state = "queued".to_string();
+        application.updated_at_ms = now_ms();
+        let payload = serde_json::to_string(&application)
+            .expect("encode preapproved runner fixture application");
+        let changed = pool
+            .get()
+            .expect("open runner fixture application connection")
+            .execute(
+                "UPDATE jobs_applications
+                    SET state = ?3, application_json = ?4, updated_at_ms = ?5
+                  WHERE account_id = ?1 AND id = ?2",
+                params![
+                    account_id,
+                    application.id,
+                    application.state,
+                    payload,
+                    application.updated_at_ms,
+                ],
+            )
+            .expect("persist preapproved queued runner fixture application");
+        assert_eq!(changed, 1);
         (application.id, run_id, browser_profile_id)
     }
 

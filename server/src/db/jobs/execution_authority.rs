@@ -22,7 +22,7 @@ fn current_execution_authorized_sqlite(
     else {
         return Ok(false);
     };
-    let Some(posting) = tx
+    let Some(stored_posting) = tx
         .query_row(
             "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
             params![account_id, application.job_id],
@@ -34,6 +34,13 @@ fn current_execution_authorized_sqlite(
     else {
         return Ok(false);
     };
+    let original_source_projection =
+        resolve_original_source_verification_projection_sqlite_tx(tx, account_id, &stored_posting)?;
+    if !original_source_projection_matches_application(application, &original_source_projection)? {
+        return Ok(false);
+    }
+    let posting =
+        posting_with_original_source_projection(&stored_posting, &original_source_projection);
     let Some((authoritative_track_id, authoritative_active, mut track)) = tx
         .query_row(
             "SELECT id, active, track_json FROM jobs_tracks
@@ -205,6 +212,7 @@ fn current_execution_authorized_postgres(
     application: &JobApplication,
     runner: ExecutionAuthorityRunner,
 ) -> Result<bool> {
+    lock_managed_cloud_release_registry_shared_postgres_tx(tx)?;
     lock_discovery_account_shared_postgres(tx, account_id)?;
     lock_account_policy_inputs_postgres(tx, account_id, false)?;
     let Some(profile_row) = tx.query_opt(
@@ -222,7 +230,17 @@ fn current_execution_authorized_postgres(
     else {
         return Ok(false);
     };
-    let posting: JobPosting = parse_json(posting_row.get(0), "Jobs execution posting")?;
+    let stored_posting: JobPosting = parse_json(posting_row.get(0), "Jobs execution posting")?;
+    let original_source_projection = resolve_original_source_verification_projection_postgres_tx(
+        tx,
+        account_id,
+        &stored_posting,
+    )?;
+    if !original_source_projection_matches_application(application, &original_source_projection)? {
+        return Ok(false);
+    }
+    let posting =
+        posting_with_original_source_projection(&stored_posting, &original_source_projection);
     let Some(track_row) = tx.query_opt(
         "SELECT id, active, track_json FROM jobs_tracks
           WHERE account_id = $1 AND id = $2 FOR SHARE",

@@ -15,14 +15,19 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   canonicalJsonBytes,
+  deriveManagedCloudCanaryCheckIds,
+  deriveManagedCloudRequiredRuntimePaths,
+  deriveRequiredRuntimeRoles,
   deriveManagedCloudRuntimeIdentitySha256,
   deriveManagedCloudTaskQueueSha256,
   inspectOciImageArchive,
   inspectStaticBundleArchive,
   MANAGED_CLOUD_AUDIENCES,
   MANAGED_CLOUD_BASE_CAPABILITIES,
+  MANAGED_CLOUD_BASE_RUNTIME_ROLES,
   MANAGED_CLOUD_COMPONENTS,
   MANAGED_CLOUD_PROTOCOL_IDS,
+  MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS,
   MANAGED_CLOUD_RUNTIME_CONTRACTS,
   sha256,
   validateManagedCloudActivationEvidence,
@@ -51,6 +56,7 @@ const PROTOCOL_VERSIONS = new Map([
   ["runner_profile_snapshot", 1],
   ["runner_result", 2],
   ["runtime_heartbeat", 1],
+  ["source_verification", 1],
   ["workflow_cleanup", 3],
   ["workflow_command", 2],
 ]);
@@ -70,6 +76,20 @@ const CANARY_CHECK_IDS = [
   "workflow-gateway-readiness",
   "workflow-worker-readiness",
 ].sort();
+const SOURCE_VERIFICATION_PROTOCOL_PATHS = [
+  "jobs/automation/src/original-source-verification.ts",
+  "jobs/automation/src/worker-auth.ts",
+  "jobs/workflows/src/original-source-verification-api.ts",
+  "jobs/workflows/src/original-source-verification-runtime.ts",
+  "jobs/workflows/src/original-source-verifier.ts",
+  "server/src/api/jobs_original_source_verifications.rs",
+  "server/src/api/jobs_worker_auth.rs",
+  "server/src/db/mod.rs",
+  "server/src/db/jobs/eligibility.rs",
+  "server/src/db/jobs/operational_holds.rs",
+  "server/src/db/jobs/original_source_verification.rs",
+  "server/src/jobs_ats_target.rs",
+];
 
 async function temporaryDirectory(t, label) {
   const path = await mkdtemp(join(tmpdir(), "bluey-" + label + "-"));
@@ -312,6 +332,47 @@ function releaseFixture() {
     verificationEvidenceSha256: "f".repeat(64),
     version: 1,
   };
+}
+
+function successorReleaseFixture() {
+  const manifest = releaseFixture();
+  manifest.version = 2;
+  manifest.audience = MANAGED_CLOUD_AUDIENCES.manifestV2;
+  manifest.sqliteMigrationHead =
+    "057_jobs_original_source_verification_authority.sql";
+  manifest.postgresMigrationHead =
+    "035_jobs_original_source_verification_authority.sql";
+  manifest.featureAuthority = {
+    ...manifest.featureAuthority,
+    sourceVerification: true,
+  };
+  manifest.featureAuthoritySha256 = sha256(
+    canonicalJsonBytes(manifest.featureAuthority),
+  );
+  manifest.capabilities = [
+    ...manifest.capabilities,
+    {
+      capability: "original_source_verifier",
+      componentId: "jobs-workflows",
+    },
+  ].sort((left, right) =>
+    left.componentId.localeCompare(right.componentId, "en") ||
+    left.capability.localeCompare(right.capability, "en"),
+  );
+  manifest.protocols = MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS.map(
+    (protocolId, index) => ({
+      protocolId,
+      protocolVersion: PROTOCOL_VERSIONS.get(protocolId),
+      schemaSha256: ((index + 1) % 10).toString(16).repeat(64),
+    }),
+  );
+  manifest.componentSetSha256 = sha256(canonicalJsonBytes({
+    audience: MANAGED_CLOUD_AUDIENCES.componentInventory,
+    capabilities: manifest.capabilities,
+    components: manifest.components,
+    version: 1,
+  }));
+  return manifest;
 }
 
 function sourceFile(path, fill = "a") {
@@ -605,6 +666,61 @@ function releaseContractFixture() {
   };
 }
 
+function successorReleaseContractFixture() {
+  const fixture = releaseContractFixture();
+  const sources = sourceSet(SOURCE_VERIFICATION_PROTOCOL_PATHS, "d");
+  fixture.protocolContract.schemaVersion = 2;
+  fixture.protocolContract.protocols.splice(9, 0, {
+    protocolId: "source_verification",
+    protocolVersion: 1,
+    schemaSha256: sources.setSha256,
+    sourceFiles: sources.files,
+  });
+  fixture.migrationContract.sqlite = {
+    files: [sourceFile(
+      "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+      "e",
+    )],
+    head: "057_jobs_original_source_verification_authority.sql",
+    name: "sqlite",
+    setSha256: "",
+  };
+  fixture.migrationContract.postgres = {
+    files: [sourceFile(
+      "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+      "f",
+    )],
+    head: "035_jobs_original_source_verification_authority.sql",
+    name: "postgres",
+    setSha256: "",
+  };
+  for (const dialect of ["postgres", "sqlite"]) {
+    fixture.migrationContract[dialect].setSha256 = sha256(
+      canonicalJsonBytes(fixture.migrationContract[dialect].files),
+    );
+  }
+  fixture.migrationContract.paritySha256 = sha256(canonicalJsonBytes({
+    postgres: [fixture.migrationContract.postgres.head],
+    sqlite: [fixture.migrationContract.sqlite.head],
+  }));
+  fixture.manifest = {
+    ...fixture.manifest,
+    version: 2,
+    migrationSetSha256: sha256(canonicalJsonBytes(fixture.migrationContract)),
+    postgresMigrationHead: fixture.migrationContract.postgres.head,
+    protocolSetSha256: sha256(canonicalJsonBytes(fixture.protocolContract)),
+    protocols: fixture.protocolContract.protocols.map(
+      ({ protocolId, protocolVersion, schemaSha256 }) => ({
+        protocolId,
+        protocolVersion,
+        schemaSha256,
+      }),
+    ),
+    sqliteMigrationHead: fixture.migrationContract.sqlite.head,
+  };
+  return fixture;
+}
+
 function rawPublicKey(pair) {
   return pair.publicKey.export({ format: "jwk" }).x;
 }
@@ -835,6 +951,70 @@ test("release-v1 validates the exact artifacts, capabilities, migrations, and pr
     /content-addressed/,
   );
   assert.match(portal.artifactRef, new RegExp(portal.artifactSha256));
+});
+
+test("release-v2 binds source verification capability, protocol, role, and entrypoint", () => {
+  const manifest = successorReleaseFixture();
+  assert.equal(validateReleaseManifest(manifest), manifest);
+  assert.deepEqual(deriveRequiredRuntimeRoles(manifest.featureAuthority), [
+    ...MANAGED_CLOUD_BASE_RUNTIME_ROLES,
+    "original_source_verifier",
+  ].sort());
+  assert.deepEqual(
+    deriveManagedCloudCanaryCheckIds(manifest.featureAuthority),
+    [...CANARY_CHECK_IDS, "original-source-verifier-readiness"].sort(),
+  );
+  assert.deepEqual(
+    deriveManagedCloudRequiredRuntimePaths(
+      "jobs-workflows",
+      manifest.capabilities,
+    ).filter((path) => path.includes("original-source")),
+    ["app/workflows/dist/original-source-verifier.js"],
+  );
+  assert.doesNotThrow(() => deriveManagedCloudRuntimeIdentitySha256(
+    "a".repeat(64),
+    "jobs-workflows",
+    "original_source_verifier",
+  ));
+
+  const versionOneEnabled = releaseFixture();
+  versionOneEnabled.featureAuthority.sourceVerification = true;
+  const versionTwoDisabled = structuredClone(manifest);
+  versionTwoDisabled.featureAuthority.sourceVerification = false;
+  for (const invalid of [versionOneEnabled, versionTwoDisabled]) {
+    invalid.featureAuthoritySha256 = sha256(
+      canonicalJsonBytes(invalid.featureAuthority),
+    );
+    assert.throws(() => validateReleaseManifest(invalid), /v1=false or v2=true/);
+  }
+
+  const missingCapability = structuredClone(manifest);
+  missingCapability.capabilities = missingCapability.capabilities.filter(
+    (entry) => entry.capability !== "original_source_verifier",
+  );
+  assert.throws(
+    () => validateReleaseManifest(missingCapability),
+    /capabilit/,
+  );
+
+  const wrongProtocol = structuredClone(manifest);
+  wrongProtocol.protocols.find(
+    (entry) => entry.protocolId === "source_verification",
+  ).protocolVersion = 2;
+  assert.throws(
+    () => validateReleaseManifest(wrongProtocol),
+    /exact sorted versioned set/,
+  );
+
+  const contracts = successorReleaseContractFixture();
+  assert.equal(validateManagedCloudReleaseContracts(contracts), true);
+  contracts.protocolContract.protocols.find(
+    (entry) => entry.protocolId === "source_verification",
+  ).sourceFiles.pop();
+  assert.throws(
+    () => validateManagedCloudReleaseContracts(contracts),
+    /required source paths/,
+  );
 });
 
 test("release contracts prove full source sets without configured runtime identity", () => {

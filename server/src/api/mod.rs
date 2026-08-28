@@ -28,6 +28,7 @@ mod jobs_mailbox;
 pub mod jobs_mailbox_oauth;
 pub mod jobs_managed_cloud_releases;
 pub mod jobs_operations;
+pub mod jobs_original_source_verifications;
 pub(crate) mod jobs_resume_assets;
 pub(crate) mod jobs_resume_generation;
 pub mod jobs_runner_volumes;
@@ -186,6 +187,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .merge(
             jobs::worker_router()
                 .merge(jobs_ats_certifications::worker_router())
+                .merge(jobs_original_source_verifications::worker_router())
                 .merge(jobs_managed_cloud_releases::worker_router())
                 .merge(jobs_runner_volumes::worker_router())
                 .route_layer(axum::middleware::from_fn_with_state(
@@ -455,6 +457,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         .merge(
             jobs::worker_router()
                 .merge(jobs_ats_certifications::worker_router())
+                .merge(jobs_original_source_verifications::worker_router())
                 .merge(jobs_managed_cloud_releases::worker_router())
                 .merge(jobs_runner_volumes::worker_router())
                 .route_layer(axum::middleware::from_fn_with_state(

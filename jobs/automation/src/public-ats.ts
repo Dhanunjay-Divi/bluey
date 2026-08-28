@@ -1232,7 +1232,7 @@ function normalizeJob(source: AtsKind, raw: RawJob): NormalizedJob {
   };
 }
 
-function normalizeEmploymentType(
+export function normalizeEmploymentType(
   explicit: string | undefined,
 ): string | undefined {
   const value = (explicit ?? "").toLowerCase().replace(/[^a-z0-9+]+/g, " ");
@@ -1336,7 +1336,7 @@ function hasNegatedSignal(value: string, signal: string): boolean {
   ).test(value);
 }
 
-function leverCompensation(value: unknown): string | undefined {
+export function leverCompensation(value: unknown): string | undefined {
   const range = asRecord(value);
   const minimum = Number(range.min);
   const maximum = Number(range.max);
@@ -1350,7 +1350,7 @@ function leverCompensation(value: unknown): string | undefined {
   return `${currency} ${bounds}${interval ? ` ${interval}` : ""}`;
 }
 
-function leverDescription(item: Record<string, unknown>): string {
+export function leverDescription(item: Record<string, unknown>): string {
   const sections = [asString(item.descriptionPlain || item.description)];
   for (const value of asArray(item.lists)) {
     const section = asRecord(value);
@@ -1376,7 +1376,7 @@ function matchesQuery(job: NormalizedJob, query: DiscoveryQuery): boolean {
   return true;
 }
 
-function extractSmartRecruitersDescription(
+export function extractSmartRecruitersDescription(
   item: Record<string, unknown>,
 ): string {
   const sections = asRecord(asRecord(item.jobAd).sections);
@@ -1388,7 +1388,7 @@ function extractSmartRecruitersDescription(
     .join("\n\n");
 }
 
-function inferWorkplace(
+export function inferWorkplace(
   value: string | undefined,
 ): NormalizedJob["workplace"] {
   // A provider's explicit workplace category is typed evidence. Location text
@@ -2139,7 +2139,7 @@ function normalizeMaxPages(value: number | undefined): number {
     : 5;
 }
 
-function stripMarkup(value: string): string {
+export function stripMarkup(value: string): string {
   return value
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -2238,7 +2238,7 @@ function asOptionalString(value: unknown): string | undefined {
   return result || undefined;
 }
 
-function combineTypedFields(...values: unknown[]): string | undefined {
+export function combineTypedFields(...values: unknown[]): string | undefined {
   const combined = values.map(asOptionalString).filter(Boolean).join(" ");
   return combined || undefined;
 }

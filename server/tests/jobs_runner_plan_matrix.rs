@@ -23,7 +23,6 @@ use serde_json::{json, Value};
 use serial_test::serial;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
-use wiremock::MockServer;
 
 const TEST_SECRET: &str = "jobs-runner-plan-matrix-secret-32-bytes";
 const JOBS_DATA_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -513,7 +512,7 @@ impl TestContext {
             eligibility: None,
         };
         posting_input.canonical_key = jobs::canonical_job_key(&posting_input);
-        posting_input.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+        posting_input.discovery_evidence = JobDiscoveryEvidence::provider_verified_original_source(
             posting_input.canonical_key.clone(),
             format!("matrix-employer:{slug}"),
             Some("boards.greenhouse.io".to_string()),
@@ -622,7 +621,7 @@ fn jobs_api_handlers_have_no_direct_workflow_gateway_boundary() {
 
 #[tokio::test]
 #[serial]
-async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
+async fn free_pro_cloud_entitlements_remain_observable_but_review_first_blocks_effects() {
     let _env = EnvGuard::capture(&[
         "BLUEY_JOBS_BETA_ENABLED",
         "BLUEY_JOBS_DATA_KEY",
@@ -692,170 +691,99 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
         0
     );
 
-    // Free may approve a reviewed packet, but neither browser runner is included.
-    let free = ctx.account("free", "free");
-    let free_application = ctx.prepare(&free.account, "free");
-    let (free_approval, _) = ctx.approve(&free_application, &free.token).await;
-    assert_eq!(free_approval, StatusCode::OK);
-    let (free_local, _) = ctx.queue(&free_application, &free.token, "local").await;
-    let (free_cloud, _) = ctx.queue(&free_application, &free.token, "cloud").await;
-    assert_eq!(free_local, StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(free_cloud, StatusCode::PAYMENT_REQUIRED);
+    // Phase 614 verifies ATS provenance but deliberately cannot mint independent employer/risk
+    // authority. Plan entitlements and release readiness therefore remain observable while every
+    // execution-capable approval fails closed and leaves no durable side effect.
+    for (plan, expected_local, expected_cloud) in [
+        ("free", false, false),
+        ("pro", true, false),
+        ("cloud", true, true),
+    ] {
+        let account = ctx.account(&format!("source-boundary-{plan}"), plan);
+        if expected_local {
+            assign_browser_release_channel(&ctx.pool, &account.account.id);
+            let release = jobs::local_browser_release_availability(
+                &ctx.pool,
+                &account.account.id,
+                TEST_BROWSER_SERVER_RELEASE_ID,
+            )
+            .expect("load assigned Browser release");
+            assert!(matches!(
+                release,
+                jobs::LocalBrowserReleaseAvailability::Available {
+                    ref channel,
+                    ref release_id,
+                    ref artifact_origin,
+                    ..
+                } if channel == "beta"
+                    && release_id == "browser-release-603-1"
+                    && artifact_origin == "https://bluey.sh"
+            ));
+        }
+        let entitlement = jobs::get_entitlement(&ctx.pool, &account.account.id)
+            .expect("load source-boundary entitlement");
+        assert_eq!(entitlement.local_browser, expected_local);
+        assert_eq!(entitlement.cloud_browser, expected_cloud);
+        let used_packets_before = entitlement.used_packets;
 
-    // Every build requires the explicit distribution flag in addition to release authority.
-    let pro_disabled = ctx.account("pro-distribution-disabled", "pro");
-    let pro_disabled_application = ctx.prepare(&pro_disabled.account, "pro-distribution-disabled");
-    let (approval_status, _) = ctx
-        .approve(&pro_disabled_application, &pro_disabled.token)
-        .await;
-    assert_eq!(approval_status, StatusCode::OK);
-    std::env::set_var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED", "0");
-    let (disabled_status, _) = ctx
-        .queue(&pro_disabled_application, &pro_disabled.token, "local")
-        .await;
-    assert_eq!(disabled_status, StatusCode::SERVICE_UNAVAILABLE);
-    std::env::set_var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED", "1");
+        let prepared = ctx.prepare(&account.account, &format!("source-boundary-{plan}"));
+        let application_before =
+            jobs::get_application(&ctx.pool, &account.account.id, &prepared.id)
+                .expect("load application before denied approval")
+                .expect("prepared application exists");
+        let sessions_before = jobs::list_browser_sessions(&ctx.pool, &account.account.id)
+            .expect("list sessions before denied approval");
+        let (reservations_before, commands_before): (i64, i64) = ctx
+            .pool
+            .get()
+            .expect("open matrix database")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM jobs_attempt_reservations WHERE account_id = ?1),
+                    (SELECT COUNT(*) FROM jobs_workflow_commands WHERE account_id = ?1)",
+                rusqlite::params![account.account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count effects before denied approval");
 
-    // Pro receives local only. Approval meters once, and queue/retry paths are idempotent.
-    let pro = ctx.account("pro", "pro");
-    assign_browser_release_channel(&ctx.pool, &pro.account.id);
-    let pro_release = jobs::local_browser_release_availability(
-        &ctx.pool,
-        &pro.account.id,
-        TEST_BROWSER_SERVER_RELEASE_ID,
-    )
-    .expect("load assigned Pro Browser release");
-    assert!(matches!(
-        pro_release,
-        jobs::LocalBrowserReleaseAvailability::Available {
-            ref channel,
-            ref release_id,
-            ref artifact_origin,
-            ..
-        } if channel == "beta"
-            && release_id == "browser-release-603-1"
-            && artifact_origin == "https://bluey.sh"
-    ));
-    let pro_application = ctx.prepare(&pro.account, "pro");
-    let (approval_status, approval_body) = ctx.approve(&pro_application, &pro.token).await;
-    assert_eq!(approval_status, StatusCode::OK);
-    assert_eq!(approval_body["metering"]["newly_metered"], true);
-    assert_eq!(approval_body["metering"]["used_packets"], 1);
-    let (second_approval_status, _) = ctx.approve(&pro_application, &pro.token).await;
-    assert_eq!(second_approval_status, StatusCode::CONFLICT);
-    let (pro_local_status, pro_local_body) = ctx.queue(&pro_application, &pro.token, "local").await;
-    assert_eq!(pro_local_status, StatusCode::OK);
-    assert!(pro_local_body["launch_url"]
-        .as_str()
-        .is_some_and(|url| url.starts_with("bluey-jobs://run/")));
-    let (pro_cloud_status, _) = ctx.queue(&pro_application, &pro.token, "cloud").await;
-    assert_eq!(pro_cloud_status, StatusCode::PAYMENT_REQUIRED);
-    let pro_entitlement =
-        jobs::get_entitlement(&ctx.pool, &pro.account.id).expect("read Pro metering");
-    assert_eq!(pro_entitlement.used_packets, 1);
-    let replay = jobs::commit_packet(&ctx.pool, &pro.account.id, &pro_application.id)
-        .expect("replay Pro packet commit");
-    assert!(!replay.newly_metered);
-    assert_eq!(replay.used_packets, 1);
+        let (approval_status, _) = ctx.approve(&prepared, &account.token).await;
+        assert_eq!(approval_status, StatusCode::CONFLICT);
+        let (local_status, _) = ctx.queue(&prepared, &account.token, "local").await;
+        let (cloud_status, _) = ctx.queue(&prepared, &account.token, "cloud").await;
+        assert_eq!(local_status, StatusCode::CONFLICT);
+        assert_eq!(cloud_status, StatusCode::CONFLICT);
 
-    // Cloud includes both runners at the plan layer, but a fresh background effect still
-    // requires signed account-scoped managed-release readiness. Legacy flags, a ready volume
-    // fleet, and gateway credentials are intentionally insufficient.
-    let cloud = ctx.account("cloud", "cloud");
-    assign_browser_release_channel(&ctx.pool, &cloud.account.id);
-    let cloud_local_application = ctx.prepare(&cloud.account, "cloud-local");
-    let (cloud_local_approval, _) = ctx.approve(&cloud_local_application, &cloud.token).await;
-    assert_eq!(cloud_local_approval, StatusCode::OK);
-    let (cloud_local_status, _) = ctx
-        .queue(&cloud_local_application, &cloud.token, "local")
-        .await;
-    assert_eq!(cloud_local_status, StatusCode::OK);
-
-    let cloud_gateway_application = ctx.prepare(&cloud.account, "cloud-gateway");
-    let (cloud_gateway_approval, _) = ctx.approve(&cloud_gateway_application, &cloud.token).await;
-    assert_eq!(cloud_gateway_approval, StatusCode::OK);
-    let application_before =
-        jobs::get_application(&ctx.pool, &cloud.account.id, &cloud_gateway_application.id)
-            .expect("load cloud application before denied admission")
-            .expect("cloud application exists");
-    let sessions_before = jobs::list_browser_sessions(&ctx.pool, &cloud.account.id)
-        .expect("list cloud browser sessions before denied admission");
-    let reservations_before: i64 = ctx
-        .pool
-        .get()
-        .expect("open matrix database")
-        .query_row(
-            "SELECT COUNT(*) FROM jobs_attempt_reservations WHERE account_id = ?1",
-            rusqlite::params![cloud.account.id],
-            |row| row.get(0),
-        )
-        .expect("count attempt reservations before denied admission");
-    let used_packets_before = jobs::get_entitlement(&ctx.pool, &cloud.account.id)
-        .expect("load cloud metering before denied admission")
-        .used_packets;
-    std::env::remove_var("BLUEY_JOBS_WORKFLOW_TOKEN");
-    let (staged_status, staged_body) = ctx
-        .queue(&cloud_gateway_application, &cloud.token, "cloud")
-        .await;
-    assert_eq!(staged_status, StatusCode::SERVICE_UNAVAILABLE);
-    assert!(staged_body.as_str().is_some_and(|message| message.contains(
-        "Background runner is included in your plan but has not been enabled for this release."
-    )));
-
-    let gateway = MockServer::start().await;
-    std::env::set_var("BLUEY_JOBS_WORKFLOW_ORIGIN", gateway.uri());
-    std::env::set_var(
-        "BLUEY_JOBS_WORKFLOW_TOKEN",
-        "matrix-workflow-token-at-least-32-bytes",
-    );
-    let (replay_status, replay_body) = ctx
-        .queue(&cloud_gateway_application, &cloud.token, "cloud")
-        .await;
-    assert_eq!(replay_status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(replay_body, staged_body);
-    let application_after =
-        jobs::get_application(&ctx.pool, &cloud.account.id, &cloud_gateway_application.id)
-            .expect("load cloud application after denied admission")
-            .expect("cloud application exists");
-    assert_eq!(application_after.state, application_before.state);
-    assert_eq!(application_after.run_id, application_before.run_id);
-    assert_eq!(application_after.receipt, application_before.receipt);
-    let sessions_after = jobs::list_browser_sessions(&ctx.pool, &cloud.account.id)
-        .expect("list cloud browser sessions after denied admission");
-    assert_eq!(
-        serde_json::to_value(sessions_after).expect("serialize browser sessions after denial"),
-        serde_json::to_value(sessions_before).expect("serialize browser sessions before denial")
-    );
-    let command_count: i64 = ctx
-        .pool
-        .get()
-        .expect("open matrix database")
-        .query_row(
-            "SELECT COUNT(*) FROM jobs_workflow_commands WHERE account_id = ?1",
-            rusqlite::params![cloud.account.id],
-            |row| row.get(0),
-        )
-        .expect("count staged cloud commands");
-    assert_eq!(
-        command_count, 0,
-        "unready cloud admission must be side-effect free"
-    );
-    let reservation_count: i64 = ctx
-        .pool
-        .get()
-        .expect("open matrix database")
-        .query_row(
-            "SELECT COUNT(*) FROM jobs_attempt_reservations WHERE account_id = ?1",
-            rusqlite::params![cloud.account.id],
-            |row| row.get(0),
-        )
-        .expect("count attempt reservations after denied admission");
-    assert_eq!(reservation_count, reservations_before);
-    assert_eq!(
-        jobs::get_entitlement(&ctx.pool, &cloud.account.id)
-            .expect("load cloud metering after denied admission")
-            .used_packets,
-        used_packets_before
-    );
-    assert!(gateway.received_requests().await.unwrap().is_empty());
+        let application_after = jobs::get_application(&ctx.pool, &account.account.id, &prepared.id)
+            .expect("load application after denied approval")
+            .expect("prepared application remains present");
+        assert_eq!(application_after.state, application_before.state);
+        assert_eq!(application_after.run_id, application_before.run_id);
+        assert_eq!(application_after.receipt, application_before.receipt);
+        let sessions_after = jobs::list_browser_sessions(&ctx.pool, &account.account.id)
+            .expect("list sessions after denied approval");
+        assert_eq!(
+            serde_json::to_value(sessions_after).expect("serialize sessions after denial"),
+            serde_json::to_value(sessions_before).expect("serialize sessions before denial")
+        );
+        let (reservations_after, commands_after): (i64, i64) = ctx
+            .pool
+            .get()
+            .expect("open matrix database")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM jobs_attempt_reservations WHERE account_id = ?1),
+                    (SELECT COUNT(*) FROM jobs_workflow_commands WHERE account_id = ?1)",
+                rusqlite::params![account.account.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("count effects after denied approval");
+        assert_eq!(reservations_after, reservations_before);
+        assert_eq!(commands_after, commands_before);
+        assert_eq!(
+            jobs::get_entitlement(&ctx.pool, &account.account.id)
+                .expect("load metering after denied approval")
+                .used_packets,
+            used_packets_before
+        );
+    }
 }
