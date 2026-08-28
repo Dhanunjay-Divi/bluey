@@ -7,6 +7,42 @@ under `docs/release/`.
 
 ### Added
 
+- Added Phase 614 Bluey Jobs original-source verification authority: an exact managed workflow
+  entrypoint and private worker API; paired SQLite/PostgreSQL fenced assignments, database-time
+  heartbeats, immutable observations/receipts/transitions, replay quarantine, and a monotonic
+  current head; anonymous bounded protocols for Greenhouse, Lever, Ashby, SmartRecruiters, and
+  Workday with duplicate-key pre-scan, fatal UTF-8, exact-octet/header evidence, strict JSON
+  media/encoding and recognized-field semantics, and conflict-aware alias handling; receipt-derived
+  posting projection; transactional queue/final-effect rechecks; and a
+  versioned managed-release v2 contract that preserves Phase 611 v1 rejection. PostgreSQL
+  application save/queue and final-effect paths now share canonical lock order, while verifier
+  lease, heartbeat, first
+  terminal publication, and changed-byte quarantine resolve immutable identity before taking
+  `H -> M -> D -> assignment`. Exact terminal replay remains read-only. The verifier scheduler uses
+  one bounded 32-candidate normal scan window, a separate eight-row hold-recheck budget, and
+  persisted cross-call hold backoff or typed supersession. Managed heartbeat expiry and grant
+  revocation retain their typed unavailable classification through SQLite/PostgreSQL assignment
+  rechecks; other registry failures remain storage/integrity errors. Mutable discovery fields or provider
+  presence cannot self-mint employer/scam/source authority. The product therefore remains
+  Review-first pending Phase 614B Signed Job Integrity Authority for independent employer/risk
+  clearance. The Jobs operational-readiness regression now covers original-source verification as
+  the eighth concrete capability and asserts its inherited global hold and absence of a native
+  blocker. The application state-machine regression also preserves its original
+  `awaiting_review`/`review_first` values when queueing lacks the required `approved_execution`
+  snapshot, without weakening transactional queue authority. Managed-cloud claim and final Submit
+  now make the combined `H -> exclusive M -> ATS -> fleet` prelock their first protected operation;
+  unmanaged paths retain `H -> shared M -> ATS`, and both acquire account `D` afterward. Certified
+  ATS fixtures use the honest `provider_verified_original_source` scope, while historical
+  source/category regressions assert Review-first preparation without minting queue authority.
+  Execution-lease/local-run intervention fixtures likewise retain real approved-execution
+  checksums and use test-only preapproved queue state for diagnostic reachability; their remaining
+  entitlement/match-threshold denials stay non-green and do not fabricate Phase 614B authority.
+  Reservation/running transitions remain `H -> M -> D` with source/discovery rechecks; their
+  independent ATS/integrity composition is explicitly parked for Phase 614B.
+  Direct/global discovery, source
+  verification in every current activation, and all production/provider-write flags remain false
+  or `0`; no live/authenticated provider action, application, message, deployment, customer cohort,
+  production flag read-back, or release claim is made.
 - Added the frozen Phase 613 Bluey Jobs role, skill, and typed-geography registry plus a paired
   SQLite/PostgreSQL ten-table Career Track policy authority. Global taxonomy/canonicalizer
   activations, policy-relevant account inputs, Track semantics, encrypted policy revisions and
