@@ -145,15 +145,33 @@
 
 - The four non-Jobs failures share the rolling Rust 1.98 Clippy surface and are independent of the
   Phase 611 managed-runner logic.
-- The complete proven eleven-file patch was backported without the unrelated Phase 623 UI changes;
+- The proven eleven-file patch was backported without the unrelated Phase 623 UI changes;
   fixing only the first `ipc_auth.rs` diagnostic would have left later failures.
 - Phase 611 still needs its own corrected exact-head run; green descendant evidence for the
   unchanged patch is compatibility precedent, not a substitute for combined-branch verification.
 
+### 611.8 — Remaining Rust 1.98 daemon application correction
+
+| Field | Value |
+|-------|-------|
+| Files | `crates/cue-daemon/src/app.rs` plus FIX-696 and Phase 611 records |
+| Source verdict | 🟢 independently reviewed; no P0/P1/P2/P3 finding |
+| Exact-head verdict | 🟡 fresh resource-capable rerun required |
+
+**Findings:**
+
+- Exact-head runs `33322554768` and `33322554753` exposed two additional constant-width
+  `chunks_exact(2)` diagnostics in daemon application code on macOS, Ubuntu, Windows, and the
+  observability job after the initial eleven-file backport.
+- FIX-696 applies only the matching `as_chunks::<2>()` transformations already present at green
+  descendant PR #33 head `83f15263`; no unrelated daemon or Phase 623 work is imported.
+- Rust 1.98 workspace formatting, diff checks, and a repository-wide numeric `.chunks_exact(...)`
+  scan pass. Independent review found no P0/P1/P2/P3 issue; combined exact-head CI remains required.
+
 ## Cross-Task Findings
 
-- The final independent review found no residual P0/P1/P2 correctness, security, privacy,
-  recovery, determinism, source-tree, path, or release-authority issue across FIX-693/FIX-694/FIX-695.
+- Final independent review found no residual P0/P1/P2 issue across FIX-693/FIX-694/FIX-695 and no
+  P0/P1/P2/P3 issue in FIX-696.
 - `directDiscovery`, `globalDiscovery`, and `sourceVerification` remain false because their exact
   pre-effect managed runtime boundaries are intentionally outside this batch.
 - Local source evidence does not claim hosted registry publication, signing ceremony, Temporal
@@ -263,7 +281,7 @@ exact-head CI rerun must replace this conditional status; no baseline result is 
 ## Overall Verdict
 
 🟡 **SOURCE GREEN; RESOURCE-CAPABLE AND HOSTED VERIFICATION PENDING** — Final independent review
-found no residual P0/P1/P2 issue, and full local automation/runner plus focused FIX-694/FIX-695
+found no residual issue through FIX-696, and full local automation/runner plus focused correction
 gates are green. Combined Rust and exact managed-runner Docker/CI gates remain required at the
 corrected head. Hosted launch evidence remains external and is not claimed by this verdict.
 

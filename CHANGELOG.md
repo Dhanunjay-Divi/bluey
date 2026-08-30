@@ -213,8 +213,9 @@ under `docs/release/`.
   identity now bind to the pull-request head SHA with a non-PR fallback instead of attesting a
   synthetic merge SHA. The prior 256-file error masked this later fail-closed path mismatch; no
   measurement root, release flag, or hosted authority was relaxed.
-- Backported the complete proven Rust 1.98 compatibility repair from `2f3910a1`, covering all
-  eleven affected core, daemon, RAG, and server files without importing unrelated Phase 623 work.
+- Completed Rust 1.98 compatibility across the initial proven eleven-file backport plus two
+  fixed-width chunk sites exposed by the exact Phase 611 rerun in the daemon application, without
+  importing unrelated Phase 623 work or changing runtime behavior.
 - Raised the closed managed-cloud runtime-measurement file bound from 256 to 512 across candidate
   construction, embedded runtime verification, and server release-evidence validation. The pinned
   Playwright Chromium headless-shell tree alone exceeds the old bound, so managed-runner image

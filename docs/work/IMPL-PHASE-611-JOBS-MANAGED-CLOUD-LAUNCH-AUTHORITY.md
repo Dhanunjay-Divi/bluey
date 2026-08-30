@@ -49,7 +49,7 @@
 
 ## Files Created / Modified
 
-Final branch-diff inventory: **93 paths** relative to Phase 610 base `89d6b820`, including this
+Final branch-diff inventory: **95 paths** relative to Phase 610 base `89d6b820`, including this
 implementation document and the Phase 611 review document. `M` means modified and `A` means added.
 
 | Status | File | Purpose |
@@ -59,6 +59,7 @@ implementation document and the Phase 611 review document. `M` means modified an
 | A | `.github/workflows/jobs-managed-cloud-release.yml` | Define manual candidate, authorize, promote, and rollback stages over stored bytes |
 | M | `CHANGELOG.md` | Record the bounded Phase 611 source result and parked launch evidence |
 | M | `crates/cue-core/src/ipc_auth.rs` | Remove the Rust 1.98 fixed-chunk Clippy failure without weakening bearer parsing |
+| M | `crates/cue-daemon/src/app.rs` | Complete Rust 1.98 fixed-width chunk handling exposed by the exact-head rerun |
 | M | `crates/cue-daemon/src/audio/framer.rs` | Preserve preallocated frame capacity after padded flush |
 | M | `crates/cue-daemon/src/audio/system_capture.rs` | Decode fixed PCM pairs through the Rust 1.98 array-chunk API |
 | M | `crates/cue-daemon/tests/system_audio_integration.rs` | Honor the declared integration deadline under parallel CI load |
@@ -69,7 +70,8 @@ implementation document and the Phase 611 review document. `M` means modified an
 | A | `docs/work/FIX-692-jobs-managed-runner-release-effect-boundary.md` | Record the missing runner release-bound effect authority and fix |
 | A | `docs/work/FIX-693-jobs-managed-runner-measurement-bound.md` | Record the impossible runner measurement ceiling and cross-language bounded correction |
 | A | `docs/work/FIX-694-jobs-managed-runner-node-path.md` | Record the pinned Playwright path mismatch, normalized runtime, and exact-head binding |
-| A | `docs/work/FIX-695-rust-1-98-compatibility-backport.md` | Record the complete proven rolling-toolchain compatibility backport |
+| A | `docs/work/FIX-695-rust-1-98-compatibility-backport.md` | Record the proven eleven-file rolling-toolchain compatibility backport |
+| A | `docs/work/FIX-696-rust-1-98-daemon-app-compatibility.md` | Record the two remaining daemon compatibility failures and correction |
 | A | `docs/work/IMPL-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Inventory implementation, validation state, deviations, and follow-ups |
 | A | `docs/work/REVIEW-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Record independent review evidence, remaining external gates, and verdict |
 | A | `infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql` | Add PostgreSQL release, runtime, readiness, command, request-start, and execution authority |
@@ -212,7 +214,8 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
 
 The final independent line-by-line source review found no residual P0/P1/P2 issue across FIX-693,
 FIX-694, and FIX-695, and the completed baseline full all-target Rust rerun passed with zero
-failures. Release status remains conditional on exact-head resource-capable and hosted evidence.
+failures. Independent review also found no P0/P1/P2/P3 issue in FIX-696; release status remains
+conditional on a fresh exact-head run and all remaining resource-capable and hosted evidence.
 
 Post-correction local evidence at the branch tip on 2026-08-24:
 
@@ -245,7 +248,7 @@ FIX-694 normalizes that regular file into the already-authoritative `/usr/local/
 measurement, removes the original after measurement, makes pull-request jobs check out and embed
 the same head SHA, and rejects symbolic links throughout every measured runtime root. Four sibling
 CI jobs also failed the new Rust 1.98
-Clippy surface; FIX-695 backports the complete proven eleven-file repair from `2f3910a1` without
+Clippy surface; FIX-695 backports the proven eleven-file repair from `2f3910a1` without
 absorbing unrelated Phase 623 work. Local evidence after the final source correction:
 
 ```text
@@ -269,6 +272,12 @@ The complete automation and runner test/typecheck gates are now green locally. R
 check/Clippy/tests plus the exact corrected managed-runner Docker build/native smoke remain
 required. Docker is unavailable locally, so a resource-capable CI rerun must record the image and
 native-addon result; the earlier successful stages cannot be inherited by either correction.
+
+The first combined exact-head run at `978ac4fe` passed native runner storage on Darwin, then exposed
+two additional Rust 1.98 constant-chunk diagnostics in `crates/cue-daemon/src/app.rs` across macOS,
+Ubuntu, Windows, and observability. FIX-696 applies only the two corresponding transformations
+already green at descendant head `83f15263`; Rust 1.98 workspace formatting, diff checks, and a repository-wide numeric
+`.chunks_exact(...)` scan pass locally. A new combined run remains required.
 
 Hosted container publication, immutable registry/static read-back, Temporal task-queue behavior,
 live runner capacity, runtime image-digest attestation, read-only-rootfs policy, customer cohort,
@@ -300,7 +309,7 @@ canary, and rollback are external-only gates and cannot be converted into local 
 
 ## Review Checklist (for reviewer)
 
-- [x] Final branch diff contains exactly 93 inventoried paths
+- [x] Final branch diff contains exactly 95 inventoried paths
 - [x] Files match the Round 611 scope with no unrelated or `docs/reviews/` changes
 - [x] New-effect availability requires exact live release and role quorum with no debug bypass
 - [x] Idempotent replay precedes mutable admission checks and preserves original A
