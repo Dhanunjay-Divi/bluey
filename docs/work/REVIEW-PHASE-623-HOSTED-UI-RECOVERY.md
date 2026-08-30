@@ -3,7 +3,7 @@
 > **Codex preflight:** Load `$bluey-ops` before review and verify its memory
 > against the current repository state and commit range.
 
-**Commit range:** `755e7d71..a37ebdaa`
+**Commit range:** `755e7d71..HEAD`
 **Reviewer:** Codex source self-review plus independent source and visual QA
 **Date:** 2026-08-30
 
@@ -50,7 +50,7 @@
 
 | Field | Value |
 |-------|-------|
-| Files | `native/macos/cue-overlay/Sources/cue-overlay/main.swift` |
+| Files | `native/macos/cue-overlay/Sources/cue-overlay/main.swift`, `ShortcutCoachmarkView.swift` |
 | Verdict | 🟢 accept |
 
 **Findings:**
@@ -72,14 +72,60 @@
   drag handlers are unchanged from `origin/main`.
 - Capture-visible settings were used only for local visual QA and are not part
   of the release configuration.
+- The post-sign-in coachmark is anchored to the real Shortcuts button, appears
+  once, does not replace active overlays or history, and defers when a text
+  editor has focus. Directly opening Shortcuts consumes the tip.
+- Light coachmark and full shortcut-modal screenshots confirm opaque, readable
+  text and controls even though the surrounding overlay remains translucent.
+
+### Desktop sign-in handoff
+
+| Field | Value |
+|-------|-------|
+| Files | CLI, daemon, native overlay, hosted account JavaScript and HTML |
+| Verdict | 🟢 accept |
+
+**Findings:**
+
+- The signed browser URL still carries the one-time code and server approval
+  remains explicit; no device is silently attached.
+- Copy now presents one `Connect this Bluey` confirmation. Re-entering the code
+  is accurately described as a fallback.
+- No token persistence, account authority, keychain, or authentication endpoint
+  changed.
+
+### Diagnostics and Rust 1.98 gates
+
+| Field | Value |
+|-------|-------|
+| Files | Daemon action classification plus Rust compatibility sites in root and server |
+| Verdict | 🟢 accept for Phase 623 scope |
+
+**Findings:**
+
+- Discrete native actions enter the existing metadata-only non-blocking local
+  log. Shown/hidden acknowledgements and continuous opacity events do not.
+- An initial per-event session-audit draft was rejected during review because
+  it could fsync and consume audit capacity on the answer path; no such write is
+  present in the final diff.
+- Full click-to-pixel correlation and optional remote diagnostic sharing remain
+  explicit Phase 624 work, not a Phase 623 claim.
+- Root and server strict Clippy pass on Rust 1.98. The code changes are typed
+  chunk conversions, a preallocated replacement-buffer swap, and narrow Axum
+  error-envelope lint annotations; public response behavior is unchanged.
+- The system-audio stub emitted the exact protocol handshake and 64,000-byte
+  PCM payload. Its integration test now honors the existing five-second outer
+  deadline rather than treating the first 500-millisecond quiet poll as a
+  terminal failure; five repeated focused runs and the final workspace run
+  passed.
 
 ## Cross-Task Findings
 
 - The answer-path fix and UI recovery are cohesive for the hosted desktop: a
   working managed response path now has bounded recovery copy and a compact,
   usable native surface.
-- No billing, authentication, provider-secret, keychain, capture-exclusion, or
-  production-flag boundary changed.
+- No billing, authentication authority, provider-secret, keychain,
+  capture-exclusion, or production-flag boundary changed.
 - No merge, deployment, release publication, or physical Windows validation is
   represented by this source batch.
 
@@ -98,6 +144,9 @@ Current Swift syntax parse: passed
 Current Swift debug build: passed
 Current four embedded Swift behavior suites: passed
 Current compact-pill and expanded-workspace visual QA: passed
+Current light post-sign-in coachmark and shortcut-modal visual QA: passed
+Current hosted JavaScript syntax check: passed
+Current Rust 1.98 root and server strict Clippy: passed
 Both Rust formatting checks and git diff --check: passed
 Physical packaged Windows/macOS release certification: not performed
 ```
@@ -118,3 +167,6 @@ physical macOS drag/persistence and packaged macOS/Windows certification pass.
 - Run physical packaged macOS and Windows certification before release.
 - Give unsupported contract skew its own bounded update-oriented reason instead
   of reusing disclosure-block recovery copy.
+- Implement the separately reviewed Phase 624 typed diagnostic bus and remove
+  remaining answer-hot-path synchronous support-audit persistence before
+  claiming full click-to-pixel bottleneck attribution.

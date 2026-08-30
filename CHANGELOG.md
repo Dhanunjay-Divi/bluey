@@ -7,6 +7,9 @@ under `docs/release/`.
 
 ### Added
 
+- Added a one-time, keyboard-accessible macOS shortcut coachmark after visible
+  desktop sign-in, anchored to the real Shortcuts control without enlarging the
+  112 by 30 Bluey pill.
 - Linked the Bluey landing, account, download, and policy headers to Bluey Jobs
   with a compact, accessible new-tab action across desktop and mobile layouts.
 - Added an opt-in, verified R2 cold-storage lifecycle for expired, unreferenced
@@ -21,6 +24,9 @@ under `docs/release/`.
 
 ### Changed
 
+- Simplified desktop account linking to one explicit `Connect this Bluey`
+  confirmation because the browser URL already carries the one-time code;
+  manual code entry remains an explicit fallback.
 - Reduced managed General-answer prompt duplication while preserving explicit
   mode and session rules, and refined the macOS overlay with a true 112 by 30
   compact pill, higher-contrast light surfaces, accessible history and
@@ -46,6 +52,13 @@ under `docs/release/`.
 
 ### Fixed
 
+- Kept shortcut help fully readable in macOS light mode at every overlay
+  opacity, including live theme changes, while delayed onboarding now preserves
+  active modals, history, and composer focus.
+- Restored Rust 1.98 strict-Clippy compatibility across the root workspace and
+  server without changing public API response shapes.
+- Kept system-audio integration checks reliable under parallel workspace load
+  while preserving a bounded five-second helper-startup failure deadline.
 - Restored hosted managed answers by separating Bluey's exact signed-release
   system contract from caller-controlled answer rules at the disclosure guard,
   preserving exact v0.1.97 through v0.1.104 client compatibility while unknown
