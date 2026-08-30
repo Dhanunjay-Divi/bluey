@@ -21,6 +21,10 @@ under `docs/release/`.
 
 ### Changed
 
+- Reduced managed General-answer prompt duplication while preserving explicit
+  mode and session rules, and refined the macOS overlay with a true 112 by 30
+  compact pill, higher-contrast light surfaces, accessible history and
+  confirmation controls, fitted shortcut help, and a bounded focus workspace.
 - Preserved three remaining Codex-owned local branch tips on named remote archive
   branches and documented why their older discovery, spend-accounting, and
   optional-provider patches must not be bulk-merged over current main.
@@ -42,6 +46,13 @@ under `docs/release/`.
 
 ### Fixed
 
+- Restored hosted managed answers by separating Bluey's exact signed-release
+  system contract from caller-controlled answer rules at the disclosure guard,
+  preserving exact v0.1.97 through v0.1.104 client compatibility while unknown
+  contracts and disclosure-bearing fields still fail closed.
+- Mapped the managed disclosure block through a bounded typed desktop error so
+  the overlay can give a safe recovery instruction without exposing arbitrary
+  server response text.
 - Serialized Windows AppUserModelID updates so concurrent disguise reassertion
   cannot corrupt the `cue-stealth` process heap during normal use or tests.
 - Made Bluey Jobs submission state and evidence runner-owned: customers can no
