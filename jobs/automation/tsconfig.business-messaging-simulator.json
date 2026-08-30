@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "declaration": false,
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": [
+    "tests/business-messaging-simulator.test.ts",
+    "tests/support/business-messaging-simulator.ts"
+  ],
+  "exclude": []
+}

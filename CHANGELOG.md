@@ -7,6 +7,17 @@ under `docs/release/`.
 
 ### Added
 
+- Added the Phase 620A1 Bluey Jobs business-messaging no-egress kernel for original,
+  deterministic owner-command planning across WhatsApp Business Platform and Apple Messages for
+  Business. A strict synthetic-only TypeScript simulator and non-default Rust verifier share
+  canonical command, plan, operation, receipt, and SHA-256 vectors; enforce universal `STOP`,
+  step-up-only chat approval, exact Jobs/source/integrity read-set binding, provider-specific truth
+  ceilings, and terminal post-request ambiguity; and report zero network, credential, provider,
+  browser, process, Jobs-mutation, or external-write attempts. Static CI containment prevents any
+  production module, route, worker, binary, Docker image, or managed release from referencing the
+  simulator. No provider account, credential, callback, database schema, UI, application,
+  employer/recruiter message, personal WhatsApp/iMessage session, production flag, deployment, or
+  external effect was added or enabled.
 - Added Phase 614B Bluey Jobs signed job-integrity authority and the FIX-725 through FIX-766
   hardening set. Exact Phase 614 original-source and ATS authority now compose with independently
   signed employer-identity and job-risk attestations under disjoint delegated roles, strict

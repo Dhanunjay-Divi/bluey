@@ -16,6 +16,7 @@ import {
   validateWorkspaceLock,
 } from "./check-provenance-licenses.mjs";
 import { classifyTrackedPath, scanTextForSecrets } from "./privacy-gate.mjs";
+import { checkBusinessMessagingSimulatorContainment } from "./check-business-messaging-simulator-containment.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -1496,11 +1497,12 @@ testPrivacyPaths();
 testSecretScanning();
 testPortalBundleFreshnessWorkflowGuard();
 testIntegrationTestSupportContainmentGuard();
+checkBusinessMessagingSimulatorContainment();
 testSchemaParity();
 testLicenseInventory();
 testProvenance();
 
 console.log(
   "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, " +
-    "integration test containment, lock inventory, and provenance).",
+  "integration and business-messaging simulator containment, lock inventory, and provenance).",
 );

@@ -84,6 +84,9 @@ jobs:
       - name: Build all Jobs workspaces
         run: npm run build --prefix jobs
 
+      - name: Check business messaging simulator containment
+        run: node jobs/scripts/check-business-messaging-simulator-containment.mjs
+
       - name: Verify the checked-in Jobs portal bundle is current
         run: git diff --exit-code -- web/jobs
 
@@ -149,6 +152,18 @@ jobs:
         run: >-
           cargo test --manifest-path server/Cargo.toml --no-default-features
           --features integration-test-support --test integration_e2e
+
+      - name: Lint the business messaging simulator verifier
+        run: >-
+          cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features
+          --features business-messaging-simulator-test-support
+          --test business_messaging_simulator -- -D warnings
+
+      - name: Run the business messaging simulator verifier
+        run: >-
+          cargo test --manifest-path server/Cargo.toml --locked --no-default-features
+          --features business-messaging-simulator-test-support
+          --test business_messaging_simulator
 
   native-runner-storage-darwin:
     name: Native runner storage (Darwin)

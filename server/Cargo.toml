@@ -10,6 +10,7 @@ license = "Proprietary"
 [features]
 default = []
 integration-test-support = ["dep:serial_test"]
+business-messaging-simulator-test-support = []
 
 [[bin]]
 name = "bluey-server"
@@ -23,6 +24,11 @@ path = "src/bin/bluey-jobs-api.rs"
 name = "integration_e2e"
 path = "tests/integration_e2e.rs"
 required-features = ["integration-test-support"]
+
+[[test]]
+name = "business_messaging_simulator"
+path = "tests/business_messaging_simulator.rs"
+required-features = ["business-messaging-simulator-test-support"]
 
 [dependencies]
 tower = { version = "0.4", features = ["util"] }

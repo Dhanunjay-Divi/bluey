@@ -20,12 +20,20 @@
 #[cfg(all(feature = "integration-test-support", not(debug_assertions)))]
 compile_error!("integration-test-support must never be enabled in release builds");
 
+#[cfg(all(
+    feature = "business-messaging-simulator-test-support",
+    not(debug_assertions)
+))]
+compile_error!("business-messaging-simulator-test-support must never be enabled in release builds");
+
 pub mod api;
 pub mod auth;
 pub mod billing;
 pub mod config;
 pub mod db;
 pub(crate) mod jobs_ats_target;
+#[cfg(feature = "business-messaging-simulator-test-support")]
+pub mod jobs_business_messaging_simulator;
 pub mod jobs_communication_dispatch;
 pub mod jobs_global_archive;
 pub mod jobs_mailbox_sync;
