@@ -1024,6 +1024,9 @@ fn map_cloud_embed_error(error: cue_cloud_client::Error) -> EmbeddingError {
         cue_cloud_client::Error::Server { status } => {
             EmbeddingError::Request(format!("Bluey embedding server error {status}"))
         }
+        cue_cloud_client::Error::InternalDisclosureBlocked => {
+            EmbeddingError::Request("Bluey embedding request was blocked".into())
+        }
         cue_cloud_client::Error::Network(_) => {
             EmbeddingError::Request("Bluey embedding network error".into())
         }

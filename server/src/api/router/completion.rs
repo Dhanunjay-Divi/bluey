@@ -4,6 +4,7 @@ async fn complete_inner(
     account: Account,
     req: CompleteRequest,
     trace_id: String,
+    system_authority: ManagedSystemAuthority,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
     reconcile_expired_llm_usage(&state.pool, &account.id).map_err(|error| *error)?;
     if let Some(err) = billing_restricted_error(&account) {
@@ -20,7 +21,7 @@ async fn complete_inner(
             }),
         ));
     }
-    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req)
+    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req, system_authority)
         .map_err(InternalDisclosureBlocked::into_api_error)?;
 
     validate_complete_images(&req.image_data_urls)

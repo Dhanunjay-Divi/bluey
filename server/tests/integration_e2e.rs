@@ -28,6 +28,9 @@ use bluey_server::db::jobs::{
 };
 use bluey_server::db::usage::{self, UsageEvent};
 use bluey_server::db::{idempotency, open_pool, run_migrations, DbPool};
+use cue_core::prompt_contracts::{
+    LEGACY_MANAGED_PROVIDER_BASE_CONTRACT_V0_1_99_TO_101, MANAGED_PROVIDER_BASE_CONTRACT,
+};
 
 /// Test harness: starts wiremocks, builds an AppState pointed at them,
 /// returns the axum Router ready for ServiceExt::oneshot.
@@ -3224,7 +3227,7 @@ async fn router_complete_happy_path_with_mocked_openai() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "test-req-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "hello",
                 "lane": "instant"
             }))
@@ -3347,7 +3350,7 @@ async fn router_complete_rejects_billing_restricted_account() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "test-restricted-complete",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "hello",
                 "lane": "instant"
             }))
@@ -3409,7 +3412,7 @@ async fn router_complete_upstream_spend_guard_blocks_before_provider_hit() {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "request_id": request_id,
-                    "system": "you are helpful",
+                    "system": MANAGED_PROVIDER_BASE_CONTRACT,
                     "user": "hello",
                     "lane": "instant"
                 }))
@@ -3450,7 +3453,7 @@ async fn router_complete_idempotency_replay_returns_cached() {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "request_id": "test-idem-1",
-                    "system": "",
+                    "system": MANAGED_PROVIDER_BASE_CONTRACT,
                     "user": "hi",
                     "lane": "instant"
                 }))
@@ -3460,6 +3463,40 @@ async fn router_complete_idempotency_replay_returns_cached() {
         let resp = h.router.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), 200);
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn router_complete_accepts_exact_legacy_signed_release_contract() {
+    let h = boot_harness().await;
+    let access = signup_and_login(&h, "legacy-contract@example.com", "longenoughpw").await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{"message": {"content": "Legacy client still works"}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4}
+        })))
+        .expect(1)
+        .mount(&h.openai)
+        .await;
+
+    let req = Request::post("/router/complete")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {access}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "request_id": "legacy-managed-contract-1",
+                "system": LEGACY_MANAGED_PROVIDER_BASE_CONTRACT_V0_1_99_TO_101,
+                "user": "Give me a concise status update.",
+                "lane": "instant"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = h.router.clone().oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -3491,7 +3528,7 @@ async fn router_complete_stream_proxies_openai_deltas_then_billing() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-openai-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer quickly",
                 "lane": "instant"
             }))
@@ -3560,7 +3597,7 @@ async fn router_complete_stream_releases_multiple_guarded_deltas_losslessly() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-openai-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer quickly",
                 "lane": "instant"
             }))
@@ -3612,7 +3649,7 @@ async fn router_complete_stream_openai_error_frame_is_retryable() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-openai-error-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer quickly",
                 "lane": "instant"
             }))
@@ -3678,7 +3715,7 @@ async fn router_complete_stream_falls_back_after_pre_output_provider_error() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-pre-output-fallback-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer reliably",
                 "lane": "balanced"
             }))
@@ -3724,7 +3761,7 @@ async fn router_complete_stream_openai_truncated_after_delta_is_not_billed_or_re
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-openai-truncated-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer quickly",
                 "lane": "instant"
             }))
@@ -3775,7 +3812,7 @@ async fn router_complete_stream_openai_length_finish_reports_output_truncated() 
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-openai-length-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer quickly",
                 "lane": "instant",
                 "max_tokens": 64
@@ -3829,7 +3866,7 @@ async fn router_complete_stream_idempotency_replays_cached_stream_without_upstre
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "request_id": "stream-idem-1",
-                    "system": "you are helpful",
+                    "system": MANAGED_PROVIDER_BASE_CONTRACT,
                     "user": "answer quickly",
                     "lane": "instant"
                 }))
@@ -3885,7 +3922,7 @@ async fn router_complete_stream_proxies_anthropic_messages_sse() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-anthropic-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer a normal technical question",
                 "lane": "balanced"
             }))
@@ -3942,7 +3979,7 @@ async fn router_complete_stream_anthropic_truncated_after_delta_is_not_billed_or
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "stream-anthropic-truncated-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer a normal technical question",
                 "lane": "balanced"
             }))
@@ -3995,7 +4032,7 @@ async fn router_complete_falls_back_when_preferred_provider_429s() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "fallback-429-1",
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer a normal technical question",
                 "lane": "balanced"
             }))
@@ -4068,7 +4105,7 @@ async fn router_complete_retries_next_openai_key_on_429_without_customer_wait() 
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": request_id,
-                "system": "you are helpful",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "answer quickly",
                 "lane": "instant"
             }))
@@ -4122,7 +4159,7 @@ async fn router_complete_short_waits_account_llm_burst_guard() {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "request_id": request_id,
-                    "system": "you are helpful",
+                    "system": MANAGED_PROVIDER_BASE_CONTRACT,
                     "user": "answer a normal technical question",
                     "lane": "balanced"
                 }))
@@ -4174,7 +4211,7 @@ async fn router_complete_reports_upstream_error_after_capacity_skip() {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "request_id": request_id,
-                    "system": "you are helpful",
+                    "system": MANAGED_PROVIDER_BASE_CONTRACT,
                     "user": "answer a normal technical question",
                     "lane": "balanced"
                 }))
@@ -4223,7 +4260,7 @@ async fn router_complete_enforces_account_burst_before_second_upstream_hit() {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "request_id": format!("burst-limit-{idx}"),
-                    "system": "",
+                    "system": MANAGED_PROVIDER_BASE_CONTRACT,
                     "user": "hi",
                     "lane": "instant"
                 }))
@@ -6477,7 +6514,7 @@ async fn auto_topup_off_by_default_does_not_fire_charge() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "topup-test-no-pm",
-                "system": "",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "hi",
                 "lane": "instant"
             }))
@@ -6543,7 +6580,7 @@ async fn square_mode_never_runs_legacy_stripe_auto_topup() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "square-mode-no-stripe-topup",
-                "system": "",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "hi",
                 "lane": "instant"
             }))
@@ -6625,7 +6662,7 @@ async fn square_auto_reload_charges_saved_card_when_threshold_crosses() {
         .body(Body::from(
             serde_json::to_vec(&json!({
                 "request_id": "square-card-topup-trigger",
-                "system": "",
+                "system": MANAGED_PROVIDER_BASE_CONTRACT,
                 "user": "hi",
                 "lane": "instant"
             }))

@@ -27,7 +27,10 @@ use crate::db::{
 };
 use crate::pricing;
 use crate::routing;
-use cue_core::prompt_contracts::ROLE_ADAPTIVE_PRACTITIONER_VOICE;
+use cue_core::prompt_contracts::{
+    MANAGED_PROVIDER_ANSWER_RULES_SEPARATOR, ROLE_ADAPTIVE_PRACTITIONER_VOICE,
+    SUPPORTED_MANAGED_PROVIDER_BASE_CONTRACTS,
+};
 use cue_core::short_observability_ref;
 
 mod interview_contracts;
@@ -122,14 +125,36 @@ fn internal_disclosure_api_error() -> (StatusCode, Json<ApiError>) {
 }
 
 fn internal_disclosure_error(req: &CompleteRequest) -> Option<(StatusCode, Json<ApiError>)> {
-    complete_request_untrusted_text(req)
-        .any(is_internal_disclosure_request)
-        .then(internal_disclosure_api_error)
+    validate_managed_direct_request(req)
+        .err()
+        .map(InternalDisclosureBlocked::into_api_error)
 }
 
-fn complete_request_untrusted_text(req: &CompleteRequest) -> impl Iterator<Item = &str> {
+fn managed_answer_rules(system: &str) -> Result<Option<&str>, InternalDisclosureBlocked> {
+    for contract in SUPPORTED_MANAGED_PROVIDER_BASE_CONTRACTS {
+        if system == *contract {
+            return Ok(None);
+        }
+        let Some(tail) = system.strip_prefix(contract) else {
+            continue;
+        };
+        let Some(rules) = tail.strip_prefix(MANAGED_PROVIDER_ANSWER_RULES_SEPARATOR) else {
+            return Err(InternalDisclosureBlocked);
+        };
+        if rules.trim().is_empty() {
+            return Err(InternalDisclosureBlocked);
+        }
+        return Ok(Some(rules));
+    }
+    Err(InternalDisclosureBlocked)
+}
+
+fn complete_request_untrusted_text<'a>(
+    req: &'a CompleteRequest,
+    answer_rules: Option<&'a str>,
+) -> impl Iterator<Item = &'a str> {
     std::iter::once(req.request_id.as_str())
-        .chain(std::iter::once(req.system.as_str()))
+        .chain(answer_rules)
         .chain(std::iter::once(req.user.as_str()))
         .chain(req.session_id.as_deref())
         .chain(req.reasoning_effort.as_deref())
@@ -144,6 +169,24 @@ fn complete_request_untrusted_text(req: &CompleteRequest) -> impl Iterator<Item 
             .into_iter()
             .flatten()
         }))
+}
+
+fn validate_untrusted_direct_fields(
+    req: &CompleteRequest,
+    answer_rules: Option<&str>,
+) -> Result<(), InternalDisclosureBlocked> {
+    if complete_request_untrusted_text(req, answer_rules).any(is_internal_disclosure_request) {
+        return Err(InternalDisclosureBlocked);
+    }
+    Ok(())
+}
+
+fn validate_managed_direct_request(
+    req: &CompleteRequest,
+) -> Result<Option<&str>, InternalDisclosureBlocked> {
+    let answer_rules = managed_answer_rules(&req.system)?;
+    validate_untrusted_direct_fields(req, answer_rules)?;
+    Ok(answer_rules)
 }
 
 fn is_internal_disclosure_request(text: &str) -> bool {
@@ -1077,12 +1120,24 @@ struct TrustedInternalEnvelope<'a> {
     user: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ManagedSystemAuthority {
+    ExternalClientContract,
+    TrustedServerSystem,
+}
+
 impl<'a> TrustedInternalEnvelope<'a> {
     fn validate_direct_request(
         req: &'a CompleteRequest,
+        system_authority: ManagedSystemAuthority,
     ) -> Result<Self, InternalDisclosureBlocked> {
-        if complete_request_untrusted_text(req).any(is_internal_disclosure_request) {
-            return Err(InternalDisclosureBlocked);
+        match system_authority {
+            ManagedSystemAuthority::ExternalClientContract => {
+                validate_managed_direct_request(req)?;
+            }
+            ManagedSystemAuthority::TrustedServerSystem => {
+                validate_untrusted_direct_fields(req, None)?;
+            }
         }
         Ok(Self {
             system: &req.system,
