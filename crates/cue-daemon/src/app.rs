@@ -3910,6 +3910,12 @@ async fn handle_current_overlay_process_event(
         return;
     }
     let event_kind = overlay_event_label(&process_event.event);
+    if overlay_event_is_user_interaction(&process_event.event) {
+        info!(
+            overlay_generation = process_event.generation,
+            event_kind, "overlay user interaction accepted"
+        );
+    }
     if let Err(error) =
         handle_overlay_event(daemon, process_event.generation, process_event.event).await
     {
@@ -4047,6 +4053,37 @@ fn overlay_event_label(event: &OverlayEvent) -> &'static str {
     }
 }
 
+fn overlay_event_is_user_interaction(event: &OverlayEvent) -> bool {
+    matches!(
+        event,
+        OverlayEvent::AskRequested { .. }
+            | OverlayEvent::AttachRequested
+            | OverlayEvent::AttachFilesRequested { .. }
+            | OverlayEvent::RemoveContextRequested { .. }
+            | OverlayEvent::InstructionsRequested
+            | OverlayEvent::InstructionsUpdated { .. }
+            | OverlayEvent::PasteTextRequested { .. }
+            | OverlayEvent::SessionOpenRequested { .. }
+            | OverlayEvent::SessionRenameRequested { .. }
+            | OverlayEvent::SessionDeleteRequested { .. }
+            | OverlayEvent::SessionListRequested
+            | OverlayEvent::SessionContinueRequested
+            | OverlayEvent::SessionNewRequested
+            | OverlayEvent::ActivePageCaptureRequested
+            | OverlayEvent::AnalyzeScreenRequested { .. }
+            | OverlayEvent::RecapRequested
+            | OverlayEvent::ContextListRequested
+            | OverlayEvent::CaptureStartRequested
+            | OverlayEvent::CaptureStopRequested
+            | OverlayEvent::RecordingStartRequested
+            | OverlayEvent::RecordingStopRequested
+            | OverlayEvent::MeetingBannerAction { .. }
+            | OverlayEvent::TranscriptClearRequested
+            | OverlayEvent::SignInRequested
+            | OverlayEvent::CloseRequested
+    )
+}
+
 fn overlay_lifecycle_detail_is_safe(stage: &str) -> bool {
     matches!(
         stage,
@@ -4059,6 +4096,10 @@ fn overlay_lifecycle_detail_is_safe(stage: &str) -> bool {
             | "autosend_answer_skipped"
             | "ask_answer_sent"
             | "ask_answer_skipped"
+            | "theme_changed"
+            | "shortcuts_overlay_opened"
+            | "shortcuts_coachmark_shown"
+            | "shortcuts_coachmark_dismissed"
     )
 }
 
@@ -7452,8 +7493,10 @@ fn pcm16_i16le_stats(raw: &[u8]) -> Pcm16AudioStats {
     let mut peak = 0_i32;
     let mut nonzero = 0_usize;
     let mut sum_squares = 0_f64;
-    for chunk in raw[..sample_bytes].chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+    let (sample_pairs, remainder) = raw[..sample_bytes].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for chunk in sample_pairs {
+        let sample = i16::from_le_bytes(*chunk) as i32;
         let magnitude = sample.abs();
         if magnitude > 0 {
             nonzero = nonzero.saturating_add(1);
@@ -9105,7 +9148,11 @@ async fn push_login_started_card(
         CardKind::System,
         title,
         format!(
-            "Open the browser, sign in, then click Connect desktop.\nCode: {user_code}\nBluey will finish automatically.\nlogin_url: {login_url}"
+            "The browser link already includes this desktop's connection code.\n\
+             Sign in, then click Connect this Bluey once.\n\
+             Fallback code: {user_code}\n\
+             Bluey will finish automatically.\n\
+             login_url: {login_url}"
         ),
     )
     .await;
@@ -9117,7 +9164,10 @@ fn login_prompt_text(login_url: &str, user_code: &str, reopened: bool) -> String
     } else {
         "Opening Bluey sign-in in your browser."
     };
-    format!("{prefix}\nCode: {user_code}\nLogin: {login_url}")
+    format!(
+        "{prefix}\nNo code re-entry is normally needed.\n\
+         Fallback code: {user_code}\nLogin: {login_url}"
+    )
 }
 
 async fn run_background_cloud_login(
@@ -12944,16 +12994,15 @@ fn compact_managed_answer_context(context: &[AnswerContext]) -> Vec<AnswerContex
         &desired_metadata_bytes,
         MANAGED_ANSWER_CONTEXT_MAX_TOTAL_METADATA_BYTES,
     );
-    let mut metadata_budgets = metadata_budgets.chunks_exact(2);
+    let (metadata_budget_pairs, remainder) = metadata_budgets.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    let mut metadata_budgets = metadata_budget_pairs.iter();
     let mut compacted = retained
         .iter()
         .map(|item| {
             let [title_budget, source_budget] = metadata_budgets
                 .next()
-                .expect("each managed context item has two metadata budgets")
-            else {
-                unreachable!("managed context metadata budgets are paired")
-            };
+                .expect("each managed context item has two metadata budgets");
             let mut compacted = (*item).clone();
             compacted.title = item
                 .title
@@ -26178,6 +26227,38 @@ Speaker 2 8:53 At Fannie Mae, I had to understand SAS-to-AWS migration business 
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn overlay_diagnostics_classify_user_actions_without_content() {
+        assert!(!overlay_event_is_user_interaction(&OverlayEvent::Shown));
+        assert!(!overlay_event_is_user_interaction(
+            &OverlayEvent::OpacityUpdated { opacity: 0.5 }
+        ));
+        assert!(overlay_event_is_user_interaction(
+            &OverlayEvent::RecordingStartRequested
+        ));
+        assert!(overlay_event_is_user_interaction(
+            &OverlayEvent::AskRequested {
+                question: "private question".to_string(),
+                provider: None,
+                model: None,
+                mode: None,
+                visible_context_ids: Vec::new(),
+                answer_current_transcript: false,
+            }
+        ));
+        assert!(!overlay_event_is_user_interaction(&OverlayEvent::Pong));
+        assert!(!overlay_event_is_user_interaction(
+            &OverlayEvent::Lifecycle {
+                stage: "theme_changed".to_string(),
+                status: Some("light".to_string()),
+                detail: None,
+            }
+        ));
+
+        assert!(overlay_lifecycle_detail_is_safe("theme_changed"));
+        assert!(!overlay_lifecycle_detail_is_safe("unknown_stage"));
     }
 
     #[test]

@@ -1397,8 +1397,8 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const body = document.createElement('span');
         body.className = 'device-code-helper';
         body.textContent = accountToken()
-          ? 'Enter the code shown in the Bluey host overlay to sign that desktop into this account.'
-          : 'Enter the code shown in the Bluey host overlay, then sign in to connect that desktop.';
+          ? 'Only use this fallback when Bluey could not open the browser with its connection code.'
+          : 'Only use this fallback when Bluey could not carry its connection code into this page.';
         const form = document.createElement('form');
         form.className = 'device-code-form';
         form.noValidate = true;
@@ -1412,7 +1412,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         const button = document.createElement('button');
         button.type = 'submit';
         button.className = 'account-button secondary compact device-primary-action';
-        button.textContent = 'Connect';
+        button.textContent = 'Continue';
         const status = document.createElement('span');
         status.className = 'device-code-status';
         form.addEventListener('submit', (event) => {
@@ -1446,40 +1446,35 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         el.replaceChildren();
         const title = document.createElement('strong');
         const approved = isPendingDeviceApprovalFresh(code);
-        title.textContent = approved ? 'Bluey desktop is connected' : 'Finish desktop sign-in';
+        title.textContent = approved ? 'This Bluey is connected' : 'Connect this Bluey?';
         const body = document.createElement('span');
         if (approved) {
-          body.textContent = 'Return to Terminal or Bluey. This browser tab can stay open.';
+          body.textContent = 'You can return to Bluey now. This browser tab can be closed.';
           el.append(title, body);
           return;
         }
         el.classList.add('is-awaiting-action');
         shell?.classList.add('is-action-needed');
-        body.append('Terminal is waiting on code ');
-        const codeEl = document.createElement('code');
-        codeEl.textContent = code;
         if (accountToken()) {
-          body.append(
-            codeEl,
-            `. This connects only that desktop to ${currentAccountEmail || 'this Bluey account'} so it uses this account's shared balance.`
-          );
+          body.textContent = `Confirm once to connect the Bluey app that opened this page to ${currentAccountEmail || 'this account'}. You do not need to re-enter a code.`;
         } else {
-          body.append(
-            codeEl,
-            '. This code came from your desktop app. Sign in or create an account here, then confirm the desktop link before Bluey can use balance or cloud answers.'
-          );
+          body.textContent = 'Bluey securely carried its connection code into this page. Sign in or create an account, then confirm this desktop once.';
         }
         el.append(title, body);
+        const fallback = document.createElement('span');
+        fallback.className = 'device-code-helper';
+        fallback.textContent = `Fallback code: ${code}`;
+        el.append(fallback);
         if (accountToken()) {
           const actionRow = document.createElement('div');
           actionRow.className = 'device-action-row';
           const cue = document.createElement('span');
           cue.className = 'device-action-cue';
-          cue.textContent = 'Next step';
+          cue.textContent = 'One secure confirmation';
           const button = document.createElement('button');
           button.type = 'button';
           button.className = 'account-button secondary compact device-primary-action';
-          button.textContent = 'Connect desktop';
+          button.textContent = 'Connect this Bluey';
           button.setAttribute('aria-label', `Connect Bluey desktop using code ${code}`);
           button.addEventListener('click', () => {
             const previousCount = lastLinkedComputerCount;
@@ -1493,7 +1488,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
               })
               .catch((error) => {
                 button.disabled = false;
-                button.textContent = 'Connect desktop';
+                button.textContent = 'Connect this Bluey';
                 accountMessage(`Desktop link failed: ${error.message}`);
               });
             });
@@ -1527,7 +1522,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
         return false;
       }
       if (sessionStorage.getItem(deviceConfirmStorageKey(code)) !== '1') {
-        accountMessage('Press Connect desktop to finish Bluey login.');
+        accountMessage('Press Connect this Bluey to finish securely.');
         return false;
       }
       accountMessage('Connecting this account to the desktop app...');
@@ -3884,7 +3879,7 @@ if (!window.__BLUEY_SITE_BOOTED__) {
             await openDesktopDeepLinkIfNeeded();
           }
         } catch {
-          accountMessage('Bluey signed in. If the desktop is waiting for this account, use Connect desktop below.');
+          accountMessage('Bluey signed in. If your desktop is waiting, use Connect this Bluey below.');
         }
       } finally {
         if (refreshButton) refreshButton.disabled = false;

@@ -227,7 +227,7 @@ private func normalizePrivateInstructionText(_ text: String) -> String {
     return output.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private enum BlueyTheme {
+enum BlueyTheme {
     static let cyan = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 1.0)
     static let cyanSoft = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 0.14)
     static let panel = NSColor(red: 0.025, green: 0.029, blue: 0.036, alpha: 0.95)
@@ -255,7 +255,7 @@ private enum BlueyTheme {
     }
 }
 
-private enum BlueyLightTheme {
+enum BlueyLightTheme {
     static let accent = NSColor(red: 0.000, green: 0.310, blue: 0.525, alpha: 1.0)
     static let accentBorder = NSColor(red: 0.000, green: 0.390, blue: 0.635, alpha: 1.0)
     static let accentSoft = NSColor(red: 0.720, green: 0.895, blue: 0.970, alpha: 1.0)
@@ -307,6 +307,14 @@ private func establishesSignedInChrome(
     to next: OverlayAccountUIState
 ) -> Bool {
     current != .signedIn && next == .signedIn
+}
+
+private func shouldPresentPostSignInShortcutCoachmark(
+    from current: OverlayAccountUIState,
+    to next: OverlayAccountUIState,
+    alreadyShown: Bool
+) -> Bool {
+    current == .signedOut && next == .signedIn && !alreadyShown
 }
 
 private func parsedBalanceCents(from label: String) -> Int? {
@@ -390,7 +398,7 @@ private func blueyLightMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: C
 private enum OverlayPlacementStore {
     private static let pillFrameKey = "bluey.overlay.pill.frame.v2"
     private static let expandedFrameKey = "bluey.overlay.expanded.frame.v2"
-    private static let firstExpandedShortcutHelpKey = "bluey.overlay.firstExpandedShortcutHelpShown.v1"
+    private static let shortcutCoachmarkKey = "bluey.overlay.shortcutCoachmarkShown.v2"
 
     static func loadPillFrame(in visibleFrame: NSRect) -> NSRect? {
         loadFrame(key: pillFrameKey).map { clampedPillFrame($0, in: visibleFrame) }
@@ -404,13 +412,12 @@ private enum OverlayPlacementStore {
         UserDefaults.standard.removeObject(forKey: pillFrameKey)
     }
 
-    static func consumeFirstExpandedShortcutHelp() -> Bool {
-        let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: firstExpandedShortcutHelpKey) else {
-            return false
-        }
-        defaults.set(true, forKey: firstExpandedShortcutHelpKey)
-        return true
+    static var hasShownShortcutCoachmark: Bool {
+        UserDefaults.standard.bool(forKey: shortcutCoachmarkKey)
+    }
+
+    static func markShortcutCoachmarkShown() {
+        UserDefaults.standard.set(true, forKey: shortcutCoachmarkKey)
     }
 
     static func loadExpandedFrame(in visibleFrame: NSRect) -> NSRect? {
@@ -4695,9 +4702,9 @@ private final class FeedView: NSView {
         stack.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.13).cgColor
         stack.layer?.borderWidth = 1
         stack.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.38).cgColor
-        stack.toolTip = "Use this code on the Bluey account page to connect this device"
+        stack.toolTip = "Use this fallback code only if the browser did not carry it automatically"
 
-        let label = NSTextField(labelWithString: "Connect code")
+        let label = NSTextField(labelWithString: "Fallback code")
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = dimTextColor
@@ -5923,6 +5930,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let closeConfirmBody: NSTextField
     let closeConfirmCancelButton: NSButton
     let closeConfirmTurnOffButton: NSButton
+    let shortcutCoachmark: ShortcutCoachmarkView
 
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
@@ -6122,6 +6130,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmBody = NSTextField(wrappingLabelWithString: "This closes Bluey completely. To start again, run: bluey on")
         closeConfirmCancelButton = NSButton(title: "Cancel", target: nil, action: nil)
         closeConfirmTurnOffButton = NSButton(title: "Turn Off", target: nil, action: nil)
+        shortcutCoachmark = ShortcutCoachmarkView(frame: .zero)
 
         super.init(frame: frameRect)
 
@@ -6263,6 +6272,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmBody,
             closeConfirmCancelButton,
             closeConfirmTurnOffButton,
+            shortcutCoachmark,
         ] {
             view.translatesAutoresizingMaskIntoConstraints = false
         }
@@ -6364,6 +6374,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmPanel.addSubview(closeConfirmBody)
         closeConfirmPanel.addSubview(closeConfirmCancelButton)
         closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
+        shortcutCoachmark.translatesAutoresizingMaskIntoConstraints = true
+        shortcutCoachmark.isHidden = true
+        shortcutCoachmark.onShowShortcuts = { [weak self] in
+            self?.dismissShortcutCoachmark()
+            self?.showShortcutHelpOverlay(source: "coachmark")
+        }
+        shortcutCoachmark.onDismiss = { [weak self] in
+            self?.dismissShortcutCoachmark()
+        }
+        addSubview(shortcutCoachmark)
         keyboardFocusRing.translatesAutoresizingMaskIntoConstraints = true
         addSubview(keyboardFocusRing)
         // Keep the fixed chrome rows above transparent scroll/canvas surfaces
@@ -6979,6 +6999,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
         refreshConfirmationChrome()
+        shortcutCoachmark.applyTheme(light: lightThemeEnabled)
         refreshKeyboardFocusRingStyle()
         feed.setLightTheme(lightThemeEnabled, opacity: backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
@@ -7016,9 +7037,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             .withAlphaComponent(lightThemeEnabled ? 0.26 : 0.52)
             .cgColor
         closeConfirmPanel.layer?.backgroundColor = (lightThemeEnabled
-            ? BlueyLightTheme.contentHigh.withAlphaComponent(
-                lightMaterialAlpha(0.998, floor: 0.38))
-            : BlueyTheme.panelDeep.withAlphaComponent(materialAlpha(0.98)))
+            ? BlueyLightTheme.contentHigh.withAlphaComponent(0.995)
+            : BlueyTheme.panelDeep.withAlphaComponent(0.99))
             .cgColor
         closeConfirmPanel.layer?.borderColor = themedAccentBorderColor
             .withAlphaComponent(lightThemeEnabled ? 0.64 : 0.30)
@@ -7620,7 +7640,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeButton,
         ])
 
-        var controls: [NSView] = headerControls
+        var controls: [NSView] = []
+
+        if !shortcutCoachmark.isHidden {
+            controls.append(contentsOf: controlsInView(shortcutCoachmark))
+        }
+
+        controls.append(contentsOf: headerControls)
 
         if !sessionDrawer.isHidden {
             controls.append(contentsOf: controlsInView(sessionDrawer))
@@ -8608,6 +8634,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 || view is NSSlider
                 || view is OpacityScrubberView
                 || view is CanvasDividerView
+                || view is ShortcutCoachmarkView
             {
                 return true
             }
@@ -8949,6 +8976,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         raiseFixedChromeToFront()
         layoutHeaderChromeControls()
+        layoutShortcutCoachmark()
         headerBar.isHidden = false
         headerChrome.isHidden = false
         headerBar.alphaValue = 1
@@ -8988,6 +9016,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateSessionDrawerGeometry(layoutWidth: layoutWidth, layoutHeight: layoutHeight)
         answerStyleOverlay.layer?.zPosition = 4_200
         closeConfirmOverlay.layer?.zPosition = 4_300
+        shortcutCoachmark.layer?.zPosition = 4_500
         keyboardFocusRing.layer?.zPosition = 4_900
         toastView.layer?.zPosition = 4_100
         transcriptStrip.layer?.zPosition = 3_000
@@ -9028,12 +9057,38 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let topSibling = subviews.last { $0 !== headerBar }
             addSubview(headerBar, positioned: .above, relativeTo: topSibling)
         }
-        for overlay in [sessionDrawer, answerStyleOverlay, closeConfirmOverlay, toastView] {
+        for overlay in [sessionDrawer, answerStyleOverlay, closeConfirmOverlay, toastView, shortcutCoachmark] {
             if overlay.superview === self, !overlay.isHidden {
                 let topSibling = subviews.last { $0 !== overlay }
                 addSubview(overlay, positioned: .above, relativeTo: topSibling)
             }
         }
+        if keyboardFocusRing.superview === self, !keyboardFocusRing.isHidden {
+            let topSibling = subviews.last { $0 !== keyboardFocusRing }
+            addSubview(keyboardFocusRing, positioned: .above, relativeTo: topSibling)
+        }
+    }
+
+    private func layoutShortcutCoachmark() {
+        guard !shortcutCoachmark.isHidden else { return }
+        let target = shortcutsButton.convert(shortcutsButton.bounds, to: self)
+        guard target.width > 0, target.height > 0 else { return }
+        let width = min(350, max(310, bounds.width - 36))
+        let height: CGFloat = 148
+        let horizontalInset: CGFloat = 18
+        let preferredX = target.midX - width + 64
+        let originX = min(
+            max(horizontalInset, preferredX),
+            max(horizontalInset, bounds.width - width - horizontalInset))
+        let top = headerBar.frame.minY - 4
+        shortcutCoachmark.frame = NSRect(
+            x: originX,
+            y: max(18, top - height),
+            width: width,
+            height: height)
+        shortcutCoachmark.arrowCenterX = target.midX - originX
+        shortcutCoachmark.needsLayout = true
+        shortcutCoachmark.layoutSubtreeIfNeeded()
     }
 
     private func layoutHeaderChromeControls() {
@@ -9739,7 +9794,15 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @objc private func themeClicked() {
         lightThemeEnabled.toggle()
         UserDefaults.standard.set(lightThemeEnabled, forKey: overlayLightThemeDefaultsKey)
+        emitLifecycle(
+            "theme_changed",
+            status: lightThemeEnabled ? "light" : "dark",
+            detail: "source=header")
         refreshBackgroundChrome()
+        if !closeConfirmOverlay.isHidden,
+           closeConfirmTitle.stringValue == "Controls and shortcuts" {
+            configureCloseConfirmForShortcutList()
+        }
         if !sessionDrawer.isHidden {
             renderSessionRows(log: false)
         }
@@ -9748,6 +9811,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     @objc private func shortcutsClicked() {
+        OverlayPlacementStore.markShortcutCoachmarkShown()
+        dismissShortcutCoachmark()
         pendingDeleteSessionId = nil
         configureCloseConfirmForShortcutList()
         presentConfirmationOverlay()
@@ -9755,10 +9820,55 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showShortcutHelpOverlay(source: String) {
+        OverlayPlacementStore.markShortcutCoachmarkShown()
+        dismissShortcutCoachmark()
         pendingDeleteSessionId = nil
         configureCloseConfirmForShortcutList()
         presentConfirmationOverlay()
         emitLifecycle("shortcuts_overlay_opened", detail: "source=\(source) platform=macos")
+    }
+
+    @discardableResult
+    func showShortcutCoachmark(source: String) -> Bool {
+        guard accountUIState == .signedIn,
+              shortcutCoachmark.isHidden,
+              closeConfirmOverlay.isHidden,
+              answerStyleOverlay.isHidden,
+              sessionDrawer.isHidden,
+              !(window?.firstResponder is NSTextView)
+        else { return false }
+        shortcutCoachmark.applyTheme(light: lightThemeEnabled)
+        shortcutCoachmark.isHidden = false
+        shortcutCoachmark.alphaValue = 0
+        layoutShortcutCoachmark()
+        raiseFixedChromeToFront()
+        clearKeyboardControlFocus()
+        setKeyboardFocusedControl(shortcutCoachmark.showButton)
+        window?.makeFirstResponder(shortcutCoachmark.showButton)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            self.shortcutCoachmark.animator().alphaValue = 1
+        }
+        emitLifecycle(
+            "shortcuts_coachmark_shown",
+            detail: "source=\(source) platform=macos")
+        return true
+    }
+
+    private func dismissShortcutCoachmark() {
+        guard !shortcutCoachmark.isHidden else { return }
+        if keyboardFocusedControl === shortcutCoachmark.showButton
+            || keyboardFocusedControl === shortcutCoachmark.dismissButton {
+            clearKeyboardControlFocus()
+        }
+        shortcutCoachmark.isHidden = true
+        shortcutCoachmark.alphaValue = 1
+        if window?.firstResponder === shortcutCoachmark.showButton
+            || window?.firstResponder === shortcutCoachmark.dismissButton
+            || window?.firstResponder === shortcutCoachmark {
+            window?.makeFirstResponder(nil)
+        }
+        emitLifecycle("shortcuts_coachmark_dismissed", detail: "platform=macos")
     }
 
     @objc private func closeClicked() {
@@ -9960,6 +10070,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     private func presentConfirmationOverlay() {
+        dismissShortcutCoachmark()
         dismissAnswerStyleEditor(animated: false)
         closeConfirmOverlay.isHidden = false
         closeConfirmOverlay.alphaValue = 0
@@ -10150,6 +10261,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @discardableResult
     private func dismissActiveOverlay() -> Bool {
+        if !shortcutCoachmark.isHidden {
+            dismissShortcutCoachmark()
+            return true
+        }
         if !closeConfirmOverlay.isHidden {
             dismissCloseConfirm(animated: true)
             return true
@@ -11088,6 +11203,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedOutLogin(url: URL?) {
+        dismissShortcutCoachmark()
         accountUIState = .signedOut
         signedOutGateActive = true
         setHeaderSubtitle("Local ready")
@@ -16634,8 +16750,7 @@ private final class OverlayApp {
         emitSimple("shown")
         emitLifecycle("expanded")
         if showFirstRunShortcuts,
-           expandedView?.isSignedOutGateActive != true,
-           OverlayPlacementStore.consumeFirstExpandedShortcutHelp() {
+           expandedView?.isSignedOutGateActive != true {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
                 guard
                     let self,
@@ -16643,9 +16758,20 @@ private final class OverlayApp {
                     self.expandedWindow?.isVisible == true,
                     self.expandedView?.isSignedOutGateActive != true
                 else { return }
-                self.expandedView?.showShortcutHelpOverlay(source: "first_expand")
+                self.presentShortcutCoachmarkIfNeeded(source: "first_expand")
             }
         }
+    }
+
+    private func presentShortcutCoachmarkIfNeeded(source: String) {
+        guard !OverlayPlacementStore.hasShownShortcutCoachmark,
+              expandedModeActive,
+              expandedWindow?.isVisible == true,
+              let expandedView,
+              expandedView.isSignedOutGateActive != true,
+              expandedView.showShortcutCoachmark(source: source)
+        else { return }
+        OverlayPlacementStore.markShortcutCoachmarkShown()
     }
 
     private func ensureExpandedWindow() {
@@ -16834,10 +16960,23 @@ private final class OverlayApp {
             let previousAccountUIState = accountUIState
             let nextAccountUIState = resolvedAccountUIState(authoritativeSignedIn: signedIn)
             accountUIState = nextAccountUIState
+            if previousAccountUIState != nextAccountUIState {
+                emitLifecycle(
+                    "auth_state_changed",
+                    status: signedIn ? "signed_in" : "signed_out")
+            }
             if signedIn {
                 let establishesSignedIn = establishesSignedInChrome(
                     from: previousAccountUIState,
                     to: nextAccountUIState)
+                let wasVisibleSignedOutGate = expandedModeActive
+                    && expandedWindow?.isVisible == true
+                    && expandedView?.isSignedOutGateActive == true
+                let shouldPresentShortcutCoachmark = shouldPresentPostSignInShortcutCoachmark(
+                    from: previousAccountUIState,
+                    to: nextAccountUIState,
+                    alreadyShown: OverlayPlacementStore.hasShownShortcutCoachmark)
+                    && wasVisibleSignedOutGate
                 let shouldCollapseAfterUnlock = establishesSignedIn
                     && expandedView?.isSignedOutGateActive == true
                 if establishesSignedIn {
@@ -16845,7 +16984,11 @@ private final class OverlayApp {
                     expandedView?.refreshAudioRouteBadge(for: currentRunState)
                 }
                 pillView?.setHealthState(.ready)
-                if shouldCollapseAfterUnlock {
+                if shouldPresentShortcutCoachmark {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                        self?.presentShortcutCoachmarkIfNeeded(source: "sign_in")
+                    }
+                } else if shouldCollapseAfterUnlock {
                     collapse()
                 }
             } else {
@@ -17161,6 +17304,7 @@ private func blueyTrustedRemoteInputEventTapCallback(
 
 #if BLUEY_AUTH_UI_POLICY_TESTS
 private func runAuthUIPolicyTests() {
+    precondition(PillMetrics.size == NSSize(width: 112, height: 30))
     precondition(!allowsAuthenticatedChromeUpdates(for: .unknown))
     precondition(!allowsAuthenticatedChromeUpdates(for: .signedOut))
     precondition(allowsAuthenticatedChromeUpdates(for: .signedIn))
@@ -17173,6 +17317,23 @@ private func runAuthUIPolicyTests() {
     precondition(establishesSignedInChrome(from: .signedOut, to: .signedIn))
     precondition(!establishesSignedInChrome(from: .signedIn, to: .signedIn))
     precondition(!establishesSignedInChrome(from: .signedOut, to: .signedOut))
+
+    precondition(shouldPresentPostSignInShortcutCoachmark(
+        from: .signedOut,
+        to: .signedIn,
+        alreadyShown: false))
+    precondition(!shouldPresentPostSignInShortcutCoachmark(
+        from: .unknown,
+        to: .signedIn,
+        alreadyShown: false))
+    precondition(!shouldPresentPostSignInShortcutCoachmark(
+        from: .signedOut,
+        to: .signedIn,
+        alreadyShown: true))
+    precondition(!shouldPresentPostSignInShortcutCoachmark(
+        from: .signedOut,
+        to: .signedOut,
+        alreadyShown: false))
 
     var state = resolvedAccountUIState(authoritativeSignedIn: true)
     precondition(allowsAuthenticatedChromeUpdates(for: state))
