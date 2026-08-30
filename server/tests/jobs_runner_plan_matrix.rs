@@ -585,7 +585,13 @@ fn jobs_api_handlers_have_no_direct_workflow_gateway_boundary() {
     assert!(api_source.contains("mark_jobs_workflow_execution_submitted"));
 
     let dispatcher_source = include_str!("../src/jobs_workflow_dispatch.rs");
-    assert!(dispatcher_source.contains("join(\"workflow-commands\")"));
+    assert!(
+        dispatcher_source.contains("const WORKFLOW_COMMAND_PATH: &str = \"workflow-commands\";")
+    );
+    assert!(dispatcher_source.contains(
+        "const WORKFLOW_COMMAND_RECONCILIATION_PATH: &str = \"workflow-command-reconciliations\";"
+    ));
+    assert!(dispatcher_source.contains("config.origin.join(endpoint_path)"));
     assert!(!dispatcher_source.contains("workflows/applications"));
 }
 
@@ -597,8 +603,12 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
         "BLUEY_JOBS_DATA_KEY",
         "BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED",
         "BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED",
+        "BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED",
         "BLUEY_JOBS_WORKFLOW_ORIGIN",
         "BLUEY_JOBS_WORKFLOW_TOKEN",
+        "BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT",
+        "BLUEY_JOBS_MANAGED_CLOUD_REGION",
+        "BLUEY_JOBS_MANAGED_CLOUD_CHANNEL",
         "BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON",
         "BLUEY_JOBS_BROWSER_SERVER_RELEASE_ID",
         "BLUEY_JOBS_LOCAL_RUN_CAPABILITY_KEY",
@@ -607,6 +617,10 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
     std::env::set_var("BLUEY_JOBS_DATA_KEY", JOBS_DATA_KEY);
     std::env::set_var("BLUEY_JOBS_LOCAL_BROWSER_DISTRIBUTION_ENABLED", "1");
     std::env::set_var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED", "1");
+    std::env::set_var("BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED", "1");
+    std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT", "staging");
+    std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_REGION", "us-east-1");
+    std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_CHANNEL", "canary");
     std::env::set_var(
         "BLUEY_JOBS_BROWSER_ROOT_TRUST_ANCHOR_JSON",
         browser_release_root_trust_anchor_json(),
@@ -719,8 +733,9 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
     assert!(!replay.newly_metered);
     assert_eq!(replay.used_packets, 1);
 
-    // Cloud includes both runners. The request handler only stages durable work; it never
-    // depends on gateway configuration or performs gateway I/O.
+    // Cloud includes both runners at the plan layer, but a fresh background effect still
+    // requires signed account-scoped managed-release readiness. Legacy flags, a ready volume
+    // fleet, and gateway credentials are intentionally insufficient.
     let cloud = ctx.account("cloud", "cloud");
     assign_browser_release_channel(&ctx.pool, &cloud.account.id);
     let cloud_local_application = ctx.prepare(&cloud.account, "cloud-local");
@@ -734,43 +749,88 @@ async fn free_pro_cloud_runner_entitlement_matrix_is_enforced() {
     let cloud_gateway_application = ctx.prepare(&cloud.account, "cloud-gateway");
     let (cloud_gateway_approval, _) = ctx.approve(&cloud_gateway_application, &cloud.token).await;
     assert_eq!(cloud_gateway_approval, StatusCode::OK);
+    let application_before =
+        jobs::get_application(&ctx.pool, &cloud.account.id, &cloud_gateway_application.id)
+            .expect("load cloud application before denied admission")
+            .expect("cloud application exists");
+    let sessions_before = jobs::list_browser_sessions(&ctx.pool, &cloud.account.id)
+        .expect("list cloud browser sessions before denied admission");
+    let reservations_before: i64 = ctx
+        .pool
+        .get()
+        .expect("open matrix database")
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_attempt_reservations WHERE account_id = ?1",
+            rusqlite::params![cloud.account.id],
+            |row| row.get(0),
+        )
+        .expect("count attempt reservations before denied admission");
+    let used_packets_before = jobs::get_entitlement(&ctx.pool, &cloud.account.id)
+        .expect("load cloud metering before denied admission")
+        .used_packets;
     std::env::remove_var("BLUEY_JOBS_WORKFLOW_TOKEN");
     let (staged_status, staged_body) = ctx
         .queue(&cloud_gateway_application, &cloud.token, "cloud")
         .await;
-    assert_eq!(staged_status, StatusCode::OK, "{staged_body}");
-    assert_eq!(staged_body["application"]["state"], "queued");
-    assert_eq!(staged_body["browser_session"]["runner"], "cloud");
-    assert!(staged_body["browser_session"]["id"]
-        .as_str()
-        .is_some_and(|session_id| session_id.starts_with("cloud-")));
-    assert!(staged_body["workflow_id"]
-        .as_str()
-        .is_some_and(|workflow_id| workflow_id.starts_with("bluey-jobs-v2-")));
-    assert_eq!(staged_body["workflow_command"]["schema_version"], 2);
-    assert_eq!(staged_body["workflow_command"]["operation"], "start");
-    assert_eq!(staged_body["workflow_command"]["state"], "pending");
-    assert_eq!(staged_body["workflow_command"]["replayed"], false);
+    assert_eq!(staged_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(staged_body.as_str().is_some_and(|message| message.contains(
+        "Background runner is included in your plan but has not been enabled for this release."
+    )));
 
     let gateway = MockServer::start().await;
     std::env::set_var("BLUEY_JOBS_WORKFLOW_ORIGIN", gateway.uri());
-    std::env::set_var("BLUEY_JOBS_WORKFLOW_TOKEN", "matrix-workflow-token");
+    std::env::set_var(
+        "BLUEY_JOBS_WORKFLOW_TOKEN",
+        "matrix-workflow-token-at-least-32-bytes",
+    );
     let (replay_status, replay_body) = ctx
         .queue(&cloud_gateway_application, &cloud.token, "cloud")
         .await;
-    assert_eq!(replay_status, StatusCode::OK);
+    assert_eq!(replay_status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(replay_body, staged_body);
+    let application_after =
+        jobs::get_application(&ctx.pool, &cloud.account.id, &cloud_gateway_application.id)
+            .expect("load cloud application after denied admission")
+            .expect("cloud application exists");
+    assert_eq!(application_after.state, application_before.state);
+    assert_eq!(application_after.run_id, application_before.run_id);
+    assert_eq!(application_after.receipt, application_before.receipt);
+    let sessions_after = jobs::list_browser_sessions(&ctx.pool, &cloud.account.id)
+        .expect("list cloud browser sessions after denied admission");
     assert_eq!(
-        replay_body["workflow_command"]["command_id"],
-        staged_body["workflow_command"]["command_id"]
+        serde_json::to_value(sessions_after).expect("serialize browser sessions after denial"),
+        serde_json::to_value(sessions_before).expect("serialize browser sessions before denial")
     );
+    let command_count: i64 = ctx
+        .pool
+        .get()
+        .expect("open matrix database")
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_workflow_commands WHERE account_id = ?1",
+            rusqlite::params![cloud.account.id],
+            |row| row.get(0),
+        )
+        .expect("count staged cloud commands");
     assert_eq!(
-        replay_body["workflow_command"]["request_id"],
-        staged_body["workflow_command"]["request_id"]
+        command_count, 0,
+        "unready cloud admission must be side-effect free"
     );
+    let reservation_count: i64 = ctx
+        .pool
+        .get()
+        .expect("open matrix database")
+        .query_row(
+            "SELECT COUNT(*) FROM jobs_attempt_reservations WHERE account_id = ?1",
+            rusqlite::params![cloud.account.id],
+            |row| row.get(0),
+        )
+        .expect("count attempt reservations after denied admission");
+    assert_eq!(reservation_count, reservations_before);
     assert_eq!(
-        replay_body["workflow_command"]["workflow_id"],
-        staged_body["workflow_command"]["workflow_id"]
+        jobs::get_entitlement(&ctx.pool, &cloud.account.id)
+            .expect("load cloud metering after denied admission")
+            .used_packets,
+        used_packets_before
     );
-    assert_eq!(replay_body["workflow_command"]["replayed"], true);
     assert!(gateway.received_requests().await.unwrap().is_empty());
 }

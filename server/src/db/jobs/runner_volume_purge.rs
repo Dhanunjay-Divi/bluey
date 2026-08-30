@@ -5571,6 +5571,15 @@ fn claim_runner_volume_instance_postgres(
 ) -> RunnerVolumePurgeResult<RunnerVolumeInstanceLease> {
     let mut conn = pool.get_pg()?;
     let mut tx = conn.transaction()?;
+    // Fleet authority always precedes child volume/key authority. Managed
+    // execution effects hold the same singleton before fencing their lease
+    // and revalidating this child, so taking the fleet lock first here avoids
+    // a fleet -> lease -> volume / volume -> fleet deadlock cycle.
+    tx.query_one(
+        "SELECT singleton_id FROM jobs_runner_volume_fleet_state \
+          WHERE singleton_id = 1 FOR UPDATE",
+        &[],
+    )?;
     let row = tx
         .query_opt(
             "SELECT worker_id, current_epoch, status, active_instance_id, \
@@ -13043,6 +13052,7 @@ pub(super) mod runner_volume_purge_tests {
                     process_instance_id: &binding_request.process_instance_id,
                     runtime_grant_id: &runtime_grant_id,
                     runtime_sha256: &runtime_sha256,
+                    managed_cloud: None,
                 },
             );
         let execution_claim_proof = sign_runner_volume_authority_proof(
@@ -13393,6 +13403,37 @@ pub(super) mod runner_volume_purge_tests {
         assert!(fleet_lock < replay_lookup);
         assert!(function[replay_lookup..]
             .contains("WHERE reconciliation_id = $1 AND authority_state = $2 FOR UPDATE"));
+    }
+
+    #[test]
+    fn postgres_instance_claim_locks_fleet_before_volume_and_cutover_invalidation() {
+        // The unit harness has no live PostgreSQL dependency. Preserve the
+        // global fleet -> child-volume ordering that prevents managed-effect
+        // transactions from deadlocking with runner instance claims.
+        let source = include_str!("runner_volume_purge.rs");
+        let function = source
+            .split_once("fn claim_runner_volume_instance_postgres(")
+            .expect("PostgreSQL runner instance claim")
+            .1
+            .split_once("\nfn validate_instance_claim_state(")
+            .expect("end of PostgreSQL runner instance claim")
+            .0;
+        let fleet_locks = function
+            .match_indices("jobs_runner_volume_fleet_state")
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert_eq!(fleet_locks.len(), 1, "exactly one fleet UPDATE lock");
+        let fleet_lock = fleet_locks[0];
+        let volume_lock = function
+            .find("jobs_runner_volumes WHERE volume_id = $1 FOR UPDATE")
+            .expect("child volume UPDATE lock");
+        let invalidate = function
+            .find("invalidate_postgres_runner_fleet_cutover")
+            .expect("fleet cutover invalidation");
+        assert!(fleet_lock < volume_lock);
+        assert!(function[fleet_lock..volume_lock].contains("WHERE singleton_id = 1 FOR UPDATE"));
+        assert!(volume_lock < invalidate);
+        assert!(!function[..fleet_lock].contains("jobs_runner_volumes"));
     }
 
     #[test]

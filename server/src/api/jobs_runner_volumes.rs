@@ -752,27 +752,55 @@ pub(crate) struct RunnerVolumeExecutionLeaseClaimPayload<'a> {
     pub(crate) process_instance_id: &'a str,
     pub(crate) runtime_grant_id: &'a str,
     pub(crate) runtime_sha256: &'a str,
+    pub(crate) managed_cloud: Option<RunnerVolumeManagedExecutionLeaseClaimPayload<'a>>,
+}
+
+pub(crate) struct RunnerVolumeManagedExecutionLeaseClaimPayload<'a> {
+    pub(crate) workflow_request_id: &'a str,
+    pub(crate) managed_cloud_release_sha256: &'a str,
+    pub(crate) runtime_instance_id: &'a str,
+    pub(crate) runtime_instance_epoch: i64,
 }
 
 pub(crate) fn runner_volume_execution_lease_claim_payload_sha256(
     payload: &RunnerVolumeExecutionLeaseClaimPayload<'_>,
 ) -> String {
     let enrollment_epoch = payload.enrollment_epoch.to_string();
+    let mut fields = vec![
+        ("account_id", payload.account_id),
+        ("application_id", payload.application_id),
+        ("run_id", payload.run_id),
+        ("browser_profile_id", payload.browser_profile_id),
+        ("owner_id", payload.owner_id),
+        ("volume_id", payload.volume_id),
+        ("enrollment_epoch", enrollment_epoch.as_str()),
+        ("process_instance_id", payload.process_instance_id),
+        ("runtime_grant_id", payload.runtime_grant_id),
+        ("runtime_sha256", payload.runtime_sha256),
+    ];
+    let runtime_instance_epoch;
+    if let Some(managed_cloud) = payload.managed_cloud.as_ref() {
+        runtime_instance_epoch = managed_cloud.runtime_instance_epoch.to_string();
+        fields.extend([
+            ("workflow_request_id", managed_cloud.workflow_request_id),
+            (
+                "managed_cloud_release_sha256",
+                managed_cloud.managed_cloud_release_sha256,
+            ),
+            (
+                "managed_cloud_runtime_instance_id",
+                managed_cloud.runtime_instance_id,
+            ),
+            (
+                "managed_cloud_runtime_instance_epoch",
+                runtime_instance_epoch.as_str(),
+            ),
+        ]);
+    }
     runner_volume_http_payload_sha256(
         RUNNER_VOLUME_EXECUTION_LEASE_CLAIM_PATH,
         payload.worker_id,
-        &[
-            ("account_id", payload.account_id),
-            ("application_id", payload.application_id),
-            ("run_id", payload.run_id),
-            ("browser_profile_id", payload.browser_profile_id),
-            ("owner_id", payload.owner_id),
-            ("volume_id", payload.volume_id),
-            ("enrollment_epoch", enrollment_epoch.as_str()),
-            ("process_instance_id", payload.process_instance_id),
-            ("runtime_grant_id", payload.runtime_grant_id),
-            ("runtime_sha256", payload.runtime_sha256),
-        ],
+        &fields,
     )
 }
 
@@ -1500,6 +1528,7 @@ mod tests {
                 process_instance_id: "process-602",
                 runtime_grant_id: "runtime-grant-602",
                 runtime_sha256: "8f5f7e462a8812d73c94fd1b63f2cf601e05070d8416d55abca946765f065b45",
+                managed_cloud: None,
             },
         );
         let canonical = concat!(
@@ -1519,6 +1548,53 @@ mod tests {
             "runtime_sha256=8f5f7e462a8812d73c94fd1b63f2cf601e05070d8416d55abca946765f065b45\n"
         );
         assert_eq!(digest, hex::encode(Sha256::digest(canonical.as_bytes())));
+
+        let managed_digest = runner_volume_execution_lease_claim_payload_sha256(
+            &RunnerVolumeExecutionLeaseClaimPayload {
+                worker_id: "worker-602",
+                account_id: "account-602",
+                application_id: "application-602",
+                run_id: "run-602",
+                browser_profile_id: "profile-602",
+                owner_id: "worker-602",
+                volume_id: "volume-602",
+                enrollment_epoch: 7,
+                process_instance_id: "process-602",
+                runtime_grant_id: "runtime-grant-602",
+                runtime_sha256: "8f5f7e462a8812d73c94fd1b63f2cf601e05070d8416d55abca946765f065b45",
+                managed_cloud: Some(RunnerVolumeManagedExecutionLeaseClaimPayload {
+                    workflow_request_id: "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd",
+                    managed_cloud_release_sha256:
+                        "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+                    runtime_instance_id: "managed-runner-instance-602",
+                    runtime_instance_epoch: 9,
+                }),
+            },
+        );
+        let managed_canonical = concat!(
+            "bluey-jobs-runner-volume-http-payload-v1\n",
+            "method=POST\n",
+            "path=/api/jobs/internal/execution-leases/claim\n",
+            "worker_id=worker-602\n",
+            "account_id=account-602\n",
+            "application_id=application-602\n",
+            "run_id=run-602\n",
+            "browser_profile_id=profile-602\n",
+            "owner_id=worker-602\n",
+            "volume_id=volume-602\n",
+            "enrollment_epoch=7\n",
+            "process_instance_id=process-602\n",
+            "runtime_grant_id=runtime-grant-602\n",
+            "runtime_sha256=8f5f7e462a8812d73c94fd1b63f2cf601e05070d8416d55abca946765f065b45\n",
+            "workflow_request_id=wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd\n",
+            "managed_cloud_release_sha256=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef\n",
+            "managed_cloud_runtime_instance_id=managed-runner-instance-602\n",
+            "managed_cloud_runtime_instance_epoch=9\n"
+        );
+        assert_eq!(
+            managed_digest,
+            hex::encode(Sha256::digest(managed_canonical.as_bytes()))
+        );
     }
 
     #[test]

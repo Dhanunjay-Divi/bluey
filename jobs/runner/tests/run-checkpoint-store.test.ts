@@ -18,6 +18,9 @@ import {
   type ApplicationPacket,
   type NormalizedJob,
 } from "@bluey/jobs-automation";
+import type {
+  ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
 import { profilePaths, restoreProfile } from "../src/profile-store.js";
 import { encryptBytes } from "../src/crypto-envelope.js";
 import type {
@@ -267,6 +270,41 @@ describe("encrypted cloud run checkpoints", () => {
     lookalike.workflow.requestId = lookalike.request.requestId;
     await expect(writeRunCheckpoint(root, lookalike, key)).rejects.toThrow(
       "workflow state",
+    );
+  });
+
+  it("persists exact managed release A and rejects open or legacy authority", async () => {
+    const root = await temporaryDirectory();
+    const key = randomBytes(32);
+    const requestId = "wfreq-v2-12345678-1234-5678-9234-123456789abc";
+    const checkpoint = fixture();
+    checkpoint.request.requestId = requestId;
+    checkpoint.request.managedCloudRelease = managedCloudReleaseMemo();
+    checkpoint.workflow.requestId = requestId;
+    const scope = cloudCheckpointScope(
+      checkpoint.profileScope,
+      checkpoint.browserSessionId,
+    );
+
+    await writeRunCheckpoint(root, checkpoint, key);
+    await expect(
+      readRunCheckpoint(root, checkpoint.profileScope, scope, key),
+    ).resolves.toEqual(checkpoint);
+
+    const open = structuredClone(checkpoint);
+    open.request.managedCloudRelease = {
+      ...managedCloudReleaseMemo(),
+      extra: true,
+    } as never;
+    await expect(writeRunCheckpoint(root, open, key)).rejects.toThrow(
+      "managed-cloud checkpoint authority",
+    );
+
+    const legacy = structuredClone(checkpoint);
+    legacy.version = 1;
+    delete legacy.lease.leaseToken;
+    await expect(writeRunCheckpoint(root, legacy, key)).rejects.toThrow(
+      "managed-cloud checkpoint authority",
     );
   });
 
@@ -582,6 +620,29 @@ interface FixtureRequest {
   url: string;
   packet: ApplicationPacket;
   job: NormalizedJob;
+  managedCloudRelease?: ManagedCloudReleaseMemoAuthority;
+}
+
+function managedCloudReleaseMemo(): ManagedCloudReleaseMemoAuthority {
+  return {
+    version: 1,
+    bindingSha256: "1".repeat(64),
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 7,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 2,
+    channelSequence: 9,
+    releaseId: "managed-cloud-release-1234",
+    releaseSequence: 4,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_900_000_000_000,
+    resolvedAtMs: 1_800_000_000_000,
+  };
 }
 
 function fixture(

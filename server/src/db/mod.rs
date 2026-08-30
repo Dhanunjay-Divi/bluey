@@ -364,6 +364,9 @@ const SQLITE_JOBS_WORKFLOW_COMMANDS: &str =
     include_str!("../../../infra/sqlite/server-runtime/053_jobs_workflow_commands.sql");
 const SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
     include_str!("../../../infra/sqlite/server-runtime/054_jobs_workflow_cleanup_authority.sql");
+const SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/055_jobs_managed_cloud_release_authority.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1706,6 +1709,8 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_WORKFLOW_COMMANDS,
     // 0054 - global legacy inventory and account-bound workflow cleanup authority.
     SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+    // 0055 - signed managed-cloud release, activation, runtime, and admission authority.
+    SQLITE_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1721,6 +1726,477 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
+    // SQLite replays the bundled schema on every startup. Phase611 cleanup
+    // columns therefore use the idempotent column helper rather than an
+    // unconditional ALTER TABLE in the replayed SQL file.
+    ensure_column(
+        &conn,
+        "jobs_workflow_commands",
+        "managed_cloud_authority_required",
+        "INTEGER NOT NULL DEFAULT 0 CHECK(managed_cloud_authority_required IN (0, 1))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_workflow_cleanup_targets",
+        "managed_cloud_binding_sha256",
+        "TEXT CHECK(managed_cloud_binding_sha256 IS NULL OR (
+            length(managed_cloud_binding_sha256) = 64
+            AND managed_cloud_binding_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_workflow_cleanup_targets",
+        "managed_cloud_release_memo_base64url",
+        "TEXT CHECK(managed_cloud_release_memo_base64url IS NULL OR (
+            length(managed_cloud_release_memo_base64url) BETWEEN 1 AND 174763
+            AND managed_cloud_release_memo_base64url NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_workflow_cleanup_targets",
+        "managed_cloud_release_memo_sha256",
+        "TEXT CHECK(managed_cloud_release_memo_sha256 IS NULL OR (
+            length(managed_cloud_release_memo_sha256) = 64
+            AND managed_cloud_release_memo_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_workflow_request_id",
+        "TEXT CHECK(managed_cloud_workflow_request_id IS NULL OR (
+            length(managed_cloud_workflow_request_id) = 45
+            AND substr(managed_cloud_workflow_request_id, 1, 9) = 'wfreq-v2-'
+            AND substr(managed_cloud_workflow_request_id, 10)
+                NOT GLOB '*[^0-9a-f-]*'
+            AND length(replace(substr(managed_cloud_workflow_request_id, 10), '-', '')) = 32
+            AND substr(managed_cloud_workflow_request_id, 18, 1) = '-'
+            AND substr(managed_cloud_workflow_request_id, 23, 1) = '-'
+            AND substr(managed_cloud_workflow_request_id, 24, 1) = '5'
+            AND substr(managed_cloud_workflow_request_id, 28, 1) = '-'
+            AND substr(managed_cloud_workflow_request_id, 29, 1) GLOB '[89ab]'
+            AND substr(managed_cloud_workflow_request_id, 33, 1) = '-'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_request_command_id",
+        "TEXT CHECK(managed_cloud_request_command_id IS NULL OR (
+            length(managed_cloud_request_command_id) BETWEEN 20 AND 128
+            AND managed_cloud_request_command_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_execution_command_id",
+        "TEXT CHECK(managed_cloud_execution_command_id IS NULL OR (
+            length(managed_cloud_execution_command_id) BETWEEN 20 AND 128
+            AND managed_cloud_execution_command_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_binding_sha256",
+        "TEXT CHECK(managed_cloud_binding_sha256 IS NULL OR (
+            length(managed_cloud_binding_sha256) = 64
+            AND managed_cloud_binding_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_release_memo_base64url",
+        "TEXT CHECK(managed_cloud_release_memo_base64url IS NULL OR (
+            length(managed_cloud_release_memo_base64url) BETWEEN 1 AND 174763
+            AND managed_cloud_release_memo_base64url NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_release_sha256",
+        "TEXT CHECK(managed_cloud_release_sha256 IS NULL OR (
+            length(managed_cloud_release_sha256) = 64
+            AND managed_cloud_release_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_runtime_instance_id",
+        "TEXT CHECK(managed_cloud_runtime_instance_id IS NULL OR (
+            length(managed_cloud_runtime_instance_id) BETWEEN 20 AND 128
+            AND managed_cloud_runtime_instance_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_runtime_instance_epoch",
+        "INTEGER CHECK(managed_cloud_runtime_instance_epoch IS NULL OR
+            managed_cloud_runtime_instance_epoch BETWEEN 1 AND 9007199254740991)",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_worker_id",
+        "TEXT CHECK(managed_cloud_worker_id IS NULL OR (
+            length(managed_cloud_worker_id) BETWEEN 20 AND 128
+            AND managed_cloud_worker_id NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_gateway_authority_base64url",
+        "TEXT CHECK(managed_cloud_gateway_authority_base64url IS NULL OR (
+            length(managed_cloud_gateway_authority_base64url) BETWEEN 1 AND 174763
+            AND managed_cloud_gateway_authority_base64url NOT GLOB '*[^A-Za-z0-9_-]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_gateway_authority_sha256",
+        "TEXT CHECK(managed_cloud_gateway_authority_sha256 IS NULL OR (
+            length(managed_cloud_gateway_authority_sha256) = 64
+            AND managed_cloud_gateway_authority_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    ensure_column(
+        &conn,
+        "jobs_execution_leases",
+        "managed_cloud_lease_authority_sha256",
+        "TEXT CHECK(managed_cloud_lease_authority_sha256 IS NULL OR (
+            length(managed_cloud_lease_authority_sha256) = 64
+            AND managed_cloud_lease_authority_sha256 NOT GLOB '*[^0-9a-f]*'))",
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS jobs_managed_cloud_irreversible_effect_receipts (
+           run_id TEXT NOT NULL CHECK(length(run_id) BETWEEN 20 AND 128
+             AND run_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           fence INTEGER NOT NULL CHECK(fence BETWEEN 1 AND 9007199254740991),
+           account_id TEXT NOT NULL CHECK(length(account_id) BETWEEN 1 AND 240),
+           application_id TEXT NOT NULL CHECK(length(application_id) BETWEEN 1 AND 240),
+           workflow_request_id TEXT NOT NULL CHECK(
+             length(workflow_request_id) = 45
+             AND substr(workflow_request_id, 1, 9) = 'wfreq-v2-'
+             AND substr(workflow_request_id, 10) NOT GLOB '*[^0-9a-f-]*'
+             AND length(replace(substr(workflow_request_id, 10), '-', '')) = 32
+             AND substr(workflow_request_id, 18, 1) = '-'
+             AND substr(workflow_request_id, 23, 1) = '-'
+             AND substr(workflow_request_id, 24, 1) = '5'
+             AND substr(workflow_request_id, 28, 1) = '-'
+             AND substr(workflow_request_id, 29, 1) GLOB '[89ab]'
+             AND substr(workflow_request_id, 33, 1) = '-'),
+           request_command_id TEXT NOT NULL CHECK(
+             length(request_command_id) BETWEEN 20 AND 128
+             AND request_command_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           execution_command_id TEXT NOT NULL CHECK(
+             length(execution_command_id) BETWEEN 20 AND 128
+             AND execution_command_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           binding_sha256 TEXT NOT NULL CHECK(length(binding_sha256) = 64
+             AND binding_sha256 NOT GLOB '*[^0-9a-f]*'),
+           release_memo_base64url TEXT NOT NULL CHECK(
+             length(release_memo_base64url) BETWEEN 1 AND 174763
+             AND release_memo_base64url NOT GLOB '*[^A-Za-z0-9_-]*'),
+           release_sha256 TEXT NOT NULL CHECK(length(release_sha256) = 64
+             AND release_sha256 NOT GLOB '*[^0-9a-f]*'),
+           runtime_instance_id TEXT NOT NULL CHECK(
+             length(runtime_instance_id) BETWEEN 20 AND 128
+             AND runtime_instance_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           runtime_instance_epoch INTEGER NOT NULL
+             CHECK(runtime_instance_epoch BETWEEN 1 AND 9007199254740991),
+           worker_id TEXT NOT NULL CHECK(length(worker_id) BETWEEN 20 AND 128
+             AND worker_id NOT GLOB '*[^A-Za-z0-9_-]*'),
+           gateway_authority_base64url TEXT NOT NULL CHECK(
+             length(gateway_authority_base64url) BETWEEN 1 AND 174763
+             AND gateway_authority_base64url NOT GLOB '*[^A-Za-z0-9_-]*'),
+           gateway_authority_sha256 TEXT NOT NULL CHECK(
+             length(gateway_authority_sha256) = 64
+             AND gateway_authority_sha256 NOT GLOB '*[^0-9a-f]*'),
+           receipt_sha256 TEXT NOT NULL UNIQUE CHECK(length(receipt_sha256) = 64
+             AND receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+           committed_at_ms INTEGER NOT NULL
+             CHECK(committed_at_ms BETWEEN 0 AND 9007199254740991),
+           PRIMARY KEY(run_id, fence),
+           FOREIGN KEY(run_id) REFERENCES jobs_execution_leases(run_id) ON DELETE CASCADE,
+           FOREIGN KEY(request_command_id)
+             REFERENCES jobs_workflow_commands(id) ON DELETE CASCADE,
+           FOREIGN KEY(execution_command_id, binding_sha256,
+             release_memo_base64url, release_sha256)
+             REFERENCES jobs_managed_cloud_workflow_bindings(
+               command_id, binding_sha256, release_memo_base64url,
+               release_memo_sha256) ON DELETE CASCADE,
+           FOREIGN KEY(runtime_instance_id, runtime_instance_epoch, worker_id)
+             REFERENCES jobs_managed_cloud_runtime_instances(
+               runtime_instance_id, instance_epoch, worker_id) ON DELETE RESTRICT
+         );
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_irreversible_receipt_insert;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_irreversible_receipt_no_update;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_irreversible_receipt_no_delete;
+         CREATE TRIGGER trg_jobs_managed_cloud_irreversible_receipt_insert
+         BEFORE INSERT ON jobs_managed_cloud_irreversible_effect_receipts
+         WHEN NOT EXISTS(
+           SELECT 1 FROM jobs_execution_leases lease
+            WHERE lease.run_id=NEW.run_id AND lease.fence=NEW.fence
+              AND lease.account_id=NEW.account_id
+              AND lease.application_id=NEW.application_id
+              AND lease.phase='click_started'
+              AND lease.managed_cloud_lease_authority_sha256 IS NOT NULL
+              AND lease.managed_cloud_runtime_instance_id=NEW.runtime_instance_id
+              AND lease.managed_cloud_runtime_instance_epoch=NEW.runtime_instance_epoch
+              AND lease.managed_cloud_worker_id=NEW.worker_id
+         ) OR NOT EXISTS(
+           SELECT 1 FROM jobs_workflow_commands command
+            WHERE command.id=NEW.request_command_id
+              AND command.request_id=NEW.workflow_request_id
+              AND command.account_id=NEW.account_id
+              AND command.application_id=NEW.application_id
+              AND command.run_id=NEW.run_id
+              AND command.command_kind IN ('start','resume')
+              AND command.managed_cloud_authority_required=1
+              AND command.first_request_started_at_ms IS NOT NULL
+              AND EXISTS(
+                SELECT 1 FROM jobs_workflow_command_attempt_events event
+                 WHERE event.command_id=command.id
+                   AND event.event_kind='request_started')
+         ) BEGIN
+           SELECT RAISE(ABORT, 'managed cloud irreversible receipt is invalid');
+         END;
+         CREATE TRIGGER trg_jobs_managed_cloud_irreversible_receipt_no_update
+         BEFORE UPDATE ON jobs_managed_cloud_irreversible_effect_receipts BEGIN
+           SELECT RAISE(ABORT, 'managed cloud irreversible receipt is immutable');
+         END;
+         CREATE TRIGGER trg_jobs_managed_cloud_irreversible_receipt_no_delete
+         BEFORE DELETE ON jobs_managed_cloud_irreversible_effect_receipts
+         WHEN NOT EXISTS(
+           SELECT 1 FROM jobs_workflow_cleanup_hard_delete_cascade_tokens token
+            WHERE token.account_id=OLD.account_id
+              AND NOT EXISTS(
+                SELECT 1 FROM accounts account WHERE account.id=OLD.account_id)
+         ) BEGIN
+           SELECT RAISE(ABORT, 'managed cloud irreversible receipt is immutable');
+         END;
+         CREATE UNIQUE INDEX IF NOT EXISTS
+           idx_jobs_workflow_commands_managed_cloud_request_identity
+           ON jobs_workflow_commands(id, request_id);
+         CREATE UNIQUE INDEX IF NOT EXISTS
+           idx_jobs_managed_cloud_runtime_instance_epoch
+           ON jobs_managed_cloud_runtime_instances(runtime_instance_id, instance_epoch);
+         CREATE UNIQUE INDEX IF NOT EXISTS
+           idx_jobs_managed_cloud_runtime_instance_epoch_worker
+           ON jobs_managed_cloud_runtime_instances(
+             runtime_instance_id, instance_epoch, worker_id);
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_execution_lease_insert;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_execution_lease_update;
+         CREATE TRIGGER trg_jobs_managed_cloud_execution_lease_insert
+         BEFORE INSERT ON jobs_execution_leases
+         WHEN
+           ((NEW.managed_cloud_workflow_request_id IS NULL)
+             + (NEW.managed_cloud_request_command_id IS NULL)
+             + (NEW.managed_cloud_execution_command_id IS NULL)
+             + (NEW.managed_cloud_binding_sha256 IS NULL)
+             + (NEW.managed_cloud_release_memo_base64url IS NULL)
+             + (NEW.managed_cloud_release_sha256 IS NULL)
+             + (NEW.managed_cloud_runtime_instance_id IS NULL)
+             + (NEW.managed_cloud_runtime_instance_epoch IS NULL)
+             + (NEW.managed_cloud_worker_id IS NULL)
+             + (NEW.managed_cloud_gateway_authority_base64url IS NULL)
+             + (NEW.managed_cloud_gateway_authority_sha256 IS NULL)
+             + (NEW.managed_cloud_lease_authority_sha256 IS NULL)) NOT IN (0, 12)
+           OR (NEW.managed_cloud_lease_authority_sha256 IS NOT NULL AND (
+             NOT EXISTS(
+               SELECT 1 FROM jobs_workflow_commands command
+                WHERE command.id = NEW.managed_cloud_request_command_id
+                  AND command.request_id = NEW.managed_cloud_workflow_request_id
+                  AND command.account_id = NEW.account_id
+                  AND command.application_id = NEW.application_id
+                  AND command.run_id = NEW.run_id
+                  AND command.managed_cloud_authority_required = 1
+                  AND command.command_kind IN ('start', 'resume')
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+                WHERE binding.command_id = NEW.managed_cloud_execution_command_id
+                  AND binding.binding_sha256 = NEW.managed_cloud_binding_sha256
+                  AND binding.release_memo_base64url =
+                      NEW.managed_cloud_release_memo_base64url
+                  AND binding.release_memo_sha256 = NEW.managed_cloud_release_sha256
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_runtime_instances instance
+                WHERE instance.runtime_instance_id =
+                      NEW.managed_cloud_runtime_instance_id
+                  AND instance.instance_epoch =
+                      NEW.managed_cloud_runtime_instance_epoch
+                  AND instance.worker_id = NEW.managed_cloud_worker_id
+             )
+           ))
+         BEGIN
+           SELECT RAISE(ABORT, 'managed-cloud execution lease authority is invalid');
+         END;
+         CREATE TRIGGER trg_jobs_managed_cloud_execution_lease_update
+         BEFORE UPDATE OF fence, phase, managed_cloud_workflow_request_id,
+           managed_cloud_request_command_id, managed_cloud_execution_command_id,
+           managed_cloud_binding_sha256, managed_cloud_release_memo_base64url,
+           managed_cloud_release_sha256, managed_cloud_runtime_instance_id,
+           managed_cloud_runtime_instance_epoch, managed_cloud_worker_id,
+           managed_cloud_gateway_authority_base64url,
+           managed_cloud_gateway_authority_sha256,
+           managed_cloud_lease_authority_sha256
+         ON jobs_execution_leases
+         WHEN
+           ((NEW.managed_cloud_workflow_request_id IS NULL)
+             + (NEW.managed_cloud_request_command_id IS NULL)
+             + (NEW.managed_cloud_execution_command_id IS NULL)
+             + (NEW.managed_cloud_binding_sha256 IS NULL)
+             + (NEW.managed_cloud_release_memo_base64url IS NULL)
+             + (NEW.managed_cloud_release_sha256 IS NULL)
+             + (NEW.managed_cloud_runtime_instance_id IS NULL)
+             + (NEW.managed_cloud_runtime_instance_epoch IS NULL)
+             + (NEW.managed_cloud_worker_id IS NULL)
+             + (NEW.managed_cloud_gateway_authority_base64url IS NULL)
+             + (NEW.managed_cloud_gateway_authority_sha256 IS NULL)
+             + (NEW.managed_cloud_lease_authority_sha256 IS NULL)) NOT IN (0, 12)
+           OR (OLD.managed_cloud_lease_authority_sha256 IS NOT NULL
+             AND NEW.managed_cloud_lease_authority_sha256 IS NULL)
+           OR (OLD.managed_cloud_lease_authority_sha256 IS NOT NULL
+             AND NEW.fence <> OLD.fence
+             AND NEW.managed_cloud_lease_authority_sha256 =
+                 OLD.managed_cloud_lease_authority_sha256)
+           OR ((NEW.managed_cloud_workflow_request_id
+                  IS NOT OLD.managed_cloud_workflow_request_id
+             OR NEW.managed_cloud_request_command_id
+                  IS NOT OLD.managed_cloud_request_command_id
+             OR NEW.managed_cloud_execution_command_id
+                  IS NOT OLD.managed_cloud_execution_command_id
+             OR NEW.managed_cloud_binding_sha256
+                  IS NOT OLD.managed_cloud_binding_sha256
+             OR NEW.managed_cloud_release_memo_base64url
+                  IS NOT OLD.managed_cloud_release_memo_base64url
+             OR NEW.managed_cloud_release_sha256
+                  IS NOT OLD.managed_cloud_release_sha256
+             OR NEW.managed_cloud_runtime_instance_id
+                  IS NOT OLD.managed_cloud_runtime_instance_id
+             OR NEW.managed_cloud_runtime_instance_epoch
+                  IS NOT OLD.managed_cloud_runtime_instance_epoch
+             OR NEW.managed_cloud_worker_id IS NOT OLD.managed_cloud_worker_id
+             OR NEW.managed_cloud_gateway_authority_base64url
+                  IS NOT OLD.managed_cloud_gateway_authority_base64url
+             OR NEW.managed_cloud_gateway_authority_sha256
+                  IS NOT OLD.managed_cloud_gateway_authority_sha256
+             OR NEW.managed_cloud_lease_authority_sha256
+                  IS NOT OLD.managed_cloud_lease_authority_sha256)
+             AND NOT (OLD.phase = 'prepared' AND NEW.phase = 'prepared'
+               AND NEW.fence > OLD.fence))
+           OR (NEW.managed_cloud_lease_authority_sha256 IS NOT NULL AND (
+             NOT EXISTS(
+               SELECT 1 FROM jobs_workflow_commands command
+                WHERE command.id = NEW.managed_cloud_request_command_id
+                  AND command.request_id = NEW.managed_cloud_workflow_request_id
+                  AND command.account_id = NEW.account_id
+                  AND command.application_id = NEW.application_id
+                  AND command.run_id = NEW.run_id
+                  AND command.managed_cloud_authority_required = 1
+                  AND command.command_kind IN ('start', 'resume')
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+                WHERE binding.command_id = NEW.managed_cloud_execution_command_id
+                  AND binding.binding_sha256 = NEW.managed_cloud_binding_sha256
+                  AND binding.release_memo_base64url =
+                      NEW.managed_cloud_release_memo_base64url
+                  AND binding.release_memo_sha256 = NEW.managed_cloud_release_sha256
+             )
+             OR NOT EXISTS(
+               SELECT 1 FROM jobs_managed_cloud_runtime_instances instance
+                WHERE instance.runtime_instance_id =
+                      NEW.managed_cloud_runtime_instance_id
+                  AND instance.instance_epoch =
+                      NEW.managed_cloud_runtime_instance_epoch
+                  AND instance.worker_id = NEW.managed_cloud_worker_id
+             )
+           ))
+         BEGIN
+           SELECT RAISE(ABORT, 'managed-cloud execution lease authority is frozen');
+         END;
+         DROP TRIGGER IF EXISTS trg_jobs_managed_cloud_command_hard_delete;
+         CREATE TRIGGER trg_jobs_managed_cloud_command_hard_delete
+         BEFORE DELETE ON jobs_workflow_commands
+         WHEN EXISTS(
+           SELECT 1 FROM jobs_workflow_cleanup_hard_delete_cascade_tokens token
+            WHERE token.account_id = OLD.account_id
+              AND NOT EXISTS(
+                SELECT 1 FROM accounts account WHERE account.id = OLD.account_id)
+         )
+         BEGIN
+           DELETE FROM jobs_execution_leases
+            WHERE account_id = OLD.account_id
+              AND (managed_cloud_request_command_id = OLD.id
+                OR managed_cloud_execution_command_id = OLD.id);
+           DELETE FROM jobs_workflow_cleanup_targets
+            WHERE account_id = OLD.account_id AND start_command_id = OLD.id;
+           DELETE FROM jobs_managed_cloud_request_start_authorities
+            WHERE account_id = OLD.account_id AND command_id = OLD.id;
+           DELETE FROM jobs_managed_cloud_workflow_bindings
+            WHERE command_id = OLD.id;
+         END;
+         CREATE TRIGGER IF NOT EXISTS trg_jobs_managed_cloud_cleanup_target_binding_insert
+         BEFORE INSERT ON jobs_workflow_cleanup_targets
+         WHEN
+           ((NEW.managed_cloud_binding_sha256 IS NULL)
+             + (NEW.managed_cloud_release_memo_base64url IS NULL)
+             + (NEW.managed_cloud_release_memo_sha256 IS NULL)) NOT IN (0, 3)
+           OR (NEW.managed_cloud_binding_sha256 IS NULL AND EXISTS(
+             SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+              WHERE binding.command_id = NEW.start_command_id
+           ))
+           OR (NEW.managed_cloud_binding_sha256 IS NOT NULL AND NOT EXISTS(
+             SELECT 1 FROM jobs_managed_cloud_workflow_bindings binding
+              WHERE binding.command_id = NEW.start_command_id
+                AND binding.binding_sha256 = NEW.managed_cloud_binding_sha256
+                AND binding.release_memo_base64url = NEW.managed_cloud_release_memo_base64url
+                AND binding.release_memo_sha256 = NEW.managed_cloud_release_memo_sha256
+           ))
+         BEGIN
+           SELECT RAISE(ABORT,
+             'workflow cleanup managed-cloud memo authority is invalid');
+         END;
+         CREATE TRIGGER IF NOT EXISTS
+           trg_jobs_managed_cloud_cleanup_target_binding_immutable
+         BEFORE UPDATE OF managed_cloud_binding_sha256,
+           managed_cloud_release_memo_base64url,
+           managed_cloud_release_memo_sha256
+         ON jobs_workflow_cleanup_targets
+         BEGIN
+           SELECT RAISE(ABORT,
+             'workflow cleanup managed-cloud memo authority is immutable');
+         END;
+         CREATE TRIGGER IF NOT EXISTS
+           trg_jobs_managed_cloud_binding_no_historical_retrofit
+         BEFORE INSERT ON jobs_managed_cloud_workflow_bindings
+         WHEN NOT EXISTS(
+           SELECT 1 FROM jobs_workflow_commands command
+            WHERE command.id = NEW.command_id
+              AND command.managed_cloud_authority_required = 1
+         ) OR EXISTS(
+             SELECT 1 FROM jobs_workflow_cleanup_targets target
+              WHERE target.start_command_id = NEW.command_id
+                AND (
+                  target.managed_cloud_binding_sha256 IS NULL
+                  OR target.managed_cloud_binding_sha256 <> NEW.binding_sha256
+                  OR target.managed_cloud_release_memo_base64url
+                     <> NEW.release_memo_base64url
+                  OR target.managed_cloud_release_memo_sha256
+                     <> NEW.release_memo_sha256
+                )
+           )
+         BEGIN
+           SELECT RAISE(ABORT,
+             'managed-cloud binding cannot retrofit cleanup memo authority');
+         END;
+         CREATE TRIGGER IF NOT EXISTS
+           trg_jobs_managed_cloud_command_authority_marker_immutable
+         BEFORE UPDATE OF managed_cloud_authority_required
+         ON jobs_workflow_commands
+         BEGIN
+           SELECT RAISE(ABORT,
+             'managed-cloud command authority marker is immutable');
+         END;",
+    )?;
     ensure_column(
         &conn,
         "jobs_communication_actions",
@@ -2260,6 +2736,11 @@ pub const JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID: &str =
     "032_jobs_workflow_cleanup_authority.sql";
 const POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY: &str =
     include_str!("../../../infra/postgres/server-runtime/032_jobs_workflow_cleanup_authority.sql");
+pub const JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID: &str =
+    "033_jobs_managed_cloud_release_authority.sql";
+const POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql"
+);
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2376,6 +2857,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+    ),
+    (
+        JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
     ),
 ];
 
@@ -4329,6 +4814,90 @@ mod sqlite_migration_replay_tests {
             format!("{error:#}").contains("CHECK constraint failed"),
             "unexpected migration error: {error:#}"
         );
+    }
+    #[test]
+    fn managed_cloud_execution_lease_schema_survives_fresh_and_replayed_startup() {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-managed-cloud-migration-replay-{}.sqlite3",
+            uuid::Uuid::new_v4()
+        ));
+        let pool = open_pool(&path).expect("open managed-cloud migration database");
+        run_migrations(&pool).expect("fresh managed-cloud migrations");
+        run_migrations(&pool).expect("replayed managed-cloud migrations");
+        let conn = pool.get().expect("managed-cloud migration connection");
+        let mut statement = conn
+            .prepare("PRAGMA table_info(jobs_execution_leases)")
+            .expect("execution lease columns");
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query execution lease columns")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collect execution lease columns");
+        for column in [
+            "managed_cloud_workflow_request_id",
+            "managed_cloud_runtime_instance_id",
+            "managed_cloud_runtime_instance_epoch",
+            "managed_cloud_worker_id",
+            "managed_cloud_lease_authority_sha256",
+        ] {
+            assert!(
+                columns.iter().any(|stored| stored == column),
+                "missing {column}"
+            );
+        }
+        let update_trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_jobs_managed_cloud_execution_lease_update'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud execution lease update trigger");
+        assert!(update_trigger.contains("managed_cloud_worker_id"));
+        assert!(update_trigger.contains("NOT IN (0, 12)"));
+        let receipt_table: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table'
+                   AND name='jobs_managed_cloud_irreversible_effect_receipts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud irreversible receipt table");
+        assert!(receipt_table.contains("PRIMARY KEY(run_id, fence)"));
+        assert!(receipt_table.contains("runtime_instance_epoch"));
+        let runtime_instance_worker_index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index'
+                   AND name='idx_jobs_managed_cloud_runtime_instance_epoch_worker'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud runtime instance/epoch/worker unique index");
+        assert!(runtime_instance_worker_index
+            .contains("runtime_instance_id, instance_epoch, worker_id"));
+        let receipt_insert_trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_jobs_managed_cloud_irreversible_receipt_insert'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud irreversible receipt insert trigger");
+        assert!(receipt_insert_trigger.contains("lease.phase='click_started'"));
+        assert!(receipt_insert_trigger.contains("managed_cloud_worker_id=NEW.worker_id"));
+        let receipt_delete_trigger: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger'
+                   AND name='trg_jobs_managed_cloud_irreversible_receipt_no_delete'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("managed-cloud irreversible receipt delete trigger");
+        assert!(receipt_delete_trigger.contains("jobs_workflow_cleanup_hard_delete_cascade_tokens"));
+        drop(statement);
+        drop(conn);
+        drop(pool);
+        let _ = std::fs::remove_file(path);
     }
 }
 

@@ -121,6 +121,12 @@ struct ReconcileV2TargetRequest {
     first_execution_run_id: Option<String>,
     start_request_id: String,
     start_payload_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_cloud_binding_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_cloud_release_memo_base64url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_cloud_release_memo_sha256: Option<String>,
     known_run_ids: Vec<String>,
     target_digest: String,
     cleanup_fence: i64,
@@ -214,6 +220,9 @@ fn v2_target_request_for_lease(lease: &JobsV2TargetCleanupLease) -> ReconcileV2T
         first_execution_run_id: lease.first_execution_run_id.clone(),
         start_request_id: lease.start_request_id.clone(),
         start_payload_digest: lease.start_payload_digest.clone(),
+        managed_cloud_binding_sha256: lease.managed_cloud_binding_sha256.clone(),
+        managed_cloud_release_memo_base64url: lease.managed_cloud_release_memo_base64url.clone(),
+        managed_cloud_release_memo_sha256: lease.managed_cloud_release_memo_sha256.clone(),
         known_run_ids: lease.known_run_ids.clone(),
         target_digest: lease.target_digest.clone(),
         cleanup_fence: lease.cleanup_fence,
@@ -330,6 +339,12 @@ struct ReconcileV2TargetReceipt {
     workflow_id: String,
     start_request_id: String,
     start_payload_digest: String,
+    #[serde(default)]
+    managed_cloud_binding_sha256: Option<String>,
+    #[serde(default)]
+    managed_cloud_release_memo_base64url: Option<String>,
+    #[serde(default)]
+    managed_cloud_release_memo_sha256: Option<String>,
     known_run_ids: Vec<String>,
     target_digest: String,
     cleanup_fence: i64,
@@ -647,6 +662,12 @@ fn cleanup_enabled() -> bool {
     std::env::var(CLEANUP_FLAG).is_ok_and(|value| value == "true")
 }
 
+/// Returns whether cleanup is explicitly enabled with the same complete,
+/// bounded configuration required by dispatcher startup.
+pub(crate) fn workflow_cleanup_dispatch_configured_for_runtime() -> bool {
+    cleanup_enabled() && CleanupDispatcherConfig::from_env().is_ok()
+}
+
 fn optional_bounded_i64(
     name: &str,
     default: i64,
@@ -930,6 +951,7 @@ fn outbound_request_is_valid(
                     .is_none_or(|value| valid_opaque_id(value, 128))
                 && valid_opaque_id(&request.start_request_id, 128)
                 && valid_digest(&request.start_payload_digest)
+                && valid_managed_cloud_cleanup_memo(request)
                 && closed_run_id_set(&request.known_run_ids)
                 && match request.first_execution_run_id.as_deref() {
                     Some(value) => request.known_run_ids.iter().any(|run_id| run_id == value),
@@ -940,7 +962,7 @@ fn outbound_request_is_valid(
                     request,
                     V2_TARGET_DIGEST_DOMAIN,
                     &request.target_digest,
-                    &["knownRunIds"],
+                    &["knownRunIds", "managedCloudReleaseMemoBase64url"],
                 )
                 && positive_safe_integer(request.cleanup_fence)
                 && matches!(request.observation_pass, 1 | 2)
@@ -973,7 +995,7 @@ fn request_target_digest_matches<T: Serialize>(
         }
     }
     for key in additional_mutable_fields {
-        if object.remove(*key).is_none() {
+        if object.remove(*key).is_none() && *key != "managedCloudReleaseMemoBase64url" {
             return false;
         }
     }
@@ -986,6 +1008,29 @@ fn positive_safe_integer(value: i64) -> bool {
 
 fn valid_optional_digest(value: Option<&str>) -> bool {
     value.is_none_or(valid_digest)
+}
+
+fn valid_managed_cloud_cleanup_memo(request: &ReconcileV2TargetRequest) -> bool {
+    match (
+        request.managed_cloud_binding_sha256.as_deref(),
+        request.managed_cloud_release_memo_base64url.as_deref(),
+        request.managed_cloud_release_memo_sha256.as_deref(),
+    ) {
+        (None, None, None) => true,
+        (Some(binding_sha256), Some(memo_base64url), Some(memo_sha256)) => {
+            let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(memo_base64url)
+            else {
+                return false;
+            };
+            valid_digest(binding_sha256)
+                && valid_digest(memo_sha256)
+                && !bytes.is_empty()
+                && bytes.len() <= 4_096
+                && base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&bytes) == memo_base64url
+                && hex::encode(Sha256::digest(&bytes)) == memo_sha256
+        }
+        _ => false,
+    }
 }
 
 fn classify_gateway_response(
@@ -1229,6 +1274,10 @@ fn v2_reconcile_receipt_matches(
         && receipt.workflow_id == request.workflow_id
         && receipt.start_request_id == request.start_request_id
         && receipt.start_payload_digest == request.start_payload_digest
+        && receipt.managed_cloud_binding_sha256 == request.managed_cloud_binding_sha256
+        && receipt.managed_cloud_release_memo_base64url
+            == request.managed_cloud_release_memo_base64url
+        && receipt.managed_cloud_release_memo_sha256 == request.managed_cloud_release_memo_sha256
         && receipt.known_run_ids == request.known_run_ids
         && receipt.target_digest == request.target_digest
         && receipt.cleanup_fence == request.cleanup_fence
@@ -1585,6 +1634,9 @@ mod tests {
             first_execution_run_id: Some(format!("temporal-run-{}", "b".repeat(32))),
             start_request_id: format!("wfreq-v2-{}", "e".repeat(32)),
             start_payload_digest: "f".repeat(64),
+            managed_cloud_binding_sha256: None,
+            managed_cloud_release_memo_base64url: None,
+            managed_cloud_release_memo_sha256: None,
             known_run_ids: vec![format!("temporal-run-{}", "b".repeat(32))],
             target_digest: "a0367cabb234f15fbc3089323607ae0e245b299cef72d86f6e04b7d42ea82d2b"
                 .to_string(),
@@ -1595,7 +1647,7 @@ mod tests {
             &request,
             V2_TARGET_DIGEST_DOMAIN,
             &request.target_digest,
-            &["knownRunIds"],
+            &["knownRunIds", "managedCloudReleaseMemoBase64url"],
         ));
 
         request
@@ -1605,7 +1657,68 @@ mod tests {
             &request,
             V2_TARGET_DIGEST_DOMAIN,
             &request.target_digest,
-            &["knownRunIds"],
+            &["knownRunIds", "managedCloudReleaseMemoBase64url"],
+        ));
+    }
+
+    #[test]
+    fn v2_managed_cloud_target_binds_exact_release_memo_without_changing_history() {
+        let binding_sha256 = "1".repeat(64);
+        let memo = json!({
+            "activationExpiresAtMs": 1_800_000_000_000_i64,
+            "activationSha256": "2".repeat(64),
+            "bindingSha256": binding_sha256,
+            "channelSequence": 4,
+            "cohortSha256": "3".repeat(64),
+            "failureConverterSha256": "4".repeat(64),
+            "headRevision": 5,
+            "manifestSha256": "6".repeat(64),
+            "readinessSha256": "7".repeat(64),
+            "releaseId": "managed-cloud-release-test",
+            "releaseSequence": 8,
+            "resolvedAtMs": 1_700_000_000_000_i64,
+            "scope": {
+                "channel": "canary",
+                "environment": "staging",
+                "region": "us-east-1",
+            },
+            "taskQueueSha256": "8".repeat(64),
+            "transitionSha256": "9".repeat(64),
+            "trustGeneration": 2,
+            "version": 1,
+        });
+        let memo_bytes = serde_json::to_vec(&memo).unwrap();
+        let memo_base64url = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&memo_bytes);
+        let memo_sha256 = hex::encode(Sha256::digest(&memo_bytes));
+        let mut request = v2_reconcile_request_fixture(None);
+        request.managed_cloud_binding_sha256 = Some("1".repeat(64));
+        request.managed_cloud_release_memo_base64url = Some(memo_base64url);
+        request.managed_cloud_release_memo_sha256 = Some(memo_sha256);
+        request.target_digest = request_target_digest(
+            &request,
+            V2_TARGET_DIGEST_DOMAIN,
+            &["knownRunIds", "managedCloudReleaseMemoBase64url"],
+        );
+        let config = static_cleanup_config_fixture(&request.namespace);
+        assert!(outbound_request_is_valid(
+            &config,
+            &WorkflowCleanupRequest::ReconcileV2Target(request.clone()),
+        ));
+        let receipt = v2_reconcile_receipt_fixture(
+            &request,
+            ReconcileOutcome::AbsenceObserved,
+            ReconcileReason::AbsenceObserved,
+            None,
+            vec![],
+        );
+        let parsed: ReconcileV2TargetReceipt = serde_json::from_value(receipt).unwrap();
+        assert!(v2_reconcile_receipt_matches(&request, &parsed));
+
+        let mut partial = request;
+        partial.managed_cloud_release_memo_sha256 = None;
+        assert!(!outbound_request_is_valid(
+            &config,
+            &WorkflowCleanupRequest::ReconcileV2Target(partial),
         ));
     }
 
@@ -1643,8 +1756,11 @@ mod tests {
 
         let mut request = v2_reconcile_request_fixture(Some(max[0].clone()));
         request.known_run_ids = max.clone();
-        request.target_digest =
-            request_target_digest(&request, V2_TARGET_DIGEST_DOMAIN, &["knownRunIds"]);
+        request.target_digest = request_target_digest(
+            &request,
+            V2_TARGET_DIGEST_DOMAIN,
+            &["knownRunIds", "managedCloudReleaseMemoBase64url"],
+        );
         let receipt = v2_reconcile_receipt_fixture(
             &request,
             ReconcileOutcome::AbsenceObserved,
@@ -2551,12 +2667,18 @@ mod tests {
             first_execution_run_id,
             start_request_id: format!("wfreq-v2-{}", "e".repeat(32)),
             start_payload_digest: "f".repeat(64),
+            managed_cloud_binding_sha256: None,
+            managed_cloud_release_memo_base64url: None,
+            managed_cloud_release_memo_sha256: None,
             target_digest: "0".repeat(64),
             cleanup_fence: 11,
             observation_pass: 1,
         };
-        request.target_digest =
-            request_target_digest(&request, V2_TARGET_DIGEST_DOMAIN, &["knownRunIds"]);
+        request.target_digest = request_target_digest(
+            &request,
+            V2_TARGET_DIGEST_DOMAIN,
+            &["knownRunIds", "managedCloudReleaseMemoBase64url"],
+        );
         request
     }
 
@@ -2587,6 +2709,15 @@ mod tests {
             "reason": reason,
             "runIds": run_ids,
         });
+        if let (Some(binding_sha256), Some(memo_base64url), Some(memo_sha256)) = (
+            request.managed_cloud_binding_sha256.as_deref(),
+            request.managed_cloud_release_memo_base64url.as_deref(),
+            request.managed_cloud_release_memo_sha256.as_deref(),
+        ) {
+            receipt["managedCloudBindingSha256"] = json!(binding_sha256);
+            receipt["managedCloudReleaseMemoBase64url"] = json!(memo_base64url);
+            receipt["managedCloudReleaseMemoSha256"] = json!(memo_sha256);
+        }
         let evidence_digest =
             cleanup_domain_digest(CLEANUP_EVIDENCE_DIGEST_DOMAIN, &receipt).unwrap();
         receipt["evidenceDigest"] = json!(evidence_digest);
@@ -2649,7 +2780,9 @@ mod tests {
             object.remove(key).unwrap();
         }
         for key in additional_mutable_fields {
-            object.remove(*key).unwrap();
+            if object.remove(*key).is_none() {
+                assert_eq!(*key, "managedCloudReleaseMemoBase64url");
+            }
         }
         cleanup_domain_digest(domain, &value).unwrap()
     }

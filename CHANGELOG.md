@@ -7,6 +7,24 @@ under `docs/release/`.
 
 ### Added
 
+- Added disabled-by-default Bluey Jobs managed-cloud launch authority for the browser-delivered,
+  no-install Background runner. The authority requires one canonical signed release to bind the
+  exact Jobs API, workflows, runner, and portal artifacts; schema, protocol, configuration,
+  Temporal, storage, and fleet identities; cohort and compatibility policy; runtime grants and
+  database-time heartbeats; and compare-and-swap activation, rollback, and revocation.
+  Start/resume admission derives live
+  role quorum and freezes release A transactionally, while materialization, Temporal activities,
+  execution-lease claim, checkpoint restore, resume, and the irreversible-effect boundary require
+  that same A plus a fresh compatible managed-runner B. Durable request-start recovery reuses the
+  original A and is lookup-only, so rollback, head loss, or disabled new-effect dispatch cannot
+  silently downgrade ambiguity into a second effect. The new build-once workflow defines closed
+  inventory and verification of stored OCI/static bytes, SBOM, provenance, and read-back evidence
+  without rebuilding.
+  Direct discovery, global discovery, and original-source verification remain outside this release
+  authority. Every customer release flag remains `0`; registry publication, signing credentials,
+  protected-environment approval, hosted PostgreSQL/Temporal and runner-capacity evidence,
+  read-only-rootfs and runtime-image attestation, customer cohort approval, canary, rollback, and
+  deployment remain parked external gates.
 - Added disabled-by-default Bluey Jobs workflow-cleanup authority as an exact prerequisite for
   account hard deletion. The stateless schema-v3 private gateway exposes `/workflow-cleanup` only
   for the exact literal enablement `true`; the Rust dispatcher validates configuration before any
@@ -189,6 +207,25 @@ under `docs/release/`.
 
 ### Fixed
 
+- Corrected the Unix daemon IPC capability replacement test to model one boot-scoped atomic
+  replacement instead of an artificial stream of 100 rewrites, and added deterministic proof that
+  four consecutive zero-link opens exhaust the existing bounded retry policy and fail closed.
+  Production owner, mode, file-type, symlink, hard-link, zero-link, and retry behavior is unchanged.
+- Normalized the pinned Playwright Noble base's regular `/usr/bin/node` into the existing
+  `/usr/local/bin/node` managed-runtime authority before measurement, then removed the source path
+  and package-manager tools from both NodeSource and `/usr/local` layouts. CI and release image
+  identity now bind to the pull-request head SHA with a non-PR fallback instead of attesting a
+  synthetic merge SHA. The prior 256-file error masked this later fail-closed path mismatch; no
+  measurement root, release flag, or hosted authority was relaxed.
+- Completed Rust 1.98 compatibility across the initial proven eleven-file backport plus two
+  fixed-width chunk sites exposed by the exact Phase 611 rerun in the daemon application, without
+  importing unrelated Phase 623 work or changing runtime behavior.
+- Raised the closed managed-cloud runtime-measurement file bound from 256 to 512 across candidate
+  construction, embedded runtime verification, and server release-evidence validation. The pinned
+  Playwright Chromium headless-shell tree alone exceeds the old bound, so managed-runner image
+  construction failed closed before the application and Node runtime were counted. Exact 512/513
+  boundary tests preserve a finite file set and the existing 128 KiB canonical envelope; no
+  measurement root, release flag, or hosted authority was relaxed.
 - Made Jobs provider write-grant upgrades advance their credential-refresh CAS
   timestamp even when both mutations occur in the same clock tick. A stale
   token refresh now deterministically loses authority instead of reaching a

@@ -26,6 +26,7 @@ pub mod jobs_interview_prep;
 pub mod jobs_local_capability;
 mod jobs_mailbox;
 pub mod jobs_mailbox_oauth;
+pub mod jobs_managed_cloud_releases;
 pub mod jobs_operations;
 pub(crate) mod jobs_resume_assets;
 pub(crate) mod jobs_resume_generation;
@@ -185,6 +186,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .merge(
             jobs::worker_router()
                 .merge(jobs_ats_certifications::worker_router())
+                .merge(jobs_managed_cloud_releases::worker_router())
                 .merge(jobs_runner_volumes::worker_router())
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),
@@ -218,6 +220,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         .merge(jobs::admin_router())
         .merge(jobs_ats_certifications::admin_router())
         .merge(jobs_browser_releases::admin_router())
+        .merge(jobs_managed_cloud_releases::admin_router())
         .merge(jobs_operations::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin));
@@ -431,6 +434,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         .merge(jobs::admin_router())
         .merge(jobs_ats_certifications::admin_router())
         .merge(jobs_browser_releases::admin_router())
+        .merge(jobs_managed_cloud_releases::admin_router())
         .merge(jobs_operations::admin_router())
         .merge(jobs_runner_volumes::admin_router())
         .route_layer(axum::middleware::from_fn(auth::require_admin))
@@ -451,6 +455,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         .merge(
             jobs::worker_router()
                 .merge(jobs_ats_certifications::worker_router())
+                .merge(jobs_managed_cloud_releases::worker_router())
                 .merge(jobs_runner_volumes::worker_router())
                 .route_layer(axum::middleware::from_fn_with_state(
                     state.clone(),

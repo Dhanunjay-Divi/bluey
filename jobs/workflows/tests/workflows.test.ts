@@ -6,6 +6,9 @@ import {
   type SubmissionReceipt,
 } from "@bluey/jobs-automation";
 import type {
+  ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import type {
   ApplicationWorkflowInput,
   InterventionResolution,
   WorkflowResumeCommandAuthority,
@@ -27,7 +30,9 @@ const runnerActivities = {
 };
 const opaqueActivities = {
   executeApplicationCommand: vi.fn(),
+  executeManagedApplicationCommand: vi.fn(),
   resumeApplicationCommand: vi.fn(),
+  resumeManagedApplicationCommand: vi.fn(),
   publishApplicationIntervention: vi.fn(),
   finalizeApplicationCommand: vi.fn(),
 };
@@ -143,7 +148,9 @@ describe("application workflow irreversible boundary", () => {
     runnerActivities.runApplication.mockReset();
     runnerActivities.resumeApplication.mockReset();
     opaqueActivities.executeApplicationCommand.mockReset();
+    opaqueActivities.executeManagedApplicationCommand.mockReset();
     opaqueActivities.resumeApplicationCommand.mockReset();
+    opaqueActivities.resumeManagedApplicationCommand.mockReset();
     opaqueActivities.publishApplicationIntervention.mockReset();
     opaqueActivities.finalizeApplicationCommand.mockReset();
     signalHandler = undefined;
@@ -334,6 +341,28 @@ function opaqueAuthority() {
   };
 }
 
+function managedCloudReleaseMemo(): ManagedCloudReleaseMemoAuthority {
+  return {
+    version: 1,
+    bindingSha256: "1".repeat(64),
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 2,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 1,
+    channelSequence: 2,
+    releaseId: "managed-cloud-release-test",
+    releaseSequence: 1,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_800_000_000_000,
+    resolvedAtMs: 1_750_000_000_000,
+  };
+}
+
 function resumeAuthority(
   marker: string,
   interventionId: string,
@@ -350,7 +379,9 @@ function resumeAuthority(
 describe("application workflow v2 opaque authority", () => {
   beforeEach(() => {
     opaqueActivities.executeApplicationCommand.mockReset();
+    opaqueActivities.executeManagedApplicationCommand.mockReset();
     opaqueActivities.resumeApplicationCommand.mockReset();
+    opaqueActivities.resumeManagedApplicationCommand.mockReset();
     opaqueActivities.publishApplicationIntervention.mockReset();
     opaqueActivities.finalizeApplicationCommand.mockReset();
     opaqueActivities.publishApplicationIntervention.mockImplementation(
@@ -381,6 +412,44 @@ describe("application workflow v2 opaque authority", () => {
     expect(opaqueActivities.executeApplicationCommand).toHaveBeenCalledWith(authority);
     expect(JSON.stringify(opaqueActivities.executeApplicationCommand.mock.calls)).not.toContain("account");
     expect(JSON.stringify(opaqueActivities.executeApplicationCommand.mock.calls)).not.toContain("https://");
+  });
+
+  it("accepts the exact managed-cloud release memo as the second workflow argument", async () => {
+    const authority = opaqueAuthority();
+    const managedCloudRelease = managedCloudReleaseMemo();
+    opaqueActivities.executeManagedApplicationCommand.mockResolvedValueOnce({ state: "submitted" });
+
+    await expect(applicationWorkflowV2(authority, managedCloudRelease))
+      .resolves.toEqual({ state: "submitted" });
+
+    expect(opaqueActivities.executeManagedApplicationCommand).toHaveBeenCalledWith({
+      command: authority,
+      managedCloudRelease,
+    });
+    expect(opaqueActivities.executeApplicationCommand).not.toHaveBeenCalled();
+  });
+
+  it("keeps the same release memo on the distinct managed resume activity", async () => {
+    const authority = opaqueAuthority();
+    const managedCloudRelease = managedCloudReleaseMemo();
+    const interventionId = `intervention-${"a".repeat(32)}`;
+    const command = resumeAuthority("d", interventionId);
+    pendingUpdates = [command];
+    opaqueActivities.executeManagedApplicationCommand.mockResolvedValueOnce({
+      state: "intervention_prepared",
+      interventionId,
+    });
+    opaqueActivities.resumeManagedApplicationCommand.mockResolvedValueOnce({ state: "submitted" });
+
+    await expect(applicationWorkflowV2(authority, managedCloudRelease))
+      .resolves.toEqual({ state: "submitted" });
+
+    expect(opaqueActivities.resumeManagedApplicationCommand).toHaveBeenCalledWith({
+      workflow: authority,
+      command,
+      managedCloudRelease,
+    });
+    expect(opaqueActivities.resumeApplicationCommand).not.toHaveBeenCalled();
   });
 
   it.each([

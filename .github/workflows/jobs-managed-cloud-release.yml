@@ -1,0 +1,451 @@
+name: Jobs managed-cloud release authority
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Build or advance one already-built release artifact set
+        required: true
+        type: choice
+        options:
+          - candidate
+          - authorize
+          - promote
+          - rollback
+      candidate_run_id:
+        description: Successful candidate run for authorize
+        required: false
+        type: string
+      authorized_run_id:
+        description: Successful authorize run for promote
+        required: false
+        type: string
+      from_promotion_run_id:
+        description: Current promotion run for rollback
+        required: false
+        type: string
+      target_promotion_run_id:
+        description: Successor promotion over prior verified bytes for rollback
+        required: false
+        type: string
+      release_id:
+        description: Immutable release identifier for a candidate build
+        required: false
+        type: string
+      manifest_generation:
+        description: Monotonic manifest generation for a candidate build
+        required: false
+        type: string
+      release_sequence:
+        description: Monotonic release sequence for a candidate build
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: jobs-managed-cloud-release-${{ github.event.inputs.operation }}
+  cancel-in-progress: false
+
+jobs:
+  # RELEASE-GATE: CANDIDATE-BUILD-BEGIN
+  candidate:
+    if: github.event.inputs.operation == 'candidate'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Validate immutable build inputs
+        env:
+          NODE_IMAGE: ${{ vars.BLUEY_JOBS_NODE_IMAGE }}
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+        run: |
+          set -euo pipefail
+          test -n "$RELEASE_ID"
+          case "$NODE_IMAGE" in
+            *@sha256:????????????????????????????????????????????????????????????????) ;;
+            *) echo "BLUEY_JOBS_NODE_IMAGE must be digest-pinned" >&2; exit 1 ;;
+          esac
+          docker buildx version
+      - name: Create closed contracts and run the release-gate tests
+        run: |
+          set -euo pipefail
+          mkdir -p release/contracts release/prepared release/oci
+          node jobs/scripts/managed-cloud-release-gate.mjs contracts \
+            --repo "$GITHUB_WORKSPACE" \
+            --out "$GITHUB_WORKSPACE/release/contracts"
+          node --test jobs/scripts/managed-cloud-release-gate.test.mjs
+          printf '%s\n%s\n' \
+            bluey-jobs-managed-cloud-release-gate-tests-v1 \
+            "$GITHUB_SHA" \
+            > release/prepared/release-gate-tests.log
+      - name: Build each component exactly once
+        env:
+          NODE_IMAGE: ${{ vars.BLUEY_JOBS_NODE_IMAGE }}
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          CONFIG_SCHEMA_SHA256=$(sha256sum release/contracts/config-contract.json | cut -d' ' -f1)
+          MIGRATION_SET_SHA256=$(sha256sum release/contracts/migration-contract.json | cut -d' ' -f1)
+          PROTOCOL_SET_SHA256=$(sha256sum release/contracts/protocol-contract.json | cut -d' ' -f1)
+          docker buildx create --driver docker-container --use
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-api" \
+            --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \
+            --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=oci,dest=release/oci/jobs-api,tar=false,compression=uncompressed,force-compression=true \
+            --file server/Dockerfile.jobs .
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg "BLUEY_JOBS_NODE_IMAGE=$NODE_IMAGE" \
+            --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-workflows" \
+            --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \
+            --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=oci,dest=release/oci/jobs-workflows,tar=false,compression=uncompressed,force-compression=true \
+            --file jobs/workflows/Dockerfile jobs
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+            --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-runner" \
+            --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \
+            --build-arg "BLUEY_JOBS_MIGRATION_SET_SHA256=$MIGRATION_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_PROTOCOL_SET_SHA256=$PROTOCOL_SET_SHA256" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+            --output type=oci,dest=release/oci/jobs-runner,tar=false,compression=uncompressed,force-compression=true \
+            --file jobs/runner/Dockerfile jobs
+          docker run --rm \
+            --env PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
+            --volume "$GITHUB_WORKSPACE/jobs:/workspace" \
+            --workdir /workspace \
+            "$NODE_IMAGE" \
+            sh -euc 'npm ci --workspace @bluey/jobs-portal --include-workspace-root && npm run build --workspace @bluey/jobs-portal'
+          for component in jobs-api jobs-workflows jobs-runner; do
+            (cd "release/oci/$component" \
+              && find . -mindepth 1 -printf '%P\0' \
+                | LC_ALL=C sort -z \
+                | tar --null --no-recursion --files-from=- \
+                    --format=ustar --mtime='@0' --owner=0 --group=0 \
+                    --numeric-owner --mode='u+rwX,go+rX,go-w' \
+                    -cf "$GITHUB_WORKSPACE/release/prepared/$component.oci.tar")
+          done
+          (cd jobs/portal/dist \
+            && find . -mindepth 1 -printf '%P\0' \
+              | LC_ALL=C sort -z \
+              | tar --null --no-recursion --files-from=- \
+                  --format=ustar --mtime='@0' --owner=0 --group=0 \
+                  --numeric-owner --mode='u+rwX,go+rX,go-w' \
+                  -cf "$GITHUB_WORKSPACE/release/prepared/jobs-portal.tar")
+      - name: Inspect artifact bytes and bind SBOM and provenance
+        env:
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+        run: |
+          set -euo pipefail
+          for component in jobs-api jobs-runner jobs-workflows; do
+            node jobs/scripts/managed-cloud-release-gate.mjs inspect-artifact \
+              --file "release/prepared/$component.oci.tar" \
+              --component "$component" --kind oci_image \
+              --out "release/prepared/$component.content-inventory.json"
+          done
+          node jobs/scripts/managed-cloud-release-gate.mjs inspect-artifact \
+            --file release/prepared/jobs-portal.tar \
+            --component jobs-portal --kind static_bundle \
+            --out release/prepared/jobs-portal.content-inventory.json
+          BUILDER_SHA=$(sha256sum release/contracts/builder-policy.json | cut -d' ' -f1)
+          SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          for component in jobs-api jobs-portal jobs-runner jobs-workflows; do
+            node jobs/scripts/managed-cloud-release-gate.mjs sbom \
+              --inventory "release/prepared/$component.content-inventory.json" \
+              --out "release/prepared/$component.sbom.json"
+            node jobs/scripts/managed-cloud-release-gate.mjs provenance \
+              --inventory "release/prepared/$component.content-inventory.json" \
+              --build-id "$RELEASE_ID-$component" \
+              --builder-policy-sha256 "$BUILDER_SHA" \
+              --source-commit "$GITHUB_SHA" \
+              --source-date-epoch "$SOURCE_DATE_EPOCH" \
+              --out "release/prepared/$component.provenance.json"
+          done
+      - name: Assemble the deterministic release candidate
+        env:
+          MANIFEST_GENERATION: ${{ github.event.inputs.manifest_generation }}
+          RELEASE_ID: ${{ github.event.inputs.release_id }}
+          RELEASE_SEQUENCE: ${{ github.event.inputs.release_sequence }}
+        run: |
+          set -euo pipefail
+          export SOURCE_DATE_EPOCH=$(git show -s --format=%ct HEAD)
+          node --input-type=module <<'NODE'
+          import { readFileSync, writeFileSync } from "node:fs";
+          import {
+            canonicalJsonBytes,
+            sha256,
+          } from "./jobs/scripts/managed-cloud-release-gate.mjs";
+          const components = ["jobs-api", "jobs-portal", "jobs-runner", "jobs-workflows"];
+          const inventory = (id) => JSON.parse(
+            readFileSync(`release/prepared/${id}.content-inventory.json`, "utf8"),
+          );
+          const testEvidence = {
+            audience: "bluey-jobs-managed-cloud-test-evidence-v1",
+            checks: [{
+              checkId: "release-gate-tests",
+              evidenceSha256: sha256(readFileSync("release/prepared/release-gate-tests.log")),
+              status: "pass",
+            }],
+            sourceCommit: process.env.GITHUB_SHA,
+            version: 1,
+          };
+          writeFileSync(
+            "release/prepared/test-evidence.json",
+            canonicalJsonBytes(testEvidence),
+          );
+          const descriptor = {
+            audience: "bluey-jobs-managed-cloud-release-descriptor-v1",
+            builds: components.map((componentId) => {
+              const value = inventory(componentId);
+              const oci = value.artifactKind === "oci_image";
+              return {
+                architecture: oci ? "x86_64" : "wasm",
+                artifactKind: value.artifactKind,
+                artifactRef: oci
+                  ? `ghcr.io/bluey/${componentId}@sha256:${value.artifactSha256}`
+                  : `https://artifacts.bluey.sh/jobs/releases/${process.env.RELEASE_ID}/${value.artifactSha256}.tar`,
+                buildId: `${process.env.RELEASE_ID}-${componentId}`,
+                candidateFile: `release/prepared/${componentId}.${oci ? "oci.tar" : "tar"}`,
+                componentId,
+                contentInventoryFile: `release/prepared/${componentId}.content-inventory.json`,
+                platform: oci ? "linux" : "web",
+                provenanceFile: `release/prepared/${componentId}.provenance.json`,
+                sbomFile: `release/prepared/${componentId}.sbom.json`,
+              };
+            }),
+            featureAuthority: {
+              cloudDistribution: true,
+              directDiscovery: false,
+              globalDiscovery: false,
+              sourceVerification: false,
+              workflowCleanup: true,
+              workflowCommandDispatch: true,
+            },
+            manifestGeneration: Number(process.env.MANIFEST_GENERATION),
+            manifestId: `${process.env.RELEASE_ID}-manifest`,
+            publishedAtMs: Number(process.env.SOURCE_DATE_EPOCH) * 1000,
+            releaseId: process.env.RELEASE_ID,
+            releaseSequence: Number(process.env.RELEASE_SEQUENCE),
+            sourceCommit: process.env.GITHUB_SHA,
+            sourceDateEpoch: Number(process.env.SOURCE_DATE_EPOCH),
+            testEvidenceFile: "release/prepared/test-evidence.json",
+            version: 1,
+          };
+          writeFileSync("release/prepared/release-descriptor.json", JSON.stringify(descriptor));
+          NODE
+          node jobs/scripts/managed-cloud-release-gate.mjs assemble \
+            --repo "$GITHUB_WORKSPACE" \
+            --contracts "$GITHUB_WORKSPACE/release/contracts" \
+            --descriptor "$GITHUB_WORKSPACE/release/prepared/release-descriptor.json" \
+            --out "$GITHUB_WORKSPACE/release/candidate"
+      - name: Upload the only candidate bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-candidate
+          path: release/candidate
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: CANDIDATE-BUILD-END
+
+  # RELEASE-GATE: VERIFY-NO-REBUILD-BEGIN
+  verify:
+    if: github.event.inputs.operation == 'candidate'
+    needs: candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Fetch candidate bytes from the build job
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-candidate
+          path: candidate
+      - name: Independently inspect the downloaded bytes
+        run: node jobs/scripts/managed-cloud-release-gate.mjs verify --candidate candidate
+  # RELEASE-GATE: VERIFY-NO-REBUILD-END
+
+  # RELEASE-GATE: AUTHORIZE-NO-REBUILD-BEGIN
+  authorize:
+    if: github.event.inputs.operation == 'authorize'
+    environment: jobs-managed-cloud-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Fetch the verified candidate run
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-candidate
+          path: candidate
+          run-id: ${{ github.event.inputs.candidate_run_id }}
+          github-token: ${{ github.token }}
+      - name: Reverify and authorize with protected trust material
+        env:
+          RELEASE_SIGNATURES: ${{ secrets.BLUEY_JOBS_RELEASE_SIGNATURES_BASE64URL }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+          TRUST_BUNDLE: ${{ secrets.BLUEY_JOBS_RELEASE_TRUST_BUNDLE_BASE64URL }}
+        run: |
+          set -euo pipefail
+          mkdir authority
+          node -e 'require("node:fs").writeFileSync("authority/release-signatures.json", Buffer.from(process.env.RELEASE_SIGNATURES, "base64url"))'
+          node -e 'require("node:fs").writeFileSync("authority/trust-bundle.json", Buffer.from(process.env.TRUST_BUNDLE, "base64url"))'
+          node jobs/scripts/managed-cloud-release-gate.mjs verify --candidate candidate
+          node jobs/scripts/managed-cloud-release-gate.mjs authorize \
+            --candidate candidate \
+            --authorization-id "authorization-$GITHUB_RUN_ID" \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --signatures authority/release-signatures.json \
+            --trust-bundle authority/trust-bundle.json \
+            --out authorized
+      - name: Upload authorized bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-authorized
+          path: authorized
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: AUTHORIZE-NO-REBUILD-END
+
+  # RELEASE-GATE: PROMOTE-NO-REBUILD-BEGIN
+  promote:
+    if: github.event.inputs.operation == 'promote'
+    environment: jobs-managed-cloud-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Fetch the authorized candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-authorized
+          path: authorized
+          run-id: ${{ github.event.inputs.authorized_run_id }}
+          github-token: ${{ github.token }}
+      - name: Reverify and produce an immutable local-adapter promotion
+        env:
+          ACTIVATION: ${{ secrets.BLUEY_JOBS_ACTIVATION_BASE64URL }}
+          ACTIVATION_EVIDENCE: ${{ secrets.BLUEY_JOBS_ACTIVATION_EVIDENCE_BUNDLE_BASE64URL }}
+          ACTIVATION_SIGNATURES: ${{ secrets.BLUEY_JOBS_ACTIVATION_SIGNATURES_BASE64URL }}
+          COHORT: ${{ secrets.BLUEY_JOBS_COHORT_BASE64URL }}
+          COHORT_SIGNATURES: ${{ secrets.BLUEY_JOBS_COHORT_SIGNATURES_BASE64URL }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          mkdir authority evidence
+          node --input-type=module <<'NODE'
+          import { writeFileSync } from "node:fs";
+          const material = [
+            ["authority/activation.json", "ACTIVATION"],
+            ["authority/activation-signatures.json", "ACTIVATION_SIGNATURES"],
+            ["authority/cohort.json", "COHORT"],
+            ["authority/cohort-signatures.json", "COHORT_SIGNATURES"],
+          ];
+          for (const [path, name] of material) {
+            writeFileSync(path, Buffer.from(process.env[name], "base64url"));
+          }
+          const bundle = JSON.parse(
+            Buffer.from(process.env.ACTIVATION_EVIDENCE, "base64url").toString("utf8"),
+          );
+          const expected = [
+            "canary.json", "cleanup-authority.json", "failure-converter.json",
+            "portal-readback.json", "runner-fleet.json", "storage-config.json",
+            "task-queue.json", "temporal-namespace.json",
+          ];
+          if (JSON.stringify(Object.keys(bundle).sort()) !== JSON.stringify(expected)) {
+            throw new Error("activation evidence bundle is not exact");
+          }
+          for (const name of expected) {
+            writeFileSync(`evidence/${name}`, Buffer.from(bundle[name], "base64url"));
+          }
+          NODE
+          node jobs/scripts/managed-cloud-release-gate.mjs promote \
+            --authorized authorized \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --cohort authority/cohort.json \
+            --cohort-signatures authority/cohort-signatures.json \
+            --activation authority/activation.json \
+            --activation-signatures authority/activation-signatures.json \
+            --evidence evidence \
+            --promotion-id "promotion-$GITHUB_RUN_ID" \
+            --out promotion
+      - name: Upload promotion receipt and exact readback bytes
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-promotion
+          path: promotion
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: PROMOTE-NO-REBUILD-END
+
+  # RELEASE-GATE: ROLLBACK-NO-REBUILD-BEGIN
+  rollback:
+    if: github.event.inputs.operation == 'rollback'
+    environment: jobs-managed-cloud-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out only the verifier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Fetch the current promotion
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-promotion
+          path: from-promotion
+          run-id: ${{ github.event.inputs.from_promotion_run_id }}
+          github-token: ${{ github.token }}
+      - name: Fetch the signed successor promotion over old bytes
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: jobs-managed-cloud-promotion
+          path: target-promotion
+          run-id: ${{ github.event.inputs.target_promotion_run_id }}
+          github-token: ${{ github.token }}
+      - name: Reverify both promotions and create the rollback receipt
+        env:
+          ROLLBACK: ${{ secrets.BLUEY_JOBS_ROLLBACK_BASE64URL }}
+          ROLLBACK_SIGNATURES: ${{ secrets.BLUEY_JOBS_ROLLBACK_SIGNATURES_BASE64URL }}
+          ROOT_ANCHOR_SHA256: ${{ vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256 }}
+        run: |
+          set -euo pipefail
+          mkdir authority
+          node -e 'require("node:fs").writeFileSync("authority/rollback.json", Buffer.from(process.env.ROLLBACK, "base64url"))'
+          node -e 'require("node:fs").writeFileSync("authority/rollback-signatures.json", Buffer.from(process.env.ROLLBACK_SIGNATURES, "base64url"))'
+          node jobs/scripts/managed-cloud-release-gate.mjs rollback \
+            --root-anchor-sha256 "$ROOT_ANCHOR_SHA256" \
+            --from-promotion from-promotion \
+            --to-promotion target-promotion \
+            --rollback authority/rollback.json \
+            --rollback-signatures authority/rollback-signatures.json \
+            --out rollback
+      - name: Upload rollback receipt and both verified promotions
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jobs-managed-cloud-rollback
+          path: rollback
+          if-no-files-found: error
+          retention-days: 30
+  # RELEASE-GATE: ROLLBACK-NO-REBUILD-END

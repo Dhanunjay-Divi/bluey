@@ -48,6 +48,11 @@ import {
   type RunnerVolumeStorageAttestation,
 } from "./storage-attestation.js";
 import { createJobsWorkerAuthHeaders } from "@bluey/jobs-automation/worker-auth";
+import {
+  managedCloudReleaseMemoBytes,
+  parseManagedCloudReleaseMemo,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
 
 const API_PREFIX = "/api/jobs/internal/runner-volumes";
 const AUTHORITY_AUDIENCE = "bluey-jobs-runner-volume-authority";
@@ -85,6 +90,11 @@ export interface RunnerExecutionLeaseClaimProofInput {
   readonly runId: string;
   readonly browserProfileId: string;
   readonly ownerId: string;
+  readonly workflowRequestId?: string;
+  readonly managedCloudRelease?: ManagedCloudReleaseMemoAuthority;
+  readonly managedCloudReleaseSha256?: string;
+  readonly managedCloudRuntimeInstanceId?: string;
+  readonly managedCloudRuntimeInstanceEpoch?: number;
 }
 
 export type RunnerVolumeClientErrorCode =
@@ -782,6 +792,49 @@ export class RunnerVolumeClient {
     input: RunnerExecutionLeaseClaimProofInput,
   ): RunnerVolumeAuthorityProof {
     const path = "/api/jobs/internal/execution-leases/claim";
+    const managedValues = [
+      input.workflowRequestId,
+      input.managedCloudRelease,
+      input.managedCloudReleaseSha256,
+      input.managedCloudRuntimeInstanceId,
+      input.managedCloudRuntimeInstanceEpoch,
+    ];
+    const hasManagedValue = managedValues.some((value) => value !== undefined);
+    const hasCompleteManagedAuthority = managedValues.every(
+      (value) => value !== undefined,
+    );
+    let managedExtensions: string[] = [];
+    if (hasManagedValue) {
+      if (!hasCompleteManagedAuthority
+        || !/^wfreq-v2-[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+          input.workflowRequestId!,
+        )
+        || !/^[A-Za-z0-9_-]{20,128}$/.test(input.managedCloudRuntimeInstanceId!)
+        || !Number.isSafeInteger(input.managedCloudRuntimeInstanceEpoch)
+        || input.managedCloudRuntimeInstanceEpoch! <= 0
+        || !SHA256_PATTERN.test(input.managedCloudReleaseSha256!)) {
+        throw new RunnerVolumeClientError("execution_lease_claim", "configuration");
+      }
+      let canonicalSha256: string;
+      try {
+        canonicalSha256 = createHash("sha256")
+          .update(managedCloudReleaseMemoBytes(
+            parseManagedCloudReleaseMemo(input.managedCloudRelease),
+          ))
+          .digest("hex");
+      } catch {
+        throw new RunnerVolumeClientError("execution_lease_claim", "configuration");
+      }
+      if (canonicalSha256 !== input.managedCloudReleaseSha256) {
+        throw new RunnerVolumeClientError("execution_lease_claim", "configuration");
+      }
+      managedExtensions = [
+        `workflow_request_id=${input.workflowRequestId}`,
+        `managed_cloud_release_sha256=${canonicalSha256}`,
+        `managed_cloud_runtime_instance_id=${input.managedCloudRuntimeInstanceId}`,
+        `managed_cloud_runtime_instance_epoch=${input.managedCloudRuntimeInstanceEpoch}`,
+      ];
+    }
     return this.createAuthorityProof("execution_lease_claim", path, [
       `account_id=${input.accountId}`,
       `application_id=${input.applicationId}`,
@@ -793,6 +846,7 @@ export class RunnerVolumeClient {
       `process_instance_id=${this.processInstanceId}`,
       `runtime_grant_id=${this.runtimeGrantId}`,
       `runtime_sha256=${this.runtimeSha256}`,
+      ...managedExtensions,
     ]);
   }
 

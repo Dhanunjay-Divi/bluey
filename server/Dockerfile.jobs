@@ -1,0 +1,79 @@
+ARG SOURCE_DATE_EPOCH
+ARG BLUEY_JOBS_BUILD_ID
+ARG BLUEY_JOBS_CONFIG_SCHEMA_SHA256
+ARG BLUEY_JOBS_MIGRATION_SET_SHA256
+ARG BLUEY_JOBS_PROTOCOL_SET_SHA256
+ARG BLUEY_JOBS_SOURCE_COMMIT
+FROM rust:1.95.0-bookworm@sha256:6258907abe69656e41cd992e0b705cdcfabcbbe3db374f92ed2d47121282d4a1 AS builder
+
+ARG BLUEY_JOBS_BUILD_ID
+ARG BLUEY_JOBS_CONFIG_SCHEMA_SHA256
+ARG BLUEY_JOBS_MIGRATION_SET_SHA256
+ARG BLUEY_JOBS_PROTOCOL_SET_SHA256
+ARG BLUEY_JOBS_SOURCE_COMMIT
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY infra ./infra
+COPY server/Cargo.toml server/Cargo.lock ./server/
+COPY server/src ./server/src
+RUN cargo build --locked --release --manifest-path server/Cargo.toml \
+        --bin bluey-jobs-api \
+    && install -D -m 0555 server/target/release/bluey-jobs-api \
+        /out/rootfs/usr/local/bin/bluey-jobs-api \
+    && ldd server/target/release/bluey-jobs-api \
+        | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
+        | sort -u \
+        | while read -r library; do \
+            install -D -m 0555 "$library" "/out/rootfs$library"; \
+          done \
+    && install -D -m 0444 /etc/ssl/certs/ca-certificates.crt \
+        /out/rootfs/etc/ssl/certs/ca-certificates.crt \
+    && install -d -m 0555 /out/rootfs/app \
+    && install -d -o 65532 -g 65532 -m 0700 /out/rootfs/var/lib/bluey-jobs \
+    && install -d -m 1777 /out/rootfs/tmp \
+    && printf 'bluey-jobs:x:65532:65532:Bluey Jobs:/nonexistent:/sbin/nologin\n' \
+        > /out/rootfs/etc/passwd \
+    && printf 'bluey-jobs:x:65532:\n' > /out/rootfs/etc/group \
+    && chmod 0444 /out/rootfs/etc/passwd /out/rootfs/etc/group
+RUN printf '%s\n' "$BLUEY_JOBS_BUILD_ID" \
+        | grep -Eq '^[a-z0-9][a-z0-9._:-]{2,127}$' \
+    && printf '%s\n' "$BLUEY_JOBS_SOURCE_COMMIT" \
+        | grep -Eq '^[0-9a-f]{40}$' \
+    && for digest in \
+        "$BLUEY_JOBS_CONFIG_SCHEMA_SHA256" \
+        "$BLUEY_JOBS_MIGRATION_SET_SHA256" \
+        "$BLUEY_JOBS_PROTOCOL_SET_SHA256"; do \
+          printf '%s\n' "$digest" | grep -Eq '^[0-9a-f]{64}$'; \
+       done \
+    && api_sha256=$(sha256sum \
+        /out/rootfs/usr/local/bin/bluey-jobs-api | cut -d' ' -f1) \
+    && install -d -m 0555 /out/rootfs/app/.bluey \
+    && printf '%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+        '{"audience":"bluey-jobs-managed-cloud-runtime-measurement-v1","buildId":"' \
+        "$BLUEY_JOBS_BUILD_ID" \
+        '","componentId":"jobs-api","configSchemaSha256":"' \
+        "$BLUEY_JOBS_CONFIG_SCHEMA_SHA256" \
+        '","measuredFiles":[{"path":"usr/local/bin/bluey-jobs-api","sha256":"' \
+        "$api_sha256" \
+        '"}],"migrationSetSha256":"' \
+        "$BLUEY_JOBS_MIGRATION_SET_SHA256" \
+        '","protocolSetSha256":"' \
+        "$BLUEY_JOBS_PROTOCOL_SET_SHA256" \
+        '","roles":["jobs_api","workflow_cleanup_dispatcher","workflow_command_dispatcher"],"sourceCommit":"' \
+        "$BLUEY_JOBS_SOURCE_COMMIT" \
+        '","version":1}' \
+        > /out/rootfs/app/.bluey/managed-cloud-runtime-measurement.json \
+    && chmod 0444 \
+        /out/rootfs/app/.bluey/managed-cloud-runtime-measurement.json
+
+FROM scratch
+COPY --from=builder /out/rootfs /
+ENV BLUEY_JOBS_API_HOST=0.0.0.0
+ENV BLUEY_JOBS_API_PORT=8081
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+WORKDIR /app
+USER 65532:65532
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/bluey-jobs-api"]

@@ -5,6 +5,10 @@ import type {
   RunnerKind,
   SubmissionReceipt,
 } from "@bluey/jobs-automation";
+import type {
+  ManagedCloudGatewayAuthority,
+  ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
 
 export interface ApplicationWorkflowInput {
   accountId: string;
@@ -82,16 +86,39 @@ export interface WorkflowUpdateReceipt extends WorkflowResumeCommandAuthority {
 
 export type WorkflowCommandOperation = "start" | "resume";
 
-export type WorkflowGatewayCommand = WorkflowCommandAuthority & (
+type WorkflowGatewayOperation =
   | { operation: "start" }
-  | { operation: "resume"; interventionId: string }
+  | { operation: "resume"; interventionId: string };
+
+export type WorkflowGatewayCommand = WorkflowGatewayOperation & (
+  | WorkflowCommandAuthority
+  | {
+    schemaVersion: 3;
+    requestId: string;
+    workflowId: string;
+    payloadDigest: string;
+    managedCloud: ManagedCloudGatewayAuthority;
+    reconcileOnly?: true;
+  }
 );
 
-export interface WorkflowGatewayReceipt extends WorkflowCommandAuthority {
+interface WorkflowGatewayReceiptFields {
   outcome: "accepted" | "already_accepted";
   temporalRunId: string;
   interventionId?: string;
 }
+
+export type WorkflowGatewayReceipt = WorkflowGatewayReceiptFields & (
+  | WorkflowCommandAuthority
+  | {
+    schemaVersion: 3;
+    requestId: string;
+    workflowId: string;
+    payloadDigest: string;
+    managedCloud: ManagedCloudGatewayAuthority;
+    reconcileOnly?: true;
+  }
+);
 
 export type WorkflowGatewayErrorReason =
   | "identity_conflict"
@@ -100,10 +127,11 @@ export type WorkflowGatewayErrorReason =
   | "workflow_not_found"
   | "workflow_closed"
   | "describe_ambiguous"
+  | "managed_cloud_unavailable"
   | "temporal_unavailable";
 
 export interface WorkflowGatewayError {
-  schemaVersion: 2;
+  schemaVersion: 2 | 3;
   outcome: "identity_conflict" | "rejected" | "delivery_unknown";
   reason: WorkflowGatewayErrorReason;
 }
@@ -180,6 +208,9 @@ export interface ReconcileV2WorkflowTargetRequest {
   firstExecutionRunId: string | null;
   startRequestId: string;
   startPayloadDigest: string;
+  managedCloudBindingSha256?: string;
+  managedCloudReleaseMemoBase64url?: string;
+  managedCloudReleaseMemoSha256?: string;
   knownRunIds: string[];
   targetDigest: string;
   cleanupFence: number;
@@ -257,14 +288,31 @@ export interface WorkflowTerminalCommand {
   openInterventionId?: string;
 }
 
+export interface ManagedWorkflowCommandInput {
+  command: WorkflowCommandAuthority;
+  managedCloudRelease: ManagedCloudReleaseMemoAuthority;
+}
+
+export interface ManagedWorkflowResumeCommandInput {
+  workflow: WorkflowCommandAuthority;
+  command: WorkflowResumeCommandAuthority;
+  managedCloudRelease: ManagedCloudReleaseMemoAuthority;
+}
+
 export interface OpaqueWorkflowActivities {
   executeApplicationCommand(
     authority: WorkflowCommandAuthority,
+  ): Promise<WorkflowCommandStep>;
+  executeManagedApplicationCommand(
+    input: ManagedWorkflowCommandInput,
   ): Promise<WorkflowCommandStep>;
   resumeApplicationCommand(input: {
     workflow: WorkflowCommandAuthority;
     command: WorkflowResumeCommandAuthority;
   }): Promise<WorkflowCommandStep>;
+  resumeManagedApplicationCommand(
+    input: ManagedWorkflowResumeCommandInput,
+  ): Promise<WorkflowCommandStep>;
   publishApplicationIntervention(
     authority: WorkflowInterventionAuthority,
   ): Promise<WorkflowPublishedIntervention>;

@@ -30,6 +30,19 @@ import {
   type ReceiptDocument,
   type SubmissionReceipt,
 } from "@bluey/jobs-automation";
+import { managedCloudRuntimeConfig } from "@bluey/jobs-automation/managed-cloud-runtime";
+import {
+  managedCloudReleaseMemoBytes,
+  parseManagedCloudReleaseMemo,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import {
+  ManagedCloudRuntimeApiClient,
+  claimManagedCloudRuntimeInstance,
+  managedCloudDependencyEvidenceSha256,
+  runManagedCloudRuntimeHeartbeats,
+  type ManagedCloudRuntimeInstance,
+} from "@bluey/jobs-automation/managed-cloud-runtime-client";
 import { installBrowserNetworkGuard } from "./browser-network-guard.js";
 import { authorizeCloudFinalSubmitBeforeCheckpoint } from "./certified-final-submit.js";
 import {
@@ -132,7 +145,7 @@ import {
   RunnerVolumeClientError,
 } from "./runner-volume-client.js";
 
-interface CloudRunRequest {
+export interface CloudRunRequest {
   accountId: string;
   applicationIdentityId: string;
   browserProfileId: string;
@@ -143,6 +156,7 @@ interface CloudRunRequest {
   url: string;
   packet: ApplicationPacket;
   job: NormalizedJob;
+  managedCloudRelease?: ManagedCloudReleaseMemoAuthority;
 }
 
 interface DurableRunResultRequest {
@@ -205,6 +219,8 @@ let accountResidency: AccountResidencyIndex;
 let subjectStorage: SubjectStorageManager;
 let nativeStorageRoot: NativeRunnerStorageRoot;
 let runnerVolumeReady = false;
+let managedCloudRuntimeReady = true;
+let managedCloudRuntimeInstance: ManagedCloudRuntimeInstance | undefined;
 let storageAttestationQuiescing = false;
 let startupStorageRecoveryComplete = false;
 const locks = new Map<string, Promise<void>>();
@@ -264,6 +280,13 @@ export class TerminalResultPersistenceError extends Error {
   }
 }
 
+export class ManagedCloudRuntimeUnavailableError extends Error {
+  constructor() {
+    super("Managed-cloud runtime authority is unavailable");
+    this.name = "ManagedCloudRuntimeUnavailableError";
+  }
+}
+
 export class DurableFailedRunResultError extends Error {
   constructor(
     readonly requestId: string,
@@ -278,8 +301,9 @@ const runnerServer = createServer(async (request, response) => {
   let workflowCommandRequestId: string | undefined;
   try {
     if (request.url === "/healthz" && request.method === "GET") {
-      return json(response, runnerVolumeReady ? 200 : 503, {
-        ok: runnerVolumeReady,
+      const ready = runnerVolumeReady && managedCloudRuntimeReady;
+      return json(response, ready ? 200 : 503, {
+        ok: ready,
       });
     }
     if (!authorized(request))
@@ -315,7 +339,7 @@ const runnerServer = createServer(async (request, response) => {
       return json(response, 404, { error: "Durable result not found" });
     }
     if (request.url === "/runs" && request.method === "POST") {
-      const input = await validate(await body<CloudRunRequest>(request));
+      const input = await validate(await body<unknown>(request));
       const requestId = input.requestId;
       if (isWorkflowCommandRequestId(requestId)) {
         workflowCommandRequestId = requestId;
@@ -366,6 +390,9 @@ const runnerServer = createServer(async (request, response) => {
           input,
         );
         if (recovered) return recovered;
+        if (!managedCloudRuntimeReady) {
+          throw new ManagedCloudRuntimeUnavailableError();
+        }
         const { lease, execution } = await beginLeasedRun(
           leaseClient,
           {
@@ -373,6 +400,12 @@ const runnerServer = createServer(async (request, response) => {
             applicationId: input.applicationId,
             runId: input.runId,
             browserProfileId: input.browserProfileId,
+            ...(input.managedCloudRelease
+              ? {
+                workflowRequestId: requestId,
+                managedCloudRelease: input.managedCloudRelease,
+              }
+              : {}),
           },
           (activeLease) =>
             run(input, paths, activeLease, requestId, checkpointCreatedAtMs),
@@ -608,6 +641,7 @@ const runnerServer = createServer(async (request, response) => {
     if (resume && request.method === "POST") {
       const resolution = parseRunnerInterventionResolution(
         await body<unknown>(request),
+        managedCloudRuntimeInstance !== undefined,
       );
       if (!/^[A-Za-z0-9:_-]{3,240}$/.test(resolution.requestId || "")) {
         return json(response, 400, { error: "A valid request ID is required" });
@@ -683,16 +717,30 @@ const runnerServer = createServer(async (request, response) => {
             binding,
           );
           if (recovered) return recovered;
+          if (!managedCloudRuntimeReady) {
+            throw new ManagedCloudRuntimeUnavailableError();
+          }
           const active =
             activeRuns.get(resume[1]!) ??
             (await restoreCloudRunCheckpoint(
               resume[1]!,
               resolution.profileScope,
               binding,
+              resolution.managedCloudRelease,
             ));
           if (!active) return undefined;
           if (!activeRunMatchesBinding(active, binding)) {
             throw new ResultStoreError("result_promotion_conflict");
+          }
+          requireSameManagedCloudRelease(
+            active.input.managedCloudRelease,
+            resolution.managedCloudRelease,
+          );
+          if (resolution.managedCloudRelease) {
+            await active.lease.authorizeManagedEffect(
+              resolution.requestId,
+              resolution.managedCloudRelease,
+            );
           }
           assertApprovedExecutionChecksum(
             active.input.packet,
@@ -960,6 +1008,7 @@ if (isMainModule()) {
 }
 
 async function startRunner(): Promise<void> {
+  const managedCloudRuntime = managedCloudRuntimeConfig("managed_runner");
   if (!serviceToken) throw new Error("BLUEY_JOBS_RUNNER_TOKEN is required");
   if (!profileKey)
     throw new Error("BLUEY_JOBS_PROFILE_ENCRYPTION_KEY is required");
@@ -978,10 +1027,25 @@ async function startRunner(): Promise<void> {
   const legacyStorage = await scanLegacyRunnerStorage(nativeStorageRoot);
   const processInstanceId = createRunnerProcessInstanceId();
   const runnerBuildId = requiredRunnerEnv("BLUEY_JOBS_RUNNER_BUILD_ID");
+  const runnerId = requiredRunnerEnv("BLUEY_JOBS_RUNNER_ID");
+  if (managedCloudRuntime && managedCloudRuntime.workerId !== runnerId) {
+    throw new Error("Managed-cloud worker ID must equal the runner ID");
+  }
+  managedCloudRuntimeReady = managedCloudRuntime === undefined;
+  const managedCloudRuntimeApi = managedCloudRuntime
+    ? new ManagedCloudRuntimeApiClient(managedCloudRuntime)
+    : undefined;
+  const claimedManagedCloudRuntimeInstance = managedCloudRuntimeApi
+    ? await claimManagedCloudRuntimeInstance(
+      managedCloudRuntimeApi,
+      AbortSignal.timeout(15_000),
+    )
+    : undefined;
+  managedCloudRuntimeInstance = claimedManagedCloudRuntimeInstance;
   runnerVolumeClient = new RunnerVolumeClient({
     origin: requiredRunnerEnv("BLUEY_JOBS_API_ORIGIN"),
     workerSigningKey: requiredRunnerEnv("BLUEY_JOBS_WORKER_SIGNING_KEY"),
-    workerId: requiredRunnerEnv("BLUEY_JOBS_RUNNER_ID"),
+    workerId: runnerId,
     admissionGrantId: requiredRunnerEnv("BLUEY_JOBS_RUNNER_ADMISSION_GRANT_ID"),
     admissionGrantToken: requiredRunnerEnv(
       "BLUEY_JOBS_RUNNER_ADMISSION_GRANT_TOKEN",
@@ -1034,14 +1098,70 @@ async function startRunner(): Promise<void> {
     runtimeSha256: runnerVolumeClient.runtimeSha256,
     createExecutionLeaseClaimProof: (input) =>
       runnerVolumeClient.createExecutionLeaseClaimProof(input),
-  });
+  }, process.env, claimedManagedCloudRuntimeInstance);
   profileSnapshotClient = createBrowserProfileSnapshotClientFromEnv();
   if (reconciledLegacyStorage.legacyArtifactCount === 0) {
     await completeRunnerStartupStorageRecovery();
   }
   await runnerVolumeClient.activateControlLoop();
-  runnerServer.listen(port, "0.0.0.0", () => {
-    console.log(`Bluey Jobs runner control endpoint listening on ${port}`);
+  await listenRunnerServer();
+  console.log(`Bluey Jobs runner control endpoint listening on ${port}`);
+  if (!managedCloudRuntime
+    || !managedCloudRuntimeApi
+    || !claimedManagedCloudRuntimeInstance) return;
+
+  const controller = new AbortController();
+  const stop = (): void => controller.abort();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  try {
+    await runManagedCloudRuntimeHeartbeats(
+      managedCloudRuntimeApi,
+      claimedManagedCloudRuntimeInstance,
+      async (instance) => runnerVolumeReady && startupStorageRecoveryComplete
+        ? {
+            taskQueueSha256: instance.taskQueueSha256,
+            failureConverterSha256: instance.failureConverterSha256,
+            dependencyEvidenceSha256: managedCloudDependencyEvidenceSha256(instance),
+            healthState: "ready",
+            reasonCode: null,
+          }
+        : {
+            taskQueueSha256: instance.taskQueueSha256,
+            failureConverterSha256: instance.failureConverterSha256,
+            dependencyEvidenceSha256: managedCloudDependencyEvidenceSha256(instance),
+            healthState: "degraded",
+            reasonCode: "startup",
+          },
+      managedCloudRuntime.heartbeatIntervalMs,
+      controller.signal,
+      { onReadinessChanged: (ready) => { managedCloudRuntimeReady = ready; } },
+    );
+  } finally {
+    managedCloudRuntimeReady = false;
+    managedCloudRuntimeInstance = undefined;
+    controller.abort();
+    process.off("SIGINT", stop);
+    process.off("SIGTERM", stop);
+    await closeRunnerServer();
+    await runnerVolumeClient.stop();
+  }
+}
+
+function listenRunnerServer(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    runnerServer.once("error", reject);
+    runnerServer.listen(port, "0.0.0.0", () => {
+      runnerServer.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function closeRunnerServer(): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (!runnerServer.listening) return resolve();
+    runnerServer.close((error) => error ? reject(error) : resolve());
   });
 }
 
@@ -1186,6 +1306,7 @@ async function restoreCloudRunCheckpoint(
   browserSessionId: string,
   profileScope: string,
   binding: DurableResultBinding,
+  managedCloudRelease: ManagedCloudReleaseMemoAuthority | undefined,
 ): Promise<NonNullable<ReturnType<typeof activeRuns.get>> | undefined> {
   const existing = activeRuns.get(browserSessionId);
   if (existing) {
@@ -1204,6 +1325,10 @@ async function restoreCloudRunCheckpoint(
     if (!checkpointMatchesBinding(found, binding)) {
       throw new ResultStoreError("result_promotion_conflict");
     }
+    requireSameManagedCloudRelease(
+      found.request.managedCloudRelease,
+      managedCloudRelease,
+    );
     const safeRecovery = await recoverSafeWorkflowCommandCheckpoint(found);
     if (safeRecovery !== "not_applicable") {
       return activeRuns.get(browserSessionId);
@@ -1346,7 +1471,19 @@ async function restoreCheckpoint(
       applicationId: approvedRequest.applicationId,
       runId: approvedRequest.runId,
       browserProfileId: approvedRequest.browserProfileId,
+      ...(approvedRequest.managedCloudRelease
+        ? {
+          workflowRequestId: checkpoint.workflow.requestId,
+          managedCloudRelease: approvedRequest.managedCloudRelease,
+        }
+        : {}),
     });
+    if (approvedRequest.managedCloudRelease) {
+      await lease.authorizeManagedEffect(
+        checkpoint.workflow.requestId,
+        approvedRequest.managedCloudRelease,
+      );
+    }
     trackAccountWork(approvedRequest, unresolvedPaths, lease);
     paths = await registerTrackedProfileResidency(lease, unresolvedPaths.scope);
     await writeCloudCheckpoint({
@@ -1441,7 +1578,11 @@ function activeRunMatchesCheckpoint(
       checkpoint.request.applicationIdentityId &&
     active.input.browserProfileId === checkpoint.request.browserProfileId &&
     active.input.browserSessionId === checkpoint.request.browserSessionId &&
-    active.input.runId === checkpoint.request.runId
+    active.input.runId === checkpoint.request.runId &&
+    sameOptionalManagedCloudRelease(
+      active.input.managedCloudRelease,
+      checkpoint.request.managedCloudRelease,
+    )
   );
 }
 
@@ -1470,6 +1611,30 @@ function checkpointMatchesBinding(
     checkpoint.request.browserSessionId === binding.browserSessionId &&
     checkpoint.request.runId === binding.runId
   );
+}
+
+function requireSameManagedCloudRelease(
+  left: ManagedCloudReleaseMemoAuthority | undefined,
+  right: ManagedCloudReleaseMemoAuthority | undefined,
+): void {
+  if (!sameOptionalManagedCloudRelease(left, right)) {
+    throw new ResultStoreError("result_promotion_conflict");
+  }
+}
+
+function sameOptionalManagedCloudRelease(
+  left: ManagedCloudReleaseMemoAuthority | undefined,
+  right: ManagedCloudReleaseMemoAuthority | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return left === right;
+  try {
+    const leftBytes = managedCloudReleaseMemoBytes(left);
+    const rightBytes = managedCloudReleaseMemoBytes(right);
+    return leftBytes.length === rightBytes.length
+      && leftBytes.every((byte, index) => byte === rightBytes[index]);
+  } catch {
+    return false;
+  }
 }
 
 export function assertWorkflowCommandCheckpointProfileScope(
@@ -2575,37 +2740,19 @@ async function evidenceObject(
   };
 }
 
-async function validate(input: CloudRunRequest): Promise<CloudRunRequest> {
-  const expectedKeys = [
-    "accountId",
-    "applicationId",
-    "applicationIdentityId",
-    "browserProfileId",
-    "browserSessionId",
-    "job",
-    "packet",
-    "requestId",
-    "runId",
-    "url",
-  ];
-  const actualKeys =
-    input && typeof input === "object" && !Array.isArray(input)
-      ? Object.keys(input).sort()
-      : [];
-  if (
-    actualKeys.length !== expectedKeys.length ||
-    actualKeys.some((key, index) => key !== expectedKeys[index])
-  ) {
-    throw new Error("Invalid run request");
-  }
-  for (const [name, value] of Object.entries({
+async function validate(value: unknown): Promise<CloudRunRequest> {
+  const input = parseCloudRunRequestForRuntime(
+    value,
+    managedCloudRuntimeInstance !== undefined,
+  );
+  for (const [name, field] of Object.entries({
     accountId: input.accountId,
     applicationIdentityId: input.applicationIdentityId,
     browserSessionId: input.browserSessionId,
     runId: input.runId,
     applicationId: input.applicationId,
   })) {
-    if (!/^[A-Za-z0-9_-]{3,160}$/.test(value))
+    if (!/^[A-Za-z0-9_-]{3,160}$/.test(field))
       throw new Error(`Invalid ${name}`);
   }
   if (!/^[A-Za-z0-9:_-]{3,160}$/.test(input.browserProfileId))
@@ -2637,6 +2784,45 @@ async function validate(input: CloudRunRequest): Promise<CloudRunRequest> {
     packet: approved.approvedPacket,
     job: approved.approvedJob,
   });
+}
+
+export function parseCloudRunRequestForRuntime(
+  value: unknown,
+  managedRuntimeConfigured: boolean,
+): CloudRunRequest {
+  const expectedKeys = [
+    "accountId",
+    "applicationId",
+    "applicationIdentityId",
+    "browserProfileId",
+    "browserSessionId",
+    "job",
+    ...(managedRuntimeConfigured ? ["managedCloudRelease"] : []),
+    "packet",
+    "requestId",
+    "runId",
+    "url",
+  ];
+  const input = value as CloudRunRequest;
+  const actualKeys =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? Object.keys(value).sort()
+      : [];
+  if (
+    actualKeys.length !== expectedKeys.length ||
+    actualKeys.some((key, index) => key !== expectedKeys[index])
+  ) {
+    throw new Error("Invalid run request");
+  }
+  if (!managedRuntimeConfigured) return input;
+  try {
+    return {
+      ...input,
+      managedCloudRelease: parseManagedCloudReleaseMemo(input.managedCloudRelease),
+    };
+  } catch {
+    throw new Error("Invalid managed-cloud run authority");
+  }
 }
 
 export function assertCloudRunCertifiedNavigation(input: {
@@ -3701,6 +3887,13 @@ export function publicRunnerFailure(error: unknown): {
       status: 503,
       code: "terminal_result_persistence_failed",
       message: "The application runner is temporarily unavailable.",
+    };
+  }
+  if (error instanceof ManagedCloudRuntimeUnavailableError) {
+    return {
+      status: 503,
+      code: "managed_cloud_runtime_unavailable",
+      message: "The managed-cloud application runner is temporarily unavailable.",
     };
   }
   if (error instanceof LeasedRunError) {

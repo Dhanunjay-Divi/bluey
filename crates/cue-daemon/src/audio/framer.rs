@@ -98,7 +98,10 @@ impl Framer {
         }
         let pad_needed = self.chunk_samples.saturating_sub(self.buffer.len());
         self.buffer.extend(std::iter::repeat_n(0i16, pad_needed));
-        let drained: Vec<i16> = self.buffer.drain(..).collect();
+        let drained = std::mem::replace(
+            &mut self.buffer,
+            Vec::with_capacity(self.chunk_samples.saturating_mul(2)),
+        );
         Some(AudioChunk {
             source: self.source,
             sample_rate: self.sample_rate,
@@ -197,6 +200,18 @@ mod tests {
     fn framer_flush_empty_returns_none() {
         let mut f = Framer::new(AudioSource::Microphone, rate_16k(), 20);
         assert!(f.flush_padded().is_none());
+    }
+
+    #[test]
+    fn framer_refills_without_losing_preallocated_capacity_after_flush() {
+        let mut f = Framer::new(AudioSource::Microphone, rate_16k(), 20);
+        f.push(&[1i16; 100], 5_000);
+        assert!(f.flush_padded().is_some());
+        assert!(f.buffer.capacity() >= f.chunk_samples().saturating_mul(2));
+
+        let emitted = f.push(&[2i16; 320], 5_020);
+        assert_eq!(emitted.len(), 1);
+        assert_eq!(emitted[0].samples, vec![2i16; 320]);
     }
 
     #[test]

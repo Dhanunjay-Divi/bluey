@@ -118,6 +118,8 @@ export class GlobalDiscoveryWorkerRuntime {
   private readonly logger: GlobalDiscoveryWorkerLogger;
   private readonly stopController = new AbortController();
   private manifestSnapshot?: ManifestSnapshot;
+  private lastPollCompletedAtMs = 0;
+  private lastPollFailedAtMs = 0;
   private stopping = false;
 
   constructor(options: GlobalDiscoveryWorkerRuntimeOptions) {
@@ -183,7 +185,9 @@ export class GlobalDiscoveryWorkerRuntime {
       while (!this.stopping) {
         try {
           await this.pollOnce();
+          this.lastPollCompletedAtMs = this.now();
         } catch (error) {
+          this.lastPollFailedAtMs = this.now();
           this.logger.log({
             event: "global_discovery_poll_failed",
             error_code: safeRuntimeErrorCode(error),
@@ -200,6 +204,12 @@ export class GlobalDiscoveryWorkerRuntime {
     if (this.stopping) return;
     this.stopping = true;
     this.stopController.abort();
+  }
+
+  managedCloudReady(nowMs: number = this.now()): boolean {
+    const maximumAgeMs = Math.max(15_000, this.pollIntervalMs * 3);
+    return this.lastPollCompletedAtMs > this.lastPollFailedAtMs
+      && nowMs - this.lastPollCompletedAtMs <= maximumAgeMs;
   }
 
   async pollOnce(): Promise<GlobalDiscoveryPollOutcome> {

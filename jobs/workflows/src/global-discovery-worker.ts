@@ -3,6 +3,13 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { GlobalDiscoveryApiClient } from "./global-discovery-api.js";
+import { managedCloudRuntimeConfig } from "@bluey/jobs-automation/managed-cloud-runtime";
+import {
+  ManagedCloudRuntimeApiClient,
+  claimManagedCloudRuntimeInstance,
+  managedCloudReadyObservation,
+  runManagedCloudRuntimeHeartbeats,
+} from "@bluey/jobs-automation/managed-cloud-runtime-client";
 import {
   DEFAULT_GLOBAL_DISCOVERY_ARTIFACT_TIMEOUT_MS,
   DEFAULT_GLOBAL_DISCOVERY_MANIFEST_REFRESH_MS,
@@ -14,10 +21,14 @@ import {
 } from "./global-discovery-runtime.js";
 
 export function globalDiscoveryWorkerFromEnvironment(): GlobalDiscoveryWorkerRuntime {
+  const runtimeConfig = managedCloudRuntimeConfig("global_discovery_worker");
   const origin = process.env.BLUEY_JOBS_API_ORIGIN || "http://127.0.0.1:8081";
   const signingKey = process.env.BLUEY_JOBS_WORKER_SIGNING_KEY || "";
   const workerId = process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_WORKER_ID
     || `global-discovery-${hostname()}-${process.pid}`;
+  if (runtimeConfig && runtimeConfig.workerId !== workerId) {
+    throw new Error("Managed-cloud worker ID must equal the global discovery worker ID");
+  }
   const stagingDirectory = process.env.BLUEY_JOBS_GLOBAL_DISCOVERY_STAGING_DIR
     || path.join(tmpdir(), "bluey-jobs-global-discovery");
   const sourceFamilies = parseGlobalDiscoverySourceFamilies(
@@ -62,11 +73,68 @@ export function globalDiscoveryWorkerFromEnvironment(): GlobalDiscoveryWorkerRun
 }
 
 export async function runGlobalDiscoveryWorkerFromEnvironment(): Promise<void> {
+  const runtimeConfig = managedCloudRuntimeConfig("global_discovery_worker");
   const worker = globalDiscoveryWorkerFromEnvironment();
   const controller = new AbortController();
   process.once("SIGINT", () => controller.abort());
   process.once("SIGTERM", () => controller.abort());
-  await worker.run(controller.signal);
+  if (!runtimeConfig) {
+    await worker.run(controller.signal);
+    return;
+  }
+  const namespace = requiredEnvironment("TEMPORAL_NAMESPACE");
+  const taskQueue = process.env.BLUEY_JOBS_TASK_QUEUE || "bluey-jobs-applications";
+  const runtimeApi = new ManagedCloudRuntimeApiClient(runtimeConfig);
+  const runtimeInstance = await claimManagedCloudRuntimeInstance(
+    runtimeApi,
+    controller.signal,
+  );
+  const workerRun = worker.run(controller.signal);
+  await waitForGlobalDiscoveryReady(worker, controller.signal);
+  try {
+    await Promise.race([
+      workerRun,
+      runManagedCloudRuntimeHeartbeats(
+        runtimeApi,
+        runtimeInstance,
+        async (instance) => {
+          if (!worker.managedCloudReady()) {
+            throw new Error("Global discovery worker dependency probe is stale");
+          }
+          return managedCloudReadyObservation(
+            instance,
+            namespace,
+            taskQueue,
+            new URL("./failure-converter.js", import.meta.url),
+          );
+        },
+        runtimeConfig.heartbeatIntervalMs,
+        controller.signal,
+      ),
+    ]);
+  } finally {
+    controller.abort();
+    await workerRun.catch(() => undefined);
+  }
+}
+
+async function waitForGlobalDiscoveryReady(
+  worker: GlobalDiscoveryWorkerRuntime,
+  signal: AbortSignal,
+): Promise<void> {
+  for (let attempts = 0; attempts < 500 && !signal.aborted; attempts += 1) {
+    if (worker.managedCloudReady()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Global discovery worker did not reach managed-cloud readiness");
+}
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name];
+  if (typeof value !== "string" || value.length === 0 || value !== value.trim()) {
+    throw new Error(`${name} is required for managed-cloud runtime evidence`);
+  }
+  return value;
 }
 
 function environmentInteger(name: string, value: string | undefined, fallback: number): number {

@@ -30,6 +30,18 @@
     "./worker-auth": {
       "types": "./dist/worker-auth.d.ts",
       "import": "./dist/worker-auth.js"
+    },
+    "./managed-cloud-runtime": {
+      "types": "./dist/managed-cloud-runtime.d.ts",
+      "import": "./dist/managed-cloud-runtime.js"
+    },
+    "./managed-cloud-runtime-client": {
+      "types": "./dist/managed-cloud-runtime-client.d.ts",
+      "import": "./dist/managed-cloud-runtime-client.js"
+    },
+    "./managed-cloud-execution": {
+      "types": "./dist/managed-cloud-execution.d.ts",
+      "import": "./dist/managed-cloud-execution.js"
     }
   },
   "scripts": {

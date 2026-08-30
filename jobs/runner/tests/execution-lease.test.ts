@@ -2,6 +2,15 @@ import { createHash, createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { finalSubmitSurfaceSha256 } from "@bluey/jobs-automation";
 import {
+  managedCloudReleaseMemoBytes,
+  parseManagedCloudGatewayAuthority,
+  recoveryAuthorizationSha256,
+  type ManagedCloudReleaseMemoAuthority,
+} from "@bluey/jobs-automation/managed-cloud-execution";
+import type {
+  ManagedCloudRuntimeInstance,
+} from "@bluey/jobs-automation/managed-cloud-runtime-client";
+import {
   createExecutionLeaseClientFromEnv,
   ExecutionLeaseClient,
   ExecutionLeaseError,
@@ -19,6 +28,12 @@ const PURGE_SUBJECT = Buffer.alloc(32, 3).toString("base64url");
 const VOLUME_KEY_FINGERPRINT = "4".repeat(64);
 const RUNTIME_GRANT_ID = "runner-process-runtime-grant-test";
 const RUNTIME_SHA256 = "7".repeat(64);
+const MANAGED_WORKFLOW_REQUEST_ID =
+  "wfreq-v2-12345678-1234-5678-9234-123456789abc";
+const MANAGED_RESUME_REQUEST_ID =
+  "wfreq-v2-22345678-1234-5678-9234-123456789abc";
+const MANAGED_SECOND_RESUME_REQUEST_ID =
+  "wfreq-v2-32345678-1234-5678-9234-123456789abc";
 const VOLUME_PROOF = {
   version: 1 as const,
   audience: "bluey-jobs-runner-volume-authority" as const,
@@ -114,6 +129,413 @@ describe("execution lease client", () => {
       ).size,
     ).toBe(calls.length);
     expect(JSON.stringify(lease)).not.toContain("lease-secret-value");
+  });
+
+  it("binds managed claim, pre-effect authorization, and irreversible response to A and runtime B", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const release = managedCloudRelease();
+    const managedCloud = managedCloudAuthority(release);
+    const proofInput = vi.fn(() => VOLUME_PROOF);
+    const fetch = vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/claim")) {
+        return grantResponse({
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      if (url.endsWith("/authorize-managed-effect")) {
+        return recordResponse("prepared", {
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_RESUME_REQUEST_ID),
+        });
+      }
+      if (url.endsWith("/irreversible")) {
+        return recordResponse("click_started", {
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_RESUME_REQUEST_ID),
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const client = createClient(fetch, {
+      managedCloudRuntime: managedCloudRuntime(),
+      runnerVolume: {
+        ...runnerVolume(),
+        createExecutionLeaseClaimProof: proofInput,
+      },
+    });
+
+    const lease = await client.claim({
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+    });
+    const releaseSha256 = createHash("sha256")
+      .update(managedCloudReleaseMemoBytes(release))
+      .digest("hex");
+    expect(JSON.parse(String(calls[0]?.init?.body))).toEqual({
+      account_id: CLAIM.accountId,
+      application_id: CLAIM.applicationId,
+      run_id: CLAIM.runId,
+      browser_profile_id: CLAIM.browserProfileId,
+      owner_id: "runner-test-1",
+      workflow_request_id: MANAGED_WORKFLOW_REQUEST_ID,
+      managed_cloud_release: release,
+      managed_cloud_release_sha256: releaseSha256,
+      managed_cloud_runtime_instance_id: managedCloudRuntime().runtimeInstanceId,
+      managed_cloud_runtime_instance_epoch: managedCloudRuntime().instanceEpoch,
+      volume_id: VOLUME_ID,
+      enrollment_epoch: 1,
+      process_instance_id: PROCESS_INSTANCE_ID,
+      runtime_grant_id: RUNTIME_GRANT_ID,
+      runtime_sha256: RUNTIME_SHA256,
+      volume_proof: VOLUME_PROOF,
+    });
+    expect(proofInput).toHaveBeenCalledWith({
+      accountId: CLAIM.accountId,
+      applicationId: CLAIM.applicationId,
+      runId: CLAIM.runId,
+      browserProfileId: CLAIM.browserProfileId,
+      ownerId: "runner-test-1",
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+      managedCloudReleaseSha256: releaseSha256,
+      managedCloudRuntimeInstanceId: managedCloudRuntime().runtimeInstanceId,
+      managedCloudRuntimeInstanceEpoch: managedCloudRuntime().instanceEpoch,
+    });
+
+    await lease.authorizeManagedEffect(MANAGED_RESUME_REQUEST_ID, release);
+    expect(calls[1]?.url).toBe(
+      "https://jobs-api.example/api/jobs/internal/execution-leases/run-123/authorize-managed-effect",
+    );
+    expect(JSON.parse(String(calls[1]?.init?.body))).toEqual({
+      account_id: CLAIM.accountId,
+      application_id: CLAIM.applicationId,
+      lease_token: "lease-secret-value",
+      fence: 7,
+      workflow_request_id: MANAGED_RESUME_REQUEST_ID,
+      managed_cloud_release: release,
+      managed_cloud_release_sha256: releaseSha256,
+      managed_cloud_runtime_instance_id: managedCloudRuntime().runtimeInstanceId,
+      managed_cloud_runtime_instance_epoch: managedCloudRuntime().instanceEpoch,
+    });
+    await lease.beforeFinalSubmit(finalSubmitProof());
+    await lease.finish("failed");
+    expect(JSON.parse(String(calls[2]?.init?.body))).toEqual({
+      account_id: CLAIM.accountId,
+      application_id: CLAIM.applicationId,
+      lease_token: "lease-secret-value",
+      fence: 7,
+      action: "submit",
+      final_submit_proof: finalSubmitProof(),
+      workflow_request_id: MANAGED_RESUME_REQUEST_ID,
+      managed_cloud_release: release,
+      managed_cloud_release_sha256: releaseSha256,
+      managed_cloud_runtime_instance_id: managedCloudRuntime().runtimeInstanceId,
+      managed_cloud_runtime_instance_epoch: managedCloudRuntime().instanceEpoch,
+    });
+    expect(JSON.parse(String(calls[3]?.init?.body))).toEqual({
+      account_id: CLAIM.accountId,
+      application_id: CLAIM.applicationId,
+      lease_token: "lease-secret-value",
+      fence: 7,
+      outcome: "failed",
+    });
+  });
+
+  it("requires all managed claim authority before network I/O", async () => {
+    const fetch = vi.fn() as typeof globalThis.fetch;
+    const managedClient = createClient(fetch, {
+      managedCloudRuntime: managedCloudRuntime(),
+    });
+    await expect(managedClient.claim(CLAIM)).rejects.toMatchObject({
+      operation: "claim",
+      code: "invalid_state",
+    });
+
+    const localClient = createClient(fetch);
+    await expect(localClient.claim({
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: managedCloudRelease(),
+    })).rejects.toMatchObject({ operation: "claim", code: "invalid_state" });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("poisons irreversible I/O after a changed-A authorization attempt", async () => {
+    const release = managedCloudRelease();
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) {
+        return grantResponse({
+          managedCloud: managedCloudAuthority(release),
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch, {
+      managedCloudRuntime: managedCloudRuntime(),
+    }).claim({
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+    });
+
+    await expect(lease.authorizeManagedEffect(MANAGED_RESUME_REQUEST_ID, {
+      ...release,
+      bindingSha256: "9".repeat(64),
+    })).rejects.toMatchObject({
+      operation: "authorize_managed_effect",
+      code: "invalid_state",
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+      operation: "irreversible",
+      code: "invalid_state",
+    });
+    await lease.finish("side_effect_unknown");
+  });
+
+  it("poisons irreversible I/O when managed authorization omits fresh B", async () => {
+    const release = managedCloudRelease();
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) {
+        return grantResponse({
+          managedCloud: managedCloudAuthority(release),
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      if (url.endsWith("/authorize-managed-effect")) {
+        return recordResponse("prepared");
+      }
+      if (url.endsWith("/irreversible")) {
+        return recordResponse("click_started");
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const client = createClient(fetch, {
+      managedCloudRuntime: managedCloudRuntime(),
+    });
+    const lease = await client.claim({
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+    });
+
+    await expect(
+      lease.authorizeManagedEffect(MANAGED_RESUME_REQUEST_ID, release),
+    ).rejects.toMatchObject({
+      operation: "authorize_managed_effect",
+      code: "invalid_response",
+    });
+    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+      operation: "irreversible",
+      code: "invalid_state",
+    });
+    expect(fetch.mock.calls.some(([input]) => String(input).endsWith("/irreversible"))).toBe(false);
+    await lease.finish("side_effect_unknown");
+  });
+
+  it.each([
+    ["lost", "request_failed"],
+    ["invalid", "invalid_response"],
+  ])("blocks irreversible I/O when a resume authorization response is %s", async (
+    failureKind,
+    expectedCode,
+  ) => {
+    const release = managedCloudRelease();
+    const managedCloud = managedCloudAuthority(release);
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetch = vi.fn(async (
+      input: string | URL | Request,
+      init?: RequestInit,
+    ) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/claim")) {
+        return grantResponse({
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      if (url.endsWith("/authorize-managed-effect")) {
+        if (failureKind === "lost") throw new Error("authorization response lost");
+        return recordResponse("prepared", {
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      if (url.endsWith("/irreversible")) {
+        return recordResponse("click_started", {
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch, {
+      managedCloudRuntime: managedCloudRuntime(),
+    }).claim({
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+    });
+
+    await expect(
+      lease.authorizeManagedEffect(MANAGED_RESUME_REQUEST_ID, release),
+    ).rejects.toMatchObject({
+      operation: "authorize_managed_effect",
+      code: expectedCode,
+    });
+    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+      operation: "irreversible",
+      code: "invalid_state",
+    });
+    expect(calls.some(({ url }) => url.endsWith("/irreversible"))).toBe(false);
+    await lease.finish("side_effect_unknown");
+  });
+
+  it.each([
+    ["original claim", MANAGED_WORKFLOW_REQUEST_ID],
+    ["prior resume", MANAGED_RESUME_REQUEST_ID],
+  ])("rejects a stale %s echo after a later managed resume", async (_label, staleId) => {
+    const release = managedCloudRelease();
+    const managedCloud = managedCloudAuthority(release);
+    let authorizationCount = 0;
+    const fetch = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.endsWith("/claim")) {
+        return grantResponse({
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID),
+        });
+      }
+      if (url.endsWith("/authorize-managed-effect")) {
+        authorizationCount += 1;
+        const requestId = authorizationCount === 1
+          ? MANAGED_RESUME_REQUEST_ID
+          : MANAGED_SECOND_RESUME_REQUEST_ID;
+        return recordResponse("prepared", {
+          managedCloud,
+          ...managedResponseCorrelation(requestId),
+        });
+      }
+      if (url.endsWith("/irreversible")) {
+        return recordResponse("click_started", {
+          managedCloud,
+          ...managedResponseCorrelation(staleId),
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const lease = await createClient(fetch, {
+      managedCloudRuntime: managedCloudRuntime(),
+    }).claim({
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+    });
+    await lease.authorizeManagedEffect(MANAGED_RESUME_REQUEST_ID, release);
+    await lease.authorizeManagedEffect(MANAGED_SECOND_RESUME_REQUEST_ID, release);
+
+    await expect(lease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+      operation: "irreversible",
+      code: "invalid_response",
+    });
+    await lease.finish("side_effect_unknown");
+  });
+
+  it("rejects swapped managed runtime instance, epoch, and worker response identities", async () => {
+    const release = managedCloudRelease();
+    const managedCloud = managedCloudAuthority(release);
+    const runtime = managedCloudRuntime();
+    const claimInput = {
+      ...CLAIM,
+      workflowRequestId: MANAGED_WORKFLOW_REQUEST_ID,
+      managedCloudRelease: release,
+    };
+    const wrongWorkflowClaimClient = createClient(vi.fn(async () => grantResponse({
+      managedCloud,
+      ...managedResponseCorrelation(MANAGED_RESUME_REQUEST_ID, runtime),
+    })) as typeof globalThis.fetch, { managedCloudRuntime: runtime });
+    await expect(wrongWorkflowClaimClient.claim(claimInput)).rejects.toMatchObject({
+      operation: "claim",
+      code: "invalid_response",
+    });
+    const wrongClaimClient = createClient(vi.fn(async () => grantResponse({
+      managedCloud,
+      ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID, {
+        ...runtime,
+        runtimeInstanceId: "managed-runner-instance-swapped",
+      }),
+    })) as typeof globalThis.fetch, { managedCloudRuntime: runtime });
+    await expect(wrongClaimClient.claim(claimInput)).rejects.toMatchObject({
+      operation: "claim",
+      code: "invalid_response",
+    });
+
+    const epochFetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/claim")) {
+        return grantResponse({
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID, runtime),
+        });
+      }
+      if (String(input).endsWith("/authorize-managed-effect")) {
+        return recordResponse("prepared", {
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_RESUME_REQUEST_ID, {
+            ...runtime,
+            instanceEpoch: runtime.instanceEpoch + 1,
+          }),
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const epochLease = await createClient(epochFetch, {
+      managedCloudRuntime: runtime,
+    }).claim(claimInput);
+    await expect(
+      epochLease.authorizeManagedEffect(MANAGED_RESUME_REQUEST_ID, release),
+    ).rejects.toMatchObject({
+      operation: "authorize_managed_effect",
+      code: "invalid_response",
+    });
+    await epochLease.finish("side_effect_unknown");
+
+    const workerFetch = vi.fn(async (input: string | URL | Request) => {
+      if (String(input).endsWith("/claim")) {
+        return grantResponse({
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID, runtime),
+        });
+      }
+      if (String(input).endsWith("/irreversible")) {
+        return recordResponse("click_started", {
+          managedCloud,
+          ...managedResponseCorrelation(MANAGED_WORKFLOW_REQUEST_ID, {
+            ...runtime,
+            workerId: "managed-runner-worker-swapped",
+          }),
+        });
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof globalThis.fetch;
+    const workerLease = await createClient(workerFetch, {
+      managedCloudRuntime: runtime,
+    }).claim(claimInput);
+    await expect(workerLease.beforeFinalSubmit(finalSubmitProof())).rejects.toMatchObject({
+      operation: "irreversible",
+      code: "invalid_response",
+    });
+    await workerLease.finish("side_effect_unknown");
   });
 
   it.each([
@@ -733,6 +1155,94 @@ describe("execution lease client", () => {
     ).not.toThrow();
   });
 });
+
+function managedCloudRelease(): ManagedCloudReleaseMemoAuthority {
+  return {
+    version: 1,
+    bindingSha256: "1".repeat(64),
+    scope: { environment: "staging", region: "us-east-1", channel: "canary" },
+    headRevision: 7,
+    transitionSha256: "2".repeat(64),
+    activationSha256: "3".repeat(64),
+    manifestSha256: "4".repeat(64),
+    cohortSha256: "5".repeat(64),
+    trustGeneration: 2,
+    channelSequence: 9,
+    releaseId: "managed-cloud-release-1234",
+    releaseSequence: 4,
+    taskQueueSha256: "6".repeat(64),
+    failureConverterSha256: "7".repeat(64),
+    readinessSha256: "8".repeat(64),
+    activationExpiresAtMs: 1_900_000_000_000,
+    resolvedAtMs: 1_800_000_000_000,
+  };
+}
+
+function managedCloudRuntime(): ManagedCloudRuntimeInstance {
+  const release = managedCloudRelease();
+  return {
+    grantId: "managed-cloud-grant-1234567890",
+    runtimeInstanceId: "managed-runner-instance-1234",
+    runtimeIdentitySha256: "9".repeat(64),
+    workerId: "managed-runner-worker-1234",
+    scope: release.scope,
+    activationSha256: release.activationSha256,
+    activationExpiresAtMs: release.activationExpiresAtMs,
+    manifestSha256: release.manifestSha256,
+    componentId: "jobs-runner",
+    role: "managed_runner",
+    headRevision: release.headRevision,
+    transitionSha256: release.transitionSha256,
+    artifactSha256: "a".repeat(64),
+    configSchemaSha256: "b".repeat(64),
+    migrationSetSha256: "c".repeat(64),
+    protocolSetSha256: "d".repeat(64),
+    taskQueueSha256: release.taskQueueSha256,
+    failureConverterSha256: release.failureConverterSha256,
+    dependencyEvidenceSha256: "e".repeat(64),
+    instanceEpoch: 3,
+    nextHeartbeatSequence: 1,
+    claimedAtMs: 1_800_000_000_100,
+    replayed: false,
+  };
+}
+
+function managedResponseCorrelation(
+  workflowRequestId: string,
+  runtime = managedCloudRuntime(),
+) {
+  return {
+    managedCloudWorkflowRequestId: workflowRequestId,
+    managedCloudRuntimeInstanceId: runtime.runtimeInstanceId,
+    managedCloudRuntimeInstanceEpoch: runtime.instanceEpoch,
+    managedCloudWorkerId: runtime.workerId,
+  };
+}
+
+function managedCloudAuthority(release: ManagedCloudReleaseMemoAuthority) {
+  const { version: _, ...execution } = release;
+  const value = {
+    version: 1,
+    execution,
+    authorization: {
+      currentHeadRevision: release.headRevision,
+      currentTransitionSha256: release.transitionSha256,
+      currentActivationSha256: release.activationSha256,
+      currentManifestSha256: release.manifestSha256,
+      currentActivationExpiresAtMs: release.activationExpiresAtMs,
+      currentTaskQueueSha256: release.taskQueueSha256,
+      currentFailureConverterSha256: release.failureConverterSha256,
+      currentReadinessSha256: release.readinessSha256,
+      recoveryAccepted: false,
+      recoveryAuthorizationSha256: "f".repeat(64),
+      authorizedAtMs: 1_800_000_000_200,
+    },
+  };
+  value.authorization.recoveryAuthorizationSha256 = recoveryAuthorizationSha256(
+    value as never,
+  );
+  return parseManagedCloudGatewayAuthority(value);
+}
 
 function createClient(
   fetch: typeof globalThis.fetch,

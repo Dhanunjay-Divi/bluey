@@ -1,4 +1,5 @@
 
+#[allow(clippy::result_large_err)]
 async fn complete_inner(
     state: AppState,
     account: Account,

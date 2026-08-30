@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -69,6 +71,12 @@ jobs:
           node jobs/scripts/browser-release-ci-gate.mjs workflow \
             --file .github/workflows/jobs-browser-release.yml
 
+      - name: Validate the managed-cloud release authority independently
+        run: |
+          node --test jobs/scripts/managed-cloud-release-gate.test.mjs
+          node jobs/scripts/managed-cloud-release-gate.mjs workflow \
+            --file .github/workflows/jobs-managed-cloud-release.yml
+
       - name: Run all Jobs tests
         run: npm test --prefix jobs
 
@@ -103,12 +111,22 @@ jobs:
           --release --locked
 
       - name: Build and smoke the managed runner image
+        env:
+          BLUEY_JOBS_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          docker build --tag bluey-jobs-runner-ci --file jobs/runner/Dockerfile jobs
+          test -n "$BLUEY_JOBS_SOURCE_COMMIT"
+          docker build \
+            --build-arg BLUEY_JOBS_BUILD_ID=jobs-runner-ci \
+            --build-arg BLUEY_JOBS_CONFIG_SCHEMA_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_MIGRATION_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg BLUEY_JOBS_PROTOCOL_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$BLUEY_JOBS_SOURCE_COMMIT" \
+            --tag bluey-jobs-runner-ci --file jobs/runner/Dockerfile jobs
           docker run --rm \
-            --entrypoint node \
+            --entrypoint /usr/local/bin/node \
             --env BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT=/var/lib/bluey-jobs-runner/native-smoke \
-            bluey-jobs-runner-ci scripts/native-runner-addon-smoke.mjs
+            --volume "$GITHUB_WORKSPACE/jobs/scripts/native-runner-addon-smoke.mjs:/app/scripts/native-runner-addon-smoke.mjs:ro" \
+            bluey-jobs-runner-ci /app/scripts/native-runner-addon-smoke.mjs
 
       - name: Reclaim ephemeral runner space before server Rust tests
         run: |

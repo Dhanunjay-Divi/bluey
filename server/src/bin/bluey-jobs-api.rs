@@ -4,8 +4,8 @@ use anyhow::Context;
 use bluey_server::{
     api,
     config::{Config, ServerDbBackend},
-    db, jobs_communication_dispatch, jobs_global_archive, jobs_mailbox_sync, jobs_workflow_cleanup,
-    jobs_workflow_dispatch,
+    db, jobs_communication_dispatch, jobs_global_archive, jobs_mailbox_sync,
+    jobs_managed_cloud_runtime, jobs_workflow_cleanup, jobs_workflow_dispatch,
 };
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tracing_subscriber::EnvFilter;
@@ -26,6 +26,8 @@ async fn main() -> anyhow::Result<()> {
         .context("validate Bluey Browser capability configuration")?;
     api::jobs_runner_volumes::validate_runtime_config()
         .context("validate managed runner-volume purge signing configuration")?;
+    jobs_managed_cloud_runtime::validate_runtime_config()
+        .context("validate managed cloud launch configuration")?;
     let port = std::env::var("BLUEY_JOBS_API_PORT")
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
@@ -79,12 +81,20 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("start global job candidate archive worker")?;
 
-    let app = api::build_jobs_router(pool, config);
+    let app = api::build_jobs_router(pool.clone(), config);
     let addr = SocketAddr::new(host, port);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("bind {addr}"))?;
     tracing::info!(%addr, "bluey-jobs-api listening");
+    let managed_cloud_runtime_reporters =
+        jobs_managed_cloud_runtime::start_jobs_api_managed_cloud_runtime_reporters(
+            pool.clone(),
+            &listener,
+            workflow_command_dispatcher.as_ref(),
+            workflow_cleanup_dispatcher.as_ref(),
+        )
+        .context("start managed-cloud Jobs API runtime reporters")?;
 
     let serve_result = axum::serve(
         listener,
@@ -93,6 +103,9 @@ async fn main() -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await
     .context("serve Bluey Jobs API");
+    if let Some(reporters) = managed_cloud_runtime_reporters {
+        reporters.shutdown().await;
+    }
     if let Some(worker) = mailbox_sync_worker {
         worker.abort();
     }
