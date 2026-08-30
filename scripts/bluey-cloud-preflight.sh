@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set +x
 set -euo pipefail
 
 # Bluey production architecture preflight.
@@ -15,20 +16,68 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FAILURES=0
 WARNINGS=0
 
+bootstrap_stat() {
+  local gnu="$1" bsd="$2" path="$3"
+  if stat "$gnu" -- "$path" >/dev/null 2>&1; then stat "$gnu" -- "$path"; else stat "$bsd" -- "$path"; fi
+}
+trusted_env_chain() {
+  local path="$1" current owner mode value
+  current="$(cd -P -- "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
+  while :; do
+    [ -d "$current" ] && [ ! -L "$current" ] || return 1
+    owner="$(bootstrap_stat -c%u -f%u "$current")" || return 1
+    { [ "$owner" = 0 ] || [ "$owner" = "$EUID" ]; } || return 1
+    mode="$(bootstrap_stat -c%a -f%Lp "$current")" || return 1
+    case "$mode" in ''|*[!0-9]*) return 1 ;; esac
+    value=$((8#$mode))
+    if [ $((value & 8#022)) -ne 0 ] &&
+       ! { [ "$owner" = 0 ] && [ $((value & 8#1000)) -ne 0 ]; }; then return 1; fi
+    [ "$current" = / ] && break
+    current="$(dirname "$current")"
+  done
+}
+load_trusted_env() {
+  local path="$1" owner mode value path_id fd_id env_fd
+  [ -f "$path" ] && [ ! -L "$path" ] && trusted_env_chain "$path" || return 1
+  owner="$(bootstrap_stat -c%u -f%u "$path")" || return 1
+  { [ "$owner" = 0 ] || [ "$owner" = "$EUID" ]; } || return 1
+  mode="$(bootstrap_stat -c%a -f%Lp "$path")" || return 1
+  case "$mode" in ''|*[!0-9]*) return 1 ;; esac
+  value=$((8#$mode)); [ $((value & 8#022)) -eq 0 ] || return 1
+  path_id="$(bootstrap_stat -c%i -f%i "$path")" || return 1
+  exec 9<"$path"
+  env_fd=9
+  fd_id="$(bootstrap_stat -c%i -f%i "/dev/fd/$env_fd")" || return 1
+  [ "$path_id" = "$fd_id" ] || return 1
+  # shellcheck disable=SC1090
+  . "/dev/fd/$env_fd"
+  exec 9<&-
+}
+
 if [ "${#ENV_FILES[@]}" -gt 0 ]; then
   for env_file in "${ENV_FILES[@]}"; do
     if [ ! -f "$env_file" ]; then
       echo "fatal: env file not found: $env_file" >&2
       exit 2
     fi
-    set -a
-    # shellcheck disable=SC1090
-    . "$env_file"
-    set +a
+    load_trusted_env "$env_file" || {
+      echo "fatal: env file or its parent chain is not trusted: $env_file" >&2
+      exit 2
+    }
   done
 fi
+unset -f bootstrap_stat trusted_env_chain load_trusted_env
 
 primary_env_file="${ENV_FILES[0]:-}"
+
+while IFS= read -r inherited_name; do
+  case "$inherited_name" in
+    *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*DATABASE_URL*|*DSN*|*WEBHOOK*|*CREDENTIAL*|*COOKIE*|*AUTH*)
+      export -n "$inherited_name" 2>/dev/null || true
+      ;;
+  esac
+done < <(compgen -e)
+unset inherited_name
 
 env_label() {
   if [ "${#ENV_FILES[@]}" -eq 0 ]; then
@@ -52,6 +101,20 @@ REQUIRE_POSTGRES="${BLUEY_REQUIRE_POSTGRES:-0}"
 REQUIRE_MANAGED_REDIS="${BLUEY_REQUIRE_MANAGED_REDIS:-0}"
 REQUIRE_OBJECT_STORAGE="${BLUEY_REQUIRE_OBJECT_STORAGE:-0}"
 SERVER_DB_BACKEND="${BLUEY_SERVER_DB_BACKEND:-sqlite}"
+REQUIRE_DISK_GUARD="${BLUEY_PREFLIGHT_REQUIRE_DISK_GUARD:-0}"
+DISK_GUARD_SCRIPT="${BLUEY_PREFLIGHT_DISK_GUARD_SCRIPT:-/usr/local/sbin/bluey-disk-guard.sh}"
+REQUIRE_RESTORE_DEADMAN_PROVIDER="${BLUEY_PREFLIGHT_REQUIRE_RESTORE_DEADMAN_PROVIDER:-0}"
+PREFLIGHT_TIMEOUT_SECONDS="${BLUEY_PREFLIGHT_COMMAND_TIMEOUT_SECONDS:-20}"
+PREFLIGHT_KILL_GRACE_SECONDS="${BLUEY_PREFLIGHT_TIMEOUT_KILL_GRACE_SECONDS:-5}"
+case "$PREFLIGHT_TIMEOUT_SECONDS" in ''|*[!0-9]*|0) echo "fatal: BLUEY_PREFLIGHT_COMMAND_TIMEOUT_SECONDS must be positive" >&2; exit 2 ;; esac
+case "$PREFLIGHT_KILL_GRACE_SECONDS" in ''|*[!0-9]*|0) echo "fatal: BLUEY_PREFLIGHT_TIMEOUT_KILL_GRACE_SECONDS must be positive" >&2; exit 2 ;; esac
+
+run_bounded() {
+  local timeout_bin
+  timeout_bin="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null || true)"
+  [ -n "$timeout_bin" ] || return 124
+  "$timeout_bin" --signal=TERM --kill-after="$PREFLIGHT_KILL_GRACE_SECONDS" "$PREFLIGHT_TIMEOUT_SECONDS" "$@"
+}
 
 ok() {
   printf 'ok: %s\n' "$1"
@@ -249,17 +312,18 @@ if [ -n "${BLUEY_DATABASE_URL:-}" ]; then
     warn "BLUEY_DATABASE_URL is set but BLUEY_SERVER_DB_BACKEND=${SERVER_DB_BACKEND}; bluey-server will stay on SQLite unless postgres backend mode is explicitly enabled"
   fi
   if command -v psql >/dev/null 2>&1; then
-    if psql "$BLUEY_DATABASE_URL" -Atqc "select 1" >/dev/null 2>&1; then
+    if PGDATABASE="$BLUEY_DATABASE_URL" run_bounded psql -Atqc "select 1" >/dev/null 2>&1; then
       ok "Postgres connection succeeded"
-      if psql "$BLUEY_DATABASE_URL" -Atqc "select 1 from pg_extension where extname = 'vector'" | grep -q 1; then
+      if PGDATABASE="$BLUEY_DATABASE_URL" run_bounded psql -Atqc \
+        "select 1 from pg_extension where extname = 'vector'" | grep -q 1; then
         ok "pgvector extension installed"
       else
         fail "pgvector extension missing"
       fi
-      rag_table="$(psql "$BLUEY_DATABASE_URL" -Atqc "select coalesce(to_regclass('public.cloud_rag_chunks')::text, to_regclass('public.memory_chunks')::text, '')")"
+      rag_table="$(PGDATABASE="$BLUEY_DATABASE_URL" run_bounded psql -Atqc "select coalesce(to_regclass('public.cloud_rag_chunks')::text, to_regclass('public.memory_chunks')::text, '')")"
       if printf '%s' "$rag_table" | grep -Eq 'cloud_rag_chunks|memory_chunks'; then
         ok "cloud RAG table present ($rag_table)"
-        embedding_type="$(psql "$BLUEY_DATABASE_URL" -Atqc "select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'cloud_rag_chunks' and column_name = 'embedding' union all select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'memory_chunks' and column_name = 'embedding' limit 1")"
+        embedding_type="$(PGDATABASE="$BLUEY_DATABASE_URL" run_bounded psql -Atqc "select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'cloud_rag_chunks' and column_name = 'embedding' union all select udt_name from information_schema.columns where table_schema = 'public' and table_name = 'memory_chunks' and column_name = 'embedding' limit 1")"
         if [ "$embedding_type" = "vector" ]; then
           ok "cloud RAG embedding column uses pgvector"
         else
@@ -385,7 +449,7 @@ if [ -n "${BLUEY_REDIS_URL:-}" ]; then
     fi
   fi
   if command -v redis-cli >/dev/null 2>&1; then
-    if redis-cli -u "$BLUEY_REDIS_URL" PING 2>/dev/null | grep -q PONG; then
+    if run_bounded redis-cli -u "$BLUEY_REDIS_URL" PING 2>/dev/null | grep -q PONG; then
       ok "Redis/Valkey ping succeeded"
     else
       fail "Redis/Valkey ping failed"
@@ -409,11 +473,11 @@ else
   warn "Redis strict mode disabled; Redis failures fall back to local process state"
 fi
 
-object_endpoint="${BLUEY_OBJECT_ENDPOINT_URL:-${BLUEY_R2_ENDPOINT_URL:-${AWS_ENDPOINT_URL_S3:-}}}"
-object_bucket="${BLUEY_OBJECT_BUCKET:-${BLUEY_R2_BUCKET:-${AWS_S3_BUCKET:-}}}"
-object_access_key="${BLUEY_OBJECT_ACCESS_KEY_ID:-${BLUEY_R2_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-}}}"
-object_secret_key="${BLUEY_OBJECT_SECRET_ACCESS_KEY:-${BLUEY_R2_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-}}}"
-object_region="${BLUEY_OBJECT_REGION:-${BLUEY_R2_REGION:-${AWS_REGION:-auto}}}"
+object_endpoint="${BLUEY_OBJECT_ENDPOINT_URL:-${BLUEY_R2_ENDPOINT_URL:-}}"
+object_bucket="${BLUEY_OBJECT_BUCKET:-${BLUEY_R2_BUCKET:-}}"
+object_access_key="${BLUEY_OBJECT_ACCESS_KEY_ID:-${BLUEY_R2_ACCESS_KEY_ID:-}}"
+object_secret_key="${BLUEY_OBJECT_SECRET_ACCESS_KEY:-${BLUEY_R2_SECRET_ACCESS_KEY:-}}"
+object_region="${BLUEY_OBJECT_REGION:-${BLUEY_R2_REGION:-auto}}"
 
 object_missing=0
 if [ -n "$object_endpoint" ] && ! is_placeholder "$object_endpoint"; then
@@ -446,7 +510,7 @@ elif command -v aws >/dev/null 2>&1; then
   if AWS_ACCESS_KEY_ID="$object_access_key" \
      AWS_SECRET_ACCESS_KEY="$object_secret_key" \
      AWS_REGION="$object_region" \
-     aws --endpoint-url "$object_endpoint" s3api head-bucket --bucket "$object_bucket" >/dev/null 2>&1; then
+     run_bounded aws --endpoint-url "$object_endpoint" s3api head-bucket --bucket "$object_bucket" >/dev/null 2>&1; then
     ok "object storage bucket reachable"
   else
     warn "object storage bucket not reachable from this machine; verify endpoint, bucket, and key policy"
@@ -467,7 +531,11 @@ if [ -n "${OFFSITE_DESTINATION:-}" ]; then
         if [ -n "${BLUEY_BACKUP_S3_ENDPOINT_URL:-}" ]; then
           aws_args+=(--endpoint-url "$BLUEY_BACKUP_S3_ENDPOINT_URL")
         fi
-        if aws "${aws_args[@]}" s3 ls "$OFFSITE_DESTINATION" >/dev/null 2>&1; then
+        if AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:-}" \
+           AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:-}" \
+           AWS_SESSION_TOKEN="${AWS_SESSION_TOKEN:-}" \
+           AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION:-auto}}" \
+           run_bounded aws "${aws_args[@]}" s3 ls "$OFFSITE_DESTINATION" >/dev/null 2>&1; then
           ok "R2/S3 backup destination reachable"
         else
           warn "R2/S3 backup destination not listable; verify bucket policy and prefix"
@@ -485,12 +553,12 @@ else
 fi
 
 require_log_archive="${BLUEY_REQUIRE_LOG_ARCHIVE:-0}"
-log_destination="${BLUEY_LOG_ARCHIVE_DESTINATION:-}"
-log_bucket="${BLUEY_LOG_R2_BUCKET:-${BLUEY_OBJECT_BUCKET:-${BLUEY_R2_BUCKET:-}}}"
-log_endpoint="${BLUEY_LOG_R2_ENDPOINT_URL:-${BLUEY_LOG_R2_ENDPOINT:-${BLUEY_BACKUP_S3_ENDPOINT_URL:-${BLUEY_OBJECT_ENDPOINT_URL:-${BLUEY_R2_ENDPOINT_URL:-}}}}}"
-log_access_key="${BLUEY_LOG_R2_ACCESS_KEY_ID:-${AWS_ACCESS_KEY_ID:-${BLUEY_OBJECT_ACCESS_KEY_ID:-${BLUEY_R2_ACCESS_KEY_ID:-}}}}"
-log_secret_key="${BLUEY_LOG_R2_SECRET_ACCESS_KEY:-${AWS_SECRET_ACCESS_KEY:-${BLUEY_OBJECT_SECRET_ACCESS_KEY:-${BLUEY_R2_SECRET_ACCESS_KEY:-}}}}"
-log_region="${BLUEY_LOG_R2_REGION:-${AWS_DEFAULT_REGION:-${BLUEY_OBJECT_REGION:-${BLUEY_R2_REGION:-auto}}}}"
+log_destination="${BLUEY_OPS_LOG_ARCHIVE_DESTINATION:-}"
+log_bucket="${BLUEY_OPS_LOG_R2_BUCKET:-}"
+log_endpoint="${BLUEY_OPS_LOG_R2_ENDPOINT_URL:-}"
+log_access_key="${BLUEY_OPS_LOG_R2_ACCESS_KEY_ID:-}"
+log_secret_key="${BLUEY_OPS_LOG_R2_SECRET_ACCESS_KEY:-}"
+log_region="${BLUEY_OPS_LOG_R2_REGION:-auto}"
 log_storage="${BLUEY_LOG_STORAGE:-}"
 log_retention_days="${BLUEY_UPLOAD_LOG_RETENTION_DAYS:-${BLUEY_LOG_RETENTION_DAYS:-180}}"
 
@@ -500,7 +568,7 @@ elif [ -n "$log_bucket" ] && ! is_placeholder "$log_bucket"; then
   ok "log archive bucket set; destination will use ${BLUEY_LOG_STORAGE_PREFIX:-prod}/logs/api"
 else
   if [ "$require_log_archive" = "1" ]; then
-    fail "log archive destination missing; set BLUEY_LOG_ARCHIVE_DESTINATION or BLUEY_LOG_R2_BUCKET"
+    fail "log archive destination missing; set BLUEY_OPS_LOG_ARCHIVE_DESTINATION or BLUEY_OPS_LOG_R2_BUCKET"
   else
     warn "log archive destination missing; production logs will remain local only"
   fi
@@ -534,7 +602,7 @@ if [ -n "$log_destination" ] && [[ "$log_destination" == s3://* ]] && command -v
   if AWS_ACCESS_KEY_ID="$log_access_key" \
      AWS_SECRET_ACCESS_KEY="$log_secret_key" \
      AWS_DEFAULT_REGION="$log_region" \
-     aws "${aws_log_args[@]}" s3 ls "$log_destination" >/dev/null 2>&1; then
+     run_bounded aws "${aws_log_args[@]}" s3 ls "$log_destination" >/dev/null 2>&1; then
     ok "R2/S3 log archive destination reachable"
   else
     warn "R2/S3 log archive destination not listable; verify bucket policy and prefix"
@@ -547,7 +615,7 @@ elif [ -n "$log_bucket" ] && command -v aws >/dev/null 2>&1; then
   if AWS_ACCESS_KEY_ID="$log_access_key" \
      AWS_SECRET_ACCESS_KEY="$log_secret_key" \
      AWS_DEFAULT_REGION="$log_region" \
-     aws "${aws_log_args[@]}" s3api head-bucket --bucket "$log_bucket" >/dev/null 2>&1; then
+     run_bounded aws "${aws_log_args[@]}" s3api head-bucket --bucket "$log_bucket" >/dev/null 2>&1; then
     ok "R2/S3 log archive bucket reachable"
   else
     warn "R2/S3 log archive bucket not reachable; verify endpoint, bucket, and key policy"
@@ -577,18 +645,45 @@ ok "log dir max bytes=${BLUEY_LOG_DIR_MAX_BYTES:-536870912}"
 ok "log archive root max bytes=${BLUEY_LOG_ROOT_MAX_BYTES:-2147483648}"
 
 if [ -n "${BLUEY_PUBLIC_URL:-}" ] && command -v curl >/dev/null 2>&1; then
-  if curl -fsS "${BLUEY_PUBLIC_URL%/}/health" >/dev/null 2>&1; then
+  if run_bounded curl -fsS "${BLUEY_PUBLIC_URL%/}/health" >/dev/null 2>&1; then
     ok "health endpoint reachable"
   else
     warn "health endpoint not reachable from this machine"
   fi
-  if curl -fsS "${BLUEY_PUBLIC_URL%/}/latest.json" >/dev/null 2>&1 &&
-     curl -fsS "${BLUEY_PUBLIC_URL%/}/latest.json.sig" >/dev/null 2>&1; then
+  if run_bounded curl -fsS "${BLUEY_PUBLIC_URL%/}/latest.json" >/dev/null 2>&1 &&
+     run_bounded curl -fsS "${BLUEY_PUBLIC_URL%/}/latest.json.sig" >/dev/null 2>&1; then
     ok "signed update manifest files reachable"
   else
     warn "signed update manifest files not both reachable"
   fi
 fi
+
+case "$REQUIRE_DISK_GUARD" in
+  0) ;;
+  1)
+    if [ ! -x "$DISK_GUARD_SCRIPT" ]; then
+      fail "required disk guard is not executable: $DISK_GUARD_SCRIPT"
+    elif run_bounded "$DISK_GUARD_SCRIPT" check >/dev/null; then
+      ok "durable production disk/backup guard passed"
+    else
+      fail "durable production disk/backup guard failed"
+    fi
+    ;;
+  *) fail "BLUEY_PREFLIGHT_REQUIRE_DISK_GUARD must be 0 or 1" ;;
+esac
+
+case "$REQUIRE_RESTORE_DEADMAN_PROVIDER" in
+  0) ;;
+  1)
+    # Phase 622 deliberately has no generic/self-issued substitute for an
+    # independent control-plane monitor that can remove an abandoned restore
+    # target after this host is killed or lost. Keep the production profile
+    # fail-closed until a separately reviewed provider integration replaces
+    # this explicit stop line with live registration/status evidence.
+    fail "external restore-drill dead-man provider is not implemented; production release remains blocked"
+    ;;
+  *) fail "BLUEY_PREFLIGHT_REQUIRE_RESTORE_DEADMAN_PROVIDER must be 0 or 1" ;;
+esac
 
 if [ "$STRICT" = "1" ] && [ "$WARNINGS" -gt 0 ]; then
   fail "strict mode treats warnings as failures ($WARNINGS warning(s))"

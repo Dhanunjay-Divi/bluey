@@ -20,7 +20,8 @@ Before starting, you must already have:
 - [ ] **Resend API key** for transactional email. Bluey uses the Resend HTTPS
   API path because many cloud hosts block outbound SMTP ports.
 - [ ] A **64-character JWT secret** generated via `openssl rand -hex 32`.
-- [ ] (Optional) **Backup destination** — S3-compatible bucket or off-host SFTP target.
+- [ ] **Backup destination** — a retention-protected S3-compatible prefix is
+  required for production.
 
 ## 1. One-time host setup
 
@@ -40,7 +41,9 @@ ufw --force enable
 # Dedicated unprivileged user for the daemon.
 useradd --system --create-home --home-dir /opt/bluey-api --shell /usr/sbin/nologin bluey
 mkdir -p /opt/bluey-api /var/log/bluey-api /var/backups/bluey-api
-chown -R bluey:bluey /opt/bluey-api /var/log/bluey-api /var/backups/bluey-api
+chown -R bluey:bluey /opt/bluey-api /var/log/bluey-api
+chown root:root /var/backups/bluey-api
+chmod 0700 /var/backups/bluey-api
 ```
 
 ## 2. Install Caddy (auto-TLS via Let's Encrypt)
@@ -161,18 +164,107 @@ Run a Square sandbox checkout and verify `journalctl -u bluey-api.service` shows
 
 ## 9. Backups
 
-Install the backup script + cron:
+Treat the storage change as a credential and filesystem-boundary migration, not
+as a script copy. Live evidence showed the old backup key in the API-readable
+environment, `/var/backups/bluey-api` owned by `bluey:bluey`, and the service
+unit allowed to write that tree. Stop the API and every storage/log schedule
+before changing ownership or credentials. Preserve the disabled files for
+audit/rollback; never reactivate them with the old 14+14 policy.
 
 ```bash
-cp ops/backup-bluey-db.sh /usr/local/sbin/backup-bluey-db.sh
-chmod 750 /usr/local/sbin/backup-bluey-db.sh
-chown root:root /usr/local/sbin/backup-bluey-db.sh
+migration_hold=/root/bluey-storage-migration-hold
+install -d -m 0700 -o root -g root "$migration_hold"
+systemctl stop bluey-api.service
+for policy in \
+  /etc/cron.d/bluey-api-backup \
+  /etc/cron.d/bluey-log-guards \
+  /etc/logrotate.d/bluey-api \
+  /etc/logrotate.d/bluey-ops; do
+  [ ! -e "$policy" ] || mv "$policy" "$migration_hold/"
+done
 
-# Cron entry: hourly snapshots; script keeps 14 hourly + 14 daily snapshots.
-cat > /etc/cron.d/bluey-api-backup <<'EOF'
-0 * * * * root /usr/local/sbin/backup-bluey-db.sh
-EOF
+install -m 0750 -o root -g root ops/backup-bluey-db.sh \
+  /usr/local/sbin/backup-bluey-db.sh
+install -m 0600 -o root -g root \
+  ops/bluey-storage.env.example /etc/bluey-api/bluey-storage.env
+
+# Install the current unit, which does not grant the API access to backup data.
+install -m 0644 -o root -g root ops/bluey-api.service.example \
+  /etc/systemd/system/bluey-api.service
+systemctl daemon-reload
 ```
+
+In the Cloudflare control plane, create a new backup credential scoped to
+list/head/get/put only for the backup prefix. It must have no delete, bucket
+administration, lifecycle, or lock-policy permission. Put that new credential,
+the real HTTPS alert receiver, and the dedicated operational-log credential in
+`/etc/bluey-api/bluey-storage.env`; keep it `root:root` mode `0600`. Remove
+`OFFSITE_DESTINATION`, `AWS_*`, `BLUEY_BACKUP_S3_*`, `BLUEY_OPS_LOG_R2_*`, and
+the alert webhook from `bluey-api.env`. Application object storage keeps its own
+separately scoped `BLUEY_OBJECT_*` credential.
+Every root-run storage script rejects this fragment if it is a symlink,
+non-regular, not root-owned, or group/world writable; that validation occurs
+before the file is sourced.
+
+With the service and old schedules still stopped, prepare the trusted roots and
+scripts. `--prepare` changes only the exact directory entries to `root:root`
+without recursively rewriting backup payloads, rejects symlinks, installs the
+journald cap, validates the installed scripts, and leaves scheduling disabled:
+
+```bash
+ops/install-bluey-log-guards.sh --prepare
+/usr/local/sbin/backup-bluey-db.sh --check-config
+/usr/local/sbin/archive-bluey-logs.sh --check-config
+/usr/local/sbin/bluey-disk-guard.sh --check-config
+find /var/backups/bluey-api -maxdepth 2 -type l -print -quit | \
+  grep -q . && { echo 'unexpected backup symlink' >&2; exit 1; } || true
+stat -c '%U:%G %a %n' \
+  /var/backups/bluey-api \
+  /var/backups/bluey-api/hourly \
+  /var/backups/bluey-api/daily \
+  /var/backups/bluey-api/.staging \
+  /var/backups/bluey-api/deadman \
+  /var/backups/bluey-api/.restore-drill-locks \
+  /var/lib/bluey-ops
+
+# With the API and every old schedule still stopped, reject unexpected entries
+# and migrate only exact backup/proof files by metadata; never recurse through
+# an unreviewed tree or follow links.
+for snapshot_dir in \
+  /var/backups/bluey-api/hourly \
+  /var/backups/bluey-api/daily; do
+  if find "$snapshot_dir" -mindepth 1 -maxdepth 1 ! -type f -print -quit | grep -q .; then
+    echo "unexpected non-regular snapshot entry under $snapshot_dir" >&2
+    exit 1
+  fi
+  if find "$snapshot_dir" -mindepth 1 -maxdepth 1 -type f \
+    ! \( -name '*.db' -o -name '*.pgdump' -o -name '*.sha256' \
+         -o -name '*.offsite-verified' \) -print -quit | grep -q .; then
+    echo "unexpected snapshot filename under $snapshot_dir" >&2
+    exit 1
+  fi
+  find "$snapshot_dir" -mindepth 1 -maxdepth 1 -type f \
+    \( -name '*.db' -o -name '*.pgdump' -o -name '*.sha256' \
+       -o -name '*.offsite-verified' \) \
+    -exec chown root:root -- {} + -exec chmod 0600 -- {} +
+done
+for control_file in \
+  /var/backups/bluey-api/.backup.lock \
+  /var/backups/bluey-api/.backup.status; do
+  [ ! -e "$control_file" ] && [ ! -L "$control_file" ] && continue
+  [ -f "$control_file" ] && [ ! -L "$control_file" ] || {
+    echo "unexpected backup control entry: $control_file" >&2
+    exit 1
+  }
+  chown root:root "$control_file"
+  chmod 0600 "$control_file"
+done
+```
+
+Do not start the API yet if any backup payload, sidecar, or proof marker is not
+root-owned and write-protected; investigate that exact file instead of applying
+a recursive ownership rewrite. The later exact read-back bootstrap revalidates
+the content after this metadata-only ownership migration.
 
 The script lives at `ops/backup-bluey-db.sh` in this repo. It auto-detects the
 runtime database backend:
@@ -181,9 +273,23 @@ runtime database backend:
 - `BLUEY_SERVER_DB_BACKEND=postgres`: loads `/etc/bluey-api/bluey-postgres.env`
   by default and writes a `pg_dump --format=custom` archive.
 
-Both modes are safe while `bluey-api.service` is live. The script rotates the
-last 14 hourly + 14 daily snapshots locally; off-host shipping to
-S3-compatible storage/SFTP is configured by setting `OFFSITE_DESTINATION`.
+Both modes are safe while `bluey-api.service` is live. Each staged SQLite copy
+must pass `PRAGMA quick_check`; each custom Postgres archive must pass
+`pg_restore --list` before finalization or proof-marker creation. The script rotates the
+configured hourly/daily counts as complete archive/checksum pairs. Production's
+58 GB host uses 4 hourly plus 7 daily snapshots, preserves at least 2 of each,
+keeps backups under 12 GB and at least 16 GB free, and ships durable copies to
+R2. A 2 GiB per-snapshot writer limit plus a pre-write reserve prevents a grown
+dump from filling the root filesystem mid-write. Midnight runs reserve two such
+allocations because the finalized hourly file and staged daily copy coexist.
+The exclusive lock removes every orphaned `.staging/run.*` before capacity work
+and prevents overlapping cron/manual backups. A dedicated volume/quota remains
+the preferred long-term boundary.
+
+The 12 GB ceiling covers database hot storage (`hourly`, `daily`, and
+`.staging`) only. Release/bin/round rollback evidence and log archives are not
+paid for by deleting DB restore points; the disk guard accounts for those
+components and whole-root pressure independently.
 
 For managed Postgres, install a `pg_dump` client that is the same major version
 as the server, or newer. A PostgreSQL 18 server requires `postgresql-client-18`;
@@ -194,10 +300,102 @@ For Cloudflare R2:
 ```bash
 OFFSITE_DESTINATION=s3://<bucket>/bluey-api-backups/
 BLUEY_BACKUP_S3_ENDPOINT_URL=https://<cloudflare-account-id>.r2.cloudflarestorage.com
-AWS_ACCESS_KEY_ID=<r2-access-key-id>
-AWS_SECRET_ACCESS_KEY=<r2-secret-access-key>
+AWS_ACCESS_KEY_ID=<new-prefix-scoped-backup-access-key>
+AWS_SECRET_ACCESS_KEY=<new-prefix-scoped-backup-secret-key>
 AWS_DEFAULT_REGION=auto
 ```
+
+New objects are written below explicit `hourly/` and `daily/` sub-prefixes;
+legacy objects remain in the flat prefix for read-only bootstrap. Before
+activation, record control-plane evidence from a management token that is never
+installed on the host:
+
+- an R2 bucket-lock rule for both new prefixes (recommended minimum: 7 days for
+  hourly and 35 days for daily);
+- lifecycle expiration longer than the lock window (recommended: 14 days for
+  hourly and 90 days for daily), plus a documented rule for legacy flat objects;
+- read-back of both lock and lifecycle configuration; the prefix-scoped host key
+  is expected to receive `AccessDenied` for those administrative APIs; and
+- no host-side remote-delete job. Retention is control-plane policy, not ad hoc
+  deletion from the backup script.
+
+At the current roughly 0.93 GiB full dump, hourly objects add about 22 GiB/day
+or 0.67 TiB/month without lifecycle expiration. Bucket lock takes precedence
+over lifecycle deletion, so the lifecycle window must exceed the lock window.
+
+The script verifies remote size, checksum sidecar, and full read-back before it
+mints `.offsite-verified`. Neither count nor capacity pruning may delete an
+unverified local snapshot when offsite backup is configured. Proof markers are
+bound to the current configured destination, and each deletion candidate gets
+a fresh local checksum plus remote full read-back immediately before removal.
+Normal runs reconcile new-format snapshots left unverified by a transient
+upload outage before allocating another dump; historical daily-to-hourly
+mappings remain exclusive to the read-only bootstrap below.
+
+Existing production files created before proof markers must be bootstrapped
+before the 12 GB ceiling is activated:
+
+```bash
+/usr/local/sbin/backup-bluey-db.sh --verify-existing
+```
+
+This command is read-only against backup objects and local archives except for
+atomic proof-marker creation. It derives historical daily-to-hourly object
+names from checksum sidecars and stops on any missing object, size, sidecar, or
+full-read-back mismatch. Record its output, then run one normal backup and a
+restore drill before relying on automatic retention.
+
+Prove the new host key with a bounded canary: list its prefix, upload a unique
+small object and checksum, HEAD both, and fully read both back. A delete attempt
+must be denied and the object must remain readable; use the separate management
+credential for any later lifecycle cleanup. Then start the API with the updated
+unit and API env, inspect only environment variable names (never values), and
+prove no backup/ops key is inherited:
+
+```bash
+systemctl start bluey-api.service
+api_pid="$(systemctl show -p MainPID --value bluey-api.service)"
+if tr '\0' '\n' < "/proc/$api_pid/environ" | cut -d= -f1 | \
+  grep -Eq '^(OFFSITE_DESTINATION|AWS_|BLUEY_BACKUP_S3_|BLUEY_OPS_LOG_R2_|BLUEY_DISK_GUARD_ALERT_WEBHOOK_URL)'; then
+  echo 'root-only storage credential leaked into bluey-api' >&2
+  exit 1
+fi
+```
+
+After that check and a new-key exact backup read-back canary pass, revoke the
+old key that had been exposed to the API process and repeat the canary. Rollback
+must never restore the old key or the old backup-root write permission.
+
+Production must keep `BLUEY_DISK_BACKUP_HEALTH_REQUIRED=1`. The 15-minute disk
+guard warns when the newest active-backend hourly snapshot reaches 120 minutes
+and fails at 180 minutes, or immediately for no snapshot, a missing/malformed
+checksum sidecar, or missing/inconsistent offsite proof. It compares trusted
+root-owned metadata only and does not rehash the full dump on each guard run.
+Non-production hosts without a backup schedule may explicitly set the switch to
+`0`; do not carry that opt-out into production.
+
+The installer creates the canonical root-owned backup lock inode, and the guard
+holds a shared lock throughout its metadata scan. While a legitimate writer holds it, the
+guard evaluates the last fully completed snapshot and reports the writer as in
+progress; after lock release, an incomplete finalized pair fails immediately.
+Production also requires the atomic backup-run status, a daily snapshot below
+the 36-hour warning/48-hour hard ages, no unverified backlog, DB hot storage
+below its cap, and inode warning/hard thresholds. Alert deduplication includes
+safe reason codes, so a new backup fault is delivered even if aggregate state
+remains `warn` or `fail`.
+
+Local alert delivery is not a dead-man for a failed host, cron daemon, network,
+or configuration. Before release, require both a real webhook transition canary
+and an external monitor that alarms if `disk-guard.status` is older than 30–45
+minutes. The DigitalOcean agent must also have a 70% root Disk Utilization alert
+with a proven operator notification path.
+
+As of 2026-08-30, the exact `bluey-brain` target also has an edit-verified
+DigitalOcean policy named `Bluey memory above 85% for 10 minutes` (policy ID
+`022ce0ab-510c-4067-8488-8b03a0dc8f7e`) using the existing verified account
+email notification. The retained disk-policy ID is
+`9c0edae0-c820-46b3-b8d7-5330779ac5c8`; record its current 70% threshold,
+target, duration, and a delivered notification alongside each release gate.
 
 Keep these values in root-owned environment/cron config on the server. They must
 never be shipped in the desktop app.
@@ -215,22 +413,117 @@ chmod 750 /usr/local/sbin/restore-drill-bluey-db.sh
 chown root:root /usr/local/sbin/restore-drill-bluey-db.sh
 ```
 
-For Postgres, provision a non-production drill database and set the target only
-for the drill command:
+For Postgres, a separately reviewed external control-plane provider must first
+provision a uniquely named empty database from `template0` on a disposable
+server/cluster. The target role must directly own it and also connect to the
+target server's `postgres` maintenance database for forced teardown. Set this
+exact database comment:
+`bluey-restore-drill-disposable:v1:<database>:<expiry_epoch>:<hex_token>`.
 
-```bash
-BLUEY_RESTORE_DRILL_DATABASE_URL='postgres://bluey_drill:...@.../bluey_restore_drill?sslmode=require' \
-  /usr/local/sbin/restore-drill-bluey-db.sh
+The same independent provider must own a bounded registration that survives
+this host, process, cron, network, and `SIGKILL`. It must monitor the exact
+provider resource, drop or quarantine an abandoned target no later than the
+declared expiry (at most 24 hours), alert on cleanup failure, and retain its own
+armed/expired/closed audit record. Before the restore starts, it must issue one
+newline-terminated marker directly under the root-owned mode-0700
+`/var/backups/bluey-api/deadman` directory:
+
+```text
+bluey-restore-drill-deadman:v1:<target_cluster_sentinel>:<database>:<expiry_epoch>:<hex_token>:<drill_authority>:<provider_identity>
 ```
 
-The script loads `/etc/bluey-api/bluey-api.env` and
-`/etc/bluey-api/bluey-postgres.env`, selects the latest local backup from
-`/var/backups/bluey-api/hourly`, refuses to restore into the live
-`BLUEY_DATABASE_URL`, restores the dump, and prints counts for core tables. For
-SQLite backups it copies the `.db` to a temp path and runs
-`PRAGMA integrity_check`.
+The marker must be a regular, non-symlink, `root:root` mode-0600 file. Never
+mint it locally or treat its existence as evidence that a provider is armed.
+The restore receives all of the following exact bindings:
 
-Run this drill after database migrations, before launch, and at least monthly.
+```text
+BLUEY_RESTORE_DRILL_DATABASE_URL=<isolated-disposable-target-url>
+BLUEY_RESTORE_DRILL_DATABASE_NAME=<bluey_restore_drill_*>
+BLUEY_RESTORE_DRILL_CONFIRMATION=restore:<database>
+BLUEY_RESTORE_DRILL_SENTINEL_TOKEN=<32-to-128-hex-token>
+BLUEY_RESTORE_DRILL_TARGET_EXPIRES_AT_EPOCH=<future-epoch-within-24h>
+BLUEY_RESTORE_DRILL_TEARDOWN_MODE=drop
+BLUEY_RESTORE_DRILL_PRODUCTION_CLUSTER_SENTINEL=<independently-read-live-sentinel>
+BLUEY_RESTORE_DRILL_TARGET_CLUSTER_SENTINEL=<provider-target-sentinel>
+BLUEY_RESTORE_DRILL_AUTHORITY=<reviewed-audit-authority>
+BLUEY_RESTORE_DRILL_DEADMAN_PROVIDER_IDENTITY=<provider-registration-identity>
+BLUEY_RESTORE_DRILL_DEADMAN_MARKER_FILE=/var/backups/bluey-api/deadman/<safe-name>.lease
+```
+
+Phase 622 does **not** select or implement that external provider. Do not run a
+production restore drill by hand-creating the marker. A later reviewed phase
+must implement provider registration, independent liveness/expiry monitoring,
+control-plane cleanup, status read-back, and closure evidence.
+
+The script loads API, root-only storage, and PostgreSQL fragments; selects only
+the active backend's extension; and rejects an explicitly mismatched backup.
+It requires an absolute non-symlink Bluey backup plus exact sidecar, validates
+the checksum and archive catalog, and verifies a zero-user-object baseline,
+direct owner, exact disposable comment, expiry, confirmation, and live/target
+server/database identity before any destructive restore. PostgreSQL URLs are
+converted to a protected temporary libpq service and never passed in argv. The
+restore and teardown are bounded; success requires the target database to be
+dropped. A same-server/different-database drill is exceptional and additionally
+requires `BLUEY_RESTORE_DRILL_ALLOW_SAME_CLUSTER=1` plus a reviewed
+`BLUEY_RESTORE_DRILL_SAME_CLUSTER_AUDIT_REF`; the production database always
+rejects. SQLite uses a temporary scratch copy and `PRAGMA
+integrity_check`.
+
+After the script proves the target absent, it consumes the exact local lease
+marker. That local removal is not provider deregistration and cannot prove the
+external monitor closed. The provider must independently observe target
+absence, close the registration, and preserve that evidence. If the process or
+host dies at any earlier point, the provider registration remains armed and
+must clean up at expiry without any local heartbeat.
+
+Run this drill after database migrations, before launch, and at least monthly,
+but only after the external-provider phase is implemented and reviewed.
+
+### Transactional storage-policy activation
+
+With cron and Bluey's logrotate policy still disabled, bootstrap every retained
+legacy snapshot, run one normal backup, prove log-archive upload/read-back and
+durable status, and exercise warning/failure/recovery delivery. Record the R2
+lock/lifecycle read-back, DigitalOcean 70% disk alert, external 30–45 minute
+guard-status dead-man, new-key/revoked-old-key evidence, API credential
+isolation, and the existing isolated restore result. These controls may activate
+the storage-reliability hotfix, but they do not satisfy the external
+restore-target dead-man gate or authorize a product release.
+
+```bash
+/usr/local/sbin/backup-bluey-db.sh --verify-existing
+/usr/local/sbin/backup-bluey-db.sh
+/usr/local/sbin/archive-bluey-logs.sh
+cat /var/lib/bluey-ops/log-archive.status
+ops/install-bluey-log-guards.sh --activate
+
+backup_cron_tmp="$(mktemp /etc/cron.d/.bluey-api-backup.tmp.XXXXXX)"
+printf '%s\n' \
+  '0 * * * * root /usr/local/sbin/backup-bluey-db.sh >> /var/log/bluey-ops/backup-cron.log 2>&1' \
+  > "$backup_cron_tmp"
+chmod 0644 "$backup_cron_tmp"
+mv "$backup_cron_tmp" /etc/cron.d/bluey-api-backup
+
+BLUEY_PREFLIGHT_REQUIRE_DISK_GUARD=1 \
+BLUEY_PREFLIGHT_REQUIRE_RESTORE_DEADMAN_PROVIDER=1 \
+  scripts/bluey-cloud-preflight.sh \
+  /etc/bluey-api/bluey-api.env \
+  /etc/bluey-api/bluey-storage.env \
+  /etc/bluey-api/bluey-postgres.env
+```
+
+The final preflight is intentionally expected to fail with
+`external restore-drill dead-man provider is not implemented` in this phase.
+Do not override the production storage profile to make it green. A later phase
+must replace that explicit stop line with a live external provider status check
+and its independently retained creation, monitoring, expiry, cleanup, and
+closure evidence.
+
+Do not roll back only the scripts or only the policy. First disable both cron
+files and both Bluey logrotate policies, preserve all local snapshots and proof
+markers, restore a reviewed script/config pair, rerun config checks and a
+canary, then re-enable schedules. Never restore the revoked key, service write
+access to the backup tree, or the old 14+14 policy.
 
 ### Data Requests And Deletes
 
@@ -264,8 +557,12 @@ blobs.
 
 Admin-only support and storage endpoints:
 
-- `/admin/storage/health`: backup directory, latest local backup, off-host
-  destination configured, object storage configured, and feature readiness.
+- `/admin/storage/health`: application-visible storage readiness only. Because
+  the service no longer reads the root-owned backup tree, `latest_backup` may be
+  null; backup freshness authority is `/var/lib/bluey-ops/disk-guard.status`
+  plus root-only proof, not this API response. Restore/release authority also
+  requires the still-unimplemented independent restore-target dead-man provider,
+  so production preflight remains blocked in Phase 622.
 - `/admin/support/accounts/<account_id>`: redacted account support bundle with
   counts, hashed identifiers, recent provider/cost rows, and artifact object
   metadata. It deliberately excludes transcript text, answer text, document
@@ -354,7 +651,7 @@ Before flipping DNS or announcing the product:
 - [ ] SMTP emails arrive in <30 seconds for both `/auth/verify-email/start` and `/auth/password-reset/start`.
 - [ ] `/admin/metrics` is reachable with a bearer + the metrics look sane (accounts >= 1, no in_progress > 0).
 - [ ] Backup script runs successfully via `/usr/local/sbin/backup-bluey-db.sh`
-      and produces the expected backend file in `/var/backups/bluey-api/`:
+      and produces the expected backend file in `/var/backups/bluey-api/hourly/`:
       `.db` for SQLite or `.pgdump` for Postgres.
 - [ ] Off-host backup destination receives the snapshot.
 - [ ] At least one full money-path smoke: signup → trial → reload via Square → cue dispatch → balance debited → cue response.
@@ -368,14 +665,17 @@ If the droplet is destroyed:
 
 1. Provision a new droplet (any region with the same Ubuntu version).
 2. Re-run sections 1, 2, 4, 5, 6.
-3. Restore the most recent backup:
-   - SQLite: `cp /tmp/<latest-snapshot>.db /opt/bluey-api/bluey.db && chown bluey:bluey /opt/bluey-api/bluey.db`.
-   - Postgres: create/provision the target database, then run
-     `pg_restore --clean --if-exists --no-owner --no-acl --dbname "$BLUEY_DATABASE_URL" /tmp/<latest-snapshot>.pgdump`.
+3. Prove the selected snapshot's sidecar, structural catalog/integrity, and
+   exact offsite read-back before any restore. Restore only into a newly
+   provisioned empty replacement database/volume with an independently checked
+   identity; never run an ad hoc `pg_restore --clean` against the former live
+   connection string. Have a second operator verify the target identity and
+   recovery plan before switching service traffic.
 4. Repoint DNS A/AAAA records.
 5. Verify section 7.
 
-RPO is 1 hour (cron interval). RTO is roughly the time to provision + restore = ~15 minutes if you have the backup handy.
+The logical-backup RPO target is one hour. RTO is not assumed from cron cadence;
+record it from a timed, independently verified replacement-host restore.
 
 ## 14. Things explicitly NOT in this runbook
 

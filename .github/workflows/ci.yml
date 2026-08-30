@@ -37,10 +37,30 @@ jobs:
             curl \
             wget \
             file \
+            sqlite3 \
+            postgresql \
+            postgresql-client \
+            libpq-dev \
             libssl-dev \
             libasound2-dev \
             libayatana-appindicator3-dev \
             libxdo-dev
+          echo "$(pg_config --bindir)" >> "$GITHUB_PATH"
+
+      - name: Test Bluey storage guards
+        if: matrix.os == 'ubuntu-latest'
+        run: bash ops/tests/test-bluey-storage-guards.sh
+
+      - name: Test Bluey restore drill and release disk gate
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          bash ops/tests/test-restore-drill-bluey-db.sh
+          real_restore_output="$(mktemp)"
+          trap 'rm -f -- "$real_restore_output"' EXIT
+          BLUEY_RESTORE_DRILL_REAL_ONLY=1 \
+            bash ops/tests/test-restore-drill-bluey-db.sh | tee "$real_restore_output"
+          grep -Fq 'real_postgres_scenario=executed' "$real_restore_output"
+          bash ops/tests/test-bluey-cloud-preflight-disk-guard.sh
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
