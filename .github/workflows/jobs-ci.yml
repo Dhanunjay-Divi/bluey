@@ -32,6 +32,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -109,13 +111,16 @@ jobs:
           --release --locked
 
       - name: Build and smoke the managed runner image
+        env:
+          BLUEY_JOBS_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          test -n "$BLUEY_JOBS_SOURCE_COMMIT"
           docker build \
             --build-arg BLUEY_JOBS_BUILD_ID=jobs-runner-ci \
             --build-arg BLUEY_JOBS_CONFIG_SCHEMA_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
             --build-arg BLUEY_JOBS_MIGRATION_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
             --build-arg BLUEY_JOBS_PROTOCOL_SET_SHA256=0000000000000000000000000000000000000000000000000000000000000000 \
-            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA" \
+            --build-arg "BLUEY_JOBS_SOURCE_COMMIT=$BLUEY_JOBS_SOURCE_COMMIT" \
             --tag bluey-jobs-runner-ci --file jobs/runner/Dockerfile jobs
           docker run --rm \
             --entrypoint /usr/local/bin/node \

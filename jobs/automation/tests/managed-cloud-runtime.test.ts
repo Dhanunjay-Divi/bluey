@@ -1,5 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
@@ -148,6 +154,71 @@ describe("managed-cloud runtime configuration", () => {
       MEASUREMENT_OPTIONS,
     )).toThrow("measured file set changed");
     rmSync(unmeasuredPath);
+  });
+
+  it("measures the normalized regular managed runner Node binary", () => {
+    const root = mkdtempSync(join(tmpdir(), "bluey-runner-measurement-"));
+    const files = [
+      ["app/automation/dist/index.js", Buffer.from("automation-runtime\n")],
+      ["app/runner/dist/server.js", Buffer.from("runner-runtime\n")],
+      [
+        "ms-playwright/chromium_headless_shell-123/" +
+          "chrome-headless-shell-linux64/chrome-headless-shell",
+        Buffer.from("chromium-runtime\n"),
+      ],
+      ["usr/local/bin/node", Buffer.from("node-runtime\n")],
+    ] as const;
+    try {
+      for (const [path, bytes] of files) {
+        mkdirSync(join(root, path.slice(0, path.lastIndexOf("/"))), {
+          recursive: true,
+        });
+        writeFileSync(join(root, path), bytes);
+      }
+      const measuredFiles = files.map(([path, bytes]) => ({
+        path,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      }));
+      const measurementPath = join(
+        root,
+        "app/.bluey/managed-cloud-runtime-measurement.json",
+      );
+      mkdirSync(join(root, "app/.bluey"), { recursive: true });
+      writeFileSync(measurementPath, JSON.stringify({
+        audience: "bluey-jobs-managed-cloud-runtime-measurement-v1",
+        buildId: "managed-cloud-611-jobs-runner",
+        componentId: "jobs-runner",
+        configSchemaSha256: "c".repeat(64),
+        measuredFiles,
+        migrationSetSha256: "d".repeat(64),
+        protocolSetSha256: "e".repeat(64),
+        roles: ["managed_runner"],
+        sourceCommit: "a".repeat(40),
+        version: 1,
+      }) + "\n");
+
+      expect(measureManagedCloudRuntimeIdentity("managed_runner", {
+        measurementPath,
+        rootPath: root,
+      })).toMatchObject({ componentId: "jobs-runner" });
+      rmSync(join(root, "usr/local/bin/node"));
+      expect(() => measureManagedCloudRuntimeIdentity("managed_runner", {
+        measurementPath,
+        rootPath: root,
+      })).toThrow("measured runtime root is missing");
+      mkdirSync(join(root, "usr/bin"), { recursive: true });
+      writeFileSync(join(root, "usr/bin/node-target"), "node-runtime\n");
+      symlinkSync(
+        join(root, "usr/bin/node-target"),
+        join(root, "usr/local/bin/node"),
+      );
+      expect(() => measureManagedCloudRuntimeIdentity("managed_runner", {
+        measurementPath,
+        rootPath: root,
+      })).toThrow("measured runtime roots cannot contain symbolic links");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
   });
 
   it("accepts exactly 512 measured files and rejects 513", () => {

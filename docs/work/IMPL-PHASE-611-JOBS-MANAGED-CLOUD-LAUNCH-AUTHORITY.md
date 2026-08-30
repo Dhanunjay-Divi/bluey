@@ -49,7 +49,7 @@
 
 ## Files Created / Modified
 
-Final branch-diff inventory: **80 paths** relative to Phase 610 base `89d6b820`, including this
+Final branch-diff inventory: **93 paths** relative to Phase 610 base `89d6b820`, including this
 implementation document and the Phase 611 review document. `M` means modified and `A` means added.
 
 | Status | File | Purpose |
@@ -58,11 +58,18 @@ implementation document and the Phase 611 review document. `M` means modified an
 | M | `.github/workflows/release.yml` | Prevent the ordinary release path from bypassing the managed-cloud gate |
 | A | `.github/workflows/jobs-managed-cloud-release.yml` | Define manual candidate, authorize, promote, and rollback stages over stored bytes |
 | M | `CHANGELOG.md` | Record the bounded Phase 611 source result and parked launch evidence |
+| M | `crates/cue-core/src/ipc_auth.rs` | Remove the Rust 1.98 fixed-chunk Clippy failure without weakening bearer parsing |
+| M | `crates/cue-daemon/src/audio/framer.rs` | Preserve preallocated frame capacity after padded flush |
+| M | `crates/cue-daemon/src/audio/system_capture.rs` | Decode fixed PCM pairs through the Rust 1.98 array-chunk API |
+| M | `crates/cue-daemon/tests/system_audio_integration.rs` | Honor the declared integration deadline under parallel CI load |
+| M | `crates/cue-rag/src/store.rs` | Decode fixed embedding values through the Rust 1.98 array-chunk API |
 | A | `docs/rounds/ROUND-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Freeze the product, authority, recovery, release, and external-evidence contract |
 | A | `docs/work/FIX-690-jobs-managed-availability-dispatch-authority.md` | Record the loose availability/dispatch root cause and fix |
 | A | `docs/work/FIX-691-jobs-request-start-recovery-authority.md` | Record the recovery downgrade/new-effect root cause and fix |
 | A | `docs/work/FIX-692-jobs-managed-runner-release-effect-boundary.md` | Record the missing runner release-bound effect authority and fix |
 | A | `docs/work/FIX-693-jobs-managed-runner-measurement-bound.md` | Record the impossible runner measurement ceiling and cross-language bounded correction |
+| A | `docs/work/FIX-694-jobs-managed-runner-node-path.md` | Record the pinned Playwright path mismatch, normalized runtime, and exact-head binding |
+| A | `docs/work/FIX-695-rust-1-98-compatibility-backport.md` | Record the complete proven rolling-toolchain compatibility backport |
 | A | `docs/work/IMPL-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Inventory implementation, validation state, deviations, and follow-ups |
 | A | `docs/work/REVIEW-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Record independent review evidence, remaining external gates, and verdict |
 | A | `infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql` | Add PostgreSQL release, runtime, readiness, command, request-start, and execution authority |
@@ -118,6 +125,12 @@ implementation document and the Phase 611 review document. `M` means modified an
 | M | `server/src/api/jobs_runner_volumes.rs` | Bind managed volume proof to release A and runtime B identity |
 | M | `server/src/api/jobs_worker_auth.rs` | Authenticate exact runtime, reconciliation, lease, and effect-boundary paths |
 | M | `server/src/api/mod.rs` | Register the managed-cloud API authority module |
+| M | `server/src/api/router.rs` | Scope the intentional bounded Axum error-envelope Clippy allowance |
+| M | `server/src/api/router/completion.rs` | Scope the intentional completion error-envelope Clippy allowance |
+| M | `server/src/api/router/embeddings.rs` | Scope the intentional embedding error-envelope Clippy allowances |
+| M | `server/src/api/router/streaming_completion.rs` | Scope the intentional streaming error-envelope Clippy allowances |
+| M | `server/src/api/router/transcribe.rs` | Scope the intentional transcription error-envelope Clippy allowance |
+| M | `server/src/api/stt.rs` | Decode fixed PCM pairs through the Rust 1.98 array-chunk API |
 | M | `server/src/bin/bluey-jobs-api.rs` | Validate/start managed reporters and independent dispatch/recovery loops |
 | M | `server/src/db/jobs.rs` | Export and integrate managed release/execution authority |
 | M | `server/src/db/jobs/execution_leases.rs` | Bind managed execution-lease claim, authorization, irreversible-effect, runtime-correlation, and receipt-replay authority |
@@ -197,8 +210,9 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
     jobs_runner_plan_matrix 2; usage schema 1
 ```
 
-The independent line-by-line review is green with no remaining P0/P1 finding, and the completed
-full all-target Rust rerun passed with zero failures.
+The final independent line-by-line source review found no residual P0/P1/P2 issue across FIX-693,
+FIX-694, and FIX-695, and the completed baseline full all-target Rust rerun passed with zero
+failures. Release status remains conditional on exact-head resource-capable and hosted evidence.
 
 Post-correction local evidence at the branch tip on 2026-08-24:
 
@@ -216,10 +230,45 @@ git -P diff --check
   PASS
 ```
 
-The automation Vitest suite, Cargo check/Clippy/tests, and exact managed-runner Docker build/smoke
-were not rerun at the corrected tip: the local disk had 5.0 GiB free, below the 8 GiB release-work
-floor, no PortableSSD was mounted, and Docker was unavailable. A resource-capable successor must
-record exact-tip results; the baseline totals above must not be treated as proof for the correction.
+The first resource-capable pull-request rerun at head `f50103e8` used GitHub's synthetic merge
+commit `f552ac2a` and produced Actions run `33313140429`, job `99261666660`. It passed the managed
+release gate, 1,748 passed Jobs tests with one intentional skip, every Jobs typecheck/build, portal
+parity, native runner format, Clippy, tests, and release build, then failed at the managed-runner
+image measurement with:
+
+```text
+Runtime measurement root is missing: /usr/local/bin/node
+```
+
+That exact pinned Playwright Noble base installs the NodeSource package at `/usr/bin/node`.
+FIX-694 normalizes that regular file into the already-authoritative `/usr/local/bin/node` before
+measurement, removes the original after measurement, makes pull-request jobs check out and embed
+the same head SHA, and rejects symbolic links throughout every measured runtime root. Four sibling
+CI jobs also failed the new Rust 1.98
+Clippy surface; FIX-695 backports the complete proven eleven-file repair from `2f3910a1` without
+absorbing unrelated Phase 623 work. Local evidence after the final source correction:
+
+```text
+automation full test suite and typecheck
+  PASS: 660 tests; 1 intentional skip; TypeScript clean
+
+runner full test suite and typecheck
+  PASS: 308 tests; TypeScript clean
+
+managed-cloud release gate
+  PASS: 17 tests
+
+server Rust formatting
+  PASS
+
+git diff --check
+  PASS
+```
+
+The complete automation and runner test/typecheck gates are now green locally. Rust
+check/Clippy/tests plus the exact corrected managed-runner Docker build/native smoke remain
+required. Docker is unavailable locally, so a resource-capable CI rerun must record the image and
+native-addon result; the earlier successful stages cannot be inherited by either correction.
 
 Hosted container publication, immutable registry/static read-back, Temporal task-queue behavior,
 live runner capacity, runtime image-digest attestation, read-only-rootfs policy, customer cohort,
@@ -251,7 +300,7 @@ canary, and rollback are external-only gates and cannot be converted into local 
 
 ## Review Checklist (for reviewer)
 
-- [x] Final branch diff contains exactly 80 inventoried paths and the handoff worktree is clean
+- [x] Final branch diff contains exactly 93 inventoried paths
 - [x] Files match the Round 611 scope with no unrelated or `docs/reviews/` changes
 - [x] New-effect availability requires exact live release and role quorum with no debug bypass
 - [x] Idempotent replay precedes mutable admission checks and preserves original A
@@ -262,4 +311,4 @@ canary, and rollback are external-only gates and cannot be converted into local 
 - [x] All customer flags remain `0` and hosted evidence is not claimed from local source
 - [x] No TODO lacks a tracked follow-up
 - [x] Baseline `423fba5c` full all-target Rust rerun passes with zero failures
-- [ ] Corrected branch tip passes automation Vitest, Rust check/Clippy/tests, and exact managed-runner Docker/CI gates
+- [ ] Final corrected branch tip passes automation Vitest, Rust check/Clippy/tests, and exact managed-runner Docker/CI gates

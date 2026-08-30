@@ -90,7 +90,7 @@
 | Field | Value |
 |-------|-------|
 | Files | Release gate/runtime measurement source and tests, Rust release authority, FIX-693, changelog, implementation, and review evidence |
-| Source verdict | 🟢 accept |
+| Source verdict | 🟡 bounded correction pending independent review |
 | Exact-tip verification verdict | 🟡 resource-capable gates required |
 
 **Findings:**
@@ -103,10 +103,57 @@
   per-file hashes, and release flags are unchanged; the correction does not weaken attestation.
 - The expanded gate fixture now emits valid 64-character digests for indexes above 255.
 
+### 611.6 — Pinned managed-runner Node path correction
+
+| Field | Value |
+|-------|-------|
+| Files | Runner Dockerfile/runtime verifier, release gate, Rust authority, CI/release smoke, tests, FIX-694, changelog, implementation, and review evidence |
+| Source verdict | 🟢 independently reviewed; no residual P0/P1/P2 finding |
+| Exact image verdict | 🟡 resource-capable rerun required |
+
+**Findings:**
+
+- Actions run `33313140429`, job `99261666660`, passed every gate before the managed image and
+  failed exactly because the contract required `/usr/local/bin/node` while the pinned Playwright
+  Noble image installs NodeSource Node at `/usr/bin/node`.
+- The former 256-file ceiling failed first while traversing Chromium and masked this later missing
+  measurement root; FIX-693 correctly exposed rather than caused the independent defect.
+- The final correction preserves the established `/usr/local/bin/node` authority: the Docker build
+  copies the pinned base's regular `/usr/bin/node` there before measurement, rejects a symlink,
+  measures and runs the normalized file, then removes the source path.
+- Candidate measurement, embedded startup remeasurement, stored-image inspection, Rust authority,
+  image command, and CI/release native smoke remain on one path. Package-manager cleanup targets
+  both the Playwright base's `/usr/bin`/`/usr/lib` layout and `/usr/local` leftovers.
+- Pull-request jobs check out and embed the same `github.event.pull_request.head.sha`, with
+  `github.sha` retained as the non-PR fallback, so runtime identity is no longer relabeled from a
+  synthetic merge tree.
+- Filesystem generation, startup remeasurement, stored OCI inspection, and Rust authority reject
+  symbolic links throughout every measured runtime root rather than silently skipping or following
+  them.
+- Full automation and runner tests/typechecks, release-gate tests, and Rust formatting are green.
+  Independent source review, the Linux image/native smoke, and complete Rust gates remain required.
+
+### 611.7 — Rust 1.98 compatibility backport
+
+| Field | Value |
+|-------|-------|
+| Files | Eleven core, daemon, RAG, and server files plus FIX-695 |
+| Source verdict | 🟢 exact backport independently verified |
+| CI precedent | 🟢 unchanged `2f3910a1` patch green at descendant PR #33 head `83f15263` on macOS, Ubuntu, Windows, and observability |
+
+**Findings:**
+
+- The four non-Jobs failures share the rolling Rust 1.98 Clippy surface and are independent of the
+  Phase 611 managed-runner logic.
+- The complete proven eleven-file patch was backported without the unrelated Phase 623 UI changes;
+  fixing only the first `ipc_auth.rs` diagnostic would have left later failures.
+- Phase 611 still needs its own corrected exact-head run; green descendant evidence for the
+  unchanged patch is compatibility precedent, not a substitute for combined-branch verification.
+
 ## Cross-Task Findings
 
-- Independent review found no remaining P0 or P1 correctness, security, privacy, recovery,
-  determinism, or release-authority issue.
+- The final independent review found no residual P0/P1/P2 correctness, security, privacy,
+  recovery, determinism, source-tree, path, or release-authority issue across FIX-693/FIX-694/FIX-695.
 - `directDiscovery`, `globalDiscovery`, and `sourceVerification` remain false because their exact
   pre-effect managed runtime boundaries are intentionally outside this batch.
 - Local source evidence does not claim hosted registry publication, signing ceremony, Temporal
@@ -168,7 +215,7 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
     jobs_runner_plan_matrix 2; usage schema 1
 ```
 
-Post-correction local evidence at the branch tip on 2026-08-24:
+Post-FIX-693 local evidence at the branch tip on 2026-08-24:
 
 ```text
 managed-cloud release gate
@@ -184,17 +231,41 @@ git -P diff --check
   PASS
 ```
 
-Not rerun at the corrected tip: automation Vitest/typecheck, Cargo check/Clippy/tests, and the exact
-managed-runner Docker build/native smoke. The local disk had 5.0 GiB free, below the 8 GiB
-release-work floor, no PortableSSD was mounted, and Docker was unavailable. Exact-tip CI evidence
-must replace this conditional status; the baseline totals above cannot be inherited by the fix.
+The first resource-capable PR rerun for head `f50103e8` checked out GitHub merge result `f552ac2a`.
+It passed managed release authority, 1,748 Jobs tests with one intentional skip, every Jobs
+typecheck/build, portal parity, and native runner storage format/Clippy/tests/release build. It then
+failed at image construction before the native smoke with
+`Runtime measurement root is missing: /usr/local/bin/node`.
+
+Post-FIX-694/FIX-695 local evidence before commit on 2026-08-30:
+
+```text
+automation full test suite and typecheck
+  PASS: 660; 1 intentional skip; TypeScript clean
+
+runner full test suite and typecheck
+  PASS: 308; TypeScript clean
+
+managed-cloud release gate
+  PASS: 17
+
+server Rust formatting
+  PASS
+
+git diff --check
+  PASS
+```
+
+Not yet rerun after the final corrections: Cargo check/Clippy/tests and the exact Linux
+managed-runner Docker build/native smoke. Docker remains unavailable locally. A resource-capable
+exact-head CI rerun must replace this conditional status; no baseline result is inherited.
 
 ## Overall Verdict
 
-🟡 **SOURCE FIX REVIEWED; RESOURCE-CAPABLE VERIFICATION REQUIRED** — Independent source review
-found no P0/P1 issue in the correction, and the lightweight local gates are green. The corrected
-tip is not accepted until automation, Rust, and exact managed-runner Docker/CI gates pass. Hosted
-launch evidence remains external and is not claimed by this verdict.
+🟡 **SOURCE GREEN; RESOURCE-CAPABLE AND HOSTED VERIFICATION PENDING** — Final independent review
+found no residual P0/P1/P2 issue, and full local automation/runner plus focused FIX-694/FIX-695
+gates are green. Combined Rust and exact managed-runner Docker/CI gates remain required at the
+corrected head. Hosted launch evidence remains external and is not claimed by this verdict.
 
 ## Follow-ups for Next Batch
 

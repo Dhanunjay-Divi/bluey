@@ -207,6 +207,14 @@ under `docs/release/`.
 
 ### Fixed
 
+- Normalized the pinned Playwright Noble base's regular `/usr/bin/node` into the existing
+  `/usr/local/bin/node` managed-runtime authority before measurement, then removed the source path
+  and package-manager tools from both NodeSource and `/usr/local` layouts. CI and release image
+  identity now bind to the pull-request head SHA with a non-PR fallback instead of attesting a
+  synthetic merge SHA. The prior 256-file error masked this later fail-closed path mismatch; no
+  measurement root, release flag, or hosted authority was relaxed.
+- Backported the complete proven Rust 1.98 compatibility repair from `2f3910a1`, covering all
+  eleven affected core, daemon, RAG, and server files without importing unrelated Phase 623 work.
 - Raised the closed managed-cloud runtime-measurement file bound from 256 to 512 across candidate
   construction, embedded runtime verification, and server release-evidence validation. The pinned
   Playwright Chromium headless-shell tree alone exceeds the old bound, so managed-runner image

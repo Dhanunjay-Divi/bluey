@@ -60,11 +60,40 @@ const MANAGED_CLOUD_RUNTIME_MEASUREMENT_AUDIENCE: &str =
 const MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH: &str =
     "app/.bluey/managed-cloud-runtime-measurement.json";
 const MANAGED_CLOUD_MAX_RUNTIME_MEASUREMENT_FILES: usize = 512;
+const MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE: &str = "/usr/local/bin/node";
+const MANAGED_CLOUD_RUNNER_NODE_INVENTORY_PATH: &str = "usr/local/bin/node";
+const MANAGED_CLOUD_WORKFLOWS_NODE_EXECUTABLE: &str = "/usr/local/bin/node";
+const MANAGED_CLOUD_WORKFLOWS_NODE_INVENTORY_PATH: &str = "usr/local/bin/node";
 const MANAGED_CLOUD_COHORT_MEMBER_DOMAIN: &[u8] = b"bluey-jobs-managed-cloud-cohort-member-v1\0";
 const MANAGED_CLOUD_HEARTBEAT_AUDIT_LIMIT: i64 = 64;
 
 fn managed_cloud_runtime_measurement_file_count_valid(count: usize) -> bool {
     (1..=MANAGED_CLOUD_MAX_RUNTIME_MEASUREMENT_FILES).contains(&count)
+}
+
+fn managed_cloud_path_within_runtime_root(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn managed_cloud_runtime_measurement_inventory_path(component_id: &str, path: &str) -> bool {
+    match component_id {
+        "jobs-api" => path == "usr/local/bin/bluey-jobs-api",
+        "jobs-runner" => {
+            managed_cloud_path_within_runtime_root(path, "app/automation")
+                || managed_cloud_path_within_runtime_root(path, "app/runner")
+                || managed_cloud_path_within_runtime_root(path, "ms-playwright")
+                || path == MANAGED_CLOUD_RUNNER_NODE_INVENTORY_PATH
+        }
+        "jobs-workflows" => {
+            managed_cloud_path_within_runtime_root(path, "app/automation")
+                || managed_cloud_path_within_runtime_root(path, "app/workflows")
+                || path == MANAGED_CLOUD_WORKFLOWS_NODE_INVENTORY_PATH
+        }
+        _ => false,
+    }
 }
 
 const MANAGED_CLOUD_BASE_RUNTIME_ROLES: [&str; 6] = [
@@ -2399,12 +2428,12 @@ fn validate_managed_cloud_verification_evidence(
             Some(OCI_PATH),
             "pwuser",
             &[],
-            &["/usr/local/bin/node", "runner/dist/server.js"],
+            &[MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE, "runner/dist/server.js"],
             &[
                 "app/.bluey/managed-cloud-runtime-measurement.json",
                 "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
                 "app/runner/dist/server.js",
-                "usr/local/bin/node",
+                MANAGED_CLOUD_RUNNER_NODE_INVENTORY_PATH,
             ],
         ),
         (
@@ -2412,7 +2441,10 @@ fn validate_managed_cloud_verification_evidence(
             Some(OCI_PATH),
             "node",
             &[],
-            &["/usr/local/bin/node", "workflows/dist/worker.js"],
+            &[
+                MANAGED_CLOUD_WORKFLOWS_NODE_EXECUTABLE,
+                "workflows/dist/worker.js",
+            ],
             &[
                 "app/.bluey/managed-cloud-runtime-measurement.json",
                 "app/workflows/dist/discovery-worker.js",
@@ -2420,7 +2452,7 @@ fn validate_managed_cloud_verification_evidence(
                 "app/workflows/dist/gateway.js",
                 "app/workflows/dist/global-discovery-worker.js",
                 "app/workflows/dist/worker.js",
-                "usr/local/bin/node",
+                MANAGED_CLOUD_WORKFLOWS_NODE_INVENTORY_PATH,
             ],
         ),
     ];
@@ -2648,7 +2680,7 @@ fn validate_managed_cloud_content_inventories(
             Some((
                 "pwuser",
                 &[],
-                &["/usr/local/bin/node", "runner/dist/server.js"],
+                &[MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE, "runner/dist/server.js"],
                 &["8091/tcp"],
                 &[
                     "BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner",
@@ -2663,7 +2695,10 @@ fn validate_managed_cloud_content_inventories(
             Some((
                 "node",
                 &[],
-                &["/usr/local/bin/node", "workflows/dist/worker.js"],
+                &[
+                    MANAGED_CLOUD_WORKFLOWS_NODE_EXECUTABLE,
+                    "workflows/dist/worker.js",
+                ],
                 &[],
                 &[
                     "NODE_ENV=production",
@@ -2772,6 +2807,15 @@ fn validate_managed_cloud_content_inventories(
                 return Err(ManagedCloudRegistryError::InvalidAuthority);
             }
         } else {
+            if inventory.entries.iter().any(|entry| {
+                entry.entry_type == "symlink"
+                    && managed_cloud_runtime_measurement_inventory_path(
+                        expected_component,
+                        &entry.path,
+                    )
+            }) {
+                return Err(ManagedCloudRegistryError::InvalidAuthority);
+            }
             for entry in inventory
                 .entries
                 .iter()
@@ -2817,21 +2861,10 @@ fn validate_managed_cloud_content_inventories(
                     entry.entry_type == "file"
                         && entry.size_bytes.is_some_and(|size| size > 0)
                         && entry.sha256.as_deref().is_some_and(managed_cloud_hex64)
-                        && match expected_component {
-                            "jobs-api" => entry.path == "usr/local/bin/bluey-jobs-api",
-                            "jobs-runner" => {
-                                entry.path.starts_with("app/automation/")
-                                    || entry.path.starts_with("app/runner/")
-                                    || entry.path.starts_with("ms-playwright/")
-                                    || entry.path == "usr/local/bin/node"
-                            }
-                            "jobs-workflows" => {
-                                entry.path.starts_with("app/automation/")
-                                    || entry.path.starts_with("app/workflows/")
-                                    || entry.path == "usr/local/bin/node"
-                            }
-                            _ => false,
-                        }
+                        && managed_cloud_runtime_measurement_inventory_path(
+                            expected_component,
+                            &entry.path,
+                        )
                 })
                 .map(|entry| {
                     (
@@ -2857,22 +2890,9 @@ fn validate_managed_cloud_content_inventories(
         }
         let required_paths = &evidence_component.required_paths;
         if required_paths.iter().any(|required| {
-            let Some(mut entry) = entries_by_path.get(required.as_str()).copied() else {
+            let Some(entry) = entries_by_path.get(required.as_str()).copied() else {
                 return true;
             };
-            let mut visited = BTreeSet::new();
-            while entry.entry_type == "symlink" {
-                if !visited.insert(entry.path.as_str()) {
-                    return true;
-                }
-                let Some(target) = entry.resolved_target.as_deref() else {
-                    return true;
-                };
-                let Some(resolved) = entries_by_path.get(target).copied() else {
-                    return true;
-                };
-                entry = resolved;
-            }
             entry.entry_type != "file"
                 || entry.size_bytes.is_none_or(|size| size <= 0)
                 || entry
@@ -15724,6 +15744,39 @@ mod managed_cloud_release_authority_tests {
         assert!(managed_cloud_runtime_measurement_file_count_valid(512));
         assert!(!managed_cloud_runtime_measurement_file_count_valid(0));
         assert!(!managed_cloud_runtime_measurement_file_count_valid(513));
+    }
+
+    #[test]
+    fn managed_cloud_node_paths_match_each_pinned_base_image() {
+        assert_eq!(MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE, "/usr/local/bin/node");
+        assert_eq!(
+            MANAGED_CLOUD_RUNNER_NODE_INVENTORY_PATH,
+            "usr/local/bin/node"
+        );
+        assert_eq!(
+            MANAGED_CLOUD_WORKFLOWS_NODE_EXECUTABLE,
+            "/usr/local/bin/node"
+        );
+        assert_eq!(
+            MANAGED_CLOUD_WORKFLOWS_NODE_INVENTORY_PATH,
+            "usr/local/bin/node"
+        );
+        assert!(managed_cloud_runtime_measurement_inventory_path(
+            "jobs-runner",
+            "app/automation"
+        ));
+        assert!(managed_cloud_runtime_measurement_inventory_path(
+            "jobs-runner",
+            "app/automation/dist/index.js"
+        ));
+        assert!(managed_cloud_runtime_measurement_inventory_path(
+            "jobs-runner",
+            "usr/local/bin/node"
+        ));
+        assert!(!managed_cloud_runtime_measurement_inventory_path(
+            "jobs-runner",
+            "app/automation-hostile/dist/index.js"
+        ));
     }
 
     #[test]

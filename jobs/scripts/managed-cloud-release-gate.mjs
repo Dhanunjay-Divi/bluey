@@ -760,6 +760,13 @@ function measurementRoots(componentId) {
 }
 
 function expectedMeasurementPaths(componentId, inventory) {
+  if (inventory.entries.some(
+    (entry) =>
+      entry.type === "symlink" &&
+      measurementPathSelected(componentId, entry.path),
+  )) {
+    fail(componentId + " runtime measurement roots may not contain symbolic links");
+  }
   return inventory.entries
     .filter(
       (entry) =>
@@ -1279,7 +1286,7 @@ export async function createStaticTreeInventory(root, rootName) {
   };
 }
 
-async function createRuntimeMeasurementFromFilesystem({
+export async function createRuntimeMeasurementFromFilesystem({
   buildId,
   componentId,
   configSchemaSha256,
@@ -1299,7 +1306,7 @@ async function createRuntimeMeasurementFromFilesystem({
       fail("Runtime measurement root is missing: " + path);
     }
     if (metadata.isSymbolicLink()) {
-      return;
+      fail(componentId + " runtime measurement roots may not contain symbolic links");
     }
     if (metadata.isDirectory()) {
       const children = await readdir(path, { withFileTypes: true });
@@ -1739,6 +1746,13 @@ function requireClosedRuntimeContent(componentId, entries) {
   }
   const byPath = new Map(entries.map((entry) => [entry.path, entry]));
   const paths = new Set(byPath.keys());
+  if (entries.some(
+    (entry) =>
+      entry.type === "symlink" &&
+      measurementPathSelected(componentId, entry.path),
+  )) {
+    fail(componentId + " runtime measurement roots may not contain symbolic links");
+  }
   for (const path of contract.requiredPaths) {
     const entry = byPath.get(path);
     if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {

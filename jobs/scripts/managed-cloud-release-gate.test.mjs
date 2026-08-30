@@ -8,6 +8,7 @@ import {
   mkdtemp,
   readFile,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,6 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   canonicalJsonBytes,
+  createRuntimeMeasurementFromFilesystem,
   deriveManagedCloudRuntimeIdentitySha256,
   deriveManagedCloudTaskQueueSha256,
   inspectOciImageArchive,
@@ -1025,6 +1027,34 @@ test("runtime measurement accepts 512 exact files and rejects 513", () => {
   );
 });
 
+test("filesystem runtime measurement rejects a symbolic-link root", async (t) => {
+  const root = await temporaryDirectory(t, "runtime-measurement-symlink");
+  await mkdir(join(root, "opt"), { recursive: true });
+  await mkdir(join(root, "usr/local/bin"), { recursive: true });
+  await writeFile(join(root, "opt/bluey-jobs-api"), "api-runtime\n");
+  await symlink(
+    join(root, "opt/bluey-jobs-api"),
+    join(root, "usr/local/bin/bluey-jobs-api"),
+  );
+  await assert.rejects(
+    () => createRuntimeMeasurementFromFilesystem({
+      buildId: "managed-cloud-611-jobs-api",
+      componentId: "jobs-api",
+      configSchemaSha256: "c".repeat(64),
+      migrationSetSha256: "d".repeat(64),
+      protocolSetSha256: "e".repeat(64),
+      roles: [
+        "jobs_api",
+        "workflow_cleanup_dispatcher",
+        "workflow_command_dispatcher",
+      ],
+      root,
+      sourceCommit: SOURCE_COMMIT,
+    }),
+    /runtime measurement roots may not contain symbolic links/,
+  );
+});
+
 test("task queue and failure-converter bytes retain shared digest goldens", () => {
   assert.equal(
     deriveManagedCloudTaskQueueSha256(
@@ -1451,7 +1481,7 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
   });
   await assert.rejects(
     () => inspectOciImageArchive(symlinkBinary, "jobs-api"),
-    /missing regular file/,
+    /runtime measurement roots may not contain symbolic links/,
   );
 
   const extraBlob = join(root, "extra-blob.oci.tar");
@@ -1483,6 +1513,25 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
     ]],
     runtime: runnerRuntime(),
   });
+
+  const symlinkedMeasuredRunner = join(root, "symlinked-measured-runner.oci.tar");
+  await writeOciFixture(symlinkedMeasuredRunner, {
+    layers: [[
+      ...runnerPaths,
+      { body: "headless\n", mode: 0o555, name: headlessExecutable },
+      { body: "shared-runtime\n", name: "opt/shared-runtime.js" },
+      {
+        linkTarget: "/opt/shared-runtime.js",
+        name: "app/automation/dist/linked-runtime.js",
+        type: "2",
+      },
+    ]],
+    runtime: runnerRuntime(),
+  });
+  await assert.rejects(
+    () => inspectOciImageArchive(symlinkedMeasuredRunner, "jobs-runner"),
+    /runtime measurement roots may not contain symbolic links/,
+  );
   const runnerInventory = await inspectOciImageArchive(
     headlessRunner,
     "jobs-runner",
