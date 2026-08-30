@@ -4,12 +4,84 @@ enum ExecutionAuthorityRunner {
     Cloud,
 }
 
+struct CurrentExecutionAuthorityResolution {
+    authorized: bool,
+    employer_domain: Option<OperationalHoldEmployerDomain>,
+}
+
+impl CurrentExecutionAuthorityResolution {
+    fn denied() -> Self {
+        Self {
+            authorized: false,
+            employer_domain: None,
+        }
+    }
+}
+
+fn current_execution_employer_domain(
+    application: &JobApplication,
+    composed: &ComposedJobIntegrityProjection,
+) -> Result<Option<OperationalHoldEmployerDomain>> {
+    if !original_source_projection_matches_application(application, &composed.original_source)?
+        || !job_integrity_resolution_matches_application(application, &composed.job_integrity)?
+    {
+        return Ok(None);
+    }
+    composed
+        .job_integrity
+        .authority
+        .as_ref()
+        .map(OperationalHoldEmployerDomain::from_current_job_integrity_authority)
+        .transpose()
+        .map_err(anyhow::Error::new)
+}
+
 fn current_execution_authorized_sqlite(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
     application: &JobApplication,
     runner: ExecutionAuthorityRunner,
 ) -> Result<bool> {
+    Ok(resolve_current_execution_authority_sqlite_after_prelock(
+        tx,
+        account_id,
+        application,
+        runner,
+    )?
+    .authorized)
+}
+
+/// Resolve the complete current execution authority inside the caller's SQLite write
+/// transaction. The returned employer domain is derived only from the current signed
+/// job-integrity authority that exactly matches the frozen application receipt.
+fn resolve_current_execution_authority_sqlite_after_prelock(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    runner: ExecutionAuthorityRunner,
+) -> Result<CurrentExecutionAuthorityResolution> {
+    let db_time_ms = original_source_db_now_sqlite(tx)
+        .context("sample database time for current execution authority")?;
+    resolve_current_execution_authority_sqlite_after_prelock_at_ms(
+        tx,
+        account_id,
+        application,
+        runner,
+        db_time_ms,
+    )
+}
+
+fn resolve_current_execution_authority_sqlite_after_prelock_at_ms(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    runner: ExecutionAuthorityRunner,
+    db_time_ms: i64,
+) -> Result<CurrentExecutionAuthorityResolution> {
+    anyhow::ensure!(
+        db_time_ms >= 0,
+        "current execution database time is invalid"
+    );
     let Some(profile) = tx
         .query_row(
             "SELECT profile_json FROM jobs_profiles WHERE account_id = ?1",
@@ -20,27 +92,39 @@ fn current_execution_authorized_sqlite(
         .map(|raw| parse_json::<CareerProfile>(raw, "Jobs execution profile"))
         .transpose()?
     else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
-    let Some(stored_posting) = tx
+    let Some((posting_id, mut stored_posting)) = tx
         .query_row(
-            "SELECT posting_json FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
+            "SELECT id, posting_json FROM jobs_postings WHERE account_id = ?1 AND id = ?2",
             params![account_id, application.job_id],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?
-        .map(|raw| parse_json::<JobPosting>(raw, "Jobs execution posting"))
+        .map(|(id, raw)| {
+            parse_json::<JobPosting>(raw, "Jobs execution posting").map(|posting| (id, posting))
+        })
         .transpose()?
     else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
-    let original_source_projection =
-        resolve_original_source_verification_projection_sqlite_tx(tx, account_id, &stored_posting)?;
-    if !original_source_projection_matches_application(application, &original_source_projection)? {
-        return Ok(false);
-    }
-    let posting =
-        posting_with_original_source_projection(&stored_posting, &original_source_projection);
+    stored_posting.id = posting_id;
+    let composed = resolve_composed_job_integrity_projection_sqlite_tx_at_ms(
+        tx,
+        account_id,
+        &stored_posting,
+        db_time_ms,
+    )?;
+    let Some(employer_domain) = current_execution_employer_domain(application, &composed)? else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let Some(source_binding) = composed.original_source.integrity_binding.as_ref() else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let mut posting =
+        posting_with_original_source_projection(&stored_posting, &composed.original_source);
+    posting.canonical_url = source_binding.canonical_application_url.clone();
+    posting.discovery_evidence = composed.discovery_evidence.clone();
     let Some((authoritative_track_id, authoritative_active, mut track)) = tx
         .query_row(
             "SELECT id, active, track_json FROM jobs_tracks
@@ -61,16 +145,16 @@ fn current_execution_authorized_sqlite(
         })
         .transpose()?
     else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
     track.id = authoritative_track_id;
     if track.active != authoritative_active
         || validate_track_policy_ledger_sqlite(tx, account_id, &track).is_err()
     {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     }
     let Some(identity_id) = frozen_receipt_string(application, "/application_identity/id") else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
     let Some((identity_raw, identity_status, is_default)) = tx
         .query_row(
@@ -88,7 +172,7 @@ fn current_execution_authorized_sqlite(
         )
         .optional()?
     else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
     let identity = parse_application_identity_row(identity_raw, identity_status, is_default)?;
     let mut fact_stmt = tx.prepare(
@@ -176,18 +260,6 @@ fn current_execution_authorized_sqlite(
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let ats_certification = match resolve_ats_certification_for_posting_sqlite_tx(
-        tx,
-        account_id,
-        &posting,
-        None,
-        now_ms(),
-    ) {
-        Ok(resolution) => Some(resolution),
-        Err(AtsCertificationAuthorityError::Storage(error)) => return Err(error),
-        Err(_) => None,
-    };
-
     let authorized = current_execution_authority_matches(
         account_id,
         application,
@@ -200,29 +272,78 @@ fn current_execution_authorized_sqlite(
         &preferences,
         &reservations,
         &authorities,
-        ats_certification.as_ref(),
+        composed.ats_certification.as_ref(),
         runner,
     )? && stored_execution_evidence_matches_sqlite(tx, account_id, application)?;
-    Ok(authorized)
+    Ok(CurrentExecutionAuthorityResolution {
+        authorized,
+        employer_domain: Some(employer_domain),
+    })
 }
 
-fn current_execution_authorized_postgres(
+/// Recover the immutable signed employer-domain projection for an already-submitted operation.
+/// The top-level final receipt replaces the mutable pre-submit receipt, so authenticate the
+/// canonical final-receipt envelope before reading its exact nested pre-submission receipt.
+fn submitted_execution_employer_domain(
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<OperationalHoldEmployerDomain> {
+    let pre_submission_application =
+        validated_submitted_pre_submission_application(account_id, application)?;
+    let receipt = application_job_integrity_receipt(&pre_submission_application)?
+        .ok_or_else(|| anyhow::anyhow!("frozen job-integrity receipt is missing"))?;
+    OperationalHoldEmployerDomain::from_validated_frozen_job_integrity_receipt(&receipt)
+        .map_err(anyhow::Error::new)
+}
+
+/// Resolve the complete current execution authority after the caller has acquired the global
+/// `H -> M -> ATS -> D` prelock. This helper must not reacquire any of those authority locks.
+fn current_execution_authorized_postgres_after_prelock(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
     application: &JobApplication,
     runner: ExecutionAuthorityRunner,
 ) -> Result<bool> {
-    lock_managed_cloud_release_registry_shared_postgres_tx(tx)?;
-    lock_discovery_account_shared_postgres(tx, account_id)?;
-    lock_account_policy_inputs_postgres(tx, account_id, false)?;
-    let Some(profile_row) = tx.query_opt(
-        "SELECT profile_json FROM jobs_profiles WHERE account_id = $1",
-        &[&account_id],
+    Ok(resolve_current_execution_authority_postgres_after_prelock(
+        tx,
+        account_id,
+        application,
+        runner,
     )?
-    else {
-        return Ok(false);
-    };
-    let profile: CareerProfile = parse_json(profile_row.get(0), "Jobs execution profile")?;
+    .authorized)
+}
+
+fn resolve_current_execution_authority_postgres_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    runner: ExecutionAuthorityRunner,
+) -> Result<CurrentExecutionAuthorityResolution> {
+    if !lock_current_execution_authority_postgres_after_prelock(tx, account_id, application)? {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    }
+    let db_time_ms = original_source_db_now_postgres(tx)
+        .context("sample database time for current execution authority")?;
+    resolve_current_execution_authority_postgres_after_prelock_at_ms(
+        tx,
+        account_id,
+        application,
+        runner,
+        db_time_ms,
+    )
+}
+
+/// Acquire the remainder of current-execution authority after the caller-owned
+/// `H -> M -> ATS -> D` prelock. The returned locks remain held by the transaction so an effect
+/// path can take its application/entitlement/reservation, ticket, lease, capacity, and managed
+/// rows, sample one final database time, and call the no-lock `_at_ms` resolver below.
+fn lock_current_execution_authority_postgres_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<bool> {
+    lock_job_integrity_publication_fence_shared_postgres_tx(tx).map_err(anyhow::Error::new)?;
+    lock_account_policy_inputs_postgres(tx, account_id, false)?;
     let Some(posting_row) = tx.query_opt(
         "SELECT posting_json FROM jobs_postings WHERE account_id = $1 AND id = $2",
         &[&account_id, &application.job_id],
@@ -230,28 +351,19 @@ fn current_execution_authorized_postgres(
     else {
         return Ok(false);
     };
-    let stored_posting: JobPosting = parse_json(posting_row.get(0), "Jobs execution posting")?;
-    let original_source_projection = resolve_original_source_verification_projection_postgres_tx(
-        tx,
-        account_id,
-        &stored_posting,
-    )?;
-    if !original_source_projection_matches_application(application, &original_source_projection)? {
-        return Ok(false);
-    }
-    let posting =
-        posting_with_original_source_projection(&stored_posting, &original_source_projection);
+    let stored_posting: JobPosting =
+        parse_json(posting_row.get(0), "Jobs execution prelock posting")?;
     let Some(track_row) = tx.query_opt(
         "SELECT id, active, track_json FROM jobs_tracks
-          WHERE account_id = $1 AND id = $2 FOR SHARE",
-        &[&account_id, &posting.track_id],
+          WHERE account_id = $1 AND id = $2",
+        &[&account_id, &stored_posting.track_id],
     )?
     else {
         return Ok(false);
     };
     let authoritative_track_id: String = track_row.get(0);
     let authoritative_active = track_row.get::<_, i32>(1) != 0;
-    let mut track: CareerTrack = parse_json(track_row.get(2), "Jobs execution Career Track")?;
+    let mut track: CareerTrack = parse_json(track_row.get(2), "Jobs execution prelock track")?;
     track.id = authoritative_track_id;
     if track.active != authoritative_active
         || validate_track_policy_ledger_postgres(tx, account_id, &track).is_err()
@@ -261,8 +373,76 @@ fn current_execution_authorized_postgres(
     if application.submission_mode == "auto_submit" {
         lock_auto_submit_authority_postgres(tx, account_id, &track.id, false)?;
     }
+    Ok(true)
+}
+
+/// Re-evaluate at one caller-sampled database time without reacquiring any common or advisory
+/// authority lock. Exact policy/source/ATS/integrity subject rows are re-read only beneath the
+/// complete lock set documented by `lock_current_execution_authority_postgres_after_prelock`.
+fn resolve_current_execution_authority_postgres_after_prelock_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    runner: ExecutionAuthorityRunner,
+    db_time_ms: i64,
+) -> Result<CurrentExecutionAuthorityResolution> {
+    anyhow::ensure!(
+        db_time_ms >= 0,
+        "current execution database time is invalid"
+    );
+    let Some(profile_row) = tx.query_opt(
+        "SELECT profile_json FROM jobs_profiles WHERE account_id = $1",
+        &[&account_id],
+    )?
+    else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let profile: CareerProfile = parse_json(profile_row.get(0), "Jobs execution profile")?;
+    let Some(posting_row) = tx.query_opt(
+        "SELECT id, posting_json FROM jobs_postings WHERE account_id = $1 AND id = $2",
+        &[&account_id, &application.job_id],
+    )?
+    else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let posting_id: String = posting_row.get(0);
+    let mut stored_posting: JobPosting = parse_json(posting_row.get(1), "Jobs execution posting")?;
+    stored_posting.id = posting_id;
+    let Some(track_row) = tx.query_opt(
+        "SELECT id, active, track_json FROM jobs_tracks
+          WHERE account_id = $1 AND id = $2",
+        &[&account_id, &stored_posting.track_id],
+    )?
+    else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let authoritative_track_id: String = track_row.get(0);
+    let authoritative_active = track_row.get::<_, i32>(1) != 0;
+    let mut track: CareerTrack = parse_json(track_row.get(2), "Jobs execution Career Track")?;
+    track.id = authoritative_track_id;
+    if track.active != authoritative_active
+        || validate_track_policy_ledger_postgres(tx, account_id, &track).is_err()
+    {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    }
+    let composed = resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms(
+        tx,
+        account_id,
+        &stored_posting,
+        db_time_ms,
+    )?;
+    let Some(employer_domain) = current_execution_employer_domain(application, &composed)? else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let Some(source_binding) = composed.original_source.integrity_binding.as_ref() else {
+        return Ok(CurrentExecutionAuthorityResolution::denied());
+    };
+    let mut posting =
+        posting_with_original_source_projection(&stored_posting, &composed.original_source);
+    posting.canonical_url = source_binding.canonical_application_url.clone();
+    posting.discovery_evidence = composed.discovery_evidence.clone();
     let Some(identity_id) = frozen_receipt_string(application, "/application_identity/id") else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
     let Some(identity_row) = tx.query_opt(
         "SELECT identity_json, verification_status, is_default
@@ -271,7 +451,7 @@ fn current_execution_authorized_postgres(
         &[&account_id, &identity_id],
     )?
     else {
-        return Ok(false);
+        return Ok(CurrentExecutionAuthorityResolution::denied());
     };
     let identity = parse_application_identity_row(
         identity_row.get(0),
@@ -294,10 +474,9 @@ fn current_execution_authorized_postgres(
             "SELECT id, career_track_id, application_identity_id,
                     source_resume_asset_id, authority_fingerprint, revision_no,
                     authorized_at_ms, revoked_at_ms
-               FROM jobs_auto_submit_authorizations
+              FROM jobs_auto_submit_authorizations
               WHERE account_id = $1 AND career_track_id = $2
-                AND revoked_at_ms IS NULL
-              FOR SHARE",
+                AND revoked_at_ms IS NULL",
             &[&account_id, &track.id],
         )?
         .map(|row| StoredAutoSubmitAuthorization {
@@ -361,18 +540,6 @@ fn current_execution_authorized_postgres(
             last_seen_run_id: row.get(6),
         })
         .collect::<Vec<_>>();
-    let ats_certification = match resolve_ats_certification_for_posting_postgres_tx(
-        tx,
-        account_id,
-        &posting,
-        None,
-        now_ms(),
-    ) {
-        Ok(resolution) => Some(resolution),
-        Err(AtsCertificationAuthorityError::Storage(error)) => return Err(error),
-        Err(_) => None,
-    };
-
     let authorized = current_execution_authority_matches(
         account_id,
         application,
@@ -385,10 +552,13 @@ fn current_execution_authorized_postgres(
         &preferences,
         &reservations,
         &authorities,
-        ats_certification.as_ref(),
+        composed.ats_certification.as_ref(),
         runner,
     )? && stored_execution_evidence_matches_postgres(tx, account_id, application)?;
-    Ok(authorized)
+    Ok(CurrentExecutionAuthorityResolution {
+        authorized,
+        employer_domain: Some(employer_domain),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -419,6 +589,10 @@ fn current_execution_authority_matches(
     let frozen_track_policy_authority = application
         .receipt
         .pointer("/career_track_policy_authority");
+    let frozen_application_destination = application
+        .receipt
+        .pointer("/approved_execution/job/canonicalUrl")
+        .and_then(Value::as_str);
     if frozen_track.as_deref() != Some(track.id.as_str())
         || posting.track_id != track.id
         || !track.active
@@ -428,6 +602,7 @@ fn current_execution_authority_matches(
         || identity.verification_status != "verified"
         || application.resume_version_id.is_none()
         || frozen_track_policy_authority != Some(&current_track_policy_authority)
+        || frozen_application_destination != Some(posting.canonical_url.as_str())
     {
         return Ok(false);
     }
@@ -458,6 +633,9 @@ fn current_execution_authority_matches(
         let Some(authorization) = auto_submit_authorization else {
             return Ok(false);
         };
+        if !current_ats_certification_matches_frozen_admission(application, ats_certification) {
+            return Ok(false);
+        }
         if !auto_submit_authorization_matches_inputs(
             authorization,
             profile,
@@ -489,6 +667,34 @@ fn current_execution_authority_matches(
         build_profile_evidence_revision(account_id, profile, facts, track, identity, &experience)?;
     Ok(frozen_evidence_id.as_deref() == Some(evidence.id.as_str())
         && frozen_evidence_hash.as_deref() == Some(evidence.content_hash.as_str()))
+}
+
+fn current_ats_certification_matches_frozen_admission(
+    application: &JobApplication,
+    current: Option<&AtsCertificationPostingResolution>,
+) -> bool {
+    if !application_has_frozen_ats_certification(application) {
+        return false;
+    }
+    let Some(frozen_value) = application
+        .receipt
+        .pointer("/approved_execution/admission/ats_certification")
+    else {
+        return false;
+    };
+    let Ok(frozen) = serde_json::from_value::<AtsFrozenCertificationAdmissionProjection>(
+        frozen_value.clone(),
+    ) else {
+        return false;
+    };
+    let Some(binding) = current
+        .filter(|resolution| resolution.status.status == "active")
+        .and_then(|resolution| resolution.active_binding.as_ref())
+    else {
+        return false;
+    };
+    ats_frozen_certification_admission_projection(binding)
+        .is_ok_and(|projection| projection == frozen)
 }
 
 fn stored_execution_evidence_matches_sqlite(

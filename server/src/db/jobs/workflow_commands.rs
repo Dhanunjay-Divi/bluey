@@ -1125,11 +1125,90 @@ fn load_stage_application_postgres_tx(
     ))
 }
 
+fn require_current_workflow_application_authority_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    posting: &JobPosting,
+) -> Result<OperationalHoldEmployerDomain> {
+    let employer_domain = ensure_original_source_application_authority_sqlite_tx(
+        tx,
+        account_id,
+        application,
+        posting,
+    )?;
+    if !current_execution_authorized_sqlite(
+        tx,
+        account_id,
+        application,
+        ExecutionAuthorityRunner::Cloud,
+    )? {
+        anyhow::bail!("current Jobs execution authority does not permit cloud workflow delivery")
+    }
+    let hold_context = operational_hold_context_for_application_sqlite_tx_after_authority(
+        tx,
+        account_id,
+        &application.id,
+        &employer_domain,
+        Some("cloud"),
+        None,
+        None,
+    )
+    .map_err(anyhow::Error::new)?;
+    require_operational_capability_sqlite_tx(
+        tx,
+        OperationalCapability::ApplicationQueue,
+        &hold_context,
+    )
+    .map_err(anyhow::Error::new)?;
+    Ok(employer_domain)
+}
+
+/// Resolve the complete current workflow authority after the caller has acquired `H -> M -> ATS
+/// -> D`. This helper must not reacquire any of those authority locks.
+fn require_current_workflow_application_authority_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<OperationalHoldEmployerDomain> {
+    let current = resolve_current_execution_authority_postgres_after_prelock(
+        tx,
+        account_id,
+        application,
+        ExecutionAuthorityRunner::Cloud,
+    )?;
+    if !current.authorized {
+        anyhow::bail!("current Jobs execution authority does not permit cloud workflow delivery")
+    }
+    let employer_domain = current
+        .employer_domain
+        .ok_or_else(|| anyhow::anyhow!("current Jobs employer authority is unavailable"))?;
+    let hold_context =
+        operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+            tx,
+            account_id,
+            &application.id,
+            &employer_domain,
+            Some("cloud"),
+            None,
+            None,
+        )
+        .map_err(anyhow::Error::new)?;
+    require_operational_capability_postgres_tx_after_authority_prelock(
+        tx,
+        OperationalCapability::ApplicationQueue,
+        &hold_context,
+    )
+    .map_err(anyhow::Error::new)?;
+    Ok(employer_domain)
+}
+
 fn stage_attempt_reservation_sqlite_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &StageCloudWorkflowStart,
     application: &JobApplication,
     posting: &JobPosting,
+    now_ms: i64,
 ) -> Result<()> {
     if let Some((runner, status)) = tx
         .query_row(
@@ -1145,7 +1224,7 @@ fn stage_attempt_reservation_sqlite_tx(
                 "UPDATE jobs_attempt_reservations SET runner = 'cloud', updated_at_ms = ?3
                   WHERE account_id = ?1 AND application_id = ?2
                     AND runner = 'unassigned' AND status = 'reserved'",
-                params![input.account_id, input.application_id, input.now_ms],
+                params![input.account_id, input.application_id, now_ms],
             )?;
             if changed != 1 {
                 anyhow::bail!("application attempt changed before cloud binding")
@@ -1162,7 +1241,7 @@ fn stage_attempt_reservation_sqlite_tx(
         |row| row.get(0),
     )?;
     let preferences: JobPreferences = parse_json(preferences_json, "Jobs preferences")?;
-    let period_key = attempt_period_key(input.now_ms, preferences.time_zone_offset_minutes);
+    let period_key = attempt_period_key(now_ms, preferences.time_zone_offset_minutes);
     let daily_limit = preferences.daily_limit.clamp(1, 50);
     let used: i64 = tx.query_row(
         "SELECT COUNT(*) FROM jobs_attempt_reservations
@@ -1200,7 +1279,7 @@ fn stage_attempt_reservation_sqlite_tx(
             input.application_id,
             company_key,
             period_key,
-            input.now_ms,
+            now_ms,
         ],
     )?;
     Ok(())
@@ -1211,6 +1290,7 @@ fn stage_attempt_reservation_postgres_tx(
     input: &StageCloudWorkflowStart,
     application: &JobApplication,
     posting: &JobPosting,
+    now_ms: i64,
 ) -> Result<()> {
     if let Some(row) = tx.query_opt(
         "SELECT runner, status FROM jobs_attempt_reservations
@@ -1224,7 +1304,7 @@ fn stage_attempt_reservation_postgres_tx(
                 "UPDATE jobs_attempt_reservations SET runner = 'cloud', updated_at_ms = $3
                   WHERE account_id = $1 AND application_id = $2
                     AND runner = 'unassigned' AND status = 'reserved'",
-                &[&input.account_id, &input.application_id, &input.now_ms],
+                &[&input.account_id, &input.application_id, &now_ms],
             )?;
             if changed != 1 {
                 anyhow::bail!("application attempt changed before cloud binding")
@@ -1242,7 +1322,7 @@ fn stage_attempt_reservation_postgres_tx(
         )?
         .get(0);
     let preferences: JobPreferences = parse_json(preferences_json, "Jobs preferences")?;
-    let period_key = attempt_period_key(input.now_ms, preferences.time_zone_offset_minutes);
+    let period_key = attempt_period_key(now_ms, preferences.time_zone_offset_minutes);
     let daily_limit = preferences.daily_limit.clamp(1, 50);
     let used: i64 = tx
         .query_one(
@@ -1283,16 +1363,112 @@ fn stage_attempt_reservation_postgres_tx(
             &input.application_id,
             &company_key,
             &period_key,
-            &input.now_ms,
+            &now_ms,
         ],
     )?;
     Ok(())
+}
+
+fn prelock_stage_cloud_start_effect_rows_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    input: &StageCloudWorkflowStart,
+    application: &JobApplication,
+) -> Result<()> {
+    tx.query_opt(
+        "SELECT application_id FROM jobs_attempt_reservations
+          WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+        &[&input.account_id, &input.application_id],
+    )?;
+    tx.query_opt(
+        "SELECT status FROM jobs_generation_allowance_reservations
+          WHERE account_id = $1 AND job_id = $2 FOR UPDATE",
+        &[&input.account_id, &application.job_id],
+    )?;
+    tx.query_opt(
+        "SELECT id FROM jobs_browser_sessions WHERE id = $1 FOR UPDATE",
+        &[&input.browser_session.id],
+    )?;
+    tx.query(
+        "SELECT id FROM credit_batches
+          WHERE account_id = $1 AND remaining_cents > 0 AND expired_at IS NULL
+          ORDER BY purchased_at, id FOR UPDATE",
+        &[&input.account_id],
+    )?;
+    Ok(())
+}
+
+fn prelock_stage_allowance_namespace_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    job_id: &str,
+) -> Result<()> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &[&format!("jobs-allowance:{account_id}:{job_id}")],
+    )?;
+    Ok(())
+}
+
+fn consume_stage_credit_batches_postgres_tx_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    cost_cents: i64,
+    db_time_ms: i64,
+) -> Result<()> {
+    if cost_cents < 0 || db_time_ms < 0 {
+        anyhow::bail!("invalid Jobs packet credit consumption")
+    }
+    let mut remaining = cost_cents;
+    for row in tx.query(
+        "SELECT id, remaining_cents FROM credit_batches
+          WHERE account_id = $1 AND remaining_cents > 0 AND expired_at IS NULL
+            AND floor(extract(epoch FROM expires_at) * 1000)::bigint > $2
+          ORDER BY purchased_at, id FOR UPDATE",
+        &[&account_id, &db_time_ms],
+    )? {
+        if remaining == 0 {
+            break;
+        }
+        let batch_id: String = row.get(0);
+        let batch_remaining: i64 = row.get(1);
+        let take = remaining.min(batch_remaining);
+        if tx.execute(
+            "UPDATE credit_batches SET remaining_cents = remaining_cents - $1
+              WHERE id = $2 AND remaining_cents = $3",
+            &[&take, &batch_id, &batch_remaining],
+        )? != 1
+        {
+            anyhow::bail!("Jobs packet credit batch changed")
+        }
+        remaining -= take;
+    }
+    if remaining != 0 {
+        anyhow::bail!("insufficient unexpired Bluey credit batches for Jobs overage")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn postgres_stage_credit_consumption_aborts_when_unexpired_batches_are_insufficient() {
+    let source = include_str!("workflow_commands.rs");
+    let helper = source
+        .split("fn consume_stage_credit_batches_postgres_tx_at_ms(")
+        .nth(1)
+        .expect("post-lock credit-batch consumer")
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("bounded post-lock credit-batch consumer");
+    assert!(helper.contains("expires_at"));
+    assert!(helper.contains("if remaining != 0"));
+    assert!(helper.contains("insufficient unexpired Bluey credit batches"));
 }
 
 fn stage_packet_metering_sqlite_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &StageCloudWorkflowStart,
     application: &JobApplication,
+    now_ms: i64,
 ) -> Result<()> {
     if application.resume_version_id.is_none() {
         anyhow::bail!("application packet has no job-specific resume")
@@ -1380,13 +1556,13 @@ fn stage_packet_metering_sqlite_tx(
             metering_key,
             i64::from(included),
             amount_cents,
-            input.now_ms,
+            now_ms,
         ],
     )?;
     tx.execute(
         "UPDATE jobs_entitlements SET used_packets = used_packets + 1,
             updated_at_ms = ?2 WHERE account_id = ?1 AND ?3 = 0",
-        params![input.account_id, input.now_ms, i64::from(pre_reserved)],
+        params![input.account_id, now_ms, i64::from(pre_reserved)],
     )?;
     if allowance
         .as_ref()
@@ -1396,12 +1572,7 @@ fn stage_packet_metering_sqlite_tx(
             "UPDATE jobs_generation_allowance_reservations
                 SET status = 'committed', application_id = ?3, updated_at_ms = ?4
               WHERE account_id = ?1 AND job_id = ?2 AND status = 'reserved'",
-            params![
-                input.account_id,
-                application.job_id,
-                application.id,
-                input.now_ms,
-            ],
+            params![input.account_id, application.job_id, application.id, now_ms,],
         )?;
     }
     Ok(())
@@ -1411,6 +1582,7 @@ fn stage_packet_metering_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
     input: &StageCloudWorkflowStart,
     application: &JobApplication,
+    now_ms: i64,
 ) -> Result<()> {
     if application.resume_version_id.is_none() {
         anyhow::bail!("application packet has no job-specific resume")
@@ -1473,7 +1645,12 @@ fn stage_packet_metering_postgres_tx(
         {
             anyhow::bail!("insufficient Bluey balance for Jobs overage")
         }
-        crate::db::balance::consume_credit_batches_pg_tx(tx, &input.account_id, amount_cents)?;
+        consume_stage_credit_batches_postgres_tx_at_ms(
+            tx,
+            &input.account_id,
+            amount_cents,
+            now_ms,
+        )?;
         crate::db::balance::insert_balance_ledger_pg_tx(
             tx,
             crate::db::balance::BalanceLedgerEntry {
@@ -1504,13 +1681,13 @@ fn stage_packet_metering_postgres_tx(
             &metering_key,
             &included_db,
             &amount_cents,
-            &input.now_ms,
+            &now_ms,
         ],
     )?;
     tx.execute(
         "UPDATE jobs_entitlements SET used_packets = used_packets + 1,
             updated_at_ms = $2 WHERE account_id = $1 AND $3 = 0",
-        &[&input.account_id, &input.now_ms, &i32::from(pre_reserved)],
+        &[&input.account_id, &now_ms, &i32::from(pre_reserved)],
     )?;
     if allowance
         .as_ref()
@@ -1524,7 +1701,7 @@ fn stage_packet_metering_postgres_tx(
                 &input.account_id,
                 &application.job_id,
                 &application.id,
-                &input.now_ms,
+                &now_ms,
             ],
         )?;
     }
@@ -1535,6 +1712,7 @@ fn stage_start_rows_sqlite_tx(
     tx: &rusqlite::Transaction<'_>,
     input: &StageCloudWorkflowStart,
     application: &mut JobApplication,
+    now_ms: i64,
 ) -> Result<()> {
     let mut session = input.browser_session.clone();
     if session.id != format!("cloud-{}", input.application_id)
@@ -1579,15 +1757,13 @@ fn stage_start_rows_sqlite_tx(
     }
     application.state = "queued".to_string();
     application.run_id = Some(input.run_id.clone());
-    application.updated_at_ms = input
-        .now_ms
-        .max(application.updated_at_ms.saturating_add(1));
+    application.updated_at_ms = now_ms.max(application.updated_at_ms.saturating_add(1));
     session.created_at_ms = if session.created_at_ms == 0 {
-        input.now_ms
+        now_ms
     } else {
         session.created_at_ms
     };
-    session.updated_at_ms = input.now_ms;
+    session.updated_at_ms = now_ms;
     let application_json = to_json(application, "staged Jobs application")?;
     let session_json = to_json(&session, "staged Jobs browser session")?;
     let changed = tx.execute(
@@ -1632,6 +1808,7 @@ fn stage_start_rows_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
     input: &StageCloudWorkflowStart,
     application: &mut JobApplication,
+    now_ms: i64,
 ) -> Result<()> {
     let mut session = input.browser_session.clone();
     if session.id != format!("cloud-{}", input.application_id)
@@ -1669,15 +1846,13 @@ fn stage_start_rows_postgres_tx(
     }
     application.state = "queued".to_string();
     application.run_id = Some(input.run_id.clone());
-    application.updated_at_ms = input
-        .now_ms
-        .max(application.updated_at_ms.saturating_add(1));
+    application.updated_at_ms = now_ms.max(application.updated_at_ms.saturating_add(1));
     session.created_at_ms = if session.created_at_ms == 0 {
-        input.now_ms
+        now_ms
     } else {
         session.created_at_ms
     };
-    session.updated_at_ms = input.now_ms;
+    session.updated_at_ms = now_ms;
     let application_json = to_json(application, "staged Jobs application")?;
     let session_json = to_json(&session, "staged Jobs browser session")?;
     let changed = tx.execute(
@@ -1939,15 +2114,14 @@ pub fn stage_cloud_workflow_start(
                 &input.account_id,
                 &input.application_id,
             )?;
-            if !current_execution_authorized_sqlite(
+            let employer_domain = require_current_workflow_application_authority_sqlite_tx(
                 &transaction,
                 &input.account_id,
                 &application,
-                ExecutionAuthorityRunner::Cloud,
-            )? {
-                anyhow::bail!("current Jobs execution authority does not permit cloud queueing")
-            }
+                &posting,
+            )?;
             validate_stage_workflow_input(input, &application, &posting)?;
+            let effect_now_ms = original_source_db_now_sqlite(&transaction)?;
             let mut request_seed = NewJobsWorkflowCommand {
                 account_id: input.account_id.clone(),
                 application_id: input.application_id.clone(),
@@ -1962,7 +2136,7 @@ pub fn stage_cloud_workflow_start(
                     browser_session_id: input.browser_session.id.clone(),
                     result_request_id: String::new(),
                 }),
-                now_ms: input.now_ms,
+                now_ms: effect_now_ms,
             };
             request_seed.request = stage_workflow_command_request(&request_seed);
             let result_request_id = workflow_command_request_id_for_idempotency(&request_seed)?;
@@ -2003,25 +2177,21 @@ pub fn stage_cloud_workflow_start(
                 transaction.commit()?;
                 return Ok(replay);
             }
-            let hold_context = operational_hold_context_for_application_sqlite_tx(
+            stage_attempt_reservation_sqlite_tx(
                 &transaction,
-                &input.account_id,
-                &input.application_id,
-                Some("cloud"),
-                None,
-                None,
-            )
-            .map_err(anyhow::Error::new)?;
-            require_operational_capability_sqlite_tx(
+                input,
+                &application,
+                &posting,
+                effect_now_ms,
+            )?;
+            stage_packet_metering_sqlite_tx(&transaction, input, &application, effect_now_ms)?;
+            stage_start_rows_sqlite_tx(&transaction, input, &mut application, effect_now_ms)?;
+            let admission = admit_jobs_workflow_command_sqlite_tx_after_authority(
                 &transaction,
-                OperationalCapability::ApplicationQueue,
-                &hold_context,
-            )
-            .map_err(anyhow::Error::new)?;
-            stage_attempt_reservation_sqlite_tx(&transaction, input, &application, &posting)?;
-            stage_packet_metering_sqlite_tx(&transaction, input, &application)?;
-            stage_start_rows_sqlite_tx(&transaction, input, &mut application)?;
-            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true)?;
+                &command,
+                true,
+                &employer_domain,
+            )?;
             bind_managed_cloud_workflow_sqlite_tx(
                 &transaction,
                 &managed_cloud_binding_input(&admission, managed_cloud_scope),
@@ -2032,8 +2202,6 @@ pub fn stage_cloud_workflow_start(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
-            lock_operational_hold_shared_postgres_tx(&mut transaction)
-                .map_err(anyhow::Error::new)?;
             if let Some(existing) = transaction.query_opt(
                 &format!(
                     "SELECT {WORKFLOW_COMMAND_SELECT} FROM jobs_workflow_commands
@@ -2089,33 +2257,55 @@ pub fn stage_cloud_workflow_start(
                 return Ok(replay);
             }
             lock_discovery_account_shared_postgres(&mut transaction, &input.account_id)?;
+            // Fleet precedes every Account lock, including the shared account-
+            // policy fence acquired by current execution authority resolution.
+            let cloud_distribution_ready = cloud_distribution_ready_postgres_tx(&mut transaction)?;
+            let discovered_application_row = transaction
+                .query_opt(
+                    "SELECT job_id, application_json FROM jobs_applications
+                      WHERE account_id = $1 AND id = $2",
+                    &[&input.account_id, &input.application_id],
+                )?
+                .ok_or(JobsWorkflowCommandError::NotFound)?;
+            let discovered_job_id: String = discovered_application_row.get(0);
+            let discovered_application = parse_application_json(
+                discovered_application_row.get(1),
+                &input.application_id,
+                &discovered_job_id,
+                "discovered Jobs staged application",
+            )?;
+            if !lock_current_execution_authority_postgres_after_prelock(
+                &mut transaction,
+                &input.account_id,
+                &discovered_application,
+            )? {
+                anyhow::bail!("current Jobs execution authority is unavailable")
+            }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut transaction,
                 &input.account_id,
             )?;
             require_no_workflow_cleanup_postgres_tx(&mut transaction, &input.account_id)?;
-            let entitlement = transaction.query_one(
-                "SELECT cloud_browser FROM jobs_entitlements
-                  WHERE account_id = $1 FOR UPDATE",
-                &[&input.account_id],
-            )?;
-            if !entitlement.get::<_, bool>(0)
-                || !cloud_distribution_ready_postgres_tx(&mut transaction)?
-            {
-                anyhow::bail!("cloud browser distribution is unavailable")
-            }
             let (mut application, posting) = load_stage_application_postgres_tx(
                 &mut transaction,
                 &input.account_id,
                 &input.application_id,
             )?;
-            if !current_execution_authorized_postgres(
+            if !job_application_snapshot_matches(&discovered_application, &application) {
+                anyhow::bail!("Jobs staged application changed during authority prelock")
+            }
+            prelock_stage_allowance_namespace_postgres_tx(
                 &mut transaction,
                 &input.account_id,
-                &application,
-                ExecutionAuthorityRunner::Cloud,
-            )? {
-                anyhow::bail!("current Jobs execution authority does not permit cloud queueing")
+                &application.job_id,
+            )?;
+            let entitlement = transaction.query_one(
+                "SELECT cloud_browser FROM jobs_entitlements
+                  WHERE account_id = $1 FOR UPDATE",
+                &[&input.account_id],
+            )?;
+            if !entitlement.get::<_, bool>(0) || !cloud_distribution_ready {
+                anyhow::bail!("cloud browser distribution is unavailable")
             }
             validate_stage_workflow_input(input, &application, &posting)?;
             let mut request_seed = NewJobsWorkflowCommand {
@@ -2167,27 +2357,66 @@ pub fn stage_cloud_workflow_start(
                 transaction.commit()?;
                 return Ok(replay);
             }
-            let hold_context = operational_hold_context_for_application_postgres_tx(
+            prelock_stage_cloud_start_effect_rows_postgres_tx(
+                &mut transaction,
+                input,
+                &application,
+            )?;
+            let effect_now_ms = original_source_db_now_postgres(&mut transaction)?;
+            let current = resolve_current_execution_authority_postgres_after_prelock_at_ms(
                 &mut transaction,
                 &input.account_id,
-                &input.application_id,
-                Some("cloud"),
-                None,
-                None,
-            )
-            .map_err(anyhow::Error::new)?;
-            require_operational_capability_postgres_tx(
+                &application,
+                ExecutionAuthorityRunner::Cloud,
+                effect_now_ms,
+            )?;
+            let employer_domain = current
+                .authorized
+                .then_some(current.employer_domain)
+                .flatten()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("current Jobs execution authority does not permit cloud start")
+                })?;
+            let hold_context =
+                operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+                    &mut transaction,
+                    &input.account_id,
+                    &application.id,
+                    &employer_domain,
+                    Some("cloud"),
+                    None,
+                    None,
+                )
+                .map_err(anyhow::Error::new)?;
+            require_operational_capability_postgres_tx_after_authority_prelock(
                 &mut transaction,
                 OperationalCapability::ApplicationQueue,
                 &hold_context,
             )
             .map_err(anyhow::Error::new)?;
-            stage_attempt_reservation_postgres_tx(&mut transaction, input, &application, &posting)?;
-            stage_packet_metering_postgres_tx(&mut transaction, input, &application)?;
-            stage_start_rows_postgres_tx(&mut transaction, input, &mut application)?;
-            let admission =
-                admit_jobs_workflow_command_postgres_tx(&mut transaction, &command, true)?;
-            bind_managed_cloud_workflow_postgres_tx(
+            let mut command = command;
+            command.now_ms = effect_now_ms;
+            stage_attempt_reservation_postgres_tx(
+                &mut transaction,
+                input,
+                &application,
+                &posting,
+                effect_now_ms,
+            )?;
+            stage_packet_metering_postgres_tx(
+                &mut transaction,
+                input,
+                &application,
+                effect_now_ms,
+            )?;
+            stage_start_rows_postgres_tx(&mut transaction, input, &mut application, effect_now_ms)?;
+            let admission = admit_jobs_workflow_command_postgres_tx_after_authority_prelock(
+                &mut transaction,
+                &command,
+                true,
+                &employer_domain,
+            )?;
+            bind_managed_cloud_workflow_postgres_tx_after_prelock(
                 &mut transaction,
                 &managed_cloud_binding_input(&admission, managed_cloud_scope),
             )?;
@@ -2701,6 +2930,12 @@ pub fn stage_cloud_workflow_resume(
                 &input.account_id,
                 &input.application_id,
             )?;
+            let employer_domain = require_current_workflow_application_authority_sqlite_tx(
+                &transaction,
+                &input.account_id,
+                &application,
+                &posting,
+            )?;
             if application.state != "needs_input"
                 || application.run_id.as_deref() != Some(input.run_id.as_str())
             {
@@ -2743,8 +2978,11 @@ pub fn stage_cloud_workflow_resume(
                 .ok_or_else(|| anyhow::anyhow!("intervention is no longer open"))?;
             let mut intervention: Intervention =
                 parse_json(intervention_json, "staged Jobs intervention")?;
-            validate_resume_resolution(&input.resolution, &intervention, &posting, input.now_ms)?;
-            approve_workflow_intervention(&mut intervention, input.now_ms)?;
+            let effect_now_ms = original_source_db_now_sqlite(&transaction)?;
+            validate_resume_resolution(&input.resolution, &intervention, &posting, effect_now_ms)?;
+            approve_workflow_intervention(&mut intervention, effect_now_ms)?;
+            let mut command = command;
+            command.now_ms = effect_now_ms;
             let encoded = to_json(&intervention, "staged Jobs intervention")?;
             let changed = transaction.execute(
                 "UPDATE jobs_interventions
@@ -2761,7 +2999,12 @@ pub fn stage_cloud_workflow_resume(
             if changed != 1 {
                 anyhow::bail!("intervention changed before workflow resume admission")
             }
-            let admission = admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true)?;
+            let admission = admit_jobs_workflow_command_sqlite_tx_after_authority(
+                &transaction,
+                &command,
+                true,
+                &employer_domain,
+            )?;
             bind_managed_cloud_workflow_sqlite_tx(
                 &transaction,
                 &managed_cloud_binding_input(&admission, managed_cloud_scope),
@@ -2772,8 +3015,6 @@ pub fn stage_cloud_workflow_resume(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
-            lock_operational_hold_shared_postgres_tx(&mut transaction)
-                .map_err(anyhow::Error::new)?;
             let idempotency_hmac = workflow_command_idempotency_hmac(&command)?;
             if let Some(existing) = transaction.query_opt(
                 &format!(
@@ -2835,6 +3076,11 @@ pub fn stage_cloud_workflow_resume(
                 &input.account_id,
             )?;
             require_no_workflow_cleanup_postgres_tx(&mut transaction, &input.account_id)?;
+            let (application, posting) = load_stage_application_postgres_tx(
+                &mut transaction,
+                &input.account_id,
+                &input.application_id,
+            )?;
             let entitlement = transaction.query_one(
                 "SELECT cloud_browser FROM jobs_entitlements
                   WHERE account_id = $1 FOR UPDATE",
@@ -2843,11 +3089,6 @@ pub fn stage_cloud_workflow_resume(
             if !entitlement.get::<_, bool>(0) {
                 anyhow::bail!("cloud browser distribution is unavailable")
             }
-            let (application, posting) = load_stage_application_postgres_tx(
-                &mut transaction,
-                &input.account_id,
-                &input.application_id,
-            )?;
             if application.state != "needs_input"
                 || application.run_id.as_deref() != Some(input.run_id.as_str())
             {
@@ -2886,8 +3127,17 @@ pub fn stage_cloud_workflow_resume(
                 .ok_or_else(|| anyhow::anyhow!("intervention is no longer open"))?;
             let mut intervention: Intervention =
                 parse_json(row.get(0), "staged Jobs intervention")?;
-            validate_resume_resolution(&input.resolution, &intervention, &posting, input.now_ms)?;
-            approve_workflow_intervention(&mut intervention, input.now_ms)?;
+            let employer_domain =
+                require_current_workflow_application_authority_postgres_tx_after_prelock(
+                    &mut transaction,
+                    &input.account_id,
+                    &application,
+                )?;
+            let effect_now_ms = original_source_db_now_postgres(&mut transaction)?;
+            validate_resume_resolution(&input.resolution, &intervention, &posting, effect_now_ms)?;
+            approve_workflow_intervention(&mut intervention, effect_now_ms)?;
+            let mut command = command;
+            command.now_ms = effect_now_ms;
             let encoded = to_json(&intervention, "staged Jobs intervention")?;
             let changed = transaction.execute(
                 "UPDATE jobs_interventions
@@ -2904,9 +3154,13 @@ pub fn stage_cloud_workflow_resume(
             if changed != 1 {
                 anyhow::bail!("intervention changed before workflow resume admission")
             }
-            let admission =
-                admit_jobs_workflow_command_postgres_tx(&mut transaction, &command, true)?;
-            bind_managed_cloud_workflow_postgres_tx(
+            let admission = admit_jobs_workflow_command_postgres_tx_after_authority_prelock(
+                &mut transaction,
+                &command,
+                true,
+                &employer_domain,
+            )?;
+            bind_managed_cloud_workflow_postgres_tx_after_prelock(
                 &mut transaction,
                 &managed_cloud_binding_input(&admission, managed_cloud_scope),
             )?;
@@ -3913,6 +4167,34 @@ pub(crate) fn admit_jobs_workflow_command_sqlite_tx(
     input: &NewJobsWorkflowCommand,
     managed_cloud_authority_required: bool,
 ) -> Result<JobsWorkflowCommandAdmission> {
+    admit_jobs_workflow_command_sqlite_tx_with_authority(
+        tx,
+        input,
+        managed_cloud_authority_required,
+        None,
+    )
+}
+
+fn admit_jobs_workflow_command_sqlite_tx_after_authority(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NewJobsWorkflowCommand,
+    managed_cloud_authority_required: bool,
+    employer_domain: &OperationalHoldEmployerDomain,
+) -> Result<JobsWorkflowCommandAdmission> {
+    admit_jobs_workflow_command_sqlite_tx_with_authority(
+        tx,
+        input,
+        managed_cloud_authority_required,
+        Some(employer_domain),
+    )
+}
+
+fn admit_jobs_workflow_command_sqlite_tx_with_authority(
+    tx: &rusqlite::Transaction<'_>,
+    input: &NewJobsWorkflowCommand,
+    managed_cloud_authority_required: bool,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+) -> Result<JobsWorkflowCommandAdmission> {
     validate_new_workflow_command(input)?;
     crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(tx, &input.account_id)?;
     require_no_workflow_cleanup_sqlite_tx(tx, &input.account_id)?;
@@ -3938,14 +4220,26 @@ pub(crate) fn admit_jobs_workflow_command_sqlite_tx(
         return workflow_command_replay(existing, input, &request_hmac_sha256);
     }
 
-    let hold_context = operational_hold_context_for_application_sqlite_tx(
-        tx,
-        &input.account_id,
-        &input.application_id,
-        Some("cloud"),
-        None,
-        None,
-    )
+    let hold_context = if let Some(employer_domain) = employer_domain {
+        operational_hold_context_for_application_sqlite_tx_after_authority(
+            tx,
+            &input.account_id,
+            &input.application_id,
+            employer_domain,
+            Some("cloud"),
+            None,
+            None,
+        )
+    } else {
+        operational_hold_context_for_application_sqlite_tx(
+            tx,
+            &input.account_id,
+            &input.application_id,
+            Some("cloud"),
+            None,
+            None,
+        )
+    }
     .map_err(anyhow::Error::new)?;
     require_operational_capability_sqlite_tx(
         tx,
@@ -4017,8 +4311,38 @@ pub(crate) fn admit_jobs_workflow_command_postgres_tx(
     input: &NewJobsWorkflowCommand,
     managed_cloud_authority_required: bool,
 ) -> Result<JobsWorkflowCommandAdmission> {
+    admit_jobs_workflow_command_postgres_tx_with_authority(
+        tx,
+        input,
+        managed_cloud_authority_required,
+        None,
+    )
+}
+
+fn admit_jobs_workflow_command_postgres_tx_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    input: &NewJobsWorkflowCommand,
+    managed_cloud_authority_required: bool,
+    employer_domain: &OperationalHoldEmployerDomain,
+) -> Result<JobsWorkflowCommandAdmission> {
+    admit_jobs_workflow_command_postgres_tx_with_authority(
+        tx,
+        input,
+        managed_cloud_authority_required,
+        Some(employer_domain),
+    )
+}
+
+fn admit_jobs_workflow_command_postgres_tx_with_authority(
+    tx: &mut postgres::Transaction<'_>,
+    input: &NewJobsWorkflowCommand,
+    managed_cloud_authority_required: bool,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+) -> Result<JobsWorkflowCommandAdmission> {
     validate_new_workflow_command(input)?;
-    lock_operational_hold_shared_postgres_tx(tx).map_err(anyhow::Error::new)?;
+    if employer_domain.is_none() {
+        lock_operational_hold_shared_postgres_tx(tx).map_err(anyhow::Error::new)?;
+    }
     crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
         tx,
         &input.account_id,
@@ -4048,20 +4372,40 @@ pub(crate) fn admit_jobs_workflow_command_postgres_tx(
         );
     }
 
-    let hold_context = operational_hold_context_for_application_postgres_tx(
-        tx,
-        &input.account_id,
-        &input.application_id,
-        Some("cloud"),
-        None,
-        None,
-    )
+    let hold_context = if let Some(employer_domain) = employer_domain {
+        operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+            tx,
+            &input.account_id,
+            &input.application_id,
+            employer_domain,
+            Some("cloud"),
+            None,
+            None,
+        )
+    } else {
+        operational_hold_context_for_application_postgres_tx(
+            tx,
+            &input.account_id,
+            &input.application_id,
+            Some("cloud"),
+            None,
+            None,
+        )
+    }
     .map_err(anyhow::Error::new)?;
-    require_operational_capability_postgres_tx(
-        tx,
-        OperationalCapability::ApplicationQueue,
-        &hold_context,
-    )
+    if employer_domain.is_some() {
+        require_operational_capability_postgres_tx_after_authority_prelock(
+            tx,
+            OperationalCapability::ApplicationQueue,
+            &hold_context,
+        )
+    } else {
+        require_operational_capability_postgres_tx(
+            tx,
+            OperationalCapability::ApplicationQueue,
+            &hold_context,
+        )
+    }
     .map_err(anyhow::Error::new)?;
 
     let command_id = new_jobs_workflow_command_id();
@@ -7457,12 +7801,9 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                 &stored.account_id,
             )?;
             require_no_workflow_cleanup_sqlite_tx(&transaction, &stored.account_id)?;
-            let managed_cloud = resolve_managed_cloud_request_start_sqlite_tx(
-                &transaction,
-                lease,
-                managed_cloud_scope.as_ref(),
-            )?;
             if delivering {
+                let managed_cloud =
+                    resolve_managed_cloud_request_start_sqlite_tx(&transaction, lease, None)?;
                 if managed_cloud
                     .as_ref()
                     .is_none_or(|authority| !authority.attempt_replayed)
@@ -7472,6 +7813,22 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                 transaction.commit()?;
                 return Ok((workflow_command_from_stored(stored)?, managed_cloud));
             }
+            let (application, posting) = load_stage_application_sqlite_tx(
+                &transaction,
+                &stored.account_id,
+                &stored.application_id,
+            )?;
+            require_current_workflow_application_authority_sqlite_tx(
+                &transaction,
+                &stored.account_id,
+                &application,
+                &posting,
+            )?;
+            let managed_cloud = resolve_managed_cloud_request_start_sqlite_tx(
+                &transaction,
+                lease,
+                managed_cloud_scope.as_ref(),
+            )?;
             if managed_cloud
                 .as_ref()
                 .is_some_and(|authority| authority.attempt_replayed)
@@ -7548,6 +7905,11 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                     &mut transaction,
                     &lease.command.id,
                 )?;
+            } else {
+                lock_operational_hold_shared_postgres_tx(&mut transaction)
+                    .map_err(anyhow::Error::new)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut transaction)?;
+                lock_postgres_ats_certification(&mut transaction)?;
             }
             lock_discovery_account_shared_postgres(&mut transaction, &lease.command.account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
@@ -7558,11 +7920,26 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
             let resolver_scope = (preflight == ManagedCloudRequestStartPreflight::FreshEffect)
                 .then_some(managed_cloud_scope.as_ref())
                 .flatten();
-            let managed_cloud = resolve_managed_cloud_request_start_postgres_tx(
-                &mut transaction,
-                lease,
-                resolver_scope,
-            )?;
+            if preflight != ManagedCloudRequestStartPreflight::Reconcile {
+                let (application, _) = load_stage_application_postgres_tx(
+                    &mut transaction,
+                    &lease.command.account_id,
+                    &lease.command.application_id,
+                )?;
+                require_current_workflow_application_authority_postgres_tx_after_prelock(
+                    &mut transaction,
+                    &lease.command.account_id,
+                    &application,
+                )?;
+            }
+            let managed_cloud_resolution =
+                resolve_managed_cloud_request_start_postgres_tx_after_prelock(
+                    &mut transaction,
+                    lease,
+                    resolver_scope,
+                )?;
+            let effect_now_ms = managed_cloud_resolution.db_time_ms;
+            let managed_cloud = managed_cloud_resolution.authority;
             let row = transaction
                 .query_opt(
                     &format!(
@@ -7578,14 +7955,14 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                 &stored,
                 lease,
                 JobsWorkflowCommandState::Claimed,
-                now_ms,
+                effect_now_ms,
             )
             .is_ok();
             let delivering = validate_workflow_command_lease(
                 &stored,
                 lease,
                 JobsWorkflowCommandState::Delivering,
-                now_ms,
+                effect_now_ms,
             )
             .is_ok();
             if !claimed && !delivering {
@@ -7619,7 +7996,7 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                     &stored.id,
                     &lease.attempt_id,
                     &lease.fence,
-                    &now_ms,
+                    &effect_now_ms,
                 ],
             )?;
             let token_sha256 = workflow_command_lease_token_sha256(&lease.lease_token);
@@ -7633,7 +8010,7 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
                     AND lease_owner = $6 AND lease_token_sha256 = $7
                     AND lease_expires_at_ms = $8",
                 &[
-                    &now_ms,
+                    &effect_now_ms,
                     &stored.id,
                     &stored.account_id,
                     &lease.attempt_id,
@@ -7660,6 +8037,58 @@ pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(
             ))
         }
     })
+}
+
+fn prelock_workflow_completion_rows_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    command: &StoredWorkflowCommandRow,
+) -> Result<()> {
+    tx.query_opt(
+        "SELECT id FROM jobs_applications
+          WHERE account_id = $1 AND id = $2 FOR UPDATE",
+        &[&command.account_id, &command.application_id],
+    )?;
+    let cloud_session_id = format!("cloud-{}", command.application_id);
+    tx.query(
+        "SELECT id FROM jobs_browser_sessions
+          WHERE account_id = $1 AND id IN ($2, $3) ORDER BY id FOR UPDATE",
+        &[&command.account_id, &command.run_id, &cloud_session_id],
+    )?;
+    tx.query_opt(
+        "SELECT application_id FROM jobs_attempt_reservations
+          WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+        &[&command.account_id, &command.application_id],
+    )?;
+    tx.query(
+        "SELECT run_id FROM jobs_execution_leases
+          WHERE account_id = $1 AND (application_id = $2 OR run_id = $3)
+          ORDER BY run_id FOR UPDATE",
+        &[
+            &command.account_id,
+            &command.application_id,
+            &command.run_id,
+        ],
+    )?;
+    tx.query_opt(
+        "SELECT workflow_id FROM jobs_workflow_executions
+          WHERE account_id = $1 AND workflow_id = $2 FOR UPDATE",
+        &[&command.account_id, &command.workflow_id],
+    )?;
+    tx.query(
+        "SELECT generation, workflow_id FROM jobs_workflow_cleanup_targets
+          WHERE account_id = $1 AND workflow_id = $2
+          ORDER BY generation, workflow_id FOR UPDATE",
+        &[&command.account_id, &command.workflow_id],
+    )?;
+    tx.query(
+        "SELECT finalization.command_id FROM jobs_workflow_execution_finalizations finalization
+          JOIN jobs_workflow_commands final_command ON final_command.id = finalization.command_id
+          WHERE final_command.account_id = $1 AND final_command.workflow_id = $2
+          ORDER BY finalization.finalized_at_ms, finalization.command_id
+          FOR UPDATE OF finalization",
+        &[&command.account_id, &command.workflow_id],
+    )?;
+    Ok(())
 }
 
 pub fn complete_jobs_workflow_command(
@@ -7838,6 +8267,10 @@ pub fn complete_jobs_workflow_command(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg()?;
             let mut transaction = connection.transaction()?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut transaction,
+                &lease.command.account_id,
+            )?;
             let row = transaction
                 .query_opt(
                     &format!(
@@ -7849,6 +8282,8 @@ pub fn complete_jobs_workflow_command(
                 )?
                 .ok_or(JobsWorkflowCommandError::NotFound)?;
             let stored = postgres_workflow_command_row(&row);
+            prelock_workflow_completion_rows_postgres_tx(&mut transaction, &stored)?;
+            let now_ms = original_source_db_now_postgres(&mut transaction)?;
             validate_workflow_command_lease(
                 &stored,
                 lease,
@@ -8111,7 +8546,7 @@ mod workflow_command_tests {
         );
         for admission in [start, resume] {
             assert!(admission.contains("bind_managed_cloud_workflow_sqlite_tx"));
-            assert!(admission.contains("bind_managed_cloud_workflow_postgres_tx"));
+            assert!(admission.contains("bind_managed_cloud_workflow_postgres_tx_after_prelock"));
             assert!(admission.contains("require_managed_cloud_workflow_binding_replay_sqlite_tx"));
             assert!(admission.contains("require_managed_cloud_workflow_binding_replay_postgres_tx"));
             let postgres = &admission[admission
@@ -8139,7 +8574,7 @@ mod workflow_command_tests {
         );
         for resolver in [
             "resolve_managed_cloud_request_start_sqlite_tx",
-            "resolve_managed_cloud_request_start_postgres_tx",
+            "resolve_managed_cloud_request_start_postgres_tx_after_prelock",
         ] {
             assert!(request_start.contains(resolver));
         }
@@ -8168,9 +8603,423 @@ mod workflow_command_tests {
                 .find("require_active_account_write_fence_postgres_tx")
                 .expect("Postgres account fence")
                 < request_start_postgres
-                    .find("resolve_managed_cloud_request_start_postgres_tx")
+                    .find("resolve_managed_cloud_request_start_postgres_tx_after_prelock")
                     .expect("Postgres release resolver")
         );
+    }
+
+    #[test]
+    fn fresh_workflow_effects_require_current_composed_authority_before_mutation() {
+        let source = include_str!("workflow_commands.rs");
+        let after_prelock = function_source(
+            source,
+            "fn require_current_workflow_application_authority_postgres_tx_after_prelock(",
+            "fn stage_attempt_reservation_sqlite_tx(",
+        );
+        for forbidden_relock in [
+            "lock_operational_hold_shared_postgres_tx(",
+            "lock_managed_cloud_release_registry_shared_postgres_tx(",
+            "lock_postgres_ats_certification(",
+            "lock_discovery_account_shared_postgres(",
+        ] {
+            assert!(!after_prelock.contains(forbidden_relock));
+        }
+        for (
+            start,
+            end,
+            first_sqlite_mutation,
+            first_postgres_mutation,
+            postgres_current_authority,
+        ) in [
+            (
+                "pub fn stage_cloud_workflow_start(",
+                "fn managed_cloud_binding_input(",
+                "stage_attempt_reservation_sqlite_tx",
+                "stage_attempt_reservation_postgres_tx",
+                "resolve_current_execution_authority_postgres_after_prelock_at_ms",
+            ),
+            (
+                "pub fn stage_cloud_workflow_resume(",
+                "fn workflow_command_random_lease_token(",
+                "UPDATE jobs_interventions",
+                "UPDATE jobs_interventions",
+                "require_current_workflow_application_authority_postgres_tx_after_prelock",
+            ),
+        ] {
+            let admission = function_source(source, start, end);
+            let postgres_start = admission
+                .find("DbPool::Postgres(_) =>")
+                .expect("Postgres workflow branch");
+            let sqlite = &admission[..postgres_start];
+            let postgres = &admission[postgres_start..];
+
+            assert!(
+                sqlite
+                    .find("require_current_workflow_application_authority_sqlite_tx")
+                    .expect("SQLite composed authority")
+                    < sqlite
+                        .find(first_sqlite_mutation)
+                        .expect("SQLite first workflow mutation")
+            );
+            assert!(sqlite.contains("admit_jobs_workflow_command_sqlite_tx_after_authority"));
+
+            let managed_prelock = postgres
+                .find("lock_managed_cloud_workflow_admission_postgres_tx")
+                .expect("Postgres H-M-ATS managed prelock");
+            let discovery_prelock = postgres
+                .find("lock_discovery_account_shared_postgres")
+                .expect("Postgres discovery prelock");
+            let current_authority = postgres
+                .find(postgres_current_authority)
+                .expect("Postgres composed authority");
+            let first_mutation = postgres
+                .find(first_postgres_mutation)
+                .expect("Postgres first workflow mutation");
+            assert!(managed_prelock < discovery_prelock);
+            assert!(discovery_prelock < current_authority);
+            assert!(current_authority < first_mutation);
+            assert!(postgres
+                .contains("admit_jobs_workflow_command_postgres_tx_after_authority_prelock"));
+            assert!(postgres.contains("bind_managed_cloud_workflow_postgres_tx_after_prelock"));
+            assert!(!postgres.contains("current_execution_authorized_postgres("));
+            assert!(!postgres.contains("operational_hold_context_for_application_postgres_tx("));
+        }
+    }
+
+    #[test]
+    fn postgres_workflow_effect_rows_lock_in_canonical_order_before_final_authority() {
+        let source = include_str!("workflow_commands.rs");
+        let start = function_source(
+            source,
+            "pub fn stage_cloud_workflow_start(",
+            "fn managed_cloud_binding_input(",
+        );
+        let start = &start[start
+            .find("DbPool::Postgres(_) =>")
+            .expect("PostgreSQL workflow start")..];
+        let mut previous = 0;
+        for operation in [
+            "cloud_distribution_ready_postgres_tx(",
+            "lock_current_execution_authority_postgres_after_prelock(",
+            "require_active_account_write_fence_postgres_tx(",
+            "load_stage_application_postgres_tx(",
+            "prelock_stage_allowance_namespace_postgres_tx(",
+            "SELECT cloud_browser FROM jobs_entitlements",
+            "prelock_stage_cloud_start_effect_rows_postgres_tx(",
+            "resolve_current_execution_authority_postgres_after_prelock_at_ms(",
+            "stage_attempt_reservation_postgres_tx(",
+        ] {
+            let position = start.find(operation).unwrap_or_else(|| {
+                panic!("missing canonical workflow start operation {operation}")
+            });
+            assert!(
+                position >= previous,
+                "workflow start application/entitlement/reservation order inverted"
+            );
+            previous = position;
+        }
+
+        let prelock = function_source(
+            source,
+            "fn prelock_stage_cloud_start_effect_rows_postgres_tx(",
+            "fn prelock_stage_allowance_namespace_postgres_tx(",
+        );
+        assert!(prelock.contains("FROM jobs_attempt_reservations"));
+        assert!(prelock.contains("FROM jobs_generation_allowance_reservations"));
+        assert!(prelock.contains("FROM jobs_browser_sessions"));
+        assert!(prelock.contains("FROM credit_batches"));
+        assert_eq!(prelock.matches("FOR UPDATE").count(), 4);
+
+        let resume = function_source(
+            source,
+            "pub fn stage_cloud_workflow_resume(",
+            "fn workflow_command_random_lease_token(",
+        );
+        let resume = &resume[resume
+            .find("DbPool::Postgres(_) =>")
+            .expect("PostgreSQL workflow resume")..];
+        previous = 0;
+        for operation in [
+            "load_stage_application_postgres_tx(",
+            "SELECT cloud_browser FROM jobs_entitlements",
+            "AND status = 'open' FOR UPDATE",
+            "require_current_workflow_application_authority_postgres_tx_after_prelock(",
+            "UPDATE jobs_interventions",
+        ] {
+            let position = resume.find(operation).unwrap_or_else(|| {
+                panic!("missing canonical workflow resume operation {operation}")
+            });
+            assert!(
+                position >= previous,
+                "workflow resume application/entitlement order inverted"
+            );
+            previous = position;
+        }
+    }
+
+    #[test]
+    fn fresh_start_and_resume_use_post_lock_database_time_for_temporal_effects() {
+        let source = include_str!("workflow_commands.rs");
+        for helper in [
+            function_source(
+                source,
+                "fn stage_attempt_reservation_sqlite_tx(",
+                "fn stage_attempt_reservation_postgres_tx(",
+            ),
+            function_source(
+                source,
+                "fn stage_attempt_reservation_postgres_tx(",
+                "fn prelock_stage_cloud_start_effect_rows_postgres_tx(",
+            ),
+            function_source(
+                source,
+                "fn stage_packet_metering_sqlite_tx(",
+                "fn stage_packet_metering_postgres_tx(",
+            ),
+            function_source(
+                source,
+                "fn stage_packet_metering_postgres_tx(",
+                "fn stage_start_rows_sqlite_tx(",
+            ),
+            function_source(
+                source,
+                "fn stage_start_rows_sqlite_tx(",
+                "fn stage_start_rows_postgres_tx(",
+            ),
+            function_source(
+                source,
+                "fn stage_start_rows_postgres_tx(",
+                "fn validate_stage_workflow_input(",
+            ),
+        ] {
+            assert!(helper.contains("now_ms: i64"));
+            assert!(!helper.contains("input.now_ms"));
+        }
+
+        let start = function_source(
+            source,
+            "pub fn stage_cloud_workflow_start(",
+            "fn managed_cloud_binding_input(",
+        );
+        let postgres = &start[start
+            .find("DbPool::Postgres(_) =>")
+            .expect("PostgreSQL workflow start")..];
+        let mut previous = 0;
+        for operation in [
+            "prelock_stage_cloud_start_effect_rows_postgres_tx",
+            "let effect_now_ms = original_source_db_now_postgres",
+            "resolve_current_execution_authority_postgres_after_prelock_at_ms",
+            "command.now_ms = effect_now_ms",
+            "stage_attempt_reservation_postgres_tx",
+            "stage_packet_metering_postgres_tx",
+            "stage_start_rows_postgres_tx",
+            "admit_jobs_workflow_command_postgres_tx_after_authority_prelock",
+            "bind_managed_cloud_workflow_postgres_tx_after_prelock",
+        ] {
+            let relative = postgres[previous..].find(operation).unwrap_or_else(|| {
+                panic!("missing post-lock workflow start operation {operation}")
+            });
+            previous += relative + operation.len();
+        }
+
+        let resume = function_source(
+            source,
+            "pub fn stage_cloud_workflow_resume(",
+            "fn workflow_command_random_lease_token(",
+        );
+        let (sqlite, postgres) = resume
+            .split_once("DbPool::Postgres(_) =>")
+            .expect("workflow resume database branches");
+        for (label, branch, db_now) in [
+            ("SQLite", sqlite, "original_source_db_now_sqlite"),
+            ("PostgreSQL", postgres, "original_source_db_now_postgres"),
+        ] {
+            let current = branch
+                .find("require_current_workflow_application_authority_")
+                .unwrap_or_else(|| panic!("missing {label} current workflow authority"));
+            let intervention = branch
+                .find("jobs_interventions")
+                .unwrap_or_else(|| panic!("missing {label} exact intervention"));
+            let final_prelock = current.max(intervention);
+            let final_time = branch[final_prelock..]
+                .find(db_now)
+                .map(|offset| final_prelock + offset)
+                .unwrap_or_else(|| panic!("missing {label} final workflow time"));
+            let validation = branch[final_time..]
+                .find("validate_resume_resolution")
+                .map(|offset| final_time + offset)
+                .unwrap_or_else(|| panic!("missing {label} OTP validation"));
+            let intervention_update = branch[validation..]
+                .find("UPDATE jobs_interventions")
+                .map(|offset| validation + offset)
+                .unwrap_or_else(|| panic!("missing {label} intervention mutation"));
+            let command_insert = branch[validation..]
+                .find("admit_jobs_workflow_command_")
+                .map(|offset| validation + offset)
+                .unwrap_or_else(|| panic!("missing {label} command admission"));
+            let binding = branch[validation..]
+                .find("bind_managed_cloud_workflow_")
+                .map(|offset| validation + offset)
+                .unwrap_or_else(|| panic!("missing {label} managed binding"));
+            assert!(current < final_time && intervention < final_time);
+            assert!(final_time < validation);
+            assert!(validation < intervention_update);
+            assert!(validation < command_insert && validation < binding);
+            assert!(!branch[final_time..validation].contains("input.now_ms"));
+        }
+    }
+
+    #[test]
+    fn fresh_request_start_rechecks_authority_and_exact_replay_uses_stored_authority() {
+        let source = include_str!("workflow_commands.rs");
+        let request_start = function_source(
+            source,
+            "pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(",
+            "pub fn complete_jobs_workflow_command(",
+        );
+        let postgres_start = request_start
+            .find("DbPool::Postgres(_) =>")
+            .expect("Postgres request-start branch");
+        let sqlite = &request_start[..postgres_start];
+        let postgres = &request_start[postgres_start..];
+
+        let delivering = sqlite
+            .find("if delivering {")
+            .expect("SQLite replay branch");
+        let current_authority = sqlite
+            .find("require_current_workflow_application_authority_sqlite_tx")
+            .expect("SQLite fresh authority");
+        let first_mutation = sqlite
+            .find("INSERT INTO jobs_workflow_command_attempt_events")
+            .expect("SQLite request-start mutation");
+        assert!(delivering < current_authority);
+        assert!(sqlite[delivering..current_authority]
+            .contains("resolve_managed_cloud_request_start_sqlite_tx(&transaction, lease, None)"));
+        assert!(current_authority < first_mutation);
+        assert!(sqlite[current_authority..first_mutation]
+            .contains("resolve_managed_cloud_request_start_sqlite_tx"));
+
+        let managed_prelock = postgres
+            .find("lock_managed_cloud_workflow_admission_postgres_tx")
+            .expect("Postgres managed H-M-ATS prelock");
+        let fallback_h = postgres
+            .find("lock_operational_hold_shared_postgres_tx")
+            .expect("Postgres historical/replay H prelock");
+        let fallback_m = postgres
+            .find("lock_managed_cloud_release_registry_shared_postgres_tx")
+            .expect("Postgres historical/replay M prelock");
+        let fallback_ats = postgres
+            .find("lock_postgres_ats_certification")
+            .expect("Postgres historical/replay ATS prelock");
+        let discovery_prelock = postgres
+            .find("lock_discovery_account_shared_postgres")
+            .expect("Postgres discovery prelock");
+        let current_authority = postgres
+            .find("require_current_workflow_application_authority_postgres_tx_after_prelock")
+            .expect("Postgres fresh authority");
+        let resolver = postgres
+            .find("resolve_managed_cloud_request_start_postgres_tx_after_prelock")
+            .expect("Postgres after-prelock resolver");
+        let first_mutation = postgres
+            .find("INSERT INTO jobs_workflow_command_attempt_events")
+            .expect("Postgres request-start mutation");
+        assert!(managed_prelock < discovery_prelock);
+        assert!(fallback_h < fallback_m);
+        assert!(fallback_m < fallback_ats);
+        assert!(fallback_ats < discovery_prelock);
+        assert!(discovery_prelock < current_authority);
+        assert!(current_authority < resolver);
+        assert!(resolver < first_mutation);
+        assert!(postgres.contains("if preflight != ManagedCloudRequestStartPreflight::Reconcile"));
+        assert!(!postgres.contains("resolve_managed_cloud_request_start_postgres_tx("));
+    }
+
+    #[test]
+    fn postgres_request_start_locks_command_and_binding_before_attempt_and_final_time() {
+        let managed_source = include_str!("managed_cloud_release_authority.rs");
+        let stored = function_source(
+            managed_source,
+            "fn resolve_postgres_managed_cloud_stored_request_start_authority(",
+            "fn insert_sqlite_managed_cloud_request_start_authority(",
+        );
+        let stored_command = stored
+            .find("lock_postgres_managed_cloud_request_start_command")
+            .expect("stored request-start command lock");
+        let stored_binding = stored
+            .find("postgres_managed_cloud_request_execution_binding")
+            .expect("stored request-start execution-binding lock");
+        let stored_attempt = stored
+            .find("lock_postgres_managed_cloud_request_start_attempt")
+            .expect("stored request-start attempt lock");
+        let stored_time = stored
+            .find("managed_cloud_db_now_postgres")
+            .expect("stored request-start final database time");
+        let stored_lease = stored
+            .find("require_postgres_managed_cloud_command_lease_replay")
+            .expect("stored request-start lease validation");
+        assert!(stored_command < stored_binding);
+        assert!(stored_binding < stored_attempt);
+        assert!(stored_attempt < stored_time && stored_time < stored_lease);
+
+        let resolver = function_source(
+            managed_source,
+            "pub(crate) fn resolve_managed_cloud_request_start_postgres_tx_after_prelock(",
+            "fn require_managed_cloud_workflow_command_identity(",
+        );
+        let effect_prelock = resolver
+            .find("prelock_postgres_managed_cloud_effect_admission_inputs")
+            .expect("fresh request-start application and entitlement prelock");
+        let command = resolver[effect_prelock..]
+            .find("lock_postgres_managed_cloud_request_start_command")
+            .map(|offset| effect_prelock + offset)
+            .expect("fresh request-start command lock");
+        let binding = resolver[command..]
+            .find("postgres_managed_cloud_request_execution_binding")
+            .map(|offset| command + offset)
+            .expect("fresh request-start execution-binding lock");
+        let attempt = resolver[binding..]
+            .find("lock_postgres_managed_cloud_request_start_attempt")
+            .map(|offset| binding + offset)
+            .expect("fresh request-start attempt lock");
+        let final_time = resolver[attempt..]
+            .find("managed_cloud_db_now_postgres")
+            .map(|offset| attempt + offset)
+            .expect("fresh request-start final database time");
+        let admission = resolver[final_time..]
+            .find("require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms")
+            .map(|offset| final_time + offset)
+            .expect("fresh request-start final authority validation");
+        let authority_insert = resolver[admission..]
+            .find("insert_postgres_managed_cloud_request_start_authority")
+            .map(|offset| admission + offset)
+            .expect("fresh request-start authority mutation");
+        assert!(effect_prelock < command);
+        assert!(command < binding && binding < attempt);
+        assert!(attempt < final_time && final_time < admission);
+        assert!(admission < authority_insert);
+
+        let workflow_source = include_str!("workflow_commands.rs");
+        let outer = function_source(
+            workflow_source,
+            "pub fn mark_jobs_workflow_command_request_started_with_managed_cloud(",
+            "pub fn complete_jobs_workflow_command(",
+        );
+        let postgres = &outer[outer
+            .find("DbPool::Postgres(_) =>")
+            .expect("Postgres request-start branch")..];
+        let resolved = postgres
+            .find("let managed_cloud_resolution")
+            .expect("transaction-owned request-start resolution");
+        let effect_time = postgres[resolved..]
+            .find("let effect_now_ms = managed_cloud_resolution.db_time_ms")
+            .map(|offset| resolved + offset)
+            .expect("request-start effect time");
+        let first_mutation = postgres
+            .find("INSERT INTO jobs_workflow_command_attempt_events")
+            .expect("request-start event mutation");
+        assert!(resolved < effect_time && effect_time < first_mutation);
+        let temporal_inputs = postgres[effect_time..first_mutation].replace("effect_now_ms", "");
+        assert!(!temporal_inputs.contains("now_ms"));
     }
 
     #[test]

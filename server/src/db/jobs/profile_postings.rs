@@ -1261,6 +1261,7 @@ pub fn upsert_posting(
     ) {
         anyhow::bail!("invalid job availability status")
     }
+    sanitize_mutable_execution_labels(&mut value.discovery_evidence);
     value.canonical_key = canonical_job_key(&value);
     let tracks = list_tracks(pool, account_id)?;
     let track = tracks.iter().find(|track| track.id == value.track_id);
@@ -1495,11 +1496,16 @@ fn prepare_snapshot_posting(
     ) {
         anyhow::bail!("invalid job availability status")
     }
+    sanitize_mutable_execution_labels(&mut value.discovery_evidence);
     value.canonical_key = canonical_job_key(&value);
     if let Some(existing) = existing {
         if existing.track_id != value.track_id {
             anyhow::bail!("job is already bound to another Career Track")
         }
+        preserve_existing_hard_discovery_denials(
+            &mut value.discovery_evidence,
+            &existing.discovery_evidence,
+        );
         value.id = existing.id;
         value.created_at_ms = existing.created_at_ms;
         if value.posted_at_ms.is_none() {
@@ -1532,9 +1538,442 @@ fn prepare_snapshot_posting(
     Ok(value)
 }
 
+fn normalized_discovery_status(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn canonical_status_is_hard_denial(value: &str) -> bool {
+    matches!(
+        normalized_discovery_status(value).as_str(),
+        "duplicate" | "repost" | "invalid" | "malformed"
+    )
+}
+
+fn employer_status_is_hard_denial(value: &str) -> bool {
+    matches!(
+        normalized_discovery_status(value).as_str(),
+        "mismatch" | "impersonated"
+    )
+}
+
+fn original_source_status_is_hard_denial(value: &str) -> bool {
+    matches!(
+        normalized_discovery_status(value).as_str(),
+        "closed"
+            | "verified_closed"
+            | "mismatch"
+            | "identity_mismatch"
+            | "materially_changed"
+            | "source_untrusted"
+            | "expired"
+            | "quarantined"
+            | "redirected_to_unknown"
+    )
+}
+
+/// Mutable source refreshes may add or replace descriptive posting data, but
+/// they cannot silently clear an already persisted hard denial. A current
+/// relational source projection can still supersede the mutable original-
+/// source fields at read/effect boundaries.
+fn preserve_existing_hard_discovery_denials(
+    incoming: &mut JobDiscoveryEvidence,
+    existing: &JobDiscoveryEvidence,
+) {
+    if canonical_status_is_hard_denial(&existing.canonical_status)
+        && !canonical_status_is_hard_denial(&incoming.canonical_status)
+    {
+        incoming.canonical_status = normalized_discovery_status(&existing.canonical_status);
+        incoming
+            .canonical_job_id
+            .clone_from(&existing.canonical_job_id);
+    }
+
+    if employer_status_is_hard_denial(&existing.employer_verification_status)
+        && !employer_status_is_hard_denial(&incoming.employer_verification_status)
+    {
+        incoming.employer_verification_status =
+            normalized_discovery_status(&existing.employer_verification_status);
+        incoming.employer_id.clone_from(&existing.employer_id);
+        incoming
+            .canonical_employer_domain
+            .clone_from(&existing.canonical_employer_domain);
+    }
+
+    if normalized_discovery_status(&existing.scam_risk_status) == "blocked" {
+        incoming.scam_risk_status = "blocked".to_string();
+        incoming
+            .scam_signals
+            .extend(existing.scam_signals.iter().cloned());
+        incoming
+            .scam_signals
+            .sort_by(|left, right| (&left.code, &left.source).cmp(&(&right.code, &right.source)));
+        incoming.scam_signals.dedup();
+    }
+
+    let existing_original_denied =
+        original_source_status_is_hard_denial(&existing.original_source_status)
+            || !existing.original_source_mismatched_fields.is_empty();
+    if existing_original_denied {
+        if original_source_status_is_hard_denial(&existing.original_source_status)
+            && !original_source_status_is_hard_denial(&incoming.original_source_status)
+        {
+            incoming.provenance.clone_from(&existing.provenance);
+            incoming.original_source_status =
+                normalized_discovery_status(&existing.original_source_status);
+            incoming.original_source_checked_at_ms = existing.original_source_checked_at_ms;
+            incoming.original_source_snapshot_expires_at_ms =
+                existing.original_source_snapshot_expires_at_ms;
+            incoming
+                .original_source_evidence_hash
+                .clone_from(&existing.original_source_evidence_hash);
+        }
+        incoming
+            .original_source_mismatched_fields
+            .extend(existing.original_source_mismatched_fields.iter().cloned());
+        incoming.original_source_mismatched_fields.sort();
+        incoming.original_source_mismatched_fields.dedup();
+        incoming.requires_original_revalidation = true;
+    }
+}
+
 #[cfg(test)]
 mod profile_postings_p3_tests {
     use super::*;
+
+    fn legacy_positive_posting(at_ms: i64) -> JobPosting {
+        let mut posting = JobPosting {
+            id: "legacy-positive-job".to_string(),
+            canonical_key: String::new(),
+            source: "greenhouse_import".to_string(),
+            external_id: "legacy-positive-job".to_string(),
+            company: "Acme".to_string(),
+            title: "Software Engineer".to_string(),
+            location: "New York, NY".to_string(),
+            workplace: "hybrid".to_string(),
+            canonical_url: "https://boards.greenhouse.io/acme/jobs/legacy-positive-job".to_string(),
+            description: "Build reliable software.".to_string(),
+            compensation: String::new(),
+            employment_type: "full_time".to_string(),
+            track_id: "track-legacy-positive".to_string(),
+            match_score: 100,
+            matched_reasons: Vec::new(),
+            missing_requirements: Vec::new(),
+            posted_at_ms: Some(at_ms),
+            last_verified_at_ms: Some(at_ms),
+            availability_status: "active".to_string(),
+            status: "matched".to_string(),
+            created_at_ms: at_ms,
+            updated_at_ms: at_ms,
+            discovery_evidence: JobDiscoveryEvidence::default(),
+            eligibility: None,
+        };
+        posting.canonical_key = canonical_job_key(&posting);
+        posting.discovery_evidence = JobDiscoveryEvidence {
+            provenance: "original_source".to_string(),
+            canonical_status: "canonical".to_string(),
+            canonical_job_id: Some(posting.canonical_key.clone()),
+            employer_verification_status: "verified".to_string(),
+            employer_id: Some("mutable-employer".to_string()),
+            canonical_employer_domain: Some("acme.example".to_string()),
+            application_domain: Some("boards.greenhouse.io".to_string()),
+            scam_risk_status: "clear".to_string(),
+            scam_signals: Vec::new(),
+            original_source_status: "verified_open".to_string(),
+            original_source_checked_at_ms: Some(at_ms),
+            original_source_snapshot_expires_at_ms: Some(at_ms + DAY_MS),
+            original_source_evidence_hash: Some("a".repeat(64)),
+            original_source_mismatched_fields: Vec::new(),
+            requires_original_revalidation: false,
+        };
+        posting
+    }
+
+    fn approved_track(profile: &CareerProfile, preferences: &JobPreferences) -> CareerTrack {
+        let mut track = CareerTrack {
+            id: "track-legacy-positive".to_string(),
+            name: "Software engineering".to_string(),
+            role: "Software Engineer".to_string(),
+            locations: vec!["New York, NY".to_string()],
+            remote_preference: "hybrid_ok".to_string(),
+            application_identity_id: Some("identity-primary".to_string()),
+            policy: CareerTrackPolicy {
+                role_family: "software_engineering".to_string(),
+                ..CareerTrackPolicy::default()
+            },
+            active: true,
+            match_count: 0,
+            created_at_ms: 0,
+            updated_at_ms: 0,
+        };
+        track.policy.authority.review_state = "approved".to_string();
+        track.policy.authority.taxonomy_version = crate::jobs_taxonomy::taxonomy_version().into();
+        track.policy.authority.taxonomy_sha256 = crate::jobs_taxonomy::taxonomy_sha256();
+        track.policy.authority.source_resume_asset_id = profile.source_resume_asset_id.clone();
+        track.policy.authority.source_resume_sha256 = profile.source_resume_sha256.clone();
+        track.policy.authority.job_preferences_sha256 =
+            job_preferences_policy_sha256(preferences).expect("canonical test preferences");
+        track
+    }
+
+    #[test]
+    fn snapshot_never_persists_queue_authority_from_legacy_positive_labels() {
+        let observed_at_ms = now_ms();
+        let profile = default_profile("legacy-positive@example.com");
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let track = approved_track(&profile, &preferences);
+        let posting = legacy_positive_posting(observed_at_ms);
+        let legacy_decision = build_job_eligibility(
+            &posting,
+            &profile,
+            &preferences,
+            &[],
+            true,
+            None,
+            Some(&track),
+        );
+        assert!(legacy_decision.can_queue_local);
+        assert!(legacy_decision.can_queue_cloud);
+
+        let saved = prepare_snapshot_posting(
+            &posting,
+            None,
+            &PostingSnapshotContext {
+                profile: &profile,
+                preferences: &preferences,
+                applications: &[],
+                reservations: &[],
+                track: Some(&track),
+                observed_at_ms,
+            },
+        )
+        .expect("prepare sanitized posting snapshot");
+
+        assert_eq!(
+            saved.discovery_evidence.employer_verification_status,
+            "unknown"
+        );
+        assert_eq!(saved.discovery_evidence.employer_id, None);
+        assert_eq!(saved.discovery_evidence.canonical_employer_domain, None);
+        assert_eq!(saved.discovery_evidence.scam_risk_status, "unknown");
+        let eligibility = saved.eligibility.expect("snapshot eligibility");
+        assert!(!eligibility.can_auto_submit);
+        assert!(!eligibility.can_queue_local);
+        assert!(!eligibility.can_queue_cloud);
+    }
+
+    #[test]
+    fn snapshot_sanitization_preserves_independent_hard_denials() {
+        let observed_at_ms = now_ms();
+        let profile = default_profile("hard-denial@example.com");
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let track = approved_track(&profile, &preferences);
+        let mut posting = legacy_positive_posting(observed_at_ms);
+        posting.discovery_evidence.employer_verification_status = "impersonated".to_string();
+        posting.discovery_evidence.scam_risk_status = "blocked".to_string();
+        posting.discovery_evidence.scam_signals = vec![DiscoveryScamSignal {
+            code: "lookalike_domain".to_string(),
+            source: "risk_engine".to_string(),
+        }];
+
+        let saved = prepare_snapshot_posting(
+            &posting,
+            None,
+            &PostingSnapshotContext {
+                profile: &profile,
+                preferences: &preferences,
+                applications: &[],
+                reservations: &[],
+                track: Some(&track),
+                observed_at_ms,
+            },
+        )
+        .expect("prepare denied posting snapshot");
+
+        assert_eq!(
+            saved.discovery_evidence.employer_verification_status,
+            "impersonated"
+        );
+        assert_eq!(saved.discovery_evidence.scam_risk_status, "blocked");
+        assert_eq!(saved.discovery_evidence.scam_signals.len(), 1);
+        let eligibility = saved.eligibility.expect("snapshot eligibility");
+        assert!(eligibility
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "employer_identity_mismatch"));
+        assert!(eligibility
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "scam_risk_blocked"));
+    }
+
+    fn hard_denial_refresh_pool() -> (DbPool, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "bluey-hard-denial-refresh-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&path).expect("open hard-denial refresh pool");
+        crate::db::run_migrations(&pool).expect("migrate hard-denial refresh pool");
+        pool.get()
+            .expect("hard-denial refresh connection")
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-hard-denial-refresh', 'denied@example.com', 'hash', 0)",
+                [],
+            )
+            .expect("insert hard-denial refresh account");
+        (pool, path)
+    }
+
+    fn stored_hard_denial_posting(at_ms: i64) -> JobPosting {
+        let mut posting = legacy_positive_posting(at_ms);
+        posting.discovery_evidence.canonical_status = "invalid".to_string();
+        posting.discovery_evidence.employer_verification_status = "impersonated".to_string();
+        posting.discovery_evidence.employer_id = Some("suspect-employer".to_string());
+        posting.discovery_evidence.canonical_employer_domain =
+            Some("lookalike-acme.example".to_string());
+        posting.discovery_evidence.scam_risk_status = "blocked".to_string();
+        posting.discovery_evidence.scam_signals = vec![DiscoveryScamSignal {
+            code: "lookalike_domain".to_string(),
+            source: "risk_engine".to_string(),
+        }];
+        posting.discovery_evidence.original_source_status = "identity_mismatch".to_string();
+        posting.discovery_evidence.original_source_mismatched_fields =
+            vec!["canonical_application_url".to_string()];
+        posting.discovery_evidence.requires_original_revalidation = true;
+        posting
+    }
+
+    fn assert_hard_denials_preserved(posting: &JobPosting) {
+        let evidence = &posting.discovery_evidence;
+        assert_eq!(evidence.canonical_status, "invalid");
+        assert_eq!(evidence.employer_verification_status, "impersonated");
+        assert_eq!(evidence.employer_id.as_deref(), Some("suspect-employer"));
+        assert_eq!(
+            evidence.canonical_employer_domain.as_deref(),
+            Some("lookalike-acme.example")
+        );
+        assert_eq!(evidence.scam_risk_status, "blocked");
+        assert_eq!(
+            evidence.scam_signals,
+            vec![DiscoveryScamSignal {
+                code: "lookalike_domain".to_string(),
+                source: "risk_engine".to_string(),
+            }]
+        );
+        assert_eq!(evidence.original_source_status, "identity_mismatch");
+        assert_eq!(
+            evidence.original_source_mismatched_fields,
+            vec!["canonical_application_url".to_string()]
+        );
+        assert!(evidence.requires_original_revalidation);
+        let eligibility = posting
+            .eligibility
+            .as_ref()
+            .expect("hard-denial eligibility");
+        for code in [
+            "canonical_job_rejected",
+            "employer_identity_mismatch",
+            "scam_risk_blocked",
+            "original_source_rejected",
+        ] {
+            assert!(eligibility
+                .hard_failures
+                .iter()
+                .any(|reason| reason.code == code));
+        }
+    }
+
+    #[test]
+    fn upsert_cannot_replace_existing_hard_denials_with_mutable_positive_labels() {
+        let (pool, path) = hard_denial_refresh_pool();
+        let profile = default_profile("denied@example.com");
+        let preferences = JobPreferences::default();
+        let denied = upsert_posting(
+            &pool,
+            "acct-hard-denial-refresh",
+            &stored_hard_denial_posting(now_ms()),
+            &profile,
+            &preferences,
+        )
+        .expect("store hard-denied posting");
+
+        let mut incoming = denied.clone();
+        incoming.discovery_evidence.canonical_status = "canonical".to_string();
+        incoming.discovery_evidence.employer_verification_status = "verified".to_string();
+        incoming.discovery_evidence.employer_id = Some("mutable-positive".to_string());
+        incoming.discovery_evidence.canonical_employer_domain =
+            Some("mutable-positive.example".to_string());
+        incoming.discovery_evidence.scam_risk_status = "clear".to_string();
+        incoming.discovery_evidence.scam_signals.clear();
+        incoming.discovery_evidence.original_source_status = "verified_open".to_string();
+        incoming
+            .discovery_evidence
+            .original_source_mismatched_fields
+            .clear();
+        incoming.discovery_evidence.requires_original_revalidation = false;
+
+        let refreshed = upsert_posting(
+            &pool,
+            "acct-hard-denial-refresh",
+            &incoming,
+            &profile,
+            &preferences,
+        )
+        .expect("refresh denied posting with positive labels");
+        assert_hard_denials_preserved(&refreshed);
+
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn refresh_cannot_replace_existing_hard_denials_with_unknown_labels() {
+        let (pool, path) = hard_denial_refresh_pool();
+        let profile = default_profile("denied@example.com");
+        let preferences = JobPreferences::default();
+        let denied = upsert_posting(
+            &pool,
+            "acct-hard-denial-refresh",
+            &stored_hard_denial_posting(now_ms()),
+            &profile,
+            &preferences,
+        )
+        .expect("store hard-denied posting");
+
+        let mut incoming = denied.clone();
+        incoming.discovery_evidence.canonical_status = "unknown".to_string();
+        incoming.discovery_evidence.employer_verification_status = "unknown".to_string();
+        incoming.discovery_evidence.employer_id = None;
+        incoming.discovery_evidence.canonical_employer_domain = None;
+        incoming.discovery_evidence.scam_risk_status = "unknown".to_string();
+        incoming.discovery_evidence.scam_signals.clear();
+        incoming.discovery_evidence.original_source_status = "unknown".to_string();
+        incoming
+            .discovery_evidence
+            .original_source_mismatched_fields
+            .clear();
+        incoming.discovery_evidence.requires_original_revalidation = false;
+
+        let refreshed = upsert_posting(
+            &pool,
+            "acct-hard-denial-refresh",
+            &incoming,
+            &profile,
+            &preferences,
+        )
+        .expect("refresh denied posting with unknown labels");
+        assert_hard_denials_preserved(&refreshed);
+
+        drop(pool);
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn unapproved_track_reason_codes_are_persisted() {

@@ -1158,19 +1158,7 @@ pub async fn matches(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
 ) -> Result<Json<Vec<JobPosting>>, ApiError> {
-    let applications = jobs::list_applications(&state.pool, &account.id).map_err(internal)?;
-    let mut postings = jobs::list_postings(&state.pool, &account.id).map_err(internal)?;
-    for posting in &mut postings {
-        let existing_id = applications
-            .iter()
-            .find(|application| application.job_id == posting.id)
-            .map(|application| application.id.as_str());
-        posting.eligibility = Some(
-            jobs::evaluate_job_eligibility(&state.pool, &account.id, posting, true, existing_id)
-                .map_err(internal)?,
-        );
-    }
-    Ok(Json(postings))
+    current_match_representations(&state.pool, &account)
 }
 
 pub async fn match_detail(
@@ -1178,26 +1166,27 @@ pub async fn match_detail(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(job_id): Path<String>,
 ) -> Result<Json<JobPosting>, ApiError> {
-    let mut posting = jobs::get_posting(&state.pool, &account.id, &job_id)
+    current_match_representation(&state.pool, &account, &job_id)
+}
+
+fn current_match_representations(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+) -> Result<Json<Vec<JobPosting>>, ApiError> {
+    jobs::list_current_posting_representations(pool, &account.id, &account.email)
+        .map(Json)
+        .map_err(internal)
+}
+
+fn current_match_representation(
+    pool: &crate::db::DbPool,
+    account: &crate::db::accounts::Account,
+    job_id: &str,
+) -> Result<Json<JobPosting>, ApiError> {
+    jobs::get_current_posting_representation(pool, &account.id, &account.email, job_id)
         .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job match not found.".to_string()))?;
-    let application = jobs::list_applications(&state.pool, &account.id)
-        .map_err(internal)?
-        .into_iter()
-        .find(|application| application.job_id == posting.id);
-    posting.eligibility = Some(
-        jobs::evaluate_job_eligibility(
-            &state.pool,
-            &account.id,
-            &posting,
-            true,
-            application
-                .as_ref()
-                .map(|application| application.id.as_str()),
-        )
-        .map_err(internal)?,
-    );
-    Ok(Json(posting))
+        .map(Json)
+        .ok_or((StatusCode::NOT_FOUND, "Job match not found.".to_string()))
 }
 
 pub async fn save_match(
@@ -1691,7 +1680,7 @@ pub async fn prepare_application(
         &req.mode,
         &req.submission_mode,
     )
-    .map_err(internal)?;
+    .map_err(domain_error)?;
     if !prepared.profile.onboarding_complete {
         return Err((
             StatusCode::CONFLICT,
@@ -1759,17 +1748,9 @@ pub async fn prepare_application(
         cover_letter,
         public_provenance,
     )
-    .map_err(internal)?;
+    .map_err(domain_error)?;
     let mut metering = None;
     if application.state == "queued" {
-        application = freeze_approved_execution(
-            &state,
-            &account.id,
-            &account.email,
-            &application,
-            &prepared.posting,
-            &resume_version,
-        )?;
         if let Err(error) = jobs::reserve_application_attempt(
             &state.pool,
             &account.id,
@@ -1891,26 +1872,25 @@ pub async fn approve_application_packet(
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Path(application_id): Path<String>,
 ) -> Result<Json<ApproveApplicationResponse>, ApiError> {
-    let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    let approval_authority = jobs::current_application_approval_authority(
+        &state.pool,
+        &account.id,
+        &account.email,
+        &application_id,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    let mut application = approval_authority.application.clone();
     if application.state != "awaiting_review" {
         return Err((
             StatusCode::CONFLICT,
             "Only a packet waiting for review can be approved.".to_string(),
         ));
     }
-    let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
-    let eligibility = jobs::evaluate_job_eligibility(
-        &state.pool,
-        &account.id,
-        &posting,
-        true,
-        Some(&application.id),
-    )
-    .map_err(internal)?;
+    let eligibility = approval_authority.posting.eligibility.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "Current signed job eligibility is unavailable. Prepare the packet again.".to_string(),
+    ))?;
     if !eligibility.can_queue_local && !eligibility.can_queue_cloud {
         let message = eligibility
             .hard_failures
@@ -1934,12 +1914,37 @@ pub async fn approve_application_packet(
         &state,
         &account.id,
         &account.email,
-        &application,
-        &posting,
+        &approval_authority,
         &resume,
     )?;
-    jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "unassigned")
-        .map_err(domain_error)?;
+    let approved_checksum = application
+        .receipt
+        .pointer("/approved_execution/checksum")
+        .and_then(Value::as_str)
+        .expect("persisted approval has a validated checksum")
+        .to_string();
+    if let Err(error) =
+        jobs::reserve_application_attempt(&state.pool, &account.id, &application.id, "unassigned")
+    {
+        match jobs::clear_current_review_approval(
+            &state.pool,
+            &account.id,
+            &application.id,
+            &approved_checksum,
+        ) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                application_id = %application.id,
+                "application reservation failed after approval, but the exact approval was no longer current"
+            ),
+            Err(cleanup_error) => tracing::error!(
+                application_id = %application.id,
+                error = %cleanup_error,
+                "application reservation failed and exact approval cleanup could not complete"
+            ),
+        }
+        return Err(domain_error(error));
+    }
     let metering =
         jobs::commit_packet(&state.pool, &account.id, &application.id).map_err(|error| {
             let _ = jobs::update_attempt_reservation_status(
@@ -2577,9 +2582,27 @@ pub async fn queue_application_run(
     if !matches!(req.runner.as_str(), "local" | "cloud") {
         return bad_request("Choose the local or cloud runner.");
     }
-    let mut application = jobs::get_application(&state.pool, &account.id, &application_id)
+    let current_authority = jobs::current_application_approval_authority(
+        &state.pool,
+        &account.id,
+        &account.email,
+        &application_id,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+    if jobs::application_job_integrity_receipt(&current_authority.application)
         .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+        .as_ref()
+        != Some(&current_authority.job_integrity)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "The approved packet no longer matches current signed job authority. Prepare or approve it again."
+                .to_string(),
+        ));
+    }
+    let mut application = current_authority.application;
+    let posting = current_authority.posting;
     if application.state == "awaiting_review" {
         return Err((
             StatusCode::CONFLICT,
@@ -2613,9 +2636,6 @@ pub async fn queue_application_run(
             format!("{} {}", channel.reason, channel.next_action),
         ));
     }
-    let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
     let resume_id = application.resume_version_id.clone().ok_or((
         StatusCode::CONFLICT,
         "Create the tailored resume before starting this application.".to_string(),
@@ -2626,14 +2646,10 @@ pub async fn queue_application_run(
             StatusCode::CONFLICT,
             "Tailored resume not found.".to_string(),
         ))?;
-    let eligibility = jobs::evaluate_job_eligibility(
-        &state.pool,
-        &account.id,
-        &posting,
-        true,
-        Some(&application.id),
-    )
-    .map_err(internal)?;
+    let eligibility = posting.eligibility.as_ref().ok_or((
+        StatusCode::CONFLICT,
+        "Current signed job eligibility is unavailable. Prepare the packet again.".to_string(),
+    ))?;
     let runner_allowed = if req.runner == "cloud" {
         eligibility.can_queue_cloud
     } else {
@@ -2875,6 +2891,11 @@ fn approved_workflow_input(
         &packet,
         &job,
     )?;
+    let exact_destination = job
+        .get("canonicalUrl")
+        .and_then(Value::as_str)
+        .expect("validated approved job has an exact canonical URL")
+        .to_string();
     attach_approved_execution_transport(application, &mut packet, approved_packet_checksum)?;
     Ok(json!({
         "accountId": account_id,
@@ -2887,7 +2908,7 @@ fn approved_workflow_input(
         "packet": packet,
         "job": job,
         "runner": runner,
-        "url": posting.canonical_url,
+        "url": exact_destination,
         "idempotencyKey": run_id,
     }))
 }
@@ -2932,10 +2953,11 @@ fn freeze_approved_execution(
     state: &AppState,
     account_id: &str,
     account_email: &str,
-    application: &JobApplication,
-    posting: &JobPosting,
+    authority: &jobs::CurrentApplicationApprovalAuthority,
     resume: &ResumeVersion,
 ) -> Result<JobApplication, ApiError> {
+    let application = &authority.application;
+    let posting = &authority.posting;
     let (identity_id, identity_email) = approved_application_identity(application)?;
     if application.receipt.get("approved_execution").is_some() {
         if application.submission_mode == "auto_submit"
@@ -2948,7 +2970,7 @@ fn freeze_approved_execution(
             ));
         }
         let (packet, job, _) = approved_execution_snapshot(application)?;
-        validate_approved_execution_matches(
+        if validate_approved_execution_matches(
             application,
             posting,
             resume,
@@ -2956,8 +2978,15 @@ fn freeze_approved_execution(
             &identity_email,
             &packet,
             &job,
-        )?;
-        return Ok(application.clone());
+        )
+        .is_ok()
+            && jobs::application_job_integrity_receipt(application)
+                .map_err(internal)?
+                .as_ref()
+                == Some(&authority.job_integrity)
+        {
+            return Ok(application.clone());
+        }
     }
 
     let profile = jobs::get_profile(&state.pool, account_id, account_email).map_err(internal)?;
@@ -2995,25 +3024,11 @@ fn freeze_approved_execution(
             &posting.track_id,
         )
         .map_err(domain_error)?;
-        let resolution = jobs::resolve_ats_certification_for_posting(
-            &state.pool,
-            account_id,
-            posting,
-            None,
-            approved_at_ms,
-        )
-        .map_err(|error| match error {
-            jobs::AtsCertificationAuthorityError::Storage(error) => internal(error),
-            _ => (
-                StatusCode::CONFLICT,
-                "This exact ATS target does not have current server-owned certification. Review the packet or try again after certification is restored."
-                    .to_string(),
-            ),
-        })?;
-        let binding = resolution
+        let binding = authority
+            .ats_certification
             .active_binding
             .as_ref()
-            .filter(|_| resolution.status.status == "active")
+            .filter(|_| authority.ats_certification.status.status == "active")
             .ok_or_else(|| {
                 (
                     StatusCode::CONFLICT,
@@ -3058,17 +3073,15 @@ fn freeze_approved_execution(
         "packet": packet,
         "job": job,
     });
-    let mut receipt = application.receipt.clone();
-    if !receipt.is_object() {
-        receipt = json!({});
-    }
-    receipt
-        .as_object_mut()
-        .expect("application receipt is an object")
-        .insert("approved_execution".to_string(), approved_execution);
-    jobs::replace_application_receipt(&state.pool, account_id, &application.id, receipt)
-        .map_err(internal)?
-        .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
+    jobs::persist_current_application_approval(
+        &state.pool,
+        account_id,
+        account_email,
+        authority,
+        &approved_execution,
+    )
+    .map_err(domain_error)?
+    .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))
 }
 
 fn approved_execution_snapshot(
@@ -3826,9 +3839,33 @@ pub async fn update_intervention(
                     .iter()
                     .any(|session| session.id == run_id && session.runner == "local");
             if !local_session {
-                let posting = jobs::get_posting(&state.pool, &account.id, &application.job_id)
-                    .map_err(internal)?
-                    .ok_or((StatusCode::NOT_FOUND, "Job not found.".to_string()))?;
+                let current_authority = jobs::current_application_approval_authority(
+                    &state.pool,
+                    &account.id,
+                    &account.email,
+                    &application.id,
+                )
+                .map_err(domain_error)?
+                .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
+                if current_authority.application.run_id.as_deref() != Some(run_id)
+                    || jobs::application_job_integrity_receipt(&current_authority.application)
+                        .map_err(internal)?
+                        .as_ref()
+                        != Some(&current_authority.job_integrity)
+                    || !current_authority
+                        .posting
+                        .eligibility
+                        .as_ref()
+                        .is_some_and(|eligibility| eligibility.can_queue_cloud)
+                {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        "The approved packet no longer has current signed cloud-runner authority."
+                            .to_string(),
+                    ));
+                }
+                let application = current_authority.application;
+                let posting = current_authority.posting;
                 let resume_id = application.resume_version_id.as_deref().ok_or((
                     StatusCode::CONFLICT,
                     "The approved application resume is unavailable.".to_string(),
@@ -4899,17 +4936,6 @@ async fn save_local_run_result(
     }
     let (bound_application, bound_session) = local_result_binding(&state, &ticket, &run_id)?;
     match ticket.status.as_str() {
-        "failed" if status == "failed" && bound_application.state == "failed" => {
-            object_uploads::release_submission_evidence_capacity(
-                &state.pool,
-                &ticket.account_id,
-                &ticket.application_id,
-                &run_id,
-                jobs::now_ms(),
-            )
-            .map_err(internal)?;
-            return Ok(Json(bound_application));
-        }
         "side_effect_unknown"
             if status == "side_effect_unknown"
                 && bound_application.state == "side_effect_unknown" => {}
@@ -4933,35 +4959,19 @@ async fn save_local_run_result(
     }
     let application = match status.as_str() {
         "needs_input" => {
-            create_intervention_from_receipt(
-                &state,
-                &ticket.account_id,
-                &ticket.application_id,
-                req.receipt,
-            )?;
-            let application = jobs::update_application(
-                &state.pool,
-                &ticket.account_id,
-                &ticket.application_id,
-                "needs_input",
-                None,
-            )
-            .map_err(domain_error)?
-            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-            update_worker_browser_session(
-                &state,
-                &ticket.account_id,
-                &ticket.application_id,
-                "needs_input",
-            )?;
-            jobs::update_local_run_ticket_status(
+            let (intervention, takeover_url) =
+                intervention_from_receipt(&ticket.application_id, req.receipt)?;
+            jobs::commit_local_run_result(
                 &state.pool,
                 &run_id,
                 &ticket.ticket_hash,
-                "needs_input",
+                jobs::LocalRunResultCommitInput {
+                    status: "needs_input".to_string(),
+                    intervention: Some(intervention),
+                    takeover_url,
+                },
             )
-            .map_err(internal)?;
-            application
+            .map_err(submission_domain_error)?
         }
         "submitted" => {
             let application =
@@ -5006,39 +5016,17 @@ async fn save_local_run_result(
             .await?;
             application
         }
-        "failed" => {
-            let application = jobs::update_application(
-                &state.pool,
-                &ticket.account_id,
-                &ticket.application_id,
-                "failed",
-                None,
-            )
-            .map_err(domain_error)?
-            .ok_or((StatusCode::NOT_FOUND, "Application not found.".to_string()))?;
-            update_worker_browser_session(
-                &state,
-                &ticket.account_id,
-                &ticket.application_id,
-                "failed",
-            )?;
-            jobs::update_local_run_ticket_status(
-                &state.pool,
-                &run_id,
-                &ticket.ticket_hash,
-                "failed",
-            )
-            .map_err(internal)?;
-            object_uploads::release_submission_evidence_capacity(
-                &state.pool,
-                &ticket.account_id,
-                &ticket.application_id,
-                &run_id,
-                jobs::now_ms(),
-            )
-            .map_err(internal)?;
-            application
-        }
+        "failed" => jobs::commit_local_run_result(
+            &state.pool,
+            &run_id,
+            &ticket.ticket_hash,
+            jobs::LocalRunResultCommitInput {
+                status: "failed".to_string(),
+                intervention: None,
+                takeover_url: None,
+            },
+        )
+        .map_err(submission_domain_error)?,
         "side_effect_unknown" => {
             let capacity = local_submission_evidence_capacity(
                 &state,
@@ -6542,6 +6530,28 @@ fn managed_execution_lease_authority_input(
     Ok(authority)
 }
 
+fn required_managed_execution_lease_authority_input(
+    workflow_request_id: Option<&str>,
+    release: Option<&jobs::ManagedCloudReleaseMemoAuthority>,
+    release_sha256: Option<&str>,
+    runtime_instance_id: Option<&str>,
+    runtime_instance_epoch: Option<i64>,
+) -> Result<jobs::ManagedCloudExecutionLeaseClaimInput, ApiError> {
+    managed_execution_lease_authority_input(
+        workflow_request_id,
+        release,
+        release_sha256,
+        runtime_instance_id,
+        runtime_instance_epoch,
+    )?
+    .ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "Managed-cloud execution authority is required.".to_string(),
+        )
+    })
+}
+
 fn valid_managed_workflow_request_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("wfreq-v2-") else {
         return false;
@@ -6579,19 +6589,13 @@ async fn worker_authorize_managed_execution_effect(
     if worker.scope == "debug" {
         return Err((StatusCode::UNAUTHORIZED, "Unauthorized".to_string()));
     }
-    let managed_cloud = managed_execution_lease_authority_input(
+    let managed_cloud = required_managed_execution_lease_authority_input(
         req.workflow_request_id.as_deref(),
         req.managed_cloud_release.as_ref(),
         req.managed_cloud_release_sha256.as_deref(),
         req.managed_cloud_runtime_instance_id.as_deref(),
         req.managed_cloud_runtime_instance_epoch,
-    )?
-    .ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "Managed-cloud execution authority is required.".to_string(),
-        )
-    })?;
+    )?;
     jobs::authorize_managed_execution_effect(
         &state.pool,
         &req.account_id,
@@ -6599,7 +6603,7 @@ async fn worker_authorize_managed_execution_effect(
         &run_id,
         &req.lease_token,
         req.fence,
-        Some(&managed_cloud),
+        &managed_cloud,
         &worker.worker_id,
     )
     .map(worker_execution_lease_json_response)
@@ -7310,9 +7314,31 @@ fn create_intervention_from_receipt(
     state: &AppState,
     account_id: &str,
     application_id: &str,
-    mut receipt: Value,
+    receipt: Value,
 ) -> Result<Intervention, ApiError> {
     ensure_worker_application(state, account_id, application_id)?;
+    let (intervention, takeover_url) = intervention_from_receipt(application_id, receipt)?;
+    let saved =
+        jobs::save_intervention(&state.pool, account_id, &intervention).map_err(internal)?;
+    if let Some(takeover_url) = takeover_url {
+        if let Some(mut session) = jobs::list_browser_sessions(&state.pool, account_id)
+            .map_err(internal)?
+            .into_iter()
+            .find(|session| session.application_id.as_deref() == saved.application_id.as_deref())
+        {
+            session.status = "needs_input".to_string();
+            session.current_step = saved.title.clone();
+            session.takeover_url = Some(takeover_url);
+            jobs::upsert_browser_session(&state.pool, account_id, &session).map_err(internal)?;
+        }
+    }
+    Ok(saved)
+}
+
+fn intervention_from_receipt(
+    application_id: &str,
+    mut receipt: Value,
+) -> Result<(Intervention, Option<String>), ApiError> {
     if let Some(receipt) = receipt.as_object_mut() {
         receipt.remove("screenshotPath");
     }
@@ -7365,26 +7391,9 @@ fn create_intervention_from_receipt(
         created_at_ms: 0,
         resolved_at_ms: None,
     };
-    let saved =
-        jobs::save_intervention(&state.pool, account_id, &intervention).map_err(internal)?;
-    if let Some(takeover_url) = takeover_url {
-        if takeover_url.starts_with("https://") || takeover_url.starts_with("bluey-jobs://") {
-            if let Some(mut session) = jobs::list_browser_sessions(&state.pool, account_id)
-                .map_err(internal)?
-                .into_iter()
-                .find(|session| {
-                    session.application_id.as_deref() == saved.application_id.as_deref()
-                })
-            {
-                session.status = "needs_input".to_string();
-                session.current_step = saved.title.clone();
-                session.takeover_url = Some(takeover_url);
-                jobs::upsert_browser_session(&state.pool, account_id, &session)
-                    .map_err(internal)?;
-            }
-        }
-    }
-    Ok(saved)
+    let takeover_url =
+        takeover_url.filter(|url| url.starts_with("https://") || url.starts_with("bluey-jobs://"));
+    Ok((intervention, takeover_url))
 }
 
 #[derive(Debug, Deserialize)]
@@ -7563,8 +7572,11 @@ async fn persist_submission_receipt(
             &evidence_objects,
             stored_execution_authority,
         )?;
-        return match submission_finalize_error_disposition(Some(&application), &request_fingerprint)
-        {
+        return match submission_finalize_error_disposition(
+            account_id,
+            Some(&application),
+            &request_fingerprint,
+        ) {
             SubmissionFinalizeErrorDisposition::Replay => mark_submitted_cloud_workflow_terminal(
                 &state.pool,
                 application,
@@ -7805,6 +7817,7 @@ async fn persist_submission_receipt(
             // ready objects remain attached to Submitted.
             match jobs::get_application(&state.pool, account_id, application_id) {
                 Ok(application) => match submission_finalize_error_disposition(
+                    account_id,
                     application.as_ref(),
                     &request_fingerprint,
                 ) {
@@ -7848,6 +7861,19 @@ fn mark_submitted_cloud_workflow_terminal(
     run_id: &str,
     expected_runner: &str,
 ) -> Result<JobApplication, ApiError> {
+    jobs::validated_submitted_pre_submission_application(account_id, &application).map_err(
+        |error| {
+            tracing::warn!(
+                application_id_hash = %sha256_hex(application_id.as_bytes()),
+                error = %error,
+                "submitted application final envelope failed authentication"
+            );
+            (
+                StatusCode::CONFLICT,
+                "This application already has a different final receipt.".to_string(),
+            )
+        },
+    )?;
     if expected_runner != "cloud" {
         return Ok(application);
     }
@@ -7880,6 +7906,7 @@ enum SubmissionFinalizeErrorDisposition {
 }
 
 fn submission_finalize_error_disposition(
+    account_id: &str,
     application: Option<&JobApplication>,
     request_fingerprint: &str,
 ) -> SubmissionFinalizeErrorDisposition {
@@ -7897,6 +7924,9 @@ fn submission_finalize_error_disposition(
     {
         return SubmissionFinalizeErrorDisposition::Conflict;
     }
+    if jobs::validated_submitted_pre_submission_application(account_id, application).is_err() {
+        return SubmissionFinalizeErrorDisposition::Conflict;
+    }
     SubmissionFinalizeErrorDisposition::Replay
 }
 
@@ -7909,7 +7939,11 @@ fn reconcile_submission_precommit_error(
 ) -> Result<JobApplication, ApiError> {
     match jobs::get_application(pool, account_id, application_id) {
         Ok(application) => {
-            match submission_finalize_error_disposition(application.as_ref(), request_fingerprint) {
+            match submission_finalize_error_disposition(
+                account_id,
+                application.as_ref(),
+                request_fingerprint,
+            ) {
                 SubmissionFinalizeErrorDisposition::Replay => {
                     Ok(application.expect("replay disposition requires an application"))
                 }
@@ -7954,9 +7988,12 @@ fn submission_authority_snapshot(
     // exact approved packet, Auto-submit admission, identity/evidence binding,
     // metering state, and intervention-driven packet revision history.
     approved_execution_snapshot(application)?;
+    let pre_submission_receipt_sha256 =
+        jobs::submission_pre_receipt_sha256(&application.receipt).map_err(internal)?;
     Ok(json!({
         "schemaVersion": 1,
         "preSubmissionReceipt": application.receipt,
+        "preSubmissionReceiptSha256": pre_submission_receipt_sha256,
         "executionAuthority": execution_authority,
     }))
 }
@@ -9650,8 +9687,14 @@ fn validate_receipt_bundle(
                 StatusCode::BAD_REQUEST,
                 "Receipt is missing its server submission authority.".to_string(),
             ))?;
+        let expected_pre_submission_receipt_sha256 =
+            jobs::submission_pre_receipt_sha256(&application.receipt).map_err(internal)?;
         if authority.get("schemaVersion").and_then(Value::as_i64) != Some(1)
             || authority.get("preSubmissionReceipt") != Some(&application.receipt)
+            || authority
+                .get("preSubmissionReceiptSha256")
+                .and_then(Value::as_str)
+                != Some(expected_pre_submission_receipt_sha256.as_str())
         {
             return bad_request("Receipt submission authority does not match the approved packet.");
         }
@@ -10190,6 +10233,16 @@ fn validation_or_internal(error: anyhow::Error, validation_message: &str) -> Api
 }
 
 pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
+    if matches!(
+        error.downcast_ref::<jobs::OperationalHoldError>(),
+        Some(jobs::OperationalHoldError::Held(_))
+    ) {
+        return (
+            StatusCode::CONFLICT,
+            "This Bluey Jobs action is temporarily held. Review the active operational hold before retrying."
+                .to_string(),
+        );
+    }
     let message = error.to_string();
     let status = if message.contains("another Bluey Jobs account")
         || message.contains("dedicated confirmation flow")
@@ -10204,6 +10257,12 @@ pub(super) fn domain_error(error: anyhow::Error) -> ApiError {
         || message.contains("no longer waiting for an answer")
         || message.contains("awaiting reconciliation")
         || message.contains("execution authority changed")
+        || message.contains("application approval authority")
+        || message.contains("original-source authority changed after application preparation")
+        || message.contains("current signed job-integrity authority does not permit")
+        || message.contains("current original-source destination is unavailable")
+        || message.contains("current ATS certification is unavailable")
+        || message.contains("current signed job-integrity receipt is unavailable")
         || message.contains("application packet revision history is invalid")
         || message.contains("communication action cannot")
         || message.contains("communication action idempotency key was reused")
@@ -10337,6 +10396,152 @@ mod tests {
     use crate::db::jobs::CareerTrackPolicy;
 
     #[test]
+    fn operational_hold_domain_error_is_redacted_conflict_and_storage_stays_internal() {
+        let scope_secret = "acct-secret-never-return";
+        let reason_secret = "incident-secret-never-return";
+        let held = domain_error(anyhow::Error::new(jobs::OperationalHoldError::Held(
+            jobs::OperationalHoldBlock {
+                capability: jobs::OperationalCapability::ApplicationQueue,
+                scope_kind: jobs::OperationalHoldScopeKind::Account,
+                scope_id: scope_secret.to_string(),
+                reason_code: jobs::OperationalHoldReasonCode::SecurityReview,
+                reason_ref: Some(reason_secret.to_string()),
+                head_revision: 7,
+            },
+        )));
+        assert_eq!(held.0, StatusCode::CONFLICT);
+        assert!(!held.1.contains(scope_secret));
+        assert!(!held.1.contains(reason_secret));
+        assert!(!held.1.contains("security_review"));
+
+        let storage = domain_error(anyhow::Error::new(jobs::OperationalHoldError::Storage(
+            anyhow::anyhow!("database-secret-never-return"),
+        )));
+        assert_eq!(storage.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!storage.1.contains("database-secret-never-return"));
+    }
+
+    #[test]
+    fn local_needs_input_and_failed_results_use_one_atomic_database_commit() {
+        let source = include_str!("jobs.rs");
+        let handler = source
+            .split("async fn save_local_run_result(")
+            .nth(1)
+            .expect("local result handler")
+            .split("async fn replay_submitted_local_run_result(")
+            .next()
+            .expect("bounded local result handler");
+        assert_eq!(handler.matches("jobs::commit_local_run_result(").count(), 2);
+        for forbidden in [
+            "create_intervention_from_receipt(",
+            "jobs::update_local_run_ticket_status(",
+            "object_uploads::release_submission_evidence_capacity(",
+        ] {
+            assert!(
+                !handler.contains(forbidden),
+                "local result handler retains non-atomic {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_submit_prepare_has_no_post_commit_approval_freeze() {
+        let prepare = include_str!("jobs.rs")
+            .split_once("pub async fn prepare_application(")
+            .expect("prepare application API implementation")
+            .1
+            .split_once("pub async fn update_application(")
+            .expect("bounded prepare application API implementation")
+            .0;
+        let finalized = prepare
+            .find("jobs::finalize_prepared_application_kit(")
+            .expect("authoritative prepared application finalization");
+        let reservation = prepare
+            .find("jobs::reserve_application_attempt(")
+            .expect("post-finalization attempt reservation");
+
+        assert!(finalized < reservation);
+        assert!(!prepare.contains("freeze_approved_execution("));
+    }
+
+    #[test]
+    fn approval_queue_and_cloud_resume_use_current_composed_authority() {
+        let source = include_str!("jobs.rs");
+        let approval = source
+            .split_once("pub async fn approve_application_packet(")
+            .expect("application approval endpoint")
+            .1
+            .split_once("pub async fn application_evidence(")
+            .expect("bounded application approval endpoint")
+            .0;
+        for required in [
+            "jobs::current_application_approval_authority(",
+            "approval_authority.posting.eligibility.as_ref()",
+            "freeze_approved_execution(",
+            "jobs::reserve_application_attempt(",
+            "jobs::update_application(",
+        ] {
+            assert!(approval.contains(required), "approval missing {required}");
+        }
+        assert!(!approval.contains("evaluate_job_eligibility("));
+        assert!(!approval.contains("jobs::get_posting("));
+
+        let queue = source
+            .split_once("pub async fn queue_application_run(")
+            .expect("application runner queue endpoint")
+            .1
+            .split_once("fn application_run_id(")
+            .expect("bounded application runner queue endpoint")
+            .0;
+        for required in [
+            "jobs::current_application_approval_authority(",
+            "jobs::application_job_integrity_receipt(&current_authority.application)",
+            "let posting = current_authority.posting",
+            "let eligibility = posting.eligibility.as_ref()",
+            "approved_workflow_input(",
+        ] {
+            assert!(queue.contains(required), "queue missing {required}");
+        }
+        assert!(!queue.contains("evaluate_job_eligibility("));
+        assert!(!queue.contains("jobs::get_posting("));
+
+        let intervention = source
+            .split_once("pub async fn update_intervention(")
+            .expect("intervention endpoint")
+            .1
+            .split_once("fn is_provider_final_review_intervention(")
+            .expect("bounded intervention endpoint")
+            .0;
+        let cloud_resume = intervention
+            .split_once("if !local_session {")
+            .expect("cloud intervention resume branch")
+            .1
+            .split_once("let mut saved = if action == \"approve_submission\"")
+            .expect("bounded cloud intervention resume branch")
+            .0;
+        for required in [
+            "jobs::current_application_approval_authority(",
+            "jobs::application_job_integrity_receipt(&current_authority.application)",
+            ".eligibility",
+            "approved_workflow_input(",
+        ] {
+            assert!(cloud_resume.contains(required), "resume missing {required}");
+        }
+        assert!(!cloud_resume.contains("evaluate_job_eligibility("));
+
+        let workflow = source
+            .split_once("fn approved_workflow_input(")
+            .expect("approved workflow input")
+            .1
+            .split_once("fn browser_profile_id(")
+            .expect("bounded approved workflow input")
+            .0;
+        assert!(workflow.contains("let exact_destination = job"));
+        assert!(workflow.contains("\"url\": exact_destination"));
+        assert!(!workflow.contains("\"url\": posting.canonical_url"));
+    }
+
+    #[test]
     fn career_track_writes_require_the_exact_taxonomy_binding() {
         let missing = require_current_taxonomy_write(&HeaderMap::new()).unwrap_err();
         assert_eq!(missing.0, StatusCode::CONFLICT);
@@ -10409,6 +10614,114 @@ mod tests {
         ] {
             assert!(!valid_managed_workflow_request_id(invalid));
         }
+    }
+
+    #[test]
+    fn managed_execution_effect_requires_complete_http_authority() {
+        let missing =
+            required_managed_execution_lease_authority_input(None, None, None, None, None)
+                .unwrap_err();
+        assert_eq!(missing.0, StatusCode::BAD_REQUEST);
+        assert_eq!(missing.1, "Managed-cloud execution authority is required.");
+
+        let incomplete = required_managed_execution_lease_authority_input(
+            Some("wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(incomplete.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            incomplete.1,
+            "Managed-cloud execution authority must be complete."
+        );
+    }
+
+    #[test]
+    fn irreversible_submit_handler_preserves_managed_unmanaged_input_pairing() {
+        let source = include_str!("jobs.rs");
+        let handler = source
+            .split("async fn worker_start_irreversible_submission(")
+            .nth(1)
+            .expect("managed irreversible-submit handler")
+            .split("async fn worker_finish_execution_lease(")
+            .next()
+            .expect("bounded managed irreversible-submit handler");
+        assert!(handler.contains("let managed_cloud = managed_execution_lease_authority_input("));
+        assert!(handler.contains("managed_cloud.as_ref()"));
+
+        assert!(
+            managed_execution_lease_authority_input(None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        let incomplete = managed_execution_lease_authority_input(
+            Some("wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(incomplete.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            incomplete.1,
+            "Managed-cloud execution authority must be complete."
+        );
+    }
+
+    #[test]
+    fn managed_execution_effect_preserves_complete_http_authority() {
+        let release = jobs::ManagedCloudReleaseMemoAuthority {
+            version: 1,
+            execution: jobs::ManagedCloudExecutionAuthority {
+                binding_sha256: "2".repeat(64),
+                admission: jobs::ManagedCloudAdmissionAuthority {
+                    scope: jobs::ManagedCloudScope {
+                        environment: "production".to_string(),
+                        region: "us-east-1".to_string(),
+                        channel: "canary".to_string(),
+                    },
+                    head_revision: 1,
+                    transition_sha256: "a".repeat(64),
+                    activation_sha256: "b".repeat(64),
+                    manifest_sha256: "c".repeat(64),
+                    cohort_sha256: "d".repeat(64),
+                    trust_generation: 1,
+                    channel_sequence: 1,
+                    release_id: "release-611".to_string(),
+                    release_sequence: 1,
+                    task_queue_sha256: "e".repeat(64),
+                    failure_converter_sha256: "f".repeat(64),
+                    readiness_sha256: "1".repeat(64),
+                    activation_expires_at_ms: 2_000,
+                    resolved_at_ms: 1_000,
+                },
+            },
+        };
+        let release_sha256 = jobs::managed_cloud_release_memo_sha256(&release).unwrap();
+        let authority = required_managed_execution_lease_authority_input(
+            Some("wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"),
+            Some(&release),
+            Some(&release_sha256),
+            Some("runtime-instance-123456789"),
+            Some(7),
+        )
+        .unwrap();
+
+        assert_eq!(
+            authority.workflow_request_id,
+            "wfreq-v2-01234567-89ab-5cde-8f01-23456789abcd"
+        );
+        assert_eq!(authority.managed_cloud_release, release);
+        assert_eq!(authority.managed_cloud_release_sha256, release_sha256);
+        assert_eq!(
+            authority.managed_cloud_runtime_instance_id,
+            "runtime-instance-123456789"
+        );
+        assert_eq!(authority.managed_cloud_runtime_instance_epoch, 7);
     }
 
     #[test]
@@ -11131,6 +11444,95 @@ mod tests {
     }
 
     #[test]
+    fn match_route_helpers_return_only_current_projected_postings_and_decisions() {
+        let pool = discovery_enrollment_test_pool();
+        let mut stored = store_discovery_posting(
+            &pool,
+            "acct-one",
+            &imported_discovery_posting(
+                "greenhouse_import",
+                "https://boards.greenhouse.io/acme/jobs/job-123",
+                "track-one",
+            ),
+        );
+        stored.discovery_evidence.provenance = "original_source".to_string();
+        stored.discovery_evidence.employer_verification_status = "verified".to_string();
+        stored.discovery_evidence.employer_id = Some("legacy-employer".to_string());
+        stored.discovery_evidence.canonical_employer_domain =
+            Some("legacy-employer.example".to_string());
+        stored.discovery_evidence.scam_risk_status = "clear".to_string();
+        stored.eligibility = Some(JobEligibilityDecision {
+            can_auto_submit: true,
+            can_queue_local: true,
+            can_queue_cloud: true,
+            ..JobEligibilityDecision::default()
+        });
+        let payload = serde_json::to_string(&stored).expect("serialize legacy route posting");
+        pool.get()
+            .expect("legacy route posting connection")
+            .execute(
+                "UPDATE jobs_postings SET posting_json = ?2
+                  WHERE account_id = ?1 AND id = ?3",
+                rusqlite::params!["acct-one", payload, stored.id],
+            )
+            .expect("inject legacy route posting");
+        let account = crate::db::accounts::Account::fetch_by_id(&pool, "acct-one")
+            .expect("fetch match-route account")
+            .expect("match-route account");
+
+        let list = current_match_representations(&pool, &account)
+            .expect("list current match representations")
+            .0;
+        let listed = list
+            .into_iter()
+            .find(|posting| posting.id == stored.id)
+            .expect("listed current match representation");
+        let detailed = current_match_representation(&pool, &account, &stored.id)
+            .expect("get current match representation")
+            .0;
+
+        for represented in [&listed, &detailed] {
+            assert_eq!(
+                represented.discovery_evidence.employer_verification_status,
+                "unknown"
+            );
+            assert_eq!(represented.discovery_evidence.employer_id, None);
+            assert_eq!(
+                represented.discovery_evidence.canonical_employer_domain,
+                None
+            );
+            assert_eq!(represented.discovery_evidence.scam_risk_status, "unknown");
+            let eligibility = represented
+                .eligibility
+                .as_ref()
+                .expect("current match eligibility");
+            assert!(!eligibility.can_auto_submit);
+            assert!(!eligibility.can_queue_local);
+            assert!(!eligibility.can_queue_cloud);
+            assert!(eligibility
+                .review_reasons
+                .iter()
+                .any(|reason| reason.code == "employer_identity_unverified"));
+            assert!(eligibility
+                .review_reasons
+                .iter()
+                .any(|reason| reason.code == "job_risk_review_required"));
+        }
+        assert_eq!(
+            listed
+                .eligibility
+                .as_ref()
+                .expect("listed eligibility")
+                .review_reasons,
+            detailed
+                .eligibility
+                .as_ref()
+                .expect("detailed eligibility")
+                .review_reasons
+        );
+    }
+
+    #[test]
     fn client_supplied_track_id_cannot_bypass_plan_limit() {
         let current = vec![test_track("existing-track")];
         let error =
@@ -11700,6 +12102,10 @@ mod tests {
         receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY] = json!({
             "schemaVersion": 1,
             "preSubmissionReceipt": application.receipt.clone(),
+            "preSubmissionReceiptSha256": jobs::submission_pre_receipt_sha256(
+                &application.receipt,
+            )
+            .unwrap(),
             "executionAuthority": {
                 "kind": "cloud_execution_lease",
                 "ownerId": "runner-test",
@@ -11714,6 +12120,25 @@ mod tests {
             (receipt_key.to_string(), receipt_sha),
         ]);
         (application, posting, resume, receipt, verified_objects)
+    }
+
+    fn authenticated_submitted_application_fixture(fingerprint: &str) -> JobApplication {
+        let (mut application, _, _, mut receipt, _) = strict_receipt_fixture();
+        receipt["receiptId"] = json!("receipt-authenticated-replay");
+        receipt["accountId"] = json!("acct-test");
+        receipt["applicationId"] = json!(application.id);
+        receipt["runId"] = json!("run-test");
+        receipt["runner"] = json!("cloud");
+        receipt["result"] = json!({
+            "status": "submitted",
+            "confirmationText": "Application received",
+        });
+        receipt[SUBMISSION_FINGERPRINT_KEY] = json!(fingerprint);
+        application.state = "submitted".to_string();
+        application.receipt = receipt;
+        jobs::validated_submitted_pre_submission_application("acct-test", &application)
+            .expect("authenticated submitted application fixture");
+        application
     }
 
     fn two_screenshot_evidence_fixture() -> (JobApplication, Vec<ApplicationEvidence>) {
@@ -12103,6 +12528,118 @@ mod tests {
         assert!(error.1.contains("changed after review"));
     }
 
+    fn exact_destination_workflow_input(
+        exact_destination: &str,
+        source: &str,
+        auto_submit: bool,
+    ) -> Value {
+        let (mut application, mut posting, resume, _, _) = strict_receipt_fixture();
+        application.state = "queued".to_string();
+        application.submission_mode = if auto_submit {
+            "auto_submit".to_string()
+        } else {
+            "review_first".to_string()
+        };
+        posting.canonical_url = exact_destination.to_string();
+        posting.source = source.to_string();
+        let packet = application.receipt["approved_execution"]["packet"].clone();
+        let mut job = application.receipt["approved_execution"]["job"].clone();
+        job["canonicalUrl"] = json!(exact_destination);
+        job["source"] = json!(source);
+        let (schema_version, admission) = if auto_submit {
+            (
+                3,
+                json!({
+                    "kind": "track_auto_submit",
+                    "authorization_id": "auto-auth-exact-destination",
+                    "career_track_id": "track-test",
+                    "revision_no": 4,
+                    "authority_fingerprint": "1".repeat(64),
+                    "ats_certification": {
+                        "schema_version": 1,
+                        "provider": "lever",
+                        "adapter_version": "2026.07.0-beta.1",
+                        "manifest_sha256": "2".repeat(64),
+                        "activation_sha256": "3".repeat(64),
+                        "activation_generation": 5,
+                        "target_key_sha256": "6".repeat(64),
+                        "layout_set_sha256": "7".repeat(64),
+                        "variant_key": "lever_application",
+                        "layout_contract_version": 1,
+                        "surface_sha256": "4".repeat(64),
+                        "adapter_bundle_sha256": "8".repeat(64),
+                        "runner_target_sha256s": ["9".repeat(64)],
+                        "expires_at_ms": 9_007_199_254_740_000_i64,
+                    }
+                }),
+            )
+        } else {
+            (2, json!({ "kind": "review_approval" }))
+        };
+        let checksum =
+            approved_execution_checksum_with_admission(schema_version, &packet, &job, &admission)
+                .unwrap();
+        application.receipt["approved_execution"] = json!({
+            "schema_version": schema_version,
+            "approved_at_ms": 1,
+            "checksum": checksum,
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        });
+
+        approved_workflow_input(
+            "acct-test",
+            &application,
+            &posting,
+            &resume,
+            "local",
+            "run-exact-destination",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn manual_review_workflow_preserves_projected_ashby_and_smartrecruiters_destinations() {
+        for (raw_posting_url, exact_destination, source) in [
+            (
+                "https://jobs.ashbyhq.com/acme/abc",
+                "https://jobs.ashbyhq.com/acme/abc/application",
+                "ashby",
+            ),
+            (
+                "https://jobs.smartrecruiters.com/acme/abc-platform-engineer",
+                "https://www.smartrecruiters.com/acme/abc-platform-engineer",
+                "smartrecruiters",
+            ),
+        ] {
+            let workflow = exact_destination_workflow_input(exact_destination, source, false);
+            assert_ne!(workflow["url"], json!(raw_posting_url));
+            assert_eq!(workflow["url"], json!(exact_destination));
+            assert_eq!(workflow["job"]["canonicalUrl"], json!(exact_destination));
+            assert_eq!(workflow["job"]["source"], json!(source));
+        }
+    }
+
+    #[test]
+    fn auto_submit_workflow_preserves_the_frozen_lever_application_destination() {
+        let raw_posting_url = "https://jobs.lever.co/acme/abc";
+        let exact_destination = "https://jobs.lever.co/acme/abc/apply";
+        let workflow = exact_destination_workflow_input(exact_destination, "lever", true);
+
+        assert_ne!(workflow["url"], json!(raw_posting_url));
+        assert_eq!(workflow["url"], json!(exact_destination));
+        assert_eq!(workflow["job"]["canonicalUrl"], json!(exact_destination));
+        assert_eq!(
+            workflow["packet"]["approvedExecutionSchemaVersion"],
+            json!(3)
+        );
+        assert_eq!(
+            workflow["packet"]["approvedExecutionAdmission"]["ats_certification"]["provider"],
+            json!("lever")
+        );
+    }
+
     #[test]
     fn auto_submit_admission_is_bound_into_the_approved_packet_checksum() {
         let (mut application, _, _, _, _) = strict_receipt_fixture();
@@ -12179,6 +12716,14 @@ mod tests {
         .unwrap();
         let preserved = authority.get("preSubmissionReceipt").unwrap();
         assert_eq!(preserved, &application.receipt);
+        let expected_pre_submission_receipt_sha256 =
+            jobs::submission_pre_receipt_sha256(&application.receipt).unwrap();
+        assert_eq!(
+            authority
+                .get("preSubmissionReceiptSha256")
+                .and_then(Value::as_str),
+            Some(expected_pre_submission_receipt_sha256.as_str())
+        );
         assert_eq!(
             preserved
                 .pointer("/approved_execution/admission/authorization_id")
@@ -12218,32 +12763,95 @@ mod tests {
     }
 
     #[test]
-    fn finalize_error_reconciliation_never_deletes_an_uncertain_committed_receipt() {
-        let (mut application, _, _, _, _) = strict_receipt_fixture();
+    fn finalize_error_reconciliation_requires_an_authenticated_committed_receipt() {
         let fingerprint = "f".repeat(64);
-        application.state = "submitted".to_string();
-        application.receipt[SUBMISSION_FINGERPRINT_KEY] = json!(fingerprint);
+        let mut application = authenticated_submitted_application_fixture(&fingerprint);
 
         assert_eq!(
-            submission_finalize_error_disposition(Some(&application), &fingerprint),
+            submission_finalize_error_disposition("acct-test", Some(&application), &fingerprint),
             SubmissionFinalizeErrorDisposition::Replay
+        );
+
+        let mut tampered = application.clone();
+        tampered.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!("0".repeat(64));
+        assert_eq!(
+            submission_finalize_error_disposition("acct-test", Some(&tampered), &fingerprint),
+            SubmissionFinalizeErrorDisposition::Conflict
         );
 
         application.receipt[SUBMISSION_FINGERPRINT_KEY] = json!("e".repeat(64));
         assert_eq!(
-            submission_finalize_error_disposition(Some(&application), &fingerprint),
+            submission_finalize_error_disposition("acct-test", Some(&application), &fingerprint),
             SubmissionFinalizeErrorDisposition::Conflict
         );
 
         application.state = "running".to_string();
         assert_eq!(
-            submission_finalize_error_disposition(Some(&application), &fingerprint),
+            submission_finalize_error_disposition("acct-test", Some(&application), &fingerprint),
             SubmissionFinalizeErrorDisposition::NotCommitted
         );
         assert_eq!(
-            submission_finalize_error_disposition(None, &fingerprint),
+            submission_finalize_error_disposition("acct-test", None, &fingerprint),
             SubmissionFinalizeErrorDisposition::NotCommitted
         );
+    }
+
+    #[test]
+    fn submitted_receipt_authentication_keeps_schema_one_admission_optional_only() {
+        let fingerprint = "f".repeat(64);
+        let application = authenticated_submitted_application_fixture(&fingerprint);
+        jobs::validated_submitted_pre_submission_application("acct-test", &application).unwrap();
+
+        let mut schema_two_without_admission = application;
+        let pre_submission_receipt = schema_two_without_admission.receipt
+            [jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            .as_object_mut()
+            .expect("fixture has a pre-submission receipt");
+        pre_submission_receipt["approved_execution"]["schema_version"] = json!(2);
+        pre_submission_receipt["approved_execution"]
+            .as_object_mut()
+            .expect("fixture has approved execution")
+            .remove("admission");
+        let pre_submission_receipt = schema_two_without_admission.receipt
+            [jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            .clone();
+        schema_two_without_admission.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]
+            ["preSubmissionReceiptSha256"] =
+            json!(jobs::submission_pre_receipt_sha256(&pre_submission_receipt).unwrap());
+
+        let error = jobs::validated_submitted_pre_submission_application(
+            "acct-test",
+            &schema_two_without_admission,
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("approved execution admission is missing"));
+    }
+
+    #[test]
+    fn terminal_workflow_mutation_follows_full_envelope_authentication() {
+        let source = include_str!("jobs.rs");
+        let terminal = source
+            .split_once("fn mark_submitted_cloud_workflow_terminal(")
+            .expect("submitted workflow terminal helper")
+            .1
+            .split_once("enum SubmissionFinalizeErrorDisposition")
+            .expect("bounded submitted workflow terminal helper")
+            .0;
+        let authenticated = terminal
+            .find("jobs::validated_submitted_pre_submission_application(")
+            .expect("full submitted-envelope authentication");
+        let local_return = terminal
+            .find("if expected_runner != \"cloud\"")
+            .expect("local terminal return");
+        let workflow_mutation = terminal
+            .find("jobs::mark_jobs_workflow_execution_submitted(")
+            .expect("cloud workflow terminal mutation");
+
+        assert!(authenticated < local_return);
+        assert!(local_return < workflow_mutation);
     }
 
     #[test]
@@ -12255,10 +12863,8 @@ mod tests {
         ));
         let pool = crate::db::open_pool(&path).unwrap();
         crate::db::run_migrations(&pool).unwrap();
-        let (mut application, _, _, _, _) = strict_receipt_fixture();
         let fingerprint = "f".repeat(64);
-        application.state = "submitted".to_string();
-        application.receipt[SUBMISSION_FINGERPRINT_KEY] = json!(&fingerprint);
+        let mut application = authenticated_submitted_application_fixture(&fingerprint);
         let payload = serde_json::to_string(&application).unwrap();
         let conn = pool.get().unwrap();
         conn.execute(
@@ -12300,6 +12906,50 @@ mod tests {
         .unwrap();
         assert_eq!(replay.state, "submitted");
 
+        let valid_final_receipt = application.receipt.clone();
+        application.receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!("0".repeat(64));
+        let payload = serde_json::to_string(&application).unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?1 WHERE id = 'app-test'",
+                rusqlite::params![payload],
+            )
+            .unwrap();
+        let before_tampered_replay: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT application_json FROM jobs_applications WHERE id = 'app-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let tampered = reconcile_submission_precommit_error(
+            &pool,
+            "acct-test",
+            "app-test",
+            &fingerprint,
+            (
+                StatusCode::BAD_GATEWAY,
+                "original upload failure".to_string(),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(tampered.0, StatusCode::CONFLICT);
+        let after_tampered_replay: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT application_json FROM jobs_applications WHERE id = 'app-test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after_tampered_replay, before_tampered_replay);
+
+        application.receipt = valid_final_receipt;
         application.receipt[SUBMISSION_FINGERPRINT_KEY] = json!("e".repeat(64));
         let payload = serde_json::to_string(&application).unwrap();
         pool.get()
@@ -13614,6 +14264,8 @@ mod tests {
         receipt["receiptObject"]["schemaVersion"] = json!(2);
         receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"] =
             application.receipt.clone();
+        receipt[jobs::SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!(jobs::submission_pre_receipt_sha256(&application.receipt).unwrap());
 
         CertifiedReceiptValidationFixture {
             pool,

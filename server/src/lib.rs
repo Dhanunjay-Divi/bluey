@@ -17,6 +17,9 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "integration-test-support", not(debug_assertions)))]
+compile_error!("integration-test-support must never be enabled in release builds");
+
 pub mod api;
 pub mod auth;
 pub mod billing;

@@ -1,3 +1,6 @@
+use super::production_positive_authority_fixture::{
+    install_production_positive_job_authorities, save_production_positive_verified_import,
+};
 use super::*;
 use crate::db;
 use serde_json::json;
@@ -86,6 +89,98 @@ fn postgres_pool() -> Option<DbPool> {
         .expect("count replayed PostgreSQL operational-hold migration ledger rows")
         .get::<_, i64>(0);
     assert_eq!(operational_hold_ledger_count, 1);
+    for migration_id in [
+        db::JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
+        db::JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+    ] {
+        let ledger_count = conn
+            .query_one(
+                "SELECT COUNT(*) FROM bluey_schema_migrations WHERE version = $1",
+                &[&migration_id],
+            )
+            .expect("count replayed PostgreSQL source/integrity migration ledger rows")
+            .get::<_, i64>(0);
+        assert_eq!(
+            ledger_count, 1,
+            "PostgreSQL migration {migration_id} must be recorded exactly once"
+        );
+    }
+
+    let mut phase614b_tables = conn
+        .query(
+            "SELECT relation.relname
+               FROM pg_class AS relation
+               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = current_schema()
+                AND relation.relkind = 'r'
+                AND starts_with(relation.relname, 'jobs_job_integrity_')",
+            &[],
+        )
+        .expect("query replayed PostgreSQL Phase 614B tables")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    phase614b_tables.sort();
+    let mut expected_phase614b_tables = [
+        "jobs_job_integrity_attestations",
+        "jobs_job_integrity_control",
+        "jobs_job_integrity_head_transitions",
+        "jobs_job_integrity_heads",
+        "jobs_job_integrity_revocations",
+        "jobs_job_integrity_trust_keys",
+        "jobs_job_integrity_trust_policies",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    expected_phase614b_tables.sort();
+    assert_eq!(phase614b_tables, expected_phase614b_tables);
+
+    let mut phase614b_triggers = conn
+        .query(
+            "SELECT trigger.tgname
+               FROM pg_trigger AS trigger
+               JOIN pg_class AS relation ON relation.oid = trigger.tgrelid
+               JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+              WHERE namespace.nspname = current_schema()
+                AND starts_with(relation.relname, 'jobs_job_integrity_')
+                AND starts_with(trigger.tgname, 'trg_jobs_job_integrity_')
+                AND NOT trigger.tgisinternal
+                AND trigger.tgenabled = 'O'",
+            &[],
+        )
+        .expect("query replayed PostgreSQL Phase 614B triggers")
+        .into_iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect::<Vec<_>>();
+    phase614b_triggers.sort();
+    let mut expected_phase614b_triggers = [
+        "trg_jobs_job_integrity_attestations_no_delete",
+        "trg_jobs_job_integrity_attestations_no_update",
+        "trg_jobs_job_integrity_attestations_validate_insert",
+        "trg_jobs_job_integrity_control_monotonic",
+        "trg_jobs_job_integrity_control_no_delete",
+        "trg_jobs_job_integrity_head_transitions_no_delete",
+        "trg_jobs_job_integrity_head_transitions_no_update",
+        "trg_jobs_job_integrity_head_transitions_validate_insert",
+        "trg_jobs_job_integrity_heads_monotonic",
+        "trg_jobs_job_integrity_heads_no_delete",
+        "trg_jobs_job_integrity_heads_validate_insert",
+        "trg_jobs_job_integrity_revocations_no_delete",
+        "trg_jobs_job_integrity_revocations_no_update",
+        "trg_jobs_job_integrity_revocations_validate_insert",
+        "trg_jobs_job_integrity_trust_keys_no_delete",
+        "trg_jobs_job_integrity_trust_keys_no_update",
+        "trg_jobs_job_integrity_trust_keys_validate_insert",
+        "trg_jobs_job_integrity_trust_policies_no_delete",
+        "trg_jobs_job_integrity_trust_policies_no_update",
+        "trg_jobs_job_integrity_trust_policies_validate_insert",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<Vec<_>>();
+    expected_phase614b_triggers.sort();
+    assert_eq!(phase614b_triggers, expected_phase614b_triggers);
     drop(conn);
     Some(pool)
 }
@@ -1030,22 +1125,132 @@ fn local_authority_fixture(pool: &DbPool, label: &str) -> LocalAuthorityFixture 
     set_entitlement_plan(pool, &account_id, "pro")
         .expect("enable PostgreSQL local-browser entitlement");
     let canonical_url = format!("https://boards.greenhouse.io/acme/jobs/{label}-{suffix}");
-    let mut posting = greenhouse_posting(&canonical_url);
-    posting.track_id = track.id;
-    let posting = upsert_posting(pool, &account_id, &posting, &profile, &preferences)
-        .expect("save PostgreSQL Greenhouse posting");
+    let posting = JobPosting {
+        id: String::new(),
+        canonical_key: String::new(),
+        source: "greenhouse_import".to_string(),
+        external_id: format!("{label}-{suffix}"),
+        company: "Acme".to_string(),
+        title: "Software Engineer".to_string(),
+        location: "New York, NY".to_string(),
+        workplace: "hybrid".to_string(),
+        canonical_url,
+        description: "Build reliable products with Rust and TypeScript.".to_string(),
+        compensation: "$170k-$200k".to_string(),
+        employment_type: "full_time".to_string(),
+        track_id: track.id,
+        match_score: 0,
+        matched_reasons: Vec::new(),
+        missing_requirements: Vec::new(),
+        posted_at_ms: Some(now - 60_000),
+        last_verified_at_ms: Some(now),
+        availability_status: "active".to_string(),
+        status: "matched".to_string(),
+        created_at_ms: 0,
+        updated_at_ms: 0,
+        discovery_evidence: JobDiscoveryEvidence::default(),
+        eligibility: None,
+    };
+    let (posting, managed) = save_production_positive_verified_import(
+        pool,
+        &account_id,
+        &posting,
+        &profile,
+        &preferences,
+    );
+    let authorities = install_production_positive_job_authorities(
+        pool,
+        &account_id,
+        &posting,
+        &managed,
+        "acme.com",
+        &format!("{label}-{suffix}"),
+    );
+    let posting = authorities.posting;
     let (application, _) =
         prepare_application(pool, &account_id, &posting.id, "factual", "review_first")
             .expect("prepare PostgreSQL application");
-    let application = update_application(
+    let authority =
+        current_application_approval_authority(pool, &account_id, &email, &application.id)
+            .expect("resolve PostgreSQL current application approval authority")
+            .expect("PostgreSQL current application approval authority exists");
+    let resume = get_resume_version(
         pool,
         &account_id,
-        &application.id,
-        "queued",
-        Some("review_first"),
+        authority
+            .application
+            .resume_version_id
+            .as_deref()
+            .expect("fixture application has a resume"),
     )
-    .expect("queue PostgreSQL application")
-    .expect("queued PostgreSQL application");
+    .expect("load PostgreSQL resume")
+    .expect("PostgreSQL resume exists");
+    let identity_id = authority
+        .application
+        .receipt
+        .pointer("/application_identity/id")
+        .and_then(Value::as_str)
+        .expect("frozen application identity")
+        .to_string();
+    let identity_email = authority
+        .application
+        .receipt
+        .pointer("/application_identity/email")
+        .and_then(Value::as_str)
+        .expect("frozen application email");
+    let browser_profile_id = execution_browser_profile_id(&account_id, &identity_id);
+    let approved_packet = json!({
+        "applicationId": authority.application.id,
+        "jobId": authority.posting.id,
+        "resumeVersionId": resume.id,
+        "resumeContent": resume.content,
+        "coverLetterContent": authority.application.cover_letter,
+        "answers": {},
+        "verifiedClaimIds": [],
+        "applicationIdentityId": identity_id,
+        "applicationEmail": identity_email,
+        "browserProfileId": browser_profile_id,
+    });
+    let approved_job = json!({
+        "externalId": authority.posting.external_id,
+        "canonicalUrl": authority.posting.canonical_url,
+        "company": authority.posting.company,
+        "title": authority.posting.title,
+        "location": authority.posting.location,
+        "workplace": authority.posting.workplace,
+        "description": authority.posting.description,
+        "source": authority.posting.source,
+        "compensation": authority.posting.compensation,
+    });
+    let admission = json!({ "kind": "review_approval" });
+    let approved_execution = json!({
+        "schema_version": 2,
+        "approved_at_ms": authority.evaluated_at_ms,
+        "checksum": approved_submission_checksum(
+            2,
+            &approved_packet,
+            &approved_job,
+            Some(&admission),
+        )
+        .expect("checksum PostgreSQL approved execution"),
+        "admission": admission,
+        "packet": approved_packet,
+        "job": approved_job,
+    });
+    let application = persist_current_application_approval(
+        pool,
+        &account_id,
+        &email,
+        &authority,
+        &approved_execution,
+    )
+    .expect("persist PostgreSQL current application approval")
+    .expect("PostgreSQL approved application exists");
+    reserve_application_attempt(pool, &account_id, &application.id, "local")
+        .expect("reserve PostgreSQL local application attempt");
+    let application = update_application(pool, &account_id, &application.id, "queued", None)
+        .expect("queue PostgreSQL application")
+        .expect("queued PostgreSQL application");
     let run_id = format!("local-run-{label}-{suffix}");
     upsert_browser_session(
         pool,
@@ -1063,75 +1268,9 @@ fn local_authority_fixture(pool: &DbPool, label: &str) -> LocalAuthorityFixture 
         },
     )
     .expect("save PostgreSQL browser session");
-    let mut application = assign_application_run(pool, &account_id, &application.id, &run_id)
+    let application = assign_application_run(pool, &account_id, &application.id, &run_id)
         .expect("bind PostgreSQL application run")
         .expect("bound PostgreSQL application run");
-    let identity_id = application
-        .receipt
-        .pointer("/application_identity/id")
-        .and_then(Value::as_str)
-        .expect("frozen application identity")
-        .to_string();
-    let browser_profile_id = execution_browser_profile_id(&account_id, &identity_id);
-    let identity_email = application
-        .receipt
-        .pointer("/application_identity/email")
-        .and_then(Value::as_str)
-        .expect("frozen application email")
-        .to_string();
-    let resume = get_resume_version(
-        pool,
-        &account_id,
-        application
-            .resume_version_id
-            .as_deref()
-            .expect("fixture application has a resume"),
-    )
-    .expect("load PostgreSQL resume")
-    .expect("PostgreSQL resume exists");
-    let approved_packet = json!({
-        "applicationId": application.id,
-        "jobId": application.job_id,
-        "resumeVersionId": resume.id,
-        "resumeContent": resume.content,
-        "coverLetterContent": application.cover_letter,
-        "answers": {},
-        "verifiedClaimIds": [],
-        "applicationIdentityId": identity_id,
-        "applicationEmail": identity_email,
-        "browserProfileId": browser_profile_id,
-    });
-    let approved_job = json!({
-        "externalId": posting.external_id,
-        "canonicalUrl": posting.canonical_url,
-        "company": posting.company,
-        "title": posting.title,
-        "location": posting.location,
-        "workplace": posting.workplace,
-        "description": posting.description,
-        "source": posting.source,
-        "compensation": posting.compensation,
-    });
-    let admission = json!({ "kind": "review_approval" });
-    let checksum =
-        approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
-            .expect("checksum PostgreSQL approved execution");
-    application.receipt["approved_execution"] = json!({
-        "schema_version": 2,
-        "approved_at_ms": now_ms(),
-        "checksum": checksum,
-        "admission": admission,
-        "packet": approved_packet,
-        "job": approved_job,
-    });
-    application = replace_application_receipt(
-        pool,
-        &account_id,
-        &application.id,
-        application.receipt.clone(),
-    )
-    .expect("save PostgreSQL approved execution")
-    .expect("PostgreSQL approved application exists");
     let ticket_hash = format!("ticket-hash-{label}-{suffix}");
     save_local_run_ticket(
         pool,
@@ -1316,7 +1455,14 @@ fn postgres_canonical_track_policy_ledger_encrypts_and_rejects_projection_drift(
     let mut tx = conn
         .transaction()
         .expect("start PostgreSQL execution assertion transaction");
-    assert!(!current_execution_authorized_postgres(
+    lock_operational_hold_shared_postgres_tx(&mut tx)
+        .expect("lock PostgreSQL operational-hold authority");
+    lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+        .expect("lock PostgreSQL managed-release authority");
+    lock_postgres_ats_certification(&mut tx).expect("lock PostgreSQL ATS authority");
+    lock_discovery_account_shared_postgres(&mut tx, &account_id)
+        .expect("lock PostgreSQL discovery-account authority");
+    assert!(!current_execution_authorized_postgres_after_prelock(
         &mut tx,
         &account_id,
         &application,
@@ -1773,6 +1919,13 @@ fn enter_running_state(pool: &DbPool, fixture: &LocalAuthorityFixture) {
     )
     .expect("start PostgreSQL application")
     .expect("running PostgreSQL application");
+    assert!(update_attempt_reservation_status(
+        pool,
+        &fixture.account_id,
+        &fixture.application.id,
+        "running",
+    )
+    .expect("start PostgreSQL attempt reservation"));
     upsert_browser_session(pool, &fixture.account_id, &running_session(fixture))
         .expect("start PostgreSQL browser session");
 }
@@ -2876,6 +3029,121 @@ fn postgres_auto_submit_revocation_and_execution_share_one_fence() {
         .expect("get PostgreSQL Auto-submit fence cleanup connection")
         .execute("DELETE FROM accounts WHERE id = $1", &[&account_id])
         .expect("delete PostgreSQL Auto-submit fence account");
+}
+
+#[test]
+#[serial_test::serial]
+fn postgres_execution_authority_locks_integrity_before_account_policy() {
+    let Some(pool) = postgres_pool() else {
+        return;
+    };
+    let fixture = local_authority_fixture(&pool, "integrity-before-policy");
+
+    let mut publisher_conn = pool
+        .get_pg()
+        .expect("get PostgreSQL integrity publisher connection");
+    let mut publisher_tx = publisher_conn
+        .transaction()
+        .expect("begin PostgreSQL integrity publisher transaction");
+    publisher_tx
+        .query_one(
+            "SELECT singleton_id FROM jobs_job_integrity_control
+              WHERE singleton_id = 1 FOR UPDATE",
+            &[],
+        )
+        .expect("hold exclusive PostgreSQL integrity publication fence");
+
+    let execution_pool = pool.clone();
+    let execution_account_id = fixture.account_id.clone();
+    let execution_application = fixture.application.clone();
+    let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let execution_worker = std::thread::spawn(move || {
+        let result = (|| -> Result<bool> {
+            let mut conn = execution_pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            tx.batch_execute(
+                "SET LOCAL lock_timeout = '5s';
+                 SET LOCAL statement_timeout = '10s';",
+            )?;
+            lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)?;
+            lock_postgres_ats_certification(&mut tx).map_err(anyhow::Error::new)?;
+            lock_discovery_account_shared_postgres(&mut tx, &execution_account_id)?;
+            let backend_pid = tx
+                .query_one("SELECT pg_backend_pid()", &[])?
+                .get::<_, i32>(0);
+            waiting_tx
+                .send(backend_pid)
+                .expect("signal execution prelocks");
+            let authorized = resolve_current_execution_authority_postgres_after_prelock(
+                &mut tx,
+                &execution_account_id,
+                &execution_application,
+                ExecutionAuthorityRunner::Local,
+            )?
+            .authorized;
+            tx.rollback()?;
+            Ok(authorized)
+        })();
+        finished_tx
+            .send(result)
+            .expect("send execution-authority result");
+    });
+
+    let execution_pid = waiting_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("execution acquired H -> M -> ATS -> D prelocks");
+    let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting_on_lock = publisher_tx
+            .query_one(
+                "SELECT COALESCE((
+                    SELECT wait_event_type = 'Lock'
+                      FROM pg_stat_activity WHERE pid = $1
+                 ), FALSE)",
+                &[&execution_pid],
+            )
+            .expect("observe execution publication-fence wait")
+            .get::<_, bool>(0);
+        if waiting_on_lock {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < wait_deadline,
+            "execution never waited on the integrity publication fence"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        finished_rx
+            .recv_timeout(std::time::Duration::from_millis(250))
+            .is_err(),
+        "execution must remain behind the publication fence"
+    );
+
+    publisher_tx
+        .batch_execute("SET LOCAL lock_timeout = '500ms'")
+        .expect("bound PostgreSQL policy-lock assertion");
+    publisher_tx
+        .query_one(
+            "SELECT account_id FROM jobs_profiles
+              WHERE account_id = $1 FOR UPDATE",
+            &[&fixture.account_id],
+        )
+        .expect("publisher can lock policy while execution waits before policy");
+    publisher_tx
+        .commit()
+        .expect("release PostgreSQL integrity and policy locks together");
+
+    assert!(finished_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("execution completes after canonical-order locks release")
+        .expect("execution authority resolves without a lock cycle"));
+    execution_worker
+        .join()
+        .expect("join PostgreSQL execution-authority worker");
+    cleanup(&pool, &fixture);
 }
 
 #[test]

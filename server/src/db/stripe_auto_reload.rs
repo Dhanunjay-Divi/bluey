@@ -1104,6 +1104,12 @@ pub fn reverse_and_restrict(
                 .map(pg_attempt)
                 .transpose()?
                 .ok_or_else(|| anyhow!("Stripe Auto Reload attempt not found"))?;
+            let account_balance_before: i64 = tx
+                .query_one(
+                    "SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE",
+                    &[&attempt.account_id],
+                )?
+                .try_get(0)?;
             let already_reversed = attempt.status == STATUS_REVERSED;
             let revoked_cents =
                 if let Some(payment_intent_id) = attempt.stripe_payment_intent_id.as_deref() {
@@ -1119,12 +1125,6 @@ pub fn reverse_and_restrict(
                         let batch_id: String = batch.try_get(0)?;
                         let remaining_cents: i64 = batch.try_get(1)?;
                         if remaining_cents > 0 {
-                            let balance_before: i64 = tx
-                                .query_one(
-                                    "SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE",
-                                    &[&attempt.account_id],
-                                )?
-                                .try_get(0)?;
                             tx.execute(
                                 "UPDATE accounts
                                 SET balance_cents = GREATEST(0, balance_cents - $1)
@@ -1151,8 +1151,8 @@ pub fn reverse_and_restrict(
                                 BalanceLedgerEntry {
                                     account_id: &attempt.account_id,
                                     event_type: "processor_credit_revoked",
-                                    amount_cents: balance_after - balance_before,
-                                    balance_cents_before: balance_before,
+                                    amount_cents: balance_after - account_balance_before,
+                                    balance_cents_before: account_balance_before,
                                     balance_cents_after: balance_after,
                                     reason: Some(&reason),
                                     provider: Some("stripe"),
@@ -1236,6 +1236,300 @@ mod tests {
         let account = eligible_account(pool, email);
         let attempt = reserve_if_eligible(pool, &account.id).unwrap().unwrap();
         attach_payment_intent(pool, &attempt.id, pi).unwrap()
+    }
+
+    fn bounded_postgres_pool(test_name: &str) -> Option<(DbPool, String)> {
+        let database_url = std::env::var("BLUEY_TEST_POSTGRES_URL").ok()?;
+        let pool = crate::db::open_postgres_pool(&database_url)
+            .expect("open PostgreSQL Stripe Auto Reload test pool");
+        crate::db::run_migrations(&pool)
+            .expect("apply PostgreSQL Stripe Auto Reload test migrations");
+        let application_name = format!("bluey-{test_name}-{}", uuid::Uuid::new_v4().simple());
+
+        // Configure every primary-pool session so the production boundary, which checks out its
+        // own connection, inherits the same bounded lock and statement timeouts.
+        let mut connections = Vec::new();
+        for _ in 0..crate::db::POSTGRES_PRIMARY_POOL_SIZE {
+            let mut connection = pool
+                .get_pg()
+                .expect("get bounded PostgreSQL Stripe Auto Reload connection");
+            connection
+                .batch_execute(
+                    "SET lock_timeout = '10s';
+                     SET statement_timeout = '15s';",
+                )
+                .expect("bound PostgreSQL Stripe Auto Reload test session");
+            connection
+                .query_one(
+                    "SELECT set_config('application_name', $1, false)",
+                    &[&application_name],
+                )
+                .expect("name PostgreSQL Stripe Auto Reload test session");
+            connections.push(connection);
+        }
+        drop(connections);
+        Some((pool, application_name))
+    }
+
+    #[test]
+    fn postgres_auto_reload_reversal_locks_account_before_credit_batch() {
+        let source = include_str!("stripe_auto_reload.rs");
+        let reverse_start = source
+            .find("pub fn reverse_and_restrict")
+            .expect("reverse_and_restrict source");
+        let tests_start = source[reverse_start..]
+            .find("\n#[cfg(test)]")
+            .map(|offset| reverse_start + offset)
+            .expect("reverse_and_restrict source boundary");
+        let reverse_source = &source[reverse_start..tests_start];
+        let postgres_start = reverse_source
+            .find("DbPool::Postgres(_) =>")
+            .expect("reverse_and_restrict PostgreSQL branch");
+        let postgres_source = &reverse_source[postgres_start..];
+
+        let account_lock = postgres_source
+            .find("SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE")
+            .expect("PostgreSQL reversal account lock");
+        let credit_batch_query = postgres_source
+            .find("FROM credit_batches")
+            .expect("PostgreSQL reversal credit-batch query");
+        let credit_batch_update = postgres_source
+            .find("UPDATE credit_batches SET remaining_cents = 0 WHERE id = $1")
+            .expect("PostgreSQL reversal credit-batch update");
+
+        assert_eq!(
+            postgres_source
+                .matches("SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE")
+                .count(),
+            1,
+            "PostgreSQL reversal must own one explicit account row fence"
+        );
+        assert!(
+            account_lock < credit_batch_query && account_lock < credit_batch_update,
+            "PostgreSQL reversal must lock Account before reading or updating credit_batches"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_auto_reload_reversal_and_account_metering_share_lock_order_when_configured() {
+        let Some((pool, _application_name)) = bounded_postgres_pool("auto-reload-order") else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct-auto-reload-order-{suffix}");
+        let email = format!("auto-reload-order-{suffix}@example.test");
+        let attempt_id = format!("attempt-auto-reload-order-{suffix}");
+        let payment_intent_id = format!("pi_auto_reload_order_{suffix}");
+        let source_id = format!("stripe:{payment_intent_id}");
+        let batch_id = format!("batch-auto-reload-order-{suffix}");
+        let event_id = format!("evt_auto_reload_order_{suffix}");
+        let customer_id = format!("cus_{suffix}");
+        let payment_method_id = format!("pm_{suffix}");
+        let create_idempotency_key = format!("create_{suffix}");
+        let confirm_idempotency_key = format!("confirm_{suffix}");
+
+        let mut setup = pool
+            .get_pg()
+            .expect("get PostgreSQL Stripe Auto Reload setup connection");
+        setup
+            .execute(
+                "INSERT INTO accounts (
+                    id, email, password_hash, email_verified_at, balance_cents,
+                    trial_seconds_remaining, auto_topup_enabled,
+                    auto_topup_threshold_cents, auto_topup_amount_cents,
+                    stripe_customer_id, stripe_payment_method_id
+                 ) VALUES ($1, $2, 'hash', now(), 1500, 0, 1, 500, 1500, $3, $4)",
+                &[&account_id, &email, &customer_id, &payment_method_id],
+            )
+            .expect("insert PostgreSQL Stripe Auto Reload account fixture");
+        setup
+            .execute(
+                "INSERT INTO credit_batches (
+                    id, account_id, amount_cents, remaining_cents, expires_at,
+                    stripe_charge_id
+                 ) VALUES ($1, $2, 1500, 1500, now() + interval '30 days', $3)",
+                &[&batch_id, &account_id, &source_id],
+            )
+            .expect("insert PostgreSQL Stripe Auto Reload credit-batch fixture");
+        setup
+            .execute(
+                "INSERT INTO stripe_auto_reload_attempts (
+                    id, account_id, amount_cents, stripe_customer_id,
+                    stripe_payment_method_id, stripe_payment_intent_id,
+                    create_idempotency_key, confirm_idempotency_key, status
+                 ) VALUES ($1, $2, 1500, $3, $4, $5, $6, $7, 'succeeded')",
+                &[
+                    &attempt_id,
+                    &account_id,
+                    &customer_id,
+                    &payment_method_id,
+                    &payment_intent_id,
+                    &create_idempotency_key,
+                    &confirm_idempotency_key,
+                ],
+            )
+            .expect("insert PostgreSQL Stripe Auto Reload attempt fixture");
+        drop(setup);
+
+        let mut metering_connection = pool
+            .get_pg()
+            .expect("get PostgreSQL account-metering connection");
+        let mut metering = metering_connection
+            .transaction()
+            .expect("begin PostgreSQL account-metering transaction");
+        let metering_pid = metering
+            .query_one("SELECT pg_backend_pid()", &[])
+            .expect("query PostgreSQL account-metering pid")
+            .get::<_, i32>(0);
+        metering
+            .query_one(
+                "SELECT balance_cents FROM accounts WHERE id = $1 FOR UPDATE",
+                &[&account_id],
+            )
+            .expect("lock PostgreSQL account before credit batch");
+
+        let reversal_pool = pool.clone();
+        let reversal_attempt_id = attempt_id.clone();
+        let reversal_event_id = event_id.clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let reversal_worker = std::thread::spawn(move || {
+            started_tx
+                .send(())
+                .expect("signal PostgreSQL Stripe reversal start");
+            let result = reverse_and_restrict(
+                &reversal_pool,
+                &reversal_attempt_id,
+                "refund.created",
+                &reversal_event_id,
+            );
+            finished_tx
+                .send(result)
+                .expect("send PostgreSQL Stripe reversal result");
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("PostgreSQL Stripe reversal worker started");
+
+        let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let reversal_waited_on_account = loop {
+            let waiting = metering
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1
+                          FROM pg_stat_activity AS activity
+                         WHERE activity.pid <> $1
+                           AND activity.wait_event_type = 'Lock'
+                           AND $1 = ANY(pg_blocking_pids(activity.pid))
+                     )",
+                    &[&metering_pid],
+                )
+                .expect("observe PostgreSQL Stripe reversal account wait")
+                .get::<_, bool>(0);
+            if waiting {
+                break true;
+            }
+            if reversal_worker.is_finished() || std::time::Instant::now() >= wait_deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert!(
+            reversal_waited_on_account,
+            "Stripe reversal did not wait at the canonical account fence"
+        );
+
+        let observed_batch_id = metering
+            .query_one(
+                "SELECT id FROM credit_batches
+                  WHERE account_id = $1 AND stripe_charge_id = $2
+                  FOR UPDATE",
+                &[&account_id, &source_id],
+            )
+            .expect("lock credit batch after account while Stripe reversal waits")
+            .get::<_, String>(0);
+        assert_eq!(observed_batch_id, batch_id);
+        metering
+            .execute(
+                "UPDATE credit_batches
+                    SET remaining_cents = remaining_cents
+                  WHERE id = $1",
+                &[&batch_id],
+            )
+            .expect("exercise account-to-credit-batch metering write");
+        metering
+            .commit()
+            .expect("release account-to-credit-batch metering transaction");
+
+        let reversal_result = finished_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("Stripe reversal completes after account-metering commit");
+        reversal_worker
+            .join()
+            .expect("join PostgreSQL Stripe reversal worker");
+        let disposition = match reversal_result {
+            Ok(disposition) => disposition,
+            Err(error) => {
+                let sqlstate = error
+                    .downcast_ref::<postgres::Error>()
+                    .and_then(postgres::Error::as_db_error)
+                    .map(|error| error.code().code());
+                assert_ne!(
+                    sqlstate,
+                    Some("40P01"),
+                    "canonical Account -> credit_batches order must not deadlock"
+                );
+                panic!("PostgreSQL Stripe reversal failed: {error:#}");
+            }
+        };
+        assert_eq!(disposition.account_id, account_id);
+        assert_eq!(disposition.revoked_cents, 1500);
+        assert!(!disposition.already_reversed);
+
+        let mut assertion_connection = pool
+            .get_pg()
+            .expect("get PostgreSQL Stripe Auto Reload assertion connection");
+        let state = assertion_connection
+            .query_one(
+                "SELECT account_row.balance_cents,
+                        account_row.billing_restricted,
+                        account_row.auto_topup_enabled,
+                        account_row.stripe_payment_method_id,
+                        attempt_row.status,
+                        batch_row.remaining_cents
+                   FROM accounts AS account_row
+                   JOIN stripe_auto_reload_attempts AS attempt_row
+                     ON attempt_row.account_id = account_row.id AND attempt_row.id = $2
+                   JOIN credit_batches AS batch_row
+                     ON batch_row.account_id = account_row.id AND batch_row.id = $3
+                  WHERE account_row.id = $1",
+                &[&account_id, &attempt_id, &batch_id],
+            )
+            .expect("query final PostgreSQL Stripe reversal state");
+        assert_eq!(state.get::<_, i64>(0), 0);
+        assert_eq!(state.get::<_, i32>(1), 1);
+        assert_eq!(state.get::<_, i32>(2), 0);
+        assert_eq!(state.get::<_, Option<String>>(3), None);
+        assert_eq!(state.get::<_, String>(4), STATUS_REVERSED);
+        assert_eq!(state.get::<_, i64>(5), 0);
+
+        let ledger = assertion_connection
+            .query(
+                "SELECT amount_cents, balance_cents_before, balance_cents_after
+                   FROM balance_ledger_entries
+                  WHERE account_id = $1 AND event_type = 'processor_credit_revoked'",
+                &[&account_id],
+            )
+            .expect("query PostgreSQL Stripe reversal ledger");
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].get::<_, i64>(0), -1500);
+        assert_eq!(ledger[0].get::<_, i64>(1), 1500);
+        assert_eq!(ledger[0].get::<_, i64>(2), 0);
+
+        assertion_connection
+            .execute("DELETE FROM accounts WHERE id = $1", &[&account_id])
+            .expect("delete PostgreSQL Stripe Auto Reload fixture");
     }
 
     #[test]

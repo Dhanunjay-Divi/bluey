@@ -2858,11 +2858,25 @@ async fn jobs_fact_route_owns_provenance_confirmation_and_timestamps() {
 }
 
 async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String, String) {
+    setup_execution_lease_run_for_runner(harness, "cloud").await
+}
+
+async fn setup_execution_lease_run_for_runner(
+    harness: &Harness,
+    runner_kind: &str,
+) -> (String, String, String, String) {
+    assert!(matches!(runner_kind, "local" | "cloud"));
     let email = "jobs-execution-lease@example.com";
     let access_token = signup_and_login(harness, email, "valid-password-123").await;
     let account = Account::fetch_by_email(&harness.pool, email)
         .unwrap()
         .unwrap();
+    let entitlement_plan = if runner_kind == "local" {
+        "pro"
+    } else {
+        "cloud"
+    };
+    jobs::set_entitlement_plan(&harness.pool, &account.id, entitlement_plan).unwrap();
     let mut profile = jobs::default_profile(&account.email);
     let source_resume_sha256 = hex::encode(Sha256::digest(EXECUTION_LEASE_SOURCE_RESUME_BYTES));
     let source_resume = jobs::ResumeSourceAsset {
@@ -2892,6 +2906,8 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
     let identity =
         jobs::ensure_primary_application_identity(&harness.pool, &account.id, &account.email)
             .unwrap();
+    let preferences =
+        jobs::save_preferences(&harness.pool, &account.id, &JobPreferences::default()).unwrap();
     let track = jobs::upsert_track(
         &harness.pool,
         &account.id,
@@ -2913,6 +2929,8 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         },
     )
     .unwrap();
+    assert_eq!(track.policy.authority.review_state, "approved");
+    assert!(track.policy.authority.policy_revision_no > 0);
     let now = chrono::Utc::now().timestamp_millis();
     let mut posting_input = JobPosting {
         id: String::new(),
@@ -2941,21 +2959,18 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         eligibility: None,
     };
     posting_input.canonical_key = jobs::canonical_job_key(&posting_input);
-    posting_input.discovery_evidence = JobDiscoveryEvidence::provider_verified_original_source(
-        posting_input.canonical_key.clone(),
-        "greenhouse:acme".to_string(),
-        Some("boards.greenhouse.io".to_string()),
-        now,
-        "a".repeat(64),
+    let posting = jobs::install_integration_test_production_positive_job_authorities(
+        jobs::IntegrationTestProductionPositiveJobAuthoritiesRequest {
+            pool: &harness.pool,
+            account_id: &account.id,
+            posting: &posting_input,
+            profile: &profile,
+            preferences: &preferences,
+            canonical_employer_domain: "acme.com",
+            suffix: "execution-lease-integration",
+            runner_kind,
+        },
     );
-    let posting = jobs::upsert_posting(
-        &harness.pool,
-        &account.id,
-        &posting_input,
-        &profile,
-        &JobPreferences::default(),
-    )
-    .unwrap();
     let (application, _) = jobs::prepare_application(
         &harness.pool,
         &account.id,
@@ -2985,6 +3000,8 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
             String::from_utf8_lossy(&body)
         );
     }
+    jobs::reserve_application_attempt(&harness.pool, &account.id, &application.id, runner_kind)
+        .unwrap();
     let application = jobs::get_application(&harness.pool, &account.id, &application.id)
         .unwrap()
         .unwrap();
@@ -2994,7 +3011,7 @@ async fn setup_execution_lease_run(harness: &Harness) -> (String, String, String
         &account.id,
         &BrowserSession {
             id: run_id.clone(),
-            runner: "cloud".to_string(),
+            runner: runner_kind.to_string(),
             status: "queued".to_string(),
             current_company: "Acme".to_string(),
             current_step: "Waiting for a browser".to_string(),
@@ -6827,8 +6844,7 @@ async fn jobs_local_submit_resume_recovers_after_consume_before_marker_case(
     })
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
-        setup_execution_lease_run(&harness).await;
-    jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
+        setup_execution_lease_run_for_runner(&harness, "local").await;
     harness
         .pool
         .get()
@@ -7727,8 +7743,7 @@ async fn jobs_local_side_effect_unknown_is_terminal_and_requires_reconciliation(
     })
     .await;
     let (account_id, application_id, run_id, browser_profile_id) =
-        setup_execution_lease_run(&harness).await;
-    jobs::set_entitlement_plan(&harness.pool, &account_id, "pro").unwrap();
+        setup_execution_lease_run_for_runner(&harness, "local").await;
     harness
         .pool
         .get()

@@ -2315,8 +2315,62 @@ include!("jobs/browser_release_registry.rs");
 include!("jobs/ats_certification_authority.rs");
 include!("jobs/managed_cloud_release_authority.rs");
 include!("jobs/original_source_verification.rs");
+include!("jobs/job_integrity_authority.rs");
+include!("jobs/job_integrity_composition.rs");
 include!("jobs/browser_profile_snapshots.rs");
 include!("jobs/workspace.rs");
+
+#[cfg(any(test, feature = "integration-test-support"))]
+#[cfg_attr(feature = "integration-test-support", allow(dead_code))]
+#[path = "jobs/production_positive_authority_fixture.rs"]
+pub(crate) mod production_positive_authority_fixture;
+
+#[cfg(feature = "integration-test-support")]
+#[doc(hidden)]
+pub struct IntegrationTestProductionPositiveJobAuthoritiesRequest<'a> {
+    pub pool: &'a DbPool,
+    pub account_id: &'a str,
+    pub posting: &'a JobPosting,
+    pub profile: &'a CareerProfile,
+    pub preferences: &'a JobPreferences,
+    pub canonical_employer_domain: &'a str,
+    pub suffix: &'a str,
+    pub runner_kind: &'a str,
+}
+
+#[cfg(feature = "integration-test-support")]
+#[doc(hidden)]
+pub fn install_integration_test_production_positive_job_authorities(
+    request: IntegrationTestProductionPositiveJobAuthoritiesRequest<'_>,
+) -> JobPosting {
+    let (saved, managed) =
+        production_positive_authority_fixture::save_production_positive_verified_import(
+            request.pool,
+            request.account_id,
+            request.posting,
+            request.profile,
+            request.preferences,
+        );
+    let installed =
+        production_positive_authority_fixture::install_production_positive_job_authorities_for_runner(
+            request.pool,
+            request.account_id,
+            &saved,
+            &managed,
+            request.canonical_employer_domain,
+            request.suffix,
+            request.runner_kind,
+        );
+    assert!(installed.source.feature_active);
+    assert!(installed.source.integrity_binding.is_some());
+    assert_eq!(installed.ats.status.status, "active");
+    assert!(installed.ats.active_binding.is_some());
+    assert_eq!(
+        installed.composed.job_integrity.status,
+        JobIntegrityResolutionStatus::Verified
+    );
+    installed.posting
+}
 
 #[cfg(test)]
 #[path = "jobs/postgres_local_authority_tests.rs"]

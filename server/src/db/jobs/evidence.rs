@@ -424,15 +424,27 @@ fn persist_evidence_revision_sqlite(
     Ok(stored)
 }
 
+fn lock_profile_evidence_revision_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    career_track_id: &str,
+) -> Result<()> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-evidence:' || $1 || ':' || $2, 0))",
+        &[&account_id, &career_track_id],
+    )?;
+    Ok(())
+}
+
 fn persist_evidence_revision_postgres(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
     evidence: &ProfileEvidenceRevision,
 ) -> Result<ProfileEvidenceRevision> {
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-evidence:' || $1 || ':' || $2, 0))",
-        &[&account_id, &evidence.career_track_id],
-    )?;
+    // Prepared finalization prelocks this exact namespace before evaluating any
+    // expiring authority. Reacquiring the transaction lock is immediate and
+    // proves that persistence cannot silently drift to a different namespace.
+    lock_profile_evidence_revision_postgres_tx(tx, account_id, &evidence.career_track_id)?;
     if let Some(row) = tx.query_opt(
         "SELECT id, revision_no, snapshot_json, created_at_ms
            FROM jobs_profile_evidence_revisions

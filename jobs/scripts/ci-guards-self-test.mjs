@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   checkPhase613MigrationRegistration,
   checkPhase614MigrationRegistration,
+  checkPhase614BMigrationRegistration,
   compareJobsSchemas,
 } from "./check-jobs-schema-parity.mjs";
 import {
@@ -196,6 +197,72 @@ function testPortalBundleFreshnessWorkflowGuard() {
     assert(
       freshnessIndex > buildIndex,
       `${workflowPath} must reject a stale checked-in Jobs portal bundle after the build`,
+    );
+  }
+}
+
+function testIntegrationTestSupportContainmentGuard() {
+  const cargo = fs.readFileSync(path.join(repoRoot, "server/Cargo.toml"), "utf8");
+  assert.match(cargo, /\[features\]\s+default = \[\]\s+integration-test-support = \["dep:serial_test"\]/);
+  assert.match(
+    cargo,
+    /\[\[test\]\]\s+name = "integration_e2e"\s+path = "tests\/integration_e2e\.rs"\s+required-features = \["integration-test-support"\]/,
+  );
+  assert.match(cargo, /^bluey-server = \{ path = "\." \}$/m);
+  assert.doesNotMatch(
+    cargo,
+    /^bluey-server = \{ path = "\.", features = \["integration-test-support"\] \}$/m,
+  );
+
+  const normalize = (value) => value.replace(/\s+/g, " ").trim();
+  const occurrences = (value, needle) => value.split(needle).length - 1;
+  const library = normalize(
+    fs.readFileSync(path.join(repoRoot, "server/src/lib.rs"), "utf8"),
+  );
+  assert.match(
+    library,
+    /#\[cfg\(all\(feature = "integration-test-support", not\(debug_assertions\)\)\)\] compile_error!\("integration-test-support must never be enabled in release builds"\);/,
+  );
+
+  const supportPrefix =
+    "cargo test --manifest-path server/Cargo.toml --no-default-features " +
+    "--features integration-test-support --test integration_e2e";
+  const supportClippy =
+    "cargo clippy --manifest-path server/Cargo.toml --no-default-features " +
+    "--features integration-test-support --test integration_e2e -- -D warnings";
+  const jobsCi = normalize(
+    fs.readFileSync(path.join(repoRoot, ".github/workflows/jobs-ci.yml"), "utf8"),
+  );
+  assert.equal(occurrences(jobsCi, supportClippy), 1);
+  assert.equal(occurrences(jobsCi, supportPrefix), 1);
+  assert.equal(occurrences(jobsCi, `${supportPrefix} jobs_`), 0);
+
+  const release = normalize(
+    fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8"),
+  );
+  assert.equal(occurrences(release, supportClippy), 1);
+  assert.equal(occurrences(release, supportPrefix), 1);
+  assert.equal(
+    occurrences(
+      release,
+      "cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings",
+    ),
+    1,
+  );
+  assert.equal(
+    occurrences(release, "cargo test --manifest-path server/Cargo.toml --all-targets"),
+    1,
+  );
+
+  for (const productionPath of [
+    "server/Dockerfile.jobs",
+    ".github/workflows/jobs-managed-cloud-release.yml",
+  ]) {
+    const productionBuild = fs.readFileSync(path.join(repoRoot, productionPath), "utf8");
+    assert.doesNotMatch(
+      productionBuild,
+      /integration-test-support/,
+      `${productionPath} must never enable integration test support`,
     );
   }
 }
@@ -427,22 +494,87 @@ function assertPhase613DriftRejected({
   );
 }
 
+function assertPhase614BDriftRejected({
+  dialect,
+  invariant,
+  original,
+  replacement,
+  sqlite,
+  postgres,
+}) {
+  const source = dialect === "SQLite" ? sqlite : postgres;
+  const mutated = replaceFirstForGuardTest(
+    source,
+    original,
+    replacement,
+    invariant,
+  );
+  const issues =
+    dialect === "SQLite"
+      ? compareJobsSchemas(mutated, postgres)
+      : compareJobsSchemas(sqlite, mutated);
+  assert(
+    issues.some((issue) =>
+      issue.includes(`${dialect} Phase 614B invariant`),
+    ),
+    `${dialect} ${invariant} drift must fail the Phase 614B semantic guard; ` +
+      `issues=${JSON.stringify(issues)}`,
+  );
+}
+
 function testSchemaParity() {
-  const sqlite = `${jobsParitySchema("INTEGER")}\n${fs.readFileSync(
-    path.join(
-      repoRoot,
-      "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+  const sqlite = [
+    jobsParitySchema("INTEGER"),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+      ),
+      "utf8",
     ),
-    "utf8",
-  )}`;
-  const postgres = `${jobsParitySchema("BIGINT")}\n${fs.readFileSync(
-    path.join(
-      repoRoot,
-      "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql",
+      ),
+      "utf8",
     ),
-    "utf8",
-  )}`;
+  ].join("\n");
+  const postgres = [
+    jobsParitySchema("BIGINT"),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql",
+      ),
+      "utf8",
+    ),
+  ].join("\n");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+
+  for (const mutation of [
+    {
+      dialect: "SQLite",
+      invariant: "trust-policy root-anchor continuity",
+      original: "predecessor.root_anchor_sha256=NEW.root_anchor_sha256",
+      replacement: "predecessor.root_anchor_sha256<>NEW.root_anchor_sha256",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "signed-authority immutability",
+      original: "RAISE EXCEPTION 'job-integrity signed authority is immutable'",
+      replacement: "RETURN OLD",
+    },
+  ]) {
+    assertPhase614BDriftRejected({ ...mutation, sqlite, postgres });
+  }
 
   for (const mutation of [
     {
@@ -821,15 +953,20 @@ function testSchemaParity() {
   );
   assert.deepEqual(checkPhase613MigrationRegistration(migrationRunner), []);
   assert.deepEqual(checkPhase614MigrationRegistration(migrationRunner), []);
+  assert.deepEqual(checkPhase614BMigrationRegistration(migrationRunner), []);
   const missingSqliteMigrationRegistration = replaceFirstForGuardTest(
     migrationRunner,
     "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n" +
       "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
       "    // lease, circuit, quarantine, and exact current-head authority.\n" +
-      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n];",
+      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
     "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
       "    // lease, circuit, quarantine, and exact current-head authority.\n" +
-      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n];",
+      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
     "SQLite 056 migration registration",
   );
   assert(
@@ -855,8 +992,11 @@ function testSchemaParity() {
   );
   const missingSqlitePhase614Registration = replaceFirstForGuardTest(
     migrationRunner,
-    "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n];",
-    "];",
+    "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
     "SQLite 057 migration registration",
   );
   assert(
@@ -876,6 +1016,35 @@ function testSchemaParity() {
   assert(
     checkPhase614MigrationRegistration(
       missingPostgresPhase614Registration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
+  const missingSqlitePhase614BRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n",
+    "",
+    "SQLite 058 migration registration",
+  );
+  assert(
+    checkPhase614BMigrationRegistration(
+      missingSqlitePhase614BRegistration,
+    ).some((issue) =>
+      issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresPhase614BRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n" +
+      "    ),\n",
+    "",
+    "Postgres 036 migration registration",
+  );
+  assert(
+    checkPhase614BMigrationRegistration(
+      missingPostgresPhase614BRegistration,
     ).some((issue) =>
       issue.includes("Postgres migration runner must register"),
     ),
@@ -1326,11 +1495,12 @@ function testProvenance() {
 testPrivacyPaths();
 testSecretScanning();
 testPortalBundleFreshnessWorkflowGuard();
+testIntegrationTestSupportContainmentGuard();
 testSchemaParity();
 testLicenseInventory();
 testProvenance();
 
 console.log(
   "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, " +
-    "lock inventory, and provenance).",
+    "integration test containment, lock inventory, and provenance).",
 );

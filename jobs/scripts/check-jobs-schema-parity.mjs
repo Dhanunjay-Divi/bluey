@@ -32,9 +32,20 @@ export const PHASE_614_PARITY_TABLES = [
   "jobs_original_source_verification_transitions",
 ];
 
+export const PHASE_614B_PARITY_TABLES = [
+  "jobs_job_integrity_attestations",
+  "jobs_job_integrity_control",
+  "jobs_job_integrity_head_transitions",
+  "jobs_job_integrity_heads",
+  "jobs_job_integrity_revocations",
+  "jobs_job_integrity_trust_keys",
+  "jobs_job_integrity_trust_policies",
+];
+
 const SEMANTIC_PARITY_TABLES = new Set([
   ...PHASE_613_PARITY_TABLES,
   ...PHASE_614_PARITY_TABLES,
+  ...PHASE_614B_PARITY_TABLES,
 ]);
 
 export const JOBS_PARITY_TABLES = [
@@ -111,9 +122,47 @@ export const JOBS_PARITY_TABLES = [
   "jobs_submission_evidence_capacity",
   ...PHASE_613_PARITY_TABLES,
   ...PHASE_614_PARITY_TABLES,
+  ...PHASE_614B_PARITY_TABLES,
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
+  [
+    "jobs_job_integrity_attestations",
+    [
+      "idx_jobs_job_integrity_attestations_employer on jobs_job_integrity_attestations (canonical_employer_id, canonical_employer_domain, expires_at_ms)",
+      "idx_jobs_job_integrity_attestations_subject on jobs_job_integrity_attestations (subject_sha256, attestation_generation desc)",
+    ].sort(),
+  ],
+  [
+    "jobs_job_integrity_head_transitions",
+    [
+      "idx_jobs_job_integrity_head_transitions_history on jobs_job_integrity_head_transitions (subject_sha256, head_revision desc)",
+    ],
+  ],
+  [
+    "jobs_job_integrity_heads",
+    [
+      "idx_jobs_job_integrity_heads_attestation on jobs_job_integrity_heads (attestation_sha256, policy_sha256)",
+    ],
+  ],
+  [
+    "jobs_job_integrity_revocations",
+    [
+      "idx_jobs_job_integrity_revocations_subject on jobs_job_integrity_revocations (subject_kind, subject_id, subject_sha256, effective_at_ms)",
+    ],
+  ],
+  [
+    "jobs_job_integrity_trust_keys",
+    [
+      "idx_jobs_job_integrity_trust_keys_role on jobs_job_integrity_trust_keys (policy_sha256, role, key_id)",
+    ],
+  ],
+  [
+    "jobs_job_integrity_trust_policies",
+    [
+      "idx_jobs_job_integrity_trust_policies_generation on jobs_job_integrity_trust_policies (trust_generation desc, expires_at_ms)",
+    ],
+  ],
   [
     "jobs_browser_account_channel_assignments",
     [
@@ -524,6 +573,16 @@ const PHASE_614_INDEX_NAMES = [
   "idx_jobs_postings_account_id_unique",
 ];
 
+const PHASE_614B_INDEX_NAMES = [
+  "idx_jobs_job_integrity_attestations_employer",
+  "idx_jobs_job_integrity_attestations_subject",
+  "idx_jobs_job_integrity_head_transitions_history",
+  "idx_jobs_job_integrity_heads_attestation",
+  "idx_jobs_job_integrity_revocations_subject",
+  "idx_jobs_job_integrity_trust_keys_role",
+  "idx_jobs_job_integrity_trust_policies_generation",
+];
+
 function balancedBody(sql, openingParen) {
   let depth = 0;
   let quote = null;
@@ -724,6 +783,350 @@ function requireSinglePhase614TableDeclarations(issues, dialect, sql) {
         `${dialect} Phase 614 table ${tableName} must be declared exactly once; found ${count}`,
       );
     }
+  }
+}
+
+function requireSinglePhase614BDeclarations(issues, dialect, sql) {
+  for (const tableName of PHASE_614B_PARITY_TABLES) {
+    const expression = new RegExp(
+      `CREATE\\s+TABLE\\s+IF\\s+NOT\\s+EXISTS\\s+${tableName}\\s*\\(`,
+      "gi",
+    );
+    const count = [...sql.matchAll(expression)].length;
+    if (count !== 1) {
+      issues.push(
+        `${dialect} Phase 614B table ${tableName} must be declared exactly once; found ${count}`,
+      );
+    }
+  }
+  for (const indexName of PHASE_614B_INDEX_NAMES) {
+    const expression = new RegExp(
+      `CREATE\\s+(?:UNIQUE\\s+)?INDEX\\s+IF\\s+NOT\\s+EXISTS\\s+${indexName}\\b`,
+      "gi",
+    );
+    const count = [...sql.matchAll(expression)].length;
+    if (count !== 1) {
+      issues.push(
+        `${dialect} Phase 614B index ${indexName} must be declared exactly once; found ${count}`,
+      );
+    }
+  }
+}
+
+function requirePhase614BFragments(
+  issues,
+  dialect,
+  objectName,
+  objectSource,
+  fragments,
+) {
+  if (!objectSource) {
+    issues.push(`${dialect} Phase 614B object ${objectName} must exist exactly once`);
+    return;
+  }
+  for (const fragment of fragments) {
+    if (!objectSource.includes(normalizeSql(fragment))) {
+      issues.push(
+        `${dialect} Phase 614B invariant is missing from ${objectName}: ${fragment}`,
+      );
+    }
+  }
+}
+
+function phase614BTableRequirements(issues, dialect, sql) {
+  for (const [tableName, fragments] of [
+    [
+      "jobs_job_integrity_trust_policies",
+      [
+        "root_authorization_id text not null unique",
+        "foreign key(predecessor_policy_sha256) references jobs_job_integrity_trust_policies(policy_sha256) on delete restrict",
+      ],
+    ],
+    [
+      "jobs_job_integrity_attestations",
+      [
+        "employer_identity_authorization_id text not null unique",
+        "job_risk_authorization_id text not null unique",
+        "unique(subject_sha256, attestation_generation)",
+        "foreign key(policy_sha256) references jobs_job_integrity_trust_policies(policy_sha256) on delete restrict",
+        "foreign key(predecessor_attestation_sha256) references jobs_job_integrity_attestations(attestation_sha256) on delete restrict",
+      ],
+    ],
+    [
+      "jobs_job_integrity_trust_keys",
+      [
+        "foreign key(policy_sha256, trust_generation) references jobs_job_integrity_trust_policies(policy_sha256, trust_generation) on delete restrict",
+      ],
+    ],
+    [
+      "jobs_job_integrity_revocations",
+      [
+        "authorization_id text not null unique",
+        "foreign key(policy_sha256) references jobs_job_integrity_trust_policies(policy_sha256) on delete restrict",
+        "foreign key(predecessor_revocation_sha256) references jobs_job_integrity_revocations(revocation_sha256) on delete restrict",
+      ],
+    ],
+    [
+      "jobs_job_integrity_head_transitions",
+      [
+        "check(head_revision = previous_head_revision + 1)",
+        "foreign key(attestation_sha256) references jobs_job_integrity_attestations(attestation_sha256) on delete restrict",
+        "foreign key(predecessor_transition_sha256) references jobs_job_integrity_head_transitions(transition_sha256) on delete restrict",
+      ],
+    ],
+    [
+      "jobs_job_integrity_heads",
+      [
+        "foreign key(transition_sha256) references jobs_job_integrity_head_transitions(transition_sha256) on delete restrict",
+        "foreign key(attestation_sha256) references jobs_job_integrity_attestations(attestation_sha256) on delete restrict",
+        "foreign key(policy_sha256) references jobs_job_integrity_trust_policies(policy_sha256) on delete restrict",
+      ],
+    ],
+    [
+      "jobs_job_integrity_control",
+      [
+        "singleton_id integer primary key check(singleton_id = 1)",
+        "foreign key(current_policy_sha256) references jobs_job_integrity_trust_policies(policy_sha256) on delete restrict",
+      ],
+    ],
+  ]) {
+    const table = extractTable(sql, tableName);
+    requirePhase614BFragments(
+      issues,
+      dialect,
+      tableName,
+      table ? normalizeSql(table.join(", ")) : null,
+      fragments,
+    );
+  }
+}
+
+function phase614BSqliteRequirements(issues, sql) {
+  const dialect = "SQLite";
+  phase614BTableRequirements(issues, dialect, sql);
+  for (const [tableName, fragments] of [
+    [
+      "jobs_job_integrity_trust_policies",
+      [
+        "json_type(allowed_providers_json) = 'array'",
+        "json_type(allowed_risk_policy_sha256s_json) = 'array'",
+      ],
+    ],
+    [
+      "jobs_job_integrity_attestations",
+      [
+        "json_type(identity_evidence_json) = 'array'",
+        "json_type(risk_evidence_json) = 'array'",
+      ],
+    ],
+  ]) {
+    const table = extractTable(sql, tableName);
+    requirePhase614BFragments(
+      issues,
+      dialect,
+      tableName,
+      table ? normalizeSql(table.join(", ")) : null,
+      fragments,
+    );
+  }
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "trg_jobs_job_integrity_trust_policies_validate_insert",
+    extractSqliteTrigger(
+      sql,
+      "trg_jobs_job_integrity_trust_policies_validate_insert",
+    ),
+    [
+      "predecessor.trust_generation=NEW.trust_generation-1",
+      "predecessor.root_anchor_sha256=NEW.root_anchor_sha256",
+    ],
+  );
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "trg_jobs_job_integrity_trust_keys_no_conflicting_insert",
+    extractSqliteTrigger(
+      sql,
+      "trg_jobs_job_integrity_trust_keys_no_conflicting_insert",
+    ),
+    [
+      "existing.key_id=NEW.key_id",
+      "existing.public_key_base64url=NEW.public_key_base64url",
+      "existing.role<>NEW.role",
+    ],
+  );
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "trg_jobs_job_integrity_revocations_validate_insert",
+    extractSqliteTrigger(
+      sql,
+      "trg_jobs_job_integrity_revocations_validate_insert",
+    ),
+    ["predecessor.revocation_generation=NEW.revocation_generation-1"],
+  );
+  for (const triggerName of [
+    "trg_jobs_job_integrity_attestations_validate_insert",
+    "trg_jobs_job_integrity_revocations_validate_insert",
+    "trg_jobs_job_integrity_head_transitions_validate_insert",
+    "trg_jobs_job_integrity_heads_monotonic",
+    "trg_jobs_job_integrity_control_monotonic",
+  ]) {
+    requirePhase614BFragments(
+      issues,
+      dialect,
+      triggerName,
+      extractSqliteTrigger(sql, triggerName),
+      ["RAISE(ABORT"],
+    );
+  }
+  for (const triggerName of [
+    "trg_jobs_job_integrity_trust_policies_no_update",
+    "trg_jobs_job_integrity_trust_policies_no_delete",
+    "trg_jobs_job_integrity_trust_keys_no_update",
+    "trg_jobs_job_integrity_trust_keys_no_delete",
+    "trg_jobs_job_integrity_attestations_no_update",
+    "trg_jobs_job_integrity_attestations_no_delete",
+    "trg_jobs_job_integrity_revocations_no_update",
+    "trg_jobs_job_integrity_revocations_no_delete",
+    "trg_jobs_job_integrity_head_transitions_no_update",
+    "trg_jobs_job_integrity_head_transitions_no_delete",
+    "trg_jobs_job_integrity_heads_no_delete",
+    "trg_jobs_job_integrity_control_no_insert",
+    "trg_jobs_job_integrity_control_no_delete",
+  ]) {
+    requirePhase614BFragments(
+      issues,
+      dialect,
+      triggerName,
+      extractSqliteTrigger(sql, triggerName),
+      ["RAISE(ABORT"],
+    );
+  }
+}
+
+function phase614BPostgresRequirements(issues, sql) {
+  const dialect = "Postgres";
+  phase614BTableRequirements(issues, dialect, sql);
+  for (const [tableName, fragments] of [
+    [
+      "jobs_job_integrity_trust_policies",
+      [
+        "jsonb_typeof(allowed_providers_json::jsonb) = 'array'",
+        "jsonb_typeof(allowed_risk_policy_sha256s_json::jsonb) = 'array'",
+      ],
+    ],
+    [
+      "jobs_job_integrity_attestations",
+      [
+        "jsonb_typeof(identity_evidence_json::jsonb) = 'array'",
+        "jsonb_typeof(risk_evidence_json::jsonb) = 'array'",
+      ],
+    ],
+  ]) {
+    const table = extractTable(sql, tableName);
+    requirePhase614BFragments(
+      issues,
+      dialect,
+      tableName,
+      table ? normalizeSql(table.join(", ")) : null,
+      fragments,
+    );
+  }
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "validate_jobs_job_integrity_trust_policy_insert",
+    extractPostgresFunction(sql, "validate_jobs_job_integrity_trust_policy_insert"),
+    [
+      "predecessor.trust_generation=NEW.trust_generation-1",
+      "predecessor.root_anchor_sha256=NEW.root_anchor_sha256",
+    ],
+  );
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "reject_jobs_job_integrity_immutable_mutation",
+    extractPostgresFunction(sql, "reject_jobs_job_integrity_immutable_mutation"),
+    ["RAISE EXCEPTION 'job-integrity signed authority is immutable'"],
+  );
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "immutable authority trigger registration",
+    normalizeSql(sql),
+    [
+      "'jobs_job_integrity_trust_policies', 'jobs_job_integrity_trust_keys'",
+      "'jobs_job_integrity_attestations', 'jobs_job_integrity_revocations'",
+      "'jobs_job_integrity_head_transitions'",
+      "CREATE TRIGGER trg_%s_no_update BEFORE UPDATE ON %I FOR EACH ROW EXECUTE FUNCTION reject_jobs_job_integrity_immutable_mutation()",
+      "CREATE TRIGGER trg_%s_no_delete BEFORE DELETE ON %I FOR EACH ROW EXECUTE FUNCTION reject_jobs_job_integrity_immutable_mutation()",
+    ],
+  );
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "validate_jobs_job_integrity_trust_key_insert",
+    extractPostgresFunction(sql, "validate_jobs_job_integrity_trust_key_insert"),
+    [
+      "existing.key_id=NEW.key_id",
+      "existing.public_key_base64url=NEW.public_key_base64url",
+      "existing.role<>NEW.role",
+    ],
+  );
+  requirePhase614BFragments(
+    issues,
+    dialect,
+    "validate_jobs_job_integrity_revocation_insert",
+    extractPostgresFunction(sql, "validate_jobs_job_integrity_revocation_insert"),
+    ["predecessor.revocation_generation=NEW.revocation_generation-1"],
+  );
+  for (const [triggerName, functionName] of [
+    [
+      "trg_jobs_job_integrity_trust_policies_validate_insert",
+      "validate_jobs_job_integrity_trust_policy_insert",
+    ],
+    [
+      "trg_jobs_job_integrity_trust_keys_validate_insert",
+      "validate_jobs_job_integrity_trust_key_insert",
+    ],
+    [
+      "trg_jobs_job_integrity_attestations_validate_insert",
+      "validate_jobs_job_integrity_attestation_insert",
+    ],
+    [
+      "trg_jobs_job_integrity_revocations_validate_insert",
+      "validate_jobs_job_integrity_revocation_insert",
+    ],
+    [
+      "trg_jobs_job_integrity_head_transitions_validate_insert",
+      "validate_jobs_job_integrity_transition_insert",
+    ],
+    [
+      "trg_jobs_job_integrity_heads_monotonic",
+      "enforce_jobs_job_integrity_head_monotonic",
+    ],
+    [
+      "trg_jobs_job_integrity_control_monotonic",
+      "enforce_jobs_job_integrity_control_monotonic",
+    ],
+    [
+      "trg_jobs_job_integrity_heads_no_delete",
+      "reject_jobs_job_integrity_immutable_mutation",
+    ],
+    [
+      "trg_jobs_job_integrity_control_no_delete",
+      "reject_jobs_job_integrity_immutable_mutation",
+    ],
+  ]) {
+    requirePhase614BFragments(
+      issues,
+      dialect,
+      triggerName,
+      extractPostgresTrigger(sql, triggerName),
+      [`EXECUTE FUNCTION ${functionName}()`],
+    );
   }
 }
 
@@ -2715,6 +3118,8 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
   requireSinglePhase614IndexDeclarations(issues, "Postgres", postgresSource);
   requireSinglePhase614TableDeclarations(issues, "SQLite", sqliteSource);
   requireSinglePhase614TableDeclarations(issues, "Postgres", postgresSource);
+  requireSinglePhase614BDeclarations(issues, "SQLite", sqliteSource);
+  requireSinglePhase614BDeclarations(issues, "Postgres", postgresSource);
   requireIndexesPresent(issues, "SQLite", sqliteSource, "jobs_postings", [
     "unique idx_jobs_postings_account_id_unique on jobs_postings (account_id, id)",
   ]);
@@ -2723,6 +3128,8 @@ export function compareJobsSchemas(sqliteSource, postgresSource) {
   ]);
   phase613SqliteRequirements(issues, sqliteSource);
   phase613PostgresRequirements(issues, postgresSource);
+  phase614BSqliteRequirements(issues, sqliteSource);
+  phase614BPostgresRequirements(issues, postgresSource);
 
   return issues;
 }
@@ -2841,6 +3248,59 @@ export function checkPhase614MigrationRegistration(runnerSource) {
   return issues;
 }
 
+export function checkPhase614BMigrationRegistration(runnerSource) {
+  const issues = [];
+  const sqliteDeclaration =
+    /const\s+SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/sqlite\/server-runtime\/058_jobs_signed_job_integrity_authority\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(sqliteDeclaration)].length !== 1) {
+    issues.push(
+      "server SQLite migration runner must include 058_jobs_signed_job_integrity_authority.sql exactly once",
+    );
+  }
+  const sqliteMigrations = extractRustArrayBody(runnerSource, "MIGRATIONS");
+  if (
+    !sqliteMigrations ||
+    (
+      sqliteMigrations.match(
+        /\bSQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY\b/g,
+      ) ?? []
+    ).length !== 1
+  ) {
+    issues.push(
+      "server SQLite migration runner must register 058_jobs_signed_job_integrity_authority.sql exactly once",
+    );
+  }
+  const postgresIdDeclaration =
+    /pub\s+const\s+JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID\s*:\s*&str\s*=\s*"036_jobs_signed_job_integrity_authority\.sql"\s*;/g;
+  if ([...runnerSource.matchAll(postgresIdDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must declare 036_jobs_signed_job_integrity_authority.sql exactly once",
+    );
+  }
+  const postgresDeclaration =
+    /const\s+POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/postgres\/server-runtime\/036_jobs_signed_job_integrity_authority\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(postgresDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must include 036_jobs_signed_job_integrity_authority.sql exactly once",
+    );
+  }
+  const postgresMigrations = extractRustArrayBody(
+    runnerSource,
+    "POSTGRES_POST_JOBS_MIGRATIONS",
+  );
+  const postgresRegistration =
+    /\(\s*JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID\s*,\s*POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY\s*,?\s*\)/g;
+  if (
+    !postgresMigrations ||
+    [...postgresMigrations.matchAll(postgresRegistration)].length !== 1
+  ) {
+    issues.push(
+      "server Postgres migration runner must register 036_jobs_signed_job_integrity_authority.sql exactly once",
+    );
+  }
+  return issues;
+}
+
 function main() {
   const repoRoot = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -2947,6 +3407,14 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
   );
+  const sqliteSignedJobIntegrityAuthorityPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql",
+  );
+  const postgresSignedJobIntegrityAuthorityPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -2961,6 +3429,7 @@ function main() {
     sqliteOperationalHoldsPath,
     sqliteCanonicalTaxonomyAuthorityPath,
     sqliteOriginalSourceVerificationAuthorityPath,
+    sqliteSignedJobIntegrityAuthorityPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -2978,6 +3447,7 @@ function main() {
     postgresOperationalHoldsPath,
     postgresCanonicalTaxonomyAuthorityPath,
     postgresOriginalSourceVerificationAuthorityPath,
+    postgresSignedJobIntegrityAuthorityPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -2985,6 +3455,7 @@ function main() {
   issues.push(
     ...checkPhase613MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase614MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
+    ...checkPhase614BMigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
   );
 
   const includePath =

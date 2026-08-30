@@ -416,6 +416,52 @@ pub struct OperationalHoldContext {
     scopes: BTreeMap<OperationalHoldScopeKind, BTreeSet<String>>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct OperationalHoldEmployerDomain {
+    canonical_ascii: String,
+}
+
+impl std::fmt::Debug for OperationalHoldEmployerDomain {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OperationalHoldEmployerDomain")
+            .field("present", &true)
+            .finish()
+    }
+}
+
+impl OperationalHoldEmployerDomain {
+    /// Construct the hold scope from the current signed job-integrity authority. Callers must
+    /// resolve that authority after the common authority prelocks.
+    pub fn from_current_job_integrity_authority(
+        authority: &JobIntegrityCurrentAuthority,
+    ) -> std::result::Result<Self, OperationalHoldError> {
+        Ok(Self {
+            canonical_ascii: canonical_operational_employer_domain(
+                &authority.canonical_employer_domain,
+            )?,
+        })
+    }
+
+    /// Construct a historical hold scope from a strictly decoded frozen job-integrity receipt.
+    /// This is intentionally crate-private: callers must first authenticate the containing
+    /// approved-execution/replay authority and must never pass a posting, URL, or mutable JSON
+    /// projection through this seam.
+    pub(crate) fn from_validated_frozen_job_integrity_receipt(
+        receipt: &JobIntegrityReceiptV1,
+    ) -> std::result::Result<Self, OperationalHoldError> {
+        Ok(Self {
+            canonical_ascii: canonical_operational_employer_domain(
+                &receipt.canonical_employer_domain,
+            )?,
+        })
+    }
+
+    fn as_str(&self) -> &str {
+        &self.canonical_ascii
+    }
+}
+
 impl std::fmt::Debug for OperationalHoldContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let scope_counts = self
@@ -527,6 +573,7 @@ fn normalize_operational_scope_id(
     scope_kind: OperationalHoldScopeKind,
     value: &str,
 ) -> std::result::Result<String, OperationalHoldError> {
+    let original = value;
     let value = value.trim();
     if value.is_empty() || value.len() > 256 || value.chars().any(char::is_control) {
         return Err(OperationalHoldError::InvalidRequest);
@@ -539,17 +586,14 @@ fn normalize_operational_scope_id(
     if value == "*" {
         return Err(OperationalHoldError::InvalidRequest);
     }
+    if scope_kind == OperationalHoldScopeKind::EmployerDomain && original != value {
+        return Err(OperationalHoldError::InvalidRequest);
+    }
     let normalized = match scope_kind {
         OperationalHoldScopeKind::Account
         | OperationalHoldScopeKind::CareerTrack
         | OperationalHoldScopeKind::DiscoverySource => value.to_string(),
-        OperationalHoldScopeKind::EmployerDomain => {
-            let domain = value.trim_end_matches('.');
-            if domain.chars().any(char::is_whitespace) {
-                return Err(OperationalHoldError::InvalidRequest);
-            }
-            unicode_lowercase_nfc(domain)
-        }
+        OperationalHoldScopeKind::EmployerDomain => canonical_operational_employer_domain(value)?,
         OperationalHoldScopeKind::Region => unicode_lowercase_nfc(value),
         _ => value.to_ascii_lowercase(),
     };
@@ -578,23 +622,87 @@ fn valid_operational_scope_token(value: &str) -> bool {
 }
 
 fn valid_operational_employer_domain(value: &str) -> bool {
-    if value.len() > 253 || value.chars().any(char::is_whitespace) {
-        return false;
+    canonical_operational_employer_domain(value).is_ok()
+}
+
+fn canonical_operational_employer_domain(
+    value: &str,
+) -> std::result::Result<String, OperationalHoldError> {
+    if value.is_empty()
+        || value.len() > 253
+        || value.trim() != value
+        || value != value.to_ascii_lowercase()
+        || !value.is_ascii()
+        || !value.contains('.')
+        || value.parse::<std::net::IpAddr>().is_ok()
+        || value == "localhost"
+        || value.ends_with(".localhost")
+    {
+        return Err(OperationalHoldError::InvalidRequest);
     }
-    let Ok(url) = reqwest::Url::parse(&format!("https://{value}/")) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    url.username().is_empty()
+    if !value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    }) {
+        return Err(OperationalHoldError::InvalidRequest);
+    }
+    let url = reqwest::Url::parse(&format!("https://{value}/"))
+        .map_err(|_| OperationalHoldError::InvalidRequest)?;
+    if url.username().is_empty()
         && url.password().is_none()
         && url.port().is_none()
         && url.path() == "/"
         && url.query().is_none()
         && url.fragment().is_none()
-        && host.contains('.')
-        && host.parse::<std::net::IpAddr>().is_err()
+        && url.domain() == Some(value)
+    {
+        Ok(value.to_string())
+    } else {
+        Err(OperationalHoldError::InvalidRequest)
+    }
+}
+
+fn operational_posting_employer_domain_matches_signed_authority(
+    posting: &JobPosting,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+) -> std::result::Result<(), OperationalHoldError> {
+    let Some(raw_domain) = posting
+        .discovery_evidence
+        .canonical_employer_domain
+        .as_deref()
+    else {
+        return Ok(());
+    };
+    let stored = canonical_operational_employer_domain(raw_domain).map_err(|_| {
+        OperationalHoldError::Storage(anyhow::anyhow!(
+            "invalid mutable Jobs employer-domain projection"
+        ))
+    })?;
+    if employer_domain.is_none() || employer_domain.is_some_and(|signed| stored != signed.as_str())
+    {
+        return Err(OperationalHoldError::Storage(anyhow::anyhow!(
+            "mutable Jobs employer-domain projection lacks matching signed authority"
+        )));
+    }
+    Ok(())
+}
+
+fn insert_operational_employer_domain(
+    context: &mut OperationalHoldContext,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+) -> std::result::Result<(), OperationalHoldError> {
+    if let Some(employer_domain) = employer_domain {
+        context.insert_scope(
+            OperationalHoldScopeKind::EmployerDomain,
+            employer_domain.as_str(),
+        )?;
+    }
+    Ok(())
 }
 
 fn validate_preemptive_operational_scope(
@@ -2093,6 +2201,14 @@ pub(crate) fn evaluate_operational_capability_postgres_tx(
     context: &OperationalHoldContext,
 ) -> std::result::Result<OperationalCapabilityEvaluation, OperationalHoldError> {
     lock_operational_hold_shared_postgres_tx(tx)?;
+    evaluate_operational_capability_postgres_tx_after_prelock(tx, capability, context)
+}
+
+fn evaluate_operational_capability_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    capability: OperationalCapability,
+    context: &OperationalHoldContext,
+) -> std::result::Result<OperationalCapabilityEvaluation, OperationalHoldError> {
     let scope_pairs = context.exact_scope_pairs();
     let scope_kinds = scope_pairs
         .iter()
@@ -2142,6 +2258,16 @@ pub(crate) fn evaluate_operational_capability_postgres_tx(
     Ok(OperationalCapabilityEvaluation::Allowed)
 }
 
+/// Evaluate a hold after the caller has already acquired the complete common authority prelock.
+/// This public-in-module seam performs no advisory locking.
+pub fn evaluate_operational_capability_postgres_tx_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    capability: OperationalCapability,
+    context: &OperationalHoldContext,
+) -> std::result::Result<OperationalCapabilityEvaluation, OperationalHoldError> {
+    evaluate_operational_capability_postgres_tx_after_prelock(tx, capability, context)
+}
+
 pub(crate) fn lock_operational_hold_shared_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
 ) -> std::result::Result<(), OperationalHoldError> {
@@ -2172,46 +2298,17 @@ pub(crate) fn require_operational_capability_postgres_tx(
     }
 }
 
-fn operational_verified_employer_domains(
-    posting: &JobPosting,
-) -> std::result::Result<Vec<String>, OperationalHoldError> {
-    let Some(raw_domain) = posting
-        .discovery_evidence
-        .canonical_employer_domain
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return Ok(Vec::new());
-    };
-    let candidate = raw_domain.trim_end_matches('.');
-    let url = reqwest::Url::parse(&format!("https://{candidate}/")).map_err(|_| {
-        OperationalHoldError::Storage(anyhow::anyhow!("invalid Jobs canonical employer domain"))
-    })?;
-    if !url.username().is_empty()
-        || url.password().is_some()
-        || url.port().is_some()
-        || url.path() != "/"
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(OperationalHoldError::Storage(anyhow::anyhow!(
-            "invalid Jobs canonical employer domain"
-        )));
+/// Evaluate a hold after the caller has already acquired the operational-hold shared advisory
+/// lock as the first common authority prelock.
+pub fn require_operational_capability_postgres_tx_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    capability: OperationalCapability,
+    context: &OperationalHoldContext,
+) -> std::result::Result<(), OperationalHoldError> {
+    match evaluate_operational_capability_postgres_tx_after_prelock(tx, capability, context)? {
+        OperationalCapabilityEvaluation::Allowed => Ok(()),
+        OperationalCapabilityEvaluation::Held(block) => Err(OperationalHoldError::Held(block)),
     }
-    let ascii_domain = url
-        .host_str()
-        .map(str::to_ascii_lowercase)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            OperationalHoldError::Storage(anyhow::anyhow!("invalid Jobs canonical employer domain"))
-        })?;
-    let unicode_domain = unicode_lowercase_nfc(candidate);
-    let mut domains = vec![unicode_domain.clone()];
-    if ascii_domain != unicode_domain {
-        domains.push(ascii_domain);
-    }
-    Ok(domains)
 }
 
 fn operational_known_ats_provider(value: &str) -> Option<&'static str> {
@@ -2247,6 +2344,7 @@ fn operational_region(value: &str) -> Option<&str> {
 struct OperationalApplicationContextValues<'a> {
     account_id: &'a str,
     posting: &'a JobPosting,
+    employer_domain: Option<&'a OperationalHoldEmployerDomain>,
     application_json: Option<&'a str>,
     runner_kind: Option<&'a str>,
     model_provider: Option<&'a str>,
@@ -2257,6 +2355,10 @@ fn add_application_context_values(
     context: &mut OperationalHoldContext,
     values: OperationalApplicationContextValues<'_>,
 ) -> std::result::Result<(), OperationalHoldError> {
+    operational_posting_employer_domain_matches_signed_authority(
+        values.posting,
+        values.employer_domain,
+    )?;
     context.insert_scope(OperationalHoldScopeKind::Account, values.account_id)?;
     if !values.posting.track_id.trim().is_empty() {
         context.insert_scope(
@@ -2264,9 +2366,7 @@ fn add_application_context_values(
             &values.posting.track_id,
         )?;
     }
-    for domain in operational_verified_employer_domains(values.posting)? {
-        context.insert_scope(OperationalHoldScopeKind::EmployerDomain, &domain)?;
-    }
+    insert_operational_employer_domain(context, values.employer_domain)?;
     if let Some(region) = operational_region(&values.posting.location) {
         context.insert_scope(OperationalHoldScopeKind::Region, region)?;
     }
@@ -2390,6 +2490,46 @@ pub(crate) fn operational_hold_context_for_application_sqlite_tx(
     model_provider: Option<&str>,
     model: Option<&str>,
 ) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
+    operational_hold_context_for_application_sqlite_tx_impl(
+        tx,
+        account_id,
+        application_id,
+        None,
+        runner_kind,
+        model_provider,
+        model,
+    )
+}
+
+pub fn operational_hold_context_for_application_sqlite_tx_after_authority(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
+    runner_kind: Option<&str>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
+    operational_hold_context_for_application_sqlite_tx_impl(
+        tx,
+        account_id,
+        application_id,
+        Some(employer_domain),
+        runner_kind,
+        model_provider,
+        model,
+    )
+}
+
+fn operational_hold_context_for_application_sqlite_tx_impl(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+    runner_kind: Option<&str>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
     let row = tx
         .query_row(
             "SELECT posting.posting_json, posting.canonical_url, posting.company,
@@ -2422,6 +2562,7 @@ pub(crate) fn operational_hold_context_for_application_sqlite_tx(
         OperationalApplicationContextValues {
             account_id,
             posting: &posting,
+            employer_domain,
             application_json: Some(&row.5),
             runner_kind,
             model_provider,
@@ -2474,6 +2615,49 @@ pub(crate) fn operational_hold_context_for_application_postgres_tx(
 ) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
     lock_discovery_account_shared_postgres(tx, account_id)
         .map_err(OperationalHoldError::Storage)?;
+    operational_hold_context_for_application_postgres_tx_impl(
+        tx,
+        account_id,
+        application_id,
+        None,
+        runner_kind,
+        model_provider,
+        model,
+    )
+}
+
+/// Build an application-scoped hold context after the caller has acquired the common job
+/// authority prelocks, including the discovery-account fence. This helper performs data reads and
+/// row locks only; it must not acquire an authority advisory lock.
+pub fn operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
+    runner_kind: Option<&str>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
+    operational_hold_context_for_application_postgres_tx_impl(
+        tx,
+        account_id,
+        application_id,
+        Some(employer_domain),
+        runner_kind,
+        model_provider,
+        model,
+    )
+}
+
+fn operational_hold_context_for_application_postgres_tx_impl(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+    runner_kind: Option<&str>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
     let initial_job_id = tx
         .query_opt(
             "SELECT job_id FROM jobs_applications
@@ -2525,6 +2709,7 @@ pub(crate) fn operational_hold_context_for_application_postgres_tx(
         OperationalApplicationContextValues {
             account_id,
             posting: &posting,
+            employer_domain,
             application_json: Some(&application_json),
             runner_kind,
             model_provider,
@@ -2569,6 +2754,42 @@ pub(crate) fn operational_hold_context_for_job_sqlite_tx(
     model_provider: Option<&str>,
     model: Option<&str>,
 ) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
+    operational_hold_context_for_job_sqlite_tx_impl(
+        tx,
+        account_id,
+        job_id,
+        None,
+        model_provider,
+        model,
+    )
+}
+
+pub fn operational_hold_context_for_job_sqlite_tx_after_authority(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    job_id: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
+    operational_hold_context_for_job_sqlite_tx_impl(
+        tx,
+        account_id,
+        job_id,
+        Some(employer_domain),
+        model_provider,
+        model,
+    )
+}
+
+fn operational_hold_context_for_job_sqlite_tx_impl(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    job_id: &str,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
     let row = tx
         .query_row(
             "SELECT posting_json, canonical_url, company, location, source FROM jobs_postings
@@ -2594,6 +2815,7 @@ pub(crate) fn operational_hold_context_for_job_sqlite_tx(
         OperationalApplicationContextValues {
             account_id,
             posting: &posting,
+            employer_domain,
             application_json: None,
             runner_kind: None,
             model_provider,
@@ -2644,6 +2866,45 @@ pub(crate) fn operational_hold_context_for_job_postgres_tx(
 ) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
     lock_discovery_account_shared_postgres(tx, account_id)
         .map_err(OperationalHoldError::Storage)?;
+    operational_hold_context_for_job_postgres_tx_impl(
+        tx,
+        account_id,
+        job_id,
+        None,
+        model_provider,
+        model,
+    )
+}
+
+/// Build a posting-scoped hold context after the caller has acquired the common job authority
+/// prelocks, including the discovery-account fence. This helper performs data reads and row locks
+/// only; it must not acquire an authority advisory lock.
+pub fn operational_hold_context_for_job_postgres_tx_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    job_id: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
+    operational_hold_context_for_job_postgres_tx_impl(
+        tx,
+        account_id,
+        job_id,
+        Some(employer_domain),
+        model_provider,
+        model,
+    )
+}
+
+fn operational_hold_context_for_job_postgres_tx_impl(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    job_id: &str,
+    employer_domain: Option<&OperationalHoldEmployerDomain>,
+    model_provider: Option<&str>,
+    model: Option<&str>,
+) -> std::result::Result<OperationalHoldContext, OperationalHoldError> {
     let row = tx
         .query_opt(
             "SELECT posting_json, canonical_url, company, location, source
@@ -2667,6 +2928,7 @@ pub(crate) fn operational_hold_context_for_job_postgres_tx(
         OperationalApplicationContextValues {
             account_id,
             posting: &posting,
+            employer_domain,
             application_json: None,
             runner_kind: None,
             model_provider,
@@ -2863,6 +3125,43 @@ mod operational_hold_tests {
                 ..JobDiscoveryEvidence::default()
             },
             eligibility: None,
+        }
+    }
+
+    fn operational_employer_domain(value: &str) -> OperationalHoldEmployerDomain {
+        OperationalHoldEmployerDomain {
+            canonical_ascii: canonical_operational_employer_domain(value).unwrap(),
+        }
+    }
+
+    fn operational_current_integrity_authority(
+        employer_domain: &str,
+        application_domain: &str,
+    ) -> JobIntegrityCurrentAuthority {
+        JobIntegrityCurrentAuthority {
+            subject_sha256: "1".repeat(64),
+            source_material_sha256: "2".repeat(64),
+            attestation_sha256: "3".repeat(64),
+            attestation_generation: 1,
+            head_revision: 1,
+            head_transition_sha256: "4".repeat(64),
+            policy_sha256: "5".repeat(64),
+            employer_authorization_sha256: "6".repeat(64),
+            risk_authorization_sha256: "7".repeat(64),
+            canonical_employer_id: "employer-acme".to_string(),
+            canonical_employer_domain: employer_domain.to_string(),
+            risk_policy_sha256: "8".repeat(64),
+            effective_expires_at_ms: 2,
+            canonical_job_id: "job-acme".to_string(),
+            provider_family: "greenhouse".to_string(),
+            provider_record_id: "record-acme".to_string(),
+            provider_host: application_domain.to_string(),
+            provider_tenant: "acme".to_string(),
+            provider_job: "123".to_string(),
+            provider_variant: "default".to_string(),
+            canonical_application_url: format!("https://{application_domain}/acme/jobs/123"),
+            application_domain: application_domain.to_string(),
+            ats_tenant_binding_sha256: "9".repeat(64),
         }
     }
 
@@ -3698,12 +3997,58 @@ mod operational_hold_tests {
             "https://boards.greenhouse.io/acme/jobs/123",
         );
         posting.location = "New York, NY".to_string();
+        let authority =
+            operational_current_integrity_authority("careers.acme.example", "boards.greenhouse.io");
+        let employer_domain =
+            OperationalHoldEmployerDomain::from_current_job_integrity_authority(&authority)
+                .unwrap();
+
+        let mut raw_only_context = OperationalHoldContext::new();
+        assert!(matches!(
+            add_application_context_values(
+                &mut raw_only_context,
+                OperationalApplicationContextValues {
+                    account_id: "acct-operational",
+                    posting: &posting,
+                    employer_domain: None,
+                    application_json: None,
+                    runner_kind: Some("cloud"),
+                    model_provider: None,
+                    model: None,
+                },
+            ),
+            Err(OperationalHoldError::Storage(_))
+        ));
+        assert_eq!(raw_only_context, OperationalHoldContext::new());
+
+        posting.discovery_evidence.canonical_employer_domain =
+            Some("mutable-spoof.example".to_string());
+        let mut spoofed_context = OperationalHoldContext::new();
+        assert!(matches!(
+            add_application_context_values(
+                &mut spoofed_context,
+                OperationalApplicationContextValues {
+                    account_id: "acct-operational",
+                    posting: &posting,
+                    employer_domain: Some(&employer_domain),
+                    application_json: None,
+                    runner_kind: Some("cloud"),
+                    model_provider: None,
+                    model: None,
+                },
+            ),
+            Err(OperationalHoldError::Storage(_))
+        ));
+        assert_eq!(spoofed_context, OperationalHoldContext::new());
+
+        posting.discovery_evidence.canonical_employer_domain = None;
         let mut context = OperationalHoldContext::new();
         add_application_context_values(
             &mut context,
             OperationalApplicationContextValues {
                 account_id: "acct-operational",
                 posting: &posting,
+                employer_domain: Some(&employer_domain),
                 application_json: None,
                 runner_kind: Some("cloud"),
                 model_provider: None,
@@ -3765,6 +4110,7 @@ mod operational_hold_tests {
             OperationalApplicationContextValues {
                 account_id: "acct-operational",
                 posting: &posting,
+                employer_domain: Some(&employer_domain),
                 application_json: Some(&application_json),
                 runner_kind: Some("cloud"),
                 model_provider: None,
@@ -3774,6 +4120,188 @@ mod operational_hold_tests {
         .unwrap();
         assert!(certified_context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
         assert!(certified_context.matches(OperationalHoldScopeKind::AtsAdapter, "2026.07.1-beta.1"));
+    }
+
+    #[test]
+    fn sqlite_application_context_requires_explicit_signed_employer_domain() {
+        let pool = hold_pool(true);
+        insert_test_account(&pool, "acct-signed-domain");
+        let posting = operational_posting(
+            "Acme Incorporated",
+            "greenhouse",
+            "https://boards.greenhouse.io/acme/jobs/123",
+        );
+        let application = JobApplication {
+            id: "application-signed-domain".to_string(),
+            job_id: posting.id.clone(),
+            resume_version_id: None,
+            state: "approved".to_string(),
+            submission_mode: "auto_submit".to_string(),
+            match_score: 100,
+            answers: Vec::new(),
+            cover_letter: String::new(),
+            receipt: Value::Null,
+            run_id: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            submitted_at_ms: None,
+        };
+        let posting_json = to_json(&posting, "signed-domain posting fixture").unwrap();
+        let application_json = to_json(&application, "signed-domain application fixture").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_postings (
+                    id, account_id, canonical_key, posting_json, source, canonical_url,
+                    company, title, location, match_score, status, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 100, 'saved', 1, 1)",
+                params![
+                    posting.id,
+                    "acct-signed-domain",
+                    posting.canonical_key,
+                    posting_json,
+                    posting.source,
+                    posting.canonical_url,
+                    posting.company,
+                    posting.title,
+                    posting.location,
+                ],
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_applications (
+                    id, account_id, job_id, state, application_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, 'approved', ?4, 1, 1)",
+                params![
+                    application.id,
+                    "acct-signed-domain",
+                    application.job_id,
+                    application_json,
+                ],
+            )
+            .unwrap();
+
+        let authority =
+            operational_current_integrity_authority("careers.acme.example", "boards.greenhouse.io");
+        let employer_domain =
+            OperationalHoldEmployerDomain::from_current_job_integrity_authority(&authority)
+                .unwrap();
+        let mut conn = pool.get().unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(matches!(
+            operational_hold_context_for_application_sqlite_tx(
+                &tx,
+                "acct-signed-domain",
+                &application.id,
+                Some("cloud"),
+                None,
+                None,
+            ),
+            Err(OperationalHoldError::Storage(_))
+        ));
+        let context = operational_hold_context_for_application_sqlite_tx_after_authority(
+            &tx,
+            "acct-signed-domain",
+            &application.id,
+            &employer_domain,
+            Some("cloud"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(context.matches(
+            OperationalHoldScopeKind::EmployerDomain,
+            "careers.acme.example"
+        ));
+        assert!(!context.matches(
+            OperationalHoldScopeKind::EmployerDomain,
+            "boards.greenhouse.io"
+        ));
+        tx.commit().unwrap();
+    }
+
+    #[test]
+    fn signed_domain_after_prelock_context_helpers_do_not_reacquire_authority_locks() {
+        let source = include_str!("operational_holds.rs");
+        let hold_evaluation = source
+            .split("pub fn require_operational_capability_postgres_tx_after_authority_prelock(")
+            .nth(1)
+            .unwrap()
+            .split("fn operational_known_ats_provider(")
+            .next()
+            .unwrap();
+        assert!(
+            hold_evaluation.contains("evaluate_operational_capability_postgres_tx_after_prelock")
+        );
+        assert!(!hold_evaluation.contains("lock_operational_hold_shared_postgres_tx("));
+
+        for (legacy_start, after_prelock_start, implementation_start, end) in [
+            (
+                "pub(crate) fn operational_hold_context_for_application_postgres_tx(",
+                "pub fn operational_hold_context_for_application_postgres_tx_after_authority_prelock(",
+                "fn operational_hold_context_for_application_postgres_tx_impl(",
+                "pub(crate) fn operational_hold_context_for_job_sqlite_tx(",
+            ),
+            (
+                "pub(crate) fn operational_hold_context_for_job_postgres_tx(",
+                "pub fn operational_hold_context_for_job_postgres_tx_after_authority_prelock(",
+                "fn operational_hold_context_for_job_postgres_tx_impl(",
+                "pub(crate) fn operational_hold_context_for_mailbox_sqlite_tx(",
+            ),
+        ] {
+            let legacy = source
+                .split(legacy_start)
+                .nth(1)
+                .unwrap()
+                .split(after_prelock_start)
+                .next()
+                .unwrap();
+            let fence = legacy
+                .find("lock_discovery_account_shared_postgres")
+                .unwrap();
+            let implementation_call = legacy
+                .find(implementation_start.trim_start_matches("fn ").trim_end_matches('('))
+                .unwrap();
+            assert!(fence < implementation_call);
+
+            let after_prelock = source
+                .split(after_prelock_start)
+                .nth(1)
+                .unwrap()
+                .split(implementation_start)
+                .next()
+                .unwrap();
+            assert!(after_prelock.contains("Some(employer_domain)"));
+            for forbidden in [
+                "lock_discovery_account_shared_postgres(",
+                "lock_operational_hold_shared_postgres_tx(",
+                "lock_managed_cloud_release_registry_shared_postgres_tx(",
+                "lock_postgres_ats_certification(",
+            ] {
+                assert!(!after_prelock.contains(forbidden));
+            }
+
+            let implementation = source
+                .split(implementation_start)
+                .nth(1)
+                .unwrap()
+                .split(end)
+                .next()
+                .unwrap();
+            assert!(implementation.contains("FROM jobs_postings"));
+            assert!(implementation.contains("FOR SHARE"));
+            assert!(!implementation.contains("FOR UPDATE OF membership, source"));
+            for forbidden in [
+                "lock_discovery_account_shared_postgres(",
+                "lock_operational_hold_shared_postgres_tx(",
+                "lock_managed_cloud_release_registry_shared_postgres_tx(",
+                "lock_postgres_ats_certification(",
+            ] {
+                assert!(!implementation.contains(forbidden));
+            }
+        }
     }
 
     #[test]
@@ -3791,6 +4319,7 @@ mod operational_hold_tests {
             OperationalApplicationContextValues {
                 account_id: "acct-operational",
                 posting: &posting,
+                employer_domain: Some(&operational_employer_domain("careers.acme.example")),
                 application_json: None,
                 runner_kind: None,
                 model_provider: None,
@@ -3809,6 +4338,7 @@ mod operational_hold_tests {
                 OperationalApplicationContextValues {
                     account_id: "acct-operational",
                     posting: &posting,
+                    employer_domain: Some(&operational_employer_domain("careers.acme.example")),
                     application_json: None,
                     runner_kind: None,
                     model_provider: None,
@@ -3823,21 +4353,46 @@ mod operational_hold_tests {
     }
 
     #[test]
-    fn unicode_employer_domain_hold_matches_verified_idn_context() {
+    fn signed_employer_domain_requires_canonical_ascii_and_rejects_mutable_idn_storage() {
         let pool = hold_pool(true);
         let mut posting = operational_posting(
             "International Employer",
             "curated_feed",
             "https://jobs.lever.co/international/job-123",
         );
+        let authority =
+            operational_current_integrity_authority("xn--mnich-kva.example", "jobs.lever.co");
+        let employer_domain =
+            OperationalHoldEmployerDomain::from_current_job_integrity_authority(&authority)
+                .unwrap();
         posting.discovery_evidence.canonical_employer_domain =
             Some("MU\u{308}NICH.example.".to_string());
+        let mut malformed_context = OperationalHoldContext::new();
+        assert!(matches!(
+            add_application_context_values(
+                &mut malformed_context,
+                OperationalApplicationContextValues {
+                    account_id: "acct-idn-employer",
+                    posting: &posting,
+                    employer_domain: Some(&employer_domain),
+                    application_json: None,
+                    runner_kind: None,
+                    model_provider: None,
+                    model: None,
+                },
+            ),
+            Err(OperationalHoldError::Storage(_))
+        ));
+        assert_eq!(malformed_context, OperationalHoldContext::new());
+
+        posting.discovery_evidence.canonical_employer_domain = None;
         let mut context = OperationalHoldContext::new();
         add_application_context_values(
             &mut context,
             OperationalApplicationContextValues {
                 account_id: "acct-idn-employer",
                 posting: &posting,
+                employer_domain: Some(&employer_domain),
                 application_json: None,
                 runner_kind: None,
                 model_provider: None,
@@ -3845,17 +4400,40 @@ mod operational_hold_tests {
             },
         )
         .unwrap();
-        assert!(context.matches(OperationalHoldScopeKind::EmployerDomain, "münich.example"));
+        assert!(!context.matches(OperationalHoldScopeKind::EmployerDomain, "münich.example"));
         assert!(context.matches(
             OperationalHoldScopeKind::EmployerDomain,
             "xn--mnich-kva.example"
         ));
 
+        for rejected in [
+            "MUNICH.example",
+            "münich.example",
+            "xn--mnich-kva.example.",
+            "xn--mnich-kva.example:443",
+            "user@xn--mnich-kva.example",
+            "xn--.example",
+        ] {
+            let rejected_authority =
+                operational_current_integrity_authority(rejected, "jobs.lever.co");
+            assert!(matches!(
+                OperationalHoldEmployerDomain::from_current_job_integrity_authority(
+                    &rejected_authority,
+                ),
+                Err(OperationalHoldError::InvalidRequest)
+            ));
+            assert!(matches!(
+                OperationalHoldContext::new()
+                    .with_scope(OperationalHoldScopeKind::EmployerDomain, rejected),
+                Err(OperationalHoldError::InvalidRequest)
+            ));
+        }
+
         let held = request(
             "unicode-employer-domain-held",
             OperationalCapability::Generation,
             OperationalHoldScopeKind::EmployerDomain,
-            "münich.example",
+            "xn--mnich-kva.example",
             OperationalHoldTransition::Held,
             0,
             None,
@@ -3909,6 +4487,9 @@ mod operational_hold_tests {
                     OperationalApplicationContextValues {
                         account_id: "acct-operational",
                         posting: &posting,
+                        employer_domain: Some(
+                            &operational_employer_domain("careers.acme.example",)
+                        ),
                         application_json: Some(&application_json),
                         runner_kind: None,
                         model_provider: None,

@@ -353,8 +353,23 @@ struct OriginalSourceOwnedProviderTarget {
     host: String,
     tenant: String,
     job: String,
-    variant: &'static str,
+    variant: String,
     provider_record_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OriginalSourceCanonicalSubject {
+    canonical_subject_json: String,
+    subject_sha256: String,
+    canonical_job_id: String,
+    provider_family: String,
+    provider_record_id: String,
+    provider_host: String,
+    provider_tenant: String,
+    provider_job: String,
+    provider_variant: String,
+    canonical_subject_original_url: String,
+    discovery_source_key: String,
 }
 
 #[derive(Serialize)]
@@ -529,7 +544,7 @@ fn original_source_provider(source: &str) -> Option<&'static str> {
 
 fn original_source_canonical_subject(
     posting: &JobPosting,
-) -> OriginalSourceVerificationResult<(String, String)> {
+) -> OriginalSourceVerificationResult<OriginalSourceCanonicalSubject> {
     let fields = [
         posting.canonical_key.trim(),
         posting.source.trim(),
@@ -596,7 +611,7 @@ fn original_source_canonical_subject(
             host: target.host,
             tenant: target.tenant,
             job: target.job,
-            variant: target.variant,
+            variant: target.variant.to_string(),
             provider_record_id: target.provider_job_key,
         }
     } else {
@@ -647,7 +662,8 @@ fn original_source_canonical_subject(
                 "smartrecruiters" => "smartrecruiters_posting",
                 "workday" => "workday_posting",
                 _ => unreachable!("provider is closed above"),
-            },
+            }
+            .to_string(),
             provider_record_id: format!("{provider}:{host}:{source_key}:{external_id}"),
         }
     };
@@ -671,9 +687,10 @@ fn original_source_canonical_subject(
         "original-source-employer-{}",
         &original_source_sha256(format!("{provider}:{source_key}").as_bytes())[..32]
     );
+    let canonical_job_id = posting.canonical_key.trim().to_string();
     let subject = OriginalSourceSubject {
         schema_version: 1,
-        canonical_job_id: posting.canonical_key.trim(),
+        canonical_job_id: &canonical_job_id,
         employer_id: Some(&employer_id),
         original_url: &original_url,
         provider_family: provider,
@@ -682,7 +699,7 @@ fn original_source_canonical_subject(
             host: &provider_target.host,
             tenant: &provider_target.tenant,
             job: &provider_target.job,
-            variant: provider_target.variant,
+            variant: &provider_target.variant,
         },
         expected: OriginalSourceExpected {
             company: posting.company.trim(),
@@ -703,43 +720,33 @@ fn original_source_canonical_subject(
         ));
     }
     let sha256 = original_source_sha256(canonical.as_bytes());
-    Ok((canonical, sha256))
+    Ok(OriginalSourceCanonicalSubject {
+        canonical_subject_json: canonical,
+        subject_sha256: sha256,
+        canonical_job_id,
+        provider_family: provider.to_string(),
+        provider_record_id: provider_target.provider_record_id,
+        provider_host: provider_target.host,
+        provider_tenant: provider_target.tenant,
+        provider_job: provider_target.job,
+        provider_variant: provider_target.variant,
+        canonical_subject_original_url: original_url,
+        discovery_source_key: source_key,
+    })
 }
 
 pub fn original_source_subject_sha256(
     posting: &JobPosting,
 ) -> OriginalSourceVerificationResult<String> {
-    original_source_canonical_subject(posting).map(|(_, sha256)| sha256)
+    original_source_canonical_subject(posting).map(|subject| subject.subject_sha256)
 }
 
-fn original_source_provider_coordinates(
-    posting: &JobPosting,
-) -> OriginalSourceVerificationResult<(&'static str, String)> {
-    let provider = original_source_provider(&posting.source).ok_or_else(|| {
-        OriginalSourceVerificationError::InvalidInput(
-            "job source is not a supported verified import".to_string(),
-        )
-    })?;
-    let (canonical_url, source_key) =
-        canonical_public_discovery_url(provider, posting.canonical_url.trim()).map_err(|_| {
-            OriginalSourceVerificationError::InvalidInput(
-                "job URL is not a supported original-source provider target".to_string(),
-            )
-        })?;
-    if canonical_url != posting.canonical_url.trim() {
-        return Err(OriginalSourceVerificationError::InvalidInput(
-            "job URL is not in server-canonical form".to_string(),
-        ));
-    }
-    Ok((provider, source_key))
-}
-
-fn require_original_source_membership_sqlite(
+fn trusted_original_source_membership_sqlite(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
     posting: &JobPosting,
-) -> OriginalSourceVerificationResult<()> {
-    let (provider, source_key) = original_source_provider_coordinates(posting)?;
+) -> OriginalSourceVerificationResult<Option<OriginalSourceCanonicalSubject>> {
+    let subject = original_source_canonical_subject(posting)?;
     let trusted = tx
         .query_row(
             "SELECT 1 FROM jobs_discovery_memberships membership
@@ -757,28 +764,35 @@ fn require_original_source_membership_sqlite(
                 posting.id,
                 posting.external_id,
                 posting.canonical_key,
-                provider,
-                source_key
+                subject.provider_family,
+                subject.discovery_source_key
             ],
             |_| Ok(()),
         )
         .optional()
         .map_err(original_source_storage)?
         .is_some();
-    if !trusted {
-        return Err(OriginalSourceVerificationError::InvalidInput(
-            "job has no trusted discovery membership".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(trusted.then_some(subject))
 }
 
-fn require_original_source_membership_postgres(
+fn require_original_source_membership_sqlite(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+) -> OriginalSourceVerificationResult<OriginalSourceCanonicalSubject> {
+    trusted_original_source_membership_sqlite(tx, account_id, posting)?.ok_or_else(|| {
+        OriginalSourceVerificationError::InvalidInput(
+            "job has no trusted discovery membership".to_string(),
+        )
+    })
+}
+
+fn trusted_original_source_membership_postgres(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
     posting: &JobPosting,
-) -> OriginalSourceVerificationResult<()> {
-    let (provider, source_key) = original_source_provider_coordinates(posting)?;
+) -> OriginalSourceVerificationResult<Option<OriginalSourceCanonicalSubject>> {
+    let subject = original_source_canonical_subject(posting)?;
     let trusted = tx
         .query_opt(
             "SELECT 1 FROM jobs_discovery_memberships membership
@@ -796,18 +810,25 @@ fn require_original_source_membership_postgres(
                 &posting.id,
                 &posting.external_id,
                 &posting.canonical_key,
-                &provider,
-                &source_key,
+                &subject.provider_family,
+                &subject.discovery_source_key,
             ],
         )
         .map_err(original_source_storage)?
         .is_some();
-    if !trusted {
-        return Err(OriginalSourceVerificationError::InvalidInput(
+    Ok(trusted.then_some(subject))
+}
+
+fn require_original_source_membership_postgres(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+) -> OriginalSourceVerificationResult<OriginalSourceCanonicalSubject> {
+    trusted_original_source_membership_postgres(tx, account_id, posting)?.ok_or_else(|| {
+        OriginalSourceVerificationError::InvalidInput(
             "job has no trusted discovery membership".to_string(),
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 fn recheck_original_source_membership_sqlite(
@@ -838,9 +859,9 @@ fn recheck_original_source_subject_sqlite(
         .map_err(original_source_storage)?
         .ok_or(OriginalSourceVerificationError::AssignmentNotFound)?;
     let posting: JobPosting =
-        serde_json::from_str(&posting_json).map_err(original_source_storage)?;
-    require_original_source_membership_sqlite(tx, account_id, &posting)?;
-    if original_source_subject_sha256(&posting)? != subject_sha256 {
+        parse_json(posting_json, "job posting").map_err(original_source_storage)?;
+    let subject = require_original_source_membership_sqlite(tx, account_id, &posting)?;
+    if subject.subject_sha256 != subject_sha256 {
         return Err(OriginalSourceVerificationError::LeaseLost);
     }
     Ok(posting)
@@ -874,9 +895,9 @@ fn recheck_original_source_subject_postgres(
         .ok_or(OriginalSourceVerificationError::AssignmentNotFound)?;
     let posting_json: String = row.get(0);
     let posting: JobPosting =
-        serde_json::from_str(&posting_json).map_err(original_source_storage)?;
-    require_original_source_membership_postgres(tx, account_id, &posting)?;
-    if original_source_subject_sha256(&posting)? != subject_sha256 {
+        parse_json(posting_json, "job posting").map_err(original_source_storage)?;
+    let subject = require_original_source_membership_postgres(tx, account_id, &posting)?;
+    if subject.subject_sha256 != subject_sha256 {
         return Err(OriginalSourceVerificationError::LeaseLost);
     }
     Ok(posting)
@@ -1198,8 +1219,9 @@ fn ensure_original_source_verification_assignment_sqlite_bound_tx(
             "account or posting identity is invalid".to_string(),
         ));
     }
-    require_original_source_membership_sqlite(tx, account_id, posting)?;
-    let (canonical_subject_json, subject_sha256) = original_source_canonical_subject(posting)?;
+    let subject = require_original_source_membership_sqlite(tx, account_id, posting)?;
+    let canonical_subject_json = subject.canonical_subject_json;
+    let subject_sha256 = subject.subject_sha256;
     let now = original_source_db_now_sqlite(tx)?;
     let current = tx
         .query_row(
@@ -1412,8 +1434,9 @@ fn ensure_original_source_verification_assignment_postgres_bound_tx(
         ));
     }
     lock_discovery_account_postgres(tx, account_id).map_err(original_source_storage)?;
-    require_original_source_membership_postgres(tx, account_id, posting)?;
-    let (canonical_subject_json, subject_sha256) = original_source_canonical_subject(posting)?;
+    let subject = require_original_source_membership_postgres(tx, account_id, posting)?;
+    let canonical_subject_json = subject.canonical_subject_json;
+    let subject_sha256 = subject.subject_sha256;
     let now = original_source_db_now_postgres(tx)?;
     let current = tx
         .query_opt(
@@ -1778,9 +1801,10 @@ fn original_source_append_event_postgres(
     let changed = tx
         .execute(
             "UPDATE jobs_original_source_verification_assignments
-                SET current_event_sequence = $2, current_event_sha256 = $3,
+                SET current_event_sequence = $2::BIGINT, current_event_sha256 = $3,
                     updated_at_ms = GREATEST(updated_at_ms, $4)
-              WHERE assignment_id = $1 AND current_event_sequence = $2 - 1",
+              WHERE assignment_id = $1
+                AND current_event_sequence = $2::BIGINT - 1",
             &[&assignment_id, &sequence, &event_sha256, &occurred_at_ms],
         )
         .map_err(original_source_storage)?;
@@ -2974,14 +2998,14 @@ fn original_source_claim_lease_candidate_postgres(
     let changed = tx
         .execute(
             "UPDATE jobs_original_source_verification_assignments SET
-                state='leased', attempt_count=$2, active_attempt_id=$3,
+                state='leased', attempt_count=$2::BIGINT, active_attempt_id=$3,
                 lease_owner=$4, lease_token_sha256=$5,
                 lease_expires_at_ms=$6, hard_deadline_at_ms=$7,
                 heartbeat_sequence=0,
                 circuit_state=CASE WHEN circuit_state='open'
                   THEN 'half_open' ELSE circuit_state END,
                 circuit_open_until_ms=NULL, updated_at_ms=$8
-              WHERE assignment_id=$1 AND attempt_count=$2 - 1
+              WHERE assignment_id=$1 AND attempt_count=$2::BIGINT - 1
                 AND state IN ('pending','retry_wait','idle')
                 AND next_attempt_at_ms <= $8
                 AND not_before_at_ms <= $8 AND expires_at_ms > $8
@@ -3414,9 +3438,10 @@ pub fn heartbeat_original_source_verification(
                 .min(hard_deadline);
             tx.execute(
                 "UPDATE jobs_original_source_verification_assignments
-                    SET heartbeat_sequence = $2, lease_expires_at_ms = $3,
+                    SET heartbeat_sequence = $2::BIGINT, lease_expires_at_ms = $3,
                         updated_at_ms = $4
-                  WHERE assignment_id = $1 AND heartbeat_sequence = $2 - 1",
+                  WHERE assignment_id = $1
+                    AND heartbeat_sequence = $2::BIGINT - 1",
                 &[
                     &request.assignment_id,
                     &request.heartbeat_sequence,
@@ -3624,21 +3649,56 @@ pub struct OriginalSourceVerificationProjection {
     pub feature_active: bool,
     pub evidence: Option<JobDiscoveryEvidence>,
     pub expected_head: Option<OriginalSourceVerificationExpectedHead>,
+    #[serde(skip)]
+    pub(crate) integrity_binding: Option<OriginalSourceIntegrityBinding>,
     pub db_time_ms: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OriginalSourceIntegrityBinding {
+    pub subject_sha256: String,
+    pub source_material_sha256: String,
+    pub source_expires_at_ms: i64,
+    pub canonical_job_id: String,
+    pub provider_family: String,
+    pub provider_record_id: String,
+    pub provider_host: String,
+    pub provider_tenant: String,
+    pub provider_job: String,
+    pub provider_variant: String,
+    pub canonical_application_url: String,
+    pub application_domain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OriginalSourcePositiveProjection {
+    evidence: JobDiscoveryEvidence,
+    expected_head: OriginalSourceVerificationExpectedHead,
+    integrity_binding: OriginalSourceIntegrityBinding,
+}
+
 fn original_source_positive_projection(
-    posting: &JobPosting,
+    subject: &OriginalSourceCanonicalSubject,
     head: &OriginalSourceVerificationHead,
     current_authority_sha256: &str,
     current_authority_json: &str,
     db_time_ms: i64,
-) -> OriginalSourceVerificationResult<
-    Option<(JobDiscoveryEvidence, OriginalSourceVerificationExpectedHead)>,
-> {
-    let subject_sha256 = original_source_subject_sha256(posting)?;
-    if head.subject_sha256 != subject_sha256 {
+) -> OriginalSourceVerificationResult<Option<OriginalSourcePositiveProjection>> {
+    if head.subject_sha256 != subject.subject_sha256 {
         return Ok(None);
+    }
+    let subject_original_url = reqwest::Url::parse(&subject.canonical_subject_original_url)
+        .map_err(|_| {
+            OriginalSourceVerificationError::Storage(
+                "canonical original-source subject URL is invalid".to_string(),
+            )
+        })?;
+    if subject_original_url.scheme() != "https"
+        || subject_original_url.host_str() != Some(subject.provider_host.as_str())
+    {
+        return Err(OriginalSourceVerificationError::Storage(
+            "canonical original-source subject coordinates are inconsistent".to_string(),
+        ));
     }
     if head.checked_at_ms > head.expires_at_ms {
         return Err(OriginalSourceVerificationError::Storage(
@@ -3650,36 +3710,24 @@ fn original_source_positive_projection(
         || head.expires_at_ms <= db_time_ms
         || head.managed_authority_sha256 != current_authority_sha256
         || head.canonical_managed_authority_json != current_authority_json
-        || head.canonical_application_url.is_none()
-        || head.application_domain.is_none()
         || head.assignment_state != "idle"
     {
         return Ok(None);
     }
-    let provider = original_source_provider(&posting.source).ok_or_else(|| {
-        OriginalSourceVerificationError::InvalidInput(
-            "job source is not a supported verified import".to_string(),
-        )
-    })?;
-    let (_, source_key) = canonical_public_discovery_url(provider, &posting.canonical_url)
-        .map_err(|_| {
-            OriginalSourceVerificationError::InvalidInput(
-                "job URL is not a supported original source".to_string(),
-            )
-        })?;
-    let employer_id = format!(
-        "original-source-employer-{}",
-        &original_source_sha256(format!("{provider}:{source_key}").as_bytes())[..32]
-    );
-    let application_domain = head.application_domain.clone();
+    let (Some(canonical_application_url), Some(application_domain)) = (
+        head.canonical_application_url.clone(),
+        head.application_domain.clone(),
+    ) else {
+        return Ok(None);
+    };
     let evidence = JobDiscoveryEvidence {
         provenance: "original_source".to_string(),
         canonical_status: "canonical".to_string(),
-        canonical_job_id: Some(posting.canonical_key.clone()),
+        canonical_job_id: Some(subject.canonical_job_id.clone()),
         employer_verification_status: "ats_tenant_verified".to_string(),
-        employer_id: Some(employer_id),
-        canonical_employer_domain: application_domain.clone(),
-        application_domain,
+        employer_id: None,
+        canonical_employer_domain: None,
+        application_domain: Some(application_domain.clone()),
         scam_risk_status: "source_screened".to_string(),
         scam_signals: Vec::new(),
         original_source_status: "verified_open".to_string(),
@@ -3697,7 +3745,101 @@ fn original_source_positive_projection(
         expires_at_ms: head.expires_at_ms,
         managed_authority_sha256: head.managed_authority_sha256.clone(),
     };
-    Ok(Some((evidence, expected_head)))
+    let integrity_binding = OriginalSourceIntegrityBinding {
+        subject_sha256: subject.subject_sha256.clone(),
+        source_material_sha256: head.material_sha256.clone(),
+        source_expires_at_ms: head.expires_at_ms,
+        canonical_job_id: subject.canonical_job_id.clone(),
+        provider_family: subject.provider_family.clone(),
+        provider_record_id: subject.provider_record_id.clone(),
+        provider_host: subject.provider_host.clone(),
+        provider_tenant: subject.provider_tenant.clone(),
+        provider_job: subject.provider_job.clone(),
+        provider_variant: subject.provider_variant.clone(),
+        canonical_application_url,
+        application_domain,
+    };
+    Ok(Some(OriginalSourcePositiveProjection {
+        evidence,
+        expected_head,
+        integrity_binding,
+    }))
+}
+
+fn original_source_nonpositive_evidence(
+    subject: &OriginalSourceCanonicalSubject,
+    head: &OriginalSourceVerificationHead,
+    current_authority_sha256: &str,
+    current_authority_json: &str,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<Option<JobDiscoveryEvidence>> {
+    if head.subject_sha256 != subject.subject_sha256 {
+        return Ok(None);
+    }
+    let subject_original_url = reqwest::Url::parse(&subject.canonical_subject_original_url)
+        .map_err(|_| {
+            OriginalSourceVerificationError::Storage(
+                "canonical original-source subject URL is invalid".to_string(),
+            )
+        })?;
+    if subject_original_url.scheme() != "https"
+        || subject_original_url.host_str() != Some(subject.provider_host.as_str())
+    {
+        return Err(OriginalSourceVerificationError::Storage(
+            "canonical original-source subject coordinates are inconsistent".to_string(),
+        ));
+    }
+    if head.checked_at_ms > head.expires_at_ms {
+        return Err(OriginalSourceVerificationError::Storage(
+            "current original-source head is inconsistent with the job subject".to_string(),
+        ));
+    }
+    if head.assurance != "original_verified"
+        || head.managed_authority_sha256 != current_authority_sha256
+        || head.canonical_managed_authority_json != current_authority_json
+        || head.assignment_state != original_source_terminal_state_from_result(&head.result)
+    {
+        return Ok(None);
+    }
+    let original_source_status = match head.result.as_str() {
+        "verified_open" if head.expires_at_ms <= db_time_ms => "expired",
+        "verified_open" => return Ok(None),
+        "closed"
+        | "redirected_to_unknown"
+        | "identity_mismatch"
+        | "materially_changed"
+        | "source_untrusted"
+        | "unreachable"
+        | "rate_limited"
+        | "auth_required"
+        | "captcha_required"
+        | "parse_ambiguous"
+        | "provider_unavailable"
+        | "expired"
+        | "unknown" => head.result.as_str(),
+        _ => return Ok(None),
+    };
+    Ok(Some(JobDiscoveryEvidence {
+        provenance: "original_source".to_string(),
+        canonical_status: "canonical".to_string(),
+        canonical_job_id: Some(subject.canonical_job_id.clone()),
+        employer_verification_status: "unknown".to_string(),
+        employer_id: None,
+        canonical_employer_domain: None,
+        application_domain: head.application_domain.clone(),
+        scam_risk_status: if original_source_status == "source_untrusted" {
+            "blocked".to_string()
+        } else {
+            "unknown".to_string()
+        },
+        scam_signals: Vec::new(),
+        original_source_status: original_source_status.to_string(),
+        original_source_checked_at_ms: Some(head.checked_at_ms),
+        original_source_snapshot_expires_at_ms: Some(head.expires_at_ms),
+        original_source_evidence_hash: Some(head.receipt_sha256.clone()),
+        original_source_mismatched_fields: Vec::new(),
+        requires_original_revalidation: true,
+    }))
 }
 
 pub(crate) fn resolve_original_source_verification_projection_sqlite_tx(
@@ -3707,36 +3849,109 @@ pub(crate) fn resolve_original_source_verification_projection_sqlite_tx(
 ) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
     let authority = sqlite_original_source_verification_authority_for_account_tx(tx, account_id)
         .map_err(original_source_storage)?;
-    let feature_active = authority.is_some();
     let db_time_ms = original_source_db_now_sqlite(tx)?;
+    resolve_original_source_verification_projection_sqlite_tx_with_authority_at_ms(
+        tx, account_id, posting, authority, db_time_ms,
+    )
+}
+
+/// Resolve a source projection against one caller-sampled database timestamp.
+/// This supports bounded batch reads without allowing caller wall-clock time
+/// to vary authority between rows.
+pub(crate) fn resolve_original_source_verification_projection_sqlite_tx_at_ms(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
+    original_source_validate_projection_db_time(db_time_ms)?;
+    let authority = sqlite_original_source_verification_authority_for_account_tx(tx, account_id)
+        .map_err(original_source_storage)?;
+    resolve_original_source_verification_projection_sqlite_tx_with_authority_at_ms(
+        tx, account_id, posting, authority, db_time_ms,
+    )
+}
+
+fn original_source_verification_unavailable_projection(
+    feature_active: bool,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationProjection {
+    OriginalSourceVerificationProjection {
+        feature_active,
+        evidence: None,
+        expected_head: None,
+        integrity_binding: None,
+        db_time_ms,
+    }
+}
+
+fn resolve_original_source_verification_projection_sqlite_tx_with_authority_at_ms(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+    authority: Option<ManagedCloudOriginalSourceVerificationAuthority>,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
+    original_source_validate_projection_db_time(db_time_ms)?;
+    let feature_active = authority.is_some();
     let Some(authority) = authority else {
-        return Ok(OriginalSourceVerificationProjection {
+        return Ok(original_source_verification_unavailable_projection(
             feature_active,
-            evidence: None,
-            expected_head: None,
             db_time_ms,
-        });
+        ));
     };
-    require_original_source_membership_sqlite(tx, account_id, posting)?;
+    if original_source_provider(&posting.source).is_none() {
+        return Ok(original_source_verification_unavailable_projection(
+            feature_active,
+            db_time_ms,
+        ));
+    }
+    let Some(subject) = trusted_original_source_membership_sqlite(tx, account_id, posting)? else {
+        return Ok(original_source_verification_unavailable_projection(
+            feature_active,
+            db_time_ms,
+        ));
+    };
     let (_, canonical_authority_json, authority_sha256) =
         original_source_managed_authority_binding(&authority)?;
-    let projected =
-        resolve_original_source_verification_head_sqlite_tx(tx, account_id, &posting.id)?
+    let head = resolve_original_source_verification_head_sqlite_tx(tx, account_id, &posting.id)?;
+    let projected = head
+        .as_ref()
+        .map(|head| {
+            original_source_positive_projection(
+                &subject,
+                head,
+                &authority_sha256,
+                &canonical_authority_json,
+                db_time_ms,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let nonpositive_evidence = if projected.is_none() {
+        head.as_ref()
             .map(|head| {
-                original_source_positive_projection(
-                    posting,
-                    &head,
+                original_source_nonpositive_evidence(
+                    &subject,
+                    head,
                     &authority_sha256,
                     &canonical_authority_json,
                     db_time_ms,
                 )
             })
             .transpose()?
-            .flatten();
+            .flatten()
+    } else {
+        None
+    };
     Ok(OriginalSourceVerificationProjection {
         feature_active,
-        evidence: projected.as_ref().map(|value| value.0.clone()),
-        expected_head: projected.map(|value| value.1),
+        evidence: projected
+            .as_ref()
+            .map(|value| value.evidence.clone())
+            .or(nonpositive_evidence),
+        expected_head: projected.as_ref().map(|value| value.expected_head.clone()),
+        integrity_binding: projected.map(|value| value.integrity_binding),
         db_time_ms,
     })
 }
@@ -3748,36 +3963,108 @@ pub(crate) fn resolve_original_source_verification_projection_postgres_tx(
 ) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
     let authority = postgres_original_source_verification_authority_for_account_tx(tx, account_id)
         .map_err(original_source_storage)?;
-    let feature_active = authority.is_some();
     let db_time_ms = original_source_db_now_postgres(tx)?;
+    resolve_original_source_verification_projection_postgres_tx_with_authority_at_ms(
+        tx, account_id, posting, authority, db_time_ms,
+    )
+}
+
+/// Resolve a source projection against one caller-sampled database timestamp
+/// after the caller has already acquired the common PostgreSQL prelock.
+pub(crate) fn resolve_original_source_verification_projection_postgres_tx_after_prelock_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
+    original_source_validate_projection_db_time(db_time_ms)?;
+    let authority = postgres_original_source_verification_authority_for_account_tx_after_prelock(
+        tx, account_id,
+    )
+    .map_err(original_source_storage)?;
+    resolve_original_source_verification_projection_postgres_tx_with_authority_at_ms(
+        tx, account_id, posting, authority, db_time_ms,
+    )
+}
+
+fn original_source_validate_projection_db_time(
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<()> {
+    if !(0..=9_007_199_254_740_991).contains(&db_time_ms) {
+        return Err(OriginalSourceVerificationError::InvalidInput(
+            "original-source projection database time is invalid".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_original_source_verification_projection_postgres_tx_with_authority_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    posting: &JobPosting,
+    authority: Option<ManagedCloudOriginalSourceVerificationAuthority>,
+    db_time_ms: i64,
+) -> OriginalSourceVerificationResult<OriginalSourceVerificationProjection> {
+    original_source_validate_projection_db_time(db_time_ms)?;
+    let feature_active = authority.is_some();
     let Some(authority) = authority else {
-        return Ok(OriginalSourceVerificationProjection {
+        return Ok(original_source_verification_unavailable_projection(
             feature_active,
-            evidence: None,
-            expected_head: None,
             db_time_ms,
-        });
+        ));
     };
-    require_original_source_membership_postgres(tx, account_id, posting)?;
+    if original_source_provider(&posting.source).is_none() {
+        return Ok(original_source_verification_unavailable_projection(
+            feature_active,
+            db_time_ms,
+        ));
+    }
+    let Some(subject) = trusted_original_source_membership_postgres(tx, account_id, posting)? else {
+        return Ok(original_source_verification_unavailable_projection(
+            feature_active,
+            db_time_ms,
+        ));
+    };
     let (_, canonical_authority_json, authority_sha256) =
         original_source_managed_authority_binding(&authority)?;
-    let projected =
-        resolve_original_source_verification_head_postgres_tx(tx, account_id, &posting.id)?
+    let head = resolve_original_source_verification_head_postgres_tx(tx, account_id, &posting.id)?;
+    let projected = head
+        .as_ref()
+        .map(|head| {
+            original_source_positive_projection(
+                &subject,
+                head,
+                &authority_sha256,
+                &canonical_authority_json,
+                db_time_ms,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let nonpositive_evidence = if projected.is_none() {
+        head.as_ref()
             .map(|head| {
-                original_source_positive_projection(
-                    posting,
-                    &head,
+                original_source_nonpositive_evidence(
+                    &subject,
+                    head,
                     &authority_sha256,
                     &canonical_authority_json,
                     db_time_ms,
                 )
             })
             .transpose()?
-            .flatten();
+            .flatten()
+    } else {
+        None
+    };
     Ok(OriginalSourceVerificationProjection {
         feature_active,
-        evidence: projected.as_ref().map(|value| value.0.clone()),
-        expected_head: projected.map(|value| value.1),
+        evidence: projected
+            .as_ref()
+            .map(|value| value.evidence.clone())
+            .or(nonpositive_evidence),
+        expected_head: projected.as_ref().map(|value| value.expected_head.clone()),
+        integrity_binding: projected.map(|value| value.integrity_binding),
         db_time_ms,
     })
 }
@@ -6783,7 +7070,8 @@ pub fn fail_original_source_verification(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-support"))]
+#[cfg_attr(feature = "integration-test-support", allow(dead_code))]
 mod original_source_verification_tests {
     use super::*;
     use crate::db;
@@ -6814,6 +7102,33 @@ mod original_source_verification_tests {
             updated_at_ms: 1,
             discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
+        }
+    }
+
+    fn positive_head_for_subject(
+        subject: &OriginalSourceCanonicalSubject,
+        canonical_application_url: &str,
+        application_domain: &str,
+    ) -> OriginalSourceVerificationHead {
+        OriginalSourceVerificationHead {
+            account_id: "acct-original-source".to_string(),
+            job_id: "job-original-source".to_string(),
+            head_revision: 1,
+            material_generation: 1,
+            assignment_id: "assignment-original-source".to_string(),
+            receipt_id: "receipt-original-source".to_string(),
+            receipt_sha256: "1".repeat(64),
+            subject_sha256: subject.subject_sha256.clone(),
+            material_sha256: "2".repeat(64),
+            assurance: "original_verified".to_string(),
+            result: "verified_open".to_string(),
+            checked_at_ms: 100,
+            expires_at_ms: 1_000,
+            canonical_application_url: Some(canonical_application_url.to_string()),
+            application_domain: Some(application_domain.to_string()),
+            managed_authority_sha256: "3".repeat(64),
+            canonical_managed_authority_json: "canonical-managed-authority".to_string(),
+            assignment_state: "idle".to_string(),
         }
     }
 
@@ -7308,6 +7623,96 @@ mod original_source_verification_tests {
             .expect("convert public lifecycle observation")
     }
 
+    pub(crate) fn complete_public_original_source_positive_fixture(
+        pool: &DbPool,
+        posting: &JobPosting,
+        managed: &super::managed_cloud_release_authority_tests::
+            OriginalSourceVerifierRuntimeTestFixture,
+        request_suffix: &str,
+    ) -> OriginalSourceVerificationHead {
+        let binding = OriginalSourceVerifierBinding {
+            worker_id: managed.worker_id.clone(),
+            runtime_instance_id: managed.runtime_instance_id.clone(),
+            runtime_instance_epoch: managed.runtime_instance_epoch,
+            runtime_authority_sha256: managed.runtime_authority_sha256.clone(),
+            runtime_session_token: managed.runtime_session_token.clone(),
+        };
+        let lease = lease_original_source_verification(pool, &binding)
+            .expect("lease public positive source verification")
+            .expect("public positive source assignment is due");
+        let subject: OriginalSourceComparisonSubject =
+            serde_json::from_str(&lease.canonical_subject_json)
+                .expect("parse public positive source subject");
+        assert_eq!(
+            lease.canonical_subject_json,
+            original_source_canonical_subject(posting)
+                .expect("rebuild public positive source subject")
+                .canonical_subject_json
+        );
+        assert_eq!(subject.provider_family, "greenhouse");
+        let requested_url = original_source_expected_requested_url(&subject)
+            .expect("derive public positive source request URL");
+        let application_domain = reqwest::Url::parse(&posting.canonical_url)
+            .expect("parse public positive application URL")
+            .host_str()
+            .expect("public positive application host")
+            .to_string();
+        let (parser_version, parser_digest) =
+            original_source_parser_metadata(&subject.provider_family);
+        let observation = seal_observation(NormalizedOriginalSourceObservation {
+            assurance: "original_verified".to_string(),
+            result: "open".to_string(),
+            error_code: None,
+            evidence_sha256: original_source_sha256(
+                format!("public-positive-evidence-{request_suffix}").as_bytes(),
+            ),
+            requested_url: Some(requested_url.clone()),
+            canonical_observed_url: Some(subject.original_url.clone()),
+            canonical_application_url: Some(posting.canonical_url.clone()),
+            application_domain: Some(application_domain),
+            retrieval_status: "observed".to_string(),
+            http_status: Some(200),
+            http_semantics_digest: original_source_http_semantics_digest(&requested_url, 200),
+            redirect_chain_digest: original_source_empty_redirect_chain_digest(),
+            headers_digest: original_source_sha256(
+                format!("public-positive-headers-{request_suffix}").as_bytes(),
+            ),
+            content_digest: original_source_sha256(
+                format!("public-positive-content-{request_suffix}").as_bytes(),
+            ),
+            parser_version,
+            parser_digest,
+            worker_runtime_identity_sha256: managed.runtime_identity_sha256.clone(),
+            provider_record_id: Some(subject.provider_record_id),
+            company: Some(posting.company.clone()),
+            title: Some(posting.title.clone()),
+            location: Some(posting.location.clone()),
+            workplace: Some(posting.workplace.clone()),
+            description: Some(posting.description.clone()),
+            compensation: Some(posting.compensation.clone()),
+            employment_type: Some(posting.employment_type.clone()),
+            posted_at_ms: posting.posted_at_ms,
+            mismatched_fields: Vec::new(),
+        });
+        let observation = serde_json::from_value(serde_json::to_value(observation).unwrap())
+            .expect("convert public positive source observation");
+        let terminal = complete_original_source_verification(
+            pool,
+            &OriginalSourceVerificationCompletionRequest {
+                binding,
+                assignment_id: lease.assignment_id,
+                attempt_id: lease.attempt_id,
+                fence: lease.fence,
+                lease_token: lease.lease_token,
+                request_id: format!("public-positive-source-{request_suffix}"),
+                observation,
+            },
+        )
+        .expect("complete public positive source verification");
+        assert_eq!(terminal.state, "idle");
+        terminal.head.expect("public positive source head")
+    }
+
     fn public_unreachable_observation(
         fixture: &PublicOriginalSourceLifecycleFixture,
     ) -> OriginalSourceVerificationObservation {
@@ -7394,10 +7799,10 @@ mod original_source_verification_tests {
         ];
         for (source, url, external_id) in fixtures {
             let posting = fixture_posting(source, url, external_id);
-            let (canonical, digest) = original_source_canonical_subject(&posting)
+            let subject = original_source_canonical_subject(&posting)
                 .unwrap_or_else(|error| panic!("{source} subject failed: {error}"));
-            assert!(original_source_valid_sha256(&digest));
-            let value: Value = serde_json::from_str(&canonical).unwrap();
+            assert!(original_source_valid_sha256(&subject.subject_sha256));
+            let value: Value = serde_json::from_str(&subject.canonical_subject_json).unwrap();
             assert_eq!(value["schema_version"], 1);
             assert_eq!(value["provider_target"]["job"], external_id);
             assert_eq!(value["expected"]["title"], posting.title);
@@ -7408,14 +7813,247 @@ mod original_source_verification_tests {
     }
 
     #[test]
+    fn canonical_subject_binding_preserves_greenhouse_and_lever_record_ids() {
+        let fixtures = [
+            (
+                fixture_posting(
+                    "greenhouse_import",
+                    "https://boards.greenhouse.io/acme/jobs/123",
+                    "123",
+                ),
+                "greenhouse:acme:123",
+                "greenhouse_public",
+            ),
+            (
+                fixture_posting(
+                    "lever_import",
+                    "https://jobs.eu.lever.co/acme/abc/apply",
+                    "abc",
+                ),
+                "lever:jobs.eu.lever.co:acme:abc",
+                "lever_application",
+            ),
+        ];
+
+        for (posting, expected_record_id, expected_variant) in fixtures {
+            let subject = original_source_canonical_subject(&posting).unwrap();
+            assert_eq!(subject.canonical_job_id, posting.canonical_key);
+            assert_eq!(subject.provider_record_id, expected_record_id);
+            assert_eq!(subject.provider_job, posting.external_id);
+            assert_eq!(subject.provider_variant, expected_variant);
+            assert_eq!(
+                subject.canonical_subject_original_url,
+                posting.canonical_url
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_subject_binding_exposes_non_gh_provider_coordinates() {
+        let fixtures = [
+            (
+                fixture_posting(
+                    "ashby_import",
+                    "https://jobs.ashbyhq.com/acme/abc",
+                    "abc",
+                ),
+                "ashby",
+                "jobs.ashbyhq.com",
+                "acme",
+                "abc",
+                "ashby_posting",
+            ),
+            (
+                fixture_posting(
+                    "smartrecruiters_import",
+                    "https://jobs.smartrecruiters.com/acme/abc-platform-engineer",
+                    "abc",
+                ),
+                "smartrecruiters",
+                "jobs.smartrecruiters.com",
+                "acme",
+                "abc",
+                "smartrecruiters_posting",
+            ),
+            (
+                fixture_posting(
+                    "workday_import",
+                    "https://acme.wd5.myworkdayjobs.com/en-US/careers/job/engineer/Software-Engineer_R-123",
+                    "R-123",
+                ),
+                "workday",
+                "acme.wd5.myworkdayjobs.com",
+                "acme",
+                "R-123",
+                "workday_posting",
+            ),
+        ];
+
+        for (posting, provider, host, tenant, job, variant) in fixtures {
+            let subject = original_source_canonical_subject(&posting).unwrap();
+            assert_eq!(subject.provider_family, provider);
+            assert_eq!(subject.provider_host, host);
+            assert_eq!(subject.provider_tenant, tenant);
+            assert_eq!(subject.provider_job, job);
+            assert_eq!(subject.provider_variant, variant);
+            assert!(subject
+                .provider_record_id
+                .starts_with(&format!("{provider}:{host}:")));
+        }
+    }
+
+    #[test]
+    fn positive_integrity_binding_uses_head_destination_and_rejects_source_drift() {
+        let posting = fixture_posting(
+            "greenhouse_import",
+            "https://boards.greenhouse.io/acme/jobs/123",
+            "123",
+        );
+        let subject = original_source_canonical_subject(&posting).unwrap();
+        let head_application_url = "https://boards.greenhouse.io/acme/jobs/123?source=head-receipt";
+        let head =
+            positive_head_for_subject(&subject, head_application_url, "boards.greenhouse.io");
+        let projected = original_source_positive_projection(
+            &subject,
+            &head,
+            &head.managed_authority_sha256,
+            &head.canonical_managed_authority_json,
+            500,
+        )
+        .unwrap()
+        .expect("positive source projection");
+        let binding = projected.integrity_binding;
+        assert_eq!(binding.subject_sha256, subject.subject_sha256);
+        assert_eq!(binding.source_material_sha256, head.material_sha256);
+        assert_eq!(binding.source_expires_at_ms, head.expires_at_ms);
+        assert_eq!(binding.canonical_job_id, posting.canonical_key);
+        assert_eq!(binding.provider_family, "greenhouse");
+        assert_eq!(binding.provider_record_id, "greenhouse:acme:123");
+        assert_eq!(binding.provider_host, "boards.greenhouse.io");
+        assert_eq!(binding.provider_tenant, "acme");
+        assert_eq!(binding.provider_job, "123");
+        assert_eq!(binding.provider_variant, "greenhouse_public");
+        assert_eq!(binding.canonical_application_url, head_application_url);
+        assert_ne!(binding.canonical_application_url, posting.canonical_url);
+        assert_eq!(binding.application_domain, "boards.greenhouse.io");
+
+        let mut drifted_posting = posting;
+        drifted_posting.title = "Principal Software Engineer".to_string();
+        let drifted_subject = original_source_canonical_subject(&drifted_posting).unwrap();
+        assert!(original_source_positive_projection(
+            &drifted_subject,
+            &head,
+            &head.managed_authority_sha256,
+            &head.canonical_managed_authority_json,
+            500,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn nonpositive_source_head_never_creates_integrity_binding() {
+        let posting = fixture_posting(
+            "greenhouse_import",
+            "https://boards.greenhouse.io/acme/jobs/123",
+            "123",
+        );
+        let subject = original_source_canonical_subject(&posting).unwrap();
+        let mut head =
+            positive_head_for_subject(&subject, &posting.canonical_url, "boards.greenhouse.io");
+        head.result = "review_required".to_string();
+        assert!(original_source_positive_projection(
+            &subject,
+            &head,
+            &head.managed_authority_sha256,
+            &head.canonical_managed_authority_json,
+            500,
+        )
+        .unwrap()
+        .is_none());
+
+        head.result = "verified_open".to_string();
+        head.canonical_application_url = None;
+        assert!(original_source_positive_projection(
+            &subject,
+            &head,
+            &head.managed_authority_sha256,
+            &head.canonical_managed_authority_json,
+            500,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn current_nonpositive_source_head_projects_exact_denial_without_execution_binding() {
+        let posting = fixture_posting(
+            "greenhouse_import",
+            "https://boards.greenhouse.io/acme/jobs/123",
+            "123",
+        );
+        let subject = original_source_canonical_subject(&posting).unwrap();
+        let mut head =
+            positive_head_for_subject(&subject, &posting.canonical_url, "boards.greenhouse.io");
+        head.result = "identity_mismatch".to_string();
+        head.assignment_state = "quarantined".to_string();
+
+        let evidence = original_source_nonpositive_evidence(
+            &subject,
+            &head,
+            &head.managed_authority_sha256,
+            &head.canonical_managed_authority_json,
+            500,
+        )
+        .unwrap()
+        .expect("current negative source projection");
+        assert_eq!(evidence.original_source_status, "identity_mismatch");
+        assert_eq!(evidence.provenance, "original_source");
+        assert_eq!(
+            evidence.canonical_job_id.as_deref(),
+            Some(subject.canonical_job_id.as_str())
+        );
+        assert!(evidence.requires_original_revalidation);
+
+        head.result = "verified_open".to_string();
+        head.assignment_state = "idle".to_string();
+        head.expires_at_ms = 499;
+        let expired = original_source_nonpositive_evidence(
+            &subject,
+            &head,
+            &head.managed_authority_sha256,
+            &head.canonical_managed_authority_json,
+            500,
+        )
+        .unwrap()
+        .expect("expired positive source projection");
+        assert_eq!(expired.original_source_status, "expired");
+    }
+
+    #[test]
+    fn caller_sampled_projection_time_accepts_only_safe_nonnegative_database_time() {
+        assert!(original_source_validate_projection_db_time(0).is_ok());
+        assert!(original_source_validate_projection_db_time(9_007_199_254_740_991).is_ok());
+        assert!(matches!(
+            original_source_validate_projection_db_time(-1),
+            Err(OriginalSourceVerificationError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            original_source_validate_projection_db_time(9_007_199_254_740_992),
+            Err(OriginalSourceVerificationError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
     fn lever_application_subject_validates_closed_request_and_destination() {
         let posting = fixture_posting(
             "lever_import",
             "https://jobs.lever.co/acme/abc/apply",
             "abc",
         );
-        let (subject_json, _) = original_source_canonical_subject(&posting).unwrap();
-        let subject: OriginalSourceComparisonSubject = serde_json::from_str(&subject_json).unwrap();
+        let canonical_subject = original_source_canonical_subject(&posting).unwrap();
+        let subject: OriginalSourceComparisonSubject =
+            serde_json::from_str(&canonical_subject.canonical_subject_json).unwrap();
         assert_eq!(subject.provider_target.variant, "lever_application");
         let requested_url = original_source_expected_requested_url(&subject).unwrap();
         assert_eq!(
@@ -7452,7 +8090,11 @@ mod original_source_verification_tests {
             posted_at_ms: posting.posted_at_ms,
             mismatched_fields: Vec::new(),
         });
-        original_source_validate_observation_subject(&subject_json, &observation).unwrap();
+        original_source_validate_observation_subject(
+            &canonical_subject.canonical_subject_json,
+            &observation,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -7462,8 +8104,9 @@ mod original_source_verification_tests {
             "https://jobs.smartrecruiters.com/acme/abc-platform-engineer",
             "abc",
         );
-        let (subject_json, _) = original_source_canonical_subject(&posting).unwrap();
-        let subject: OriginalSourceComparisonSubject = serde_json::from_str(&subject_json).unwrap();
+        let canonical_subject = original_source_canonical_subject(&posting).unwrap();
+        let subject: OriginalSourceComparisonSubject =
+            serde_json::from_str(&canonical_subject.canonical_subject_json).unwrap();
         assert_eq!(
             subject.original_url,
             "https://jobs.smartrecruiters.com/acme/abc"
@@ -7506,7 +8149,11 @@ mod original_source_verification_tests {
             posted_at_ms: posting.posted_at_ms,
             mismatched_fields: Vec::new(),
         });
-        original_source_validate_observation_subject(&subject_json, &observation).unwrap();
+        original_source_validate_observation_subject(
+            &canonical_subject.canonical_subject_json,
+            &observation,
+        )
+        .unwrap();
 
         let (pool, mut assigned_posting) = fixture_pool_and_posting();
         assigned_posting.canonical_key = posting.canonical_key.clone();
@@ -7653,7 +8300,8 @@ mod original_source_verification_tests {
             "https://boards.greenhouse.io/acme/jobs/123",
             "123",
         );
-        let (subject_json, _) = original_source_canonical_subject(&posting).unwrap();
+        let canonical_subject = original_source_canonical_subject(&posting).unwrap();
+        let subject_json = canonical_subject.canonical_subject_json;
         let subject: Value = serde_json::from_str(&subject_json).unwrap();
         let provider_record_id = subject["provider_record_id"].as_str().unwrap().to_string();
         let comparison_subject: OriginalSourceComparisonSubject =
@@ -9313,8 +9961,92 @@ mod original_source_verification_tests {
     }
 
     #[test]
+    fn public_projection_keeps_non_authoritative_jobs_visible_without_weakening_effect_gates() {
+        let fixture = public_original_source_lifecycle_long_horizon_fixture();
+        let unsupported_posting = fixture_posting(
+            "pasted_link",
+            "https://careers.example.test/jobs/manual-001",
+            "manual-001",
+        );
+        let unsupported_projection = resolve_original_source_verification_projection(
+            &fixture.pool,
+            &fixture.account_id,
+            &unsupported_posting,
+        )
+        .expect("resolve unsupported-source read projection");
+        assert!(unsupported_projection.feature_active);
+        assert!(unsupported_projection.evidence.is_none());
+        assert!(unsupported_projection.expected_head.is_none());
+        assert!(unsupported_projection.integrity_binding.is_none());
+
+        let missing_membership_posting = fixture_posting(
+            "greenhouse_import",
+            "https://boards.greenhouse.io/missingmembership/jobs/missing-001",
+            "missing-001",
+        );
+        let missing_membership_projection = resolve_original_source_verification_projection(
+            &fixture.pool,
+            &fixture.account_id,
+            &missing_membership_posting,
+        )
+        .expect("resolve supported-source projection without membership");
+        assert!(missing_membership_projection.feature_active);
+        assert!(missing_membership_projection.evidence.is_none());
+        assert!(missing_membership_projection.expected_head.is_none());
+        assert!(missing_membership_projection.integrity_binding.is_none());
+
+        let malformed_supported_posting = fixture_posting(
+            "greenhouse_import",
+            "https://careers.example.test/jobs/malformed-001",
+            "malformed-001",
+        );
+        assert!(matches!(
+            resolve_original_source_verification_projection(
+                &fixture.pool,
+                &fixture.account_id,
+                &malformed_supported_posting,
+            ),
+            Err(OriginalSourceVerificationError::InvalidInput(message))
+                if message == "job URL is not a supported original-source provider target"
+        ));
+
+        {
+            let mut connection = fixture
+                .pool
+                .get()
+                .expect("get strict original-source membership fixture");
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin strict original-source membership fixture");
+            assert!(matches!(
+                require_original_source_membership_sqlite(
+                    &tx,
+                    &fixture.account_id,
+                    &missing_membership_posting,
+                ),
+                Err(OriginalSourceVerificationError::InvalidInput(message))
+                    if message == "job has no trusted discovery membership"
+            ));
+            tx.rollback()
+                .expect("roll back strict original-source membership fixture");
+        }
+
+        cleanup_public_original_source_lifecycle_fixture(fixture);
+    }
+
+    #[test]
     fn public_sqlite_lifecycle_replays_exact_terminal_and_quarantines_changed_bytes() {
         let fixture = public_original_source_lifecycle_fixture();
+        let pending_projection = resolve_original_source_verification_projection(
+            &fixture.pool,
+            &fixture.account_id,
+            &fixture.posting,
+        )
+        .expect("resolve pending public lifecycle projection");
+        assert!(pending_projection.feature_active);
+        assert!(pending_projection.evidence.is_none());
+        assert!(pending_projection.expected_head.is_none());
+        assert!(pending_projection.integrity_binding.is_none());
         let lease = lease_original_source_verification(&fixture.pool, &fixture.binding)
             .expect("lease public lifecycle assignment")
             .expect("public lifecycle assignment is due");
@@ -9359,7 +10091,63 @@ mod original_source_verification_tests {
             &fixture.posting,
         )
         .expect("resolve positive public lifecycle projection");
-        assert!(projection.evidence.is_some());
+        let evidence = projection
+            .evidence
+            .as_ref()
+            .expect("positive public lifecycle evidence");
+        assert_eq!(evidence.employer_verification_status, "ats_tenant_verified");
+        assert_eq!(
+            evidence.application_domain.as_deref(),
+            Some("boards.greenhouse.io")
+        );
+        assert_eq!(evidence.employer_id, None);
+        assert_eq!(evidence.canonical_employer_domain, None);
+        assert_eq!(evidence.scam_risk_status, "source_screened");
+        let integrity_binding = projection
+            .integrity_binding
+            .as_ref()
+            .expect("positive public lifecycle integrity binding");
+        assert_eq!(
+            integrity_binding.subject_sha256,
+            original_head.subject_sha256
+        );
+        assert_eq!(
+            integrity_binding.source_material_sha256,
+            original_head.material_sha256
+        );
+        assert_eq!(
+            integrity_binding.source_expires_at_ms,
+            original_head.expires_at_ms
+        );
+        assert_eq!(
+            integrity_binding.canonical_job_id,
+            fixture.posting.canonical_key
+        );
+        let fixture_subject = original_source_canonical_subject(&fixture.posting)
+            .expect("canonical public lifecycle source subject");
+        assert_eq!(integrity_binding.provider_family, "greenhouse");
+        assert_eq!(
+            integrity_binding.provider_record_id,
+            fixture_subject.provider_record_id
+        );
+        assert_eq!(
+            integrity_binding.provider_host,
+            fixture_subject.provider_host
+        );
+        assert_eq!(
+            integrity_binding.provider_tenant,
+            fixture_subject.provider_tenant
+        );
+        assert_eq!(integrity_binding.provider_job, fixture_subject.provider_job);
+        assert_eq!(
+            integrity_binding.provider_variant,
+            fixture_subject.provider_variant
+        );
+        assert_eq!(
+            integrity_binding.canonical_application_url,
+            fixture.posting.canonical_url
+        );
+        assert_eq!(integrity_binding.application_domain, "boards.greenhouse.io");
         let expected_head = projection
             .expected_head
             .expect("positive public lifecycle expected head");
@@ -9476,6 +10264,7 @@ mod original_source_verification_tests {
         .expect("resolve quarantined public lifecycle projection");
         assert!(quarantined_projection.evidence.is_none());
         assert!(quarantined_projection.expected_head.is_none());
+        assert!(quarantined_projection.integrity_binding.is_none());
         assert!(resolve_original_source_verification_evidence(
             &fixture.pool,
             &fixture.account_id,
@@ -9603,8 +10392,17 @@ mod original_source_verification_tests {
         )
         .expect("resolve nonpositive failure projection");
         assert!(projection.feature_active);
-        assert!(projection.evidence.is_none());
+        let evidence = projection
+            .evidence
+            .expect("auditable nonpositive failure evidence");
+        assert_eq!(evidence.original_source_status, "unreachable");
+        assert!(evidence.requires_original_revalidation);
+        assert_eq!(
+            evidence.original_source_evidence_hash.as_deref(),
+            Some(head.receipt_sha256.as_str())
+        );
         assert!(projection.expected_head.is_none());
+        assert!(projection.integrity_binding.is_none());
         let counts = {
             let conn = fixture
                 .pool

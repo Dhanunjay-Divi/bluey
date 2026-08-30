@@ -140,8 +140,15 @@ jobs:
       - name: Run server Jobs unit tests
         run: cargo test --manifest-path server/Cargo.toml --lib jobs
 
+      - name: Lint the server Jobs integration target
+        run: >-
+          cargo clippy --manifest-path server/Cargo.toml --no-default-features
+          --features integration-test-support --test integration_e2e -- -D warnings
+
       - name: Run server Jobs integration tests
-        run: cargo test --manifest-path server/Cargo.toml --test integration_e2e jobs_
+        run: >-
+          cargo test --manifest-path server/Cargo.toml --no-default-features
+          --features integration-test-support --test integration_e2e
 
   native-runner-storage-darwin:
     name: Native runner storage (Darwin)

@@ -430,6 +430,7 @@ fn legacy_debug_token_valid(request: &Request<Body>) -> bool {
         && supplied.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() == 1
 }
 
+#[cfg(any(debug_assertions, test))]
 fn managed_execution_effect_authorization_path(path: &str) -> bool {
     path.strip_prefix("/api/jobs/internal/execution-leases/")
         .and_then(|rest| rest.strip_suffix("/authorize-managed-effect"))

@@ -23,6 +23,7 @@ pub mod jobs_browser_releases;
 mod jobs_communication_actions;
 mod jobs_import;
 pub mod jobs_interview_prep;
+pub mod jobs_job_integrity;
 pub mod jobs_local_capability;
 mod jobs_mailbox;
 pub mod jobs_mailbox_oauth;
@@ -221,6 +222,7 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
         )
         .merge(jobs::admin_router())
         .merge(jobs_ats_certifications::admin_router())
+        .merge(jobs_job_integrity::admin_router())
         .merge(jobs_browser_releases::admin_router())
         .merge(jobs_managed_cloud_releases::admin_router())
         .merge(jobs_operations::admin_router())
@@ -435,6 +437,7 @@ pub fn build_jobs_router(pool: DbPool, config: Config) -> Router {
         .route("/admin/metrics", get(metrics::get_metrics))
         .merge(jobs::admin_router())
         .merge(jobs_ats_certifications::admin_router())
+        .merge(jobs_job_integrity::admin_router())
         .merge(jobs_browser_releases::admin_router())
         .merge(jobs_managed_cloud_releases::admin_router())
         .merge(jobs_operations::admin_router())

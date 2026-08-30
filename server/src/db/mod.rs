@@ -372,6 +372,9 @@ const SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY: &str =
 const SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
     "../../../infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql"
 );
+const SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
+    "../../../infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql"
+);
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1722,6 +1725,8 @@ const MIGRATIONS: &[&str] = &[
     // 0057 - replay-safe original-source assignment, receipt, transition,
     // lease, circuit, quarantine, and exact current-head authority.
     SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+    // 0058 - dual-role signed employer-identity and job-risk authority.
+    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1733,7 +1738,13 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
 
 fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     let mut conn = pool.get().context("get conn")?;
-    for (i, sql) in MIGRATIONS.iter().enumerate() {
+    let (signed_job_integrity_migration, preceding_migrations) = MIGRATIONS
+        .split_last()
+        .context("SQLite signed job-integrity migration is missing")?;
+    if *signed_job_integrity_migration != SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY {
+        anyhow::bail!("SQLite signed job-integrity migration must remain the migration head")
+    }
+    for (i, sql) in preceding_migrations.iter().enumerate() {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
     }
@@ -2659,10 +2670,68 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     // replay-era compatibility columns exist.
     ensure_sqlite_original_source_verification_hold_capability(&mut conn)
         .context("widen SQLite operational-hold capability authority")?;
+    // Migration 058 rebuilds one immutable table to widen a CHECK constraint. SQLite reparses
+    // every trigger during that table swap, including replay-era triggers that refer to columns
+    // installed by the compatibility helpers above. Keep 058 as the logical migration head while
+    // executing it only after those columns and trigger refreshes are present.
+    execute_sqlite_signed_job_integrity_migration(&mut conn, signed_job_integrity_migration)
+        .with_context(|| format!("migration {} failed", MIGRATIONS.len()))?;
     tracing::info!(
         backend = pool.backend_name(),
         count = MIGRATIONS.len(),
         "migrations applied"
+    );
+    Ok(())
+}
+
+fn execute_sqlite_signed_job_integrity_migration(
+    conn: &mut rusqlite::Connection,
+    migration: &str,
+) -> Result<()> {
+    let foreign_keys_enabled: bool =
+        conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+    let execution = conn.execute_batch(migration);
+    let rollback = (|| -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK")?;
+        }
+        Ok(())
+    })();
+    let restore = (|| -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", foreign_keys_enabled)?;
+        let restored: bool = conn.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
+        anyhow::ensure!(
+            restored == foreign_keys_enabled,
+            "SQLite foreign-key enforcement was not restored after migration 058"
+        );
+        Ok(())
+    })();
+
+    if let Err(error) = execution {
+        let rollback_status = rollback
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        let restore_status = restore
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "ok".to_string());
+        return Err(anyhow::Error::new(error).context(format!(
+            "SQLite migration 058 failed; rollback={rollback_status}; \
+             foreign_key_restore={restore_status}"
+        )));
+    }
+    rollback.context("finish SQLite migration 058 transaction cleanup")?;
+    restore.context("restore SQLite foreign-key enforcement after migration 058")?;
+
+    let foreign_key_violation = conn
+        .prepare("PRAGMA foreign_key_check")?
+        .query([])?
+        .next()?
+        .is_some();
+    anyhow::ensure!(
+        !foreign_key_violation,
+        "SQLite migration 058 produced a foreign-key violation"
     );
     Ok(())
 }
@@ -2768,6 +2837,11 @@ pub const JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID: &str =
     "035_jobs_original_source_verification_authority.sql";
 const POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
     "../../../infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql"
+);
+pub const JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID: &str =
+    "036_jobs_signed_job_integrity_authority.sql";
+const POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
+    "../../../infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql"
 );
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
@@ -2897,6 +2971,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
+    ),
+    (
+        JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+        POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
     ),
 ];
 
@@ -3188,11 +3266,58 @@ mod blocking_boundary_tests {
 #[cfg(test)]
 mod sqlite_migration_replay_tests {
     use super::{
-        ensure_column, ensure_sqlite_original_source_verification_hold_capability, open_pool,
-        run_migrations, SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY,
-        SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
-        SQLITE_JOBS_OPERATIONAL_HOLDS,
+        ensure_column, ensure_sqlite_original_source_verification_hold_capability,
+        execute_sqlite_signed_job_integrity_migration, open_pool, run_migrations,
+        SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY,
+        SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY, SQLITE_JOBS_OPERATIONAL_HOLDS,
     };
+
+    #[test]
+    fn signed_job_integrity_migration_failure_restores_transaction_and_foreign_keys() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let error = execute_sqlite_signed_job_integrity_migration(
+            &mut conn,
+            "PRAGMA foreign_keys=OFF;
+             BEGIN IMMEDIATE;
+             CREATE TABLE phase614b_interrupted (id INTEGER PRIMARY KEY);
+             SELECT * FROM phase614b_forced_missing_relation;
+             COMMIT;
+             PRAGMA foreign_keys=ON;",
+        )
+        .expect_err("injected migration failure must propagate");
+        assert!(error.to_string().contains("SQLite migration 058 failed"));
+        assert!(conn.is_autocommit(), "failed migration must roll back");
+        let foreign_keys_enabled: bool = conn
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .unwrap();
+        assert!(foreign_keys_enabled, "foreign keys must be restored");
+        let interrupted_table_exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type='table' AND name='phase614b_interrupted'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!interrupted_table_exists, "partial schema must roll back");
+        conn.execute_batch(
+            "CREATE TABLE phase614b_parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE phase614b_child (
+               id INTEGER PRIMARY KEY,
+               parent_id INTEGER NOT NULL REFERENCES phase614b_parent(id)
+             );",
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO phase614b_child(id,parent_id) VALUES(1,999)",
+                [],
+            )
+            .is_err());
+    }
 
     #[allow(clippy::too_many_arguments)]
     fn insert_operational_hold_event(
@@ -5968,7 +6093,8 @@ mod postgres_migration_tests {
         JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
         JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
         JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
-        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
+        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+        JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
         MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
         POSTGRES_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL, POSTGRES_JOBS_ATS_CERTIFICATION_AUTHORITY,
@@ -5976,6 +6102,7 @@ mod postgres_migration_tests {
         POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
         POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
         POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
+        POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
         SQLITE_ACCOUNT_DELETION_INTENTS, SQLITE_JOBS_ACCOUNT_OBJECT_UPLOAD_BACKFILL,
@@ -5983,8 +6110,8 @@ mod postgres_migration_tests {
         SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
         SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
         SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
-        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
-        SQLITE_JOBS_WORKFLOW_COMMANDS,
+        SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
+        SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY, SQLITE_JOBS_WORKFLOW_COMMANDS,
     };
 
     #[test]
@@ -6348,7 +6475,10 @@ mod postgres_migration_tests {
     #[test]
     fn original_source_verification_authority_is_paired_replay_safe_and_current_head() {
         let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
-            .last()
+            .iter()
+            .find(|(version, _)| {
+                *version == JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID
+            })
             .expect("original-source verification authority must be the PostgreSQL head");
         assert_eq!(
             *version,
@@ -6358,10 +6488,7 @@ mod postgres_migration_tests {
             *postgres_sql,
             POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY
         );
-        assert_eq!(
-            MIGRATIONS.last().copied(),
-            Some(SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY)
-        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY));
         for schema in [
             *postgres_sql,
             SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
@@ -6401,6 +6528,68 @@ mod postgres_migration_tests {
             assert!(schema.contains("original_source_verifier"));
             assert!(schema.contains("jobs-workflows"));
             assert!(!schema.contains("INSERT INTO jobs_original_source_verification_"));
+        }
+    }
+
+    #[test]
+    fn signed_job_integrity_authority_is_paired_unseeded_and_current_head() {
+        let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .last()
+            .expect("signed job-integrity authority must be the PostgreSQL head");
+        assert_eq!(*version, JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID);
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY);
+        assert_eq!(
+            MIGRATIONS.last().copied(),
+            Some(SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY)
+        );
+        for schema in [*postgres_sql, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY] {
+            assert_eq!(
+                schema
+                    .lines()
+                    .filter(
+                        |line| line.starts_with("CREATE TABLE IF NOT EXISTS jobs_job_integrity_")
+                    )
+                    .count(),
+                7
+            );
+            for required in [
+                "jobs_job_integrity_trust_policies",
+                "jobs_job_integrity_trust_keys",
+                "jobs_job_integrity_attestations",
+                "jobs_job_integrity_revocations",
+                "jobs_job_integrity_head_transitions",
+                "jobs_job_integrity_heads",
+                "jobs_job_integrity_control",
+                "employer_identity",
+                "job_risk",
+                "revocation",
+                "maximum_positive_lifetime_ms",
+                "maximum_nonpositive_lifetime_ms",
+                "allowed_risk_policy_sha256s_json",
+                "root_authorization_id",
+                "employer_identity_authorization_id",
+                "job_risk_authorization_id",
+                "authorization_id",
+                "root_anchor_sha256=NEW.root_anchor_sha256",
+                "existing.public_key_base64url=NEW.public_key_base64url",
+                "job-integrity attestation predecessor binding is invalid",
+                "job-integrity revocation predecessor binding is invalid",
+            ] {
+                assert!(schema.contains(required), "migration missing {required}");
+            }
+            for required in [
+                "jobs_job_integrity_trust_policies_validate_insert",
+                "jobs_job_integrity_trust_keys_validate_insert",
+                "jobs_job_integrity_attestations_validate_insert",
+                "jobs_job_integrity_revocations_validate_insert",
+                "jobs_job_integrity_head_transitions_validate_insert",
+                "jobs_job_integrity_heads_monotonic",
+                "jobs_job_integrity_control_monotonic",
+            ] {
+                assert!(schema.contains(required), "migration missing {required}");
+            }
+            assert!(!schema.contains("INSERT INTO jobs_job_integrity_attestations"));
+            assert!(!schema.contains("INSERT INTO jobs_job_integrity_revocations"));
         }
     }
 

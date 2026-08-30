@@ -8482,11 +8482,7 @@ fn require_sqlite_ats_newer_activation_circuit_close(
     }
     let activation = sqlite_ats_activation_for_head(tx, &event.authority_ref)?
         .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
-    require_current_sqlite_ats_trust_policy(
-        tx,
-        &activation.trust_policy_sha256,
-        recorded_at_ms,
-    )?;
+    require_current_sqlite_ats_trust_policy(tx, &activation.trust_policy_sha256, recorded_at_ms)?;
     ensure_sqlite_ats_activation_available(tx, &activation, recorded_at_ms)?;
     require_sqlite_ats_stored_activation_canary_allowlist(tx, &activation, recorded_at_ms)?;
     let runtimes = sqlite_ats_runtime_targets(tx, &activation.manifest_sha256)?;
@@ -8561,11 +8557,7 @@ fn require_postgres_ats_newer_activation_circuit_close(
     }
     let activation = postgres_ats_activation_for_head(tx, &event.authority_ref)?
         .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
-    require_current_postgres_ats_trust_policy(
-        tx,
-        &activation.trust_policy_sha256,
-        recorded_at_ms,
-    )?;
+    require_current_postgres_ats_trust_policy(tx, &activation.trust_policy_sha256, recorded_at_ms)?;
     ensure_postgres_ats_activation_available(tx, &activation, recorded_at_ms)?;
     require_postgres_ats_stored_activation_canary_allowlist(tx, &activation, recorded_at_ms)?;
     let runtimes = postgres_ats_runtime_targets(tx, &activation.manifest_sha256)?;
@@ -8774,12 +8766,7 @@ pub fn append_ats_certification_circuit_event_sqlite_tx(
         expected_event_id,
     )?;
     if let Some(current) = current.as_ref() {
-        require_sqlite_ats_newer_activation_circuit_close(
-            tx,
-            event,
-            current.2,
-            recorded_at_ms,
-        )?;
+        require_sqlite_ats_newer_activation_circuit_close(tx, event, current.2, recorded_at_ms)?;
     }
     tx.execute(
         "INSERT INTO jobs_ats_certification_circuit_events (
@@ -8943,12 +8930,7 @@ pub fn append_ats_certification_circuit_event_postgres_tx(
         expected_event_id,
     )?;
     if let Some(current) = current.as_ref() {
-        require_postgres_ats_newer_activation_circuit_close(
-            tx,
-            event,
-            current.2,
-            recorded_at_ms,
-        )?;
+        require_postgres_ats_newer_activation_circuit_close(tx, event, current.2, recorded_at_ms)?;
     }
     tx.execute(
         "INSERT INTO jobs_ats_certification_circuit_events (
@@ -11854,8 +11836,20 @@ pub fn create_ats_application_certification_binding_from_context_postgres_tx(
     request: &AtsCertificationPhaseAContextRequest,
     now_ms: i64,
 ) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
-    validate_ats_phase_a_context_request(request, now_ms)?;
     lock_postgres_ats_certification(tx)?;
+    create_ats_application_certification_binding_from_context_postgres_tx_after_prelock(
+        tx, request, now_ms,
+    )
+}
+
+/// Create Phase A authority after the caller has already acquired the common ATS advisory
+/// prelock. This preserves all row validation and CAS semantics without reacquiring ATS after D.
+pub(crate) fn create_ats_application_certification_binding_from_context_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    request: &AtsCertificationPhaseAContextRequest,
+    now_ms: i64,
+) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
+    validate_ats_phase_a_context_request(request, now_ms)?;
     let row = tx
         .query_opt(
             "SELECT job_id, application_json, state FROM jobs_applications
@@ -11961,7 +11955,7 @@ pub fn create_ats_application_certification_binding_from_context_postgres_tx(
         requested_expires_at_ms: now_ms
             .saturating_add(ATS_CERTIFICATION_APPLICATION_BINDING_TTL_MS),
     };
-    create_ats_application_certification_binding_postgres_tx(tx, &raw_request, now_ms)
+    create_ats_application_certification_binding_postgres_tx_after_prelock(tx, &raw_request, now_ms)
 }
 
 pub fn create_ats_application_certification_binding(
@@ -11988,8 +11982,9 @@ pub fn create_ats_application_certification_binding(
                 .start()
                 .map_err(ats_certification_storage)?;
             lock_postgres_ats_certification(&mut tx)?;
-            let result =
-                create_ats_application_certification_binding_postgres_tx(&mut tx, request, now_ms)?;
+            let result = create_ats_application_certification_binding_postgres_tx_after_prelock(
+                &mut tx, request, now_ms,
+            )?;
             tx.commit().map_err(ats_certification_storage)?;
             Ok(result)
         }
@@ -12159,8 +12154,19 @@ pub fn create_ats_application_certification_binding_postgres_tx(
     request: &AtsApplicationCertificationBindingRequest,
     now_ms: i64,
 ) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
-    validate_ats_application_binding_request(request, now_ms)?;
     lock_postgres_ats_certification(tx)?;
+    create_ats_application_certification_binding_postgres_tx_after_prelock(tx, request, now_ms)
+}
+
+/// Persist or replay a Phase A binding after the caller has acquired ATS. This helper deliberately
+/// performs no advisory locking so callers that already hold H -> M -> ATS -> D cannot invert the
+/// common authority order.
+pub(crate) fn create_ats_application_certification_binding_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    request: &AtsApplicationCertificationBindingRequest,
+    now_ms: i64,
+) -> Result<AtsApplicationCertificationBindingRecord, AtsCertificationAuthorityError> {
+    validate_ats_application_binding_request(request, now_ms)?;
     let account_allowlist_sha256 = if request.rollout_channel == "canary" {
         Some(
             resolve_postgres_ats_canary_allowlist_for_target_account(
@@ -13316,8 +13322,18 @@ pub fn validate_consume_reserve_ats_application_certification_from_context_postg
     request: &AtsCertificationPhaseBContextRequest,
     now_ms: i64,
 ) -> Result<AtsCertificationPhaseBTransactionOutcome, AtsCertificationAuthorityError> {
-    validate_ats_phase_b_context_request(request, now_ms)?;
     lock_postgres_ats_certification(tx)?;
+    validate_consume_reserve_ats_application_certification_from_context_postgres_tx_after_prelock(
+        tx, request, now_ms,
+    )
+}
+
+pub(crate) fn validate_consume_reserve_ats_application_certification_from_context_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    request: &AtsCertificationPhaseBContextRequest,
+    now_ms: i64,
+) -> Result<AtsCertificationPhaseBTransactionOutcome, AtsCertificationAuthorityError> {
+    validate_ats_phase_b_context_request(request, now_ms)?;
     let rows = tx
         .query(
             "SELECT binding_sha256, frozen_certification_base64url, phase, fence,
@@ -13458,7 +13474,11 @@ pub fn validate_consume_reserve_ats_application_certification_from_context_postg
         expected_fence: record.fence,
         terminal_phase: request.terminal_phase.clone(),
     };
-    validate_consume_reserve_ats_application_certification_postgres_tx(tx, &raw_request, now_ms)
+    validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(
+        tx,
+        &raw_request,
+        now_ms,
+    )
 }
 
 pub fn validate_consume_reserve_ats_application_certification(
@@ -13486,9 +13506,10 @@ pub fn validate_consume_reserve_ats_application_certification(
                 .start()
                 .map_err(ats_certification_storage)?;
             lock_postgres_ats_certification(&mut tx)?;
-            let outcome = validate_consume_reserve_ats_application_certification_postgres_tx(
-                &mut tx, request, now_ms,
-            )?;
+            let outcome =
+                validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(
+                    &mut tx, request, now_ms,
+                )?;
             tx.commit().map_err(ats_certification_storage)?;
             outcome.into_result()
         }
@@ -13606,8 +13627,18 @@ pub fn validate_consume_reserve_ats_application_certification_postgres_tx(
     request: &AtsCertificationPhaseBRequest,
     now_ms: i64,
 ) -> Result<AtsCertificationPhaseBTransactionOutcome, AtsCertificationAuthorityError> {
-    let phase_b_request_sha256 = validate_ats_phase_b_request(request, now_ms)?;
     lock_postgres_ats_certification(tx)?;
+    validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(
+        tx, request, now_ms,
+    )
+}
+
+pub(crate) fn validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    request: &AtsCertificationPhaseBRequest,
+    now_ms: i64,
+) -> Result<AtsCertificationPhaseBTransactionOutcome, AtsCertificationAuthorityError> {
+    let phase_b_request_sha256 = validate_ats_phase_b_request(request, now_ms)?;
     let row = tx
         .query_opt(
             "SELECT binding_sha256, frozen_certification_base64url, phase, fence,
@@ -14634,12 +14665,58 @@ fn validate_ats_frozen_request(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration-test-support"))]
+#[cfg_attr(feature = "integration-test-support", allow(dead_code))]
 pub(super) mod ats_certification_authority_tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
 
     const TEST_NOW_MS: i64 = 2_000_000_000_000;
+
+    #[test]
+    fn fix_728_ats_after_prelock_phase_helpers_never_reacquire_ats() {
+        let source = include_str!("ats_certification_authority.rs");
+        for (legacy_start, after_prelock_start, end) in [
+            (
+                "pub fn create_ats_application_certification_binding_from_context_postgres_tx(",
+                "pub(crate) fn create_ats_application_certification_binding_from_context_postgres_tx_after_prelock(",
+                "pub fn create_ats_application_certification_binding(",
+            ),
+            (
+                "pub fn create_ats_application_certification_binding_postgres_tx(",
+                "pub(crate) fn create_ats_application_certification_binding_postgres_tx_after_prelock(",
+                "fn validate_ats_phase_b_request(",
+            ),
+            (
+                "pub fn validate_consume_reserve_ats_application_certification_from_context_postgres_tx(",
+                "pub(crate) fn validate_consume_reserve_ats_application_certification_from_context_postgres_tx_after_prelock(",
+                "pub fn validate_consume_reserve_ats_application_certification(",
+            ),
+            (
+                "pub fn validate_consume_reserve_ats_application_certification_postgres_tx(",
+                "pub(crate) fn validate_consume_reserve_ats_application_certification_postgres_tx_after_prelock(",
+                "fn require_sqlite_ats_canary_capacity(",
+            ),
+        ] {
+            let legacy = source
+                .split(legacy_start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing legacy ATS helper {legacy_start}"))
+                .split(after_prelock_start)
+                .next()
+                .expect("bounded legacy ATS helper");
+            assert!(legacy.contains("lock_postgres_ats_certification(tx)"));
+
+            let after_prelock = source
+                .split(after_prelock_start)
+                .nth(1)
+                .unwrap_or_else(|| panic!("missing after-prelock ATS helper {after_prelock_start}"))
+                .split(end)
+                .next()
+                .expect("bounded after-prelock ATS helper");
+            assert!(!after_prelock.contains("lock_postgres_ats_certification"));
+        }
+    }
 
     struct TestAuthority {
         anchor: AtsCertificationTrustAnchor,
@@ -15603,6 +15680,82 @@ pub(super) mod ats_certification_authority_tests {
         pub(super) runtime_target: AtsCertificationRuntimeTarget,
     }
 
+    struct InstalledFixtureHead {
+        head_revision: i64,
+        transition_sha256: String,
+        activation_sha256: String,
+        activation_generation: i64,
+        channel_sequence: i64,
+        manifest_sha256: String,
+        manifest_generation: i64,
+    }
+
+    fn installed_fixture_head(
+        pool: &DbPool,
+        scope_sha256: &str,
+        channel: &str,
+    ) -> Result<Option<InstalledFixtureHead>, AtsCertificationAuthorityError> {
+        match pool {
+            DbPool::Sqlite(_) => {
+                let conn = pool.get().map_err(ats_certification_storage)?;
+                conn.query_row(
+                    "SELECT head.head_revision, head.current_transition_sha256,
+                            head.current_activation_sha256, activation.activation_generation,
+                            head.current_channel_sequence, manifest.manifest_sha256,
+                            manifest.manifest_generation
+                       FROM jobs_ats_certification_heads head
+                       JOIN jobs_ats_certification_activations activation
+                         ON activation.activation_sha256 = head.current_activation_sha256
+                       JOIN jobs_ats_certification_manifests manifest
+                         ON manifest.manifest_sha256 = activation.manifest_sha256
+                      WHERE head.scope_sha256 = ?1 AND head.channel = ?2",
+                    params![scope_sha256, channel],
+                    |row| {
+                        Ok(InstalledFixtureHead {
+                            head_revision: row.get(0)?,
+                            transition_sha256: row.get(1)?,
+                            activation_sha256: row.get(2)?,
+                            activation_generation: row.get(3)?,
+                            channel_sequence: row.get(4)?,
+                            manifest_sha256: row.get(5)?,
+                            manifest_generation: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(ats_certification_storage)
+            }
+            DbPool::Postgres(_) => {
+                let mut conn = pool.get_pg().map_err(ats_certification_storage)?;
+                Ok(conn
+                    .query_opt(
+                        "SELECT head.head_revision, head.current_transition_sha256,
+                                head.current_activation_sha256,
+                                activation.activation_generation,
+                                head.current_channel_sequence, manifest.manifest_sha256,
+                                manifest.manifest_generation
+                           FROM jobs_ats_certification_heads head
+                           JOIN jobs_ats_certification_activations activation
+                             ON activation.activation_sha256 = head.current_activation_sha256
+                           JOIN jobs_ats_certification_manifests manifest
+                             ON manifest.manifest_sha256 = activation.manifest_sha256
+                          WHERE head.scope_sha256 = $1 AND head.channel = $2",
+                        &[&scope_sha256, &channel],
+                    )
+                    .map_err(ats_certification_storage)?
+                    .map(|row| InstalledFixtureHead {
+                        head_revision: row.get(0),
+                        transition_sha256: row.get(1),
+                        activation_sha256: row.get(2),
+                        activation_generation: row.get(3),
+                        channel_sequence: row.get(4),
+                        manifest_sha256: row.get(5),
+                        manifest_generation: row.get(6),
+                    }))
+            }
+        }
+    }
+
     pub(super) fn install_signed_ats_authority_fixture(
         pool: &DbPool,
         target_evidence: AtsCertificationFreshTargetEvidence,
@@ -15629,36 +15782,54 @@ pub(super) mod ats_certification_authority_tests {
             &ats_certification_canonical_json(&fixture_identity)
                 .map_err(|_| AtsCertificationAuthorityError::InvalidAuthority)?,
         );
-        let policy_issued_at_ms = now_ms.saturating_sub(4_000);
-        let policy_valid_from_ms = now_ms.saturating_sub(3_000);
-        let policy_expires_at_ms = now_ms
-            .checked_add(2_000_000)
-            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
-        let mut policy = test_trust_policy(&authority, 1, None);
-        policy.policy_id = format!("ats-fixture-policy-{fixture_id}");
-        policy.issued_at_ms = policy_issued_at_ms;
-        policy.valid_from_ms = policy_valid_from_ms;
-        policy.expires_at_ms = policy_expires_at_ms;
-        let policy_envelope = envelope(
-            &policy,
-            "root",
-            ATS_CERTIFICATION_TRUST_POLICY_AUDIENCE,
-            policy.issued_at_ms,
-            &authority,
-            &format!("authorize-fixture-policy-{fixture_id}"),
-        );
-        let policy_sha256 = envelope_sha256(&policy_envelope);
-        import_ats_certification_trust_policy_with_root_at(
-            pool,
-            &policy_envelope,
-            &authority.root_anchor,
-            "fixture-root-operator",
-            now_ms,
-        )?;
+        let (policy_sha256, policy_expires_at_ms) =
+            match load_current_ats_certification_trust_policy(pool, now_ms) {
+            Ok((policy_sha256, current_policy)) => {
+                let expected_policy = test_trust_policy(&authority, 1, None);
+                if current_policy.delegated_trust != expected_policy.delegated_trust
+                    || current_policy.certification_requirements
+                        != expected_policy.certification_requirements
+                {
+                    return Err(AtsCertificationAuthorityError::InvalidTrustPolicy);
+                }
+                (policy_sha256, current_policy.expires_at_ms)
+            }
+            Err(AtsCertificationAuthorityError::TrustPolicyNotInitialized) => {
+                let policy_issued_at_ms = now_ms.saturating_sub(4_000);
+                let policy_valid_from_ms = now_ms.saturating_sub(3_000);
+                let policy_expires_at_ms = now_ms
+                    .checked_add(2_000_000)
+                    .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+                let mut policy = test_trust_policy(&authority, 1, None);
+                policy.policy_id = format!("ats-fixture-policy-{fixture_id}");
+                policy.issued_at_ms = policy_issued_at_ms;
+                policy.valid_from_ms = policy_valid_from_ms;
+                policy.expires_at_ms = policy_expires_at_ms;
+                let policy_envelope = envelope(
+                    &policy,
+                    "root",
+                    ATS_CERTIFICATION_TRUST_POLICY_AUDIENCE,
+                    policy.issued_at_ms,
+                    &authority,
+                    &format!("authorize-fixture-policy-{fixture_id}"),
+                );
+                let policy_sha256 = envelope_sha256(&policy_envelope);
+                import_ats_certification_trust_policy_with_root_at(
+                    pool,
+                    &policy_envelope,
+                    &authority.root_anchor,
+                    "fixture-root-operator",
+                    now_ms,
+                )?;
+                (policy_sha256, policy_expires_at_ms)
+            }
+            Err(error) => return Err(error),
+        };
 
         let evidence_expires_at_ms = now_ms
             .checked_add(1_000_000)
-            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?
+            .min(policy_expires_at_ms);
         let mut evidence = test_evidence("authorized_sandbox", &policy_sha256);
         evidence.evidence_id = format!("fixture-evidence-{fixture_id}");
         evidence.provider = provider.clone();
@@ -15729,7 +15900,8 @@ pub(super) mod ats_certification_authority_tests {
 
         let manifest_expires_at_ms = now_ms
             .checked_add(900_000)
-            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?
+            .min(evidence_expires_at_ms);
         let mut manifest = test_manifest(
             envelope_sha256(&evidence_envelope),
             envelope_sha256(&layout_envelope),
@@ -15780,6 +15952,14 @@ pub(super) mod ats_certification_authority_tests {
         manifest.issued_at_ms = now_ms.saturating_sub(900);
         manifest.not_before_ms = now_ms.saturating_sub(800);
         manifest.expires_at_ms = manifest_expires_at_ms;
+        let current_head = installed_fixture_head(pool, &manifest.scope_sha256, "general")?;
+        if let Some(head) = current_head.as_ref() {
+            manifest.manifest_generation = head
+                .manifest_generation
+                .checked_add(1)
+                .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+            manifest.predecessor_manifest_sha256 = Some(head.manifest_sha256.clone());
+        }
         let manifest_envelope = envelope(
             &manifest,
             "manifest",
@@ -15801,13 +15981,25 @@ pub(super) mod ats_certification_authority_tests {
             manifest.scope_sha256.clone(),
             &policy_sha256,
         );
+        if let Some(head) = current_head.as_ref() {
+            activation.activation_generation = head
+                .activation_generation
+                .checked_add(1)
+                .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+            activation.predecessor_activation_sha256 = Some(head.activation_sha256.clone());
+            activation.channel_sequence = head
+                .channel_sequence
+                .checked_add(1)
+                .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+        }
         activation.activation_id = format!("fixture-activation-{fixture_id}");
         activation.approval_ref = format!("fixture-approval-{fixture_id}");
         activation.issued_at_ms = now_ms.saturating_sub(700);
         activation.not_before_ms = now_ms.saturating_sub(600);
         activation.expires_at_ms = now_ms
             .checked_add(800_000)
-            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?;
+            .ok_or(AtsCertificationAuthorityError::InvalidAuthority)?
+            .min(manifest_expires_at_ms);
         let activation_envelope = envelope(
             &activation,
             "activation",
@@ -15823,11 +16015,17 @@ pub(super) mod ats_certification_authority_tests {
             now_ms,
         )?;
         let activation_sha256 = envelope_sha256(&activation_envelope);
+        let expected_head_revision = current_head
+            .as_ref()
+            .map_or(0, |head| head.head_revision);
+        let expected_transition_sha256 = current_head
+            .as_ref()
+            .map(|head| head.transition_sha256.as_str());
         apply_ats_certification_activation_at(
             pool,
             &activation_sha256,
-            0,
-            None,
+            expected_head_revision,
+            expected_transition_sha256,
             "fixture-promoter",
             now_ms,
         )?;
@@ -16477,6 +16675,88 @@ pub(super) mod ats_certification_authority_tests {
         .expect("installed authority must resolve at the caller clock");
         assert_eq!(active.manifest_sha256, fixture.manifest_sha256);
         assert_eq!(active.activation_sha256, fixture.activation_sha256);
+    }
+
+    #[test]
+    fn signed_fixture_installer_advances_an_existing_exact_scope_head() {
+        let pool = test_pool();
+        let runtime_target = test_manifest("0".repeat(64), "9".repeat(64), &"8".repeat(64))
+            .runtime_targets
+            .remove(0);
+        let first = install_signed_ats_authority_fixture(
+            &pool,
+            test_target_evidence(),
+            test_surface(),
+            runtime_target.clone(),
+            TEST_NOW_MS,
+        )
+        .unwrap();
+        let mut successor_runtime = runtime_target;
+        successor_runtime.runtime_id = "local:fixture-successor".to_string();
+        successor_runtime.runtime_sha256 = ats_certification_sha256(b"fixture-successor-runtime");
+        successor_runtime.automation_bundle_sha256 =
+            ats_certification_sha256(b"fixture-successor-automation");
+        let successor = install_signed_ats_authority_fixture(
+            &pool,
+            test_target_evidence(),
+            test_surface(),
+            successor_runtime.clone(),
+            TEST_NOW_MS + 1,
+        )
+        .unwrap();
+        assert_ne!(successor.activation_sha256, first.activation_sha256);
+        let active = resolve_active_ats_certification(
+            &pool,
+            &successor.target_evidence.canonical_url,
+            Some(&successor_runtime.runtime_sha256),
+            Some(&successor.surface),
+            TEST_NOW_MS + 1,
+        )
+        .unwrap()
+        .expect("successor authority must own the exact scope head");
+        assert_eq!(active.activation_generation, 2);
+        assert_eq!(active.activation_sha256, successor.activation_sha256);
+        assert_eq!(active.runtime_targets, vec![successor_runtime]);
+    }
+
+    #[test]
+    fn signed_fixture_installer_caps_successor_lifetime_to_current_policy() {
+        let pool = test_pool();
+        let runtime_target = test_manifest("0".repeat(64), "9".repeat(64), &"8".repeat(64))
+            .runtime_targets
+            .remove(0);
+        install_signed_ats_authority_fixture(
+            &pool,
+            test_target_evidence(),
+            test_surface(),
+            runtime_target.clone(),
+            TEST_NOW_MS,
+        )
+        .unwrap();
+
+        let successor_now_ms = TEST_NOW_MS + 1_500_001;
+        let mut successor_target_evidence = test_target_evidence();
+        successor_target_evidence.discovery_observed_at_ms = successor_now_ms - 100;
+        successor_target_evidence.original_source_observed_at_ms = successor_now_ms - 50;
+        let successor = install_signed_ats_authority_fixture(
+            &pool,
+            successor_target_evidence,
+            test_surface(),
+            runtime_target.clone(),
+            successor_now_ms,
+        )
+        .unwrap();
+        let active = resolve_active_ats_certification(
+            &pool,
+            &successor.target_evidence.canonical_url,
+            Some(&runtime_target.runtime_sha256),
+            Some(&successor.surface),
+            successor_now_ms,
+        )
+        .unwrap()
+        .expect("successor authority must remain bounded by the current policy");
+        assert_eq!(active.activation_generation, 2);
+        assert_eq!(active.expires_at_ms, TEST_NOW_MS + 2_000_000);
     }
 
     #[test]
@@ -20368,10 +20648,7 @@ pub(super) mod ats_certification_authority_tests {
         let broad_opens = [
             ("provider", fixture.manifest.provider.clone()),
             ("target", fixture.manifest.target_key.clone()),
-            (
-                "adapter",
-                fixture.manifest.adapter_bundle_sha256.clone(),
-            ),
+            ("adapter", fixture.manifest.adapter_bundle_sha256.clone()),
             (
                 "runtime",
                 fixture.manifest.runtime_targets[0].runtime_sha256.clone(),
@@ -20379,13 +20656,15 @@ pub(super) mod ats_certification_authority_tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(index, (scope_kind, subject_key))| AtsCertificationCircuitEvent {
-            event_id: format!("postgres-broad-circuit-open-{index}-{suffix}"),
-            scope_kind: scope_kind.to_string(),
-            subject_key,
-            authority_ref: format!("postgres-broad-incident-{index}-{suffix}"),
-            ..activation_open.clone()
-        })
+        .map(
+            |(index, (scope_kind, subject_key))| AtsCertificationCircuitEvent {
+                event_id: format!("postgres-broad-circuit-open-{index}-{suffix}"),
+                scope_kind: scope_kind.to_string(),
+                subject_key,
+                authority_ref: format!("postgres-broad-incident-{index}-{suffix}"),
+                ..activation_open.clone()
+            },
+        )
         .collect::<Vec<_>>();
         for open in std::iter::once(&activation_open).chain(broad_opens.iter()) {
             let mut conn = fixture.pool.get_pg().unwrap();

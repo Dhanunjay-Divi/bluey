@@ -7,6 +7,22 @@ under `docs/release/`.
 
 ### Added
 
+- Added Phase 614B Bluey Jobs signed job-integrity authority and the FIX-725 through FIX-766
+  hardening set. Exact Phase 614 original-source and ATS authority now compose with independently
+  signed employer-identity and job-risk attestations under disjoint delegated roles, strict
+  Ed25519 verification, monotonic trust/revocation/head transitions, database-time freshness, and
+  paired SQLite/PostgreSQL migrations. Preparation, approval, reservation, running, local/cloud
+  runner claim, managed/unmanaged FinalSubmit, public projections, exports, and immutable receipts
+  recheck the current composed authority under canonical lock order. Production-positive tests now
+  traverse the real source → ATS → integrity lifecycle with exact local/cloud runner binding; the
+  integration-only support target is explicit, default-off, rejected by release builds, and
+  excluded from production Docker/release commands by a static CI guard. Added design-only Phase
+  620A and 620B–F plans for consent-bound WhatsApp/Apple business messaging, mailbox draft control,
+  scoped agents/MCP, C2C planning, and LinkedIn drafting/publishing. The plans are clean-room,
+  simulator-first, and keep every OAuth, ingestion, draft, send, submit, post, reconciliation,
+  source-verification, discovery, runner, and customer effect flag at `0`. No competitor private
+  session, proprietary code/UI, provider write, application, message, email, post, deployment,
+  production flag, or customer cohort was used or enabled.
 - Added Phase 614 Bluey Jobs original-source verification authority: an exact managed workflow
   entrypoint and private worker API; paired SQLite/PostgreSQL fenced assignments, database-time
   heartbeats, immutable observations/receipts/transitions, replay quarantine, and a monotonic
