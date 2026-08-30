@@ -72,7 +72,11 @@ async fn system_audio_capture_receives_chunks_from_stub() {
     while received.len() < 5 && tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
             Ok(Some(chunk)) => received.push(chunk),
-            _ => break,
+            Ok(None) => break,
+            // Process startup can exceed a single polling interval under
+            // parallel workspace load. Honor the declared five-second
+            // deadline before classifying capture as failed.
+            Err(_) => continue,
         }
     }
 
@@ -173,7 +177,10 @@ async fn system_audio_chunks_drive_stt_provider() {
                 provider.send_audio(&chunk).await.unwrap();
                 chunks_sent += 1;
             }
-            _ => break,
+            Ok(None) => break,
+            // Keep waiting until the overall deadline if the helper was only
+            // delayed by concurrent test/build scheduling.
+            Err(_) => continue,
         }
     }
 

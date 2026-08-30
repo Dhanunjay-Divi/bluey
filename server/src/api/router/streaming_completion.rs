@@ -1,4 +1,5 @@
 
+#[allow(clippy::result_large_err)]
 pub async fn complete(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -38,6 +39,7 @@ pub async fn complete(
 /// The worker owns the provider stream, billing, usage recording, and
 /// idempotency caching, so dropping the HTTP response body cannot cancel
 /// settlement. A terminal `billing` event carries the final `CompleteResponse`.
+#[allow(clippy::result_large_err)]
 pub async fn complete_stream(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -62,6 +64,7 @@ pub async fn complete_stream(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn complete_stream_inner(
     state: AppState,
     account: Account,
@@ -2146,6 +2149,7 @@ async fn complete_stream_inner(
     Ok(router_sse(detach_router_stream(Box::pin(event_stream))))
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) async fn complete_for_account(
     state: AppState,
     account: Account,
