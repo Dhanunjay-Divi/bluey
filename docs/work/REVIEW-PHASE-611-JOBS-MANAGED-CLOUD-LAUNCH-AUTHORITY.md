@@ -90,8 +90,8 @@
 | Field | Value |
 |-------|-------|
 | Files | Release gate/runtime measurement source and tests, Rust release authority, FIX-693, changelog, implementation, and review evidence |
-| Source verdict | 🟡 bounded correction pending independent review |
-| Exact-tip verification verdict | 🟡 resource-capable gates required |
+| Source verdict | 🟢 independently reviewed |
+| Exact-tip verification verdict | 🟢 exact source-head CI green |
 
 **Findings:**
 
@@ -109,7 +109,7 @@
 |-------|-------|
 | Files | Runner Dockerfile/runtime verifier, release gate, Rust authority, CI/release smoke, tests, FIX-694, changelog, implementation, and review evidence |
 | Source verdict | 🟢 independently reviewed; no residual P0/P1/P2 finding |
-| Exact image verdict | 🟡 resource-capable rerun required |
+| Exact image verdict | 🟢 Docker build, runtime measurement, and native smoke green at exact source head |
 
 **Findings:**
 
@@ -130,8 +130,8 @@
 - Filesystem generation, startup remeasurement, stored OCI inspection, and Rust authority reject
   symbolic links throughout every measured runtime root rather than silently skipping or following
   them.
-- Full automation and runner tests/typechecks, release-gate tests, and Rust formatting are green.
-  Independent source review, the Linux image/native smoke, and complete Rust gates remain required.
+- Full automation and runner tests/typechecks, release-gate tests, Rust formatting, Linux
+  image/native smoke, and complete exact source-head CI gates are green.
 
 ### 611.7 — Rust 1.98 compatibility backport
 
@@ -140,6 +140,7 @@
 | Files | Eleven core, daemon, RAG, and server files plus FIX-695 |
 | Source verdict | 🟢 exact backport independently verified |
 | CI precedent | 🟢 unchanged `2f3910a1` patch green at descendant PR #33 head `83f15263` on macOS, Ubuntu, Windows, and observability |
+| Phase 611 exact-head verdict | 🟢 macOS, Ubuntu, Windows, and observability/server checks green |
 
 **Findings:**
 
@@ -147,8 +148,8 @@
   Phase 611 managed-runner logic.
 - The proven eleven-file patch was backported without the unrelated Phase 623 UI changes;
   fixing only the first `ipc_auth.rs` diagnostic would have left later failures.
-- Phase 611 still needs its own corrected exact-head run; green descendant evidence for the
-  unchanged patch is compatibility precedent, not a substitute for combined-branch verification.
+- Phase 611 now has its own corrected exact source-head run; the earlier descendant evidence remains
+  compatibility precedent, while runs 33323257936 and 33323257933 are the combined-branch proof.
 
 ### 611.8 — Remaining Rust 1.98 daemon application correction
 
@@ -156,7 +157,7 @@
 |-------|-------|
 | Files | `crates/cue-daemon/src/app.rs` plus FIX-696 and Phase 611 records |
 | Source verdict | 🟢 independently reviewed; no P0/P1/P2/P3 finding |
-| Exact-head verdict | 🟡 fresh resource-capable rerun required |
+| Exact-head verdict | 🟢 exact source-head CI green |
 
 **Findings:**
 
@@ -166,7 +167,8 @@
 - FIX-696 applies only the matching `as_chunks::<2>()` transformations already present at green
   descendant PR #33 head `83f15263`; no unrelated daemon or Phase 623 work is imported.
 - Rust 1.98 workspace formatting, diff checks, and a repository-wide numeric `.chunks_exact(...)`
-  scan pass. Independent review found no P0/P1/P2/P3 issue; combined exact-head CI remains required.
+  scan pass. Independent review found no P0/P1/P2/P3 issue; the final combined exact source-head CI
+  run passed.
 
 ## Cross-Task Findings
 
@@ -177,8 +179,8 @@
 - Local source evidence does not claim hosted registry publication, signing ceremony, Temporal
   behavior, customer admission, real runner capacity, image-digest attestation, read-only-rootfs
   enforcement, canary execution, or rollback execution.
-- The baseline `423fba5c` full Rust all-target test rerun passed with zero failures; the corrected
-  tip still requires a resource-capable rerun.
+- The baseline `423fba5c` full Rust all-target test rerun passed with zero failures, and the final
+  corrected exact source head also passed the resource-capable combined workflows.
 
 ## Build & Test Verification
 
@@ -274,16 +276,32 @@ git diff --check
   PASS
 ```
 
-Not yet rerun after the final corrections: Cargo check/Clippy/tests and the exact Linux
-managed-runner Docker build/native smoke. Docker remains unavailable locally. A resource-capable
-exact-head CI rerun must replace this conditional status; no baseline result is inherited.
+Exact-tip CI evidence for source head `032568c3698af10150752bb23cebf71268b614b6`:
+
+- [Jobs run 33323257948](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948):
+  [Jobs CI/privacy job 99288862771](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862771)
+  passed 1,749 Jobs tests with one intentional skip (660/219/308/291/271 by workspace), 17
+  managed-cloud release-gate tests, all typechecks/builds and privacy/contract gates, native
+  storage format/Clippy/tests/release build, the Linux managed-runner Docker build with exact-head
+  runtime measurement, and native-addon smoke. Its server subset passed 729 unit and 34 integration
+  tests. [Darwin native storage 99288862640](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862640)
+  passed independently.
+- [CI run 33323257936](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936):
+  Ubuntu, Windows, and macOS checks all passed.
+- [Observability run 33323257933](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933):
+  server, observability-policy, workspace, and aggregate checks passed. The
+  [server job 99288828813](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933/job/99288828813)
+  reported 1,464 passed tests across its suites with zero failures.
 
 ## Overall Verdict
 
-🟡 **SOURCE GREEN; RESOURCE-CAPABLE AND HOSTED VERIFICATION PENDING** — Final independent review
-found no residual issue through FIX-696, and full local automation/runner plus focused correction
-gates are green. Combined Rust and exact managed-runner Docker/CI gates remain required at the
-corrected head. Hosted launch evidence remains external and is not claimed by this verdict.
+🟢 **SOURCE AND EXACT-TIP CI GREEN; HOSTED LAUNCH AUTHORITY REMAINS NO-GO** — Final independent
+review found no residual issue through FIX-696, and the exact source head passed Jobs/privacy,
+cross-platform CI, observability/server, Linux managed-runner Docker measurement, and native smoke.
+This verdict is limited to source and CI evidence. Registry publication/read-back, protected
+threshold approval, hosted PostgreSQL/Temporal/network behavior, deployed runtime image and
+read-only-rootfs attestation, real runner capacity, ATS/customer canaries, cohort admission, flag
+enablement, kill-switch exercise, and rollback rehearsal remain unproven and must not be inferred.
 
 ## Follow-ups for Next Batch
 

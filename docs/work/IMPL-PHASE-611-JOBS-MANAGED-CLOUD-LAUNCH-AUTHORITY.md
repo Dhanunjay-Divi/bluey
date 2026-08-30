@@ -214,8 +214,8 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
 
 The final independent line-by-line source review found no residual P0/P1/P2 issue across FIX-693,
 FIX-694, and FIX-695, and the completed baseline full all-target Rust rerun passed with zero
-failures. Independent review also found no P0/P1/P2/P3 issue in FIX-696; release status remains
-conditional on a fresh exact-head run and all remaining resource-capable and hosted evidence.
+failures. Independent review also found no P0/P1/P2/P3 issue in FIX-696; the later exact source-head
+CI run closes the resource-capable source verification while hosted launch evidence remains open.
 
 Post-correction local evidence at the branch tip on 2026-08-24:
 
@@ -277,7 +277,35 @@ The first combined exact-head run at `978ac4fe` passed native runner storage on 
 two additional Rust 1.98 constant-chunk diagnostics in `crates/cue-daemon/src/app.rs` across macOS,
 Ubuntu, Windows, and observability. FIX-696 applies only the two corresponding transformations
 already green at descendant head `83f15263`; Rust 1.98 workspace formatting, diff checks, and a repository-wide numeric
-`.chunks_exact(...)` scan pass locally. A new combined run remains required.
+`.chunks_exact(...)` scan pass locally. The final exact source-head run recorded below closes that
+combined CI requirement.
+
+Final exact-tip pull-request evidence at source head
+`032568c3698af10150752bb23cebf71268b614b6` on 2026-08-30 is green:
+
+- [Bluey Jobs CI / Privacy Gate run 33323257948](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948)
+  completed successfully. Its [Jobs gate job 99288862771](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862771)
+  passed 1,749 Jobs tests with one intentional skip (automation 660, browser 219, runner 308,
+  workflows 291, portal 271), 17 managed-cloud release-gate tests, all Jobs typechecks/builds,
+  native-storage format/Clippy/tests/release build, the exact managed-runner Docker build and
+  runtime measurement, and the native addon smoke. The server Jobs subset passed 729 unit tests
+  and 34 integration tests with zero failures. The companion
+  [Darwin native-storage job 99288862640](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862640)
+  also passed.
+- [CI run 33323257936](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936)
+  completed successfully on [Ubuntu](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936/job/99288828817),
+  [Windows](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936/job/99288828935),
+  and [macOS](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936/job/99288828944).
+- [Observability Policy run 33323257933](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933)
+  completed successfully. The [server test job](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933/job/99288828813)
+  observed 1,464 passed tests across its reported binaries/suites (1,350 library, 1 bluey-server,
+  1 connectinfo, 1 context migration, 2 GDPR, 106 integration, 2 plan-matrix, 1 usage-schema), with
+  zero failures; observability policy, workspace tests, and the final aggregate check also passed.
+
+This closes the Phase 611 source and exact-tip CI gates only. It does not publish or read back a
+registry artifact, prove hosted PostgreSQL/Temporal/network behavior, attest a deployed image or
+read-only root filesystem, establish real runner capacity, admit a customer cohort, run an ATS
+canary, enable a flag, exercise a kill switch, or rehearse production rollback.
 
 Hosted container publication, immutable registry/static read-back, Temporal task-queue behavior,
 live runner capacity, runtime image-digest attestation, read-only-rootfs policy, customer cohort,
@@ -320,4 +348,4 @@ canary, and rollback are external-only gates and cannot be converted into local 
 - [x] All customer flags remain `0` and hosted evidence is not claimed from local source
 - [x] No TODO lacks a tracked follow-up
 - [x] Baseline `423fba5c` full all-target Rust rerun passes with zero failures
-- [ ] Final corrected branch tip passes automation Vitest, Rust check/Clippy/tests, and exact managed-runner Docker/CI gates
+- [x] Final corrected source head `032568c3698af10150752bb23cebf71268b614b6` passes automation Vitest, Rust check/Clippy/tests, and exact managed-runner Docker/CI gates
