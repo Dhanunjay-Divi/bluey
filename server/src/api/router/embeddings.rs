@@ -56,6 +56,7 @@ pub struct EmbedBatchResponse {
     pub trial_seconds_remaining: i64,
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn embed(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -96,6 +97,7 @@ pub async fn embed(
     }))
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn embed_batch(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -109,6 +111,7 @@ pub async fn embed_batch(
         .map(Json)
 }
 
+#[allow(clippy::result_large_err)]
 async fn embed_batch_inner(
     state: &AppState,
     account: &crate::db::accounts::Account,

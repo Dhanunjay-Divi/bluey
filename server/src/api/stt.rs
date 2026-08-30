@@ -1229,8 +1229,10 @@ fn pcm16_i16le_stats(raw: &[u8]) -> Pcm16AudioStats {
     let mut peak = 0_i32;
     let mut nonzero = 0_usize;
     let mut sum_squares = 0_f64;
-    for chunk in raw[..sample_bytes].chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+    let (sample_pairs, remainder) = raw[..sample_bytes].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for chunk in sample_pairs {
+        let sample = i16::from_le_bytes(*chunk) as i32;
         let magnitude = sample.abs();
         if magnitude > 0 {
             nonzero = nonzero.saturating_add(1);

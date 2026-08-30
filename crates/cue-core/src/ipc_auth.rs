@@ -935,8 +935,10 @@ fn decode_hex_32(value: &str) -> std::result::Result<[u8; IPC_BEARER_BYTES], Str
         return Err("daemon IPC bearer must contain exactly 32 bytes".to_string());
     }
     let mut output = [0_u8; IPC_BEARER_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        output[index] = (decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?;
+    let bytes = value.as_bytes();
+    for (index, slot) in output.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = (decode_nibble(bytes[offset])? << 4) | decode_nibble(bytes[offset + 1])?;
     }
     Ok(output)
 }

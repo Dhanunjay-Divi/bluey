@@ -1223,9 +1223,11 @@ async fn read_child_stdout_with_protocol(
         offset += n;
 
         while offset >= CHUNK_BYTES {
-            let samples: Vec<i16> = buf[..CHUNK_BYTES]
-                .chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]))
+            let (sample_pairs, remainder) = buf[..CHUNK_BYTES].as_chunks::<2>();
+            debug_assert!(remainder.is_empty());
+            let samples: Vec<i16> = sample_pairs
+                .iter()
+                .map(|bytes| i16::from_le_bytes(*bytes))
                 .collect();
 
             let chunk = AudioChunk {
