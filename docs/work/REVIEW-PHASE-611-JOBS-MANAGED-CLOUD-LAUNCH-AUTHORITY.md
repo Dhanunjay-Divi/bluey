@@ -6,7 +6,7 @@
 
 **Commit range:** `89d6b820..branch tip`
 **Reviewer:** Codex (independent line-by-line review)
-**Date:** 2026-08-24
+**Date:** 2026-08-30 (final exact-head update)
 
 ## Per-Task Review
 
@@ -80,7 +80,7 @@
   provenance, and release-hygiene checks are green.
 - The customer boundary is the browser-delivered portal plus managed execution; no installable
   Bluey Browser is required or introduced by this batch.
-- The 80-path branch-diff inventory matches the implementation record, and `docs/reviews/` remains
+- The 96-path branch-diff inventory matches the implementation record, and `docs/reviews/` remains
   untouched.
 
 ---
@@ -148,8 +148,9 @@
   Phase 611 managed-runner logic.
 - The proven eleven-file patch was backported without the unrelated Phase 623 UI changes;
   fixing only the first `ipc_auth.rs` diagnostic would have left later failures.
-- Phase 611 now has its own corrected exact source-head run; the earlier descendant evidence remains
-  compatibility precedent, while runs 33323257936 and 33323257933 are the combined-branch proof.
+- Phase 611 now has its own corrected exact source-head runs; the earlier descendant evidence
+  remains compatibility precedent, runs 33323257936 and 33323257933 preserve the first
+  combined-branch proof, and final runs 33326265510 and 33326265494 bind the current head.
 
 ### 611.8 — Remaining Rust 1.98 daemon application correction
 
@@ -167,13 +168,36 @@
 - FIX-696 applies only the matching `as_chunks::<2>()` transformations already present at green
   descendant PR #33 head `83f15263`; no unrelated daemon or Phase 623 work is imported.
 - Rust 1.98 workspace formatting, diff checks, and a repository-wide numeric `.chunks_exact(...)`
-  scan pass. Independent review found no P0/P1/P2/P3 issue; the final combined exact source-head CI
-  run passed.
+  scan pass. Independent review found no P0/P1/P2/P3 issue; the first combined exact source-head CI
+  run passed and the final FIX-697 head rerun remains green.
+
+### 611.9 — Bounded IPC capability replacement test correction
+
+| Field | Value |
+|-------|-------|
+| Files | `crates/cue-core/src/ipc_auth.rs`, FIX-697, changelog, implementation, and review evidence |
+| Production verdict | 🟢 unchanged production implementation and retry policy |
+| Test-model verdict | 🟢 realistic one-replacement model plus deterministic bounded-failure coverage |
+| Exact-head verdict | 🟢 Jobs/privacy, Ubuntu, Windows, macOS, and observability/server checks green |
+
+**Findings:**
+
+- Production publishes one atomic capability replacement per daemon boot; the former stress test's
+  100 continuous replacements could outlast any finite retry policy and did not model that contract.
+- FIX-697 models one realistic boot-scoped replacement while concurrent readers prove that every
+  successful record is complete and that the stable final record belongs to the second boot.
+- Deterministic hook coverage forces all four allowed opens to observe zero-link inodes and proves
+  that the reader fails closed after the configured three retries. The existing zero-link reopen
+  and hard-link rejection coverage remains intact.
+- Production retry constants, open/validation logic, owner/mode/type/link checks, and capability
+  serialization are unchanged. Final exact-head cross-platform and observability workflows are
+  green.
+- Independent review found no P0/P1/P2/P3 issue in the bounded test-only correction.
 
 ## Cross-Task Findings
 
 - Final independent review found no residual P0/P1/P2 issue across FIX-693/FIX-694/FIX-695 and no
-  P0/P1/P2/P3 issue in FIX-696.
+  P0/P1/P2/P3 issue in FIX-696 or FIX-697.
 - `directDiscovery`, `globalDiscovery`, and `sourceVerification` remain false because their exact
   pre-effect managed runtime boundaries are intentionally outside this batch.
 - Local source evidence does not claim hosted registry publication, signing ceremony, Temporal
@@ -276,7 +300,7 @@ git diff --check
   PASS
 ```
 
-Exact-tip CI evidence for source head `032568c3698af10150752bb23cebf71268b614b6`:
+Earlier exact-tip CI evidence for source head `032568c3698af10150752bb23cebf71268b614b6`:
 
 - [Jobs run 33323257948](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948):
   [Jobs CI/privacy job 99288862771](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862771)
@@ -293,10 +317,32 @@ Exact-tip CI evidence for source head `032568c3698af10150752bb23cebf71268b614b6`
   [server job 99288828813](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933/job/99288828813)
   reported 1,464 passed tests across its suites with zero failures.
 
+Final exact-tip CI evidence for source head `24b5f717f941c39d1ab72b34af50a5e3cac4d183`:
+
+- [Jobs run 33326265497](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265497):
+  [Jobs CI/privacy job 99296815980](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265497/job/99296815980)
+  passed 1,749 Jobs tests including one intentional skip, 17 managed-cloud release-gate tests,
+  every Jobs typecheck/build and privacy/contract gate, native-storage
+  format/Clippy/tests/release build, the exact managed-runner Docker measurement, and native-addon
+  smoke. Its server subset passed 729 unit and 34 integration tests. The
+  [Darwin job 99296816093](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265497/job/99296816093)
+  passed independently.
+- [CI run 33326265510](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510):
+  [Ubuntu 99296815848](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510/job/99296815848),
+  [Windows 99296815952](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510/job/99296815952),
+  and [macOS 99296815972](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510/job/99296815972)
+  all passed.
+- [Observability run 33326265494](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494):
+  [server 99296815882](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99296815882)
+  reported 1,464 passed tests; [observability policy 99296815780](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99296815780),
+  [workspace 99296815885](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99296815885),
+  and [aggregate 99300208699](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99300208699)
+  all passed.
+
 ## Overall Verdict
 
 🟢 **SOURCE AND EXACT-TIP CI GREEN; HOSTED LAUNCH AUTHORITY REMAINS NO-GO** — Final independent
-review found no residual issue through FIX-696, and the exact source head passed Jobs/privacy,
+review found no residual issue through FIX-697, and the exact source head passed Jobs/privacy,
 cross-platform CI, observability/server, Linux managed-runner Docker measurement, and native smoke.
 This verdict is limited to source and CI evidence. Registry publication/read-back, protected
 threshold approval, hosted PostgreSQL/Temporal/network behavior, deployed runtime image and
