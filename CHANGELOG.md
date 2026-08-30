@@ -207,6 +207,10 @@ under `docs/release/`.
 
 ### Fixed
 
+- Corrected the Unix daemon IPC capability replacement test to model one boot-scoped atomic
+  replacement instead of an artificial stream of 100 rewrites, and added deterministic proof that
+  four consecutive zero-link opens exhaust the existing bounded retry policy and fail closed.
+  Production owner, mode, file-type, symlink, hard-link, zero-link, and retry behavior is unchanged.
 - Normalized the pinned Playwright Noble base's regular `/usr/bin/node` into the existing
   `/usr/local/bin/node` managed-runtime authority before measurement, then removed the source path
   and package-manager tools from both NodeSource and `/usr/local` layouts. CI and release image
