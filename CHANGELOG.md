@@ -316,6 +316,11 @@ under `docs/release/`.
 
 ### Fixed
 
+- Raised the combined Linux Jobs CI lane's closed timeout from 45 to 90 minutes after the exact
+  PR-head run passed every preceding gate but was cancelled with 89 of 108 integration tests green
+  and zero failures. The pre-install Jobs CI self-test now rejects any drift from the bounded
+  90-minute contract; test commands, release authority, feature flags, and production behavior are
+  unchanged.
 - Removed the Bluey Jobs dependency-security release blocker by upgrading both résumé PDF
   extractors to patched PDF.js 6.2.108, retaining text-only parsing with loading-task cleanup,
   and refreshing vulnerable DOMPurify, PostCSS/Nano ID, brace-expansion, JS-YAML, and Undici
