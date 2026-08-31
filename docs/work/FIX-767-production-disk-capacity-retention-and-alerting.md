@@ -318,6 +318,29 @@ administer the bucket, and an operator confirms the future automatic deletion
 policy. The production dashboard forms were inspected and closed without
 saving.
 
+## Live host recheck — 2026-08-31
+
+A fresh read-only check at `2026-08-31T04:53:47Z` found the production root filesystem at 71%
+used: 43,188,903,936 of 61,285,326,848 bytes, with 18,079,645,696 bytes available. This is below
+the hard 80% release line and above the 8 GiB hard reserve, but it is still inside the new 70%
+early-warning state.
+
+The underlying retention defect is not yet repaired on the host:
+
+- `/var/backups/bluey-api` still consumes 26,372,472,832 bytes and contains 623 regular-file
+  entries totaling 24,997,332,246 bytes;
+- its `hourly` directory contains 59 regular-file entries and 13,979,320,320 bytes, while `daily`
+  contains 44 entries and 7,558,512,640 bytes;
+- the installed backup, archive, and guard scripts are the June 30 / July 5 revisions, the
+  root-only `/etc/bluey-api/bluey-storage.env` fragment is absent, and no durable
+  `/var/lib/bluey-ops/disk-guard.status` exists; and
+- `bluey-api.service` is active, but current free space therefore reflects interim capacity relief,
+  not activation of the reviewed byte-bounded retention, alerting, and dead-man controls.
+
+No production file, schedule, database, object, configuration, or service was changed by this
+recheck. Release remains blocked on transactional installation/canaries and the independent
+restore-target provider described below.
+
 ## Known Limitations
 
 - All database snapshot/validation, operational archive, provider read-back,
