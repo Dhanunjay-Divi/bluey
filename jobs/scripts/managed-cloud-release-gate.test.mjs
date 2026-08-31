@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import {
   generateKeyPairSync,
   sign as signBytes,
 } from "node:crypto";
 import {
+  copyFile,
+  cp,
   mkdir,
   mkdtemp,
   readFile,
@@ -13,20 +16,35 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
+import { promisify } from "node:util";
 import {
   assembleManagedCloudCandidate,
+  attestManagedCloudArtifactPublication,
+  authorizeManagedCloudCandidate,
   canonicalJsonBytes,
+  captureManagedCloudPortalManifestStream,
+  captureManagedCloudPublicationApiStream,
   createArtifactProvenance,
   createFileSbom,
+  createManagedCloudCiEvidence,
+  createManagedCloudArtifactPublicationPlan,
+  createManagedCloudRollback,
   createManagedCloudContracts,
+  createManagedCloudPublicationWorkflowEvidence,
+  createManagedCloudPublicationPreflightDocument,
+  createManagedCloudPublicationSetDocument,
+  promoteManagedCloudCandidate,
   createRuntimeMeasurementFromFilesystem,
   deriveManagedCloudCanaryCheckIds,
+  deriveManagedCloudPortalManifestCreatedAt,
   deriveManagedCloudRequiredRuntimePaths,
   deriveRequiredRuntimeRoles,
   deriveManagedCloudRuntimeIdentitySha256,
   deriveManagedCloudTaskQueueSha256,
   inspectOciImageArchive,
+  inspectManagedCloudArtifactPublicationReadback,
   inspectStaticBundleArchive,
   MANAGED_CLOUD_AUDIENCES,
   MANAGED_CLOUD_BASE_CAPABILITIES,
@@ -36,17 +54,29 @@ import {
   MANAGED_CLOUD_SUCCESSOR_PROTOCOL_IDS,
   MANAGED_CLOUD_RUNTIME_CONTRACTS,
   sha256,
+  stageManagedCloudPortalArtifactReadback,
   validateManagedCloudActivationEvidence,
   validateManagedCloudActivationWindow,
   validateManagedCloudInventoryAttachments,
+  validateManagedCloudPublicationAdapter,
+  validateManagedCloudPublicationBuilderPolicy,
+  validateManagedCloudPublicationPlanShape,
+  validateManagedCloudPublicationPreflightDocument,
+  validateManagedCloudPublicationRuntimeIdentity,
+  validateManagedCloudPublicationSetShape,
+  validateManagedCloudPromotion,
   validateManagedCloudReleaseContracts,
   validateManagedCloudRollbackSuccessor,
+  validateManagedCloudRollback,
   validateManagedCloudRuntimeMeasurement,
+  validateManagedCloudTestEvidence,
   validateManagedCloudTrustBundle,
   validateManagedCloudWorkflowContract,
   validateReleaseManifest,
   verifyManagedCloudSignatureSet,
 } from "./managed-cloud-release-gate.mjs";
+
+const execFileAsync = promisify(execFile);
 
 const SOURCE_COMMIT = "a".repeat(40);
 const RELEASE_ID = "managed-cloud-611-001";
@@ -153,6 +183,56 @@ function descriptor(bytes, mediaType) {
   };
 }
 
+function portalArtifactManifest(portalBytes, overrides = {}) {
+  const manifest = {
+    annotations: {
+      "org.opencontainers.image.created": "2026-08-31T00:00:00Z",
+    },
+    artifactType: "application/vnd.bluey.jobs.portal.v1",
+    config: {
+      data: "e30=",
+      digest:
+        "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+      mediaType: "application/vnd.oci.empty.v1+json",
+      size: 2,
+    },
+    layers: [{
+      annotations: { "org.opencontainers.image.title": "jobs-portal.tar" },
+      digest: "sha256:" + sha256(portalBytes),
+      mediaType: "application/vnd.bluey.jobs.portal.tar",
+      size: portalBytes.length,
+    }],
+    mediaType: "application/vnd.oci.image.manifest.v1+json",
+    schemaVersion: 2,
+  };
+  return { ...manifest, ...overrides };
+}
+
+function publicationWorkflowArtifacts({
+  attempt = 1,
+  branch = "main",
+  repositoryId = 611,
+  runId = 2001,
+} = {}) {
+  return {
+    artifacts: [{
+      digest: "sha256:" + "b".repeat(64),
+      expired: false,
+      id: 4001,
+      name: "jobs-managed-cloud-publication-" + runId + "-" + attempt,
+      size_in_bytes: 4096,
+      workflow_run: {
+        head_branch: branch,
+        head_repository_id: repositoryId,
+        head_sha: SOURCE_COMMIT,
+        id: runId,
+        repository_id: repositoryId,
+      },
+    }],
+    total_count: 1,
+  };
+}
+
 function apiRuntime(overrides = {}) {
   return {
     Cmd: [],
@@ -203,6 +283,7 @@ function workflowsRuntime(overrides = {}) {
 
 async function writeOciFixture(path, {
   extraBlob,
+  indexReferenceName,
   layers = [
     [
       { name: "app", type: "5" },
@@ -255,8 +336,16 @@ async function writeOciFixture(path, {
     manifestBytes,
     "application/vnd.oci.image.manifest.v1+json",
   );
+  const indexDescriptor = indexReferenceName
+    ? {
+        ...manifestDescriptor,
+        annotations: {
+          "org.opencontainers.image.ref.name": indexReferenceName,
+        },
+      }
+    : manifestDescriptor;
   const indexBytes = Buffer.from(
-    JSON.stringify({ manifests: [manifestDescriptor], schemaVersion: 2 }),
+    JSON.stringify({ manifests: [indexDescriptor], schemaVersion: 2 }),
   );
   const outerEntries = [
     { body: JSON.stringify({ imageLayoutVersion: "1.0.0" }), name: "oci-layout" },
@@ -687,6 +776,12 @@ function releaseContractFixture() {
 
 function successorReleaseContractFixture() {
   const fixture = releaseContractFixture();
+  fixture.builderPolicy = {
+    ...fixture.builderPolicy,
+    audience: MANAGED_CLOUD_AUDIENCES.builderPolicyV2,
+    noRebuildStages: ["authorize", "promote", "publish", "rollback", "verify"],
+    schemaVersion: 2,
+  };
   const sources = sourceSet(SOURCE_VERIFICATION_PROTOCOL_PATHS, "d");
   fixture.protocolContract.schemaVersion = 2;
   fixture.protocolContract.protocols.splice(9, 0, {
@@ -880,6 +975,678 @@ function trustFixture() {
   };
 }
 
+async function fileSha256(path) {
+  return sha256(await readFile(path));
+}
+
+function runtimeMeasurementFixture({
+  buildId,
+  componentId,
+  contractHashes,
+  entries,
+  roles,
+}) {
+  const roots = componentId === "jobs-api"
+    ? ["usr/local/bin/bluey-jobs-api"]
+    : componentId === "jobs-workflows"
+      ? ["app/automation", "app/workflows", "usr/local/bin/node"]
+      : ["app/automation", "app/runner", "ms-playwright", "usr/local/bin/node"];
+  const measuredFiles = entries
+    .filter((entry) =>
+      (entry.type ?? "0") === "0" &&
+      Buffer.byteLength(entry.body ?? "") > 0 &&
+      roots.some((root) => entry.name === root || entry.name.startsWith(root + "/")),
+    )
+    .map((entry) => ({
+      path: entry.name,
+      sha256: sha256(Buffer.from(entry.body ?? "")),
+    }))
+    .sort((left, right) => left.path.localeCompare(right.path));
+  return {
+    audience: MANAGED_CLOUD_AUDIENCES.runtimeMeasurement,
+    buildId,
+    componentId,
+    configSchemaSha256: contractHashes.config,
+    measuredFiles,
+    migrationSetSha256: contractHashes.migration,
+    protocolSetSha256: contractHashes.protocol,
+    roles: [...roles].sort(),
+    sourceCommit: SOURCE_COMMIT,
+    version: 1,
+  };
+}
+
+async function createAuthorizedCandidateFixture({
+  label,
+  releaseSequence,
+  root,
+  trust,
+}) {
+  const repoRoot = join(import.meta.dirname, "../..");
+  const fixtureRoot = join(root, label);
+  const contracts = join(fixtureRoot, "contracts");
+  await createManagedCloudContracts(repoRoot, contracts, 2);
+  const contractHashes = {
+    builder: await fileSha256(join(contracts, "builder-policy.json")),
+    config: await fileSha256(join(contracts, "config-contract.json")),
+    migration: await fileSha256(join(contracts, "migration-contract.json")),
+    protocol: await fileSha256(join(contracts, "protocol-contract.json")),
+  };
+  const sourceDateEpoch = Math.floor((Date.now() - 2_000) / 1_000);
+  const artifactRoot = join(fixtureRoot, "artifacts");
+  await mkdir(artifactRoot, { recursive: true });
+  const specs = [
+    {
+      componentId: "jobs-api",
+      entries: [{
+        body: "api-binary\n",
+        mode: 0o555,
+        name: "usr/local/bin/bluey-jobs-api",
+      }],
+      roles: [
+        "jobs_api",
+        "workflow_cleanup_dispatcher",
+        "workflow_command_dispatcher",
+      ],
+      runtime: apiRuntime(),
+    },
+    {
+      componentId: "jobs-runner",
+      entries: [
+        { body: "automation\n", name: "app/automation/dist/index.js" },
+        { body: "runner\n", name: "app/runner/dist/server.js" },
+        {
+          body: "native-addon\n",
+          mode: 0o555,
+          name: "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
+        },
+        { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+        {
+          body: "headless\n",
+          mode: 0o555,
+          name:
+            "ms-playwright/chromium_headless_shell-1/" +
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+        },
+        {
+          body: "ffmpeg\n",
+          mode: 0o555,
+          name: "ms-playwright/ffmpeg-1/ffmpeg",
+        },
+      ],
+      roles: ["managed_runner"],
+      runtime: runnerRuntime(),
+    },
+    {
+      componentId: "jobs-workflows",
+      entries: [
+        { body: "automation\n", name: "app/automation/dist/index.js" },
+        { body: "discovery\n", name: "app/workflows/dist/discovery-worker.js" },
+        { body: "failure\n", name: "app/workflows/dist/failure-converter.js" },
+        { body: "gateway\n", name: "app/workflows/dist/gateway.js" },
+        {
+          body: "global-discovery\n",
+          name: "app/workflows/dist/global-discovery-worker.js",
+        },
+        {
+          body: "verifier\n",
+          name: "app/workflows/dist/original-source-verifier.js",
+        },
+        { body: "worker\n", name: "app/workflows/dist/worker.js" },
+        { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+      ],
+      roles: [
+        "original_source_verifier",
+        "workflow_gateway",
+        "workflow_worker",
+      ],
+      runtime: workflowsRuntime(),
+    },
+  ];
+  const builds = [];
+  const releaseId = `managed-cloud-${label}`;
+  for (const spec of specs) {
+    const buildId = `${releaseId}-${spec.componentId}`;
+    const measurement = runtimeMeasurementFixture({
+      buildId,
+      componentId: spec.componentId,
+      contractHashes,
+      entries: spec.entries,
+      roles: spec.roles,
+    });
+    const artifact = join(artifactRoot, spec.componentId + ".oci.tar");
+    await writeOciFixture(artifact, {
+      layers: [[
+        ...spec.entries,
+        {
+          body: canonicalJsonBytes(measurement),
+          name: "app/.bluey/managed-cloud-runtime-measurement.json",
+        },
+      ]],
+      runtime: spec.runtime,
+    });
+    const inventory = await inspectOciImageArchive(artifact, spec.componentId);
+    const inventoryFile = join(artifactRoot, spec.componentId + ".inventory.json");
+    const sbomFile = join(artifactRoot, spec.componentId + ".sbom.json");
+    const provenanceFile = join(artifactRoot, spec.componentId + ".provenance.json");
+    await writeCanonical(inventoryFile, inventory);
+    await writeCanonical(sbomFile, createFileSbom(inventory));
+    await writeCanonical(provenanceFile, createArtifactProvenance({
+      artifactSha256: inventory.artifactSha256,
+      buildId,
+      builderPolicySha256: contractHashes.builder,
+      componentId: spec.componentId,
+      sourceCommit: SOURCE_COMMIT,
+      sourceDateEpoch,
+    }));
+    builds.push({
+      architecture: "x86_64",
+      artifactKind: "oci_image",
+      artifactRef:
+        `ghcr.io/dhanunjay-divi/bluey-jobs-${spec.componentId.slice(5)}` +
+        `@sha256:${inventory.artifactSha256}`,
+      buildId,
+      candidateFile: artifact,
+      componentId: spec.componentId,
+      contentInventoryFile: inventoryFile,
+      platform: "linux",
+      provenanceFile,
+      sbomFile,
+    });
+  }
+  const portalArtifact = join(artifactRoot, "jobs-portal.tar");
+  await writeFile(
+    portalArtifact,
+    tarArchive([{ body: "<main>Bluey Jobs</main>\n", name: "index.html" }]),
+  );
+  const portalInventory = await inspectStaticBundleArchive(
+    portalArtifact,
+    "jobs-portal",
+  );
+  const portalInventoryFile = join(artifactRoot, "jobs-portal.inventory.json");
+  const portalSbomFile = join(artifactRoot, "jobs-portal.sbom.json");
+  const portalProvenanceFile = join(artifactRoot, "jobs-portal.provenance.json");
+  const portalBuildId = `${releaseId}-jobs-portal`;
+  await writeCanonical(portalInventoryFile, portalInventory);
+  await writeCanonical(portalSbomFile, createFileSbom(portalInventory));
+  await writeCanonical(portalProvenanceFile, createArtifactProvenance({
+    artifactSha256: portalInventory.artifactSha256,
+    buildId: portalBuildId,
+    builderPolicySha256: contractHashes.builder,
+    componentId: "jobs-portal",
+    sourceCommit: SOURCE_COMMIT,
+    sourceDateEpoch,
+  }));
+  builds.push({
+    architecture: "wasm",
+    artifactKind: "static_bundle",
+    artifactRef:
+      `https://artifacts.bluey.sh/jobs/releases/${releaseId}/` +
+      `${portalInventory.artifactSha256}.tar`,
+    buildId: portalBuildId,
+    candidateFile: portalArtifact,
+    componentId: "jobs-portal",
+    contentInventoryFile: portalInventoryFile,
+    platform: "web",
+    provenanceFile: portalProvenanceFile,
+    sbomFile: portalSbomFile,
+  });
+  const repository = "Dhanunjay-Divi/bluey";
+  const repositoryRecord = { full_name: repository, id: 611 };
+  const run = (id, path) => ({
+    conclusion: "success",
+    event: "push",
+    head_branch: "main",
+    head_sha: SOURCE_COMMIT,
+    id,
+    path,
+    repository: repositoryRecord,
+    run_attempt: 1,
+    status: "completed",
+  });
+  const testEvidenceFile = join(fixtureRoot, "test-evidence.json");
+  await writeCanonical(testEvidenceFile, createManagedCloudCiEvidence({
+    defaultBranch: "main",
+    jobsCiRun: run(1001, ".github/workflows/jobs-ci.yml@main"),
+    observabilityRun: run(1002, ".github/workflows/observability-policy.yml"),
+    releaseContractSelfTestSha256: "b".repeat(64),
+    repository,
+    sourceCommit: SOURCE_COMMIT,
+  }));
+  const descriptorFile = join(fixtureRoot, "release-descriptor.json");
+  const publishedAtMs = Date.now() - 1_000;
+  await writeCanonical(descriptorFile, {
+    audience: "bluey-jobs-managed-cloud-release-descriptor-v2",
+    builds,
+    featureAuthority: {
+      cloudDistribution: true,
+      directDiscovery: false,
+      globalDiscovery: false,
+      sourceVerification: true,
+      workflowCleanup: true,
+      workflowCommandDispatch: true,
+    },
+    manifestGeneration: releaseSequence,
+    manifestId: `manifest-${label}`,
+    publishedAtMs,
+    releaseId,
+    releaseSequence,
+    sourceCommit: SOURCE_COMMIT,
+    sourceDateEpoch,
+    testEvidenceFile,
+    version: 2,
+  });
+  const candidate = join(fixtureRoot, "candidate");
+  await assembleManagedCloudCandidate({
+    contractsDirectory: contracts,
+    descriptorFile,
+    outputDirectory: candidate,
+    repoRoot,
+  });
+  const manifestFile = join(candidate, "release-manifest.json");
+  const releaseSignaturesFile = join(fixtureRoot, "release-signatures.json");
+  await writeCanonical(releaseSignaturesFile, signedSet({
+    id: `release-signatures-${label}`,
+    keys: [{ keyId: "release-active", pair: trust.pairs["release-active"] }],
+    role: "release",
+    signedAtMs: Date.now(),
+    targetAudience: MANAGED_CLOUD_AUDIENCES.manifestV2,
+    targetBytes: await readFile(manifestFile),
+  }));
+  const trustBundleFile = join(fixtureRoot, "trust-bundle.json");
+  await writeCanonical(trustBundleFile, trust.trustBundle);
+  const authorized = join(fixtureRoot, "authorized");
+  await authorizeManagedCloudCandidate({
+    authorizationId: `authorization-${label}`,
+    candidateDirectory: candidate,
+    expectedRootAnchorSha256: trust.rootAnchorSha256,
+    outputDirectory: authorized,
+    signatureSetFile: releaseSignaturesFile,
+    trustBundleFile,
+  });
+  return { authorized, fixtureRoot, releaseId };
+}
+
+async function createRemotePromotionFixture({
+  activationGeneration,
+  channelSequence,
+  expectedHeadRevision,
+  expectedTransitionSha256,
+  label,
+  predecessorActivationSha256,
+  releaseSequence,
+  root,
+  trust,
+}) {
+  const candidateFixture = await createAuthorizedCandidateFixture({
+    label,
+    releaseSequence,
+    root,
+    trust,
+  });
+  const { authorized, fixtureRoot } = candidateFixture;
+  const manifest = JSON.parse(
+    await readFile(join(authorized, "candidate/release-manifest.json"), "utf8"),
+  );
+  const candidateSet = JSON.parse(
+    await readFile(join(authorized, "candidate/candidate-set.json"), "utf8"),
+  );
+  const authorization = JSON.parse(
+    await readFile(join(authorized, "authorization-set.json"), "utf8"),
+  );
+  const nowMs = Date.now();
+  const scope = { channel: "shadow", environment: "staging", region: "us-east-1" };
+  const cohort = {
+    accountIdSha256s: [],
+    approvalRef: "test-only-shadow-approval",
+    audience: MANAGED_CLOUD_AUDIENCES.cohort,
+    cohortGeneration: activationGeneration,
+    cohortId: `cohort-${label}`,
+    expiresAtMs: nowMs + 20_000,
+    issuedAtMs: nowMs - 3_000,
+    notBeforeMs: nowMs - 500,
+    rolloutMode: "none",
+    scope,
+    trustGeneration: 1,
+    version: 1,
+  };
+  const cohortFile = join(fixtureRoot, "cohort.json");
+  await writeCanonical(cohortFile, cohort);
+  const cohortSignaturesFile = join(fixtureRoot, "cohort-signatures.json");
+  await writeCanonical(cohortSignaturesFile, signedSet({
+    id: `cohort-signatures-${label}`,
+    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+    role: "promotion",
+    signedAtMs: nowMs - 400,
+    targetAudience: MANAGED_CLOUD_AUDIENCES.cohort,
+    targetBytes: await readFile(cohortFile),
+  }));
+  const activationTimes = {
+    expiresAtMs: nowMs + 10_000,
+    issuedAtMs: nowMs - 1_000,
+    notBeforeMs: nowMs - 400,
+    portalReadbackAtMs: nowMs - 2_000,
+  };
+  const evidence = join(fixtureRoot, "activation-evidence");
+  await mkdir(evidence);
+  const evidenceEnvelope = {
+    expiresAtMs: nowMs + 20_000,
+    manifestSha256: candidateSet.manifestSha256,
+    observedAtMs: activationTimes.portalReadbackAtMs,
+    scope,
+    status: "pass",
+    version: 1,
+  };
+  const workflowsInventory = JSON.parse(
+    await readFile(
+      join(authorized, "candidate/evidence/jobs-workflows.content-inventory.json"),
+      "utf8",
+    ),
+  );
+  const converterSha256 = workflowsInventory.entries.find(
+    (entry) => entry.path === "app/workflows/dist/failure-converter.js",
+  ).sha256;
+  const portal = manifest.components.find(
+    (component) => component.componentId === "jobs-portal",
+  );
+  const taskQueueSha256 = deriveManagedCloudTaskQueueSha256(
+    "bluey-test",
+    "bluey-jobs-applications",
+  );
+  const evidenceDocuments = {
+    "canary.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.canaryEvidence,
+      checks: deriveManagedCloudCanaryCheckIds(manifest.featureAuthority).map(
+        (checkId) => ({ checkId, evidenceSha256: "1".repeat(64), status: "pass" }),
+      ),
+    },
+    "cleanup-authority.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.cleanupEvidence,
+      cleanupAuthoritySha256: "2".repeat(64),
+      dispatcherReady: true,
+    },
+    "failure-converter.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.failureConverterEvidence,
+      deployedFileSha256: converterSha256,
+    },
+    "portal-readback.json": {
+      ...evidenceEnvelope,
+      artifactRef: portal.artifactRef,
+      audience: MANAGED_CLOUD_AUDIENCES.portalReadbackEvidenceV2,
+      portalArtifactSha256: portal.artifactSha256,
+      readbackSha256: portal.artifactSha256,
+    },
+    "runner-fleet.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.runnerFleetEvidence,
+      fleetIdSha256: "3".repeat(64),
+      readyInstances: 1,
+      requiredInstances: 1,
+    },
+    "storage-config.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.storageEvidence,
+      readProbeSha256: "4".repeat(64),
+      storageConfigSha256: "5".repeat(64),
+      writeProbeSha256: "6".repeat(64),
+    },
+    "task-queue.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.taskQueueEvidence,
+      namespace: "bluey-test",
+      taskQueue: "bluey-jobs-applications",
+      taskQueueSha256,
+    },
+    "temporal-namespace.json": {
+      ...evidenceEnvelope,
+      audience: MANAGED_CLOUD_AUDIENCES.temporalEvidence,
+      gatewayReady: true,
+      namespace: "bluey-test",
+      namespaceSha256: sha256(Buffer.from("bluey-test")),
+      workflowWorkerReady: true,
+    },
+  };
+  for (const [name, value] of Object.entries(evidenceDocuments)) {
+    await writeCanonical(join(evidence, name), value);
+  }
+  const activation = {
+    activationGeneration,
+    activationId: `activation-${label}`,
+    audience: MANAGED_CLOUD_AUDIENCES.activationV2,
+    canaryEvidenceSha256: await fileSha256(join(evidence, "canary.json")),
+    channelSequence,
+    cleanupAuthoritySha256: "2".repeat(64),
+    cohortSha256: await fileSha256(cohortFile),
+    cohortSignatureSetSha256: await fileSha256(cohortSignaturesFile),
+    expectedHeadRevision,
+    expectedTransitionSha256,
+    expiresAtMs: activationTimes.expiresAtMs,
+    failureConverterSha256: converterSha256,
+    featureAuthority: manifest.featureAuthority,
+    featureAuthoritySha256: manifest.featureAuthoritySha256,
+    heartbeatTtlMs: 5_000,
+    issuedAtMs: activationTimes.issuedAtMs,
+    manifestSha256: candidateSet.manifestSha256,
+    manifestSignatureSetSha256: authorization.releaseSignatureSetSha256,
+    maximumDailyAdmissions: 0,
+    maximumInflight: 0,
+    notBeforeMs: activationTimes.notBeforeMs,
+    portalReadbackAtMs: activationTimes.portalReadbackAtMs,
+    portalReadbackEvidenceSha256: await fileSha256(
+      join(evidence, "portal-readback.json"),
+    ),
+    portalReadbackTtlMs: 60_000,
+    predecessorActivationSha256,
+    recoveryAcceptances: [],
+    runnerFleetEvidenceSha256: await fileSha256(
+      join(evidence, "runner-fleet.json"),
+    ),
+    scope,
+    storageConfigSha256: "5".repeat(64),
+    taskQueueSha256,
+    temporalNamespaceSha256: sha256(Buffer.from("bluey-test")),
+    trustGeneration: 1,
+    version: 2,
+  };
+  const activationFile = join(fixtureRoot, "activation.json");
+  await writeCanonical(activationFile, activation);
+  const activationSignaturesFile = join(
+    fixtureRoot,
+    "activation-signatures.json",
+  );
+  await writeCanonical(activationSignaturesFile, signedSet({
+    id: `activation-signatures-${label}`,
+    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+    role: "promotion",
+    signedAtMs: nowMs,
+    targetAudience: MANAGED_CLOUD_AUDIENCES.activationV2,
+    targetBytes: await readFile(activationFile),
+  }));
+  const publication = join(fixtureRoot, "publication");
+  const publicationPlanFile = join(publication, "publication-plan.json");
+  const plan = await createManagedCloudArtifactPublicationPlan({
+    authorizedDirectory: authorized,
+    expectedRootAnchorSha256: trust.rootAnchorSha256,
+    outputFile: publicationPlanFile,
+    portalArtifactOrigin: "https://artifacts.bluey.sh/jobs/releases",
+    registryNamespace: "ghcr.io/dhanunjay-divi/bluey-jobs",
+  });
+  const publicationReadback = join(fixtureRoot, "publication-readback");
+  await mkdir(publicationReadback);
+  for (const component of MANAGED_CLOUD_COMPONENTS) {
+    const extension = component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    await copyFile(
+      join(authorized, "candidate/payloads", component.componentId + extension),
+      join(publicationReadback, component.componentId + extension),
+    );
+  }
+  const portalPlan = plan.artifacts.find(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  const portalReadbackBytes = await readFile(
+    join(publicationReadback, "jobs-portal.tar"),
+  );
+  const portalManifestBytes = canonicalJsonBytes(portalArtifactManifest(
+    portalReadbackBytes,
+    {
+      annotations: {
+        "org.opencontainers.image.created": plan.portalManifestCreatedAt,
+      },
+    },
+  ));
+  await writeFile(
+    join(publicationReadback, "jobs-portal.oci-manifest.json"),
+    portalManifestBytes,
+  );
+  const portalRegistryRef =
+    portalPlan.publicationRepository + "@sha256:" + sha256(portalManifestBytes);
+  const workflowRunId = 20_000 + releaseSequence;
+  const workflowRunAttempt = 1;
+  const publicationSetFile = join(publication, "publication-set.json");
+  const publicationSet = await attestManagedCloudArtifactPublication({
+    authorizedDirectory: authorized,
+    expectedRootAnchorSha256: trust.rootAnchorSha256,
+    outputFile: publicationSetFile,
+    planFile: publicationPlanFile,
+    portalRegistryRef,
+    readbackDirectory: publicationReadback,
+    workflowRunAttempt,
+    workflowRunId,
+  });
+  const run = {
+    conclusion: "success",
+    event: "workflow_dispatch",
+    head_branch: "main",
+    head_sha: SOURCE_COMMIT,
+    id: workflowRunId,
+    path: ".github/workflows/jobs-managed-cloud-release.yml@main",
+    repository: { full_name: "Dhanunjay-Divi/bluey", id: 611 },
+    run_attempt: workflowRunAttempt,
+    status: "completed",
+  };
+  const jobs = {
+    jobs: [{
+      conclusion: "success",
+      head_sha: SOURCE_COMMIT,
+      id: workflowRunId + 1,
+      name: "publish",
+      run_attempt: workflowRunAttempt,
+      run_id: workflowRunId,
+      status: "completed",
+      steps: [{
+        conclusion: "success",
+        name: "Upload the remote publication receipt only",
+        status: "completed",
+      }],
+    }],
+    total_count: 1,
+  };
+  const workflowEvidence = createManagedCloudPublicationWorkflowEvidence({
+    artifacts: publicationWorkflowArtifacts({ runId: workflowRunId }),
+    defaultBranch: "main",
+    jobs,
+    plan,
+    publication: publicationSet,
+    run,
+  });
+  const workflowEvidenceFile = join(fixtureRoot, "publication-workflow-evidence.json");
+  await writeCanonical(workflowEvidenceFile, workflowEvidence);
+  const preflightFile = join(fixtureRoot, "publication-preflight.json");
+  await writeCanonical(preflightFile, createManagedCloudPublicationPreflightDocument({
+    plan,
+    publication: publicationSet,
+    publicationPlanSha256: await fileSha256(publicationPlanFile),
+    publicationSetSha256: await fileSha256(publicationSetFile),
+    workflowEvidence,
+  }));
+  const promotion = join(fixtureRoot, "promotion-v2");
+  const promotionSet = await promoteManagedCloudCandidate({
+    activationFile,
+    activationSignatureSetFile: activationSignaturesFile,
+    authorizedDirectory: authorized,
+    cohortFile,
+    cohortSignatureSetFile: cohortSignaturesFile,
+    evidenceDirectory: evidence,
+    expectedRootAnchorSha256: trust.rootAnchorSha256,
+    outputDirectory: promotion,
+    publicationDirectory: publication,
+    publicationPreflightFile: preflightFile,
+    publicationReadbackDirectory: publicationReadback,
+    promotionId: `promotion-${label}`,
+  });
+  return {
+    activationFile,
+    authorized,
+    fixtureRoot,
+    promotion,
+    promotionSet,
+  };
+}
+
+async function createHistoricalPromotionFixture(remoteFixture, output) {
+  await mkdir(output);
+  for (const name of [
+    "activation-signatures.json",
+    "activation.json",
+    "cohort-signatures.json",
+    "cohort.json",
+  ]) {
+    await copyFile(join(remoteFixture.promotion, name), join(output, name));
+  }
+  await cp(
+    join(remoteFixture.promotion, "authorized-candidate"),
+    join(output, "authorized-candidate"),
+    { recursive: true },
+  );
+  await cp(join(remoteFixture.promotion, "evidence"), join(output, "evidence"), {
+    recursive: true,
+  });
+  const candidateSet = JSON.parse(
+    await readFile(
+      join(output, "authorized-candidate/candidate/candidate-set.json"),
+      "utf8",
+    ),
+  );
+  const payloads = candidateSet.payloads.filter((payload) =>
+    payload.path.startsWith("payloads/"),
+  );
+  for (const rootName of ["published", "readback"]) {
+    for (const payload of payloads) {
+      const target = join(output, rootName, payload.path);
+      await mkdir(join(target, ".."), { recursive: true });
+      await copyFile(
+        join(output, "authorized-candidate/candidate", payload.path),
+        target,
+      );
+    }
+  }
+  const remoteSet = remoteFixture.promotionSet;
+  const historicalSet = {
+    activationSha256: remoteSet.activationSha256,
+    activationSignatureSetSha256: remoteSet.activationSignatureSetSha256,
+    activationSignerKeyIds: remoteSet.activationSignerKeyIds,
+    adapter: "local_fixture",
+    audience: MANAGED_CLOUD_AUDIENCES.promotion,
+    authorizationSetSha256: remoteSet.authorizationSetSha256,
+    cohortSha256: remoteSet.cohortSha256,
+    cohortSignatureSetSha256: remoteSet.cohortSignatureSetSha256,
+    cohortSignerKeyIds: remoteSet.cohortSignerKeyIds,
+    manifestSha256: remoteSet.manifestSha256,
+    promotedAtMs: remoteSet.promotedAtMs,
+    promotionId: remoteSet.promotionId + "-historical",
+    publishedPayloads: payloads,
+    readbackPayloads: payloads,
+    releaseSignatureSetSha256: remoteSet.releaseSignatureSetSha256,
+    trustGeneration: remoteSet.trustGeneration,
+    version: 1,
+  };
+  await writeCanonical(join(output, "promotion-set.json"), historicalSet);
+  return historicalSet;
+}
+
 test("canonical JSON is recursively UTF-8-key-sorted and integer-only", () => {
   const value = {
     z: "é",
@@ -1039,6 +1806,27 @@ test("release-v2 binds source verification capability, protocol, role, and entry
 test("release contracts prove full source sets without configured runtime identity", () => {
   const fixture = releaseContractFixture();
   assert.equal(validateManagedCloudReleaseContracts(fixture), true);
+  assert.throws(
+    () => validateManagedCloudPublicationBuilderPolicy(fixture.builderPolicy),
+    /requires builder policy v2/,
+  );
+
+  const successor = successorReleaseContractFixture();
+  assert.equal(validateManagedCloudReleaseContracts(successor), true);
+  assert.equal(
+    validateManagedCloudPublicationBuilderPolicy(successor.builderPolicy),
+    true,
+  );
+  const historicalSuccessor = structuredClone(successor);
+  historicalSuccessor.builderPolicy = structuredClone(fixture.builderPolicy);
+  assert.equal(validateManagedCloudReleaseContracts(historicalSuccessor), true);
+  assert.throws(
+    () =>
+      validateManagedCloudPublicationBuilderPolicy(
+        historicalSuccessor.builderPolicy,
+      ),
+    /requires builder policy v2/,
+  );
 
   const wrongProtocol = structuredClone(fixture);
   wrongProtocol.protocolContract.protocols[0].sourceFiles[0].sha256 =
@@ -1943,6 +2731,682 @@ test("OCI inspection proves closed blobs, absolute runtime, and safe overlays", 
   );
 });
 
+test("portal manifest transport admits 32768 bytes and leaves no 32769-byte partial", async (t) => {
+  const root = await temporaryDirectory(t, "portal-manifest-capture");
+  const exactPath = join(root, "exact.json");
+  const exactBytes = Buffer.alloc(32 * 1024, 0x20);
+  exactBytes.set(Buffer.from("{}\n"));
+  assert.deepEqual(
+    await captureManagedCloudPortalManifestStream({
+      input: Readable.from([exactBytes.subarray(0, 17), exactBytes.subarray(17)]),
+      outputFile: exactPath,
+    }),
+    { sizeBytes: 32 * 1024 },
+  );
+  assert.deepEqual(await readFile(exactPath), exactBytes);
+
+  const oversizedPath = join(root, "oversized.json");
+  await assert.rejects(
+    () => captureManagedCloudPortalManifestStream({
+      input: Readable.from([Buffer.alloc(32 * 1024), Buffer.from("x")]),
+      outputFile: oversizedPath,
+    }),
+    /exceeds its 32768-byte limit/,
+  );
+  await assert.rejects(() => readFile(oversizedPath), /ENOENT/);
+  await assert.rejects(() => readFile(oversizedPath + ".partial"), /ENOENT/);
+});
+
+test("publication API captures enforce every fixed transport cap atomically", async (t) => {
+  const root = await temporaryDirectory(t, "publication-api-capture");
+  for (const [kind, maximumBytes] of [
+    ["run", 128 * 1024],
+    ["jobs", 1024 * 1024],
+    ["artifacts", 1024 * 1024],
+  ]) {
+    const exactPath = join(root, kind + "-exact.json");
+    const exact = Buffer.alloc(maximumBytes, 0x20);
+    exact.set(Buffer.from("{}\n"));
+    assert.deepEqual(
+      await captureManagedCloudPublicationApiStream({
+        input: Readable.from([exact]),
+        kind,
+        outputFile: exactPath,
+      }),
+      { sizeBytes: maximumBytes },
+    );
+    assert.deepEqual(await readFile(exactPath), exact);
+    const oversizedPath = join(root, kind + "-oversized.json");
+    await assert.rejects(
+      () => captureManagedCloudPublicationApiStream({
+        input: Readable.from([Buffer.alloc(maximumBytes), Buffer.from("x")]),
+        kind,
+        outputFile: oversizedPath,
+      }),
+      new RegExp(`exceeds its ${maximumBytes}-byte limit`),
+    );
+    await assert.rejects(() => readFile(oversizedPath), /ENOENT/);
+    await assert.rejects(() => readFile(oversizedPath + ".partial"), /ENOENT/);
+  }
+});
+
+test("failed API producer removes a completed run capture and its partial", async (t) => {
+  const root = await temporaryDirectory(t, "failed-api-producer");
+  const output = join(root, "run.json");
+  const gateScript = join(import.meta.dirname, "managed-cloud-release-gate.mjs");
+  const shell = [
+    "set -o pipefail",
+    'if ! { printf "{}\\n"; exit 23; } | "$1" "$2" publication-api-capture \\',
+    '  --kind run --out "$3"',
+    "then",
+    '  rm -f -- "$3" "$3.partial"',
+    "  exit 1",
+    "fi",
+    "exit 99",
+  ].join("\\n");
+  await assert.rejects(
+    () => execFileAsync("bash", [
+      "-c",
+      shell,
+      "bluey-capture-test",
+      process.execPath,
+      gateScript,
+      output,
+    ]),
+    /Command failed/,
+  );
+  await assert.rejects(() => readFile(output), /ENOENT/);
+  await assert.rejects(() => readFile(output + ".partial"), /ENOENT/);
+});
+
+test("remote publication readback binds OCI digests, portal bytes, and runner native bytes", async (t) => {
+  const root = await temporaryDirectory(t, "publication-readback");
+  const readback = join(root, "readback");
+  await mkdir(readback);
+  const apiPath = join(readback, "jobs-api.oci.tar");
+  await writeOciFixture(apiPath, { indexReferenceName: "publication-run-1" });
+  const workflowsPath = join(readback, "jobs-workflows.oci.tar");
+  await writeOciFixture(workflowsPath, {
+    indexReferenceName: "publication-run-1",
+    layers: [[
+      { body: "automation\n", name: "app/automation/dist/index.js" },
+      { body: "discovery\n", name: "app/workflows/dist/discovery-worker.js" },
+      { body: "failure\n", name: "app/workflows/dist/failure-converter.js" },
+      { body: "gateway\n", name: "app/workflows/dist/gateway.js" },
+      {
+        body: "global-discovery\n",
+        name: "app/workflows/dist/global-discovery-worker.js",
+      },
+      {
+        body: "source-verifier\n",
+        name: "app/workflows/dist/original-source-verifier.js",
+      },
+      { body: "worker\n", name: "app/workflows/dist/worker.js" },
+      { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+    ]],
+    runtime: workflowsRuntime(),
+  });
+  const runnerPath = join(readback, "jobs-runner.oci.tar");
+  await writeOciFixture(runnerPath, {
+    indexReferenceName: "publication-run-1",
+    layers: [[
+      { body: "automation\n", name: "app/automation/dist/index.js" },
+      { body: "runner\n", name: "app/runner/dist/server.js" },
+      {
+        body: "native-addon\n",
+        mode: 0o555,
+        name: "app/runner/dist/native/bluey_jobs_runner_native_storage.node",
+      },
+      { body: "node\n", mode: 0o555, name: "usr/local/bin/node" },
+      {
+        body: "headless\n",
+        mode: 0o555,
+        name:
+          "ms-playwright/chromium_headless_shell-1/" +
+          "chrome-headless-shell-linux64/chrome-headless-shell",
+      },
+      {
+        body: "ffmpeg\n",
+        mode: 0o555,
+        name: "ms-playwright/ffmpeg-1/ffmpeg",
+      },
+    ]],
+    runtime: runnerRuntime(),
+  });
+  const portalPath = join(readback, "jobs-portal.tar");
+  await writeFile(
+    portalPath,
+    tarArchive([{ body: "<main>Bluey Jobs</main>\n", name: "index.html" }]),
+  );
+  const paths = new Map([
+    ["jobs-api", apiPath],
+    ["jobs-portal", portalPath],
+    ["jobs-runner", runnerPath],
+    ["jobs-workflows", workflowsPath],
+  ]);
+  const artifacts = [];
+  for (const component of MANAGED_CLOUD_COMPONENTS) {
+    const path = paths.get(component.componentId);
+    const inventory = component.artifactKind === "oci_image"
+      ? await inspectOciImageArchive(path, component.componentId)
+      : await inspectStaticBundleArchive(path, component.componentId);
+    const bytes = await readFile(path);
+    const repository =
+      "ghcr.io/dhanunjay-divi/bluey-jobs-" +
+      component.componentId.slice("jobs-".length);
+    artifacts.push({
+      artifactKind: component.artifactKind,
+      artifactSha256: inventory.artifactSha256,
+      candidatePayloadPath:
+        "payloads/" + component.componentId +
+        (component.artifactKind === "oci_image" ? ".oci.tar" : ".tar"),
+      candidatePayloadSha256: sha256(bytes),
+      candidatePayloadSizeBytes: bytes.length,
+      componentId: component.componentId,
+      signedArtifactRef: component.artifactKind === "oci_image"
+        ? repository + "@sha256:" + inventory.artifactSha256
+        : "https://artifacts.bluey.sh/jobs/releases/" +
+          RELEASE_ID + "/" + inventory.artifactSha256 + ".tar",
+      publicationRepository: repository,
+      publicationTagRef: repository + ":" + RELEASE_ID,
+    });
+  }
+  const portalBytes = await readFile(portalPath);
+  const portalArtifact = artifacts.find(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  const portalManifest = portalArtifactManifest(portalBytes);
+  const portalManifestBytes = canonicalJsonBytes(portalManifest);
+  const portalManifestPath = join(readback, "jobs-portal.oci-manifest.json");
+  await writeFile(portalManifestPath, portalManifestBytes);
+  const portalRegistryRef =
+    portalArtifact.publicationRepository + "@sha256:" +
+    sha256(portalManifestBytes);
+  const plan = {
+    adapter: "remote_registry_readback_v1",
+    artifacts,
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPlan,
+    authorizationSetSha256: "a".repeat(64),
+    candidateSetSha256: "b".repeat(64),
+    manifestSha256: "c".repeat(64),
+    nativeArtifact: {},
+    portalArtifactOrigin: "https://artifacts.bluey.sh/jobs/releases",
+    portalManifestCreatedAt: "2026-08-31T00:00:00Z",
+    registryNamespace: "ghcr.io/dhanunjay-divi/bluey-jobs",
+    releaseId: RELEASE_ID,
+    sourceCommit: SOURCE_COMMIT,
+    sourceDefaultBranch: "main",
+    sourceRepository: "Dhanunjay-Divi/bluey",
+    sourceRepositoryId: 611,
+    supplyChainStatus: {},
+    version: 1,
+  };
+  const portalDownload = join(root, "portal-download");
+  await mkdir(portalDownload);
+  await writeFile(join(portalDownload, "jobs-portal.tar"), portalBytes);
+  const stagedPortal = join(root, "staged-portal.tar");
+  assert.equal(
+    await stageManagedCloudPortalArtifactReadback({
+      downloadDirectory: portalDownload,
+      manifestFile: portalManifestPath,
+      outputFile: stagedPortal,
+      plan,
+      portalRegistryRef,
+    }),
+    true,
+  );
+  assert.deepEqual(await readFile(stagedPortal), portalBytes);
+  const records = await inspectManagedCloudArtifactPublicationReadback({
+    plan,
+    portalRegistryRef,
+    readbackDirectory: readback,
+  });
+  assert.equal(records.length, 4);
+  assert.equal(
+    records.find((item) => item.componentId === "jobs-runner")
+      .publishedManifestDigest,
+    "sha256:" +
+      artifacts.find((item) => item.componentId === "jobs-runner").artifactSha256,
+  );
+  const portalRecord = records.find((item) => item.componentId === "jobs-portal");
+  assert.match(portalRecord.signedArtifactRef, /^https:\/\//);
+  assert.equal(
+    portalRecord.publishedRegistryRef,
+    portalRegistryRef,
+  );
+  await assert.rejects(
+    () => inspectManagedCloudArtifactPublicationReadback({
+      plan,
+      portalRegistryRef:
+        "ghcr.io/other/bluey-jobs-portal@sha256:" +
+        portalRegistryRef.slice(portalRegistryRef.indexOf("sha256:") + 7),
+      readbackDirectory: readback,
+    }),
+    /controlled repository/,
+  );
+  assert.throws(
+    () => validateManagedCloudPublicationAdapter("local_fixture"),
+    /test-only/,
+  );
+  for (const [label, mutate, expected] of [
+    [
+      "extra-layer",
+      (manifest) => ({ ...manifest, layers: [...manifest.layers, manifest.layers[0]] }),
+      /exactly one layer/,
+    ],
+    [
+      "layer-digest",
+      (manifest) => ({
+        ...manifest,
+        layers: [{ ...manifest.layers[0], digest: "sha256:" + "f".repeat(64) }],
+      }),
+      /exact candidate tar/,
+    ],
+    [
+      "layer-size",
+      (manifest) => ({
+        ...manifest,
+        layers: [{ ...manifest.layers[0], size: manifest.layers[0].size + 1 }],
+      }),
+      /exact candidate tar/,
+    ],
+    [
+      "layer-media-type",
+      (manifest) => ({
+        ...manifest,
+        layers: [{ ...manifest.layers[0], mediaType: "application/octet-stream" }],
+      }),
+      /exact candidate tar/,
+    ],
+    [
+      "layer-title",
+      (manifest) => ({
+        ...manifest,
+        layers: [{
+          ...manifest.layers[0],
+          annotations: { "org.opencontainers.image.title": "other.tar" },
+        }],
+      }),
+      /exact candidate tar/,
+    ],
+    [
+      "artifact-type",
+      (manifest) => ({ ...manifest, artifactType: "application/octet-stream" }),
+      /manifest or artifact type/,
+    ],
+    [
+      "created",
+      (manifest) => ({
+        ...manifest,
+        annotations: {
+          "org.opencontainers.image.created": "2026-08-31T00:00:01Z",
+        },
+      }),
+      /deterministic plan value/,
+    ],
+  ]) {
+    const mutatedBytes = canonicalJsonBytes(mutate(structuredClone(portalManifest)));
+    await writeFile(portalManifestPath, mutatedBytes);
+    const mutatedRef =
+      portalArtifact.publicationRepository + "@sha256:" + sha256(mutatedBytes);
+    await assert.rejects(
+      () => inspectManagedCloudArtifactPublicationReadback({
+        plan,
+        portalRegistryRef: mutatedRef,
+        readbackDirectory: readback,
+      }),
+      expected,
+      label,
+    );
+  }
+  await writeFile(portalManifestPath, portalManifestBytes);
+  const planFile = join(root, "publication-plan.json");
+  await writeCanonical(planFile, plan);
+  const gateScript = join(
+    import.meta.dirname,
+    "managed-cloud-release-gate.mjs",
+  );
+  await execFileAsync(process.execPath, [
+    gateScript,
+    "publication-portal-manifest",
+    "--plan",
+    planFile,
+    "--portal-registry-ref",
+    portalRegistryRef,
+    "--manifest",
+    portalManifestPath,
+  ]);
+  const oversizedManifest = Buffer.alloc(32 * 1024 + 1, 0x20);
+  await writeFile(portalManifestPath, oversizedManifest);
+  await assert.rejects(
+    () => execFileAsync(process.execPath, [
+      gateScript,
+      "publication-portal-manifest",
+      "--plan",
+      planFile,
+      "--portal-registry-ref",
+      portalArtifact.publicationRepository + "@sha256:" +
+        sha256(oversizedManifest),
+      "--manifest",
+      portalManifestPath,
+    ]),
+    /invalid byte length/,
+  );
+  await writeFile(portalManifestPath, portalManifestBytes);
+  await writeFile(join(portalDownload, "unexpected"), "extra\n");
+  await assert.rejects(
+    () => stageManagedCloudPortalArtifactReadback({
+      downloadDirectory: portalDownload,
+      manifestFile: portalManifestPath,
+      outputFile: join(root, "extra-output.tar"),
+      plan,
+      portalRegistryRef,
+    }),
+    /exact flat regular-file set/,
+  );
+  await rm(join(portalDownload, "unexpected"));
+  await mkdir(join(portalDownload, "unexpected-directory"));
+  await assert.rejects(
+    () => stageManagedCloudPortalArtifactReadback({
+      downloadDirectory: portalDownload,
+      manifestFile: portalManifestPath,
+      outputFile: join(root, "directory-output.tar"),
+      plan,
+      portalRegistryRef,
+    }),
+    /exact flat regular-file set/,
+  );
+  await rm(join(portalDownload, "unexpected-directory"), { recursive: true });
+  await writeFile(join(readback, "unexpected"), "not remote authority\n");
+  await assert.rejects(
+    () => inspectManagedCloudArtifactPublicationReadback({
+      plan,
+      portalRegistryRef,
+      readbackDirectory: readback,
+    }),
+    /exact flat regular-file set/,
+  );
+  await rm(join(readback, "unexpected"));
+  await mkdir(join(readback, "unexpected-directory"));
+  await assert.rejects(
+    () => inspectManagedCloudArtifactPublicationReadback({
+      plan,
+      portalRegistryRef,
+      readbackDirectory: readback,
+    }),
+    /exact flat regular-file set/,
+  );
+});
+
+test("publication plan and generated receipt share fail-closed schema keys", () => {
+  const plan = {
+    adapter: "remote_registry_readback_v1",
+    artifacts: [],
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPlan,
+    authorizationSetSha256: "a".repeat(64),
+    candidateSetSha256: "b".repeat(64),
+    manifestSha256: "c".repeat(64),
+    nativeArtifact: {},
+    portalArtifactOrigin: "https://artifacts.bluey.sh/jobs/releases",
+    portalManifestCreatedAt: "2026-08-31T00:00:00Z",
+    registryNamespace: "ghcr.io/dhanunjay-divi/bluey-jobs",
+    releaseId: RELEASE_ID,
+    sourceCommit: SOURCE_COMMIT,
+    sourceDefaultBranch: "main",
+    sourceRepository: "Dhanunjay-Divi/bluey",
+    sourceRepositoryId: 611,
+    supplyChainStatus: {},
+    version: 1,
+  };
+  assert.equal(validateManagedCloudPublicationPlanShape(plan), true);
+  assert.equal(
+    validateManagedCloudPublicationRuntimeIdentity({
+      defaultBranch: plan.sourceDefaultBranch,
+      plan,
+      repository: plan.sourceRepository,
+      repositoryId: String(plan.sourceRepositoryId),
+      sourceCommit: plan.sourceCommit,
+    }),
+    true,
+  );
+  for (const mutation of [
+    { defaultBranch: "other" },
+    { repository: "other/bluey" },
+    { repositoryId: "612" },
+    { sourceCommit: "f".repeat(40) },
+  ]) {
+    assert.throws(
+      () => validateManagedCloudPublicationRuntimeIdentity({
+        defaultBranch: plan.sourceDefaultBranch,
+        plan,
+        repository: plan.sourceRepository,
+        repositoryId: String(plan.sourceRepositoryId),
+        sourceCommit: plan.sourceCommit,
+        ...mutation,
+      }),
+      /exact GitHub runtime identity/,
+    );
+  }
+  const slashBranchPlan = {
+    ...plan,
+    sourceDefaultBranch: "release/stable",
+  };
+  assert.equal(
+    validateManagedCloudPublicationRuntimeIdentity({
+      defaultBranch: "release/stable",
+      plan: slashBranchPlan,
+      repository: slashBranchPlan.sourceRepository,
+      repositoryId: String(slashBranchPlan.sourceRepositoryId),
+      sourceCommit: slashBranchPlan.sourceCommit,
+    }),
+    true,
+  );
+  const publication = createManagedCloudPublicationSetDocument({
+    artifacts: [],
+    attestedAtMs: Date.now(),
+    plan,
+    publicationPlanSha256: "d".repeat(64),
+    workflowRunAttempt: 1,
+    workflowRunId: 2001,
+  });
+  assert.equal(validateManagedCloudPublicationSetShape(publication), true);
+  assert.throws(
+    () => validateManagedCloudPublicationSetShape({
+      ...publication,
+      publishedAtMs: publication.attestedAtMs,
+    }),
+    /must contain exactly/,
+  );
+});
+
+test("publication preflight is canonical, bounded, and retry-stable", () => {
+  const portalManifestCreatedAt =
+    deriveManagedCloudPortalManifestCreatedAt(1_788_134_400);
+  assert.equal(portalManifestCreatedAt, "2026-08-31T00:00:00Z");
+  assert.equal(
+    deriveManagedCloudPortalManifestCreatedAt(1_788_134_400),
+    portalManifestCreatedAt,
+  );
+  const retryPortalBytes = Buffer.from("retry-stable-portal\n");
+  const manifestForAttempt = ({ observedAtMs, sourceDateEpoch }) => {
+    assert.ok(Number.isSafeInteger(observedAtMs));
+    return portalArtifactManifest(retryPortalBytes, {
+      annotations: {
+        "org.opencontainers.image.created":
+          deriveManagedCloudPortalManifestCreatedAt(sourceDateEpoch),
+      },
+    });
+  };
+  const firstAttempt = manifestForAttempt({
+    observedAtMs: 1_788_134_410_000,
+    sourceDateEpoch: 1_788_134_400,
+  });
+  const retryAttempt = manifestForAttempt({
+    observedAtMs: 1_788_220_800_000,
+    sourceDateEpoch: 1_788_134_400,
+  });
+  const changedSourceAttempt = manifestForAttempt({
+    observedAtMs: 1_788_220_800_000,
+    sourceDateEpoch: 1_788_134_401,
+  });
+  assert.equal(
+    sha256(canonicalJsonBytes(firstAttempt)),
+    sha256(canonicalJsonBytes(retryAttempt)),
+  );
+  assert.notEqual(
+    sha256(canonicalJsonBytes(firstAttempt)),
+    sha256(canonicalJsonBytes(changedSourceAttempt)),
+  );
+  const registryNamespace = "ghcr.io/dhanunjay-divi/bluey-jobs";
+  const digestCharacters = ["1", "2", "3", "4"];
+  const artifacts = MANAGED_CLOUD_COMPONENTS.map((component, index) => {
+    const artifactSha256 = digestCharacters[index].repeat(64);
+    const publicationRepository =
+      registryNamespace + "-" + component.componentId.slice("jobs-".length);
+    return {
+      artifactKind: component.artifactKind,
+      artifactSha256,
+      candidatePayloadPath:
+        "payloads/" + component.componentId +
+        (component.artifactKind === "oci_image" ? ".oci.tar" : ".tar"),
+      candidatePayloadSha256: String(index + 5).repeat(64),
+      candidatePayloadSizeBytes: 10_000 + index,
+      componentId: component.componentId,
+      publicationRepository,
+      publicationTagRef: publicationRepository + ":" + RELEASE_ID,
+      signedArtifactRef:
+        component.artifactKind === "oci_image"
+          ? publicationRepository + "@sha256:" + artifactSha256
+          : "https://artifacts.bluey.sh/jobs/releases/" + RELEASE_ID +
+            "/" + artifactSha256 + ".tar",
+    };
+  });
+  const plan = {
+    adapter: "remote_registry_readback_v1",
+    artifacts,
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPlan,
+    authorizationSetSha256: "a".repeat(64),
+    candidateSetSha256: "b".repeat(64),
+    manifestSha256: "c".repeat(64),
+    nativeArtifact: {},
+    portalArtifactOrigin: "https://artifacts.bluey.sh/jobs/releases",
+    portalManifestCreatedAt,
+    registryNamespace,
+    releaseId: RELEASE_ID,
+    sourceCommit: SOURCE_COMMIT,
+    sourceDefaultBranch: "release/stable",
+    sourceRepository: "Dhanunjay-Divi/bluey",
+    sourceRepositoryId: 611,
+    supplyChainStatus: {},
+    version: 1,
+  };
+  const publicationArtifacts = artifacts.map((artifact, index) => {
+    const publishedManifestDigest = artifact.artifactKind === "oci_image"
+      ? "sha256:" + artifact.artifactSha256
+      : "sha256:" + ["9", "a", "b", "c"][index].repeat(64);
+    return {
+      componentId: artifact.componentId,
+      publishedManifestDigest,
+      publishedRegistryRef:
+        artifact.publicationRepository + "@" + publishedManifestDigest,
+    };
+  });
+  const publication = createManagedCloudPublicationSetDocument({
+    artifacts: publicationArtifacts,
+    attestedAtMs: Date.now(),
+    plan,
+    publicationPlanSha256: "d".repeat(64),
+    workflowRunAttempt: 1,
+    workflowRunId: 2001,
+  });
+  const run = {
+    conclusion: "success",
+    event: "workflow_dispatch",
+    head_branch: "release/stable",
+    head_sha: SOURCE_COMMIT,
+    id: 2001,
+    path: ".github/workflows/jobs-managed-cloud-release.yml@release/stable",
+    repository: { full_name: plan.sourceRepository, id: plan.sourceRepositoryId },
+    run_attempt: 1,
+    status: "completed",
+  };
+  const jobs = {
+    jobs: [{
+      conclusion: "success",
+      head_sha: SOURCE_COMMIT,
+      id: 3001,
+      name: "publish",
+      run_attempt: 1,
+      run_id: 2001,
+      status: "completed",
+      steps: [{
+        conclusion: "success",
+        name: "Upload the remote publication receipt only",
+        status: "completed",
+      }],
+    }],
+    total_count: 1,
+  };
+  const workflowEvidence = createManagedCloudPublicationWorkflowEvidence({
+    artifacts: publicationWorkflowArtifacts({
+      branch: "release/stable",
+      repositoryId: plan.sourceRepositoryId,
+    }),
+    defaultBranch: "release/stable",
+    jobs,
+    plan,
+    publication,
+    run,
+  });
+  const preflight = createManagedCloudPublicationPreflightDocument({
+    plan,
+    publication,
+    publicationPlanSha256: "d".repeat(64),
+    publicationSetSha256: "e".repeat(64),
+    workflowEvidence,
+  });
+  assert.deepEqual(
+    createManagedCloudPublicationPreflightDocument({
+      plan,
+      publication,
+      publicationPlanSha256: "d".repeat(64),
+      publicationSetSha256: "e".repeat(64),
+      workflowEvidence,
+    }),
+    preflight,
+  );
+  assert.equal(
+    validateManagedCloudPublicationPreflightDocument(preflight).defaultBranch,
+    "release/stable",
+  );
+  const wrongRef = structuredClone(preflight);
+  wrongRef.artifacts[0].publishedRegistryRef =
+    "ghcr.io/other/jobs-api@" +
+    wrongRef.artifacts[0].publishedManifestDigest;
+  assert.throws(
+    () => validateManagedCloudPublicationPreflightDocument(wrongRef),
+    /outside its exact authority/,
+  );
+  const wrongRun = structuredClone(preflight);
+  wrongRun.workflowEvidence.runId = 2002;
+  wrongRun.workflowEvidence.artifactName =
+    "jobs-managed-cloud-publication-2002-1";
+  assert.throws(
+    () => validateManagedCloudPublicationPreflightDocument(wrongRun, {
+      plan,
+      publication,
+    }),
+    /exact publication set/,
+  );
+  const oversized = structuredClone(preflight);
+  oversized.repository = "R".repeat(128 * 1024);
+  oversized.workflowEvidence.repository = oversized.repository;
+  assert.throws(
+    () => validateManagedCloudPublicationPreflightDocument(oversized),
+    /exceeds the 128 KiB canonical limit/,
+  );
+});
+
 test("release-v1 assembly rejects a three-role workflows verifier image", async (t) => {
   const root = await temporaryDirectory(t, "v1-verifier-assembly");
   const repoRoot = join(import.meta.dirname, "../..");
@@ -2115,7 +3579,8 @@ test("release-v2 activation evidence requires verifier readiness and exact readb
     },
     "portal-readback.json": {
       ...common,
-      audience: MANAGED_CLOUD_AUDIENCES.portalReadbackEvidence,
+      artifactRef: portal.artifactRef,
+      audience: MANAGED_CLOUD_AUDIENCES.portalReadbackEvidenceV2,
       portalArtifactSha256: portal.artifactSha256,
       readbackSha256: portal.artifactSha256,
     },
@@ -2207,6 +3672,18 @@ test("release-v2 activation evidence requires verifier readiness and exact readb
     join(evidenceRoot, "portal-readback.json"),
     documents["portal-readback.json"],
   );
+  await writeCanonical(join(evidenceRoot, "portal-readback.json"), {
+    ...documents["portal-readback.json"],
+    artifactRef: documents["portal-readback.json"].artifactRef + ".wrong",
+  });
+  await assert.rejects(
+    () => validateManagedCloudActivationEvidence(args),
+    /signed portal URL and artifact/,
+  );
+  await writeCanonical(
+    join(evidenceRoot, "portal-readback.json"),
+    documents["portal-readback.json"],
+  );
   await writeCanonical(join(evidenceRoot, "temporal-namespace.json"), {
     ...documents["temporal-namespace.json"],
     namespace: "other-namespace",
@@ -2220,6 +3697,187 @@ test("release-v2 activation evidence requires verifier readiness and exact readb
   await assert.rejects(
     () => validateManagedCloudActivationEvidence(args),
     /must contain exactly/,
+  );
+});
+
+test("promotion and rollback authority preserves v1 readback and emits only v2", async (t) => {
+  const root = await temporaryDirectory(t, "promotion-generations");
+  const trust = trustFixture();
+  const from = await createRemotePromotionFixture({
+    activationGeneration: 1,
+    channelSequence: 1,
+    expectedHeadRevision: 0,
+    expectedTransitionSha256: null,
+    label: "remote-from",
+    predecessorActivationSha256: null,
+    releaseSequence: 200,
+    root,
+    trust,
+  });
+  assert.equal(from.promotionSet.version, 2);
+  assert.equal(from.promotionSet.audience, MANAGED_CLOUD_AUDIENCES.promotionV2);
+  assert.equal(
+    (await validateManagedCloudPromotion(from.promotion, trust.rootAnchorSha256))
+      .promotionGeneration,
+    2,
+  );
+  const historicalFrom = join(root, "historical-from");
+  await createHistoricalPromotionFixture(from, historicalFrom);
+  assert.equal(
+    (await validateManagedCloudPromotion(historicalFrom, trust.rootAnchorSha256))
+      .promotionGeneration,
+    1,
+  );
+
+  const to = await createRemotePromotionFixture({
+    activationGeneration: 2,
+    channelSequence: 2,
+    expectedHeadRevision: 1,
+    expectedTransitionSha256: "7".repeat(64),
+    label: "remote-target",
+    predecessorActivationSha256: await fileSha256(from.activationFile),
+    releaseSequence: 100,
+    root,
+    trust,
+  });
+  const historicalTo = join(root, "historical-target");
+  await createHistoricalPromotionFixture(to, historicalTo);
+  const rollbackDocument = (version, audience, rollbackId) => ({
+    audience,
+    evidenceSha256: "8".repeat(64),
+    expectedHeadRevision: 1,
+    expectedTransitionSha256: "7".repeat(64),
+    fromActivationSha256: from.promotionSet.activationSha256,
+    fromManifestSha256: from.promotionSet.manifestSha256,
+    issuedAtMs: Date.now(),
+    reasonRef: "test-only-release-regression",
+    rollbackGeneration: 1,
+    rollbackId,
+    scope: { channel: "shadow", environment: "staging", region: "us-east-1" },
+    toActivationSha256: to.promotionSet.activationSha256,
+    toManifestSha256: to.promotionSet.manifestSha256,
+    trustGeneration: 1,
+    version,
+  });
+  const rollbackV2File = join(root, "rollback-v2.json");
+  const rollbackV2 = rollbackDocument(
+    2,
+    MANAGED_CLOUD_AUDIENCES.rollbackV2,
+    "rollback-v2-test",
+  );
+  await writeCanonical(rollbackV2File, rollbackV2);
+  const rollbackV2Signatures = join(root, "rollback-v2-signatures.json");
+  await writeCanonical(rollbackV2Signatures, signedSet({
+    id: "rollback-v2-signatures",
+    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+    role: "promotion",
+    signedAtMs: rollbackV2.issuedAtMs,
+    targetAudience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
+    targetBytes: await readFile(rollbackV2File),
+  }));
+  const rollbackV2Root = join(root, "rollback-v2");
+  const emittedRollback = await createManagedCloudRollback({
+    expectedRootAnchorSha256: trust.rootAnchorSha256,
+    fromPromotionDirectory: from.promotion,
+    outputDirectory: rollbackV2Root,
+    rollbackFile: rollbackV2File,
+    rollbackSignatureSetFile: rollbackV2Signatures,
+    toPromotionDirectory: to.promotion,
+  });
+  assert.equal(emittedRollback.version, 2);
+  assert.equal(emittedRollback.audience, MANAGED_CLOUD_AUDIENCES.rollbackSetV2);
+  assert.equal(
+    (await validateManagedCloudRollback(rollbackV2Root, trust.rootAnchorSha256))
+      .rollbackSet.version,
+    2,
+  );
+  await assert.rejects(
+    () => createManagedCloudRollback({
+      expectedRootAnchorSha256: trust.rootAnchorSha256,
+      fromPromotionDirectory: historicalFrom,
+      outputDirectory: join(root, "forbidden-v1-create"),
+      rollbackFile: rollbackV2File,
+      rollbackSignatureSetFile: rollbackV2Signatures,
+      toPromotionDirectory: historicalTo,
+    }),
+    /requires two remote promotion v2 inputs/,
+  );
+
+  const rollbackV1 = rollbackDocument(
+    1,
+    MANAGED_CLOUD_AUDIENCES.rollback,
+    "rollback-v1-historical",
+  );
+  const rollbackV1Root = join(root, "rollback-v1-historical");
+  await mkdir(rollbackV1Root);
+  await cp(historicalFrom, join(rollbackV1Root, "from-promotion"), {
+    recursive: true,
+  });
+  await cp(historicalTo, join(rollbackV1Root, "target-promotion"), {
+    recursive: true,
+  });
+  const rollbackV1File = join(rollbackV1Root, "rollback.json");
+  await writeCanonical(rollbackV1File, rollbackV1);
+  const rollbackV1Signatures = join(rollbackV1Root, "rollback-signatures.json");
+  await writeCanonical(rollbackV1Signatures, signedSet({
+    id: "rollback-v1-signatures",
+    keys: [{ keyId: "promotion-key", pair: trust.pairs.promotion }],
+    role: "promotion",
+    signedAtMs: rollbackV1.issuedAtMs,
+    targetAudience: MANAGED_CLOUD_AUDIENCES.rollback,
+    targetBytes: await readFile(rollbackV1File),
+  }));
+  await writeCanonical(join(rollbackV1Root, "rollback-set.json"), {
+    audience: MANAGED_CLOUD_AUDIENCES.rollbackSet,
+    fromPromotionSha256: await fileSha256(
+      join(rollbackV1Root, "from-promotion/promotion-set.json"),
+    ),
+    rollbackSha256: await fileSha256(rollbackV1File),
+    rollbackSignatureSetSha256: await fileSha256(rollbackV1Signatures),
+    signerKeyIds: ["promotion-key"],
+    targetPromotionSha256: await fileSha256(
+      join(rollbackV1Root, "target-promotion/promotion-set.json"),
+    ),
+    version: 1,
+  });
+  assert.equal(
+    (await validateManagedCloudRollback(rollbackV1Root, trust.rootAnchorSha256))
+      .rollbackSet.version,
+    1,
+  );
+
+  const mixedRollback = join(root, "mixed-rollback");
+  await cp(rollbackV1Root, mixedRollback, { recursive: true });
+  await rm(join(mixedRollback, "target-promotion"), { recursive: true });
+  await cp(to.promotion, join(mixedRollback, "target-promotion"), {
+    recursive: true,
+  });
+  await assert.rejects(
+    () => validateManagedCloudRollback(mixedRollback, trust.rootAnchorSha256),
+    /cannot mix historical and remote promotion generations/,
+  );
+
+  const crossedV1 = join(root, "crossed-v1-tree");
+  await cp(from.promotion, crossedV1, { recursive: true });
+  await rm(join(crossedV1, "promotion-set.json"));
+  await copyFile(
+    join(historicalFrom, "promotion-set.json"),
+    join(crossedV1, "promotion-set.json"),
+  );
+  await assert.rejects(
+    () => validateManagedCloudPromotion(crossedV1, trust.rootAnchorSha256),
+    /unexpected or missing top-level entry/,
+  );
+  const crossedV2 = join(root, "crossed-v2-tree");
+  await cp(historicalFrom, crossedV2, { recursive: true });
+  await rm(join(crossedV2, "promotion-set.json"));
+  await copyFile(
+    join(from.promotion, "promotion-set.json"),
+    join(crossedV2, "promotion-set.json"),
+  );
+  await assert.rejects(
+    () => validateManagedCloudPromotion(crossedV2, trust.rootAnchorSha256),
+    /unexpected or missing top-level entry/,
   );
 });
 
@@ -2342,6 +4000,266 @@ test("activation window is contained by cohort, trust, and portal readback", () 
   );
 });
 
+test("release-v2 CI evidence requires two successful exact-tip default-branch runs", () => {
+  const repository = "Dhanunjay-Divi/bluey";
+  const repositoryRecord = {
+    full_name: repository,
+    id: 611,
+  };
+  const run = (id, path) => ({
+    conclusion: "success",
+    event: "push",
+    head_branch: "main",
+    head_sha: SOURCE_COMMIT,
+    id,
+    path,
+    repository: repositoryRecord,
+    run_attempt: 1,
+    status: "completed",
+  });
+  const jobsCiRun = run(1001, ".github/workflows/jobs-ci.yml@main");
+  const observabilityRun = run(
+    1002,
+    ".github/workflows/observability-policy.yml",
+  );
+  const evidence = createManagedCloudCiEvidence({
+    defaultBranch: "main",
+    jobsCiRun,
+    observabilityRun,
+    releaseContractSelfTestSha256: "b".repeat(64),
+    repository,
+    sourceCommit: SOURCE_COMMIT,
+  });
+  assert.equal(evidence.version, 2);
+  assert.equal(evidence.defaultBranch, "main");
+  assert.equal("default_branch" in repositoryRecord, false);
+  assert.equal(evidence.audience, MANAGED_CLOUD_AUDIENCES.testEvidenceV2);
+  assert.deepEqual(
+    evidence.ciRuns.map((item) => item.checkId),
+    ["jobs-ci", "observability-policy"],
+  );
+  assert.throws(
+    () => createManagedCloudCiEvidence({
+      defaultBranch: "main",
+      jobsCiRun: { ...jobsCiRun, event: "pull_request" },
+      observabilityRun,
+      releaseContractSelfTestSha256: "b".repeat(64),
+      repository,
+      sourceCommit: SOURCE_COMMIT,
+    }),
+    /exact-tip default-branch push run/,
+  );
+  assert.throws(
+    () => createManagedCloudCiEvidence({
+      defaultBranch: "main",
+      jobsCiRun,
+      observabilityRun: { ...observabilityRun, head_sha: "c".repeat(40) },
+      releaseContractSelfTestSha256: "b".repeat(64),
+      repository,
+      sourceCommit: SOURCE_COMMIT,
+    }),
+    /exact-tip default-branch push run/,
+  );
+  const storedBranchDrift = structuredClone(evidence);
+  storedBranchDrift.ciRuns[0].headBranch = "other";
+  assert.throws(
+    () => validateManagedCloudTestEvidence(storedBranchDrift, SOURCE_COMMIT, 2),
+    /exact-tip CI authority/,
+  );
+  const storedDefaultBranchDrift = structuredClone(evidence);
+  storedDefaultBranchDrift.defaultBranch = "other";
+  assert.throws(
+    () =>
+      validateManagedCloudTestEvidence(
+        storedDefaultBranchDrift,
+        SOURCE_COMMIT,
+        2,
+      ),
+    /exact-tip CI authority/,
+  );
+  const slashBranchRun = (source) => ({
+    ...source,
+    head_branch: "release/main",
+    path: source.path.replace(/@main$/, "") + "@release/main",
+  });
+  const slashBranchEvidence = createManagedCloudCiEvidence({
+    defaultBranch: "release/main",
+    jobsCiRun: slashBranchRun(jobsCiRun),
+    observabilityRun: slashBranchRun(observabilityRun),
+    releaseContractSelfTestSha256: "b".repeat(64),
+    repository,
+    sourceCommit: SOURCE_COMMIT,
+  });
+  assert.equal(
+    validateManagedCloudTestEvidence(slashBranchEvidence, SOURCE_COMMIT, 2),
+    slashBranchEvidence,
+  );
+  assert.throws(
+    () => createManagedCloudCiEvidence({
+      defaultBranch: "release..main",
+      jobsCiRun,
+      observabilityRun,
+      releaseContractSelfTestSha256: "b".repeat(64),
+      repository,
+      sourceCommit: SOURCE_COMMIT,
+    }),
+    /canonical Git branch name/,
+  );
+  assert.throws(
+    () => createManagedCloudCiEvidence({
+      defaultBranch: "release/main",
+      jobsCiRun,
+      observabilityRun,
+      releaseContractSelfTestSha256: "b".repeat(64),
+      repository,
+      sourceCommit: SOURCE_COMMIT,
+    }),
+    /exact-tip default-branch push run/,
+  );
+});
+
+test("promotion binds the successful exact-source publication workflow job", () => {
+  const repository = "Dhanunjay-Divi/bluey";
+  const plan = {
+    sourceCommit: SOURCE_COMMIT,
+    sourceDefaultBranch: "main",
+    sourceRepository: repository,
+    sourceRepositoryId: 611,
+  };
+  const publication = { workflowRunAttempt: 1, workflowRunId: 2001 };
+  const run = {
+    conclusion: "success",
+    event: "workflow_dispatch",
+    head_branch: "main",
+    head_sha: SOURCE_COMMIT,
+    id: 2001,
+    path: ".github/workflows/jobs-managed-cloud-release.yml@main",
+    repository: {
+      full_name: repository,
+      id: 611,
+    },
+    run_attempt: 1,
+    status: "completed",
+  };
+  const publishJob = {
+    conclusion: "success",
+    head_sha: SOURCE_COMMIT,
+    id: 3001,
+    name: "publish",
+    run_attempt: 1,
+    run_id: 2001,
+    status: "completed",
+    steps: [{
+      conclusion: "success",
+      name: "Upload the remote publication receipt only",
+      status: "completed",
+    }],
+  };
+  const jobs = { jobs: [publishJob], total_count: 1 };
+  const artifacts = publicationWorkflowArtifacts();
+  const evidence = createManagedCloudPublicationWorkflowEvidence({
+    artifacts,
+    defaultBranch: "main",
+    jobs,
+    plan,
+    publication,
+    run,
+  });
+  assert.equal(evidence.runId, 2001);
+  assert.equal(evidence.jobId, 3001);
+  assert.equal(evidence.artifactId, 4001);
+  assert.equal(evidence.artifactName, "jobs-managed-cloud-publication-2001-1");
+  assert.equal("default_branch" in run.repository, false);
+  assert.equal(
+    evidence.environmentProtectionStatus,
+    "workflow_declared_settings_not_attested",
+  );
+  assert.throws(
+    () => createManagedCloudPublicationWorkflowEvidence({
+      artifacts,
+      defaultBranch: "main",
+      jobs,
+      plan,
+      publication,
+      run: { ...run, head_sha: "c".repeat(40) },
+    }),
+    /successful exact-source workflow dispatch/,
+  );
+  assert.throws(
+    () => createManagedCloudPublicationWorkflowEvidence({
+      artifacts: {
+        artifacts: [
+          ...artifacts.artifacts,
+          { ...artifacts.artifacts[0], id: 4002 },
+        ],
+        total_count: 2,
+      },
+      defaultBranch: "main",
+      jobs,
+      plan,
+      publication,
+      run,
+    }),
+    /exactly one attempt-qualified receipt/,
+  );
+  assert.throws(
+    () => createManagedCloudPublicationWorkflowEvidence({
+      artifacts: {
+        artifacts: [{
+          ...artifacts.artifacts[0],
+          size_in_bytes: 1024 * 1024 + 1,
+        }],
+        total_count: 1,
+      },
+      defaultBranch: "main",
+      jobs,
+      plan,
+      publication,
+      run,
+    }),
+    /exceeds the 1 MiB receipt limit/,
+  );
+  assert.throws(
+    () => createManagedCloudPublicationWorkflowEvidence({
+      artifacts,
+      defaultBranch: "main",
+      jobs: {
+        jobs: [{ ...publishJob, conclusion: "failure" }],
+        total_count: 1,
+      },
+      plan,
+      publication,
+      run,
+    }),
+    /did not complete successfully/,
+  );
+  assert.throws(
+    () => createManagedCloudPublicationWorkflowEvidence({
+      artifacts,
+      defaultBranch: "main",
+      jobs: {
+        jobs: [{ ...publishJob, run_attempt: 2 }],
+        total_count: 1,
+      },
+      plan,
+      publication,
+      run,
+    }),
+    /did not complete successfully/,
+  );
+  assert.throws(
+    () => createManagedCloudPublicationWorkflowEvidence({
+      artifacts,
+      defaultBranch: "other",
+      jobs,
+      plan,
+      publication,
+      run,
+    }),
+    /successful exact-source workflow dispatch/,
+  );
+});
+
 test("release workflow statically proves build-once and protected authorization", async (t) => {
   const workflow = new URL(
     "../../.github/workflows/jobs-managed-cloud-release.yml",
@@ -2361,20 +4279,34 @@ test("release workflow statically proves build-once and protected authorization"
     text.split(
       "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
     ).length - 1,
-    5,
+    6,
   );
-  assert.equal(text.split("node-version: 22.23.2").length - 1, 5);
+  assert.equal(text.split("node-version: 22.23.2").length - 1, 6);
   assert.equal(
     text.split('test "$(node --version)" = "v22.23.2"').length - 1,
-    5,
+    6,
   );
-  assert.equal(text.split("github.ref_type == 'branch'").length - 1, 5);
+  assert.equal(text.split("github.ref_type == 'branch'").length - 1, 6);
   assert.equal(
     text.split(
       "github.ref_name == github.event.repository.default_branch",
     ).length - 1,
-    5,
+    6,
   );
+  assert.equal(text.split("actions: read").length - 1, 6);
+  assert.equal(text.split("contents: read").length - 1, 7);
+  assert.equal(text.split("packages: write").length - 1, 1);
+  assert.match(text, /environment: jobs-managed-cloud-artifact-publication/);
+  assert.match(text, /publication-attest/);
+  assert.match(text, /publication-preflight/);
+  assert.match(text, /publication-portal-manifest/);
+  assert.match(text, /publication-verify/);
+  assert.match(
+    text,
+    /--annotation "org\.opencontainers\.image\.created=\$PORTAL_MANIFEST_CREATED_AT"/,
+  );
+  assert.doesNotMatch(text, /`ghcr\.io\/bluey\//);
+  assert.doesNotMatch(text, /local_fixture/);
   assert.doesNotMatch(text, /sourceVerification: false/);
   assert.doesNotMatch(text, /bluey-jobs-managed-cloud-release-descriptor-v1/);
   for (const contract of Object.values(MANAGED_CLOUD_RUNTIME_CONTRACTS)) {
@@ -2382,6 +4314,87 @@ test("release workflow statically proves build-once and protected authorization"
   }
 
   const root = await temporaryDirectory(t, "managed-cloud-v2-workflow-guard");
+  const mutateMarkedSection = (workflowText, marker, mutate) => {
+    const begin = `# RELEASE-GATE: ${marker}-BEGIN`;
+    const end = `# RELEASE-GATE: ${marker}-END`;
+    const start = workflowText.indexOf(begin) + begin.length;
+    const finish = workflowText.indexOf(end);
+    const section = workflowText.slice(start, finish);
+    const mutatedSection = mutate(section);
+    assert.notEqual(mutatedSection, section, `${marker} mutation must alter its section`);
+    return workflowText.slice(0, start) + mutatedSection + workflowText.slice(finish);
+  };
+  const mutateNamedStep = (section, name, mutate) => {
+    const marker = `      - name: ${name}`;
+    const start = section.indexOf(marker);
+    assert.ok(start >= 0, `${name} step must exist before mutation`);
+    assert.equal(
+      section.indexOf(marker, start + marker.length),
+      -1,
+      `${name} step must be unambiguous before mutation`,
+    );
+    const next = section.indexOf("\n      - ", start + marker.length);
+    const finish = next < 0 ? section.length : next;
+    const step = section.slice(start, finish);
+    const mutatedStep = mutate(step);
+    assert.notEqual(mutatedStep, step, `${name} mutation must alter only that step`);
+    return section.slice(0, start) + mutatedStep + section.slice(finish);
+  };
+  const permissionContracts = new Map([
+    ["CANDIDATE-BUILD", ["actions: read", "contents: read"]],
+    ["VERIFY-NO-REBUILD", ["actions: read", "contents: read"]],
+    ["AUTHORIZE-NO-REBUILD", ["actions: read", "contents: read"]],
+    ["PUBLISH-REMOTE", ["actions: read", "contents: read", "packages: write"]],
+    ["PROMOTE-NO-REBUILD", ["actions: read", "contents: read", "packages: read"]],
+    ["ROLLBACK-NO-REBUILD", ["actions: read", "contents: read"]],
+  ]);
+  for (const [marker, permissions] of permissionContracts) {
+    for (const permission of permissions) {
+      const mutated = mutateMarkedSection(text, marker, (section) =>
+        section.replace(`      ${permission}`, `      ${permission.split(":")[0]}: none`),
+      );
+      const label = permission.replace(/[: ]/g, "-");
+      const path = join(root, `${marker.toLowerCase()}-${label}-permission.yml`);
+      await writeFile(path, mutated);
+      await assert.rejects(
+        () => validateManagedCloudWorkflowContract(path),
+        /exact least-privilege job-local permissions/,
+      );
+    }
+  }
+  for (const marker of [
+    "CANDIDATE-BUILD",
+    "VERIFY-NO-REBUILD",
+    "AUTHORIZE-NO-REBUILD",
+    "ROLLBACK-NO-REBUILD",
+  ]) {
+    const mutated = mutateMarkedSection(text, marker, (section) =>
+      section.replace(
+        "      contents: read",
+        "      contents: read\n      packages: read",
+      ),
+    );
+    const path = join(root, `${marker.toLowerCase()}-unexpected-packages.yml`);
+    await writeFile(path, mutated);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(path),
+      /exact least-privilege job-local permissions/,
+    );
+  }
+  for (const [label, replacement] of [
+    ["changed-contents", "permissions:\n  contents: none"],
+    ["widened-actions", "permissions:\n  actions: read\n  contents: read"],
+    ["widened-packages", "permissions:\n  contents: read\n  packages: read"],
+  ]) {
+    const mutated = text.replace("permissions:\n  contents: read", replacement);
+    assert.notEqual(mutated, text, `${label} mutation must alter global permissions`);
+    const path = join(root, `${label}-global-permissions.yml`);
+    await writeFile(path, mutated);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(path),
+      /Global workflow permissions must be contents: read only/,
+    );
+  }
   for (const [label, original, replacement] of [
     ["contract", "--version 2", "--version 1"],
     ["descriptor", "release-descriptor-v2", "release-descriptor-v1"],
@@ -2400,6 +4413,400 @@ test("release workflow statically proves build-once and protected authorization"
     await assert.rejects(
       () => validateManagedCloudWorkflowContract(path),
       /exact source-verification v2 candidate/,
+    );
+  }
+
+  for (const [label, runId, output] of [
+    ["jobs-ci", "$JOBS_CI_RUN_ID", "release/prepared/jobs-ci-run.json"],
+    [
+      "observability",
+      "$OBSERVABILITY_RUN_ID",
+      "release/prepared/observability-run.json",
+    ],
+  ]) {
+    const endpoint =
+      `gh api "/repos/$GITHUB_REPOSITORY/actions/runs/${runId}"`;
+    const directRedirect = mutateMarkedSection(
+      text,
+      "CANDIDATE-BUILD",
+      (section) => section.replace(
+        `${endpoint} \\\n` +
+          "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
+          "publication-api-capture \\\n" +
+          `                --kind run --out ${output}`,
+        `${endpoint} > ${output}`,
+      ),
+    );
+    assert.notEqual(
+      directRedirect,
+      text,
+      `${label} direct-redirection mutation must alter the workflow fixture`,
+    );
+    const directRedirectPath = join(root, `${label}-direct-redirect.yml`);
+    await writeFile(directRedirectPath, directRedirect);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(directRedirectPath),
+      /exactly two atomic 128 KiB captures|fail closed without final or partial output/,
+    );
+
+    const bypassCapture = mutateMarkedSection(
+      text,
+      "CANDIDATE-BUILD",
+      (section) => section.replace(
+        `--kind run --out ${output}`,
+        `--kind run-unbounded --out ${output}`,
+      ),
+    );
+    assert.notEqual(
+      bypassCapture,
+      text,
+      `${label} capture-bypass mutation must alter the workflow fixture`,
+    );
+    const bypassCapturePath = join(root, `${label}-capture-bypass.yml`);
+    await writeFile(bypassCapturePath, bypassCapture);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(bypassCapturePath),
+      /exactly two atomic 128 KiB captures|fail closed without final or partial output/,
+    );
+
+    const missingCleanup = mutateMarkedSection(
+      text,
+      "CANDIDATE-BUILD",
+      (section) => section.replace(`${output}.partial`, `${output}.unchecked`),
+    );
+    assert.notEqual(
+      missingCleanup,
+      text,
+      `${label} missing-cleanup mutation must alter the workflow fixture`,
+    );
+    const missingCleanupPath = join(root, `${label}-missing-cleanup.yml`);
+    await writeFile(missingCleanupPath, missingCleanup);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(missingCleanupPath),
+      /fail closed without final or partial output/,
+    );
+  }
+
+  const missingCandidateCapturePipefail = mutateMarkedSection(
+    text,
+    "CANDIDATE-BUILD",
+    (section) =>
+      mutateNamedStep(
+        section,
+        "Bind successful exact-tip CI instead of synthetic candidate evidence",
+        (step) =>
+          step.replace(
+            "        run: |\n          set -euo pipefail\n",
+            "        run: |\n          set -eu\n",
+          ),
+      ),
+  );
+  const missingCandidateCapturePipefailPath = join(
+    root,
+    "candidate-capture-missing-pipefail.yml",
+  );
+  await writeFile(
+    missingCandidateCapturePipefailPath,
+    missingCandidateCapturePipefail,
+  );
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(missingCandidateCapturePipefailPath),
+    /exact-tip CI capture step must enable pipefail/,
+  );
+
+  const interpolatedPublicationRun = text.replace(
+    '--workflow-run-id "$PUBLICATION_RUN_ID"',
+    '--workflow-run-id "${{ github.event.inputs.publication_run_id }}"',
+  );
+  assert.notEqual(interpolatedPublicationRun, text);
+  const interpolatedPublicationRunPath = join(
+    root,
+    "interpolated-publication-run.yml",
+  );
+  await writeFile(interpolatedPublicationRunPath, interpolatedPublicationRun);
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(interpolatedPublicationRunPath),
+    /Promotion must independently read back/,
+  );
+  const missingPublicationJobsApi = text.replace(
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs"',
+  );
+  assert.notEqual(missingPublicationJobsApi, text);
+  const missingPublicationJobsApiPath = join(
+    root,
+    "missing-publication-jobs-api.yml",
+  );
+  await writeFile(missingPublicationJobsApiPath, missingPublicationJobsApi);
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(missingPublicationJobsApiPath),
+    /Promotion must independently read back/,
+  );
+  for (const [label, original, replacement] of [
+    [
+      "unsafe-publication-run-input",
+      "Number.isSafeInteger(Number(value))",
+      "Number.isInteger(Number(value))",
+    ],
+    [
+      "latest-publication-attempt",
+      '/attempts/$PUBLICATION_RUN_ATTEMPT"',
+      '"',
+    ],
+    [
+      "unchecked-publication-artifact",
+      "publication-artifact-select",
+      "publication-artifact-unchecked",
+    ],
+    [
+      "unbounded-publication-run-api",
+      "publication-api-capture",
+      "publication-api-unbounded",
+    ],
+    [
+      "missing-publication-api-cleanup",
+      "rm -f -- publication-workflow-run.json publication-workflow-run.json.partial",
+      "true # missing bounded-capture cleanup",
+    ],
+    [
+      "receipt-download-by-name",
+      "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+      "name: jobs-managed-cloud-publication",
+    ],
+    [
+      "unbound-publication-evidence",
+      "--publication-workflow-evidence publication-workflow-evidence.json",
+      "--publication-workflow-evidence unchecked.json",
+    ],
+  ]) {
+    const mutated = mutateMarkedSection(
+      text,
+      "PROMOTE-NO-REBUILD",
+      (section) => section.replace(original, replacement),
+    );
+    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    const path = join(root, `${label}.yml`);
+    await writeFile(path, mutated);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(path),
+      /Promotion must independently read back|Promotion preflight must pass/,
+    );
+  }
+
+  const staticPublicationName = text.replace(
+    "name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}",
+    "name: jobs-managed-cloud-publication",
+  );
+  assert.notEqual(staticPublicationName, text);
+  const staticPublicationNamePath = join(root, "static-publication-name.yml");
+  await writeFile(staticPublicationNamePath, staticPublicationName);
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(staticPublicationNamePath),
+    /protected package writer and immutable readback/,
+  );
+
+  for (const [label, original, replacement] of [
+    ["package-writer", "packages: write", "packages: read"],
+    ["remote-readback", "oras cp --to-oci-layout", "oras cp"],
+    [
+      "oci-layout-source",
+      '"publication-source/$component@sha256:$DIGEST" "$TAG_REF"',
+      '"authorized/candidate/payloads/$component.oci.tar@sha256:$DIGEST" "$TAG_REF"',
+    ],
+    [
+      "controlled-namespace",
+      "vars.BLUEY_JOBS_ARTIFACT_NAMESPACE",
+      "'ghcr.io/bluey/jobs'",
+    ],
+  ]) {
+    const mutated = text.replace(original, replacement);
+    assert.notEqual(mutated, text, `${label} mutation must alter the workflow fixture`);
+    const path = join(root, `${label}.yml`);
+    await writeFile(path, mutated);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(path),
+      /controlled namespaces|protected package writer|immutable readback|exact least-privilege job-local permissions/,
+    );
+  }
+
+  for (const [label, marker, replacement] of [
+    ["authorized", "--authorized authorized", "--authorized unchecked"],
+    [
+      "root-anchor-sha256",
+      '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+      '--root-anchor-sha256 "$MUTATED_ROOT_ANCHOR_SHA256"',
+    ],
+    [
+      "default-branch",
+      '--default-branch "$DEFAULT_BRANCH"',
+      '--default-branch "$MUTATED_DEFAULT_BRANCH"',
+    ],
+    [
+      "source-commit",
+      '--source-commit "$GITHUB_SHA"',
+      '--source-commit "$MUTATED_SHA"',
+    ],
+    [
+      "repository",
+      '--repository "$GITHUB_REPOSITORY"',
+      '--repository "$MUTATED_REPOSITORY"',
+    ],
+    [
+      "repository-id",
+      '--repository-id "$GITHUB_REPOSITORY_ID"',
+      '--repository-id "$MUTATED_REPOSITORY_ID"',
+    ],
+  ]) {
+    const mutated = mutateMarkedSection(text, "PUBLISH-REMOTE", (section) =>
+      section.replaceAll(marker, replacement),
+    );
+    const path = join(root, `${label}-runtime-identity.yml`);
+    await writeFile(path, mutated);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(path),
+      /protected package writer and immutable readback/,
+    );
+  }
+  for (const marker of ["PUBLISH-REMOTE", "PROMOTE-NO-REBUILD"]) {
+    const unboundedManifest = mutateMarkedSection(text, marker, (section) =>
+      section.replace("publication-portal-capture", "publication-portal-tee"),
+    );
+    const unboundedManifestPath = join(
+      root,
+      `${marker.toLowerCase()}-unbounded-portal-manifest.yml`,
+    );
+    await writeFile(unboundedManifestPath, unboundedManifest);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(unboundedManifestPath),
+      /exact portal OCI manifest and one-file pull/,
+    );
+    const uncheckedPortal = mutateMarkedSection(text, marker, (section) =>
+      section.replace(
+        "publication-portal-readback",
+        "publication-portal-unchecked",
+      ),
+    );
+    const uncheckedPortalPath = join(
+      root,
+      `${marker.toLowerCase()}-unchecked-portal-readback.yml`,
+    );
+    await writeFile(uncheckedPortalPath, uncheckedPortal);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(uncheckedPortalPath),
+      /exact portal OCI manifest and one-file pull/,
+    );
+    const uncheckedManifest = mutateMarkedSection(text, marker, (section) =>
+      section.replace(
+        "publication-portal-manifest",
+        "portal-manifest-unchecked",
+      ),
+    );
+    const uncheckedManifestPath = join(
+      root,
+      `${marker.toLowerCase()}-unchecked-portal-manifest.yml`,
+    );
+    await writeFile(uncheckedManifestPath, uncheckedManifest);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(uncheckedManifestPath),
+      /exact portal OCI manifest and one-file pull/,
+    );
+    const lateManifest = mutateMarkedSection(text, marker, (section) => {
+      const commandStart =
+        "\n          node jobs/scripts/managed-cloud-release-gate.mjs \\\n" +
+        "            publication-portal-manifest \\\n";
+      const commandEnd =
+        "            --manifest " +
+        "publication-readback/jobs-portal.oci-manifest.json\n";
+      const start = section.indexOf(commandStart);
+      const finish = section.indexOf(commandEnd, start) + commandEnd.length;
+      assert.ok(
+        start >= 0 && finish >= commandEnd.length,
+        `${marker} must contain manifest-only validation`,
+      );
+      const block = section.slice(start, finish);
+      return section.replace(block, "").replace(
+        'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
+        'oras pull "$PORTAL_REGISTRY_REF" --output portal-download' + block,
+      );
+    });
+    const lateManifestPath = join(
+      root,
+      `${marker.toLowerCase()}-late-portal-manifest.yml`,
+    );
+    await writeFile(lateManifestPath, lateManifest);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(lateManifestPath),
+      /exact portal OCI manifest and one-file pull/,
+    );
+  }
+  const missingCreatedAnnotation = mutateMarkedSection(
+    text,
+    "PUBLISH-REMOTE",
+    (section) => section.replace(
+      '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+      '--annotation "org.opencontainers.image.created=$UNBOUND_NOW"',
+    ),
+  );
+  const missingCreatedAnnotationPath = join(
+    root,
+    "unbound-portal-created-annotation.yml",
+  );
+  await writeFile(missingCreatedAnnotationPath, missingCreatedAnnotation);
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(missingCreatedAnnotationPath),
+    /protected package writer and immutable readback/,
+  );
+  const rawPromotionReceipt = mutateMarkedSection(
+    text,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      'const preflight=require("./publication-preflight.json");',
+      'const preflight=require("./publication/publication-plan.json");',
+    ),
+  );
+  const rawPromotionReceiptPath = join(root, "raw-promotion-receipt.yml");
+  await writeFile(rawPromotionReceiptPath, rawPromotionReceipt);
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(rawPromotionReceiptPath),
+    /Promotion must independently read back/,
+  );
+  const missingPromotionPreflight = mutateMarkedSection(
+    text,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "publication-preflight \\",
+      "publication-unchecked \\",
+    ),
+  );
+  const missingPromotionPreflightPath = join(
+    root,
+    "missing-promotion-preflight.yml",
+  );
+  await writeFile(missingPromotionPreflightPath, missingPromotionPreflight);
+  await assert.rejects(
+    () => validateManagedCloudWorkflowContract(missingPromotionPreflightPath),
+    /Promotion must independently read back|Promotion preflight must pass/,
+  );
+  for (const [marker, expected] of [
+    ["CANDIDATE-BUILD", /controlled namespaces and successful exact-tip CI evidence/],
+    ["PROMOTE-NO-REBUILD", /Promotion must independently read back/],
+  ]) {
+    const missingDefaultBranchInput = mutateMarkedSection(
+      text,
+      marker,
+      (section) => section.replaceAll(
+        '--default-branch "$DEFAULT_BRANCH"',
+        "--default-branch main",
+      ),
+    );
+    const missingDefaultBranchInputPath = join(
+      root,
+      `${marker.toLowerCase()}-missing-default-branch-input.yml`,
+    );
+    await writeFile(missingDefaultBranchInputPath, missingDefaultBranchInput);
+    await assert.rejects(
+      () => validateManagedCloudWorkflowContract(missingDefaultBranchInputPath),
+      expected,
     );
   }
 

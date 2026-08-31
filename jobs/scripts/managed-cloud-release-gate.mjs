@@ -12,6 +12,8 @@ import {
   open,
   readFile,
   readdir,
+  rename,
+  rm,
   writeFile,
 } from "node:fs/promises";
 import {
@@ -30,6 +32,7 @@ export const MANAGED_CLOUD_AUDIENCES = Object.freeze({
   activationV2: "bluey-jobs-managed-cloud-activation-v2",
   authorization: "bluey-jobs-managed-cloud-authorization-v1",
   builderPolicy: "bluey-jobs-managed-cloud-builder-policy-v1",
+  builderPolicyV2: "bluey-jobs-managed-cloud-builder-policy-v2",
   candidate: "bluey-jobs-managed-cloud-candidate-v1",
   canaryEvidence: "bluey-jobs-managed-cloud-canary-evidence-v1",
   cleanupEvidence: "bluey-jobs-managed-cloud-cleanup-evidence-v1",
@@ -42,12 +45,24 @@ export const MANAGED_CLOUD_AUDIENCES = Object.freeze({
   manifest: "bluey-jobs-managed-cloud-release-v1",
   manifestV2: "bluey-jobs-managed-cloud-release-v2",
   migrationContract: "bluey-jobs-managed-cloud-migration-contract-v1",
+  publicationPlan: "bluey-jobs-managed-cloud-publication-plan-v1",
+  publicationPreflight:
+    "bluey-jobs-managed-cloud-publication-preflight-v1",
+  publicationSet: "bluey-jobs-managed-cloud-publication-set-v1",
+  publicationWorkflowEvidence:
+    "bluey-jobs-managed-cloud-publication-workflow-evidence-v1",
   promotion: "bluey-jobs-managed-cloud-promotion-v1",
+  promotionV2: "bluey-jobs-managed-cloud-promotion-v2",
   portalReadbackEvidence:
     "bluey-jobs-managed-cloud-portal-readback-evidence-v1",
+  portalReadbackEvidenceV2:
+    "bluey-jobs-managed-cloud-portal-readback-evidence-v2",
   provenance: "bluey-jobs-managed-cloud-provenance-v1",
   protocolContract: "bluey-jobs-managed-cloud-protocol-contract-v1",
   rollback: "bluey-jobs-managed-cloud-rollback-v1",
+  rollbackV2: "bluey-jobs-managed-cloud-rollback-v2",
+  rollbackSet: "bluey-jobs-managed-cloud-rollback-set-v1",
+  rollbackSetV2: "bluey-jobs-managed-cloud-rollback-set-v2",
   rootAnchor: "bluey-jobs-managed-cloud-root-anchor-v1",
   runtimeMeasurement:
     "bluey-jobs-managed-cloud-runtime-measurement-v1",
@@ -55,6 +70,7 @@ export const MANAGED_CLOUD_AUDIENCES = Object.freeze({
   sbom: "bluey-jobs-managed-cloud-file-sbom-v1",
   signatureSet: "bluey-jobs-managed-cloud-signature-set-v1",
   testEvidence: "bluey-jobs-managed-cloud-test-evidence-v1",
+  testEvidenceV2: "bluey-jobs-managed-cloud-test-evidence-v2",
   taskQueueEvidence: "bluey-jobs-managed-cloud-task-queue-evidence-v1",
   temporalEvidence: "bluey-jobs-managed-cloud-temporal-evidence-v1",
   trustBundle: "bluey-jobs-managed-cloud-trust-bundle-v1",
@@ -240,6 +256,8 @@ const SAFE_ID = /^[a-z0-9][a-z0-9._:-]{2,127}$/;
 const BASE64URL = /^[A-Za-z0-9_-]+$/;
 const IMAGE_REFERENCE =
   /^[a-z0-9][a-z0-9._:-]*(?:\/[a-z0-9][a-z0-9._-]*)+@sha256:[0-9a-f]{64}$/;
+const REGISTRY_NAMESPACE =
+  /^[a-z0-9][a-z0-9.-]*(?::[0-9]{2,5})?\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/;
 const MAX_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_SIGNED_OBJECT_BYTES = 128 * 1024;
 const MAX_INVENTORY_ATTACHMENT_BYTES = 12 * 1024 * 1024;
@@ -248,6 +266,12 @@ const MAX_INVENTORY_ATTACHMENT_TRANSPORT_BYTES =
 const MAX_INVENTORY_ENTRIES = 100_000;
 const MAX_ACTIVATION_EVIDENCE_FILE_BYTES = 128 * 1024;
 const MAX_ACTIVATION_EVIDENCE_TOTAL_BYTES = 1024 * 1024;
+const MAX_PORTAL_OCI_MANIFEST_BYTES = 32 * 1024;
+const MAX_PUBLICATION_PREFLIGHT_BYTES = 128 * 1024;
+const MAX_PUBLICATION_ARTIFACTS_BYTES = 1024 * 1024;
+const MAX_PUBLICATION_ARTIFACT_ARCHIVE_BYTES = 1024 * 1024;
+const MAX_PUBLICATION_WORKFLOW_JOBS_BYTES = 1024 * 1024;
+const MAX_PUBLICATION_WORKFLOW_RUN_BYTES = 128 * 1024;
 const MAX_RUNTIME_MEASUREMENT_FILES = 512;
 const MAX_SAFE_GENERATION = Number.MAX_SAFE_INTEGER;
 const RUNTIME_MEASUREMENT_PATH =
@@ -282,7 +306,7 @@ const REQUIRED_AUTHORIZED_FILES = Object.freeze([
   "release-signatures.json",
   "trust-bundle.json",
 ]);
-const REQUIRED_PROMOTION_FILES = Object.freeze([
+const REQUIRED_PROMOTION_FILES_V1 = Object.freeze([
   "activation-signatures.json",
   "activation.json",
   "authorized-candidate",
@@ -293,6 +317,89 @@ const REQUIRED_PROMOTION_FILES = Object.freeze([
   "published",
   "readback",
 ]);
+const REQUIRED_PROMOTION_FILES_V2 = Object.freeze([
+  "activation-signatures.json",
+  "activation.json",
+  "authorized-candidate",
+  "cohort-signatures.json",
+  "cohort.json",
+  "evidence",
+  "publication",
+  "publication-workflow-evidence.json",
+  "promotion-set.json",
+]);
+const REQUIRED_PUBLICATION_FILES = Object.freeze([
+  "publication-plan.json",
+  "publication-set.json",
+]);
+const MANAGED_CLOUD_PUBLICATION_PLAN_KEYS = Object.freeze([
+  "adapter",
+  "artifacts",
+  "audience",
+  "authorizationSetSha256",
+  "candidateSetSha256",
+  "manifestSha256",
+  "nativeArtifact",
+  "portalArtifactOrigin",
+  "portalManifestCreatedAt",
+  "registryNamespace",
+  "releaseId",
+  "sourceCommit",
+  "sourceDefaultBranch",
+  "sourceRepository",
+  "sourceRepositoryId",
+  "supplyChainStatus",
+  "version",
+]);
+const MANAGED_CLOUD_PUBLICATION_SET_KEYS = Object.freeze([
+  "adapter",
+  "artifacts",
+  "attestedAtMs",
+  "audience",
+  "authorizationSetSha256",
+  "manifestSha256",
+  "nativeArtifact",
+  "publicationPlanSha256",
+  "releaseId",
+  "sourceCommit",
+  "supplyChainStatus",
+  "version",
+  "workflowRunId",
+  "workflowRunAttempt",
+]);
+const MANAGED_CLOUD_PUBLICATION_PREFLIGHT_KEYS = Object.freeze([
+  "adapter",
+  "artifacts",
+  "audience",
+  "defaultBranch",
+  "portalManifestCreatedAt",
+  "publicationPlanSha256",
+  "publicationSetSha256",
+  "registryNamespace",
+  "releaseId",
+  "repository",
+  "repositoryId",
+  "sourceCommit",
+  "version",
+  "workflowEvidence",
+]);
+const MANAGED_CLOUD_PUBLICATION_PREFLIGHT_ARTIFACT_KEYS = Object.freeze([
+  "artifactKind",
+  "artifactSha256",
+  "candidatePayloadSha256",
+  "candidatePayloadSizeBytes",
+  "componentId",
+  "publishedManifestDigest",
+  "publishedRegistryRef",
+]);
+const OCI_IMAGE_MANIFEST_MEDIA_TYPE =
+  "application/vnd.oci.image.manifest.v1+json";
+const OCI_EMPTY_CONFIG_MEDIA_TYPE = "application/vnd.oci.empty.v1+json";
+const OCI_EMPTY_CONFIG_DIGEST =
+  "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+const PORTAL_OCI_ARTIFACT_TYPE = "application/vnd.bluey.jobs.portal.v1";
+const PORTAL_OCI_LAYER_MEDIA_TYPE =
+  "application/vnd.bluey.jobs.portal.tar";
 const REQUIRED_ROLLBACK_FILES = Object.freeze([
   "from-promotion",
   "rollback-signatures.json",
@@ -713,6 +820,52 @@ function requireSafeId(value, label) {
     fail(label + " is not a safe identifier");
   }
   return id;
+}
+
+function requireGitBranchName(value, label) {
+  const branch = requireString(value, label);
+  if (
+    branch.length > 255 ||
+    branch.startsWith("/") ||
+    branch.endsWith("/") ||
+    branch.endsWith(".") ||
+    branch.endsWith(".lock") ||
+    branch.includes("..") ||
+    branch.includes("@{") ||
+    /[\u0000-\u0020\u007f~^:?*\\\[]/.test(branch) ||
+    branch.split("/").some((part) => part === "" || part.startsWith("."))
+  ) {
+    fail(label + " is not a canonical Git branch name");
+  }
+  return branch;
+}
+
+export function deriveManagedCloudPortalManifestCreatedAt(sourceDateEpoch) {
+  const seconds = requireInteger(
+    sourceDateEpoch,
+    "portal provenance sourceDateEpoch",
+  );
+  if (seconds > 253_402_300_799) {
+    fail("portal provenance sourceDateEpoch is outside the RFC3339 range");
+  }
+  const createdAt = new Date(seconds * 1_000).toISOString();
+  if (!createdAt.endsWith(".000Z")) {
+    fail("portal provenance sourceDateEpoch is not an exact whole second");
+  }
+  return createdAt.slice(0, -5) + "Z";
+}
+
+function requireCanonicalRfc3339Seconds(value, label) {
+  const timestamp = requireString(value, label);
+  const parsed = Date.parse(timestamp);
+  if (
+    !Number.isSafeInteger(parsed) ||
+    parsed < 0 ||
+    deriveManagedCloudPortalManifestCreatedAt(parsed / 1_000) !== timestamp
+  ) {
+    fail(label + " must be canonical UTC RFC3339 whole seconds");
+  }
+  return timestamp;
 }
 
 function requireHex64(value, label) {
@@ -1255,6 +1408,14 @@ async function readJson(
   return { bytes, value };
 }
 
+async function readBoundedJson(path, label, maximumBytes) {
+  const metadata = await requireRegularFile(path, label);
+  if (metadata.size < 3 || metadata.size > maximumBytes) {
+    fail(label + " has an invalid byte length");
+  }
+  return readJson(path, label, maximumBytes);
+}
+
 async function readCanonicalJson(
   path,
   label = basename(path),
@@ -1347,6 +1508,29 @@ async function collectTreeFiles(root) {
   }
 
   await visit(rootPath);
+  return files;
+}
+
+async function requireExactFlatRegularFiles(root, expected, label) {
+  const rootPath = resolve(root);
+  const entries = await readdir(rootPath, { withFileTypes: true });
+  entries.sort((left, right) => compareUtf8(left.name, right.name));
+  const wanted = [...expected].sort(compareUtf8);
+  if (
+    entries.length !== wanted.length ||
+    entries.some(
+      (entry, index) => entry.name !== wanted[index] || !entry.isFile(),
+    )
+  ) {
+    fail(label + " must contain only its exact flat regular-file set");
+  }
+  const files = await collectTreeFiles(rootPath);
+  if (
+    files.length !== wanted.length ||
+    files.some((file, index) => file.relativePath !== wanted[index])
+  ) {
+    fail(label + " must contain only its exact flat regular-file set");
+  }
   return files;
 }
 
@@ -2409,7 +2593,7 @@ function validateSourceFileSet(
   return entries;
 }
 
-function validateBuilderPolicyContract(builderPolicy) {
+function validateBuilderPolicyShape(builderPolicy) {
   requireExactKeys(
     builderPolicy,
     [
@@ -2425,15 +2609,22 @@ function validateBuilderPolicyContract(builderPolicy) {
     ],
     "builder policy",
   );
+  const legacy =
+    builderPolicy.schemaVersion === 1 &&
+    builderPolicy.audience === MANAGED_CLOUD_AUDIENCES.builderPolicy &&
+    JSON.stringify(builderPolicy.noRebuildStages) ===
+      JSON.stringify(["authorize", "promote", "rollback", "verify"]);
+  const publication =
+    builderPolicy.schemaVersion === 2 &&
+    builderPolicy.audience === MANAGED_CLOUD_AUDIENCES.builderPolicyV2 &&
+    JSON.stringify(builderPolicy.noRebuildStages) ===
+      JSON.stringify(["authorize", "promote", "publish", "rollback", "verify"]);
   if (
-    builderPolicy.schemaVersion !== 1 ||
-    builderPolicy.audience !== MANAGED_CLOUD_AUDIENCES.builderPolicy ||
+    (!legacy && !publication) ||
     builderPolicy.buildNetwork !== "dependency-fetch-only" ||
     builderPolicy.candidateBuildIsolation !== "credential-free" ||
     builderPolicy.immutableBaseImageRequired !== true ||
-    builderPolicy.rootlessRuntimeRequired !== true ||
-    JSON.stringify(builderPolicy.noRebuildStages) !==
-      JSON.stringify(["authorize", "promote", "rollback", "verify"])
+    builderPolicy.rootlessRuntimeRequired !== true
   ) {
     fail("Builder policy does not enforce the closed build-once contract");
   }
@@ -2444,7 +2635,22 @@ function validateBuilderPolicyContract(builderPolicy) {
   if (builderPolicy.setSha256 !== sha256(canonicalJsonBytes(files))) {
     fail("Builder policy source-set digest is invalid");
   }
-  return files;
+  return { files, generation: publication ? 2 : 1 };
+}
+
+function validateBuilderPolicyContract(builderPolicy, contractVersion) {
+  const validated = validateBuilderPolicyShape(builderPolicy);
+  if (contractVersion === 1 && validated.generation !== 1) {
+    fail("Release-v1 requires the historical builder policy bytes");
+  }
+  return validated.files;
+}
+
+export function validateManagedCloudPublicationBuilderPolicy(builderPolicy) {
+  if (validateBuilderPolicyShape(builderPolicy).generation !== 2) {
+    fail("Production publication requires builder policy v2 with publish fenced");
+  }
+  return true;
 }
 
 function validateMigrationContract(migrationContract, contractVersion) {
@@ -2715,7 +2921,7 @@ export function validateManagedCloudReleaseContracts({
   ) {
     fail("Release contracts do not share one exact version");
   }
-  validateBuilderPolicyContract(builderPolicy);
+  validateBuilderPolicyContract(builderPolicy, contractVersion);
   validateConfigContract(configContract);
   validateMigrationContract(migrationContract, contractVersion);
   validateProtocolContract(protocolContract, manifest.protocols, contractVersion);
@@ -2755,14 +2961,20 @@ export async function createManagedCloudContracts(
 
   const builderSources = await createSourceSet(root, BUILDER_POLICY_PATHS);
   const builderPolicy = {
-    audience: MANAGED_CLOUD_AUDIENCES.builderPolicy,
+    audience:
+      contractVersion === 1
+        ? MANAGED_CLOUD_AUDIENCES.builderPolicy
+        : MANAGED_CLOUD_AUDIENCES.builderPolicyV2,
     buildNetwork: "dependency-fetch-only",
     candidateBuildIsolation: "credential-free",
     files: builderSources.files,
     immutableBaseImageRequired: true,
-    noRebuildStages: ["authorize", "promote", "rollback", "verify"],
+    noRebuildStages:
+      contractVersion === 1
+        ? ["authorize", "promote", "rollback", "verify"]
+        : ["authorize", "promote", "publish", "rollback", "verify"],
     rootlessRuntimeRequired: true,
-    schemaVersion: 1,
+    schemaVersion: contractVersion,
     setSha256: builderSources.setSha256,
   };
 
@@ -2851,7 +3063,7 @@ export async function createManagedCloudContracts(
     ),
     schemaVersion: 1,
     variables: [...variables.entries()]
-      .sort(([left], [right]) => left.localeCompare(right, "en"))
+      .sort(([left], [right]) => compareUtf8(left, right))
       .map(([name, roles]) => ({
         classification:
           MANAGED_CLOUD_REQUIRED_CONFIG_SPECS.get(name)?.classification ??
@@ -3320,42 +3532,237 @@ function validateProvenance(
   }
 }
 
-function validateTestEvidence(testEvidence, sourceCommit) {
+const REQUIRED_EXACT_TIP_CI_RUNS = Object.freeze([
+  Object.freeze({
+    checkId: "jobs-ci",
+    workflowPath: ".github/workflows/jobs-ci.yml",
+  }),
+  Object.freeze({
+    checkId: "observability-policy",
+    workflowPath: ".github/workflows/observability-policy.yml",
+  }),
+]);
+
+function normalizeExactTipCiRun(
+  run,
+  expected,
+  repository,
+  defaultBranch,
+  sourceCommit,
+) {
+  requireObject(run, expected.checkId + " GitHub workflow run");
+  const runRepository = requireObject(
+    run.repository,
+    expected.checkId + " repository",
+  );
+  const repositoryId = requireInteger(
+    runRepository.id,
+    expected.checkId + " repository.id",
+    1,
+  );
+  const workflowPath = requireString(
+    run.path,
+    expected.checkId + " workflow path",
+  );
+  if (
+    runRepository.full_name !== repository ||
+    ![
+      expected.workflowPath,
+      expected.workflowPath + "@" + defaultBranch,
+    ].includes(workflowPath) ||
+    run.event !== "push" ||
+    run.status !== "completed" ||
+    run.conclusion !== "success" ||
+    run.head_sha !== sourceCommit ||
+    run.head_branch !== defaultBranch
+  ) {
+    fail(
+      expected.checkId +
+        " must be a successful exact-tip default-branch push run",
+    );
+  }
+  return {
+    checkId: expected.checkId,
+    conclusion: "success",
+    event: "push",
+    headBranch: defaultBranch,
+    headSha: sourceCommit,
+    repositoryId,
+    runAttempt: requireInteger(
+      run.run_attempt,
+      expected.checkId + ".run_attempt",
+      1,
+    ),
+    runId: requireInteger(run.id, expected.checkId + ".id", 1),
+    workflowPath: expected.workflowPath,
+  };
+}
+
+export function createManagedCloudCiEvidence({
+  defaultBranch,
+  jobsCiRun,
+  observabilityRun,
+  releaseContractSelfTestSha256,
+  repository,
+  sourceCommit,
+}) {
+  const exactRepository = requireString(repository, "repository");
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "defaultBranch",
+  );
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(exactRepository)) {
+    fail("repository must be one exact GitHub owner/name");
+  }
+  requireSourceCommit(sourceCommit);
+  const ciRuns = [jobsCiRun, observabilityRun]
+    .map((run, index) =>
+      normalizeExactTipCiRun(
+        run,
+        REQUIRED_EXACT_TIP_CI_RUNS[index],
+        exactRepository,
+        exactDefaultBranch,
+        sourceCommit,
+      ),
+    )
+    .sort((left, right) => compareUtf8(left.checkId, right.checkId));
+  if (ciRuns[0].repositoryId !== ciRuns[1].repositoryId) {
+    fail("Exact-tip CI runs must belong to the same repository identity");
+  }
+  const evidence = {
+    audience: MANAGED_CLOUD_AUDIENCES.testEvidenceV2,
+    ciRuns,
+    defaultBranch: exactDefaultBranch,
+    releaseContractSelfTestSha256: requireHex64(
+      releaseContractSelfTestSha256,
+      "releaseContractSelfTestSha256",
+    ),
+    repository: exactRepository,
+    repositoryId: ciRuns[0].repositoryId,
+    sourceCommit,
+    version: 2,
+  };
+  validateManagedCloudTestEvidence(evidence, sourceCommit, 2);
+  return evidence;
+}
+
+export function validateManagedCloudTestEvidence(
+  testEvidence,
+  sourceCommit,
+  contractVersion,
+) {
+  if (contractVersion === 1) {
+    requireExactKeys(
+      testEvidence,
+      ["audience", "checks", "sourceCommit", "version"],
+      "test evidence",
+    );
+    if (
+      testEvidence.version !== 1 ||
+      testEvidence.audience !== MANAGED_CLOUD_AUDIENCES.testEvidence ||
+      testEvidence.sourceCommit !== sourceCommit
+    ) {
+      fail("Test evidence does not bind the candidate source");
+    }
+    const checkIds = [];
+    for (const [index, check] of requireArray(
+      testEvidence.checks,
+      "test evidence checks",
+      1,
+    ).entries()) {
+      requireExactKeys(
+        check,
+        ["checkId", "evidenceSha256", "status"],
+        "test evidence check[" + index + "]",
+      );
+      checkIds.push(requireSafeId(check.checkId, "checkId"));
+      requireHex64(check.evidenceSha256, "test evidence digest");
+      if (check.status !== "pass") {
+        fail("Every candidate test evidence check must pass");
+      }
+    }
+    if (
+      new Set(checkIds).size !== checkIds.length ||
+      checkIds.some((id, index) => id !== [...checkIds].sort()[index])
+    ) {
+      fail("Test evidence check IDs must be sorted and unique");
+    }
+    return testEvidence;
+  }
+  if (contractVersion !== 2) {
+    fail("Test evidence contract version is invalid");
+  }
   requireExactKeys(
     testEvidence,
-    ["audience", "checks", "sourceCommit", "version"],
+    [
+      "audience",
+      "ciRuns",
+      "defaultBranch",
+      "releaseContractSelfTestSha256",
+      "repository",
+      "repositoryId",
+      "sourceCommit",
+      "version",
+    ],
     "test evidence",
   );
   if (
-    testEvidence.version !== 1 ||
-    testEvidence.audience !== MANAGED_CLOUD_AUDIENCES.testEvidence ||
-    testEvidence.sourceCommit !== sourceCommit
+    testEvidence.version !== 2 ||
+    testEvidence.audience !== MANAGED_CLOUD_AUDIENCES.testEvidenceV2 ||
+    testEvidence.sourceCommit !== sourceCommit ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(testEvidence.repository)
   ) {
-    fail("Test evidence does not bind the candidate source");
+    fail("Release-v2 test evidence does not bind its exact source repository");
   }
-  const checkIds = [];
-  for (const [index, check] of requireArray(
-    testEvidence.checks,
-    "test evidence checks",
-    1,
-  ).entries()) {
+  requireInteger(testEvidence.repositoryId, "test evidence repositoryId", 1);
+  const defaultBranch = requireGitBranchName(
+    testEvidence.defaultBranch,
+    "test evidence defaultBranch",
+  );
+  requireHex64(
+    testEvidence.releaseContractSelfTestSha256,
+    "releaseContractSelfTestSha256",
+  );
+  const runs = requireArray(testEvidence.ciRuns, "test evidence ciRuns", 2);
+  if (runs.length !== REQUIRED_EXACT_TIP_CI_RUNS.length) {
+    fail("Release-v2 test evidence requires both exact-tip CI workflows");
+  }
+  for (const [index, expected] of REQUIRED_EXACT_TIP_CI_RUNS.entries()) {
+    const run = runs[index];
     requireExactKeys(
-      check,
-      ["checkId", "evidenceSha256", "status"],
-      "test evidence check[" + index + "]",
+      run,
+      [
+        "checkId",
+        "conclusion",
+        "event",
+        "headBranch",
+        "headSha",
+        "repositoryId",
+        "runAttempt",
+        "runId",
+        "workflowPath",
+      ],
+      "test evidence ciRuns[" + index + "]",
     );
-    checkIds.push(requireSafeId(check.checkId, "checkId"));
-    requireHex64(check.evidenceSha256, "test evidence digest");
-    if (check.status !== "pass") {
-      fail("Every candidate test evidence check must pass");
+    if (
+      run.checkId !== expected.checkId ||
+      run.workflowPath !== expected.workflowPath ||
+      run.conclusion !== "success" ||
+      run.event !== "push" ||
+      run.headBranch !== defaultBranch ||
+      run.headSha !== sourceCommit ||
+      run.repositoryId !== testEvidence.repositoryId
+    ) {
+      fail("Release-v2 test evidence is not exact-tip CI authority");
     }
+    requireGitBranchName(run.headBranch, expected.checkId + ".headBranch");
+    requireInteger(run.runAttempt, expected.checkId + ".runAttempt", 1);
+    requireInteger(run.runId, expected.checkId + ".runId", 1);
   }
-  if (
-    new Set(checkIds).size !== checkIds.length ||
-    checkIds.some((id, index) => id !== [...checkIds].sort()[index])
-  ) {
-    fail("Test evidence check IDs must be sorted and unique");
+  if (runs[0].runId === runs[1].runId) {
+    fail("Exact-tip CI workflow run IDs must be distinct");
   }
+  return testEvidence;
 }
 
 async function descriptorBuildToComponent(
@@ -3458,8 +3865,9 @@ async function descriptorBuildToComponent(
     sourceCommit,
   };
   requireImmutableArtifactReference(component, releaseId);
+  const managedRuntimeContract = MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId];
   const runtimeContract =
-    MANAGED_CLOUD_RUNTIME_CONTRACTS[componentId] ?? {
+    managedRuntimeContract ?? {
       cmd: [],
       entrypoint: [],
       requiredPaths: ["index.html"],
@@ -3494,7 +3902,7 @@ async function descriptorBuildToComponent(
     componentId,
     capabilities,
   );
-  const runtimeMeasurement = runtimeContract
+  const runtimeMeasurement = managedRuntimeContract
     ? runtimeMeasurementDocument({
         buildId,
         componentId,
@@ -3719,7 +4127,7 @@ export async function assembleManagedCloudCandidate({
     testEvidenceFile,
     "test evidence",
   );
-  validateTestEvidence(testEvidence, sourceCommit);
+  validateManagedCloudTestEvidence(testEvidence, sourceCommit, descriptor.version);
   await copyFile(testEvidenceFile, join(output, "test-evidence.json"), 0);
   const verificationEvidence = {
     audience: MANAGED_CLOUD_AUDIENCES.verificationEvidence,
@@ -4042,7 +4450,11 @@ export async function validateManagedCloudCandidate(candidateDirectory) {
   const { value: testEvidence } = await readCanonicalJson(
     join(root, "test-evidence.json"),
   );
-  validateTestEvidence(testEvidence, manifest.sourceCommit);
+  validateManagedCloudTestEvidence(
+    testEvidence,
+    manifest.sourceCommit,
+    manifest.version,
+  );
   if (verificationEvidence.components.length !== manifest.components.length) {
     fail("Verification evidence component set is incomplete");
   }
@@ -4251,6 +4663,7 @@ const SIGNED_TARGET_AUDIENCES = Object.freeze([
   MANAGED_CLOUD_AUDIENCES.manifest,
   MANAGED_CLOUD_AUDIENCES.manifestV2,
   MANAGED_CLOUD_AUDIENCES.rollback,
+  MANAGED_CLOUD_AUDIENCES.rollbackV2,
   MANAGED_CLOUD_AUDIENCES.trustPolicy,
 ]);
 
@@ -4882,7 +5295,7 @@ export async function authorizeManagedCloudCandidate({
     signatureSet,
   });
   if (signatureSet.signedAtMs < validated.manifest.publishedAtMs) {
-    fail("Release signature cannot predate manifest publication");
+    fail("Release signature cannot predate the deterministic manifest source epoch");
   }
   await cp(resolve(candidateDirectory), join(output, "candidate"), {
     errorOnExist: true,
@@ -4976,7 +5389,7 @@ export async function validateAuthorizedManagedCloudCandidate(
     signatureSet,
   });
   if (signatureSet.signedAtMs < validated.manifest.publishedAtMs) {
-    fail("Release signature cannot predate manifest publication");
+    fail("Release signature cannot predate the deterministic manifest source epoch");
   }
   if (
     authorization.authorizedAtMs < signatureSet.signedAtMs ||
@@ -5374,10 +5787,15 @@ async function readActivationEvidence(
       continue;
     }
     if (entry.field === "portalReadbackEvidenceSha256") {
+      const portalReadbackV2 = authorized.manifest.version === 2;
       requireEvidenceEnvelope(
         value,
-        MANAGED_CLOUD_AUDIENCES.portalReadbackEvidence,
-        ["portalArtifactSha256", "readbackSha256"],
+        portalReadbackV2
+          ? MANAGED_CLOUD_AUDIENCES.portalReadbackEvidenceV2
+          : MANAGED_CLOUD_AUDIENCES.portalReadbackEvidence,
+        portalReadbackV2
+          ? ["artifactRef", "portalArtifactSha256", "readbackSha256"]
+          : ["portalArtifactSha256", "readbackSha256"],
         activation,
         authorized.candidate.manifestSha256,
         "portal readback evidence",
@@ -5385,8 +5803,15 @@ async function readActivationEvidence(
       const portal = authorized.manifest.components.find(
         (component) => component.componentId === "jobs-portal",
       );
-      if (value.portalArtifactSha256 !== portal.artifactSha256) {
-        fail("Portal readback evidence does not bind portal artifact");
+      if (
+        (portalReadbackV2 && value.artifactRef !== portal.artifactRef) ||
+        value.portalArtifactSha256 !== portal.artifactSha256
+      ) {
+        fail(
+          portalReadbackV2
+            ? "Portal readback evidence does not bind the signed portal URL and artifact"
+            : "Portal readback evidence does not bind portal artifact",
+        );
       }
       requireHex64(value.readbackSha256, "portal readbackSha256");
       if (value.readbackSha256 !== portal.artifactSha256) {
@@ -5727,34 +6152,1611 @@ export function validateManagedCloudActivationWindow(
   return true;
 }
 
-async function copyPublishedPayloads(candidateRoot, publishedRoot, readbackRoot) {
-  await requireEmptyOutputDirectory(publishedRoot);
-  await requireEmptyOutputDirectory(readbackRoot);
-  const { value: candidateSet } = await readCanonicalJson(
-    join(candidateRoot, "candidate-set.json"),
+const MANAGED_CLOUD_NATIVE_ADDON_PATH =
+  "app/runner/dist/native/bluey_jobs_runner_native_storage.node";
+const MANAGED_CLOUD_RELEASE_WORKFLOW_PATH =
+  ".github/workflows/jobs-managed-cloud-release.yml";
+const MANAGED_CLOUD_PUBLICATION_JOB_NAME = "publish";
+const MANAGED_CLOUD_PUBLICATION_ENVIRONMENT =
+  "jobs-managed-cloud-artifact-publication";
+const MANAGED_CLOUD_PUBLICATION_RECEIPT_STEP =
+  "Upload the remote publication receipt only";
+
+function requireRegistryNamespace(value) {
+  const namespace = requireString(value, "registry namespace");
+  if (
+    namespace !== namespace.toLowerCase() ||
+    !REGISTRY_NAMESPACE.test(namespace) ||
+    namespace.includes("@") ||
+    namespace === "ghcr.io/bluey" ||
+    namespace.startsWith("ghcr.io/bluey/")
+  ) {
+    fail("Registry namespace must be one controlled lowercase repository prefix");
+  }
+  return namespace;
+}
+
+function requirePortalArtifactOrigin(value) {
+  const origin = requireString(value, "portal artifact origin");
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    fail("Portal artifact origin must be one canonical HTTPS directory");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    origin.endsWith("/") ||
+    url.toString() !== origin
+  ) {
+    fail("Portal artifact origin must be one canonical HTTPS directory");
+  }
+  return origin;
+}
+
+function publicationRepository(registryNamespace, componentId) {
+  return registryNamespace + "-" + componentId.slice("jobs-".length);
+}
+
+function publicationTagRef(registryNamespace, componentId, releaseId) {
+  if (!/^[a-z0-9][a-z0-9._-]{2,127}$/.test(releaseId)) {
+    fail("releaseId must also be a canonical OCI tag");
+  }
+  return publicationRepository(registryNamespace, componentId) + ":" + releaseId;
+}
+
+function portalArtifactRef(portalOrigin, releaseId, artifactSha256) {
+  return portalOrigin + "/" + releaseId + "/" + artifactSha256 + ".tar";
+}
+
+async function candidateContentInventory(authorized, componentId) {
+  const path = join(
+    authorized.root,
+    "candidate/evidence/" + componentId + ".content-inventory.json",
   );
-  const payloads = candidateSet.payloads.filter((item) =>
-    item.path.startsWith("payloads/"),
+  const { value } = await readCanonicalJson(path, componentId + " inventory");
+  validateContentInventoryDocument(value, componentId);
+  return value;
+}
+
+async function candidateNativeAddon(authorized) {
+  const inventory = await candidateContentInventory(authorized, "jobs-runner");
+  const entry = inventory.entries.find(
+    (item) => item.path === MANAGED_CLOUD_NATIVE_ADDON_PATH,
   );
-  for (const payload of payloads) {
-    const source = join(candidateRoot, payload.path);
-    const published = join(publishedRoot, payload.path);
-    const readback = join(readbackRoot, payload.path);
-    await mkdir(dirname(published), { recursive: true });
-    await mkdir(dirname(readback), { recursive: true });
-    await copyFile(source, published, 0);
-    await copyFile(published, readback, 0);
-    for (const path of [published, readback]) {
-      const metadata = await requireRegularFile(path);
-      if (
-        metadata.size !== payload.sizeBytes ||
-        (await hashFile(path)) !== payload.sha256
-      ) {
-        fail("Immutable local adapter readback changed " + payload.path);
-      }
+  if (!entry || entry.type !== "file" || entry.sizeBytes < 1) {
+    fail("Managed runner candidate is missing the exact native addon artifact");
+  }
+  return {
+    componentId: "jobs-runner",
+    mode: entry.mode,
+    path: entry.path,
+    sha256: entry.sha256,
+    sizeBytes: entry.sizeBytes,
+  };
+}
+
+async function candidateExactTipCiEvidence(authorized) {
+  const { value } = await readCanonicalJson(
+    join(authorized.root, "candidate/test-evidence.json"),
+    "candidate exact-tip CI evidence",
+  );
+  validateManagedCloudTestEvidence(
+    value,
+    authorized.manifest.sourceCommit,
+    authorized.manifest.version,
+  );
+  if (
+    value.version !== 2 ||
+    value.audience !== MANAGED_CLOUD_AUDIENCES.testEvidenceV2
+  ) {
+    fail("Production publication requires release-v2 exact-tip CI evidence");
+  }
+  return value;
+}
+
+async function candidatePortalManifestCreatedAt(authorized) {
+  const component = authorized.manifest.components.find(
+    (item) => item.componentId === "jobs-portal",
+  );
+  if (!component || component.artifactKind !== "static_bundle") {
+    fail("Authorized candidate must contain the exact Jobs portal component");
+  }
+  const provenancePath = join(
+    authorized.root,
+    "candidate/evidence/jobs-portal.provenance.json",
+  );
+  const { value: provenance } = await readCanonicalJson(
+    provenancePath,
+    "portal artifact provenance",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  validateProvenance(provenance, {
+    artifactSha256: component.artifactSha256,
+    buildId: component.buildId,
+    builderPolicySha256: provenance.builderPolicySha256,
+    componentId: "jobs-portal",
+    sourceCommit: authorized.manifest.sourceCommit,
+    sourceDateEpoch: requireInteger(
+      provenance.sourceDateEpoch,
+      "portal provenance sourceDateEpoch",
+    ),
+  });
+  if ((await hashFile(provenancePath)) !== component.provenanceSha256) {
+    fail("Portal provenance bytes do not bind the authorized candidate");
+  }
+  return deriveManagedCloudPortalManifestCreatedAt(
+    provenance.sourceDateEpoch,
+  );
+}
+
+function publicationSupplyChainStatus() {
+  return {
+    blueyFileInventorySbom: "present",
+    blueyRecipeProvenance: "present",
+    ociProvenanceAttestation: "not_generated",
+    ociSbomAttestation: "not_generated",
+  };
+}
+
+export function validateManagedCloudPublicationAdapter(adapter) {
+  if (adapter !== "remote_registry_readback_v1") {
+    fail("local_fixture is test-only and cannot supply production publication");
+  }
+  return adapter;
+}
+
+async function publicationPlanDocument(
+  authorized,
+  registryNamespace,
+  portalOrigin,
+) {
+  const namespace = requireRegistryNamespace(registryNamespace);
+  const artifactOrigin = requirePortalArtifactOrigin(portalOrigin);
+  const { value: builderPolicy } = await readCanonicalJson(
+    join(authorized.root, "candidate/builder-policy.json"),
+    "publication builder policy",
+  );
+  validateManagedCloudPublicationBuilderPolicy(builderPolicy);
+  const exactTipCi = await candidateExactTipCiEvidence(authorized);
+  const payloads = new Map(
+    authorized.candidate.payloads.map((payload) => [payload.path, payload]),
+  );
+  const artifacts = [];
+  for (const component of authorized.manifest.components) {
+    const extension = component.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    const candidatePayloadPath =
+      "payloads/" + component.componentId + extension;
+    const payload = payloads.get(candidatePayloadPath);
+    if (!payload) {
+      fail(component.componentId + " publication payload is missing");
+    }
+    const repository = publicationRepository(namespace, component.componentId);
+    const signedArtifactRef =
+      component.artifactKind === "oci_image"
+        ? repository + "@sha256:" + component.artifactSha256
+        : portalArtifactRef(
+            artifactOrigin,
+            authorized.manifest.releaseId,
+            component.artifactSha256,
+          );
+    if (component.artifactRef !== signedArtifactRef) {
+      fail(
+        component.componentId +
+          " signed artifact reference is outside the controlled publication namespace",
+      );
+    }
+    artifacts.push({
+      artifactKind: component.artifactKind,
+      artifactSha256: component.artifactSha256,
+      candidatePayloadPath,
+      candidatePayloadSha256: payload.sha256,
+      candidatePayloadSizeBytes: payload.sizeBytes,
+      componentId: component.componentId,
+      publicationRepository: repository,
+      publicationTagRef: publicationTagRef(
+        namespace,
+        component.componentId,
+        authorized.manifest.releaseId,
+      ),
+      signedArtifactRef,
+    });
+  }
+  artifacts.sort((left, right) => compareUtf8(left.componentId, right.componentId));
+  const plan = {
+    adapter: "remote_registry_readback_v1",
+    artifacts,
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPlan,
+    authorizationSetSha256: await hashFile(
+      join(authorized.root, "authorization-set.json"),
+    ),
+    candidateSetSha256: await hashFile(
+      join(authorized.root, "candidate/candidate-set.json"),
+    ),
+    manifestSha256: authorized.candidate.manifestSha256,
+    nativeArtifact: await candidateNativeAddon(authorized),
+    portalArtifactOrigin: artifactOrigin,
+    portalManifestCreatedAt:
+      await candidatePortalManifestCreatedAt(authorized),
+    registryNamespace: namespace,
+    releaseId: authorized.manifest.releaseId,
+    sourceCommit: authorized.manifest.sourceCommit,
+    sourceDefaultBranch: exactTipCi.defaultBranch,
+    sourceRepository: exactTipCi.repository,
+    sourceRepositoryId: exactTipCi.repositoryId,
+    supplyChainStatus: publicationSupplyChainStatus(),
+    version: 1,
+  };
+  validateManagedCloudPublicationPlanShape(plan);
+  return plan;
+}
+
+export function validateManagedCloudPublicationPlanShape(plan) {
+  requireExactKeys(
+    plan,
+    MANAGED_CLOUD_PUBLICATION_PLAN_KEYS,
+    "publication plan",
+  );
+  requireCanonicalRfc3339Seconds(
+    plan.portalManifestCreatedAt,
+    "publication plan portalManifestCreatedAt",
+  );
+  return true;
+}
+
+export function validateManagedCloudPublicationRuntimeIdentity({
+  defaultBranch,
+  plan,
+  repository,
+  repositoryId,
+  sourceCommit,
+}) {
+  validateManagedCloudPublicationPlanShape(plan);
+  const exactRepository = requireString(repository, "runtime repository");
+  const repositoryIdText = requireString(
+    repositoryId,
+    "runtime repositoryId",
+  );
+  if (!/^[1-9][0-9]*$/.test(repositoryIdText)) {
+    fail("runtime repositoryId must be canonical positive decimal");
+  }
+  const exactRepositoryId = requireInteger(
+    Number(repositoryIdText),
+    "runtime repositoryId",
+    1,
+  );
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "runtime default branch",
+  );
+  const exactSourceCommit = requireSourceCommit(sourceCommit);
+  if (
+    plan.sourceCommit !== exactSourceCommit ||
+    plan.sourceDefaultBranch !== exactDefaultBranch ||
+    plan.sourceRepository !== exactRepository ||
+    plan.sourceRepositoryId !== exactRepositoryId
+  ) {
+    fail("Publication plan does not bind the exact GitHub runtime identity");
+  }
+  return true;
+}
+
+async function validatePublicationPlan(plan, authorized) {
+  validateManagedCloudPublicationPlanShape(plan);
+  if (
+    plan.version !== 1 ||
+    plan.audience !== MANAGED_CLOUD_AUDIENCES.publicationPlan ||
+    validateManagedCloudPublicationAdapter(plan.adapter) !== plan.adapter
+  ) {
+    fail("local_fixture is test-only and cannot supply production publication");
+  }
+  const expected = await publicationPlanDocument(
+    authorized,
+    plan.registryNamespace,
+    plan.portalArtifactOrigin,
+  );
+  if (canonicalJsonBytes(plan).compare(canonicalJsonBytes(expected)) !== 0) {
+    fail("Publication plan does not bind the exact authorized candidate");
+  }
+  return plan;
+}
+
+export async function createManagedCloudArtifactPublicationPlan({
+  authorizedDirectory,
+  expectedRootAnchorSha256,
+  outputFile,
+  portalArtifactOrigin,
+  registryNamespace,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const plan = await publicationPlanDocument(
+    authorized,
+    registryNamespace,
+    portalArtifactOrigin,
+  );
+  await validatePublicationPlan(plan, authorized);
+  await writeCanonicalJson(outputFile, plan);
+  return plan;
+}
+
+export async function validateManagedCloudArtifactPublicationRuntimeIdentity({
+  authorizedDirectory,
+  defaultBranch,
+  expectedRootAnchorSha256,
+  planFile,
+  repository,
+  repositoryId,
+  sourceCommit,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const { value: plan } = await readCanonicalJson(
+    planFile,
+    "publication plan",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  await validatePublicationPlan(plan, authorized);
+  validateManagedCloudPublicationRuntimeIdentity({
+    defaultBranch,
+    plan,
+    repository,
+    repositoryId,
+    sourceCommit,
+  });
+  return plan;
+}
+
+function requirePublicationArtifactRecord(record, expected, label) {
+  requireExactKeys(
+    record,
+    [
+      "artifactKind",
+      "candidatePayloadSha256",
+      "componentId",
+      "publishedManifestDigest",
+      "publishedRegistryRef",
+      "readbackArtifactSha256",
+      "readbackContentSizeBytes",
+      "readbackContentInventorySha256",
+      "signedArtifactRef",
+    ],
+    label,
+  );
+  if (
+    record.componentId !== expected.componentId ||
+    record.artifactKind !== expected.artifactKind ||
+    record.candidatePayloadSha256 !== expected.candidatePayloadSha256 ||
+    record.signedArtifactRef !== expected.signedArtifactRef
+  ) {
+    fail("Publication receipt artifact does not bind its exact plan");
+  }
+  requireDigest(record.publishedManifestDigest, label + ".publishedManifestDigest");
+  if (
+    record.publishedRegistryRef !==
+    expected.publicationRepository + "@" + record.publishedManifestDigest
+  ) {
+    fail("Publication receipt registry ref is outside its exact plan repository");
+  }
+  requireHex64(record.readbackArtifactSha256, label + ".readbackArtifactSha256");
+  requireHex64(
+    record.readbackContentInventorySha256,
+    label + ".readbackContentInventorySha256",
+  );
+  requireInteger(
+    record.readbackContentSizeBytes,
+    label + ".readbackContentSizeBytes",
+    1,
+  );
+  return record;
+}
+
+async function captureBoundedStream({ input, label, maximumBytes, outputFile }) {
+  const chunks = [];
+  let totalBytes = 0;
+  for await (const value of input) {
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    totalBytes += chunk.length;
+    if (totalBytes > maximumBytes) {
+      fail(label + " transport exceeds its " + maximumBytes + "-byte limit");
+    }
+    chunks.push(chunk);
+  }
+  if (totalBytes < 3) {
+    fail(label + " transport has an invalid byte length");
+  }
+  const target = resolve(
+    requireString(outputFile, label + " capture output"),
+  );
+  const temporary = target + ".partial";
+  await mkdir(dirname(target), { recursive: true });
+  let handle;
+  let created = false;
+  try {
+    try {
+      await lstat(target);
+      fail(label + " capture output already exists");
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+    handle = await open(temporary, "wx", 0o400);
+    created = true;
+    await handle.writeFile(Buffer.concat(chunks, totalBytes));
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, target);
+    created = false;
+  } catch (error) {
+    if (created) {
+      await handle?.close().catch(() => {});
+      handle = undefined;
+      await rm(temporary, { force: true });
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+  return { sizeBytes: totalBytes };
+}
+
+export async function captureManagedCloudPortalManifestStream({
+  input = process.stdin,
+  outputFile,
+}) {
+  return captureBoundedStream({
+    input,
+    label: "Portal OCI manifest",
+    maximumBytes: MAX_PORTAL_OCI_MANIFEST_BYTES,
+    outputFile,
+  });
+}
+
+export async function captureManagedCloudPublicationApiStream({
+  input = process.stdin,
+  kind,
+  outputFile,
+}) {
+  const limits = {
+    artifacts: MAX_PUBLICATION_ARTIFACTS_BYTES,
+    jobs: MAX_PUBLICATION_WORKFLOW_JOBS_BYTES,
+    run: MAX_PUBLICATION_WORKFLOW_RUN_BYTES,
+  };
+  const maximumBytes = limits[kind];
+  if (maximumBytes === undefined) {
+    fail("Publication API capture kind must be run, jobs, or artifacts");
+  }
+  return captureBoundedStream({
+    input,
+    label: "Publication API " + kind,
+    maximumBytes,
+    outputFile,
+  });
+}
+
+export async function validateManagedCloudPortalOciArtifactManifest(
+  artifact,
+  manifestFile,
+  portalRegistryRef,
+  portalManifestCreatedAt,
+) {
+  const { bytes: manifestBytes, value: manifest } = await readBoundedJson(
+    manifestFile,
+    "portal OCI artifact manifest",
+    MAX_PORTAL_OCI_MANIFEST_BYTES,
+  );
+  const separator = portalRegistryRef.lastIndexOf("@");
+  const manifestDigest = requireDigest(
+    separator < 0 ? "" : portalRegistryRef.slice(separator + 1),
+    "portal registry manifest digest",
+  );
+  if (
+    portalRegistryRef !== artifact.publicationRepository + "@" + manifestDigest ||
+    sha256(manifestBytes) !== manifestDigest.slice("sha256:".length)
+  ) {
+    fail(
+      "Portal OCI manifest bytes or ref is outside its exact controlled repository",
+    );
+  }
+  requireExactKeys(
+    manifest,
+    ["annotations", "artifactType", "config", "layers", "mediaType", "schemaVersion"],
+    "portal OCI artifact manifest",
+  );
+  requireExactKeys(
+    manifest.annotations,
+    ["org.opencontainers.image.created"],
+    "portal OCI artifact annotations",
+  );
+  const created = requireString(
+    manifest.annotations["org.opencontainers.image.created"],
+    "portal OCI artifact created annotation",
+  );
+  if (
+    created !== requireCanonicalRfc3339Seconds(
+      portalManifestCreatedAt,
+      "planned portal OCI artifact created annotation",
+    )
+  ) {
+    fail("Portal OCI artifact created annotation is not the deterministic plan value");
+  }
+  if (
+    manifest.schemaVersion !== 2 ||
+    manifest.mediaType !== OCI_IMAGE_MANIFEST_MEDIA_TYPE ||
+    manifest.artifactType !== PORTAL_OCI_ARTIFACT_TYPE
+  ) {
+    fail("Portal OCI artifact manifest or artifact type is not exact");
+  }
+  requireExactKeys(
+    manifest.config,
+    ["data", "digest", "mediaType", "size"],
+    "portal OCI artifact config",
+  );
+  if (
+    manifest.config.mediaType !== OCI_EMPTY_CONFIG_MEDIA_TYPE ||
+    manifest.config.digest !== OCI_EMPTY_CONFIG_DIGEST ||
+    manifest.config.size !== 2 ||
+    manifest.config.data !== "e30="
+  ) {
+    fail("Portal OCI artifact config is not the exact empty OCI config");
+  }
+  const layers = requireArray(manifest.layers, "portal OCI artifact layers", 1);
+  if (layers.length !== 1) {
+    fail("Portal OCI artifact must contain exactly one layer");
+  }
+  const layer = requireObject(layers[0], "portal OCI artifact layer");
+  requireExactKeys(
+    layer,
+    ["annotations", "digest", "mediaType", "size"],
+    "portal OCI artifact layer",
+  );
+  requireExactKeys(
+    layer.annotations,
+    ["org.opencontainers.image.title"],
+    "portal OCI artifact layer annotations",
+  );
+  if (
+    layer.digest !== "sha256:" + artifact.candidatePayloadSha256 ||
+    layer.size !== artifact.candidatePayloadSizeBytes ||
+    layer.mediaType !== PORTAL_OCI_LAYER_MEDIA_TYPE ||
+    layer.annotations["org.opencontainers.image.title"] !== "jobs-portal.tar"
+  ) {
+    fail("Portal OCI artifact layer does not bind the exact candidate tar");
+  }
+  return manifestDigest;
+}
+
+function publicationPortalArtifact(plan) {
+  validateManagedCloudPublicationPlanShape(plan);
+  const portal = plan.artifacts.filter(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  if (portal.length !== 1 || portal[0].artifactKind !== "static_bundle") {
+    fail("Publication plan must contain exactly one portal artifact");
+  }
+  return portal[0];
+}
+
+function publicationPortalExpectation({ plan, preflight }) {
+  if ((plan === undefined) === (preflight === undefined)) {
+    fail("Portal validation requires exactly one plan or preflight authority");
+  }
+  if (plan !== undefined) {
+    return {
+      artifact: publicationPortalArtifact(plan),
+      portalManifestCreatedAt: plan.portalManifestCreatedAt,
+    };
+  }
+  const { portalManifestCreatedAt, registryNamespace } =
+    validateManagedCloudPublicationPreflightDocument(preflight);
+  const portal = preflight.artifacts.filter(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  if (portal.length !== 1 || portal[0].artifactKind !== "static_bundle") {
+    fail("Publication preflight must contain exactly one portal artifact");
+  }
+  return {
+    artifact: {
+      ...portal[0],
+      publicationRepository: publicationRepository(
+        registryNamespace,
+        "jobs-portal",
+      ),
+    },
+    portalManifestCreatedAt,
+  };
+}
+
+export async function validateManagedCloudPortalArtifactManifestReadback({
+  manifestFile,
+  plan,
+  preflight,
+  portalRegistryRef,
+}) {
+  const expectation = publicationPortalExpectation({ plan, preflight });
+  return validateManagedCloudPortalOciArtifactManifest(
+    expectation.artifact,
+    manifestFile,
+    requireString(portalRegistryRef, "portal registry ref"),
+    expectation.portalManifestCreatedAt,
+  );
+}
+
+export async function stageManagedCloudPortalArtifactReadback({
+  downloadDirectory,
+  manifestFile,
+  outputFile,
+  plan,
+  preflight,
+  portalRegistryRef,
+}) {
+  const expectation = publicationPortalExpectation({ plan, preflight });
+  const portal = expectation.artifact;
+  await requireExactFlatRegularFiles(
+    downloadDirectory,
+    ["jobs-portal.tar"],
+    "Portal ORAS pull output",
+  );
+  await validateManagedCloudPortalArtifactManifestReadback({
+    manifestFile,
+    plan,
+    preflight,
+    portalRegistryRef,
+  });
+  const source = join(resolve(downloadDirectory), "jobs-portal.tar");
+  const bytes = await readFile(source);
+  if (
+    sha256(bytes) !== portal.candidatePayloadSha256 ||
+    bytes.length !== portal.candidatePayloadSizeBytes
+  ) {
+    fail("Portal ORAS pull output differs from the exact candidate tar");
+  }
+  await inspectStaticBundleArchive(source, "jobs-portal");
+  await writeFile(outputFile, bytes, { flag: "wx", mode: 0o444 });
+  return true;
+}
+
+async function publicationReadbackRecords(plan, readbackDirectory, portalRegistryRef) {
+  const root = resolve(readbackDirectory);
+  const expectedFiles = [
+    "jobs-api.oci.tar",
+    "jobs-portal.oci-manifest.json",
+    "jobs-portal.tar",
+    "jobs-runner.oci.tar",
+    "jobs-workflows.oci.tar",
+  ];
+  await requireExactFlatRegularFiles(
+    root,
+    expectedFiles,
+    "Remote publication readback",
+  );
+  const portalArtifact = plan.artifacts.find(
+    (artifact) => artifact.componentId === "jobs-portal",
+  );
+  if (!portalArtifact) {
+    fail("Publication plan is missing its portal artifact");
+  }
+  await validateManagedCloudPortalOciArtifactManifest(
+    portalArtifact,
+    join(root, "jobs-portal.oci-manifest.json"),
+    portalRegistryRef,
+    plan.portalManifestCreatedAt,
+  );
+  const records = [];
+  for (const artifact of plan.artifacts) {
+    const extension = artifact.artifactKind === "oci_image" ? ".oci.tar" : ".tar";
+    const path = join(root, artifact.componentId + extension);
+    const metadata = await requireRegularFile(path);
+    const inventory = await inspectPreparedArtifact(
+      path,
+      artifact.componentId,
+      artifact.artifactKind,
+    );
+    if (inventory.artifactSha256 !== artifact.artifactSha256) {
+      fail(artifact.componentId + " remote readback digest differs from candidate");
+    }
+    const publishedManifestDigest =
+      artifact.artifactKind === "oci_image"
+        ? "sha256:" + artifact.artifactSha256
+        : requireDigest(
+            portalRegistryRef.slice(portalRegistryRef.lastIndexOf("@") + 1),
+            "portal registry digest",
+          );
+    const publishedRegistryRef =
+      artifact.publicationRepository + "@" + publishedManifestDigest;
+    if (
+      artifact.artifactKind === "static_bundle" &&
+      portalRegistryRef !== publishedRegistryRef
+    ) {
+      fail("Portal registry readback is outside the controlled namespace");
+    }
+    if (
+      artifact.artifactKind === "oci_image" &&
+      artifact.signedArtifactRef !== publishedRegistryRef
+    ) {
+      fail(artifact.componentId + " registry readback differs from its signed OCI ref");
+    }
+    if (
+      artifact.artifactKind === "static_bundle" &&
+      ((await hashFile(path)) !== artifact.candidatePayloadSha256 ||
+        metadata.size !== artifact.candidatePayloadSizeBytes)
+    ) {
+      fail("Portal registry readback bytes differ from the exact candidate tar");
+    }
+    records.push({
+      artifactKind: artifact.artifactKind,
+      candidatePayloadSha256: artifact.candidatePayloadSha256,
+      componentId: artifact.componentId,
+      publishedManifestDigest,
+      publishedRegistryRef,
+      readbackArtifactSha256: inventory.artifactSha256,
+      readbackContentSizeBytes: inventory.entries
+        .filter((entry) => entry.type === "file")
+        .reduce((total, entry) => total + entry.sizeBytes, 0),
+      readbackContentInventorySha256: sha256(canonicalJsonBytes(inventory)),
+      signedArtifactRef: artifact.signedArtifactRef,
+    });
+  }
+  return records.sort((left, right) => compareUtf8(left.componentId, right.componentId));
+}
+
+export async function inspectManagedCloudArtifactPublicationReadback({
+  plan,
+  portalRegistryRef,
+  readbackDirectory,
+}) {
+  validateManagedCloudPublicationAdapter(plan.adapter);
+  return publicationReadbackRecords(
+    plan,
+    readbackDirectory,
+    requireString(portalRegistryRef, "portal registry ref"),
+  );
+}
+
+async function validatePublicationSetDocument(publication, plan, authorized) {
+  validateManagedCloudPublicationSetShape(publication);
+  if (
+    publication.version !== 1 ||
+    publication.audience !== MANAGED_CLOUD_AUDIENCES.publicationSet ||
+    validateManagedCloudPublicationAdapter(publication.adapter) !==
+      publication.adapter
+  ) {
+    fail("local_fixture is test-only and cannot supply production publication");
+  }
+  const nowMs = Date.now();
+  if (
+    publication.authorizationSetSha256 !== plan.authorizationSetSha256 ||
+    publication.manifestSha256 !== plan.manifestSha256 ||
+    publication.releaseId !== plan.releaseId ||
+    publication.sourceCommit !== plan.sourceCommit ||
+    publication.attestedAtMs < authorized.authorization.authorizedAtMs ||
+    publication.attestedAtMs > nowMs ||
+    canonicalJsonBytes(publication.nativeArtifact).compare(
+      canonicalJsonBytes(plan.nativeArtifact),
+    ) !== 0 ||
+    canonicalJsonBytes(publication.supplyChainStatus).compare(
+      canonicalJsonBytes(publicationSupplyChainStatus()),
+    ) !== 0
+  ) {
+    fail("Publication set does not bind its exact authorized candidate");
+  }
+  requireHex64(publication.publicationPlanSha256, "publicationPlanSha256");
+  requireInteger(publication.attestedAtMs, "attestedAtMs");
+  requireInteger(publication.workflowRunAttempt, "workflowRunAttempt", 1);
+  requireInteger(publication.workflowRunId, "workflowRunId", 1);
+  const artifacts = requireArray(publication.artifacts, "publication artifacts", 4);
+  if (artifacts.length !== plan.artifacts.length) {
+    fail("Publication set must bind all four artifacts");
+  }
+  for (const [index, expected] of plan.artifacts.entries()) {
+    requirePublicationArtifactRecord(
+      artifacts[index],
+      expected,
+      "publication artifacts[" + index + "]",
+    );
+    if (
+      expected.artifactKind === "oci_image" &&
+      (artifacts[index].publishedManifestDigest !==
+        "sha256:" + expected.artifactSha256 ||
+        artifacts[index].readbackArtifactSha256 !== expected.artifactSha256)
+    ) {
+      fail(expected.componentId + " publication changed its OCI manifest digest");
+    }
+    if (
+      expected.artifactKind === "static_bundle" &&
+      artifacts[index].readbackArtifactSha256 !== expected.artifactSha256
+    ) {
+      fail("Portal publication changed its exact candidate bytes");
     }
   }
-  return payloads;
+  return publication;
+}
+
+export function validateManagedCloudPublicationSetShape(publication) {
+  requireExactKeys(
+    publication,
+    MANAGED_CLOUD_PUBLICATION_SET_KEYS,
+    "publication set",
+  );
+  return true;
+}
+
+export function createManagedCloudPublicationSetDocument({
+  artifacts,
+  attestedAtMs,
+  plan,
+  publicationPlanSha256,
+  workflowRunAttempt,
+  workflowRunId,
+}) {
+  const publication = {
+    adapter: "remote_registry_readback_v1",
+    artifacts,
+    attestedAtMs,
+    audience: MANAGED_CLOUD_AUDIENCES.publicationSet,
+    authorizationSetSha256: plan.authorizationSetSha256,
+    manifestSha256: plan.manifestSha256,
+    nativeArtifact: plan.nativeArtifact,
+    publicationPlanSha256,
+    releaseId: plan.releaseId,
+    sourceCommit: plan.sourceCommit,
+    supplyChainStatus: plan.supplyChainStatus,
+    version: 1,
+    workflowRunAttempt,
+    workflowRunId,
+  };
+  validateManagedCloudPublicationSetShape(publication);
+  return publication;
+}
+
+export async function attestManagedCloudArtifactPublication({
+  authorizedDirectory,
+  expectedRootAnchorSha256,
+  outputFile,
+  planFile,
+  portalRegistryRef,
+  readbackDirectory,
+  workflowRunAttempt,
+  workflowRunId,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const { value: plan } = await readCanonicalJson(planFile, "publication plan");
+  await validatePublicationPlan(plan, authorized);
+  const artifacts = await publicationReadbackRecords(
+    plan,
+    readbackDirectory,
+    requireString(portalRegistryRef, "portal registry ref"),
+  );
+  const nowMs = Date.now();
+  const publication = createManagedCloudPublicationSetDocument({
+    artifacts,
+    attestedAtMs: nowMs,
+    plan,
+    publicationPlanSha256: await hashFile(planFile),
+    workflowRunAttempt: requireInteger(
+      Number(workflowRunAttempt),
+      "workflowRunAttempt",
+      1,
+    ),
+    workflowRunId: requireInteger(Number(workflowRunId), "workflowRunId", 1),
+  });
+  await validatePublicationSetDocument(publication, plan, authorized);
+  await writeCanonicalJson(outputFile, publication);
+  return publication;
+}
+
+export async function validateManagedCloudArtifactPublication({
+  authorizedDirectory,
+  expectedWorkflowRunAttempt,
+  expectedWorkflowRunId,
+  expectedRootAnchorSha256,
+  publicationDirectory,
+  readbackDirectory,
+}) {
+  const root = resolve(publicationDirectory);
+  await requireExactTopLevel(root, REQUIRED_PUBLICATION_FILES);
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const planFile = join(root, "publication-plan.json");
+  const { value: plan } = await readCanonicalJson(planFile, "publication plan");
+  await validatePublicationPlan(plan, authorized);
+  const { value: publication } = await readCanonicalJson(
+    join(root, "publication-set.json"),
+    "publication set",
+  );
+  await validatePublicationSetDocument(publication, plan, authorized);
+  if (
+    expectedWorkflowRunId !== undefined &&
+    publication.workflowRunId !==
+      requireInteger(
+        Number(expectedWorkflowRunId),
+        "expected publication workflowRunId",
+        1,
+      )
+  ) {
+    fail("Publication receipt does not bind the selected protected workflow run");
+  }
+  if (
+    expectedWorkflowRunAttempt !== undefined &&
+    publication.workflowRunAttempt !==
+      requireInteger(
+        Number(expectedWorkflowRunAttempt),
+        "expected publication workflowRunAttempt",
+        1,
+      )
+  ) {
+    fail("Publication receipt does not bind the selected protected workflow attempt");
+  }
+  if (publication.publicationPlanSha256 !== (await hashFile(planFile))) {
+    fail("Publication set does not bind its canonical plan bytes");
+  }
+  if (readbackDirectory !== undefined) {
+    const portal = publication.artifacts.find(
+      (artifact) => artifact.componentId === "jobs-portal",
+    );
+    const portalPlan = plan.artifacts.find(
+      (artifact) => artifact.componentId === "jobs-portal",
+    );
+    const records = await publicationReadbackRecords(
+      plan,
+      readbackDirectory,
+      portalPlan.publicationRepository + "@" + portal.publishedManifestDigest,
+    );
+    if (canonicalJsonBytes(records).compare(canonicalJsonBytes(publication.artifacts)) !== 0) {
+      fail("Independent remote publication readback differs from its receipt");
+    }
+  }
+  return { authorized, plan, publication };
+}
+
+function validatePublicationWorkflowEvidenceDocument(
+  evidence,
+  plan,
+  publication,
+) {
+  requireExactKeys(
+    evidence,
+    [
+      "audience",
+      "artifactDigest",
+      "artifactId",
+      "artifactName",
+      "artifactSizeBytes",
+      "conclusion",
+      "environmentName",
+      "environmentProtectionStatus",
+      "headBranch",
+      "headSha",
+      "jobId",
+      "jobName",
+      "repository",
+      "repositoryId",
+      "runAttempt",
+      "runId",
+      "version",
+      "workflowPath",
+    ],
+    "publication workflow evidence",
+  );
+  if (
+    evidence.version !== 1 ||
+    evidence.audience !==
+      MANAGED_CLOUD_AUDIENCES.publicationWorkflowEvidence ||
+    evidence.conclusion !== "success" ||
+    evidence.environmentName !== MANAGED_CLOUD_PUBLICATION_ENVIRONMENT ||
+    evidence.environmentProtectionStatus !==
+      "workflow_declared_settings_not_attested" ||
+    evidence.jobName !== MANAGED_CLOUD_PUBLICATION_JOB_NAME ||
+    evidence.repository !== plan.sourceRepository ||
+    evidence.repositoryId !== plan.sourceRepositoryId ||
+    evidence.runId !== publication.workflowRunId ||
+    evidence.runAttempt !== publication.workflowRunAttempt ||
+    evidence.headBranch !== plan.sourceDefaultBranch ||
+    evidence.headSha !== plan.sourceCommit ||
+    evidence.workflowPath !== MANAGED_CLOUD_RELEASE_WORKFLOW_PATH
+  ) {
+    fail("Publication workflow evidence is not the exact declared publication job");
+  }
+  requireGitBranchName(evidence.headBranch, "publication workflow headBranch");
+  requireDigest(evidence.artifactDigest, "publication workflow artifactDigest");
+  requireInteger(evidence.artifactId, "publication workflow artifactId", 1);
+  if (
+    evidence.artifactName !==
+    "jobs-managed-cloud-publication-" + evidence.runId + "-" + evidence.runAttempt
+  ) {
+    fail("Publication workflow artifact name is not attempt-qualified");
+  }
+  const artifactSizeBytes = requireInteger(
+    evidence.artifactSizeBytes,
+    "publication workflow artifactSizeBytes",
+    1,
+  );
+  if (artifactSizeBytes > MAX_PUBLICATION_ARTIFACT_ARCHIVE_BYTES) {
+    fail("Publication workflow artifact exceeds the 1 MiB receipt limit");
+  }
+  requireInteger(evidence.jobId, "publication workflow jobId", 1);
+  requireInteger(evidence.repositoryId, "publication workflow repositoryId", 1);
+  requireInteger(evidence.runAttempt, "publication workflow runAttempt", 1);
+  requireInteger(evidence.runId, "publication workflow runId", 1);
+  return evidence;
+}
+
+export function createManagedCloudPublicationWorkflowEvidence({
+  artifacts,
+  defaultBranch,
+  jobs,
+  plan,
+  publication,
+  run,
+}) {
+  requireObject(plan, "publication plan");
+  requireObject(publication, "publication set");
+  requireObject(run, "publication workflow run");
+  const repository = requireObject(
+    run.repository,
+    "publication workflow repository",
+  );
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "publication workflow default branch",
+  );
+  const workflowPath = requireString(run.path, "publication workflow path");
+  const runId = requireInteger(run.id, "publication workflow run.id", 1);
+  const runAttempt = requireInteger(
+    run.run_attempt,
+    "publication workflow run_attempt",
+    1,
+  );
+  if (
+    runId !== publication.workflowRunId ||
+    runAttempt !== publication.workflowRunAttempt ||
+    repository.full_name !== plan.sourceRepository ||
+    repository.id !== plan.sourceRepositoryId ||
+    exactDefaultBranch !== plan.sourceDefaultBranch ||
+    run.event !== "workflow_dispatch" ||
+    run.status !== "completed" ||
+    run.conclusion !== "success" ||
+    run.head_branch !== exactDefaultBranch ||
+    run.head_sha !== plan.sourceCommit ||
+    ![
+      MANAGED_CLOUD_RELEASE_WORKFLOW_PATH,
+      MANAGED_CLOUD_RELEASE_WORKFLOW_PATH + "@" + exactDefaultBranch,
+    ].includes(workflowPath)
+  ) {
+    fail("Selected publication run is not a successful exact-source workflow dispatch");
+  }
+  requireObject(jobs, "publication workflow jobs response");
+  const jobRows = requireArray(jobs.jobs, "publication workflow jobs", 1);
+  const totalCount = requireInteger(
+    jobs.total_count,
+    "publication workflow jobs total_count",
+    1,
+  );
+  if (totalCount !== jobRows.length || totalCount > 100) {
+    fail("Publication workflow jobs response must be complete and unpaginated");
+  }
+  const publicationJobs = jobRows.filter(
+    (job) => job?.name === MANAGED_CLOUD_PUBLICATION_JOB_NAME,
+  );
+  if (publicationJobs.length !== 1) {
+    fail("Publication workflow must contain exactly one publish job");
+  }
+  const job = requireObject(publicationJobs[0], "publication workflow publish job");
+  if (
+    job.run_id !== runId ||
+    job.run_attempt !== runAttempt ||
+    job.head_sha !== plan.sourceCommit ||
+    job.status !== "completed" ||
+    job.conclusion !== "success"
+  ) {
+    fail("Publication workflow publish job did not complete successfully at source");
+  }
+  const steps = requireArray(job.steps, "publication workflow publish steps", 1);
+  const receiptSteps = steps.filter(
+    (step) => step?.name === MANAGED_CLOUD_PUBLICATION_RECEIPT_STEP,
+  );
+  if (
+    receiptSteps.length !== 1 ||
+    receiptSteps[0].status !== "completed" ||
+    receiptSteps[0].conclusion !== "success"
+  ) {
+    fail("Publication workflow did not successfully upload its exact receipt");
+  }
+  requireObject(artifacts, "publication workflow artifacts response");
+  const artifactRows = requireArray(
+    artifacts.artifacts,
+    "publication workflow artifacts",
+    1,
+  );
+  const artifactCount = requireInteger(
+    artifacts.total_count,
+    "publication workflow artifacts total_count",
+    1,
+  );
+  if (artifactCount !== artifactRows.length || artifactCount > 100) {
+    fail("Publication workflow artifacts response must be complete and unpaginated");
+  }
+  const expectedArtifactName =
+    "jobs-managed-cloud-publication-" + runId + "-" + runAttempt;
+  const receiptArtifacts = artifactRows.filter(
+    (artifact) => artifact?.name === expectedArtifactName,
+  );
+  if (receiptArtifacts.length !== 1) {
+    fail("Publication workflow must expose exactly one attempt-qualified receipt");
+  }
+  const artifact = requireObject(
+    receiptArtifacts[0],
+    "publication workflow receipt artifact",
+  );
+  const artifactWorkflowRun = requireObject(
+    artifact.workflow_run,
+    "publication workflow receipt artifact workflow_run",
+  );
+  if (
+    artifact.expired !== false ||
+    artifactWorkflowRun.id !== runId ||
+    artifactWorkflowRun.repository_id !== plan.sourceRepositoryId ||
+    artifactWorkflowRun.head_repository_id !== plan.sourceRepositoryId ||
+    artifactWorkflowRun.head_branch !== exactDefaultBranch ||
+    artifactWorkflowRun.head_sha !== plan.sourceCommit
+  ) {
+    fail("Publication artifact is not bound to the exact repository run and source");
+  }
+  const artifactSizeBytes = requireInteger(
+    artifact.size_in_bytes,
+    "publication workflow receipt artifact size_in_bytes",
+    1,
+  );
+  if (artifactSizeBytes > MAX_PUBLICATION_ARTIFACT_ARCHIVE_BYTES) {
+    fail("Publication workflow artifact exceeds the 1 MiB receipt limit");
+  }
+  const evidence = {
+    audience: MANAGED_CLOUD_AUDIENCES.publicationWorkflowEvidence,
+    artifactDigest: requireDigest(
+      artifact.digest,
+      "publication workflow receipt artifact digest",
+    ),
+    artifactId: requireInteger(
+      artifact.id,
+      "publication workflow receipt artifact id",
+      1,
+    ),
+    artifactName: expectedArtifactName,
+    artifactSizeBytes,
+    conclusion: "success",
+    environmentName: MANAGED_CLOUD_PUBLICATION_ENVIRONMENT,
+    environmentProtectionStatus: "workflow_declared_settings_not_attested",
+    headBranch: exactDefaultBranch,
+    headSha: plan.sourceCommit,
+    jobId: requireInteger(job.id, "publication workflow job.id", 1),
+    jobName: MANAGED_CLOUD_PUBLICATION_JOB_NAME,
+    repository: plan.sourceRepository,
+    repositoryId: plan.sourceRepositoryId,
+    runAttempt,
+    runId,
+    version: 1,
+    workflowPath: MANAGED_CLOUD_RELEASE_WORKFLOW_PATH,
+  };
+  return validatePublicationWorkflowEvidenceDocument(
+    evidence,
+    plan,
+    publication,
+  );
+}
+
+export async function selectManagedCloudPublicationArtifact({
+  artifactsFile,
+  authorizedDirectory,
+  defaultBranch,
+  expectedRootAnchorSha256,
+  jobsFile,
+  outputFile,
+  repository,
+  repositoryId,
+  runAttempt,
+  runFile,
+  runId,
+}) {
+  const authorized = await validateAuthorizedManagedCloudCandidate(
+    authorizedDirectory,
+    expectedRootAnchorSha256,
+  );
+  const candidateRoot = join(authorized.root, "candidate");
+  const { value: testEvidence } = await readCanonicalJson(
+    join(candidateRoot, "test-evidence.json"),
+    "authorized test evidence",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  validateManagedCloudTestEvidence(
+    testEvidence,
+    authorized.manifest.sourceCommit,
+    authorized.manifest.version,
+  );
+  const exactRepository = requireString(repository, "publication repository");
+  const repositoryIdText = requireString(
+    String(repositoryId),
+    "publication repositoryId",
+  );
+  if (!/^[1-9][0-9]*$/.test(repositoryIdText)) {
+    fail("publication repositoryId must be canonical positive decimal");
+  }
+  const exactRepositoryId = requireInteger(
+    Number(repositoryIdText),
+    "publication repositoryId",
+    1,
+  );
+  const exactDefaultBranch = requireGitBranchName(
+    defaultBranch,
+    "publication default branch",
+  );
+  if (
+    testEvidence.version !== 2 ||
+    testEvidence.repository !== exactRepository ||
+    testEvidence.repositoryId !== exactRepositoryId ||
+    testEvidence.defaultBranch !== exactDefaultBranch
+  ) {
+    fail("Authorized candidate does not bind the current repository identity");
+  }
+  const plan = {
+    sourceCommit: authorized.manifest.sourceCommit,
+    sourceDefaultBranch: exactDefaultBranch,
+    sourceRepository: exactRepository,
+    sourceRepositoryId: exactRepositoryId,
+  };
+  const publication = {
+    workflowRunAttempt: requireInteger(
+      Number(runAttempt),
+      "selected publication workflow runAttempt",
+      1,
+    ),
+    workflowRunId: requireInteger(
+      Number(runId),
+      "selected publication workflow runId",
+      1,
+    ),
+  };
+  const run = (
+    await readBoundedJson(
+      runFile,
+      "publication workflow run",
+      MAX_PUBLICATION_WORKFLOW_RUN_BYTES,
+    )
+  ).value;
+  const jobs = (
+    await readBoundedJson(
+      jobsFile,
+      "publication workflow jobs",
+      MAX_PUBLICATION_WORKFLOW_JOBS_BYTES,
+    )
+  ).value;
+  const artifacts = (
+    await readBoundedJson(
+      artifactsFile,
+      "publication workflow artifacts",
+      MAX_PUBLICATION_ARTIFACTS_BYTES,
+    )
+  ).value;
+  const evidence = createManagedCloudPublicationWorkflowEvidence({
+    artifacts,
+    defaultBranch: exactDefaultBranch,
+    jobs,
+    plan,
+    publication,
+    run,
+  });
+  await writeCanonicalJson(outputFile, evidence);
+  return evidence;
+}
+
+function publicationPreflightArtifactRecords(plan, publication) {
+  const publicationByComponent = new Map(
+    publication.artifacts.map((artifact) => [artifact.componentId, artifact]),
+  );
+  return plan.artifacts.map((artifact) => {
+    const published = publicationByComponent.get(artifact.componentId);
+    if (!published) {
+      fail("Publication preflight is missing " + artifact.componentId);
+    }
+    return {
+      artifactKind: artifact.artifactKind,
+      artifactSha256: artifact.artifactSha256,
+      candidatePayloadSha256: artifact.candidatePayloadSha256,
+      candidatePayloadSizeBytes: artifact.candidatePayloadSizeBytes,
+      componentId: artifact.componentId,
+      publishedManifestDigest: published.publishedManifestDigest,
+      publishedRegistryRef: published.publishedRegistryRef,
+    };
+  });
+}
+
+export function validateManagedCloudPublicationPreflightDocument(
+  preflight,
+  expected = {},
+) {
+  requireExactKeys(
+    preflight,
+    MANAGED_CLOUD_PUBLICATION_PREFLIGHT_KEYS,
+    "publication preflight",
+  );
+  if (
+    preflight.version !== 1 ||
+    preflight.audience !== MANAGED_CLOUD_AUDIENCES.publicationPreflight ||
+    validateManagedCloudPublicationAdapter(preflight.adapter) !==
+      preflight.adapter
+  ) {
+    fail("Publication preflight schema or adapter is invalid");
+  }
+  const repository = requireString(
+    preflight.repository,
+    "publication preflight repository",
+  );
+  const repositoryId = requireInteger(
+    preflight.repositoryId,
+    "publication preflight repositoryId",
+    1,
+  );
+  const sourceCommit = requireSourceCommit(preflight.sourceCommit);
+  const defaultBranch = requireGitBranchName(
+    preflight.defaultBranch,
+    "publication preflight defaultBranch",
+  );
+  const registryNamespace = requireRegistryNamespace(
+    preflight.registryNamespace,
+  );
+  const portalManifestCreatedAt = requireCanonicalRfc3339Seconds(
+    preflight.portalManifestCreatedAt,
+    "publication preflight portalManifestCreatedAt",
+  );
+  requireSafeId(preflight.releaseId, "publication preflight releaseId");
+  requireHex64(
+    preflight.publicationPlanSha256,
+    "publication preflight publicationPlanSha256",
+  );
+  requireHex64(
+    preflight.publicationSetSha256,
+    "publication preflight publicationSetSha256",
+  );
+  const artifacts = requireBoundedArray(
+    preflight.artifacts,
+    "publication preflight artifacts",
+    MANAGED_CLOUD_COMPONENTS.length,
+    MANAGED_CLOUD_COMPONENTS.length,
+  );
+  const expectedComponents = [...MANAGED_CLOUD_COMPONENTS].sort((left, right) =>
+    compareUtf8(left.componentId, right.componentId),
+  );
+  for (const [index, component] of expectedComponents.entries()) {
+    const artifact = requireObject(
+      artifacts[index],
+      "publication preflight artifacts[" + index + "]",
+    );
+    requireExactKeys(
+      artifact,
+      MANAGED_CLOUD_PUBLICATION_PREFLIGHT_ARTIFACT_KEYS,
+      "publication preflight artifacts[" + index + "]",
+    );
+    if (
+      artifact.componentId !== component.componentId ||
+      artifact.artifactKind !== component.artifactKind
+    ) {
+      fail("Publication preflight artifacts are not the exact component set");
+    }
+    requireHex64(
+      artifact.artifactSha256,
+      artifact.componentId + " preflight artifactSha256",
+    );
+    requireHex64(
+      artifact.candidatePayloadSha256,
+      artifact.componentId + " preflight candidatePayloadSha256",
+    );
+    requireInteger(
+      artifact.candidatePayloadSizeBytes,
+      artifact.componentId + " preflight candidatePayloadSizeBytes",
+      1,
+    );
+    const manifestDigest = requireDigest(
+      artifact.publishedManifestDigest,
+      artifact.componentId + " preflight publishedManifestDigest",
+    );
+    const repositoryName = publicationRepository(
+      registryNamespace,
+      artifact.componentId,
+    );
+    if (
+      artifact.publishedRegistryRef !== repositoryName + "@" + manifestDigest ||
+      (artifact.artifactKind === "oci_image" &&
+        manifestDigest !== "sha256:" + artifact.artifactSha256)
+    ) {
+      fail("Publication preflight artifact ref is outside its exact authority");
+    }
+  }
+  const workflowEvidencePlan = {
+    sourceCommit,
+    sourceDefaultBranch: defaultBranch,
+    sourceRepository: repository,
+    sourceRepositoryId: repositoryId,
+  };
+  const workflowEvidencePublication = {
+    workflowRunAttempt: preflight.workflowEvidence?.runAttempt,
+    workflowRunId: preflight.workflowEvidence?.runId,
+  };
+  validatePublicationWorkflowEvidenceDocument(
+    preflight.workflowEvidence,
+    workflowEvidencePlan,
+    workflowEvidencePublication,
+  );
+  if (
+    expected.plan !== undefined &&
+    (preflight.adapter !== expected.plan.adapter ||
+      preflight.defaultBranch !== expected.plan.sourceDefaultBranch ||
+      preflight.portalManifestCreatedAt !==
+        expected.plan.portalManifestCreatedAt ||
+      preflight.registryNamespace !== expected.plan.registryNamespace ||
+      preflight.releaseId !== expected.plan.releaseId ||
+      preflight.repository !== expected.plan.sourceRepository ||
+      preflight.repositoryId !== expected.plan.sourceRepositoryId ||
+      preflight.sourceCommit !== expected.plan.sourceCommit)
+  ) {
+    fail("Publication preflight does not bind its exact publication plan");
+  }
+  if (
+    expected.publication !== undefined &&
+    (preflight.adapter !== expected.publication.adapter ||
+      preflight.publicationPlanSha256 !==
+        expected.publication.publicationPlanSha256 ||
+      preflight.workflowEvidence.runAttempt !==
+        expected.publication.workflowRunAttempt ||
+      preflight.workflowEvidence.runId !==
+        expected.publication.workflowRunId)
+  ) {
+    fail("Publication preflight does not bind its exact publication set");
+  }
+  if (
+    expected.plan !== undefined &&
+    expected.publication !== undefined &&
+    canonicalJsonBytes(preflight.artifacts).compare(
+      canonicalJsonBytes(
+        publicationPreflightArtifactRecords(
+          expected.plan,
+          expected.publication,
+        ),
+      ),
+    ) !== 0
+  ) {
+    fail("Publication preflight artifact set differs from its receipt");
+  }
+  if (
+    canonicalJsonBytes(preflight).length > MAX_PUBLICATION_PREFLIGHT_BYTES
+  ) {
+    fail("Publication preflight exceeds the 128 KiB canonical limit");
+  }
+  return {
+    defaultBranch,
+    portalManifestCreatedAt,
+    registryNamespace,
+  };
+}
+
+export function createManagedCloudPublicationPreflightDocument({
+  plan,
+  publication,
+  publicationPlanSha256,
+  publicationSetSha256,
+  workflowEvidence,
+}) {
+  validateManagedCloudPublicationPlanShape(plan);
+  validateManagedCloudPublicationSetShape(publication);
+  const preflight = {
+    adapter: publication.adapter,
+    artifacts: publicationPreflightArtifactRecords(plan, publication),
+    audience: MANAGED_CLOUD_AUDIENCES.publicationPreflight,
+    defaultBranch: plan.sourceDefaultBranch,
+    portalManifestCreatedAt: plan.portalManifestCreatedAt,
+    publicationPlanSha256,
+    publicationSetSha256,
+    registryNamespace: plan.registryNamespace,
+    releaseId: plan.releaseId,
+    repository: plan.sourceRepository,
+    repositoryId: plan.sourceRepositoryId,
+    sourceCommit: plan.sourceCommit,
+    version: 1,
+    workflowEvidence,
+  };
+  validateManagedCloudPublicationPreflightDocument(preflight, {
+    plan,
+    publication,
+  });
+  return preflight;
+}
+
+export async function createManagedCloudArtifactPublicationPreflight({
+  authorizedDirectory,
+  defaultBranch,
+  expectedRootAnchorSha256,
+  outputFile,
+  publicationDirectory,
+  publicationWorkflowEvidenceFile,
+  repository,
+  repositoryId,
+}) {
+  const { value: selectedWorkflowEvidence } = await readCanonicalJson(
+    publicationWorkflowEvidenceFile,
+    "selected publication workflow evidence",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  const publicationValidation =
+    await validateManagedCloudArtifactPublication({
+      authorizedDirectory,
+      expectedWorkflowRunAttempt: selectedWorkflowEvidence.runAttempt,
+      expectedWorkflowRunId: selectedWorkflowEvidence.runId,
+      expectedRootAnchorSha256,
+      publicationDirectory,
+    });
+  validateManagedCloudPublicationRuntimeIdentity({
+    defaultBranch,
+    plan: publicationValidation.plan,
+    repository,
+    repositoryId,
+    sourceCommit: publicationValidation.plan.sourceCommit,
+  });
+  validatePublicationWorkflowEvidenceDocument(
+    selectedWorkflowEvidence,
+    publicationValidation.plan,
+    publicationValidation.publication,
+  );
+  const publicationRoot = resolve(publicationDirectory);
+  const preflight = createManagedCloudPublicationPreflightDocument({
+    plan: publicationValidation.plan,
+    publication: publicationValidation.publication,
+    publicationPlanSha256: await hashFile(
+      join(publicationRoot, "publication-plan.json"),
+    ),
+    publicationSetSha256: await hashFile(
+      join(publicationRoot, "publication-set.json"),
+    ),
+    workflowEvidence: selectedWorkflowEvidence,
+  });
+  await writeCanonicalJson(outputFile, preflight);
+  return preflight;
+}
+
+async function validatePublicationPreflightAgainstPublication(
+  preflightFile,
+  plan,
+  publication,
+  publicationDirectory,
+) {
+  const { value: preflight } = await readCanonicalJson(
+    preflightFile,
+    "publication preflight",
+    MAX_PUBLICATION_PREFLIGHT_BYTES,
+  );
+  validateManagedCloudPublicationPreflightDocument(preflight, {
+    plan,
+    publication,
+  });
+  const publicationRoot = resolve(publicationDirectory);
+  if (
+    preflight.publicationPlanSha256 !==
+      (await hashFile(join(publicationRoot, "publication-plan.json"))) ||
+    preflight.publicationSetSha256 !==
+      (await hashFile(join(publicationRoot, "publication-set.json")))
+  ) {
+    fail("Publication preflight does not bind the exact canonical receipt bytes");
+  }
+  return preflight;
 }
 
 async function validatePublishedPayloads(root, candidateSet) {
@@ -5764,9 +7766,7 @@ async function validatePublishedPayloads(root, candidateSet) {
   const files = await collectTreeFiles(root);
   if (
     files.length !== expected.length ||
-    files.some(
-      (file, index) => file.relativePath !== expected[index].path,
-    )
+    files.some((file, index) => file.relativePath !== expected[index].path)
   ) {
     fail("Published/readback payload tree is not exact");
   }
@@ -5790,6 +7790,9 @@ export async function promoteManagedCloudCandidate({
   evidenceDirectory,
   expectedRootAnchorSha256,
   outputDirectory,
+  publicationDirectory,
+  publicationPreflightFile,
+  publicationReadbackDirectory,
   promotionId,
 }) {
   const output = resolve(outputDirectory);
@@ -5851,6 +7854,29 @@ export async function promoteManagedCloudCandidate({
   if (activationSignatures.signedAtMs < activation.issuedAtMs) {
     fail("Activation signature cannot predate activation issuance");
   }
+  const { value: preflightReceipt } = await readCanonicalJson(
+    publicationPreflightFile,
+    "publication preflight",
+    MAX_PUBLICATION_PREFLIGHT_BYTES,
+  );
+  validateManagedCloudPublicationPreflightDocument(preflightReceipt);
+  const publicationValidation =
+    await validateManagedCloudArtifactPublication({
+      authorizedDirectory,
+      expectedWorkflowRunAttempt: preflightReceipt.workflowEvidence.runAttempt,
+      expectedWorkflowRunId: preflightReceipt.workflowEvidence.runId,
+      expectedRootAnchorSha256,
+      publicationDirectory,
+      readbackDirectory: publicationReadbackDirectory,
+    });
+  const publicationPreflight =
+    await validatePublicationPreflightAgainstPublication(
+      publicationPreflightFile,
+      publicationValidation.plan,
+      publicationValidation.publication,
+      publicationDirectory,
+    );
+  const publicationWorkflowEvidence = publicationPreflight.workflowEvidence;
   await cp(resolve(authorizedDirectory), join(output, "authorized-candidate"), {
     errorOnExist: true,
     force: false,
@@ -5873,10 +7899,14 @@ export async function promoteManagedCloudCandidate({
     force: false,
     recursive: true,
   });
-  const publishedPayloads = await copyPublishedPayloads(
-    join(resolve(authorizedDirectory), "candidate"),
-    join(output, "published"),
-    join(output, "readback"),
+  await cp(resolve(publicationDirectory), join(output, "publication"), {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  await writeCanonicalJson(
+    join(output, "publication-workflow-evidence.json"),
+    publicationWorkflowEvidence,
   );
   const promotion = {
     activationSha256: await hashFile(activationFile),
@@ -5884,8 +7914,8 @@ export async function promoteManagedCloudCandidate({
       activationSignatureSetFile,
     ),
     activationSignerKeyIds,
-    adapter: "local_fixture",
-    audience: MANAGED_CLOUD_AUDIENCES.promotion,
+    adapter: "remote_registry_readback_v1",
+    audience: MANAGED_CLOUD_AUDIENCES.promotionV2,
     authorizationSetSha256: await hashFile(
       join(resolve(authorizedDirectory), "authorization-set.json"),
     ),
@@ -5893,14 +7923,18 @@ export async function promoteManagedCloudCandidate({
     cohortSignatureSetSha256: await hashFile(cohortSignatureSetFile),
     cohortSignerKeyIds,
     manifestSha256: authorized.candidate.manifestSha256,
+    publicationSetSha256: await hashFile(
+      join(resolve(publicationDirectory), "publication-set.json"),
+    ),
+    publicationWorkflowEvidenceSha256: await hashFile(
+      join(output, "publication-workflow-evidence.json"),
+    ),
     promotedAtMs: Date.now(),
     promotionId: requireSafeId(promotionId, "promotionId"),
-    publishedPayloads,
-    readbackPayloads: publishedPayloads,
     releaseSignatureSetSha256:
       authorized.authorization.releaseSignatureSetSha256,
     trustGeneration: authorized.policy.trustGeneration,
-    version: 1,
+    version: 2,
   };
   await writeCanonicalJson(join(output, "promotion-set.json"), promotion);
   return promotion;
@@ -5911,7 +7945,26 @@ export async function validateManagedCloudPromotion(
   expectedRootAnchorSha256,
 ) {
   const root = resolve(promotionDirectory);
-  await requireExactTopLevel(root, REQUIRED_PROMOTION_FILES);
+  const { value: promotion } = await readCanonicalJson(
+    join(root, "promotion-set.json"),
+    "promotion set",
+    MAX_SIGNED_OBJECT_BYTES,
+  );
+  const isHistoricalV1 =
+    promotion.version === 1 &&
+    promotion.audience === MANAGED_CLOUD_AUDIENCES.promotion &&
+    promotion.adapter === "local_fixture";
+  const isRemoteV2 =
+    promotion.version === 2 &&
+    promotion.audience === MANAGED_CLOUD_AUDIENCES.promotionV2 &&
+    promotion.adapter === "remote_registry_readback_v1";
+  if (!isHistoricalV1 && !isRemoteV2) {
+    fail("Promotion generation, audience, and adapter are not an admitted set");
+  }
+  await requireExactTopLevel(
+    root,
+    isHistoricalV1 ? REQUIRED_PROMOTION_FILES_V1 : REQUIRED_PROMOTION_FILES_V2,
+  );
   const authorized = await validateAuthorizedManagedCloudCandidate(
     join(root, "authorized-candidate"),
     expectedRootAnchorSha256,
@@ -5964,12 +8017,9 @@ export async function validateManagedCloudPromotion(
   if (activationSignatures.signedAtMs < activation.issuedAtMs) {
     fail("Activation signature cannot predate activation issuance");
   }
-  const { value: promotion } = await readCanonicalJson(
-    join(root, "promotion-set.json"),
-  );
   requireExactKeys(
     promotion,
-    [
+    isHistoricalV1 ? [
       "activationSha256",
       "activationSignatureSetSha256",
       "activationSignerKeyIds",
@@ -5987,15 +8037,30 @@ export async function validateManagedCloudPromotion(
       "releaseSignatureSetSha256",
       "trustGeneration",
       "version",
+    ] : [
+      "activationSha256",
+      "activationSignatureSetSha256",
+      "activationSignerKeyIds",
+      "adapter",
+      "audience",
+      "authorizationSetSha256",
+      "cohortSha256",
+      "cohortSignatureSetSha256",
+      "cohortSignerKeyIds",
+      "manifestSha256",
+      "publicationSetSha256",
+      "publicationWorkflowEvidenceSha256",
+      "promotedAtMs",
+      "promotionId",
+      "releaseSignatureSetSha256",
+      "trustGeneration",
+      "version",
     ],
     "promotion set",
   );
   requireSafeId(promotion.promotionId, "promotionId");
   requireInteger(promotion.promotedAtMs, "promotedAtMs");
   if (
-    promotion.version !== 1 ||
-    promotion.audience !== MANAGED_CLOUD_AUDIENCES.promotion ||
-    promotion.adapter !== "local_fixture" ||
     promotion.manifestSha256 !== authorized.candidate.manifestSha256 ||
     promotion.activationSha256 !==
       (await hashFile(join(root, "activation.json"))) ||
@@ -6019,25 +8084,56 @@ export async function validateManagedCloudPromotion(
   ) {
     fail("Promotion set does not bind its exact authorized bytes");
   }
-  const publishedPayloads = await validatePublishedPayloads(
-    join(root, "published"),
-    authorized.candidate,
-  );
-  const readbackPayloads = await validatePublishedPayloads(
-    join(root, "readback"),
-    authorized.candidate,
-  );
-  if (
-    canonicalJsonBytes(promotion.publishedPayloads).compare(
-      canonicalJsonBytes(publishedPayloads),
-    ) !== 0 ||
-    canonicalJsonBytes(promotion.readbackPayloads).compare(
-      canonicalJsonBytes(readbackPayloads),
-    ) !== 0
-  ) {
-    fail("Promotion receipt does not bind published and read-back bytes");
+  if (isHistoricalV1) {
+    const publishedPayloads = await validatePublishedPayloads(
+      join(root, "published"),
+      authorized.candidate,
+    );
+    const readbackPayloads = await validatePublishedPayloads(
+      join(root, "readback"),
+      authorized.candidate,
+    );
+    if (
+      canonicalJsonBytes(promotion.publishedPayloads).compare(
+        canonicalJsonBytes(publishedPayloads),
+      ) !== 0 ||
+      canonicalJsonBytes(promotion.readbackPayloads).compare(
+        canonicalJsonBytes(readbackPayloads),
+      ) !== 0
+    ) {
+      fail("Historical promotion does not bind published and read-back bytes");
+    }
+    return { activation, authorized, promotion, promotionGeneration: 1 };
   }
-  return { activation, authorized, promotion };
+  if (
+    promotion.publicationSetSha256 !==
+      (await hashFile(join(root, "publication/publication-set.json"))) ||
+    promotion.publicationWorkflowEvidenceSha256 !==
+      (await hashFile(join(root, "publication-workflow-evidence.json")))
+  ) {
+    fail("Remote promotion does not bind its publication receipt bytes");
+  }
+  const publication = await validateManagedCloudArtifactPublication({
+    authorizedDirectory: join(root, "authorized-candidate"),
+    expectedRootAnchorSha256,
+    publicationDirectory: join(root, "publication"),
+  });
+  if (
+    publication.publication.manifestSha256 !==
+    authorized.candidate.manifestSha256
+  ) {
+    fail("Promotion receipt does not bind remote publication authority");
+  }
+  const { value: publicationWorkflowEvidence } = await readCanonicalJson(
+    join(root, "publication-workflow-evidence.json"),
+    "publication workflow evidence",
+  );
+  validatePublicationWorkflowEvidenceDocument(
+    publicationWorkflowEvidence,
+    publication.plan,
+    publication.publication,
+  );
+  return { activation, authorized, promotion, promotionGeneration: 2 };
 }
 
 export function validateManagedCloudRollbackSuccessor(rollback, from, to) {
@@ -6089,6 +8185,9 @@ export async function createManagedCloudRollback({
     toPromotionDirectory,
     expectedRootAnchorSha256,
   );
+  if (from.promotionGeneration !== 2 || to.promotionGeneration !== 2) {
+    fail("New rollback authority requires two remote promotion v2 inputs");
+  }
   const { value: rollback } = await readCanonicalJson(rollbackFile, "rollback");
   requireSignedObjectSize(rollback, "rollback");
   requireExactKeys(
@@ -6113,8 +8212,8 @@ export async function createManagedCloudRollback({
     "rollback",
   );
   if (
-    rollback.version !== 1 ||
-    rollback.audience !== MANAGED_CLOUD_AUDIENCES.rollback
+    rollback.version !== 2 ||
+    rollback.audience !== MANAGED_CLOUD_AUDIENCES.rollbackV2
   ) {
     fail("Rollback audience or schema version is invalid");
   }
@@ -6156,7 +8255,7 @@ export async function createManagedCloudRollback({
   );
   const signerKeyIds = verifyManagedCloudSignatureSet({
     expectedRole: authorityRoleForChannel(scope.channel),
-    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.rollback,
+    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.rollbackV2,
     expectedTargetBytes: await readFile(rollbackFile),
     policy: to.authorized.policy,
     signatureSet: signatures,
@@ -6181,7 +8280,7 @@ export async function createManagedCloudRollback({
     0,
   );
   const rollbackSet = {
-    audience: "bluey-jobs-managed-cloud-rollback-set-v1",
+    audience: MANAGED_CLOUD_AUDIENCES.rollbackSetV2,
     fromPromotionSha256: await hashFile(
       join(resolve(fromPromotionDirectory), "promotion-set.json"),
     ),
@@ -6191,7 +8290,7 @@ export async function createManagedCloudRollback({
     targetPromotionSha256: await hashFile(
       join(resolve(toPromotionDirectory), "promotion-set.json"),
     ),
-    version: 1,
+    version: 2,
   };
   await writeCanonicalJson(join(output, "rollback-set.json"), rollbackSet);
   return rollbackSet;
@@ -6211,6 +8310,16 @@ export async function validateManagedCloudRollback(
     join(root, "target-promotion"),
     expectedRootAnchorSha256,
   );
+  if (from.promotionGeneration !== to.promotionGeneration) {
+    fail("Rollback cannot mix historical and remote promotion generations");
+  }
+  const rollbackGeneration = from.promotionGeneration;
+  const expectedRollbackAudience = rollbackGeneration === 1
+    ? MANAGED_CLOUD_AUDIENCES.rollback
+    : MANAGED_CLOUD_AUDIENCES.rollbackV2;
+  const expectedRollbackSetAudience = rollbackGeneration === 1
+    ? MANAGED_CLOUD_AUDIENCES.rollbackSet
+    : MANAGED_CLOUD_AUDIENCES.rollbackSetV2;
   const { value: rollback } = await readCanonicalJson(
     join(root, "rollback.json"),
   );
@@ -6237,8 +8346,8 @@ export async function validateManagedCloudRollback(
     "rollback",
   );
   if (
-    rollback.version !== 1 ||
-    rollback.audience !== MANAGED_CLOUD_AUDIENCES.rollback
+    rollback.version !== rollbackGeneration ||
+    rollback.audience !== expectedRollbackAudience
   ) {
     fail("Rollback audience or version is invalid");
   }
@@ -6274,7 +8383,7 @@ export async function validateManagedCloudRollback(
   validateManagedCloudRollbackSuccessor(rollback, from, to);
   const signerKeyIds = verifyManagedCloudSignatureSet({
     expectedRole: authorityRoleForChannel(scope.channel),
-    expectedTargetAudience: MANAGED_CLOUD_AUDIENCES.rollback,
+    expectedTargetAudience: expectedRollbackAudience,
     expectedTargetBytes: await readFile(join(root, "rollback.json")),
     policy: to.authorized.policy,
     signatureSet: signatures,
@@ -6299,8 +8408,8 @@ export async function validateManagedCloudRollback(
     "rollback set",
   );
   if (
-    rollbackSet.version !== 1 ||
-    rollbackSet.audience !== "bluey-jobs-managed-cloud-rollback-set-v1" ||
+    rollbackSet.version !== rollbackGeneration ||
+    rollbackSet.audience !== expectedRollbackSetAudience ||
     rollbackSet.fromPromotionSha256 !==
       (await hashFile(join(root, "from-promotion/promotion-set.json"))) ||
     rollbackSet.targetPromotionSha256 !==
@@ -6327,17 +8436,66 @@ function markedSection(text, marker) {
   return text.slice(start + begin.length, finish);
 }
 
+function namedWorkflowStep(section, name) {
+  const marker = `      - name: ${name}`;
+  const start = section.indexOf(marker);
+  if (start < 0 || section.indexOf(marker, start + marker.length) >= 0) {
+    fail(`Release workflow must contain one unambiguous ${name} step`);
+  }
+  const next = section.indexOf("\n      - ", start + marker.length);
+  return section.slice(start, next < 0 ? section.length : next);
+}
+
 export async function validateManagedCloudWorkflowContract(workflowFile) {
   const text = await readFile(workflowFile, "utf8");
   const releaseSections = [
     "CANDIDATE-BUILD",
     "VERIFY-NO-REBUILD",
     "AUTHORIZE-NO-REBUILD",
+    "PUBLISH-REMOTE",
     "PROMOTE-NO-REBUILD",
     "ROLLBACK-NO-REBUILD",
   ];
   for (const marker of releaseSections) {
     markedSection(text, marker);
+  }
+  const globalPermissions = text.match(
+    /(?:^|\n)permissions:\n((?:  [^\n]+\n)+)/,
+  );
+  if (
+    globalPermissions === null ||
+    globalPermissions[1].trim() !== "contents: read"
+  ) {
+    fail("Global workflow permissions must be contents: read only");
+  }
+  const jobPermissionContracts = new Map([
+    ["CANDIDATE-BUILD", ["actions: read", "contents: read"]],
+    ["VERIFY-NO-REBUILD", ["actions: read", "contents: read"]],
+    ["AUTHORIZE-NO-REBUILD", ["actions: read", "contents: read"]],
+    [
+      "PUBLISH-REMOTE",
+      ["actions: read", "contents: read", "packages: write"],
+    ],
+    [
+      "PROMOTE-NO-REBUILD",
+      ["actions: read", "contents: read", "packages: read"],
+    ],
+    ["ROLLBACK-NO-REBUILD", ["actions: read", "contents: read"]],
+  ]);
+  for (const [marker, expected] of jobPermissionContracts) {
+    const section = markedSection(text, marker);
+    const permissions = section.match(/\n    permissions:\n((?:      [^\n]+\n)+)/);
+    const observed = permissions?.[1]
+      .trim()
+      .split("\n")
+      .map((line) => line.trim());
+    if (
+      permissions === null ||
+      section.split("\n    permissions:").length - 1 !== 1 ||
+      JSON.stringify(observed) !== JSON.stringify(expected)
+    ) {
+      fail(marker + " must declare exact least-privilege job-local permissions");
+    }
   }
   const forbiddenCommands = [
     /\b(?:cargo\s+(?:build|install)|docker\s+(?:build|buildx))\b/i,
@@ -6373,6 +8531,7 @@ export async function validateManagedCloudWorkflowContract(workflowFile) {
     "actions/download-artifact",
     "actions/setup-node",
     "actions/upload-artifact",
+    "oras-project/setup-oras",
   ]);
   for (const match of text.matchAll(/uses:\s*([^\s#]+)/g)) {
     const [action, revision, extra] = match[1].split("@");
@@ -6442,6 +8601,287 @@ export async function validateManagedCloudWorkflowContract(workflowFile) {
       "Workflow must build the exact source-verification v2 candidate " +
         "while direct and global discovery remain disabled",
     );
+  }
+  const publicationSection = markedSection(text, "PUBLISH-REMOTE");
+  const promotionSection = markedSection(text, "PROMOTE-NO-REBUILD");
+  if (
+    candidateBuildSection.split("vars.BLUEY_JOBS_ARTIFACT_NAMESPACE").length - 1 !== 2 ||
+    candidateBuildSection.split("vars.BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN").length - 1 !== 2 ||
+    !candidateBuildSection.includes("ci-evidence") ||
+    candidateBuildSection.split(
+      "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    ).length - 1 !== 1 ||
+    !candidateBuildSection.includes('--default-branch "$DEFAULT_BRANCH"') ||
+    !candidateBuildSection.includes("jobs_ci_run_id") ||
+    !candidateBuildSection.includes("observability_run_id") ||
+    candidateBuildSection.includes("managed-cloud-test-evidence-v1") ||
+    text.includes("`ghcr.io/bluey/")
+  ) {
+    fail(
+      "Candidate must bind controlled namespaces and successful exact-tip CI evidence",
+    );
+  }
+  const candidateRunCaptures = [
+    {
+      endpoint:
+        'gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$JOBS_CI_RUN_ID"',
+      output: "release/prepared/jobs-ci-run.json",
+    },
+    {
+      endpoint:
+        'gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$OBSERVABILITY_RUN_ID"',
+      output: "release/prepared/observability-run.json",
+    },
+  ];
+  const candidateRunCaptureStep = namedWorkflowStep(
+    candidateBuildSection,
+    "Bind successful exact-tip CI instead of synthetic candidate evidence",
+  );
+  if (
+    candidateBuildSection.split("publication-api-capture").length - 1 !== 2 ||
+    candidateRunCaptureStep.split("publication-api-capture").length - 1 !== 2 ||
+    candidateBuildSection.split("--kind run --out").length - 1 !== 2 ||
+    candidateRunCaptureStep.split("--kind run --out").length - 1 !== 2 ||
+    candidateBuildSection.includes("> release/prepared/jobs-ci-run.json") ||
+    candidateBuildSection.includes("> release/prepared/observability-run.json")
+  ) {
+    fail("Candidate CI runs must use exactly two atomic 128 KiB captures");
+  }
+  if (
+    candidateRunCaptureStep.split(
+      "        run: |\n          set -euo pipefail\n",
+    ).length - 1 !== 1
+  ) {
+    fail(
+      "Candidate exact-tip CI capture step must enable pipefail before both producer pipelines",
+    );
+  }
+  for (const { endpoint, output } of candidateRunCaptures) {
+    const pipeline =
+      `if ! ${endpoint} \\\n` +
+      "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
+      "publication-api-capture \\\n" +
+      `                --kind run --out ${output}`;
+    const cleanup = `rm -f -- ${output} \\\n              ${output}.partial`;
+    if (
+      candidateBuildSection.split(endpoint).length - 1 !== 1 ||
+      candidateBuildSection.split(output).length - 1 !== 4 ||
+      !candidateRunCaptureStep.includes(pipeline) ||
+      !candidateRunCaptureStep.includes(cleanup)
+    ) {
+      fail(
+        "Candidate CI run capture must fail closed without final or partial output",
+      );
+    }
+  }
+  const portalReadbackMarkers = [
+    'oras manifest fetch "$PORTAL_REGISTRY_REF"',
+    "publication-portal-capture",
+    "--out publication-readback/jobs-portal.oci-manifest.json",
+    "rm -f -- publication-readback/jobs-portal.oci-manifest.json",
+    "publication-readback/jobs-portal.oci-manifest.json.partial",
+    "publication-portal-manifest",
+    "publication-portal-readback",
+    "--manifest publication-readback/jobs-portal.oci-manifest.json",
+    "--download portal-download",
+    "--out publication-readback/jobs-portal.tar",
+  ];
+  for (const [label, section] of [
+    ["Publication", publicationSection],
+    ["Promotion", promotionSection],
+  ]) {
+    const fetchIndex = section.indexOf(
+      'oras manifest fetch "$PORTAL_REGISTRY_REF"',
+    );
+    const captureIndex = section.indexOf("publication-portal-capture");
+    const manifestIndex = section.indexOf("publication-portal-manifest");
+    const pullIndex = section.indexOf(
+      'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
+    );
+    const readbackIndex = section.indexOf("publication-portal-readback");
+    if (
+      portalReadbackMarkers.some((marker) => !section.includes(marker)) ||
+      section.includes(
+        "--output publication-readback/jobs-portal.oci-manifest.json",
+      ) ||
+      fetchIndex < 0 ||
+      captureIndex <= fetchIndex ||
+      manifestIndex <= captureIndex ||
+      pullIndex <= manifestIndex ||
+      readbackIndex <= pullIndex
+    ) {
+      fail(label + " must verify the exact portal OCI manifest and one-file pull");
+    }
+  }
+  const publicationRuntimeIndex = publicationSection.indexOf(
+    "publication-runtime",
+  );
+  const registryLoginIndex = publicationSection.indexOf("oras login ghcr.io");
+  if (
+    !publicationSection.includes(
+      "environment: jobs-managed-cloud-artifact-publication",
+    ) ||
+    publicationSection.split("packages: write").length - 1 !== 1 ||
+    !publicationSection.includes(
+      "uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3",
+    ) ||
+    !publicationSection.includes("oras cp --from-oci-layout") ||
+    !publicationSection.includes("oras cp --to-oci-layout") ||
+    !publicationSection.includes(
+      'tar --extract --file "authorized/candidate/payloads/$component.oci.tar"',
+    ) ||
+    !publicationSection.includes(
+      '"publication-source/$component@sha256:$DIGEST" "$TAG_REF"',
+    ) ||
+    !publicationSection.includes(
+      '"publication-layout/$component:$GITHUB_RUN_ID"',
+    ) ||
+    !publicationSection.includes(
+      'publication-readback/$component.oci.tar',
+    ) ||
+    publicationRuntimeIndex < 0 ||
+    registryLoginIndex <= publicationRuntimeIndex ||
+    publicationSection.split(
+      "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    ).length - 1 !== 1 ||
+    !publicationSection.includes('--authorized authorized') ||
+    !publicationSection.includes(
+      '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+    ) ||
+    !publicationSection.includes('--default-branch "$DEFAULT_BRANCH"') ||
+    !publicationSection.includes('--source-commit "$GITHUB_SHA"') ||
+    !publicationSection.includes('--repository "$GITHUB_REPOSITORY"') ||
+    !publicationSection.includes('--repository-id "$GITHUB_REPOSITORY_ID"') ||
+    !publicationSection.includes(
+      '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+    ) ||
+    !publicationSection.includes(
+      "process.stdout.write(plan.portalManifestCreatedAt)",
+    ) ||
+    !publicationSection.includes("--plan publication/publication-plan.json") ||
+    !publicationSection.includes("publication-attest") ||
+    !publicationSection.includes("publication-verify") ||
+    !publicationSection.includes(
+      "name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}",
+    ) ||
+    publicationSection.split(
+      '--workflow-run-attempt "$GITHUB_RUN_ATTEMPT"',
+    ).length - 1 !== 2 ||
+    publicationSection.includes("local_fixture") ||
+    text.split("packages: write").length - 1 !== 1
+  ) {
+    fail(
+      "Remote publication must use one protected package writer and immutable readback",
+    );
+  }
+  if (
+    !promotionSection.includes("environment: jobs-managed-cloud-release") ||
+    !promotionSection.includes("packages: read") ||
+    !promotionSection.includes("publication_run_id") ||
+    !promotionSection.includes("publication_run_attempt") ||
+    !promotionSection.includes("canonical positive safe integer") ||
+    !promotionSection.includes("Number.isSafeInteger(Number(value))") ||
+    promotionSection.split(
+      "PUBLICATION_RUN_ID: ${{ github.event.inputs.publication_run_id }}",
+    ).length - 1 !== 2 ||
+    !promotionSection.includes(
+      '"publication-layout/$component:$GITHUB_RUN_ID"',
+    ) ||
+    !promotionSection.includes(
+      'publication-readback/$component.oci.tar',
+    ) ||
+    !promotionSection.includes("publication-verify") ||
+    promotionSection.split(
+      "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+    ).length - 1 !== 2 ||
+    !promotionSection.includes('--default-branch "$DEFAULT_BRANCH"') ||
+    !promotionSection.includes(
+      "managed-cloud-release-gate.mjs publication-preflight",
+    ) ||
+    !promotionSection.includes("--publication-preflight publication-preflight.json") ||
+    !promotionSection.includes('--repository "$GITHUB_REPOSITORY"') ||
+    !promotionSection.includes('--repository-id "$GITHUB_REPOSITORY_ID"') ||
+    !promotionSection.includes("--publication publication") ||
+    !promotionSection.includes("--publication-readback publication-readback") ||
+    !promotionSection.includes(
+      '/attempts/$PUBLICATION_RUN_ATTEMPT"',
+    ) ||
+    !promotionSection.includes(
+      '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+    ) ||
+    !promotionSection.includes(
+      '/artifacts?per_page=100"',
+    ) ||
+    !promotionSection.includes("publication-artifact-select") ||
+    promotionSection.split("publication-api-capture").length - 1 !== 3 ||
+    !promotionSection.includes("--kind run --out publication-workflow-run.json") ||
+    !promotionSection.includes("--kind jobs --out publication-workflow-jobs.json") ||
+    !promotionSection.includes(
+      "--kind artifacts --out publication-workflow-artifacts.json",
+    ) ||
+    !promotionSection.includes(
+      "rm -f -- publication-workflow-run.json publication-workflow-run.json.partial",
+    ) ||
+    !promotionSection.includes(
+      "rm -f -- publication-workflow-jobs.json publication-workflow-jobs.json.partial",
+    ) ||
+    !promotionSection.includes(
+      "rm -f -- publication-workflow-artifacts.json publication-workflow-artifacts.json.partial",
+    ) ||
+    !promotionSection.includes("artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}") ||
+    !promotionSection.includes("merge-multiple: true") ||
+    !promotionSection.includes(
+      "--publication-workflow-evidence publication-workflow-evidence.json",
+    ) ||
+    !promotionSection.includes(
+      '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+    ) ||
+    !promotionSection.includes('--workflow-run-id "$PUBLICATION_RUN_ID"') ||
+    !promotionSection.includes('--workflow-run-attempt "$PUBLICATION_RUN_ATTEMPT"') ||
+    promotionSection.includes("filter=latest") ||
+    promotionSection.includes("name: jobs-managed-cloud-publication\n") ||
+    promotionSection.includes(
+      'require("./publication/publication-plan.json")',
+    ) ||
+    promotionSection.includes(
+      'require("./publication/publication-set.json")',
+    ) ||
+    promotionSection.includes(
+      '--workflow-run-id "${{ github.event.inputs.publication_run_id }}"',
+    ) ||
+    promotionSection.includes("local_fixture")
+  ) {
+    fail("Promotion must independently read back the protected remote publication");
+  }
+  const publicationJobsReadIndex = promotionSection.indexOf(
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+  );
+  const publicationSelectionIndex = promotionSection.indexOf(
+    "publication-artifact-select",
+  );
+  const publicationDownloadIndex = promotionSection.indexOf(
+    "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+  );
+  const promotionPreflightIndex = promotionSection.indexOf(
+    "managed-cloud-release-gate.mjs publication-preflight",
+  );
+  const promotionLoginIndex = promotionSection.indexOf("oras login ghcr.io");
+  const promotionPullIndex = promotionSection.indexOf("oras cp --to-oci-layout");
+  if (
+    publicationJobsReadIndex < 0 ||
+    publicationSelectionIndex <= publicationJobsReadIndex ||
+    publicationDownloadIndex <= publicationSelectionIndex ||
+    promotionPreflightIndex <= publicationDownloadIndex ||
+    promotionLoginIndex <= promotionPreflightIndex ||
+    promotionPullIndex <= promotionPreflightIndex
+  ) {
+    fail("Promotion preflight must pass before registry login or readback");
+  }
+  if (
+    !text.includes("group: jobs-managed-cloud-release") ||
+    text.includes("jobs-managed-cloud-release-${{")
+  ) {
+    fail("All managed-cloud release operations must share one non-cancelling lock");
   }
   if (
     !text.includes("vars.BLUEY_JOBS_MANAGED_CLOUD_ROOT_ANCHOR_SHA256") ||
@@ -6545,6 +8985,32 @@ async function main(argv) {
     );
     return;
   }
+  if (command === "ci-evidence") {
+    const jobsCiRun = (
+      await readJson(requireOption(options, "jobs-ci-run"), "Jobs CI run")
+    ).value;
+    const observabilityRun = (
+      await readJson(
+        requireOption(options, "observability-run"),
+        "observability run",
+      )
+    ).value;
+    await writeCanonicalJson(
+      requireOption(options, "out"),
+      createManagedCloudCiEvidence({
+        defaultBranch: requireOption(options, "default-branch"),
+        jobsCiRun,
+        observabilityRun,
+        releaseContractSelfTestSha256: requireOption(
+          options,
+          "release-contract-self-test-sha256",
+        ),
+        repository: requireOption(options, "repository"),
+        sourceCommit: requireOption(options, "source-commit"),
+      }),
+    );
+    return;
+  }
   if (command === "assemble") {
     await assembleManagedCloudCandidate({
       contractsDirectory: requireOption(options, "contracts"),
@@ -6572,6 +9038,184 @@ async function main(argv) {
     });
     return;
   }
+  if (command === "publication-plan") {
+    await createManagedCloudArtifactPublicationPlan({
+      authorizedDirectory: requireOption(options, "authorized"),
+      expectedRootAnchorSha256: requireOption(
+        options,
+        "root-anchor-sha256",
+      ),
+      outputFile: requireOption(options, "out"),
+      portalArtifactOrigin: requireOption(options, "portal-artifact-origin"),
+      registryNamespace: requireOption(options, "registry-namespace"),
+    });
+    return;
+  }
+  if (command === "publication-runtime") {
+    await validateManagedCloudArtifactPublicationRuntimeIdentity({
+      authorizedDirectory: requireOption(options, "authorized"),
+      defaultBranch: requireOption(options, "default-branch"),
+      expectedRootAnchorSha256: requireOption(
+        options,
+        "root-anchor-sha256",
+      ),
+      planFile: requireOption(options, "plan"),
+      repository: requireOption(options, "repository"),
+      repositoryId: requireOption(options, "repository-id"),
+      sourceCommit: requireOption(options, "source-commit"),
+    });
+    return;
+  }
+  if (command === "publication-preflight") {
+    await createManagedCloudArtifactPublicationPreflight({
+      authorizedDirectory: requireOption(options, "authorized"),
+      defaultBranch: requireOption(options, "default-branch"),
+      expectedRootAnchorSha256: requireOption(
+        options,
+        "root-anchor-sha256",
+      ),
+      outputFile: requireOption(options, "out"),
+      publicationDirectory: requireOption(options, "publication"),
+      publicationWorkflowEvidenceFile: requireOption(
+        options,
+        "publication-workflow-evidence",
+      ),
+      repository: requireOption(options, "repository"),
+      repositoryId: requireOption(options, "repository-id"),
+    });
+    return;
+  }
+  if (command === "publication-artifact-select") {
+    await selectManagedCloudPublicationArtifact({
+      artifactsFile: requireOption(options, "artifacts"),
+      authorizedDirectory: requireOption(options, "authorized"),
+      defaultBranch: requireOption(options, "default-branch"),
+      expectedRootAnchorSha256: requireOption(
+        options,
+        "root-anchor-sha256",
+      ),
+      jobsFile: requireOption(options, "jobs"),
+      outputFile: requireOption(options, "out"),
+      repository: requireOption(options, "repository"),
+      repositoryId: requireOption(options, "repository-id"),
+      runAttempt: requireOption(options, "run-attempt"),
+      runFile: requireOption(options, "run"),
+      runId: requireOption(options, "run-id"),
+    });
+    return;
+  }
+  if (command === "publication-portal-capture") {
+    await captureManagedCloudPortalManifestStream({
+      outputFile: requireOption(options, "out"),
+    });
+    return;
+  }
+  if (command === "publication-api-capture") {
+    await captureManagedCloudPublicationApiStream({
+      kind: requireOption(options, "kind"),
+      outputFile: requireOption(options, "out"),
+    });
+    return;
+  }
+  if (command === "publication-portal-manifest") {
+    const hasPlan = options.plan !== undefined;
+    const hasPreflight = options.preflight !== undefined;
+    if (hasPlan === hasPreflight) {
+      fail("publication-portal-manifest requires exactly one --plan or --preflight");
+    }
+    const authority = hasPlan
+      ? {
+          plan: (
+            await readCanonicalJson(
+              requireOption(options, "plan"),
+              "publication plan",
+              MAX_SIGNED_OBJECT_BYTES,
+            )
+          ).value,
+        }
+      : {
+          preflight: (
+            await readCanonicalJson(
+              requireOption(options, "preflight"),
+              "publication preflight",
+              MAX_PUBLICATION_PREFLIGHT_BYTES,
+            )
+          ).value,
+        };
+    await validateManagedCloudPortalArtifactManifestReadback({
+      ...authority,
+      manifestFile: requireOption(options, "manifest"),
+      portalRegistryRef: requireOption(options, "portal-registry-ref"),
+    });
+    return;
+  }
+  if (command === "publication-portal-readback") {
+    const hasPlan = options.plan !== undefined;
+    const hasPreflight = options.preflight !== undefined;
+    if (hasPlan === hasPreflight) {
+      fail("publication-portal-readback requires exactly one --plan or --preflight");
+    }
+    const authority = hasPlan
+      ? {
+          plan: (
+            await readCanonicalJson(
+              requireOption(options, "plan"),
+              "publication plan",
+              MAX_SIGNED_OBJECT_BYTES,
+            )
+          ).value,
+        }
+      : {
+          preflight: (
+            await readCanonicalJson(
+              requireOption(options, "preflight"),
+              "publication preflight",
+              MAX_PUBLICATION_PREFLIGHT_BYTES,
+            )
+          ).value,
+        };
+    await stageManagedCloudPortalArtifactReadback({
+      ...authority,
+      downloadDirectory: requireOption(options, "download"),
+      manifestFile: requireOption(options, "manifest"),
+      outputFile: requireOption(options, "out"),
+      portalRegistryRef: requireOption(options, "portal-registry-ref"),
+    });
+    return;
+  }
+  if (command === "publication-attest") {
+    await attestManagedCloudArtifactPublication({
+      authorizedDirectory: requireOption(options, "authorized"),
+      expectedRootAnchorSha256: requireOption(
+        options,
+        "root-anchor-sha256",
+      ),
+      outputFile: requireOption(options, "out"),
+      planFile: requireOption(options, "plan"),
+      portalRegistryRef: requireOption(options, "portal-registry-ref"),
+      readbackDirectory: requireOption(options, "readback"),
+      workflowRunAttempt: requireOption(options, "workflow-run-attempt"),
+      workflowRunId: requireOption(options, "workflow-run-id"),
+    });
+    return;
+  }
+  if (command === "publication-verify") {
+    await validateManagedCloudArtifactPublication({
+      authorizedDirectory: requireOption(options, "authorized"),
+      expectedWorkflowRunAttempt: requireOption(
+        options,
+        "workflow-run-attempt",
+      ),
+      expectedWorkflowRunId: requireOption(options, "workflow-run-id"),
+      expectedRootAnchorSha256: requireOption(
+        options,
+        "root-anchor-sha256",
+      ),
+      publicationDirectory: requireOption(options, "publication"),
+      readbackDirectory: requireOption(options, "readback"),
+    });
+    return;
+  }
   if (command === "promote") {
     await promoteManagedCloudCandidate({
       activationFile: requireOption(options, "activation"),
@@ -6588,6 +9232,15 @@ async function main(argv) {
         "root-anchor-sha256",
       ),
       outputDirectory: requireOption(options, "out"),
+      publicationDirectory: requireOption(options, "publication"),
+      publicationPreflightFile: requireOption(
+        options,
+        "publication-preflight",
+      ),
+      publicationReadbackDirectory: requireOption(
+        options,
+        "publication-readback",
+      ),
       promotionId: requireOption(options, "promotion-id"),
     });
     return;
@@ -6613,7 +9266,11 @@ async function main(argv) {
   fail(
     "Usage: managed-cloud-release-gate.mjs " +
       "<contracts|inventory-tree|runtime-measurement|inspect-artifact|sbom|provenance|" +
-      "assemble|verify|authorize|promote|rollback|workflow>",
+      "ci-evidence|assemble|verify|authorize|publication-plan|publication-runtime|" +
+      "publication-api-capture|publication-artifact-select|publication-preflight|" +
+      "publication-portal-capture|publication-portal-manifest|" +
+      "publication-portal-readback|publication-attest|" +
+      "publication-verify|promote|rollback|workflow>",
   );
 }
 

@@ -1559,6 +1559,151 @@ provider canaries, rights/rate approval, hosted PostgreSQL/Temporal behavior,
 runtime capacity, monitoring, kill-switch exercise, and rollback rehearsal are
 separate release gates.
 
+### Managed-cloud artifact publication and read-back
+
+Candidate creation now requires two successful default-branch `push` runs at
+the exact candidate commit: Bluey Jobs CI / Privacy Gate and Observability
+Policy. The candidate's own release-contract self-test is supplemental evidence
+only; it cannot replace either full exact-tip run. GitHub's Actions-run payload
+does not supply repository `default_branch`; the workflow therefore passes the
+trusted workflow-event default branch separately, stores it once in release-v2
+CI evidence, and requires both normalized runs' `headBranch` to equal it.
+Each candidate run response is piped through Bluey's fixed 128 KiB `run`
+capture before it becomes evidence. The capture creates a private partial file
+and atomically renames it only after success; cap overflow, capture failure, or
+an API producer failure removes both final and partial output. Never redirect a
+candidate `gh api` response directly into an evidence file.
+
+The source workflow has a separate `publish` operation in the protected
+`jobs-managed-cloud-artifact-publication` environment. Configure all of the
+following before dispatching it:
+
+- repository variable `BLUEY_JOBS_ARTIFACT_NAMESPACE`, set to a controlled,
+  lowercase OCI repository prefix such as
+  `ghcr.io/dhanunjay-divi/bluey-jobs`;
+- repository variable `BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN`, set to the canonical
+  immutable HTTPS directory that will later serve the exact portal tar;
+- required reviewers and deployment-branch policy on
+  `jobs-managed-cloud-artifact-publication` and
+  `jobs-managed-cloud-release`;
+- GitHub Packages billing and repository Actions access for the four resulting
+  packages; and
+- the existing root-anchor and threshold-signing authority.
+
+Referencing an environment or requesting `packages: write` in source does not
+prove any of that control is configured. Verify the repository settings and
+package access separately before dispatch. The publication job alone receives
+`packages: write`; promotion receives only `packages: read`. Every release job
+declares `actions: read` and `contents: read` locally because it consumes pinned
+Actions or release evidence. Candidate, verify, authorize, and rollback receive
+no Packages permission, and the workflow-level default remains `contents: read`
+only.
+
+Immediately before registry login or any GHCR write, the publisher validates
+that the canonical plan's source commit, repository name, numeric repository
+ID, and trusted current default branch equal `GITHUB_SHA`,
+`GITHUB_REPOSITORY`, `GITHUB_REPOSITORY_ID`, and the default branch from the
+workflow event. A mismatch stops publication before credentials are used. This
+runtime binding revalidates the exact authorized candidate and plan and is
+separate from namespace ownership validation.
+
+Publication extracts the three already-verified OCI-layout tars into layout
+directories without rebuilding, resolves their exact signed image-manifest
+digests, publishes the exact portal tar as an OCI artifact, and pulls all four
+artifacts back by immutable digest. Freshly pulled layouts are normalized back
+into verifier tars; registry tag annotations or tar packaging size are not
+authority. The read-back verifier re-inspects each OCI manifest and canonical
+content inventory plus the exact portal bytes, and binds the runner native
+addon path, size, mode, and SHA-256. Promotion repeats the remote pull
+independently and rejects a missing or changed publication receipt. Production
+promotion and rollback creation emit remote audience/schema v2 and never emit
+`local_fixture`. Strict historical audience/schema-v1 `local_fixture`
+promotion and rollback readers remain available only to audit and read back
+already stored historical bytes. Remote v2 and historical v1 documents may not
+be mixed in one promotion or rollback tree.
+
+The portal pull is stricter than a matching tar hash. Both publication and
+promotion pipe the compact raw OCI manifest from `oras manifest fetch` through
+Bluey's fixed 32 KiB streaming capture. The capture writes a private partial
+file and atomically renames it only on success; byte 32,769 fails and removes
+both partial and final output. The completed manifest must then pass validation
+before `oras pull`: its SHA-256 must equal the immutable reference, and it must
+be the exact OCI image manifest and Bluey portal artifact type with the exact
+empty OCI config and one layer only. That layer must name `jobs-portal.tar` and
+match the candidate tar's digest, size, and media type. Only after the manifest
+passes may ORAS pull; its output must contain exactly that one regular file.
+The final publication read-back must be a flat five-file tree: three OCI layout
+tars, the portal tar, and its raw OCI manifest. Extra files or even empty
+directories fail closed.
+
+The plan stores one canonical UTC RFC3339 whole-second
+`portalManifestCreatedAt` derived from the signed portal provenance
+`sourceDateEpoch`. Publication supplies it explicitly as the ORAS
+`org.opencontainers.image.created` annotation, and read-back requires exact
+equality. Do not substitute current runner time: a retry at another wall-clock
+time must retain the same manifest digest, while a different signed source
+epoch must produce a different digest.
+
+Promotion requires both `publication_run_id` and the exact
+`publication_run_attempt`; it never resolves a race-prone "latest attempt."
+Before downloading the receipt, it queries the exact run and exact-attempt jobs
+endpoints plus the run-scoped artifact list. Each API response is captured
+atomically before parsing: run JSON is capped at 128 KiB, and jobs/artifacts JSON
+at 1 MiB each. Cap overflow or command failure removes partial and final output.
+The run must be a completed successful dispatch of the exact managed-cloud
+release workflow at the candidate source commit. Exactly one `publish` job from
+the explicit attempt, its publication-receipt upload step, and exactly one
+unexpired artifact named
+`jobs-managed-cloud-publication-<run-id>-<run-attempt>` must have succeeded.
+Artifact metadata is bound by immutable ID, digest, and size; size may not
+exceed 1 MiB. The workflow downloads only that validated artifact ID, never an
+artifact name.
+
+The verifier combines that selected evidence with the exact authorized
+candidate, canonical plan/publication-set hashes, and current repository
+ID/name/default branch into a 128 KiB-capped canonical preflight before registry
+login or ref consumption. The selected run and attempt, rather than the
+workflow file's current tip, bind the candidate source commit. Every immutable
+ref used by promotion comes only from that preflight; never parse downloaded
+plan/set JSON directly into an ORAS command. The normalized run/job/artifact
+evidence is stored in the promotion and rebound during final validation. Its
+environment status is deliberately `workflow_declared_settings_not_attested`:
+this proves which source job ran, not that required reviewers, branch policy,
+or self-review prevention are configured.
+
+Portal registry storage and portal delivery are distinct. Publication records
+both the signed HTTPS delivery ref and the GHCR immutable ref actually read
+back. Release-v2 `portal-readback.json` must use audience
+`bluey-jobs-managed-cloud-portal-readback-evidence-v2`, include `artifactRef`
+equal to the signed portal component ref, and bind the returned tar SHA-256.
+The older evidence-v1 shape remains historical release-v1 compatibility only.
+
+Builder-policy compatibility is versioned. Historical v1 and pre-Phase-627B
+v2 candidates retain the audience/schema-v1 four-stage policy bytes and remain
+verifiable. New contract-v2 candidates emit audience/schema-v2 policy that
+also fences `publish`. Production publication explicitly requires that v2
+policy; accepting old bytes for historical verification never grants them new
+registry-write authority.
+
+The candidate emits Bluey's exhaustive file-inventory SBOM and deterministic
+recipe/source provenance documents. Docker Buildx still runs with OCI-native
+SBOM and provenance attestations disabled, so the publication receipt records
+both registry attestation states as `not_generated`. Do not describe those
+internal documents as OCI attestations. Adding registry-native attestations is
+a successor contract and requires their exact digests, read-back, and policy
+validation.
+
+GHCR publication is durable artifact evidence, not proof that the portal is
+served, a runtime is deployed, a root filesystem is read-only, or an activation
+is current. Promotion still requires the separate static-origin portal
+read-back, deployed image/runtime attestations, protected threshold approval,
+hosted canaries, and compare-and-swap activation evidence.
+
+The historical manifest field `publishedAtMs` is the deterministic source
+commit epoch used by the reproducible v1/v2 candidate schema; it is not a
+registry timestamp. Publication receipts use `attestedAtMs`. Do not present
+the legacy field as hosted publication evidence.
+
 ## Reviewed communication release authority
 
 Recruiter replies and interview-calendar actions use an authority boundary that

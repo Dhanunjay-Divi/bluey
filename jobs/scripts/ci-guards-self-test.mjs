@@ -26,6 +26,341 @@ const repoRoot = path.resolve(
 
 const JOBS_CI_TIMEOUT_MINUTES = 90;
 
+const managedReleasePermissionContracts = new Map([
+  ["CANDIDATE-BUILD", ["actions: read", "contents: read"]],
+  ["VERIFY-NO-REBUILD", ["actions: read", "contents: read"]],
+  ["AUTHORIZE-NO-REBUILD", ["actions: read", "contents: read"]],
+  ["PUBLISH-REMOTE", ["actions: read", "contents: read", "packages: write"]],
+  ["PROMOTE-NO-REBUILD", ["actions: read", "contents: read", "packages: read"]],
+  ["ROLLBACK-NO-REBUILD", ["actions: read", "contents: read"]],
+]);
+
+function managedReleaseMarkedSection(text, marker) {
+  const begin = `# RELEASE-GATE: ${marker}-BEGIN`;
+  const end = `# RELEASE-GATE: ${marker}-END`;
+  const start = text.indexOf(begin);
+  const finish = text.indexOf(end);
+  assert(start >= 0 && finish > start, `${marker} must have one marked section`);
+  return {
+    begin: start + begin.length,
+    end: finish,
+    text: text.slice(start + begin.length, finish),
+  };
+}
+
+function assertManagedReleasePermissionContract(text) {
+  const globalPermissions = text.match(
+    /(?:^|\n)permissions:\n((?:  [^\n]+\n)+)/,
+  );
+  assert.deepEqual(
+    globalPermissions?.[1]
+      .trim()
+      .split("\n")
+      .map((line) => line.trim()),
+    ["contents: read"],
+    "Managed-cloud global permissions must be contents: read only",
+  );
+  for (const [marker, expected] of managedReleasePermissionContracts) {
+    const section = managedReleaseMarkedSection(text, marker).text;
+    const permissions = section.match(/\n    permissions:\n((?:      [^\n]+\n)+)/);
+    assert.equal(
+      section.split("\n    permissions:").length - 1,
+      1,
+      `${marker} must have exactly one job-local permissions map`,
+    );
+    assert.deepEqual(
+      permissions?.[1]
+        .trim()
+        .split("\n")
+        .map((line) => line.trim()),
+      expected,
+      `${marker} must retain exact job-local permissions`,
+    );
+  }
+}
+
+function mutateManagedReleaseSection(text, marker, mutate) {
+  const section = managedReleaseMarkedSection(text, marker);
+  const mutated = mutate(section.text);
+  assert.notEqual(mutated, section.text, `${marker} mutation must alter its section`);
+  return text.slice(0, section.begin) + mutated + text.slice(section.end);
+}
+
+function managedReleaseNamedStep(section, name) {
+  const marker = `      - name: ${name}`;
+  const begin = section.indexOf(marker);
+  assert(begin >= 0, `${name} step must exist`);
+  assert.equal(
+    section.indexOf(marker, begin + marker.length),
+    -1,
+    `${name} step must be unambiguous`,
+  );
+  const next = section.indexOf("\n      - ", begin + marker.length);
+  const end = next < 0 ? section.length : next;
+  return { begin, end, text: section.slice(begin, end) };
+}
+
+function mutateManagedReleaseNamedStep(text, marker, name, mutate) {
+  return mutateManagedReleaseSection(text, marker, (section) => {
+    const step = managedReleaseNamedStep(section, name);
+    const mutated = mutate(step.text);
+    assert.notEqual(mutated, step.text, `${name} mutation must alter only that step`);
+    return section.slice(0, step.begin) + mutated + section.slice(step.end);
+  });
+}
+
+function assertManagedPublicationNetworkContract(text) {
+  const candidate = managedReleaseMarkedSection(text, "CANDIDATE-BUILD").text;
+  const publication = managedReleaseMarkedSection(text, "PUBLISH-REMOTE").text;
+  const promotion = managedReleaseMarkedSection(
+    text,
+    "PROMOTE-NO-REBUILD",
+  ).text;
+  for (const [label, section, expectedBindings] of [
+    ["candidate", candidate, 1],
+    ["publication", publication, 1],
+    ["promotion", promotion, 2],
+  ]) {
+    assert(
+      section.split(
+        "DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}",
+      ).length -
+        1 ===
+        expectedBindings &&
+        section.split('--default-branch "$DEFAULT_BRANCH"').length - 1 ===
+          expectedBindings,
+      `${label} must take default branch from trusted GitHub event context`,
+    );
+  }
+  const candidateRunCaptures = [
+    {
+      endpoint:
+        'gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$JOBS_CI_RUN_ID"',
+      output: "release/prepared/jobs-ci-run.json",
+    },
+    {
+      endpoint:
+        'gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$OBSERVABILITY_RUN_ID"',
+      output: "release/prepared/observability-run.json",
+    },
+  ];
+  const candidateRunCaptureStep = managedReleaseNamedStep(
+    candidate,
+    "Bind successful exact-tip CI instead of synthetic candidate evidence",
+  ).text;
+  assert.equal(
+    candidate.split("publication-api-capture").length - 1,
+    2,
+    "Candidate must use exactly two atomic bounded run-response captures",
+  );
+  assert.equal(
+    candidateRunCaptureStep.split("publication-api-capture").length - 1,
+    2,
+    "Candidate exact-tip CI step must contain both bounded captures",
+  );
+  assert.equal(
+    candidate.split("--kind run --out").length - 1,
+    2,
+    "Candidate must fix both CI evidence captures to the 128 KiB run kind",
+  );
+  assert.equal(
+    candidateRunCaptureStep.split("--kind run --out").length - 1,
+    2,
+    "Candidate exact-tip CI step must fix both captures to the run kind",
+  );
+  assert.equal(
+    candidateRunCaptureStep.split(
+      "        run: |\n          set -euo pipefail\n",
+    ).length - 1,
+    1,
+    "Candidate exact-tip CI capture step must enable pipefail before both producer pipelines",
+  );
+  for (const { endpoint, output } of candidateRunCaptures) {
+    const pipeline =
+      `if ! ${endpoint} \\\n` +
+      "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
+      "publication-api-capture \\\n" +
+      `                --kind run --out ${output}`;
+    const cleanup = `rm -f -- ${output} \\\n              ${output}.partial`;
+    assert(
+      candidate.split(endpoint).length - 1 === 1 &&
+        candidate.split(output).length - 1 === 4 &&
+        candidateRunCaptureStep.includes(pipeline) &&
+        candidateRunCaptureStep.includes(cleanup) &&
+        !candidate.includes(`> ${output}`),
+      `Candidate CI run capture must be atomic and fail closed: ${output}`,
+    );
+  }
+  const runtimeMarkers = [
+    "publication-runtime",
+    "--authorized authorized",
+    '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+    '--default-branch "$DEFAULT_BRANCH"',
+    '--source-commit "$GITHUB_SHA"',
+    '--repository "$GITHUB_REPOSITORY"',
+    '--repository-id "$GITHUB_REPOSITORY_ID"',
+  ];
+  for (const marker of runtimeMarkers) {
+    assert(
+      publication.includes(marker),
+      `Publication pre-write runtime identity is missing: ${marker}`,
+    );
+  }
+  assert(
+    publication.indexOf("publication-runtime") <
+      publication.indexOf("oras login ghcr.io"),
+    "Publication runtime identity must pass before registry login or write",
+  );
+  const portalMarkers = [
+    'oras manifest fetch "$PORTAL_REGISTRY_REF"',
+    "publication-portal-capture",
+    "--out publication-readback/jobs-portal.oci-manifest.json",
+    "rm -f -- publication-readback/jobs-portal.oci-manifest.json",
+    "publication-readback/jobs-portal.oci-manifest.json.partial",
+    "publication-portal-manifest",
+    "publication-portal-readback",
+    "--manifest publication-readback/jobs-portal.oci-manifest.json",
+    "--download portal-download",
+    "--out publication-readback/jobs-portal.tar",
+  ];
+  for (const [label, section] of [
+    ["publication", publication],
+    ["promotion", promotion],
+  ]) {
+    for (const marker of portalMarkers) {
+      assert(
+        section.includes(marker),
+        `${label} portal manifest/readback is missing: ${marker}`,
+      );
+    }
+    const fetchIndex = section.indexOf(
+      'oras manifest fetch "$PORTAL_REGISTRY_REF"',
+    );
+    const captureIndex = section.indexOf("publication-portal-capture");
+    const manifestIndex = section.indexOf("publication-portal-manifest");
+    const pullIndex = section.indexOf(
+      'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
+    );
+    const readbackIndex = section.indexOf("publication-portal-readback");
+    assert(
+      fetchIndex >= 0 &&
+        captureIndex > fetchIndex &&
+        manifestIndex > captureIndex &&
+        pullIndex > manifestIndex &&
+        readbackIndex > pullIndex &&
+        !section.includes(
+          "--output publication-readback/jobs-portal.oci-manifest.json",
+        ),
+      `${label} must validate the bounded manifest before pull and the tree after pull`,
+    );
+  }
+  assert(
+    publication.includes(
+      '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+    ) &&
+      publication.includes(
+        "process.stdout.write(plan.portalManifestCreatedAt)",
+      ),
+    "Publication must bind the deterministic portal manifest timestamp",
+  );
+  const exactRunIndex = promotion.indexOf(
+    '/attempts/$PUBLICATION_RUN_ATTEMPT"',
+  );
+  const jobsReadIndex = promotion.indexOf(
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+  );
+  const artifactsReadIndex = promotion.indexOf('/artifacts?per_page=100"');
+  const selectionIndex = promotion.indexOf("publication-artifact-select");
+  const downloadIndex = promotion.indexOf(
+    "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+  );
+  const preflightIndex = promotion.indexOf(
+    "managed-cloud-release-gate.mjs publication-preflight",
+  );
+  const loginIndex = promotion.indexOf("oras login ghcr.io");
+  const registryReadIndex = promotion.indexOf("oras cp --to-oci-layout");
+  assert(
+    exactRunIndex >= 0 &&
+      jobsReadIndex > exactRunIndex &&
+      artifactsReadIndex > jobsReadIndex &&
+      selectionIndex > artifactsReadIndex &&
+      downloadIndex > selectionIndex &&
+      preflightIndex > downloadIndex &&
+      loginIndex > preflightIndex &&
+      registryReadIndex > preflightIndex,
+    "Promotion canonical preflight must pass before registry login or readback",
+  );
+  const exactAttemptMarkers = [
+    "publication_run_attempt",
+    "PUBLICATION_RUN_ATTEMPT: ${{ github.event.inputs.publication_run_attempt }}",
+    "canonical positive safe integer",
+    "Number.isSafeInteger(Number(value))",
+    '/attempts/$PUBLICATION_RUN_ATTEMPT"',
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+    '/artifacts?per_page=100"',
+    "publication-artifact-select",
+    "--run-attempt \"$PUBLICATION_RUN_ATTEMPT\"",
+    "--publication-workflow-evidence publication-workflow-evidence.json",
+    "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+    "merge-multiple: true",
+    '--workflow-run-attempt "$PUBLICATION_RUN_ATTEMPT"',
+  ];
+  for (const marker of exactAttemptMarkers) {
+    assert(
+      promotion.includes(marker),
+      `Promotion exact-attempt artifact authority is missing: ${marker}`,
+    );
+  }
+  const apiCaptureMarkers = [
+    "--kind run --out publication-workflow-run.json",
+    "--kind jobs --out publication-workflow-jobs.json",
+    "--kind artifacts --out publication-workflow-artifacts.json",
+    "rm -f -- publication-workflow-run.json publication-workflow-run.json.partial",
+    "rm -f -- publication-workflow-jobs.json publication-workflow-jobs.json.partial",
+    "rm -f -- publication-workflow-artifacts.json publication-workflow-artifacts.json.partial",
+  ];
+  assert.equal(
+    promotion.split("publication-api-capture").length - 1,
+    3,
+    "Promotion must use exactly three fixed-kind bounded API captures",
+  );
+  for (const marker of apiCaptureMarkers) {
+    assert(
+      promotion.includes(marker),
+      `Promotion bounded API capture is missing: ${marker}`,
+    );
+  }
+  assert(
+    publication.includes(
+      "name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}",
+    ) &&
+      publication.split('--workflow-run-attempt "$GITHUB_RUN_ATTEMPT"').length -
+        1 ===
+        2,
+    "Publication must bind and upload one run-and-attempt-qualified receipt",
+  );
+  assert(
+    !promotion.includes("filter=latest") &&
+      !promotion.includes("name: jobs-managed-cloud-publication\n") &&
+      !promotion.includes("> publication-workflow-run.json") &&
+      !promotion.includes("> publication-workflow-jobs.json") &&
+      !promotion.includes("> publication-workflow-artifacts.json"),
+    "Promotion must reject latest-attempt, reusable-name, and unbounded API transports",
+  );
+  assert(
+    promotion.includes("--publication-preflight publication-preflight.json") &&
+      promotion.includes('--repository "$GITHUB_REPOSITORY"') &&
+      promotion.includes('--repository-id "$GITHUB_REPOSITORY_ID"') &&
+      !promotion.includes('require("./publication/publication-plan.json")') &&
+      !promotion.includes('require("./publication/publication-set.json")'),
+    "Promotion must consume only canonical preflight registry authority",
+  );
+  assert(
+    !text.includes("mv portal-download/jobs-portal.tar"),
+    "Portal pull must pass closed inspection before a new readback file is written",
+  );
+}
+
 function runnerVolumeParitySchema(integerType) {
   const migrationPath =
     integerType === "INTEGER"
@@ -237,6 +572,336 @@ function testDependencySecurityWorkflowGuard() {
     path.join(repoRoot, ".github/workflows/jobs-managed-cloud-release.yml"),
     "utf8",
   );
+  assertManagedReleasePermissionContract(managedRelease);
+  assertManagedPublicationNetworkContract(managedRelease);
+  for (const [marker, permissions] of managedReleasePermissionContracts) {
+    for (const permission of permissions) {
+      const mutated = mutateManagedReleaseSection(managedRelease, marker, (section) =>
+        section.replace(`      ${permission}`, `      ${permission.split(":")[0]}: none`),
+      );
+      assert.throws(
+        () => assertManagedReleasePermissionContract(mutated),
+        new RegExp(`${marker} must retain exact job-local permissions`),
+      );
+    }
+  }
+  for (const marker of [
+    "CANDIDATE-BUILD",
+    "VERIFY-NO-REBUILD",
+    "AUTHORIZE-NO-REBUILD",
+    "ROLLBACK-NO-REBUILD",
+  ]) {
+    const mutated = mutateManagedReleaseSection(managedRelease, marker, (section) =>
+      section.replace(
+        "      contents: read",
+        "      contents: read\n      packages: read",
+      ),
+    );
+    assert.throws(
+      () => assertManagedReleasePermissionContract(mutated),
+      new RegExp(`${marker} must retain exact job-local permissions`),
+    );
+  }
+  for (const replacement of [
+    "permissions:\n  contents: none",
+    "permissions:\n  actions: read\n  contents: read",
+    "permissions:\n  contents: read\n  packages: read",
+  ]) {
+    const mutated = managedRelease.replace(
+      "permissions:\n  contents: read",
+      replacement,
+    );
+    assert.notEqual(mutated, managedRelease);
+    assert.throws(
+      () => assertManagedReleasePermissionContract(mutated),
+      /Managed-cloud global permissions must be contents: read only/,
+    );
+  }
+  for (const [marker, replacement] of [
+    ["--authorized authorized", "--authorized unchecked"],
+    [
+      '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+      '--root-anchor-sha256 "$MUTATED_ROOT_ANCHOR_SHA256"',
+    ],
+    [
+      '--default-branch "$DEFAULT_BRANCH"',
+      '--default-branch "$MUTATED_DEFAULT_BRANCH"',
+    ],
+    ['--source-commit "$GITHUB_SHA"', '--source-commit "$MUTATED_SHA"'],
+    [
+      '--repository "$GITHUB_REPOSITORY"',
+      '--repository "$MUTATED_REPOSITORY"',
+    ],
+    [
+      '--repository-id "$GITHUB_REPOSITORY_ID"',
+      '--repository-id "$MUTATED_REPOSITORY_ID"',
+    ],
+  ]) {
+    const mutated = mutateManagedReleaseSection(
+      managedRelease,
+      "PUBLISH-REMOTE",
+      (section) => section.replaceAll(marker, replacement),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(mutated),
+      /Publication pre-write runtime identity is missing|trusted GitHub event context/,
+    );
+  }
+  for (const marker of ["PUBLISH-REMOTE", "PROMOTE-NO-REBUILD"]) {
+    const missingPortalManifest = mutateManagedReleaseSection(
+      managedRelease,
+      marker,
+      (section) => section.replace(
+        "publication-portal-readback",
+        "publication-portal-unchecked",
+      ),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(missingPortalManifest),
+      /portal manifest\/readback is missing/,
+    );
+    const lateManifestValidation = mutateManagedReleaseSection(
+      managedRelease,
+      marker,
+      (section) => {
+        const line = section.match(
+          /\n\s*publication-portal-manifest[\s\S]*?--manifest publication-readback\/jobs-portal\.oci-manifest\.json\n/,
+        )?.[0];
+        assert(line, `${marker} must contain a manifest-only validation block`);
+        return section.replace(line, "").replace(
+          'oras pull "$PORTAL_REGISTRY_REF" --output portal-download',
+          'oras pull "$PORTAL_REGISTRY_REF" --output portal-download' + line,
+        );
+      },
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(lateManifestValidation),
+      /validate the bounded manifest before pull/,
+    );
+    const unboundedPortalManifest = mutateManagedReleaseSection(
+      managedRelease,
+      marker,
+      (section) => section.replace(
+        "publication-portal-capture",
+        "publication-portal-unbounded",
+      ),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(unboundedPortalManifest),
+      /portal manifest\/readback is missing/,
+    );
+    const missingPortalCleanup = mutateManagedReleaseSection(
+      managedRelease,
+      marker,
+      (section) => section.replace(
+        "publication-readback/jobs-portal.oci-manifest.json.partial",
+        "publication-readback/jobs-portal.oci-manifest.json.unchecked",
+      ),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(missingPortalCleanup),
+      /portal manifest\/readback is missing/,
+    );
+  }
+  const unboundedPublicationApi = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "publication-api-capture",
+      "publication-api-unbounded",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(unboundedPublicationApi),
+    /exactly three fixed-kind bounded API captures/,
+  );
+  const unsafePublicationInput = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "Number.isSafeInteger(Number(value))",
+      "Number.isInteger(Number(value))",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(unsafePublicationInput),
+    /exact-attempt artifact authority is missing/,
+  );
+  const missingPublicationApiCleanup = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "publication-workflow-run.json.partial",
+      "publication-workflow-run.json.unchecked",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(missingPublicationApiCleanup),
+    /bounded API capture is missing/,
+  );
+  const latestAttemptJobs = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100',
+      '/jobs?filter=latest&per_page=100',
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(latestAttemptJobs),
+    /canonical preflight must pass|exact-attempt artifact authority is missing|reject latest-attempt/,
+  );
+  const uncheckedArtifactSelection = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "publication-artifact-select",
+      "publication-artifact-unchecked",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(uncheckedArtifactSelection),
+    /canonical preflight must pass|exact-attempt artifact authority is missing/,
+  );
+  const reusableArtifactName = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+      "name: jobs-managed-cloud-publication",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(reusableArtifactName),
+    /canonical preflight must pass|exact-attempt artifact authority is missing|reject latest-attempt/,
+  );
+  const staticPublicationArtifactName = mutateManagedReleaseSection(
+    managedRelease,
+    "PUBLISH-REMOTE",
+    (section) => section.replace(
+      "name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}",
+      "name: jobs-managed-cloud-publication",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(staticPublicationArtifactName),
+    /run-and-attempt-qualified receipt/,
+  );
+  const unboundPortalCreated = mutateManagedReleaseSection(
+    managedRelease,
+    "PUBLISH-REMOTE",
+    (section) => section.replace(
+      '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+      '--annotation "org.opencontainers.image.created=$RUNNER_NOW"',
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(unboundPortalCreated),
+    /deterministic portal manifest timestamp/,
+  );
+  const rawPromotionReceipt = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      'const preflight=require("./publication-preflight.json");',
+      'const preflight=require("./publication/publication-plan.json");',
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(rawPromotionReceipt),
+    /only canonical preflight registry authority/,
+  );
+  const missingPromotionPreflight = mutateManagedReleaseSection(
+    managedRelease,
+    "PROMOTE-NO-REBUILD",
+    (section) => section.replace(
+      "managed-cloud-release-gate.mjs publication-preflight",
+      "managed-cloud-release-gate.mjs publication-unchecked",
+    ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(missingPromotionPreflight),
+    /canonical preflight must pass before registry login or readback/,
+  );
+  for (const marker of ["CANDIDATE-BUILD", "PROMOTE-NO-REBUILD"]) {
+    const untrustedDefaultBranch = mutateManagedReleaseSection(
+      managedRelease,
+      marker,
+      (section) => section.replace(
+        '--default-branch "$DEFAULT_BRANCH"',
+        "--default-branch main",
+      ),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(untrustedDefaultBranch),
+      /trusted GitHub event context/,
+    );
+  }
+  for (const [label, runId, output] of [
+    ["jobs-ci", "$JOBS_CI_RUN_ID", "release/prepared/jobs-ci-run.json"],
+    [
+      "observability",
+      "$OBSERVABILITY_RUN_ID",
+      "release/prepared/observability-run.json",
+    ],
+  ]) {
+    const endpoint =
+      `gh api "/repos/$GITHUB_REPOSITORY/actions/runs/${runId}"`;
+    const directRedirect = mutateManagedReleaseSection(
+      managedRelease,
+      "CANDIDATE-BUILD",
+      (section) => section.replace(
+        `${endpoint} \\\n` +
+          "            | node jobs/scripts/managed-cloud-release-gate.mjs " +
+          "publication-api-capture \\\n" +
+          `                --kind run --out ${output}`,
+        `${endpoint} > ${output}`,
+      ),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(directRedirect),
+      /exactly two atomic bounded run-response captures|atomic and fail closed/,
+      `${label} direct redirection must fail the independent CI guard`,
+    );
+    const bypassCapture = mutateManagedReleaseSection(
+      managedRelease,
+      "CANDIDATE-BUILD",
+      (section) => section.replace(
+        `--kind run --out ${output}`,
+        `--kind run-unbounded --out ${output}`,
+      ),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(bypassCapture),
+      /128 KiB run kind|atomic and fail closed/,
+      `${label} cap bypass must fail the independent CI guard`,
+    );
+    const missingCleanup = mutateManagedReleaseSection(
+      managedRelease,
+      "CANDIDATE-BUILD",
+      (section) => section.replace(`${output}.partial`, `${output}.unchecked`),
+    );
+    assert.throws(
+      () => assertManagedPublicationNetworkContract(missingCleanup),
+      /atomic and fail closed/,
+      `${label} partial-file cleanup bypass must fail the independent CI guard`,
+    );
+  }
+  const missingCandidateCapturePipefail = mutateManagedReleaseNamedStep(
+    managedRelease,
+    "CANDIDATE-BUILD",
+    "Bind successful exact-tip CI instead of synthetic candidate evidence",
+    (step) =>
+      step.replace(
+        "        run: |\n          set -euo pipefail\n",
+        "        run: |\n          set -eu\n",
+      ),
+  );
+  assert.throws(
+    () => assertManagedPublicationNetworkContract(missingCandidateCapturePipefail),
+    /exact-tip CI capture step must enable pipefail/,
+    "Removing pipefail only from the live candidate capture step must fail the independent guard",
+  );
   const managedAuditIndex = managedRelease.indexOf("npm audit --audit-level=moderate");
   const managedBuildIndex = managedRelease.indexOf("docker buildx build --platform");
   assert(
@@ -258,6 +923,7 @@ function testDependencySecurityWorkflowGuard() {
     "CANDIDATE-BUILD",
     "VERIFY-NO-REBUILD",
     "AUTHORIZE-NO-REBUILD",
+    "PUBLISH-REMOTE",
     "PROMOTE-NO-REBUILD",
     "ROLLBACK-NO-REBUILD",
   ]) {
@@ -324,6 +990,58 @@ function testDependencySecurityWorkflowGuard() {
     !managedRelease.includes("sourceVerification: false") &&
       !managedRelease.includes("bluey-jobs-managed-cloud-release-descriptor-v1"),
     "Managed-cloud candidate must not silently fall back to release v1",
+  );
+  assert.equal(
+    managedRelease.split("packages: write").length - 1,
+    1,
+    "Managed-cloud publication must have exactly one package writer",
+  );
+  for (const required of [
+    "environment: jobs-managed-cloud-artifact-publication",
+    "uses: oras-project/setup-oras@38de303aac69abb66f3e6255b7198bff35f323e3",
+    "vars.BLUEY_JOBS_ARTIFACT_NAMESPACE",
+    "vars.BLUEY_JOBS_PORTAL_ARTIFACT_ORIGIN",
+    "ci-evidence",
+    "oras cp --from-oci-layout",
+    "oras cp --to-oci-layout",
+    'tar --extract --file "authorized/candidate/payloads/$component.oci.tar"',
+    '"publication-source/$component@sha256:$DIGEST" "$TAG_REF"',
+    '"publication-layout/$component:$GITHUB_RUN_ID"',
+    "publication-readback/$component.oci.tar",
+    "publication-attest",
+    "publication-preflight",
+    "publication-portal-manifest",
+    "publication-verify",
+    "--publication-readback publication-readback",
+    'PUBLICATION_RUN_ID: ${{ github.event.inputs.publication_run_id }}',
+    'PUBLICATION_RUN_ATTEMPT: ${{ github.event.inputs.publication_run_attempt }}',
+    '--workflow-run-id "$PUBLICATION_RUN_ID"',
+    '--workflow-run-attempt "$PUBLICATION_RUN_ATTEMPT"',
+    '/attempts/$PUBLICATION_RUN_ATTEMPT"',
+    '/attempts/$PUBLICATION_RUN_ATTEMPT/jobs?per_page=100"',
+    '/artifacts?per_page=100"',
+    "publication-api-capture",
+    "publication-artifact-select",
+    "--publication-workflow-evidence publication-workflow-evidence.json",
+    "artifact-ids: ${{ steps.select-publication.outputs.artifact-id }}",
+    "name: jobs-managed-cloud-publication-${{ github.run_id }}-${{ github.run_attempt }}",
+    '--root-anchor-sha256 "$ROOT_ANCHOR_SHA256"',
+    '--default-branch "$DEFAULT_BRANCH"',
+    '--source-commit "$GITHUB_SHA"',
+    '--repository "$GITHUB_REPOSITORY"',
+    '--repository-id "$GITHUB_REPOSITORY_ID"',
+    '--annotation "org.opencontainers.image.created=$PORTAL_MANIFEST_CREATED_AT"',
+  ]) {
+    assert(
+      managedRelease.includes(required),
+      `Managed-cloud remote publication authority is missing: ${required}`,
+    );
+  }
+  assert(
+    !managedRelease.includes("`ghcr.io/bluey/") &&
+      !managedRelease.includes("local_fixture") &&
+      !managedRelease.includes("filter=latest"),
+    "Managed-cloud production workflow must not use the old namespace or test adapter",
   );
   const workflowsDockerfile = fs.readFileSync(
     path.join(repoRoot, "jobs/workflows/Dockerfile"),
@@ -1836,6 +2554,6 @@ testProvenance();
 
 console.log(
   "Jobs CI guard self-tests passed (privacy, portal bundle freshness, dependency security, " +
-  "time budget, schema parity, integration and business-messaging simulator containment, " +
-  "lock inventory, and provenance).",
+  "managed artifact publication, time budget, schema parity, integration and " +
+  "business-messaging simulator containment, lock inventory, and provenance).",
 );

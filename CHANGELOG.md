@@ -7,6 +7,47 @@ under `docs/release/`.
 
 ### Added
 
+- Added bounded Bluey Jobs managed-cloud artifact-publication authority. New
+  release-v2 candidates bind successful exact-tip default-branch Jobs CI and
+  Observability runs instead of treating a candidate-local self-test as the
+  full gate, derive immutable artifact references from controlled repository
+  configuration instead of `ghcr.io/bluey`, and add a separately protected
+  package writer that copies stored OCI layouts, publishes the exact portal tar,
+  and performs full remote read-back. Promotion independently pulls the same
+  immutable digests again, verifies the exact-source publication workflow and
+  job through the Actions API, binds the managed-runner native addon, and gives
+  every release job an exact least-privilege Actions/contents permission map
+  while reserving Packages write for publication and Packages read for
+  promotion. The trusted default branch is supplied separately from real
+  Actions-run payloads and stored in release-v2 CI evidence; every stored run
+  must bind it. Before registry login or write, publication rebinds the plan to
+  the exact GitHub SHA, repository, numeric repository ID, and trusted current
+  default branch. Promotion first validates the authorized candidate, exact
+  canonical plan/set bytes, selected Actions run and explicit attempt,
+  exact-attempt publish job, receipt upload, and exactly one attempt-qualified
+  immutable artifact into one bounded canonical preflight; only that output can
+  supply registry refs before login or pull. Both candidate CI run responses
+  and the promotion run response are transport-capped at 128 KiB;
+  jobs/artifacts responses are capped at 1 MiB before parsing. Every capture is
+  atomic, and producer or capture failure removes final and partial output;
+  promotion downloads only the validated artifact ID and binds its digest and
+  size. Portal publication derives one deterministic
+  RFC3339 created annotation from signed `sourceDateEpoch`. Both ORAS raw-
+  manifest reads pass through an atomic fixed 32 KiB capture and are validated
+  before pull, including digest, created value, exact artifact/config types,
+  and one exact tar layer, then prove closed post-pull output trees. Historical
+  builder-policy v1 bytes remain readable, while production publication
+  requires builder policy v2 with `publish` explicitly fenced. Production
+  promotion and rollback creation emits remote schema v2; strict historical-v1
+  `local_fixture` readers remain audit/read-back only, and mixed generations
+  fail closed.
+  Registry refs are
+  distinguished from the signed portal-delivery URL, which release-v2 portal
+  read-back evidence must name exactly. The receipt truthfully
+  records Bluey's internal file SBOM/recipe provenance as present and
+  OCI-native SBOM/provenance attestations as not generated. No workflow was
+  dispatched and no package, environment, credential, deployment, activation,
+  flag, provider, application, message, or customer state was changed.
 - Prepared the Bluey Jobs managed-cloud candidate path for the existing release-v2 original-source
   verifier authority. New candidates explicitly bind the source-verification protocol, compiled
   verifier entrypoint, exact three-role workflows image measurement, distinct runtime grant and
