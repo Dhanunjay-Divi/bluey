@@ -1,0 +1,172 @@
+{
+  "schemaVersion": 1,
+  "attestation": {
+    "version": 1,
+    "audience": "bluey-jobs-job-integrity-attestation-v1",
+    "attestationId": "job-integrity-vector-v1",
+    "policySha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "subjectSha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "sourceMaterialSha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "attestationGeneration": 1,
+    "predecessorAttestationSha256": null,
+    "canonicalJobId": "greenhouse:acme:vector-1",
+    "source": {
+      "providerFamily": "greenhouse",
+      "providerRecordId": "vector-1",
+      "target": {
+        "host": "boards.greenhouse.io",
+        "tenant": "acme",
+        "job": "vector-1",
+        "variant": "greenhouse_hosted"
+      },
+      "canonicalApplicationUrl": "https://boards.greenhouse.io/acme/jobs/vector-1",
+      "applicationDomain": "boards.greenhouse.io",
+      "atsTenantBindingSha256": "4444444444444444444444444444444444444444444444444444444444444444"
+    },
+    "employer": {
+      "status": "verified",
+      "canonicalEmployerId": "employer-acme",
+      "canonicalEmployerDomain": "acme.example",
+      "verificationMethods": [
+        "corporate_domain_control",
+        "provider_tenant_binding"
+      ],
+      "evidence": [
+        {
+          "class": "corporate_domain",
+          "kind": "dns_txt",
+          "sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+          "observedAtMs": 1999999999000,
+          "expiresAtMs": 2000000900000
+        },
+        {
+          "class": "provider_tenant",
+          "kind": "provider_tenant_binding",
+          "sha256": "6666666666666666666666666666666666666666666666666666666666666666",
+          "observedAtMs": 1999999999000,
+          "expiresAtMs": 2000000900000
+        }
+      ]
+    },
+    "risk": {
+      "status": "clear",
+      "signalCodes": [],
+      "policySha256": "7777777777777777777777777777777777777777777777777777777777777777",
+      "inputSha256": "8888888888888888888888888888888888888888888888888888888888888888",
+      "engineReleaseSha256": "9999999999999999999999999999999999999999999999999999999999999999",
+      "evidence": [
+        {
+          "class": "risk_engine",
+          "kind": "engine_result",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "observedAtMs": 1999999999000,
+          "expiresAtMs": 2000000900000
+        },
+        {
+          "class": "source_consistency",
+          "kind": "source_binding",
+          "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observedAtMs": 1999999999000,
+          "expiresAtMs": 2000000900000
+        }
+      ]
+    },
+    "assessedAtMs": 2000000000000,
+    "issuedAtMs": 2000000000000,
+    "notBeforeMs": 2000000000000,
+    "expiresAtMs": 2000000900000
+  },
+  "attestationSha256": "561e76321438820d07b8bb93d3770c32638d2f364283dc7babf4d59327ee935b",
+  "authorization": {
+    "publicKeyBase64url": "GX9rI-FshTLGq8g4-s1ep4m-DHaykgM0A5v6iz02jWE",
+    "payload": {
+      "version": 1,
+      "audience": "bluey-jobs-job-integrity-authorization-v1",
+      "authorizationId": "job-integrity-vector-employer-authorization-v1",
+      "role": "employer_identity",
+      "policySha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "targetAudience": "bluey-jobs-job-integrity-attestation-v1",
+      "targetSha256": "561e76321438820d07b8bb93d3770c32638d2f364283dc7babf4d59327ee935b",
+      "signedAtMs": 2000000000000
+    },
+    "payloadSha256": "6ad67d02417d5b49469b516b4c04f7a9e80d40117d8b8ea72c1d5d1ff8fbbbfa",
+    "envelope": {
+      "version": 1,
+      "audience": "bluey-jobs-job-integrity-authorization-v1",
+      "authorizationId": "job-integrity-vector-employer-authorization-v1",
+      "role": "employer_identity",
+      "policySha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "targetAudience": "bluey-jobs-job-integrity-attestation-v1",
+      "targetSha256": "561e76321438820d07b8bb93d3770c32638d2f364283dc7babf4d59327ee935b",
+      "signedAtMs": 2000000000000,
+      "signatures": [
+        {
+          "keyId": "employer-identity-vector-key-v1",
+          "signature": "VNlkdXTyCnJyYQkzIFZc6VJvmyTu7ohHd-JWZunY76XgqPNqS9HlKiXES48k33Af5EaHDi4F4F9d1PP9CMHSBQ"
+        }
+      ]
+    },
+    "envelopeSha256": "7ea4ca4fda12e486dd2f808d1402d9a91d0c6c8af0a91eee0da5382846d4cabc"
+  },
+  "canonicalRejections": [
+    {
+      "name": "missing_terminal_newline",
+      "mutation": "remove_terminal_newline",
+      "expectedError": "invalid_authority"
+    },
+    {
+      "name": "extra_terminal_newline",
+      "mutation": "append_terminal_newline",
+      "expectedError": "invalid_authority"
+    },
+    {
+      "name": "leading_ascii_space",
+      "mutation": "prepend_ascii_space",
+      "expectedError": "invalid_authority"
+    },
+    {
+      "name": "duplicate_top_level_version",
+      "mutation": "duplicate_top_level_version",
+      "expectedError": "invalid_authority"
+    },
+    {
+      "name": "unknown_top_level_field",
+      "mutation": "append_unknown_top_level_field",
+      "expectedError": "invalid_authority"
+    },
+    {
+      "name": "reordered_top_level_fields",
+      "mutation": "swap_version_and_audience",
+      "expectedError": "invalid_authority"
+    }
+  ],
+  "keyRejections": [
+    {
+      "name": "malformed_key_length",
+      "publicKeyBase64url": "AAAA",
+      "expectedError": "invalid_trust_anchor"
+    },
+    {
+      "name": "weak_identity_point",
+      "publicKeyBase64url": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "expectedError": "invalid_trust_anchor"
+    }
+  ],
+  "signatureRejections": [
+    {
+      "name": "small_order_r",
+      "signature": "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAADgqPNqS9HlKiXES48k33Af5EaHDi4F4F9d1PP9CMHSBQ",
+      "expectedError": "invalid_signature"
+    },
+    {
+      "name": "noncanonical_s",
+      "signature": "VNlkdXTyCnJyYQkzIFZc6VJvmyTu7ohHd-JWZunY76XNfOnHZTT4gvtgQzID2U805EaHDi4F4F9d1PP9CMHSFQ",
+      "expectedError": "invalid_signature"
+    },
+    {
+      "name": "padded_base64url",
+      "signature": "VNlkdXTyCnJyYQkzIFZc6VJvmyTu7ohHd-JWZunY76XgqPNqS9HlKiXES48k33Af5EaHDi4F4F9d1PP9CMHSBQ=",
+      "expectedError": "invalid_envelope"
+    }
+  ]
+}

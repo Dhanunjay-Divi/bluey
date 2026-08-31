@@ -122,6 +122,15 @@ fn lock_session_postgres_tx(tx: &mut PgTransaction<'_>, session_id: &str) -> Res
     Ok(())
 }
 
+fn application_object_upload_db_now_postgres_tx(tx: &mut PgTransaction<'_>) -> Result<i64> {
+    Ok(tx
+        .query_one(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )?
+        .get(0))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectKind {
     Artifact,
@@ -1721,14 +1730,17 @@ fn consume_submission_evidence_capacity_postgres_tx(
     runner: &str,
     bytes: i64,
     objects: i64,
-    now_ms: i64,
-) -> Result<()> {
+) -> Result<i64> {
     let capacity =
         load_submission_evidence_capacity_postgres(tx, account_id, application_id, run_id)?
             .ok_or(UploadControlError::SubmissionEvidenceCapacityUnavailable)?;
-    validate_capacity_consumption(&capacity, runner, bytes, objects, now_ms)?;
+    // The capacity row is the final effect-authority lock for an application object
+    // reservation. Only database time sampled after that lock may authorize the CAS or stamp
+    // the upload/outbox rows that cause the object-store PUT.
+    let effect_now_ms = application_object_upload_db_now_postgres_tx(tx)?;
+    validate_capacity_consumption(&capacity, runner, bytes, objects, effect_now_ms)?;
     if bytes == 0 && objects == 0 {
-        return Ok(());
+        return Ok(effect_now_ms);
     }
     if tx.execute(
         "UPDATE jobs_submission_evidence_capacity
@@ -1746,13 +1758,13 @@ fn consume_submission_evidence_capacity_postgres_tx(
             &runner,
             &bytes,
             &objects,
-            &now_ms,
+            &effect_now_ms,
         ],
     )? != 1
     {
         return Err(UploadControlError::SubmissionEvidenceCapacityExceeded.into());
     }
-    Ok(())
+    Ok(effect_now_ms)
 }
 
 fn validate_capacity_consumption(
@@ -2482,7 +2494,7 @@ fn reserve_upload_postgres(pool: &DbPool, input: &NewObjectUpload) -> Result<Upl
         ],
     )?;
     insert_put_outbox_postgres(&mut tx, &upload_id, &input.account_id, input.now_ms)?;
-    add_daily_usage_postgres(&mut tx, input)?;
+    add_daily_usage_postgres(&mut tx, input, input.now_ms)?;
     let upload =
         load_upload_postgres(&mut tx, &upload_id)?.ok_or(UploadControlError::UploadNotFound)?;
     tx.commit()?;
@@ -2602,7 +2614,7 @@ fn reserve_account_object_upload_postgres(
         ],
     )?;
     insert_put_outbox_postgres(&mut tx, &upload_id, &input.account_id, input.now_ms)?;
-    add_daily_usage_postgres(&mut tx, input)?;
+    add_daily_usage_postgres(&mut tx, input, input.now_ms)?;
     let upload =
         load_upload_postgres(&mut tx, &upload_id)?.ok_or(UploadControlError::UploadNotFound)?;
     tx.commit()?;
@@ -2734,40 +2746,50 @@ fn reserve_application_object_upload_postgres(
         }
         Some(_) => {}
     }
-    if let Some(existing) = load_logical_upload_postgres(
+    let existing = load_logical_upload_postgres(
         &mut tx,
         &input.account_id,
         input.object_kind.as_str(),
         &input.logical_id,
-    )? {
-        consume_submission_evidence_capacity_postgres_tx(
-            &mut tx,
-            &input.account_id,
-            application_id,
-            run_id,
-            runner,
-            0,
-            0,
-            input.now_ms,
-        )?;
-        let reservation = retry_reservation(&existing, input)?;
+    )?;
+    let replay = existing
+        .as_ref()
+        .map(|upload| retry_reservation(upload, input))
+        .transpose()?;
+    if let Some(reservation) = replay.as_ref() {
         if reservation.needs_put {
-            reopen_put_outbox_postgres(&mut tx, &existing.id, input.now_ms)?;
+            // Final submission locks upload -> PUT outbox -> exact capacity. Match that order so
+            // the database clock below is sampled only after every existing effect row is held.
+            lock_put_outbox_postgres_tx(&mut tx, &reservation.upload.id)?;
         }
-        tx.commit()?;
-        return Ok(reservation);
     }
 
-    consume_submission_evidence_capacity_postgres_tx(
+    let (capacity_bytes, capacity_objects) = if existing.is_some() {
+        (0, 0)
+    } else {
+        (input.size_bytes, 1)
+    };
+    let effect_now_ms = consume_submission_evidence_capacity_postgres_tx(
         &mut tx,
         &input.account_id,
         application_id,
         run_id,
         runner,
-        input.size_bytes,
-        1,
-        input.now_ms,
+        capacity_bytes,
+        capacity_objects,
     )?;
+    if input.expires_at_ms <= effect_now_ms {
+        return Err(UploadControlError::InvalidMetadata("expiration").into());
+    }
+
+    if let Some(reservation) = replay {
+        if reservation.needs_put {
+            reopen_put_outbox_postgres(&mut tx, &reservation.upload.id, effect_now_ms)?;
+        }
+        tx.commit()?;
+        return Ok(reservation);
+    }
+
     let upload_id = stable_upload_id(input);
     let metadata_json = serde_json::to_string(&input.metadata_json)?;
     tx.execute(
@@ -2788,11 +2810,11 @@ fn reserve_application_object_upload_postgres(
             &input.content_type,
             &input.expires_at_ms,
             &metadata_json,
-            &input.now_ms,
+            &effect_now_ms,
         ],
     )?;
-    insert_put_outbox_postgres(&mut tx, &upload_id, &input.account_id, input.now_ms)?;
-    add_daily_usage_postgres(&mut tx, input)?;
+    insert_put_outbox_postgres(&mut tx, &upload_id, &input.account_id, effect_now_ms)?;
+    add_daily_usage_postgres(&mut tx, input, effect_now_ms)?;
     let upload =
         load_upload_postgres(&mut tx, &upload_id)?.ok_or(UploadControlError::UploadNotFound)?;
     tx.commit()?;
@@ -3073,7 +3095,11 @@ fn add_daily_usage_sqlite(tx: &SqliteTransaction<'_>, input: &NewObjectUpload) -
     Ok(())
 }
 
-fn add_daily_usage_postgres(tx: &mut PgTransaction<'_>, input: &NewObjectUpload) -> Result<()> {
+fn add_daily_usage_postgres(
+    tx: &mut PgTransaction<'_>,
+    input: &NewObjectUpload,
+    now_ms: i64,
+) -> Result<()> {
     tx.execute(
         "INSERT INTO object_upload_daily_usage (
             account_id, day_start_ms, reserved_bytes, reserved_objects, updated_at_ms
@@ -3084,9 +3110,9 @@ fn add_daily_usage_postgres(tx: &mut PgTransaction<'_>, input: &NewObjectUpload)
             updated_at_ms = EXCLUDED.updated_at_ms",
         &[
             &input.account_id,
-            &day_start_ms(input.now_ms),
+            &day_start_ms(now_ms),
             &input.size_bytes,
-            &input.now_ms,
+            &now_ms,
         ],
     )?;
     Ok(())
@@ -3202,6 +3228,21 @@ fn reopen_put_outbox_sqlite(
           WHERE upload_id = ?1 AND operation = 'put' AND state <> 'completed'",
         params![upload_id, now_ms, attempts.saturating_add(1)],
     )?;
+    Ok(())
+}
+
+fn lock_put_outbox_postgres_tx(tx: &mut PgTransaction<'_>, upload_id: &str) -> Result<()> {
+    if tx
+        .query_opt(
+            "SELECT 1 FROM object_storage_outbox
+              WHERE upload_id = $1 AND operation = 'put'
+              FOR UPDATE",
+            &[&upload_id],
+        )?
+        .is_none()
+    {
+        return Err(UploadControlError::UploadNotFound.into());
+    }
     Ok(())
 }
 
@@ -5347,6 +5388,69 @@ mod tests {
         }
     }
 
+    fn assert_source_order(section: &str, needles: &[&str], label: &str) {
+        let mut offset = 0;
+        for needle in needles {
+            let relative = section[offset..]
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle:?} in {label}"));
+            offset += relative + needle.len();
+        }
+    }
+
+    #[test]
+    fn postgres_application_object_upload_uses_one_post_lock_database_clock() {
+        let source = include_str!("object_uploads.rs");
+        let consume = source
+            .split_once("fn consume_submission_evidence_capacity_postgres_tx(")
+            .expect("PostgreSQL application capacity consumer")
+            .1
+            .split_once("\nfn validate_capacity_consumption(")
+            .expect("bounded PostgreSQL application capacity consumer")
+            .0;
+        assert_source_order(
+            consume,
+            &[
+                "load_submission_evidence_capacity_postgres",
+                "application_object_upload_db_now_postgres_tx(tx)",
+                "validate_capacity_consumption",
+                "UPDATE jobs_submission_evidence_capacity",
+                "expires_at_ms > $7",
+                "&effect_now_ms",
+            ],
+            "PostgreSQL post-capacity-lock effect clock",
+        );
+        assert!(!consume.contains("now_ms: i64"));
+
+        let reserve = source
+            .split_once("fn reserve_application_object_upload_postgres(")
+            .expect("PostgreSQL application object reservation")
+            .1
+            .split_once("\nfn validate_session_sqlite(")
+            .expect("bounded PostgreSQL application object reservation")
+            .0;
+        assert_source_order(
+            reserve,
+            &[
+                "lock_context_artifact_postgres_tx",
+                "require_active_account_write_fence_postgres_tx",
+                "SELECT state FROM jobs_applications",
+                "load_logical_upload_postgres",
+                "lock_put_outbox_postgres_tx",
+                "consume_submission_evidence_capacity_postgres_tx",
+                "if input.expires_at_ms <= effect_now_ms",
+                "reopen_put_outbox_postgres",
+                "INSERT INTO object_uploads",
+                "&effect_now_ms",
+                "insert_put_outbox_postgres",
+                "add_daily_usage_postgres",
+            ],
+            "PostgreSQL application object lock/time/effect order",
+        );
+        assert!(reserve.contains("effect_now_ms)?;"));
+        assert!(!reserve.contains("input.now_ms"));
+    }
+
     #[test]
     fn postgres_cleanup_sql_guards_legacy_json_and_bounds_every_lock_set() {
         let validity_check = POSTGRES_SAFE_UPLOAD_METADATA_JOIN
@@ -6354,6 +6458,169 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn postgres_application_upload_waiting_past_capacity_expiry_mutates_nothing() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = open_postgres_pool(&database_url).expect("open Postgres test pool");
+        run_migrations(&pool).expect("apply Postgres runtime migrations");
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let account_id = format!("acct_upload_expiry_{suffix}");
+        let application_id = format!("app_upload_expiry_{suffix}");
+        let job_id = format!("job_upload_expiry_{suffix}");
+        let run_id = format!("run_upload_expiry_{suffix}");
+        let logical_id = format!("evidence-upload-expiry-{suffix}");
+        let mut setup = pool.get_pg().expect("get Postgres setup connection");
+        let db_now_ms: i64 = setup
+            .query_one(
+                "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample Postgres fixture time")
+            .get(0);
+        let capacity_expires_at_ms = db_now_ms + 750;
+        setup
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash) VALUES ($1, $2, 'hash')",
+                &[&account_id, &format!("{account_id}@example.test")],
+            )
+            .expect("insert Postgres upload-expiry account");
+        setup
+            .execute(
+                "INSERT INTO jobs_postings (
+                    id, account_id, canonical_key, posting_json, source, company, title,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, '{}', 'test', 'Acme', 'Engineer', $4, $4)",
+                &[
+                    &job_id,
+                    &account_id,
+                    &format!("canonical-{suffix}"),
+                    &db_now_ms,
+                ],
+            )
+            .expect("insert Postgres upload-expiry job");
+        setup
+            .execute(
+                "INSERT INTO jobs_applications (
+                    id, account_id, job_id, state, application_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, 'running', '{}', $4, $4)",
+                &[&application_id, &account_id, &job_id, &db_now_ms],
+            )
+            .expect("insert Postgres upload-expiry application");
+        reserve_submission_evidence_capacity(
+            &pool,
+            &NewSubmissionEvidenceCapacity {
+                account_id: account_id.clone(),
+                application_id: application_id.clone(),
+                run_id: run_id.clone(),
+                runner: "cloud".into(),
+                reserved_bytes: 100,
+                reserved_objects: 3,
+                expires_at_ms: capacity_expires_at_ms,
+                now_ms: db_now_ms,
+                limits: UploadLimits {
+                    max_object_bytes: 100,
+                    max_account_bytes: 150,
+                    max_daily_bytes: 100,
+                    max_account_objects: 10,
+                },
+            },
+        )
+        .expect("reserve short-lived Postgres submission capacity");
+
+        let mut blocker = pool.get_pg().expect("get Postgres capacity blocker");
+        let mut blocker_tx = blocker.transaction().expect("begin capacity blocker");
+        blocker_tx
+            .query_one(
+                "SELECT account_id FROM jobs_submission_evidence_capacity
+                  WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+                  FOR UPDATE",
+                &[&account_id, &application_id, &run_id],
+            )
+            .expect("lock exact Postgres submission capacity");
+
+        let mut object =
+            submission_object_input(&application_id, &run_id, &logical_id, 40, db_now_ms);
+        object.account_id = account_id.clone();
+        object.object_key = object.object_key.replace("acct_1", &account_id);
+        let reservation_pool = pool.clone();
+        let reservation_application_id = application_id.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let reservation_thread = std::thread::spawn(move || {
+            let _ = result_tx.send(reserve_application_object_upload(
+                &reservation_pool,
+                &reservation_application_id,
+                &object,
+            ));
+        });
+        assert!(
+            matches!(
+                result_rx.recv_timeout(Duration::from_millis(200)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "application upload did not wait on its exact capacity row"
+        );
+
+        let wait_deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            let observed_now_ms: i64 = blocker_tx
+                .query_one(
+                    "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )
+                .expect("observe Postgres expiry while capacity remains locked")
+                .get(0);
+            if observed_now_ms > capacity_expires_at_ms {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < wait_deadline,
+                "capacity did not expire within the bounded fixture window"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        blocker_tx.commit().expect("release expired capacity row");
+
+        let error = result_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("application upload finishes after capacity release")
+            .expect_err("expired capacity must reject object PUT metadata");
+        reservation_thread
+            .join()
+            .expect("application upload thread should not panic");
+        assert_eq!(
+            error.downcast_ref::<UploadControlError>(),
+            Some(&UploadControlError::SubmissionEvidenceCapacityUnavailable)
+        );
+
+        let state = setup
+            .query_one(
+                "SELECT capacity.consumed_bytes, capacity.consumed_objects,
+                        (SELECT COUNT(*) FROM object_uploads upload
+                          WHERE upload.account_id = $1 AND upload.logical_id = $4)::bigint,
+                        (SELECT COUNT(*) FROM object_storage_outbox outbox
+                          WHERE outbox.account_id = $1)::bigint,
+                        (SELECT COUNT(*) FROM object_upload_daily_usage usage
+                          WHERE usage.account_id = $1)::bigint
+                   FROM jobs_submission_evidence_capacity capacity
+                  WHERE capacity.account_id = $1 AND capacity.application_id = $2
+                    AND capacity.run_id = $3",
+                &[&account_id, &application_id, &run_id, &logical_id],
+            )
+            .expect("query zero-mutation upload-expiry state");
+        assert_eq!(state.get::<_, i64>(0), 0);
+        assert_eq!(state.get::<_, i64>(1), 0);
+        assert_eq!(state.get::<_, i64>(2), 0);
+        assert_eq!(state.get::<_, i64>(3), 0);
+        assert_eq!(state.get::<_, i64>(4), 0);
+        setup
+            .execute("DELETE FROM accounts WHERE id = $1", &[&account_id])
+            .expect("delete Postgres upload-expiry account");
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn postgres_protected_capacity_converts_and_restores_on_cleanup() {
         let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
             return;
@@ -6365,8 +6632,15 @@ mod tests {
         let application_id = format!("app_capacity_{suffix}");
         let job_id = format!("job_capacity_{suffix}");
         let run_id = format!("run_capacity_{suffix}");
-        {
+        let db_now_ms = {
             let mut conn = pool.get_pg().expect("get Postgres setup connection");
+            let db_now_ms: i64 = conn
+                .query_one(
+                    "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )
+                .expect("sample Postgres capacity fixture time")
+                .get(0);
             conn.execute(
                 "INSERT INTO accounts (id, email, password_hash) VALUES ($1, $2, 'hash')",
                 &[&account_id, &format!("{account_id}@example.test")],
@@ -6388,7 +6662,8 @@ mod tests {
                 &[&application_id, &account_id, &job_id],
             )
             .expect("insert Postgres capacity application");
-        }
+            db_now_ms
+        };
 
         let capacity = NewSubmissionEvidenceCapacity {
             account_id: account_id.clone(),
@@ -6397,8 +6672,8 @@ mod tests {
             runner: "cloud".into(),
             reserved_bytes: 100,
             reserved_objects: 3,
-            expires_at_ms: DAY_MS + 1_000,
-            now_ms: 1_000,
+            expires_at_ms: db_now_ms + DAY_MS,
+            now_ms: db_now_ms,
             limits: UploadLimits {
                 max_object_bytes: 100,
                 max_account_bytes: 150,
@@ -6413,23 +6688,32 @@ mod tests {
             &run_id,
             &format!("evidence-{suffix}"),
             40,
-            1_100,
+            db_now_ms + 100,
         );
         object.account_id = account_id.clone();
         object.object_key = object.object_key.replace("acct_1", &account_id);
         let reservation = reserve_application_object_upload(&pool, &application_id, &object)
             .expect("convert Postgres protected capacity");
-        assert!(
-            claim_cleanup_jobs(&pool, &account_id, StorageScope::Artifact, 2_000, 1_500, 10,)
-                .expect("run account-scoped Postgres stale cleanup")
-                .is_empty()
-        );
-        assert!(
-            !claim_global_cleanup_jobs(&pool, StorageScope::Artifact, 2_100, 1_500, 10,)
-                .expect("run global Postgres stale cleanup")
-                .iter()
-                .any(|job| job.upload_id == reservation.upload.id)
-        );
+        assert!(claim_cleanup_jobs(
+            &pool,
+            &account_id,
+            StorageScope::Artifact,
+            db_now_ms + 1_000,
+            db_now_ms + 500,
+            10,
+        )
+        .expect("run account-scoped Postgres stale cleanup")
+        .is_empty());
+        assert!(!claim_global_cleanup_jobs(
+            &pool,
+            StorageScope::Artifact,
+            db_now_ms + 1_100,
+            db_now_ms + 500,
+            10,
+        )
+        .expect("run global Postgres stale cleanup")
+        .iter()
+        .any(|job| job.upload_id == reservation.upload.id));
         assert_eq!(
             artifact_upload(&pool, &account_id, &object.logical_id)
                 .expect("load protected Postgres evidence")
@@ -6437,9 +6721,9 @@ mod tests {
                 .state,
             "pending"
         );
-        schedule_upload_cleanup(&pool, &reservation.upload.id, 1_200)
+        schedule_upload_cleanup(&pool, &reservation.upload.id, db_now_ms + 200)
             .expect("schedule Postgres evidence cleanup");
-        mark_cleanup_succeeded(&pool, &reservation.upload.id, 1_300)
+        mark_cleanup_succeeded(&pool, &reservation.upload.id, db_now_ms + 300)
             .expect("finish Postgres evidence cleanup");
 
         let mut conn = pool.get_pg().expect("get Postgres assertion connection");

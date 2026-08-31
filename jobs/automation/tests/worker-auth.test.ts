@@ -81,6 +81,26 @@ describe("Bluey Jobs worker authentication", () => {
     )).toBe("managed-cloud-runtime");
     expect(jobsWorkerScope(
       "POST",
+      "/api/jobs/internal/original-source-verifications/lease",
+    )).toBe("original-source-verification");
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/original-source-verifications/source-verification-assignment-123/heartbeat",
+    )).toBe("original-source-verification");
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/original-source-verifications/source-verification-assignment-123/complete",
+    )).toBe("original-source-verification");
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/original-source-verifications/source-verification-assignment-123/fail",
+    )).toBe("original-source-verification");
+    expect(jobsWorkerScope(
+      "POST",
+      "/api/jobs/internal/original-source-verifications/short/complete",
+    )).toBeUndefined();
+    expect(jobsWorkerScope(
+      "POST",
       "/api/jobs/internal/managed-cloud/runtime-grants/short/claim",
     )).toBeUndefined();
     expect(jobsWorkerScope("GET", "/api/jobs/internal/discovery/lease")).toBeUndefined();

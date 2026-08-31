@@ -357,7 +357,6 @@ where
     {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     }
-    let now = now_ms();
     let claim_nonce_sha256 = hex::encode(Sha256::digest(claim_nonce.as_bytes()));
     let claim_request_sha256 =
         browser_claim_request_sha256(run_id, ticket_hash, claim_nonce, descriptor);
@@ -374,7 +373,6 @@ where
                 &claim_request_sha256,
                 descriptor,
                 server_release_id,
-                now,
                 require_distribution_ready,
                 &issue_response,
             )?;
@@ -386,16 +384,29 @@ where
             let mut transaction = connection.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut transaction)
                 .map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut transaction)?;
             lock_postgres_ats_certification(&mut transaction)?;
+            let account_id = transaction
+                .query_opt(
+                    "SELECT account_id FROM jobs_local_run_tickets
+                      WHERE id = $1 AND ticket_hash = $2",
+                    &[&run_id, &ticket_hash],
+                )?
+                .map(|row| row.get::<_, String>(0));
+            let Some(account_id) = account_id else {
+                transaction.commit()?;
+                return Ok(BrowserLocalRunClaimDisposition::Rejected);
+            };
+            lock_discovery_account_shared_postgres(&mut transaction, &account_id)?;
             let disposition = postgres_claim_local_run_with_browser_release(
                 &mut transaction,
+                &account_id,
                 run_id,
                 ticket_hash,
                 &claim_nonce_sha256,
                 &claim_request_sha256,
                 descriptor,
                 server_release_id,
-                now,
                 require_distribution_ready,
                 &issue_response,
             )?;
@@ -480,11 +491,13 @@ fn sqlite_browser_runner_claim_operational_block(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
     application_id: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
 ) -> Result<Option<BrowserLocalRunClaimDisposition>> {
-    let hold_context = match operational_hold_context_for_application_sqlite_tx(
+    let hold_context = match operational_hold_context_for_application_sqlite_tx_after_authority(
         tx,
         account_id,
         application_id,
+        employer_domain,
         Some("local"),
         None,
         None,
@@ -511,20 +524,23 @@ fn postgres_browser_runner_claim_operational_block(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
     application_id: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
 ) -> Result<Option<BrowserLocalRunClaimDisposition>> {
-    let hold_context = match operational_hold_context_for_application_postgres_tx(
-        tx,
-        account_id,
-        application_id,
-        Some("local"),
-        None,
-        None,
-    ) {
-        Ok(context) => context,
-        Err(OperationalHoldError::Storage(error)) => return Err(error),
-        Err(_) => return Ok(Some(BrowserLocalRunClaimDisposition::Rejected)),
-    };
-    match require_operational_capability_postgres_tx(
+    let hold_context =
+        match operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+            tx,
+            account_id,
+            application_id,
+            employer_domain,
+            Some("local"),
+            None,
+            None,
+        ) {
+            Ok(context) => context,
+            Err(OperationalHoldError::Storage(error)) => return Err(error),
+            Err(_) => return Ok(Some(BrowserLocalRunClaimDisposition::Rejected)),
+        };
+    match require_operational_capability_postgres_tx_after_authority_prelock(
         tx,
         OperationalCapability::RunnerClaim,
         &hold_context,
@@ -538,6 +554,87 @@ fn postgres_browser_runner_claim_operational_block(
     }
 }
 
+fn sqlite_browser_replay_employer_domain(
+    tx: &rusqlite::Transaction<'_>,
+    ticket: &LocalRunTicket,
+) -> Result<Option<OperationalHoldEmployerDomain>> {
+    let application = tx
+        .query_row(
+            "SELECT id, job_id, application_json FROM jobs_applications
+              WHERE account_id = ?1 AND id = ?2",
+            params![ticket.account_id, ticket.application_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(application_id, job_id, raw)| {
+            parse_application_json(raw, &application_id, &job_id, "job application replay")
+        })
+        .transpose()?;
+    let Some(application) = application else {
+        return Ok(None);
+    };
+    if application.state == "submitted" {
+        return submitted_execution_employer_domain(&ticket.account_id, &application).map(Some);
+    }
+    let current = resolve_current_execution_authority_sqlite_after_prelock(
+        tx,
+        &ticket.account_id,
+        &application,
+        ExecutionAuthorityRunner::Local,
+    )?;
+    Ok(if current.authorized {
+        current.employer_domain
+    } else {
+        None
+    })
+}
+
+fn postgres_browser_replay_employer_domain(
+    tx: &mut postgres::Transaction<'_>,
+    ticket: &LocalRunTicket,
+) -> Result<Option<OperationalHoldEmployerDomain>> {
+    let application = tx
+        .query_opt(
+            "SELECT id, job_id, application_json FROM jobs_applications
+              WHERE account_id = $1 AND id = $2 FOR SHARE",
+            &[&ticket.account_id, &ticket.application_id],
+        )?
+        .map(|row| {
+            let application_id: String = row.get(0);
+            let job_id: String = row.get(1);
+            parse_application_json(
+                row.get(2),
+                &application_id,
+                &job_id,
+                "job application replay",
+            )
+        })
+        .transpose()?;
+    let Some(application) = application else {
+        return Ok(None);
+    };
+    if application.state == "submitted" {
+        return submitted_execution_employer_domain(&ticket.account_id, &application).map(Some);
+    }
+    let current = resolve_current_execution_authority_postgres_after_prelock(
+        tx,
+        &ticket.account_id,
+        &application,
+        ExecutionAuthorityRunner::Local,
+    )?;
+    Ok(if current.authorized {
+        current.employer_domain
+    } else {
+        None
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sqlite_claim_local_run_with_browser_release<F>(
     tx: &rusqlite::Transaction<'_>,
@@ -547,7 +644,6 @@ fn sqlite_claim_local_run_with_browser_release<F>(
     claim_request_sha256: &str,
     descriptor: &VerifiedBrowserBuildDescriptor,
     server_release_id: &str,
-    now: i64,
     require_distribution_ready: bool,
     issue_response: &F,
 ) -> Result<BrowserLocalRunClaimDisposition>
@@ -562,10 +658,15 @@ where
         claim_request_sha256,
     )? {
         if let BrowserLocalRunClaimDisposition::Success(success) = &disposition {
+            let Some(employer_domain) = sqlite_browser_replay_employer_domain(tx, &success.ticket)?
+            else {
+                return Ok(BrowserLocalRunClaimDisposition::Rejected);
+            };
             if let Some(blocked) = sqlite_browser_runner_claim_operational_block(
                 tx,
                 &success.ticket.account_id,
                 &success.ticket.application_id,
+                &employer_domain,
             )? {
                 return Ok(blocked);
             }
@@ -587,15 +688,18 @@ where
         return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
     }
     crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(tx, &account_id)?;
-    let Some(mut ticket) =
+    let now = local_run_claim_db_now_sqlite(tx)?;
+    let Some(authority) =
         sqlite_local_run_authority(tx, run_id, ticket_hash, now, LocalRunAuthorityPhase::Claim)?
     else {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     };
+    let mut ticket = authority.ticket;
     if let Some(blocked) = sqlite_browser_runner_claim_operational_block(
         tx,
         &ticket.account_id,
         &ticket.application_id,
+        &authority.employer_domain,
     )? {
         return Ok(blocked);
     }
@@ -933,13 +1037,13 @@ fn browser_release_binding_from_sqlite_row(
 #[allow(clippy::too_many_arguments)]
 fn postgres_claim_local_run_with_browser_release<F>(
     tx: &mut postgres::Transaction<'_>,
+    prelocked_account_id: &str,
     run_id: &str,
     ticket_hash: &str,
     claim_nonce_sha256: &str,
     claim_request_sha256: &str,
     descriptor: &VerifiedBrowserBuildDescriptor,
     server_release_id: &str,
-    now: i64,
     require_distribution_ready: bool,
     issue_response: &F,
 ) -> Result<BrowserLocalRunClaimDisposition>
@@ -954,59 +1058,70 @@ where
         claim_request_sha256,
     )? {
         if let BrowserLocalRunClaimDisposition::Success(success) = &disposition {
+            if success.ticket.account_id != prelocked_account_id {
+                return Ok(BrowserLocalRunClaimDisposition::Rejected);
+            }
+            let Some(employer_domain) =
+                postgres_browser_replay_employer_domain(tx, &success.ticket)?
+            else {
+                return Ok(BrowserLocalRunClaimDisposition::Rejected);
+            };
             if let Some(blocked) = postgres_browser_runner_claim_operational_block(
                 tx,
                 &success.ticket.account_id,
                 &success.ticket.application_id,
+                &employer_domain,
             )? {
                 return Ok(blocked);
             }
         }
         return Ok(disposition);
     }
-    let account_id = tx
-        .query_opt(
-            "SELECT account_id FROM jobs_local_run_tickets
-              WHERE id = $1 AND ticket_hash = $2",
-            &[&run_id, &ticket_hash],
-        )?
-        .map(|row| row.get::<_, String>(0));
-    let Some(account_id) = account_id else {
-        return Ok(BrowserLocalRunClaimDisposition::Rejected);
-    };
-    lock_discovery_account_shared_postgres(tx, &account_id)?;
     if require_distribution_ready && !postgres_runner_volume_fleet_distribution_ready(tx)? {
         return Ok(BrowserLocalRunClaimDisposition::DistributionUnavailable);
     }
     tx.query_one(
         "SELECT id FROM accounts WHERE id = $1 FOR UPDATE",
-        &[&account_id],
+        &[&prelocked_account_id],
     )?;
-    crate::db::object_uploads::require_active_account_write_fence_postgres_tx(tx, &account_id)?;
-    let Some(mut ticket) =
-        postgres_local_run_authority(tx, run_id, ticket_hash, now, LocalRunAuthorityPhase::Claim)?
+    crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+        tx,
+        prelocked_account_id,
+    )?;
+    let Some(authority_prelock) = postgres_local_run_authority_prelock(
+        tx,
+        prelocked_account_id,
+        run_id,
+        ticket_hash,
+        LocalRunAuthorityPhase::Claim,
+    )?
     else {
         return Ok(BrowserLocalRunClaimDisposition::Rejected);
     };
+    let ticket_application_id = authority_prelock.ticket.application_id.clone();
+    let mut application = authority_prelock.application.clone();
+    let mut session = authority_prelock.session.clone();
+    postgres_lock_browser_release_registry_shared(tx)?;
+    let now = local_run_claim_db_now_postgres(tx)?;
+    let Some(authority) =
+        postgres_local_run_authority_after_prelock_at_ms(tx, authority_prelock, now)?
+    else {
+        return Ok(BrowserLocalRunClaimDisposition::Rejected);
+    };
+    if authority.ticket.account_id != prelocked_account_id
+        || authority.ticket.application_id != ticket_application_id
+    {
+        return Ok(BrowserLocalRunClaimDisposition::Rejected);
+    }
+    let mut ticket = authority.ticket;
     if let Some(blocked) = postgres_browser_runner_claim_operational_block(
         tx,
         &ticket.account_id,
         &ticket.application_id,
+        &authority.employer_domain,
     )? {
         return Ok(blocked);
     }
-    let reservation_status = tx
-        .query_opt(
-            "SELECT status FROM jobs_attempt_reservations
-              WHERE account_id = $1 AND application_id = $2
-              FOR UPDATE",
-            &[&ticket.account_id, &ticket.application_id],
-        )?
-        .map(|row| row.get::<_, String>(0));
-    if reservation_status.as_deref() != Some("reserved") {
-        return Ok(BrowserLocalRunClaimDisposition::Rejected);
-    }
-    postgres_lock_browser_release_registry_shared(tx)?;
     let Some(release) = postgres_browser_release_for_claim_tx(
         tx,
         &ticket.account_id,
@@ -1026,32 +1141,9 @@ where
     let encrypted_response = encrypt_payload(&response_json)?;
     let binding_sha256 = browser_release_binding_sha256(&release);
 
-    let application_row = tx.query_one(
-        "SELECT job_id, application_json FROM jobs_applications
-          WHERE account_id = $1 AND id = $2 AND state = 'queued'
-          FOR UPDATE",
-        &[&ticket.account_id, &ticket.application_id],
-    )?;
-    let job_id: String = application_row.get(0);
-    let application_raw: String = application_row.get(1);
-    let mut application = parse_application_json(
-        application_raw,
-        &ticket.application_id,
-        &job_id,
-        "job application",
-    )?;
     application.state = "running".to_string();
     application.updated_at_ms = now;
     let application_json = to_json(&application, "job application")?;
-    let session_raw: String = tx
-        .query_one(
-            "SELECT session_json FROM jobs_browser_sessions
-              WHERE account_id = $1 AND id = $2 AND runner = 'local' AND status = 'queued'
-              FOR UPDATE",
-            &[&ticket.account_id, &run_id],
-        )?
-        .get(0);
-    let mut session: BrowserSession = parse_json(session_raw, "browser session")?;
     session.status = "running".to_string();
     session.current_step = "Filling application".to_string();
     session.updated_at_ms = now;
@@ -1141,7 +1233,9 @@ where
         descriptor,
         &release,
     )? {
-        create_ats_application_certification_binding_from_context_postgres_tx(tx, &request, now)?;
+        create_ats_application_certification_binding_from_context_postgres_tx_after_prelock(
+            tx, &request, now,
+        )?;
     }
     let event = json!({
         "application_id": ticket.application_id,
@@ -1522,12 +1616,12 @@ fn postgres_runner_volume_fleet_distribution_ready(
         .get(0))
 }
 
-fn sqlite_bound_browser_release_submit_allowed(
+fn sqlite_bound_browser_release_submit_allowed_at_ms(
     tx: &rusqlite::Transaction<'_>,
     run_id: &str,
     server_release_id: &str,
+    now: i64,
 ) -> Result<bool> {
-    let now = now_ms();
     let allowed: i64 = tx.query_row(
         "SELECT EXISTS(
             SELECT 1
@@ -1640,12 +1734,12 @@ fn sqlite_bound_browser_release_submit_allowed(
     Ok(allowed != 0)
 }
 
-fn postgres_bound_browser_release_submit_allowed(
+fn postgres_bound_browser_release_submit_allowed_at_ms(
     tx: &mut postgres::Transaction<'_>,
     run_id: &str,
     server_release_id: &str,
+    now: i64,
 ) -> Result<bool> {
-    let now = now_ms();
     Ok(tx
         .query_one(
             "SELECT EXISTS(
@@ -1847,12 +1941,12 @@ fn local_browser_release_availability_inner(
     if account_id.trim().is_empty() || !browser_release_safe_id(server_release_id) {
         anyhow::bail!("invalid Browser release availability binding")
     }
-    let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut connection = pool.get()?;
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = now_ms();
             if require_distribution_ready
                 && !sqlite_runner_volume_fleet_distribution_ready(&transaction)?
             {
@@ -1878,6 +1972,7 @@ fn local_browser_release_availability_inner(
                 return Ok(browser_release_distribution_unavailable());
             }
             postgres_lock_browser_release_registry_shared(&mut transaction)?;
+            let now = local_run_claim_db_now_postgres(&mut transaction)?;
             let availability = postgres_local_browser_release_availability(
                 &mut transaction,
                 account_id,
@@ -3691,6 +3786,150 @@ fn browser_release_positive_integer(value: &str) -> Result<i64, BrowserReleaseAu
 #[cfg(test)]
 mod browser_release_authority_tests {
     use super::*;
+
+    #[test]
+    fn postgres_availability_samples_database_time_after_fleet_and_registry_fences() {
+        let source = include_str!("browser_release_authority.rs");
+        let section = source
+            .split("fn local_browser_release_availability_inner(")
+            .nth(1)
+            .expect("Browser release availability")
+            .split("fn sqlite_local_browser_release_availability(")
+            .next()
+            .expect("bounded Browser release availability")
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL Browser release availability");
+        let mut previous = 0;
+        for operation in [
+            "postgres_runner_volume_fleet_distribution_ready",
+            "postgres_lock_browser_release_registry_shared",
+            "local_run_claim_db_now_postgres",
+            "postgres_local_browser_release_availability",
+        ] {
+            let position = section
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing Browser availability operation {operation}"));
+            assert!(
+                position >= previous,
+                "Browser availability time sampled before {operation}"
+            );
+            previous = position;
+        }
+        assert!(!section.contains("now_ms()"));
+    }
+
+    #[test]
+    fn postgres_claim_locks_effect_rows_before_final_database_time_and_never_relocks() {
+        let source = include_str!("browser_release_authority.rs");
+        let outer = source
+            .split("fn claim_local_run_with_browser_release_inner")
+            .nth(1)
+            .expect("Browser claim transaction")
+            .split("fn browser_claim_request_sha256")
+            .next()
+            .expect("bounded Browser claim transaction")
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL Browser claim transaction");
+        let mut previous = 0;
+        for operation in [
+            "lock_operational_hold_shared_postgres_tx",
+            "lock_managed_cloud_release_registry_shared_postgres_tx",
+            "lock_postgres_ats_certification",
+            "SELECT account_id FROM jobs_local_run_tickets",
+            "lock_discovery_account_shared_postgres",
+            "postgres_claim_local_run_with_browser_release",
+        ] {
+            let position = outer
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing Browser claim operation {operation}"));
+            assert!(position >= previous, "Browser claim prelock order inverted");
+            previous = position;
+        }
+
+        let claim = source
+            .split("fn postgres_claim_local_run_with_browser_release")
+            .nth(1)
+            .expect("PostgreSQL Browser claim")
+            .split("fn postgres_lock_browser_release_registry_shared")
+            .next()
+            .expect("bounded PostgreSQL Browser claim");
+        let fresh_claim = claim
+            .split("if require_distribution_ready")
+            .nth(1)
+            .expect("fresh PostgreSQL Browser claim");
+        let mut previous = 0;
+        for operation in [
+            "SELECT id FROM accounts",
+            "postgres_local_run_authority_prelock",
+            "postgres_lock_browser_release_registry_shared",
+            "local_run_claim_db_now_postgres",
+            "postgres_local_run_authority_after_prelock_at_ms",
+            "postgres_browser_runner_claim_operational_block",
+            "INSERT INTO jobs_local_run_release_bindings",
+        ] {
+            let position = fresh_claim
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing Browser claim operation {operation}"));
+            assert!(
+                position >= previous,
+                "Browser claim row/time order inverted"
+            );
+            previous = position;
+        }
+        assert!(claim.contains(
+            "create_ats_application_certification_binding_from_context_postgres_tx_after_prelock"
+        ));
+        for forbidden in [
+            "lock_operational_hold_shared_postgres_tx",
+            "lock_managed_cloud_release_registry_shared_postgres_tx",
+            "lock_postgres_ats_certification",
+            "lock_discovery_account_shared_postgres",
+            "operational_hold_context_for_application_postgres_tx(",
+            "create_ats_application_certification_binding_from_context_postgres_tx(",
+        ] {
+            assert!(
+                !claim.contains(forbidden),
+                "Browser claim relocks {forbidden}"
+            );
+        }
+
+        let sqlite_replay_domain = source
+            .split("fn sqlite_browser_replay_employer_domain(")
+            .nth(1)
+            .expect("SQLite Browser replay domain")
+            .split("fn postgres_browser_replay_employer_domain(")
+            .next()
+            .expect("bounded SQLite Browser replay domain");
+        assert!(sqlite_replay_domain.contains("application.state == \"submitted\""));
+        assert!(sqlite_replay_domain.contains("submitted_execution_employer_domain"));
+        assert!(sqlite_replay_domain
+            .contains("resolve_current_execution_authority_sqlite_after_prelock"));
+
+        let postgres_replay_domain = source
+            .split("fn postgres_browser_replay_employer_domain(")
+            .nth(1)
+            .expect("PostgreSQL Browser replay domain")
+            .split("fn sqlite_claim_local_run_with_browser_release")
+            .next()
+            .expect("bounded PostgreSQL Browser replay domain");
+        assert!(postgres_replay_domain.contains("application.state == \"submitted\""));
+        assert!(postgres_replay_domain.contains("submitted_execution_employer_domain"));
+        assert!(postgres_replay_domain
+            .contains("resolve_current_execution_authority_postgres_after_prelock"));
+        for forbidden in [
+            "lock_operational_hold_shared_postgres_tx",
+            "lock_managed_cloud_release_registry_shared_postgres_tx",
+            "lock_postgres_ats_certification",
+            "lock_discovery_account_shared_postgres",
+        ] {
+            assert!(
+                !postgres_replay_domain.contains(forbidden),
+                "Browser replay domain relocks {forbidden}"
+            );
+        }
+    }
 
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]

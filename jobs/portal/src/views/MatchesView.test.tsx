@@ -9,15 +9,17 @@ import type {
   RunnerAvailability,
 } from "../types";
 import {
+  DISCOVERY_SOURCE_STALE_AFTER_MS,
+  discoverySourceAction,
+  discoverySourceState,
+} from "../lib/discovery-source";
+import {
   canAutoSubmit,
   DiscoverySourceHealthList,
   JOB_IMPORT_ACTION_LABEL,
   JOB_IMPORT_DESCRIPTION,
   JOB_IMPORT_FALLBACK_LABEL,
   autoSubmitUnavailableReason,
-  DISCOVERY_SOURCE_STALE_AFTER_MS,
-  discoverySourceAction,
-  discoverySourceState,
   isCandidateLead,
   isMatchEligibleForDefaultView,
   isMatchVisibleByState,

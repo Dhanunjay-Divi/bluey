@@ -7,6 +7,11 @@ edition = "2021"
 description = "Bluey product server: auth, billing, license, managed Auto Router endpoint, admin"
 license = "Proprietary"
 
+[features]
+default = []
+integration-test-support = ["dep:serial_test"]
+business-messaging-simulator-test-support = []
+
 [[bin]]
 name = "bluey-server"
 path = "src/main.rs"
@@ -14,6 +19,16 @@ path = "src/main.rs"
 [[bin]]
 name = "bluey-jobs-api"
 path = "src/bin/bluey-jobs-api.rs"
+
+[[test]]
+name = "integration_e2e"
+path = "tests/integration_e2e.rs"
+required-features = ["integration-test-support"]
+
+[[test]]
+name = "business_messaging_simulator"
+path = "tests/business_messaging_simulator.rs"
+required-features = ["business-messaging-simulator-test-support"]
 
 [dependencies]
 tower = { version = "0.4", features = ["util"] }
@@ -80,6 +95,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
 lopdf = { version = "0.44", default-features = false }
 png = "0.18"
+serial_test = { version = "3", optional = true }
 
 # CLI / config
 clap = { version = "4", features = ["derive", "env"] }

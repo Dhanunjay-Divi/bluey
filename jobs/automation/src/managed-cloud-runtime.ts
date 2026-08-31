@@ -503,6 +503,7 @@ function runtimeRoles(
       : [
         "discovery_worker",
         "global_discovery_worker",
+        "original_source_verifier",
         "workflow_gateway",
         "workflow_worker",
       ] as const;
@@ -534,9 +535,6 @@ function componentForRuntimeRole(
     || role === "workflow_cleanup_dispatcher"
     || role === "workflow_command_dispatcher") return "jobs-api";
   if (role === "managed_runner") return "jobs-runner";
-  if (role === "original_source_verifier") {
-    throw new Error("Original-source verification is not a Phase 611 runtime");
-  }
   return "jobs-workflows";
 }
 

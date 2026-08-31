@@ -599,7 +599,7 @@ export const previewWorkspace: JobsWorkspace = {
       id: "outcome-1",
       event_type: "application_outcome",
       job_id: "job-1",
-      application_id: "app-1",
+      application_id: "app-3",
       action: "interview",
       reasons: [],
       note: "Recruiter screen scheduled for Friday.",
@@ -749,36 +749,42 @@ export function previewWorkspaceForScenario(workspace: JobsWorkspace, scenario: 
     };
   }
   if (scenario === "many-matches") {
-    const matches = Array.from({ length: 125 }, (_, index) => {
-      const template = workspace.matches[index % workspace.matches.length];
-      const candidateLead = index % 4 === 0;
-      const eligibility = template.eligibility ?? betaEligibility();
-      return {
-        ...template,
-        id: `volume-job-${index + 1}`,
-        canonical_key: `volume-job-${index + 1}`,
-        external_id: `volume-${index + 1}`,
-        company: `${template.company} ${index + 1}`,
-        title: index % 3 === 0 ? `Senior Product Engineer ${index + 1}` : template.title,
-        source: candidateLead ? "curated_feed:preview-volume" : template.source,
-        canonical_url: `https://example.com/jobs/volume-${index + 1}`,
-        track_id: workspace.tracks[index % workspace.tracks.length].id,
-        match_score: 70 + (index % 26),
-        posted_at_ms: now - (index % 10) * 86_400_000,
-        last_verified_at_ms: candidateLead ? undefined : now - (index % 60) * 60_000,
-        availability_status: candidateLead ? "unknown" as const : "active" as const,
-        eligibility: candidateLead ? {
-          ...eligibility,
-          can_prepare: false,
-          can_auto_submit: false,
-          can_queue_local: false,
-          can_queue_cloud: false,
-        } : eligibility,
-      };
-    });
+    const matches = Array.from(
+      { length: Math.max(0, 125 - workspace.matches.length) },
+      (_, offset) => {
+        const index = workspace.matches.length + offset;
+        const template = workspace.matches[index % workspace.matches.length];
+        const candidateLead = index % 4 === 0;
+        const eligibility = template.eligibility ?? betaEligibility();
+        return {
+          ...template,
+          id: `volume-job-${index + 1}`,
+          canonical_key: `volume-job-${index + 1}`,
+          external_id: `volume-${index + 1}`,
+          company: `${template.company} ${index + 1}`,
+          title: index % 3 === 0 ? `Senior Product Engineer ${index + 1}` : template.title,
+          source: candidateLead ? "curated_feed:preview-volume" : template.source,
+          canonical_url: `https://example.com/jobs/volume-${index + 1}`,
+          track_id: workspace.tracks[index % workspace.tracks.length].id,
+          match_score: 70 + (index % 26),
+          posted_at_ms: now - (index % 10) * 86_400_000,
+          last_verified_at_ms: candidateLead ? undefined : now - (index % 60) * 60_000,
+          availability_status: candidateLead ? "unknown" as const : "active" as const,
+          eligibility: candidateLead
+            ? {
+                ...eligibility,
+                can_prepare: false,
+                can_auto_submit: false,
+                can_queue_local: false,
+                can_queue_cloud: false,
+              }
+            : eligibility,
+        };
+      },
+    );
     return {
       ...workspace,
-      matches,
+      matches: [...workspace.matches, ...matches],
       discovery_sources: [
         ...workspace.discovery_sources,
         {

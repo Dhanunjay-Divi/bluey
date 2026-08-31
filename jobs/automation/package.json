@@ -42,12 +42,16 @@
     "./managed-cloud-execution": {
       "types": "./dist/managed-cloud-execution.d.ts",
       "import": "./dist/managed-cloud-execution.js"
+    },
+    "./original-source-verification": {
+      "types": "./dist/original-source-verification.d.ts",
+      "import": "./dist/original-source-verification.js"
     }
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
     "build": "npm run clean && tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.business-messaging-simulator.json",
     "test": "vitest run",
     "smoke": "node -e \"import('@bluey/jobs-automation').then(m => { if (!m.PublicAtsDiscoveryProvider || !m.planApplicationForm || !m.createApplicationReceipt) process.exit(1) })\""
   },

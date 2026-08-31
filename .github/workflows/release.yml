@@ -105,12 +105,16 @@ jobs:
         run: |
           cargo clippy --all-targets -- -D warnings
           cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --no-default-features --features integration-test-support --test integration_e2e -- -D warnings
+          cargo clippy --manifest-path server/Cargo.toml --locked --no-default-features --features business-messaging-simulator-test-support --test business_messaging_simulator -- -D warnings
           cargo clippy --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked -- -D warnings
 
       - name: Test Rust workspaces
         run: |
           cargo test --all-targets
           cargo test --manifest-path server/Cargo.toml --all-targets
+          cargo test --manifest-path server/Cargo.toml --no-default-features --features integration-test-support --test integration_e2e
+          cargo test --manifest-path server/Cargo.toml --locked --no-default-features --features business-messaging-simulator-test-support --test business_messaging_simulator
           cargo test --manifest-path jobs/runner/native-storage/Cargo.toml --all-targets --locked
 
       - name: Build native runner storage release artifact
@@ -130,6 +134,7 @@ jobs:
           npm test --prefix jobs
           npm run typecheck --prefix jobs
           npm run build --prefix jobs
+          node jobs/scripts/check-business-messaging-simulator-containment.mjs
           git diff --exit-code -- web/jobs
 
       - name: Build and smoke the managed runner image

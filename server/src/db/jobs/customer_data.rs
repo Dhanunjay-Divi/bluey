@@ -670,19 +670,18 @@ pub fn resolve_intervention_answer_for_review(
                 anyhow::bail!("application execution authority changed")
             }
 
-            let browser_session: Option<BrowserSession> = if let Some(run_id) =
-                previous_run_id.as_deref()
-            {
-                tx.query_opt(
-                    "SELECT session_json FROM jobs_browser_sessions
+            let browser_session: Option<BrowserSession> =
+                if let Some(run_id) = previous_run_id.as_deref() {
+                    tx.query_opt(
+                        "SELECT session_json FROM jobs_browser_sessions
                       WHERE account_id = $1 AND id = $2 FOR UPDATE",
-                    &[&account_id, &run_id],
-                )?
-                .map(|row| parse_json(row.get(0), "browser session"))
-                .transpose()?
-            } else {
-                None
-            };
+                        &[&account_id, &run_id],
+                    )?
+                    .map(|row| parse_json(row.get(0), "browser session"))
+                    .transpose()?
+                } else {
+                    None
+                };
             reject_irreversible_answer_revision(
                 lease_phase.as_deref(),
                 local_ticket_status.as_deref(),
@@ -1339,7 +1338,54 @@ pub fn save_application_evidence(
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
-            conn.execute(
+            let mut tx = conn.transaction()?;
+            match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
+                crate::db::account_data::AccountWriteFence::Active => {}
+                crate::db::account_data::AccountWriteFence::DeletionRequested => {
+                    anyhow::bail!("account deletion has fenced application evidence")
+                }
+                crate::db::account_data::AccountWriteFence::Missing => {
+                    anyhow::bail!("account not found")
+                }
+            }
+            let application_row = tx
+                .query_opt(
+                    "SELECT job_id, application_json FROM jobs_applications
+                      WHERE account_id = $1 AND id = $2 FOR SHARE",
+                    &[&account_id, &value.application_id],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("application not found"))?;
+            let locked_job_id: String = application_row.get(0);
+            let locked_application = parse_application_json(
+                application_row.get(1),
+                &value.application_id,
+                &locked_job_id,
+                "application evidence application",
+            )?;
+            if locked_application.job_id != application.job_id
+                || locked_application.resume_version_id != application.resume_version_id
+            {
+                anyhow::bail!("application changed before evidence persistence")
+            }
+            lock_application_evidence_namespaces_postgres_tx(
+                &mut tx,
+                account_id,
+                &[(value.id.as_str(), provider_event_hash.as_str())],
+            )?;
+            if let Some(row) = tx.query_opt(
+                "SELECT account_id, provider_event_hash FROM jobs_application_evidence
+                  WHERE id = $1 FOR SHARE",
+                &[&value.id],
+            )? {
+                let stored_account_id: String = row.get(0);
+                let stored_provider_event_hash: String = row.get(1);
+                if stored_account_id != account_id
+                    || stored_provider_event_hash != provider_event_hash
+                {
+                    anyhow::bail!("application evidence id is already bound")
+                }
+            }
+            tx.execute(
                 "INSERT INTO jobs_application_evidence (
                     id, account_id, application_id, kind, provider_event_hash,
                     evidence_json, occurred_at_ms, created_at_ms
@@ -1356,12 +1402,14 @@ pub fn save_application_evidence(
                     &value.created_at_ms,
                 ],
             )?;
-            let row = conn.query_one(
+            let row = tx.query_one(
                 "SELECT evidence_json FROM jobs_application_evidence
                   WHERE account_id = $1 AND provider_event_hash = $2",
                 &[&account_id, &provider_event_hash],
             )?;
-            parse_json(row.get(0), "application evidence")
+            let stored = parse_json(row.get(0), "application evidence")?;
+            tx.commit()?;
+            Ok(stored)
         }
     })
 }
@@ -1408,6 +1456,56 @@ struct PreparedSubmissionEvidence {
     value: ApplicationEvidence,
     provider_event_hash: String,
     payload: String,
+}
+
+fn application_evidence_namespace_keys(
+    account_id: &str,
+    evidence_ids_and_hashes: &[(&str, &str)],
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(evidence_ids_and_hashes.len().saturating_mul(2));
+    for (evidence_id, provider_event_hash) in evidence_ids_and_hashes {
+        keys.push(format!(
+            "jobs-application-evidence:id:{}:{evidence_id}",
+            evidence_id.len()
+        ));
+        keys.push(format!(
+            "jobs-application-evidence:account-provider:{}:{account_id}:{provider_event_hash}",
+            account_id.len()
+        ));
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    keys
+}
+
+fn lock_application_evidence_namespaces_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    evidence_ids_and_hashes: &[(&str, &str)],
+) -> Result<()> {
+    for key in application_evidence_namespace_keys(account_id, evidence_ids_and_hashes) {
+        tx.query_one(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            &[&key],
+        )?;
+    }
+    Ok(())
+}
+
+fn bind_prepared_submission_evidence_time_at_ms(
+    evidence: &mut [PreparedSubmissionEvidence],
+    now_ms: i64,
+) -> Result<()> {
+    for item in evidence {
+        if item.value.occurred_at_ms == 0 {
+            item.value.occurred_at_ms = now_ms;
+        }
+        if item.value.created_at_ms == 0 {
+            item.value.created_at_ms = now_ms;
+        }
+        item.payload = to_json(&item.value, "application evidence")?;
+    }
+    Ok(())
 }
 
 const MAX_SUBMISSION_CONFIRMATIONS: usize = 4;
@@ -1649,6 +1747,11 @@ fn validate_submission_receipt_evidence(
     receipt: &Value,
     evidence: &[PreparedSubmissionEvidence],
 ) -> Result<()> {
+    let receipt_schema_version = receipt
+        .get("schemaVersion")
+        .and_then(Value::as_i64)
+        .filter(|version| matches!(*version, 1 | 2))
+        .ok_or_else(|| anyhow::anyhow!("final receipt schema is invalid"))?;
     let receipt_id = receipt
         .get("receiptId")
         .and_then(Value::as_str)
@@ -1674,7 +1777,8 @@ fn validate_submission_receipt_evidence(
         .filter(|value| *value > 0)
         .ok_or_else(|| anyhow::anyhow!("final receipt object size is invalid"))?;
     if receipt_object.get("mediaType").and_then(Value::as_str) != Some("application/json")
-        || receipt_object.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+        || receipt_object.get("schemaVersion").and_then(Value::as_i64)
+            != Some(receipt_schema_version)
     {
         anyhow::bail!("final receipt object metadata is invalid")
     }
@@ -1994,6 +2098,31 @@ fn canonical_submission_json(value: &Value) -> Value {
     }
 }
 
+pub(crate) fn submission_pre_receipt_sha256(receipt: &Value) -> Result<String> {
+    if !receipt.is_object() {
+        anyhow::bail!("pre-submission receipt is invalid")
+    }
+    let bytes = serde_json::to_vec(&canonical_submission_json(receipt))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn bind_submission_pre_receipt_sha256(receipt: &mut Value) -> Result<()> {
+    let authority = receipt
+        .get_mut(SERVER_SUBMISSION_AUTHORITY_KEY)
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| anyhow::anyhow!("final receipt submission authority is missing"))?;
+    let pre_submission_receipt = authority
+        .get("preSubmissionReceipt")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| anyhow::anyhow!("final receipt pre-submission authority is missing"))?;
+    let sha256 = submission_pre_receipt_sha256(pre_submission_receipt)?;
+    authority.insert(
+        "preSubmissionReceiptSha256".to_string(),
+        Value::String(sha256),
+    );
+    Ok(())
+}
+
 fn approved_submission_checksum(
     schema_version: i64,
     packet: &Value,
@@ -2184,6 +2313,40 @@ fn valid_approved_submission_ats_certification(value: &Value) -> bool {
     true
 }
 
+#[cfg(test)]
+mod approved_submission_ats_certification_tests {
+    use super::*;
+
+    fn exact_schema_three_certification() -> Value {
+        json!({
+            "schema_version": 1,
+            "provider": "greenhouse",
+            "adapter_version": "2026.07.1-beta.1",
+            "variant_key": "greenhouse_public",
+            "layout_contract_version": 1,
+            "activation_generation": 1,
+            "expires_at_ms": 1,
+            "activation_sha256": "1".repeat(64),
+            "adapter_bundle_sha256": "2".repeat(64),
+            "layout_set_sha256": "3".repeat(64),
+            "manifest_sha256": "4".repeat(64),
+            "surface_sha256": "5".repeat(64),
+            "target_key_sha256": "6".repeat(64),
+            "runner_target_sha256s": ["7".repeat(64)],
+        })
+    }
+
+    #[test]
+    fn schema_three_ats_certification_accepts_exact_keys_and_rejects_extra_keys() {
+        let exact = exact_schema_three_certification();
+        assert!(valid_approved_submission_ats_certification(&exact));
+
+        let mut extra = exact;
+        extra["unexpected"] = json!(true);
+        assert!(!valid_approved_submission_ats_certification(&extra));
+    }
+}
+
 fn approved_submission_object_has_keys(
     value: &serde_json::Map<String, Value>,
     expected: &[&str],
@@ -2254,14 +2417,16 @@ fn approved_submission_snapshot<'a>(
         .ok_or_else(|| anyhow::anyhow!("approved execution checksum is invalid"))?;
     let admission = approved.get("admission");
     validate_approved_submission_admission(application, schema_version, admission)?;
-    let expected_checksum = approved_submission_checksum(
-        schema_version,
-        packet,
-        job,
-        matches!(schema_version, 2 | 3).then_some(
-            admission.ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?,
-        ),
-    )?;
+    let checksum_admission = if matches!(schema_version, 2 | 3) {
+        Some(
+            admission
+                .ok_or_else(|| anyhow::anyhow!("approved execution admission is missing"))?,
+        )
+    } else {
+        None
+    };
+    let expected_checksum =
+        approved_submission_checksum(schema_version, packet, job, checksum_admission)?;
     if !constant_time_equal(checksum, &expected_checksum) {
         anyhow::bail!("approved execution checksum does not match its exact packet")
     }
@@ -2318,7 +2483,11 @@ fn validate_submission_authority_snapshot(
         .get("executionAuthority")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow::anyhow!("final receipt execution authority is missing"))?;
+    let pre_submission_receipt_sha256 = submission_pre_receipt_sha256(&application.receipt)?;
     let approved = approved_submission_snapshot(account_id, application)?;
+    let certified_execution = application_has_frozen_ats_certification(application);
+    let expected_receipt_schema_version = if certified_execution { 2 } else { 1 };
+    let presented_ats_authority = submission_ats_certified_receipt_authority(receipt)?;
     let receipt_packet = receipt
         .get("packet")
         .and_then(Value::as_object)
@@ -2363,7 +2532,22 @@ fn validate_submission_authority_snapshot(
                     .and_then(Value::as_str)
                     .is_some_and(|value| !value.trim().is_empty())
         });
-    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(1)
+    let certified_packet_matches = if certified_execution {
+        receipt_packet
+            .get("approvedExecutionSchemaVersion")
+            .and_then(Value::as_i64)
+            == Some(3)
+            && receipt_packet.get("approvedExecutionAdmission")
+                == application.receipt.pointer("/approved_execution/admission")
+            && presented_ats_authority.is_some()
+    } else {
+        receipt_packet
+            .get("approvedExecutionSchemaVersion")
+            .is_none()
+            && receipt_packet.get("approvedExecutionAdmission").is_none()
+            && presented_ats_authority.is_none()
+    };
+    if receipt.get("schemaVersion").and_then(Value::as_i64) != Some(expected_receipt_schema_version)
         || receipt.get("accountId").and_then(Value::as_str) != Some(account_id)
         || receipt.get("applicationId").and_then(Value::as_str) != Some(application.id.as_str())
         || receipt.get("runId").and_then(Value::as_str) != Some(run_id)
@@ -2395,6 +2579,11 @@ fn validate_submission_authority_snapshot(
             != Some(resume_version_id)
         || authority.get("schemaVersion").and_then(Value::as_i64) != Some(1)
         || authority.get("preSubmissionReceipt") != Some(&application.receipt)
+        || authority
+            .get("preSubmissionReceiptSha256")
+            .and_then(Value::as_str)
+            != Some(pre_submission_receipt_sha256.as_str())
+        || !certified_packet_matches
         || match runner {
             "cloud" => {
                 execution.get("kind").and_then(Value::as_str) != Some("cloud_execution_lease")
@@ -2406,6 +2595,65 @@ fn validate_submission_authority_snapshot(
         anyhow::bail!("final receipt submission authority does not match the approved packet")
     }
     Ok(())
+}
+
+fn submission_ats_certified_receipt_authority(
+    receipt: &Value,
+) -> Result<Option<AtsCertifiedReceiptAuthority>> {
+    receipt
+        .get("atsCertifiedReceiptAuthority")
+        .cloned()
+        .map(|value| {
+            serde_json::from_value(value)
+                .context("decode final receipt ATS certification authority")
+        })
+        .transpose()
+}
+
+/// Authenticate a submitted final-receipt envelope and recover the exact pre-submission
+/// application snapshot that the server bound into it.
+pub(crate) fn validated_submitted_pre_submission_application(
+    account_id: &str,
+    application: &JobApplication,
+) -> Result<JobApplication> {
+    if application.state != "submitted" {
+        anyhow::bail!("submitted execution receipt is unavailable")
+    }
+    let authority = application
+        .receipt
+        .get(SERVER_SUBMISSION_AUTHORITY_KEY)
+        .and_then(Value::as_object)
+        .ok_or_else(|| anyhow::anyhow!("final receipt submission authority is missing"))?;
+    let pre_submission_receipt = authority
+        .get("preSubmissionReceipt")
+        .filter(|value| value.is_object())
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("final receipt pre-submission authority is missing"))?;
+    let run_id = application
+        .receipt
+        .get("runId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("final receipt run authority is missing"))?;
+    let runner = application
+        .receipt
+        .get("runner")
+        .and_then(Value::as_str)
+        .filter(|value| matches!(*value, "cloud" | "local"))
+        .ok_or_else(|| anyhow::anyhow!("final receipt runner authority is missing"))?;
+    if application.run_id.as_deref() != Some(run_id) {
+        anyhow::bail!("final receipt run authority does not match the application")
+    }
+    let mut pre_submission_application = application.clone();
+    pre_submission_application.receipt = pre_submission_receipt;
+    validate_submission_authority_snapshot(
+        account_id,
+        &pre_submission_application,
+        run_id,
+        &application.receipt,
+        runner,
+    )?;
+    Ok(pre_submission_application)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2490,6 +2738,15 @@ fn validate_submission_execution_authority_sqlite_tx(
             anyhow::bail!("final receipt local execution authority changed")
         }
     }
+    if let Some(authority) = submission_ats_certified_receipt_authority(receipt)? {
+        lookup_ats_certification_terminal_receipt_authority_sqlite_tx(
+            tx,
+            account_id,
+            application_id,
+            run_id,
+            &authority,
+        )?;
+    }
     Ok(())
 }
 
@@ -2564,6 +2821,83 @@ fn validate_submission_execution_authority_postgres_tx(
         {
             anyhow::bail!("final receipt local execution authority changed")
         }
+    }
+    if let Some(authority) = submission_ats_certified_receipt_authority(receipt)? {
+        lookup_ats_certification_terminal_receipt_authority_postgres_tx(
+            tx,
+            account_id,
+            application_id,
+            run_id,
+            &authority,
+        )?;
+    }
+    Ok(())
+}
+
+fn prelock_submission_execution_authority_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+    runner: &str,
+) -> Result<()> {
+    let locked = if runner == "cloud" {
+        tx.query_opt(
+            "SELECT run_id FROM jobs_execution_leases
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?
+    } else {
+        tx.query_opt(
+            "SELECT id FROM jobs_local_run_tickets
+              WHERE id = $1 AND account_id = $2 AND application_id = $3
+              FOR UPDATE",
+            &[&run_id, &account_id, &application_id],
+        )?
+    };
+    if locked.is_none() {
+        anyhow::bail!("final receipt execution authority is missing")
+    }
+    Ok(())
+}
+
+fn prelock_submission_object_publication_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> Result<()> {
+    // Final publication locks the complete pending account-upload set after the application row.
+    // Holding that row already prevents a new upload reservation for this application, while the
+    // deterministic upload/outbox order closes waits inside the publication helper before time is
+    // sampled for its capacity and expiry checks.
+    tx.query(
+        "SELECT id FROM object_uploads
+          WHERE account_id = $1 AND object_kind = 'artifact'
+            AND session_id IS NULL AND state = 'pending'
+          ORDER BY id FOR UPDATE",
+        &[&account_id],
+    )?;
+    tx.query(
+        "SELECT outbox.upload_id, outbox.operation
+           FROM object_storage_outbox outbox
+           JOIN object_uploads upload ON upload.id = outbox.upload_id
+          WHERE upload.account_id = $1 AND upload.object_kind = 'artifact'
+            AND upload.session_id IS NULL AND upload.state = 'pending'
+          ORDER BY outbox.upload_id, outbox.operation FOR UPDATE OF outbox",
+        &[&account_id],
+    )?;
+    if tx
+        .query_opt(
+            "SELECT application_id FROM jobs_submission_evidence_capacity
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?
+        .is_none()
+    {
+        anyhow::bail!("submission evidence capacity is missing")
     }
     Ok(())
 }
@@ -2642,28 +2976,31 @@ pub fn finalize_submission(
     if (runner == "local") != local_ticket_hash.is_some() {
         anyhow::bail!("invalid final submission runner binding")
     }
-    let now = now_ms();
-    let prepared_evidence =
-        prepare_submission_evidence(application_id, request_fingerprint, evidence, now)?;
-    validate_submission_receipt_evidence(&receipt, &prepared_evidence)?;
-    validate_submission_object_bindings(&receipt, &prepared_evidence, object_uploads)?;
-    let mut terminal_session = terminal_session.clone();
+    let mut receipt = receipt;
+    bind_submission_pre_receipt_sha256(&mut receipt)?;
+    let terminal_session = terminal_session.clone();
     if terminal_session.application_id.as_deref() != Some(application_id)
         || terminal_session.id != run_id
         || terminal_session.runner != runner
     {
         anyhow::bail!("browser session does not match final submission")
     }
-    terminal_session.status = "complete".to_string();
-    terminal_session.current_step = "Application submitted".to_string();
-    terminal_session.takeover_url = None;
-    terminal_session.updated_at_ms = now;
-    let terminal_session_payload = to_json(&terminal_session, "browser session")?;
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = original_source_db_now_sqlite(&tx)?;
+            let prepared_evidence =
+                prepare_submission_evidence(application_id, request_fingerprint, evidence, now)?;
+            validate_submission_receipt_evidence(&receipt, &prepared_evidence)?;
+            validate_submission_object_bindings(&receipt, &prepared_evidence, object_uploads)?;
+            let mut terminal_session = terminal_session.clone();
+            terminal_session.status = "complete".to_string();
+            terminal_session.current_step = "Application submitted".to_string();
+            terminal_session.takeover_url = None;
+            terminal_session.updated_at_ms = now;
+            let terminal_session_payload = to_json(&terminal_session, "browser session")?;
             if runner == "cloud" {
                 require_current_runner_volume_identity_sqlite_for_operation(
                     &tx, account_id, run_id, now,
@@ -2698,6 +3035,7 @@ pub fn finalize_submission(
                     .and_then(Value::as_str)
                     == Some(request_fingerprint)
                 {
+                    validated_submitted_pre_submission_application(account_id, &application)?;
                     tx.commit().map_err(submission_commit_uncertain)?;
                     return Ok(SubmissionFinalizeResult::Replayed(application));
                 }
@@ -2848,9 +3186,16 @@ pub fn finalize_submission(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // This preliminary scalar is only an early-denial input while the runner-volume
+            // helper acquires its durable rows. No receipt, capacity, CAS, or application effect
+            // is accepted from it; every temporal decision is repeated at `now` below.
+            let preliminary_now = original_source_db_now_postgres(&mut tx)?;
             if runner == "cloud" {
                 require_current_runner_volume_identity_postgres_for_operation(
-                    &mut tx, account_id, run_id, now,
+                    &mut tx,
+                    account_id,
+                    run_id,
+                    preliminary_now,
                 )?;
             }
             match crate::db::account_data::account_write_fence_postgres_tx(&mut tx, account_id)? {
@@ -2880,6 +3225,7 @@ pub fn finalize_submission(
                     .and_then(Value::as_str)
                     == Some(request_fingerprint)
                 {
+                    validated_submitted_pre_submission_application(account_id, &application)?;
                     tx.commit().map_err(submission_commit_uncertain)?;
                     return Ok(SubmissionFinalizeResult::Replayed(application));
                 }
@@ -2888,6 +3234,67 @@ pub fn finalize_submission(
             if application.run_id.as_deref() != Some(run_id) {
                 anyhow::bail!("application browser run does not match final receipt")
             }
+            if tx
+                .query_opt(
+                    "SELECT application_id FROM jobs_attempt_reservations
+                      WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+                    &[&account_id, &application_id],
+                )?
+                .is_none()
+            {
+                anyhow::bail!("application attempt reservation is missing")
+            }
+            prelock_submission_execution_authority_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+                runner,
+            )?;
+            if tx
+                .query_opt(
+                    "SELECT id FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &run_id],
+                )?
+                .is_none()
+            {
+                anyhow::bail!("browser session not found")
+            }
+            prelock_submission_object_publication_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+            )?;
+            let mut prepared_evidence =
+                prepare_submission_evidence(application_id, request_fingerprint, evidence, 0)?;
+            {
+                let evidence_namespaces = prepared_evidence
+                    .iter()
+                    .map(|item| (item.value.id.as_str(), item.provider_event_hash.as_str()))
+                    .collect::<Vec<_>>();
+                lock_application_evidence_namespaces_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    &evidence_namespaces,
+                )?;
+            }
+            let now = original_source_db_now_postgres(&mut tx)?;
+            if runner == "cloud" {
+                require_current_runner_volume_identity_postgres_for_operation(
+                    &mut tx, account_id, run_id, now,
+                )?;
+            }
+            bind_prepared_submission_evidence_time_at_ms(&mut prepared_evidence, now)?;
+            validate_submission_receipt_evidence(&receipt, &prepared_evidence)?;
+            validate_submission_object_bindings(&receipt, &prepared_evidence, object_uploads)?;
+            let mut terminal_session = terminal_session.clone();
+            terminal_session.status = "complete".to_string();
+            terminal_session.current_step = "Application submitted".to_string();
+            terminal_session.takeover_url = None;
+            terminal_session.updated_at_ms = now;
+            let terminal_session_payload = to_json(&terminal_session, "browser session")?;
             validate_submission_authority_snapshot(
                 account_id,
                 &application,
@@ -3028,6 +3435,345 @@ pub fn finalize_submission(
             Ok(SubmissionFinalizeResult::Committed(application))
         }
     })
+}
+
+#[cfg(test)]
+mod submission_post_lock_time_tests {
+    use super::lock_application_evidence_namespaces_postgres_tx;
+
+    fn bounded<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing section start {start}"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("missing section end {end}"))
+    }
+
+    #[test]
+    fn postgres_finalization_uses_one_authoritative_time_after_all_effect_locks() {
+        let source = include_str!("customer_data.rs");
+        let boundary = source
+            .split("pub fn finalize_submission(")
+            .nth(1)
+            .expect("submission finalizer")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("bounded submission finalizer");
+        let before_blocking = boundary
+            .split("crate::db::run_blocking_db")
+            .next()
+            .expect("pre-transaction finalizer section");
+        assert!(!before_blocking.contains("now_ms()"));
+        assert!(!before_blocking.contains("prepare_submission_evidence"));
+
+        let postgres = boundary
+            .rsplit("DbPool::Postgres(_) =>")
+            .next()
+            .expect("PostgreSQL finalizer");
+        let mut previous = 0;
+        for operation in [
+            "require_current_runner_volume_identity_postgres_for_operation",
+            "account_write_fence_postgres_tx",
+            "FROM jobs_applications",
+            "FROM jobs_attempt_reservations",
+            "prelock_submission_execution_authority_postgres_tx",
+            "FROM jobs_browser_sessions",
+            "prelock_submission_object_publication_postgres_tx",
+            "prepare_submission_evidence(application_id, request_fingerprint, evidence, 0)",
+            "lock_application_evidence_namespaces_postgres_tx",
+            "let now = original_source_db_now_postgres",
+            "require_current_runner_volume_identity_postgres_for_operation",
+            "bind_prepared_submission_evidence_time_at_ms",
+            "validate_submission_execution_authority_postgres_tx",
+            "commit_application_object_uploads_postgres_tx",
+            "application.state = \"submitted\"",
+        ] {
+            let relative = postgres[previous..]
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing post-lock finalizer operation {operation}"));
+            previous += relative + operation.len();
+        }
+        let authoritative = postgres
+            .split("let now = original_source_db_now_postgres")
+            .nth(1)
+            .expect("authoritative post-lock database time");
+        assert!(!authoritative.contains("preliminary_now"));
+    }
+
+    #[test]
+    fn every_postgres_evidence_writer_uses_account_application_namespace_order() {
+        let source = include_str!("customer_data.rs");
+        let save = bounded(
+            source,
+            "pub fn save_application_evidence(",
+            "fn validate_document_evidence(",
+        );
+        let postgres = save
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL application-evidence writer");
+        let mut previous = 0;
+        for operation in [
+            "let mut tx = conn.transaction()",
+            "account_write_fence_postgres_tx",
+            "FROM jobs_applications",
+            "FOR SHARE",
+            "lock_application_evidence_namespaces_postgres_tx",
+            "WHERE id = $1 FOR SHARE",
+            "INSERT INTO jobs_application_evidence",
+            "tx.commit()",
+        ] {
+            let relative = postgres[previous..]
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing evidence-writer operation {operation}"));
+            previous += relative + operation.len();
+        }
+
+        let namespace = bounded(
+            source,
+            "fn application_evidence_namespace_keys(",
+            "fn bind_prepared_submission_evidence_time_at_ms(",
+        );
+        assert!(namespace.contains("jobs-application-evidence:id:"));
+        assert!(namespace.contains("jobs-application-evidence:account-provider:"));
+        assert!(namespace.contains("keys.sort_unstable()"));
+        assert!(namespace.contains("keys.dedup()"));
+        assert!(namespace.contains("pg_advisory_xact_lock"));
+    }
+
+    #[test]
+    fn postgres_evidence_namespace_wait_precedes_final_expiry_clock() {
+        let Ok(url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let schema = format!("fix753_evidence_{suffix}");
+        let candidate_name = format!("bluey-fix753-evidence-{suffix}");
+        let mut setup =
+            postgres::Client::connect(&url, postgres::NoTls).expect("connect FIX-753 evidence DB");
+        let setup_now_ms: i64 = setup
+            .query_one(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample FIX-753 setup time")
+            .get(0);
+        let expires_at_ms = setup_now_ms.saturating_add(750);
+        setup
+            .batch_execute(&format!(
+                "CREATE SCHEMA {schema};
+                 CREATE TABLE {schema}.accounts (id text PRIMARY KEY);
+                 CREATE TABLE {schema}.applications (
+                     id text PRIMARY KEY, account_id text NOT NULL
+                 );
+                 CREATE TABLE {schema}.authority (
+                     account_id text PRIMARY KEY, expires_at_ms bigint NOT NULL
+                 );
+                 CREATE TABLE {schema}.evidence (
+                     id text PRIMARY KEY, account_id text NOT NULL,
+                     provider_event_hash text NOT NULL,
+                     UNIQUE(account_id, provider_event_hash)
+                 );
+                 INSERT INTO {schema}.accounts(id) VALUES ('acct-holder'), ('acct-target');
+                 INSERT INTO {schema}.applications(id, account_id)
+                 VALUES ('app-holder', 'acct-holder'), ('app-target', 'acct-target');
+                 INSERT INTO {schema}.authority(account_id, expires_at_ms)
+                 VALUES ('acct-target', {expires_at_ms});"
+            ))
+            .expect("create isolated FIX-753 evidence fixture");
+
+        let holder_url = url.clone();
+        let holder_schema = schema.clone();
+        let (holder_locked_tx, holder_locked_rx) = std::sync::mpsc::channel();
+        let (release_holder_tx, release_holder_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || -> std::result::Result<(), String> {
+            let mut client = postgres::Client::connect(&holder_url, postgres::NoTls)
+                .map_err(|error| error.to_string())?;
+            let mut tx = client.transaction().map_err(|error| error.to_string())?;
+            tx.batch_execute("SET LOCAL lock_timeout = '5s'")
+                .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {holder_schema}.accounts
+                      WHERE id = 'acct-holder' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {holder_schema}.applications
+                      WHERE id = 'app-holder' FOR SHARE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            lock_application_evidence_namespaces_postgres_tx(
+                &mut tx,
+                "acct-holder",
+                &[("evidence-shared", "hash-holder")],
+            )
+            .map_err(|error| error.to_string())?;
+            holder_locked_tx
+                .send(())
+                .map_err(|error| error.to_string())?;
+            release_holder_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .map_err(|error| error.to_string())?;
+            tx.execute(
+                &format!(
+                    "INSERT INTO {holder_schema}.evidence(id, account_id, provider_event_hash)
+                     VALUES ('evidence-shared', 'acct-holder', 'hash-holder')"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())
+        });
+        holder_locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("FIX-753 competing evidence writer acquired namespace");
+
+        let candidate_url = url.clone();
+        let candidate_schema = schema.clone();
+        let candidate_application_name = candidate_name.clone();
+        let (candidate_started_tx, candidate_started_rx) = std::sync::mpsc::channel();
+        let candidate = std::thread::spawn(move || -> std::result::Result<bool, String> {
+            let mut client = postgres::Client::connect(&candidate_url, postgres::NoTls)
+                .map_err(|error| error.to_string())?;
+            client
+                .query_one(
+                    "SELECT set_config('application_name', $1, false)",
+                    &[&candidate_application_name],
+                )
+                .map_err(|error| error.to_string())?;
+            let mut tx = client.transaction().map_err(|error| error.to_string())?;
+            tx.batch_execute("SET LOCAL lock_timeout = '5s'")
+                .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {candidate_schema}.accounts
+                      WHERE id = 'acct-target' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!(
+                    "SELECT id FROM {candidate_schema}.applications
+                      WHERE id = 'app-target' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            candidate_started_tx
+                .send(())
+                .map_err(|error| error.to_string())?;
+            lock_application_evidence_namespaces_postgres_tx(
+                &mut tx,
+                "acct-target",
+                &[("evidence-shared", "hash-target")],
+            )
+            .map_err(|error| error.to_string())?;
+            let now_ms: i64 = tx
+                .query_one(
+                    "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            let stored_expires_at_ms: i64 = tx
+                .query_one(
+                    &format!(
+                        "SELECT expires_at_ms FROM {candidate_schema}.authority
+                          WHERE account_id = 'acct-target'"
+                    ),
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            if stored_expires_at_ms <= now_ms {
+                tx.commit().map_err(|error| error.to_string())?;
+                return Ok(true);
+            }
+            tx.execute(
+                &format!(
+                    "INSERT INTO {candidate_schema}.evidence(id, account_id, provider_event_hash)
+                     VALUES ('evidence-shared', 'acct-target', 'hash-target')"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok(false)
+        });
+        candidate_started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("FIX-753 candidate evidence finalizer reached namespace");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let candidate_waited = loop {
+            let waiting: i64 = setup
+                .query_one(
+                    "SELECT COUNT(*)::bigint
+                       FROM pg_locks lock
+                       JOIN pg_stat_activity activity ON activity.pid = lock.pid
+                      WHERE NOT lock.granted AND activity.application_name = $1",
+                    &[&candidate_name],
+                )
+                .expect("observe FIX-753 evidence namespace wait")
+                .get(0);
+            if waiting > 0 {
+                break true;
+            }
+            if candidate.is_finished() || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let current_ms: i64 = setup
+            .query_one(
+                "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample FIX-753 contention time")
+            .get(0);
+        let wait_ms = expires_at_ms.saturating_sub(current_ms).saturating_add(100);
+        std::thread::sleep(std::time::Duration::from_millis(
+            u64::try_from(wait_ms.max(0)).expect("bounded FIX-753 expiry wait"),
+        ));
+        release_holder_tx
+            .send(())
+            .expect("release FIX-753 competing evidence writer");
+        let holder_result = holder.join().expect("join FIX-753 evidence holder");
+        let candidate_result = candidate.join().expect("join FIX-753 evidence candidate");
+        let target_rows: i64 = setup
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*)::bigint FROM {schema}.evidence
+                      WHERE account_id = 'acct-target'"
+                ),
+                &[],
+            )
+            .expect("read FIX-753 denied evidence rows")
+            .get(0);
+        setup
+            .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+            .expect("remove isolated FIX-753 evidence fixture");
+
+        assert!(
+            candidate_waited,
+            "candidate did not wait on evidence namespace"
+        );
+        holder_result.expect("competing evidence writer completed");
+        assert!(
+            candidate_result.expect("candidate evidence finalizer completed"),
+            "candidate accepted authority after the namespace wait crossed expiry"
+        );
+        assert_eq!(target_rows, 0, "expiry denial persisted target evidence");
+    }
 }
 
 pub fn list_application_identities(
@@ -3282,12 +4028,21 @@ pub fn save_application_identity(
                     value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "identity",
+                &value.id,
+                value.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(value)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let is_default = i32::from(value.is_default);
             if value.is_default {
                 tx.execute(
@@ -3319,6 +4074,13 @@ pub fn save_application_identity(
                     &value.updated_at_ms,
                 ],
             )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "identity",
+                &value.id,
+                value.updated_at_ms,
+            )?;
             tx.commit()?;
             Ok(value)
         }
@@ -3342,14 +4104,97 @@ pub fn delete_application_identity(
         anyhow::bail!("choose another email for the Career Track before removing this one")
     }
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => Ok(pool.get()?.execute(
-            "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
-            params![account_id, identity_id],
-        )? > 0),
-        DbPool::Postgres(_) => Ok(pool.get_pg()?.execute(
-            "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
-            &[&account_id, &identity_id],
-        )? > 0),
+        DbPool::Sqlite(_) => {
+            let mut conn = pool.get()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let is_default: i64 = tx
+                .query_row(
+                    "SELECT is_default FROM jobs_application_identities
+                      WHERE account_id = ?1 AND id = ?2",
+                    params![account_id, identity_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .context("application email not found")?;
+            anyhow::ensure!(
+                is_default == 0,
+                "choose another default application email first"
+            );
+            let bound = {
+                let mut stmt = tx.prepare(
+                    "SELECT track_json FROM jobs_tracks WHERE account_id = ?1 ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map(params![account_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|raw| parse_json::<CareerTrack>(raw, "Career Track"))
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .any(|track| track.application_identity_id.as_deref() == Some(identity_id))
+            };
+            anyhow::ensure!(!bound, "choose another email for the Career Track first");
+            let changed = tx.execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = ?1 AND id = ?2",
+                params![account_id, identity_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_sqlite(
+                    &tx,
+                    account_id,
+                    "identity",
+                    identity_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
+        DbPool::Postgres(_) => {
+            let mut conn = pool.get_pg()?;
+            let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
+            let is_default: i32 = tx
+                .query_opt(
+                    "SELECT is_default FROM jobs_application_identities
+                      WHERE account_id = $1 AND id = $2",
+                    &[&account_id, &identity_id],
+                )?
+                .context("application email not found")?
+                .get(0);
+            anyhow::ensure!(
+                is_default == 0,
+                "choose another default application email first"
+            );
+            let bound = tx
+                .query(
+                    "SELECT track_json FROM jobs_tracks
+                      WHERE account_id = $1 ORDER BY id",
+                    &[&account_id],
+                )?
+                .into_iter()
+                .map(|row| parse_json::<CareerTrack>(row.get(0), "Career Track"))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .any(|track| track.application_identity_id.as_deref() == Some(identity_id));
+            anyhow::ensure!(!bound, "choose another email for the Career Track first");
+            let changed = tx.execute(
+                "DELETE FROM jobs_application_identities WHERE account_id = $1 AND id = $2",
+                &[&account_id, &identity_id],
+            )? > 0;
+            if changed {
+                advance_account_input_generation_postgres(
+                    &mut tx,
+                    account_id,
+                    "identity",
+                    identity_id,
+                    now_ms(),
+                )?;
+            }
+            tx.commit()?;
+            Ok(changed)
+        }
     })
 }
 
@@ -3487,6 +4332,13 @@ pub fn verify_application_identity(
                   WHERE account_id = ?1 AND id = ?2",
                 params![account_id, identity_id, payload, identity.updated_at_ms],
             )?;
+            advance_account_input_generation_sqlite(
+                &tx,
+                account_id,
+                "identity",
+                identity_id,
+                identity.updated_at_ms,
+            )?;
             tx.execute(
                 "DELETE FROM jobs_identity_verifications WHERE account_id = ?1 AND identity_id = ?2",
                 params![account_id, identity_id],
@@ -3497,6 +4349,8 @@ pub fn verify_application_identity(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            lock_discovery_account_postgres(&mut tx, account_id)?;
+            lock_account_policy_inputs_postgres(&mut tx, account_id, true)?;
             let row = tx
                 .query_opt(
                     "SELECT otp_hash, attempts, expires_at_ms FROM jobs_identity_verifications
@@ -3538,6 +4392,13 @@ pub fn verify_application_identity(
                     identity_json = $3, updated_at_ms = $4
                   WHERE account_id = $1 AND id = $2",
                 &[&account_id, &identity_id, &payload, &identity.updated_at_ms],
+            )?;
+            advance_account_input_generation_postgres(
+                &mut tx,
+                account_id,
+                "identity",
+                identity_id,
+                identity.updated_at_ms,
             )?;
             tx.execute(
                 "DELETE FROM jobs_identity_verifications WHERE account_id = $1 AND identity_id = $2",
@@ -3716,8 +4577,7 @@ pub fn save_mailbox_connection_with_credential(
     }
     if stored_credential.grant_revision > 0 {
         let computed = communication_grant_sha256(&stored_credential)?;
-        if !stored_credential.grant_sha256.is_empty()
-            && stored_credential.grant_sha256 != computed
+        if !stored_credential.grant_sha256.is_empty() && stored_credential.grant_sha256 != computed
         {
             anyhow::bail!("provider grant digest is invalid")
         }
@@ -3752,8 +4612,7 @@ pub fn save_mailbox_connection_with_credential(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
             let was_disconnected = tx
                 .query_row(
@@ -3858,8 +4717,7 @@ pub fn save_mailbox_connection_with_credential(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             let was_disconnected = tx
                 .query_opt(
@@ -4001,8 +4859,7 @@ pub fn save_mailbox_connection_with_credential_cas(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
             let unresolved_actions: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM jobs_communication_actions
@@ -4030,8 +4887,8 @@ pub fn save_mailbox_connection_with_credential_cas(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let (current_mailbox_json, current_credential_json) = raw
-                .ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
+            let (current_mailbox_json, current_credential_json) =
+                raw.ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
             let current_mailbox: MailboxConnection =
                 parse_json(current_mailbox_json, "mailbox connection")?;
             let current: JobsProviderCredential =
@@ -4055,8 +4912,7 @@ pub fn save_mailbox_connection_with_credential_cas(
             mailbox.updated_at_ms = authority_updated_at_ms;
             stored_credential.updated_at_ms = authority_updated_at_ms;
             let mailbox_json = to_json(&mailbox, "mailbox connection")?;
-            let credential_json =
-                to_json(&stored_credential, "Jobs provider credential")?;
+            let credential_json = to_json(&stored_credential, "Jobs provider credential")?;
             let mailbox_updated = tx.execute(
                 "UPDATE jobs_mailbox_connections
                     SET status = 'connected', connection_json = ?4, updated_at_ms = ?5
@@ -4095,8 +4951,7 @@ pub fn save_mailbox_connection_with_credential_cas(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             let unresolved_actions: i64 = tx
                 .query_one(
@@ -4125,8 +4980,7 @@ pub fn save_mailbox_connection_with_credential_cas(
                     &[&account_id, &mailbox.id, &mailbox.provider, &subject_hash],
                 )?
                 .ok_or_else(|| anyhow::anyhow!("connected mailbox provider grant not found"))?;
-            let current_mailbox: MailboxConnection =
-                parse_json(row.get(0), "mailbox connection")?;
+            let current_mailbox: MailboxConnection = parse_json(row.get(0), "mailbox connection")?;
             let current: JobsProviderCredential =
                 parse_json(row.get(1), "Jobs provider credential")?;
             if current.grant_revision != expected_grant_revision
@@ -4148,8 +5002,7 @@ pub fn save_mailbox_connection_with_credential_cas(
             mailbox.updated_at_ms = authority_updated_at_ms;
             stored_credential.updated_at_ms = authority_updated_at_ms;
             let mailbox_json = to_json(&mailbox, "mailbox connection")?;
-            let credential_json =
-                to_json(&stored_credential, "Jobs provider credential")?;
+            let credential_json = to_json(&stored_credential, "Jobs provider credential")?;
             let mailbox_updated = tx.execute(
                 "UPDATE jobs_mailbox_connections
                     SET status = 'connected', connection_json = $4, updated_at_ms = $5
@@ -4310,8 +5163,7 @@ pub fn delete_mailbox_connection(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
             let raw: Option<String> = tx
                 .query_row(
@@ -4400,14 +5252,14 @@ pub fn delete_mailbox_connection(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             let Some(row) = tx.query_opt(
                 "SELECT connection_json FROM jobs_mailbox_connections
                   WHERE account_id = $1 AND id = $2 FOR UPDATE",
                 &[&account_id, &connection_id],
-            )? else {
+            )?
+            else {
                 tx.commit()?;
                 return Ok(false);
             };
@@ -4445,8 +5297,7 @@ pub fn delete_mailbox_connection(
             if exhausted > 0 {
                 anyhow::bail!("mailbox communication revision authority is exhausted")
             }
-            let mut mailbox: MailboxConnection =
-                parse_json(row.get(0), "mailbox connection")?;
+            let mut mailbox: MailboxConnection = parse_json(row.get(0), "mailbox connection")?;
             mailbox.status = "disconnected".to_string();
             mailbox.capabilities.clear();
             mailbox.updated_at_ms = now;
@@ -4608,7 +5459,12 @@ pub fn mark_mailbox_reauthorization_required(
                         connection_json = $3,
                         updated_at_ms = $4
                   WHERE account_id = $1 AND id = $2 AND status = 'connected'",
-                &[&account_id, &connection_id, &payload, &mailbox.updated_at_ms],
+                &[
+                    &account_id,
+                    &connection_id,
+                    &payload,
+                    &mailbox.updated_at_ms,
+                ],
             )?;
             if changed != 1 {
                 anyhow::bail!("mailbox authorization authority changed")
@@ -4823,8 +5679,7 @@ pub fn save_jobs_provider_credential(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
             tx.query_row(
                 "SELECT 1 FROM jobs_mailbox_connections
@@ -4871,8 +5726,7 @@ pub fn save_jobs_provider_credential(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             tx.query_one(
                 "SELECT 1 FROM jobs_mailbox_connections
@@ -4961,9 +5815,8 @@ pub fn refresh_jobs_provider_credential_cas(
     expires_at_ms: i64,
 ) -> Result<JobsProviderCredential> {
     if !crate::jobs_provider_auth::valid_provider_token(access_token)
-        || refresh_token.is_some_and(|value| {
-            !crate::jobs_provider_auth::valid_provider_token(value)
-        })
+        || refresh_token
+            .is_some_and(|value| !crate::jobs_provider_auth::valid_provider_token(value))
         || !crate::jobs_provider_auth::valid_provider_token(&expected.access_token)
         || (!expected.refresh_token.is_empty()
             && !crate::jobs_provider_auth::valid_provider_token(&expected.refresh_token))
@@ -4995,8 +5848,7 @@ pub fn refresh_jobs_provider_credential_cas(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
             let raw: Option<(String, String)> = tx
                 .query_row(
@@ -5023,8 +5875,7 @@ pub fn refresh_jobs_provider_credential_cas(
             let (mailbox_json, raw) =
                 raw.ok_or_else(|| anyhow::anyhow!("provider credential refresh lost CAS"))?;
             let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
-            let current: JobsProviderCredential =
-                parse_json(raw, "Jobs provider credential")?;
+            let current: JobsProviderCredential = parse_json(raw, "Jobs provider credential")?;
             validate_provider_refresh_mailbox(expected, &mailbox)?;
             validate_provider_refresh_snapshot(expected, &current)?;
             let mut updated = current;
@@ -5060,8 +5911,7 @@ pub fn refresh_jobs_provider_credential_cas(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             let row = tx
                 .query_opt(

@@ -1,4 +1,3 @@
-
 const OPERATIONAL_HOLD_CANDIDATE_SCAN_LIMIT: usize = 8;
 
 type DiscoveryOperationalHoldScanCursor = (i64, String);
@@ -960,12 +959,28 @@ pub fn save_verified_import_posting_with_source(
                     import_run_id,
                 ],
             )?;
+            if let Some(authority) =
+                sqlite_original_source_verification_scheduling_authority_for_account_tx(
+                    &tx, account_id,
+                )?
+            {
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    &tx, account_id, &saved, &authority,
+                )?;
+            }
             tx.commit()?;
             Ok(saved)
         }
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Managed-release authority uses a process-wide advisory fence. Resolve it before
+            // taking the account/source locks so verifier publication and discovery ingestion
+            // share one lock order instead of forming managed->source/source->managed cycles.
+            let source_verification_authority =
+                postgres_original_source_verification_scheduling_authority_for_account_tx(
+                    &mut tx, account_id,
+                )?;
             lock_discovery_account_postgres(&mut tx, account_id)?;
             enforce_discovery_source_authority_postgres(
                 &mut tx,
@@ -1090,6 +1105,11 @@ pub fn save_verified_import_posting_with_source(
                     &import_run_id,
                 ],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                    &mut tx, account_id, &saved, &authority,
+                )?;
+            }
             tx.commit()?;
             Ok(saved)
         }
@@ -1287,13 +1307,7 @@ fn discovery_operational_context_sqlite(
             )
             .optional()?
             .ok_or_else(|| anyhow::anyhow!("discovery source Career Track was not found"))?;
-        add_discovery_track_operational_context(
-            &mut context,
-            &track_id,
-            track_json,
-            active,
-            true,
-        )?;
+        add_discovery_track_operational_context(&mut context, &track_id, track_json, active, true)?;
     }
     Ok(context)
 }
@@ -1360,6 +1374,26 @@ pub fn lease_due_discovery_source(
     pool: &DbPool,
     worker_id: &str,
 ) -> Result<Option<DiscoverySourceLease>> {
+    lease_due_discovery_source_inner(pool, worker_id, None)
+}
+
+#[cfg(any(test, feature = "integration-test-support"))]
+pub(crate) fn lease_due_discovery_source_for_test(
+    pool: &DbPool,
+    worker_id: &str,
+    source_id: &str,
+) -> Result<Option<DiscoverySourceLease>> {
+    if source_id.trim().is_empty() {
+        anyhow::bail!("test discovery source ID is required")
+    }
+    lease_due_discovery_source_inner(pool, worker_id, Some(source_id))
+}
+
+fn lease_due_discovery_source_inner(
+    pool: &DbPool,
+    worker_id: &str,
+    target_source_id: Option<&str>,
+) -> Result<Option<DiscoverySourceLease>> {
     let worker_id = worker_id.trim();
     if worker_id.len() < 3
         || worker_id.len() > 160
@@ -1382,8 +1416,11 @@ pub fn lease_due_discovery_source(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let initial_scan_cursor =
-                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS);
+            let initial_scan_cursor = if target_source_id.is_some() {
+                None
+            } else {
+                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS)
+            };
             let mut scan_cursor = initial_scan_cursor.clone();
             let mut wrapped = false;
             let mut scanned = 0;
@@ -1412,10 +1449,16 @@ pub fn lease_due_discovery_source(
                              WHERE r.source_id = jobs_discovery_sources.id
                                AND r.status = 'committing'
                         )
+                        AND (?4 IS NULL OR id = ?4)
                         AND (?2 IS NULL OR next_run_at_ms > ?2
                              OR (next_run_at_ms = ?2 AND id > ?3))
                       ORDER BY next_run_at_ms ASC, id ASC LIMIT 1",
-                        params![now, cursor_next_run_at_ms, cursor_source_id],
+                        params![
+                            now,
+                            cursor_next_run_at_ms,
+                            cursor_source_id,
+                            target_source_id
+                        ],
                         discovery_source_from_sqlite_row,
                     )
                     .optional()?;
@@ -1450,11 +1493,13 @@ pub fn lease_due_discovery_source(
                 .flatten();
             let Some(source) = source else {
                 tx.commit()?;
-                compare_exchange_operational_hold_scan_cursor(
-                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
-                    initial_scan_cursor.as_ref(),
-                    next_scan_cursor,
-                );
+                if target_source_id.is_none() {
+                    compare_exchange_operational_hold_scan_cursor(
+                        &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                        initial_scan_cursor.as_ref(),
+                        next_scan_cursor,
+                    );
+                }
                 return Ok(None);
             };
             let scheduled_for_ms = source.next_run_at_ms;
@@ -1475,11 +1520,13 @@ pub fn lease_due_discovery_source(
                 params![run_id, source.account_id, source.id, replay_key, now],
             )?;
             tx.commit()?;
-            compare_exchange_operational_hold_scan_cursor(
-                &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
-                initial_scan_cursor.as_ref(),
-                next_scan_cursor,
-            );
+            if target_source_id.is_none() {
+                compare_exchange_operational_hold_scan_cursor(
+                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
+            }
             Ok(Some(DiscoverySourceLease {
                 source: DiscoverySource {
                     lease_expires_at_ms: Some(lease_expires),
@@ -1495,8 +1542,11 @@ pub fn lease_due_discovery_source(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
-            let initial_scan_cursor =
-                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS);
+            let initial_scan_cursor = if target_source_id.is_some() {
+                None
+            } else {
+                operational_hold_scan_cursor_snapshot(&DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS)
+            };
             let mut scan_cursor = initial_scan_cursor.clone();
             let mut wrapped = false;
             let mut scanned = 0;
@@ -1524,11 +1574,17 @@ pub fn lease_due_discovery_source(
                              WHERE r.source_id = jobs_discovery_sources.id
                                AND r.status = 'committing'
                         )
+                        AND ($4::TEXT IS NULL OR id = $4)
                         AND ($2::BIGINT IS NULL OR next_run_at_ms > $2
                              OR (next_run_at_ms = $2 AND id > $3))
                       ORDER BY next_run_at_ms ASC, id ASC
                       FOR UPDATE SKIP LOCKED LIMIT 1",
-                    &[&now, &cursor_next_run_at_ms, &cursor_source_id],
+                    &[
+                        &now,
+                        &cursor_next_run_at_ms,
+                        &cursor_source_id,
+                        &target_source_id,
+                    ],
                 )?;
                 let Some(row) = row else {
                     if !wrapped && initial_scan_cursor.is_some() {
@@ -1562,11 +1618,13 @@ pub fn lease_due_discovery_source(
                 .flatten();
             let Some(source) = source else {
                 tx.commit()?;
-                compare_exchange_operational_hold_scan_cursor(
-                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
-                    initial_scan_cursor.as_ref(),
-                    next_scan_cursor,
-                );
+                if target_source_id.is_none() {
+                    compare_exchange_operational_hold_scan_cursor(
+                        &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                        initial_scan_cursor.as_ref(),
+                        next_scan_cursor,
+                    );
+                }
                 return Ok(None);
             };
             let scheduled_for_ms = source.next_run_at_ms;
@@ -1593,11 +1651,13 @@ pub fn lease_due_discovery_source(
                 &[&run_id, &source.account_id, &source.id, &replay_key, &now],
             )?;
             tx.commit()?;
-            compare_exchange_operational_hold_scan_cursor(
-                &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
-                initial_scan_cursor.as_ref(),
-                next_scan_cursor,
-            );
+            if target_source_id.is_none() {
+                compare_exchange_operational_hold_scan_cursor(
+                    &DISCOVERY_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
+            }
             Ok(Some(DiscoverySourceLease {
                 source: DiscoverySource {
                     lease_expires_at_ms: Some(lease_expires),
@@ -1724,9 +1784,7 @@ fn prepare_discovery_snapshot_candidate(
     if let Some(value) = existing.as_ref() {
         candidate.track_id.clone_from(&value.track_id);
     }
-    let track = tracks
-        .iter()
-        .find(|track| track.id == candidate.track_id);
+    let track = tracks.iter().find(|track| track.id == candidate.track_id);
     if is_curated_job_source(&candidate.source) && track.is_none() {
         anyhow::bail!("curated discovery job Career Track was not found")
     }
@@ -1858,6 +1916,14 @@ fn publish_discovery_snapshot(
                 params![source.id, replay_key, snapshot_hash],
             )?;
 
+            let source_verification_authority = if source.provider != CURATED_DISCOVERY_PROVIDER {
+                sqlite_original_source_verification_scheduling_authority_for_account_tx(
+                    &tx,
+                    &source.account_id,
+                )?
+            } else {
+                None
+            };
             let mut seen = Vec::with_capacity(normalized.len());
             for (external_id, (posting, content_hash)) in normalized {
                 let membership_job_id: Option<String> = tx
@@ -1966,6 +2032,14 @@ fn publish_discovery_snapshot(
                         content_hash, observed_at_ms, run_id, posting.availability_status,
                     ],
                 )?;
+                if let Some(authority) = source_verification_authority.as_ref() {
+                    ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                        &tx,
+                        &source.account_id,
+                        &saved,
+                        authority,
+                    )?;
+                }
                 seen.push(external_id.clone());
             }
             let closed_count = close_missing_snapshot_memberships_sqlite(
@@ -1974,6 +2048,7 @@ fn publish_discovery_snapshot(
                 &run_id,
                 observed_at_ms,
                 &seen,
+                source_verification_authority.as_ref(),
                 profile,
                 preferences,
                 applications,
@@ -2032,6 +2107,16 @@ fn publish_discovery_snapshot(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Keep managed-release advisory authority ahead of discovery/source row locks. The
+            // verifier terminal path uses that same order when it republishes source truth.
+            let source_verification_authority = if source.provider != CURATED_DISCOVERY_PROVIDER {
+                postgres_original_source_verification_scheduling_authority_for_account_tx(
+                    &mut tx,
+                    &source.account_id,
+                )?
+            } else {
+                None
+            };
             lock_discovery_account_postgres(&mut tx, &source.account_id)?;
             let tx_now = now_ms();
             let fresh = tx.query_opt(
@@ -2217,6 +2302,14 @@ fn publish_discovery_snapshot(
                         &posting.availability_status,
                     ],
                 )?;
+                if let Some(authority) = source_verification_authority.as_ref() {
+                    ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                        &mut tx,
+                        &source.account_id,
+                        &saved,
+                        authority,
+                    )?;
+                }
                 seen.push(external_id.clone());
             }
             let closed_count = close_missing_snapshot_memberships_postgres(
@@ -2225,6 +2318,7 @@ fn publish_discovery_snapshot(
                 &run_id,
                 observed_at_ms,
                 &seen,
+                source_verification_authority.as_ref(),
                 profile,
                 preferences,
                 applications,
@@ -2290,6 +2384,7 @@ fn close_missing_snapshot_memberships_sqlite(
     _run_id: &str,
     observed_at_ms: i64,
     seen: &[String],
+    source_verification_authority: Option<&ManagedCloudOriginalSourceVerificationAuthority>,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -2396,6 +2491,14 @@ fn close_missing_snapshot_memberships_sqlite(
                   WHERE account_id = ?1 AND id = ?2",
                 params![source.account_id, job_id, payload, observed_at_ms],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_sqlite_with_authority_tx(
+                    tx,
+                    &source.account_id,
+                    &posting,
+                    authority,
+                )?;
+            }
         }
         if !still_unknown {
             closed += 1;
@@ -2411,6 +2514,7 @@ fn close_missing_snapshot_memberships_postgres(
     _run_id: &str,
     observed_at_ms: i64,
     seen: &[String],
+    source_verification_authority: Option<&ManagedCloudOriginalSourceVerificationAuthority>,
     profile: &CareerProfile,
     preferences: &JobPreferences,
     applications: &[JobApplication],
@@ -2467,15 +2571,14 @@ fn close_missing_snapshot_memberships_postgres(
         if changed == 0 || !should_close {
             continue;
         }
-        let row = tx
-            .query_one(
-                "SELECT
+        let row = tx.query_one(
+            "SELECT
                     EXISTS(SELECT 1 FROM jobs_discovery_memberships
                       WHERE account_id = $1 AND job_id = $2 AND availability_status = 'active'),
                     EXISTS(SELECT 1 FROM jobs_discovery_memberships
                       WHERE account_id = $1 AND job_id = $2 AND availability_status = 'unknown')",
-                &[&source.account_id, &job_id],
-            )?;
+            &[&source.account_id, &job_id],
+        )?;
         let still_active: bool = row.get(0);
         let still_unknown: bool = row.get(1);
         if still_active {
@@ -2517,6 +2620,14 @@ fn close_missing_snapshot_memberships_postgres(
                   WHERE account_id = $1 AND id = $2",
                 &[&source.account_id, &job_id, &payload, &observed_at_ms],
             )?;
+            if let Some(authority) = source_verification_authority {
+                ensure_original_source_verification_assignment_postgres_with_authority_tx(
+                    tx,
+                    &source.account_id,
+                    &posting,
+                    authority,
+                )?;
+            }
         }
         if !still_unknown {
             closed += 1;
@@ -2589,14 +2700,11 @@ pub fn complete_discovery_run(
             canonical_url,
             description: input.description.trim().to_string(),
             compensation: input.compensation.trim().to_string(),
-            employment_type: [
-                input.employment_type.trim(),
-                input.engagement_type.trim(),
-            ]
-            .into_iter()
-            .filter(|value| !value.is_empty())
-            .collect::<Vec<_>>()
-            .join(" "),
+            employment_type: [input.employment_type.trim(), input.engagement_type.trim()]
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join(" "),
             track_id: source.track_id.clone(),
             match_score: 0,
             matched_reasons: Vec::new(),
@@ -2618,12 +2726,9 @@ pub fn complete_discovery_run(
             eligibility: None,
         };
         if source.provider == CURATED_DISCOVERY_PROVIDER {
-            let Some(track) = best_curated_discovery_track(
-                &posting,
-                &profile,
-                &preferences,
-                &tracks,
-            ) else {
+            let Some(track) =
+                best_curated_discovery_track(&posting, &profile, &preferences, &tracks)
+            else {
                 continue;
             };
             posting.track_id = track.id.clone();
@@ -2963,8 +3068,7 @@ fn validate_discovered_job(source: &DiscoverySource, input: &DiscoveredJobInput)
 fn is_canonical_discovered_employment_type(value: &str) -> bool {
     matches!(
         value.trim(),
-        ""
-            | "full_time"
+        "" | "full_time"
             | "part_time"
             | "contract"
             | "temporary"
@@ -3065,8 +3169,20 @@ fn best_curated_discovery_track<'a>(
 
 fn meaningful_role_overlap(left: &str, right: &str) -> bool {
     const GENERIC: [&str; 14] = [
-        "associate", "developer", "engineer", "engineering", "intern", "junior", "lead",
-        "manager", "principal", "senior", "specialist", "staff", "the", "and",
+        "associate",
+        "developer",
+        "engineer",
+        "engineering",
+        "intern",
+        "junior",
+        "lead",
+        "manager",
+        "principal",
+        "senior",
+        "specialist",
+        "staff",
+        "the",
+        "and",
     ];
     let tokens = |value: &str| {
         value
@@ -3573,13 +3689,7 @@ fn discovery_lease_skips_native_pauses_and_operational_holds_without_starvation(
     assert!(paused.track_id.is_empty());
     let held = make_source("greenhouse", "held-board");
     let allowed = make_source("lever", "allowed-board");
-    set_discovery_source_status(
-        &pool,
-        "acct-discovery-hold",
-        &paused.id,
-        "paused",
-    )
-    .unwrap();
+    set_discovery_source_status(&pool, "acct-discovery-hold", &paused.id, "paused").unwrap();
     let schedule = now_ms().saturating_sub(10_000);
     pool.get()
         .unwrap()
@@ -3606,14 +3716,8 @@ fn discovery_lease_skips_native_pauses_and_operational_holds_without_starvation(
     assert!(paused_context.matches(OperationalHoldScopeKind::Region, "new york, ny"));
     let held_context = discovery_operational_context_sqlite(&tx, &held).unwrap();
     assert!(held_context.matches(OperationalHoldScopeKind::Global, "*"));
-    assert!(held_context.matches(
-        OperationalHoldScopeKind::DiscoverySource,
-        &held.id
-    ));
-    assert!(held_context.matches(
-        OperationalHoldScopeKind::Account,
-        "acct-discovery-hold"
-    ));
+    assert!(held_context.matches(OperationalHoldScopeKind::DiscoverySource, &held.id));
+    assert!(held_context.matches(OperationalHoldScopeKind::Account, "acct-discovery-hold"));
     assert!(held_context.matches(OperationalHoldScopeKind::CareerTrack, &track.id));
     assert!(held_context.matches(OperationalHoldScopeKind::AtsProvider, "greenhouse"));
     assert!(held_context.matches(OperationalHoldScopeKind::Region, "new york, ny"));

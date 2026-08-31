@@ -14,6 +14,13 @@ fn build_profile_evidence_revision(
     let mut candidate_profile = profile.clone();
     candidate_profile.email.clear();
     candidate_profile.updated_at_ms = 0;
+    // Track timestamps and match counts are transport/derived projection data.
+    // They can advance during a semantic no-op read/write and must not revoke a
+    // prepared application's immutable candidate-evidence binding.
+    let mut candidate_track = track.clone();
+    candidate_track.match_count = 0;
+    candidate_track.created_at_ms = 0;
+    candidate_track.updated_at_ms = 0;
     let mut confirmed_facts = facts
         .iter()
         .filter(|fact| fact.verification_status == "confirmed")
@@ -25,7 +32,7 @@ fn build_profile_evidence_revision(
         "schema_version": JOBS_EVIDENCE_SCHEMA_VERSION,
         "profile": candidate_profile,
         "confirmed_facts": confirmed_facts,
-        "career_track": track,
+        "career_track": candidate_track,
         "application_identity": {
             "id": identity.id,
             "email": identity.email,
@@ -417,15 +424,27 @@ fn persist_evidence_revision_sqlite(
     Ok(stored)
 }
 
+fn lock_profile_evidence_revision_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    career_track_id: &str,
+) -> Result<()> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-evidence:' || $1 || ':' || $2, 0))",
+        &[&account_id, &career_track_id],
+    )?;
+    Ok(())
+}
+
 fn persist_evidence_revision_postgres(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
     evidence: &ProfileEvidenceRevision,
 ) -> Result<ProfileEvidenceRevision> {
-    tx.query_one(
-        "SELECT pg_advisory_xact_lock(hashtextextended('jobs-evidence:' || $1 || ':' || $2, 0))",
-        &[&account_id, &evidence.career_track_id],
-    )?;
+    // Prepared finalization prelocks this exact namespace before evaluating any
+    // expiring authority. Reacquiring the transaction lock is immediate and
+    // proves that persistence cannot silently drift to a different namespace.
+    lock_profile_evidence_revision_postgres_tx(tx, account_id, &evidence.career_track_id)?;
     if let Some(row) = tx.query_opt(
         "SELECT id, revision_no, snapshot_json, created_at_ms
            FROM jobs_profile_evidence_revisions

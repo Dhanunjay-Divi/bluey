@@ -5741,7 +5741,7 @@ pub fn browser_release_channel_status(
 }
 
 #[cfg(test)]
-mod browser_release_registry_tests {
+pub(super) mod browser_release_registry_tests {
     use super::*;
     use crate::db;
     use ed25519_dalek::{Signer, SigningKey};
@@ -6260,6 +6260,182 @@ mod browser_release_registry_tests {
                 deterministic_build_proof("darwin", "x64"),
                 deterministic_build_proof("windows", "x64"),
             ],
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub(super) struct InstalledSignedBrowserReleaseFixture {
+        pub(super) descriptor: VerifiedBrowserBuildDescriptor,
+        pub(super) binding: BrowserReleaseClaimBinding,
+        pub(super) runtime_target: AtsCertificationRuntimeTarget,
+    }
+
+    fn signed_browser_release_local_runtime_target(
+        descriptor: &VerifiedBrowserBuildDescriptor,
+        binding: &BrowserReleaseClaimBinding,
+    ) -> AtsCertificationRuntimeTarget {
+        assert_eq!(binding.release_id, descriptor.release_id);
+        assert_eq!(binding.build_id, descriptor.build_id);
+        assert_eq!(binding.app_version, descriptor.app_version);
+        assert_eq!(binding.protocol_version, descriptor.protocol_version);
+        assert_eq!(
+            binding.build_descriptor_sha256,
+            descriptor.descriptor_sha256
+        );
+
+        let platform = match binding.platform.as_str() {
+            "darwin" => "macos",
+            "windows" => "windows",
+            platform => panic!("unsupported signed Browser fixture platform {platform}"),
+        };
+        let architecture = match binding.architecture.as_str() {
+            "arm64" => "arm64",
+            "x64" => "x86_64",
+            architecture => {
+                panic!("unsupported signed Browser fixture architecture {architecture}")
+            }
+        };
+        let attestation = AtsCertificationRuntimeAttestation::Local {
+            platform: platform.to_string(),
+            architecture: architecture.to_string(),
+            browser_release_manifest_sha256: binding.manifest_sha256.clone(),
+            browser_artifact_sha256: binding.artifact_sha256.clone(),
+            browser_build_descriptor_sha256: binding.build_descriptor_sha256.clone(),
+            automation_bundle_sha256: binding.automation_bundle_sha256.clone(),
+            playwright_version: descriptor.playwright_version.clone(),
+            chromium_revision: descriptor.chromium_revision.clone(),
+            chromium_executable_sha256: binding.chromium_executable_sha256.clone(),
+        };
+        let runtime_sha256 = ats_certification_sha256(
+            &ats_certification_canonical_json(&attestation)
+                .expect("canonical signed Browser runtime attestation"),
+        );
+        let runtime_target = AtsCertificationRuntimeTarget {
+            runtime_kind: "local".to_string(),
+            runtime_id: format!("local:{}:{}:{}", binding.release_id, platform, architecture),
+            runtime_sha256,
+            platform: platform.to_string(),
+            architecture: architecture.to_string(),
+            automation_bundle_sha256: binding.automation_bundle_sha256.clone(),
+            browser_release_manifest_sha256: Some(binding.manifest_sha256.clone()),
+            browser_artifact_sha256: Some(binding.artifact_sha256.clone()),
+            browser_build_descriptor_sha256: Some(binding.build_descriptor_sha256.clone()),
+            runner_build_id: None,
+            runner_image_sha256: None,
+            playwright_version: descriptor.playwright_version.clone(),
+            chromium_revision: descriptor.chromium_revision.clone(),
+            chromium_executable_sha256: binding.chromium_executable_sha256.clone(),
+        };
+        validate_ats_runtime_target(&runtime_target)
+            .expect("validate signed Browser local ATS runtime target");
+        runtime_target
+    }
+
+    pub(super) fn install_signed_browser_release_fixture(
+        pool: &DbPool,
+        account_id: &str,
+    ) -> InstalledSignedBrowserReleaseFixture {
+        let fixture = registry_fixture();
+        let policy_bytes = decode_fixture(&fixture.trust_policy.canonical);
+        let policy = parse_canonical_browser_release_trust_policy(&policy_bytes)
+            .expect("parse signed Browser fixture policy");
+        let policy_sha256 = browser_release_authority_sha256(&policy_bytes);
+        let trust_envelope = BrowserReleaseAuthorityEnvelope {
+            canonical_base64url: fixture.trust_policy.canonical.clone(),
+            signature_set_base64url: fixture.trust_policy.signature_set.clone(),
+        };
+        {
+            let _environment_lock = ROOT_ANCHOR_ENV_LOCK.lock().expect("lock root anchor env");
+            let previous = std::env::var_os(BROWSER_RELEASE_ROOT_TRUST_ANCHOR_ENV);
+            let _environment_guard = RootAnchorEnvironmentGuard(previous);
+            install_fixture_root_anchor(&policy);
+            let trust = import_browser_release_trust_policy(pool, &trust_envelope, "test-suite")
+                .expect("import signed Browser fixture trust policy");
+            assert_eq!(trust.authority_sha256, policy_sha256);
+        }
+
+        let manifest_request = fixture_manifest_request(&fixture);
+        let manifest = import_browser_release_manifest(pool, &manifest_request, "test-suite")
+            .expect("import signed Browser fixture manifest");
+        let descriptor = manifest_request
+            .build_proofs
+            .iter()
+            .map(|proof| {
+                verify_browser_build_proof_against_release_policy(proof, &policy)
+                    .expect("verify signed Browser fixture build proof")
+            })
+            .find(|descriptor| {
+                descriptor.platform == "darwin" && descriptor.architecture == "arm64"
+            })
+            .expect("signed Browser fixture has a Darwin arm64 descriptor");
+
+        let mut activation = parse_canonical_browser_release_activation(&decode_fixture(
+            &fixture.activation.canonical,
+        ))
+        .expect("parse signed Browser fixture activation");
+        assert_eq!(activation.manifest_sha256, manifest.authority_sha256);
+        assert_eq!(
+            activation.signature_set_sha256,
+            manifest.signature_set_sha256
+        );
+        activation.activation_id = "browser-activation-beta-test-suite-1".to_string();
+        activation.accepted_server_release_ids = vec![
+            "alternate-test-server".to_string(),
+            "test-server".to_string(),
+        ];
+        let activation_envelope = signed_authority_envelope(
+            &activation,
+            "browser-activation-beta-test-suite-promotion-set",
+            activation.trust_generation,
+            "promotion",
+            BROWSER_RELEASE_ACTIVATION_AUDIENCE,
+            activation.issued_at_ms,
+            &[("promotion-key-1", 2), ("promotion-key-2", 3)],
+        );
+        let activation_import =
+            import_browser_release_activation(pool, &activation_envelope, "test-suite")
+                .expect("import signed Browser fixture activation");
+        let active = apply_browser_release_activation(
+            pool,
+            &ApplyBrowserReleaseActivationRequest {
+                activation_sha256: activation_import.authority_sha256,
+                expected_head_revision: 0,
+                expected_transition_sha256: None,
+            },
+            "test-suite",
+        )
+        .expect("apply signed Browser fixture activation");
+        assert!(active.available);
+
+        let assignment = assign_browser_release_account_channel(
+            pool,
+            account_id,
+            &AssignBrowserReleaseChannelRequest {
+                assignment_generation: 1,
+                predecessor_assignment_sha256: None,
+                channel: activation.channel,
+                reason_ref: "signed-test-fixture".to_string(),
+                assigned_at_ms: activation.issued_at_ms,
+            },
+            "test-suite",
+        )
+        .expect("assign signed Browser fixture channel");
+        let binding =
+            browser_release_for_claim(pool, account_id, &descriptor, "test-server", now_ms())
+                .expect("resolve signed Browser fixture release")
+                .expect("signed Browser fixture release is available");
+        assert_eq!(binding.assignment_sha256, assignment.assignment_sha256);
+        assert_eq!(
+            binding.channel_transition_sha256,
+            active
+                .transition_sha256
+                .expect("signed Browser fixture has an active transition")
+        );
+        let runtime_target = signed_browser_release_local_runtime_target(&descriptor, &binding);
+        InstalledSignedBrowserReleaseFixture {
+            descriptor,
+            binding,
+            runtime_target,
         }
     }
 

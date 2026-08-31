@@ -27,14 +27,16 @@ pub(crate) fn communication_review_text_is_safe(value: &str) -> bool {
 }
 
 pub(crate) fn communication_body_text_is_safe(value: &str) -> bool {
-    value.chars().all(|character| match get_general_category(character) {
-        GeneralCategory::Control => matches!(character, '\t' | '\n' | '\r'),
-        GeneralCategory::Format => matches!(character, '\u{200c}' | '\u{200d}'),
-        GeneralCategory::Surrogate
-        | GeneralCategory::LineSeparator
-        | GeneralCategory::ParagraphSeparator => false,
-        _ => true,
-    })
+    value
+        .chars()
+        .all(|character| match get_general_category(character) {
+            GeneralCategory::Control => matches!(character, '\t' | '\n' | '\r'),
+            GeneralCategory::Format => matches!(character, '\u{200c}' | '\u{200d}'),
+            GeneralCategory::Surrogate
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator => false,
+            _ => true,
+        })
 }
 
 fn exact_lowercase_sha256(value: &str) -> bool {
@@ -98,14 +100,17 @@ fn communication_write_is_fenced(
     connection_id: &str,
 ) -> Result<bool> {
     crate::db::run_blocking_db(|| match pool {
-        DbPool::Sqlite(_) => pool.get()?.query_row(
-            "SELECT EXISTS(
+        DbPool::Sqlite(_) => pool
+            .get()?
+            .query_row(
+                "SELECT EXISTS(
                 SELECT 1 FROM jobs_communication_write_fences
                  WHERE account_id = ?1 AND connection_id IN ('', ?2)
              )",
-            params![account_id, connection_id],
-            |row| row.get(0),
-        ).map_err(Into::into),
+                params![account_id, connection_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into),
         DbPool::Postgres(_) => Ok(pool
             .get_pg()?
             .query_one(
@@ -125,10 +130,28 @@ fn communication_dispatch_is_held_sqlite_tx(
     application_id: &str,
     mailbox_provider: &str,
 ) -> Result<bool> {
-    let mut context = operational_hold_context_for_application_sqlite_tx(
+    let employer_domain = communication_employer_domain_sqlite_tx(tx, account_id, application_id)?;
+    communication_dispatch_is_held_sqlite_tx_after_authority(
         tx,
         account_id,
         application_id,
+        mailbox_provider,
+        &employer_domain,
+    )
+}
+
+fn communication_dispatch_is_held_sqlite_tx_after_authority(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    mailbox_provider: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
+) -> Result<bool> {
+    let mut context = operational_hold_context_for_application_sqlite_tx_after_authority(
+        tx,
+        account_id,
+        application_id,
+        employer_domain,
         None,
         None,
         None,
@@ -148,16 +171,38 @@ fn communication_dispatch_is_held_sqlite_tx(
     ))
 }
 
-fn communication_dispatch_is_held_postgres_tx(
+fn communication_dispatch_is_held_postgres_tx_after_authority_prelock(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
     application_id: &str,
     mailbox_provider: &str,
 ) -> Result<bool> {
-    let mut context = operational_hold_context_for_application_postgres_tx(
+    let employer_domain = communication_employer_domain_postgres_tx_after_authority_prelock(
         tx,
         account_id,
         application_id,
+    )?;
+    communication_dispatch_is_held_postgres_tx_with_domain_after_authority_prelock(
+        tx,
+        account_id,
+        application_id,
+        mailbox_provider,
+        &employer_domain,
+    )
+}
+
+fn communication_dispatch_is_held_postgres_tx_with_domain_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    mailbox_provider: &str,
+    employer_domain: &OperationalHoldEmployerDomain,
+) -> Result<bool> {
+    let mut context = operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+        tx,
+        account_id,
+        application_id,
+        employer_domain,
         None,
         None,
         None,
@@ -167,7 +212,7 @@ fn communication_dispatch_is_held_postgres_tx(
         .insert_scope(OperationalHoldScopeKind::MailboxProvider, mailbox_provider)
         .map_err(anyhow::Error::new)?;
     Ok(matches!(
-        evaluate_operational_capability_postgres_tx(
+        evaluate_operational_capability_postgres_tx_after_authority_prelock(
             tx,
             OperationalCapability::CommunicationDispatch,
             &context,
@@ -175,6 +220,52 @@ fn communication_dispatch_is_held_postgres_tx(
         .map_err(anyhow::Error::new)?,
         OperationalCapabilityEvaluation::Held(_)
     ))
+}
+
+fn communication_employer_domain_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<OperationalHoldEmployerDomain> {
+    let (stored_application_id, job_id, application_json): (String, String, String) = tx
+        .query_row(
+            "SELECT id, job_id, application_json FROM jobs_applications
+              WHERE account_id = ?1 AND id = ?2",
+            params![account_id, application_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("communication application is unavailable"))?;
+    let application = parse_application_json(
+        application_json,
+        &stored_application_id,
+        &job_id,
+        "communication application",
+    )?;
+    submitted_execution_employer_domain(account_id, &application)
+}
+
+fn communication_employer_domain_postgres_tx_after_authority_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<OperationalHoldEmployerDomain> {
+    let row = tx
+        .query_opt(
+            "SELECT id, job_id, application_json FROM jobs_applications AS application
+              WHERE account_id = $1 AND id = $2 FOR SHARE OF application",
+            &[&account_id, &application_id],
+        )?
+        .ok_or_else(|| anyhow::anyhow!("communication application is unavailable"))?;
+    let stored_application_id: String = row.get(0);
+    let job_id: String = row.get(1);
+    let application = parse_application_json(
+        row.get(2),
+        &stored_application_id,
+        &job_id,
+        "communication application",
+    )?;
+    submitted_execution_employer_domain(account_id, &application)
 }
 
 type CommunicationActionRow = (
@@ -223,12 +314,9 @@ type CommunicationReconciliationCandidateRow = (
 
 fn canonical_communication_value(value: &Value) -> Value {
     match value {
-        Value::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(canonical_communication_value)
-                .collect(),
-        ),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonical_communication_value).collect())
+        }
         Value::Object(values) => {
             let sorted = values
                 .iter()
@@ -249,7 +337,10 @@ fn communication_payload_sha256(payload: &Value) -> Result<String> {
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
-fn communication_authority_sha256(account_id: &str, action: &JobsCommunicationAction) -> Result<String> {
+fn communication_authority_sha256(
+    account_id: &str,
+    action: &JobsCommunicationAction,
+) -> Result<String> {
     let authority = serde_json::json!({
         "account_id": account_id,
         "application_id": action.application_id,
@@ -354,7 +445,10 @@ fn validate_communication_grant(
         || credential.provider != connection_provider
         || credential.grant_revision <= 0
         || !mailbox.capabilities.iter().any(|value| value == capability)
-        || !credential.capabilities.iter().any(|value| value == capability)
+        || !credential
+            .capabilities
+            .iter()
+            .any(|value| value == capability)
         || !credential.scopes.iter().any(|value| value == scope)
     {
         anyhow::bail!("communication action needs an exact provider write grant")
@@ -504,9 +598,7 @@ pub(crate) fn validate_communication_reply_source(
                         && !message
                             .external_id
                             .bytes()
-                            .any(|byte| byte.is_ascii_control()))) =>
-        {
-        }
+                            .any(|byte| byte.is_ascii_control()))) => {}
         _ => anyhow::bail!("communication reply source metadata is incomplete"),
     }
     Ok(())
@@ -710,6 +802,36 @@ const COMMUNICATION_ACTION_SELECT: &str =
      approved_grant_sha256, approved_at_ms, dispatched_at_ms, created_at_ms,
      updated_at_ms, action_revision";
 
+/// Return one transaction-owned clock sample after the caller has acquired the
+/// complete row-lock set for a communication lease mutation. A process clock
+/// captured before `run_blocking_db` is discovery-only and must never authorize
+/// a lease, provider dispatch, or reconciliation mutation.
+fn communication_post_lock_db_now_postgres_tx(tx: &mut postgres::Transaction<'_>) -> Result<i64> {
+    let now_ms: i64 = tx
+        .query_one(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )?
+        .get(0);
+    if !(0..=COMMUNICATION_ACTION_REVISION_MAX).contains(&now_ms) {
+        anyhow::bail!("communication database time is outside the supported range")
+    }
+    Ok(now_ms)
+}
+
+fn require_communication_lease_current_at_ms(
+    action: &JobsCommunicationAction,
+    now_ms: i64,
+) -> Result<()> {
+    if action
+        .lease_expires_at_ms
+        .is_none_or(|expires_at_ms| expires_at_ms <= now_ms)
+    {
+        anyhow::bail!("communication action lease not found")
+    }
+    Ok(())
+}
+
 pub fn communication_action(
     pool: &DbPool,
     account_id: &str,
@@ -779,9 +901,7 @@ pub fn list_communication_actions(
                       WHERE account_id = ?1
                       ORDER BY created_at_ms DESC, id ASC LIMIT ?2"
                 ))?;
-                for row in
-                    stmt.query_map(params![account_id, limit], sqlite_communication_row)?
-                {
+                for row in stmt.query_map(params![account_id, limit], sqlite_communication_row)? {
                     actions.push(communication_action_from_row(row?)?);
                 }
             }
@@ -830,8 +950,7 @@ pub fn export_communication_actions(
                   WHERE account_id = ?1 ORDER BY created_at_ms, id"
             ))?;
             let rows = stmt.query_map(params![account_id], sqlite_communication_row)?;
-            rows
-                .map(|row| communication_action_from_row(row?))
+            rows.map(|row| communication_action_from_row(row?))
                 .collect::<Result<Vec<_>>>()
         }
         DbPool::Postgres(_) => pool
@@ -981,8 +1100,7 @@ pub fn communication_action_execution_readiness(
     account_id: &str,
     action: &JobsCommunicationAction,
 ) -> Result<(bool, String)> {
-    let dispatch_enabled =
-        communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED");
+    let dispatch_enabled = communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED");
     if !dispatch_enabled {
         return Ok((
             false,
@@ -1044,7 +1162,8 @@ pub fn communication_action_execution_readiness(
             "Reconnect this mailbox before approving communication.".to_string(),
         ));
     };
-    let Some(credential) = jobs_provider_credential(pool, account_id, &action.connection_id)? else {
+    let Some(credential) = jobs_provider_credential(pool, account_id, &action.connection_id)?
+    else {
         return Ok((
             false,
             "Authorize the required provider write access before approving communication."
@@ -1056,8 +1175,7 @@ pub fn communication_action_execution_readiness(
     else {
         return Ok((
             false,
-            "Reconnect this mailbox and authorize the required provider write access."
-                .to_string(),
+            "Reconnect this mailbox and authorize the required provider write access.".to_string(),
         ));
     };
     if action.status == "approved"
@@ -1093,29 +1211,28 @@ fn validate_communication_relationships(
     if let Some(message_id) = action.source_message_id.as_deref() {
         let message = crate::db::run_blocking_db(|| -> Result<Option<JobsProviderMessage>> {
             match pool {
-            DbPool::Sqlite(_) => {
-                let conn = pool.get()?;
-                let raw: Option<String> = conn
-                    .query_row(
-                        "SELECT message_json FROM jobs_provider_messages
+                DbPool::Sqlite(_) => {
+                    let conn = pool.get()?;
+                    let raw: Option<String> = conn
+                        .query_row(
+                            "SELECT message_json FROM jobs_provider_messages
                           WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
                             AND application_id = ?4",
-                        params![
-                            account_id,
-                            action.connection_id,
-                            message_id,
-                            action.application_id,
-                        ],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                raw.map(|value| parse_json(value, "Jobs provider message"))
-                    .transpose()
-            }
-            DbPool::Postgres(_) => {
-                let mut conn = pool.get_pg()?;
-                conn
-                    .query_opt(
+                            params![
+                                account_id,
+                                action.connection_id,
+                                message_id,
+                                action.application_id,
+                            ],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    raw.map(|value| parse_json(value, "Jobs provider message"))
+                        .transpose()
+                }
+                DbPool::Postgres(_) => {
+                    let mut conn = pool.get_pg()?;
+                    conn.query_opt(
                         "SELECT message_json FROM jobs_provider_messages
                           WHERE account_id = $1 AND connection_id = $2 AND id = $3
                             AND application_id = $4",
@@ -1128,7 +1245,7 @@ fn validate_communication_relationships(
                     )?
                     .map(|row| parse_json(row.get(0), "Jobs provider message"))
                     .transpose()
-            }
+                }
             }
         })?;
         let message = message.ok_or_else(|| anyhow::anyhow!("source mailbox message not found"))?;
@@ -1163,7 +1280,10 @@ pub fn create_communication_action(
         || value.connection_id.trim().is_empty()
         || value.idempotency_key.is_empty()
         || value.idempotency_key.len() > 240
-        || value.idempotency_key.bytes().any(|byte| byte.is_ascii_control())
+        || value
+            .idempotency_key
+            .bytes()
+            .any(|byte| byte.is_ascii_control())
     {
         anyhow::bail!("communication action is incomplete")
     }
@@ -1204,14 +1324,9 @@ pub fn create_communication_action(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
-            require_communication_write_unfenced_sqlite_tx(
-                &tx,
-                account_id,
-                &value.connection_id,
-            )?;
+            require_communication_write_unfenced_sqlite_tx(&tx, account_id, &value.connection_id)?;
             validate_communication_kind_provider(&value.kind, &value.provider)?;
             validate_communication_payload(&value.kind, &value.payload)?;
             if communication_authority_sha256(account_id, &value)? != value.authority_sha256 {
@@ -1242,11 +1357,15 @@ pub fn create_communication_action(
                     "SELECT message_json FROM jobs_provider_messages
                       WHERE account_id = ?1 AND connection_id = ?2 AND id = ?3
                         AND application_id = ?4",
-                    params![account_id, value.connection_id, source_id, value.application_id],
+                    params![
+                        account_id,
+                        value.connection_id,
+                        source_id,
+                        value.application_id
+                    ],
                     |row| row.get(0),
                 )?;
-                let source: JobsProviderMessage =
-                    parse_json(source_json, "Jobs provider message")?;
+                let source: JobsProviderMessage = parse_json(source_json, "Jobs provider message")?;
                 validate_communication_reply_source(&value, &source)?;
             }
             let inserted = tx.execute(
@@ -1302,8 +1421,7 @@ pub fn create_communication_action(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             require_communication_write_unfenced_postgres_tx(
                 &mut tx,
@@ -1339,7 +1457,12 @@ pub fn create_communication_action(
                     "SELECT message_json FROM jobs_provider_messages
                       WHERE account_id = $1 AND connection_id = $2 AND id = $3
                         AND application_id = $4 FOR SHARE",
-                    &[&account_id, &value.connection_id, &source_id, &value.application_id],
+                    &[
+                        &account_id,
+                        &value.connection_id,
+                        &source_id,
+                        &value.application_id,
+                    ],
                 )?;
                 let source: JobsProviderMessage =
                     parse_json(source_row.get(0), "Jobs provider message")?;
@@ -1416,10 +1539,8 @@ pub fn approve_communication_action(
     {
         anyhow::bail!("communication action review snapshot changed")
     }
-    if !matches!(
-        action.status.as_str(),
-        "awaiting_approval" | "needs_input"
-    ) || action.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS
+    if !matches!(action.status.as_str(), "awaiting_approval" | "needs_input")
+        || action.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS
     {
         anyhow::bail!("communication action cannot be approved in its current state")
     }
@@ -1441,8 +1562,7 @@ pub fn approve_communication_action(
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx,
-                account_id,
+                &tx, account_id,
             )?;
             if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
                 anyhow::bail!("communication execution is not enabled")
@@ -1482,7 +1602,9 @@ pub fn approve_communication_action(
             validate_communication_kind_provider(&current.kind, &current.provider)?;
             validate_communication_payload(&current.kind, &current.payload)?;
             let current_authority = communication_authority_sha256(account_id, &current)?;
-            if current_authority != authority_sha256 || current.authority_sha256 != current_authority {
+            if current_authority != authority_sha256
+                || current.authority_sha256 != current_authority
+            {
                 anyhow::bail!("communication action authority changed before approval")
             }
             tx.query_row(
@@ -1507,8 +1629,7 @@ pub fn approve_communication_action(
                     ],
                     |row| row.get(0),
                 )?;
-                let source: JobsProviderMessage =
-                    parse_json(source_json, "Jobs provider message")?;
+                let source: JobsProviderMessage = parse_json(source_json, "Jobs provider message")?;
                 validate_communication_reply_source(&current, &source)?;
             }
             let (mailbox_json, credential_json): (String, String) = tx.query_row(
@@ -1588,8 +1709,7 @@ pub fn approve_communication_action(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx,
-                account_id,
+                &mut tx, account_id,
             )?;
             if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
                 anyhow::bail!("communication execution is not enabled")
@@ -1602,8 +1722,7 @@ pub fn approve_communication_action(
                 ),
                 &[&account_id, &action_id],
             )?;
-            let current =
-                communication_action_from_row(postgres_communication_row(current_row))?;
+            let current = communication_action_from_row(postgres_communication_row(current_row))?;
             require_communication_write_unfenced_postgres_tx(
                 &mut tx,
                 account_id,
@@ -1629,7 +1748,9 @@ pub fn approve_communication_action(
             validate_communication_kind_provider(&current.kind, &current.provider)?;
             validate_communication_payload(&current.kind, &current.payload)?;
             let current_authority = communication_authority_sha256(account_id, &current)?;
-            if current_authority != authority_sha256 || current.authority_sha256 != current_authority {
+            if current_authority != authority_sha256
+                || current.authority_sha256 != current_authority
+            {
                 anyhow::bail!("communication action authority changed before approval")
             }
             tx.query_one(
@@ -1668,8 +1789,7 @@ pub fn approve_communication_action(
                   FOR UPDATE OF mailbox, credential",
                 &[&account_id, &current.connection_id],
             )?;
-            let mailbox: MailboxConnection =
-                parse_json(grant_row.get(0), "mailbox connection")?;
+            let mailbox: MailboxConnection = parse_json(grant_row.get(0), "mailbox connection")?;
             let credential: JobsProviderCredential =
                 parse_json(grant_row.get(1), "Jobs provider credential")?;
             let (grant_revision, grant_sha256) =
@@ -1827,7 +1947,8 @@ pub fn cancel_communication_action(
                 ),
                 &[&account_id, &action_id],
             )?;
-            let action = row.map(postgres_communication_row)
+            let action = row
+                .map(postgres_communication_row)
                 .map(communication_action_from_row)
                 .transpose()?;
             if action.is_some() && changed != 1 {
@@ -1912,9 +2033,8 @@ pub fn claim_communication_action(
                 i64,
                 i64,
             );
-            let initial_scan_cursor = operational_hold_scan_cursor_snapshot(
-                &COMMUNICATION_OPERATIONAL_HOLD_SCAN_CURSORS,
-            );
+            let initial_scan_cursor =
+                operational_hold_scan_cursor_snapshot(&COMMUNICATION_OPERATIONAL_HOLD_SCAN_CURSORS);
             let mut scan_cursor = initial_scan_cursor.clone();
             let mut wrapped = false;
             let mut scanned = 0;
@@ -2020,8 +2140,7 @@ pub fn claim_communication_action(
                 }
                 scan_cursor = Some(candidate_cursor);
                 scanned += 1;
-                let mailbox: MailboxConnection =
-                    parse_json(candidate.3, "mailbox connection")?;
+                let mailbox: MailboxConnection = parse_json(candidate.3, "mailbox connection")?;
                 if mailbox.provider != candidate.6 {
                     anyhow::bail!("communication mailbox authority changed")
                 }
@@ -2091,8 +2210,7 @@ pub fn claim_communication_action(
                     ],
                     |row| row.get(0),
                 )?;
-                let source: JobsProviderMessage =
-                    parse_json(source_json, "Jobs provider message")?;
+                let source: JobsProviderMessage = parse_json(source_json, "Jobs provider message")?;
                 validate_communication_reply_source(&current, &source)?;
             }
             let authority_sha256 = communication_authority_sha256(&account_id, &current)?;
@@ -2141,13 +2259,7 @@ pub fn claim_communication_action(
                     AND action_revision < 9007199254740991
                     AND updated_at_ms < 9223372036854775807",
                 params![
-                    now,
-                    owner_id,
-                    token_hash,
-                    fence,
-                    expires_at,
-                    attempt_id,
-                    action_id,
+                    now, owner_id, token_hash, fence, expires_at, attempt_id, action_id,
                     account_id,
                 ],
             )?;
@@ -2186,6 +2298,8 @@ pub fn claim_communication_action(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)?;
+            lock_postgres_ats_certification(&mut tx)?;
             if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
                 anyhow::bail!("communication execution is not enabled")
             }
@@ -2197,11 +2311,29 @@ pub fn claim_communication_action(
             )? {
                 let expired_action_id: String = expired.get(0);
                 let expired_account_id: String = expired.get(1);
+                lock_discovery_account_shared_postgres(&mut tx, &expired_account_id)?;
                 crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                     &mut tx,
                     &expired_account_id,
                 )?;
-                tx.execute(
+                let locked_expiry = tx
+                    .query_opt(
+                        "SELECT lease_expires_at_ms FROM jobs_communication_actions
+                          WHERE account_id = $1 AND id = $2 AND status = 'dispatching'
+                          FOR UPDATE",
+                        &[&expired_account_id, &expired_action_id],
+                    )?
+                    .map(|row| row.get::<_, Option<i64>>(0));
+                let Some(Some(locked_expiry)) = locked_expiry else {
+                    tx.commit()?;
+                    return Ok(None);
+                };
+                let reclaim_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+                if locked_expiry > reclaim_now_ms {
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                let changed = tx.execute(
                     "UPDATE jobs_communication_actions
                         SET status = 'side_effect_unknown',
                             action_revision = action_revision + 1,
@@ -2212,14 +2344,16 @@ pub fn claim_communication_action(
                         AND lease_expires_at_ms <= $1
                         AND action_revision < 9007199254740991
                         AND updated_at_ms < 9223372036854775807",
-                    &[&now, &expired_account_id, &expired_action_id],
+                    &[&reclaim_now_ms, &expired_account_id, &expired_action_id],
                 )?;
+                if changed != 1 {
+                    anyhow::bail!("expired communication dispatch authority changed")
+                }
                 tx.commit()?;
                 return Ok(None);
             }
-            let initial_scan_cursor = operational_hold_scan_cursor_snapshot(
-                &COMMUNICATION_OPERATIONAL_HOLD_SCAN_CURSORS,
-            );
+            let initial_scan_cursor =
+                operational_hold_scan_cursor_snapshot(&COMMUNICATION_OPERATIONAL_HOLD_SCAN_CURSORS);
             let mut scan_cursor = initial_scan_cursor.clone();
             let mut wrapped = false;
             let mut scanned = 0;
@@ -2316,7 +2450,8 @@ pub fn claim_communication_action(
                 }
                 scan_cursor = Some(candidate_cursor.clone());
                 scanned += 1;
-                if communication_dispatch_is_held_postgres_tx(
+                lock_discovery_account_shared_postgres(&mut tx, &candidate_account_id)?;
+                if communication_dispatch_is_held_postgres_tx_after_authority_prelock(
                     &mut tx,
                     &candidate_account_id,
                     &application_id,
@@ -2360,11 +2495,11 @@ pub fn claim_communication_action(
                      ON credential.connection_id = a.connection_id
                     AND credential.account_id = a.account_id
                   WHERE a.id = $1 AND a.account_id = $2 AND a.status = 'approved'
-                    AND a.next_attempt_at_ms <= $3 AND a.attempt_count < $4
+                    AND a.attempt_count < $3
                     AND a.approval_revision > 0
                     AND length(a.authority_sha256) = 64
                     AND a.approved_authority_sha256 = a.authority_sha256
-                    AND a.application_id = $5 AND c.provider = $6
+                    AND a.application_id = $4 AND c.provider = $5
                     AND NOT EXISTS (
                       SELECT 1 FROM account_deletion_intents deletion
                        WHERE deletion.account_id = a.account_id
@@ -2392,7 +2527,6 @@ pub fn claim_communication_action(
                 &[
                     &action_id,
                     &account_id,
-                    &now,
                     &COMMUNICATION_ACTION_MAX_ATTEMPTS,
                     &application_id,
                     &mailbox_provider,
@@ -2415,11 +2549,7 @@ pub fn claim_communication_action(
             if mailbox.provider != locked.get::<_, String>(3) {
                 anyhow::bail!("communication mailbox authority changed")
             }
-            require_communication_write_unfenced_postgres_tx(
-                &mut tx,
-                &account_id,
-                &mailbox.id,
-            )?;
+            require_communication_write_unfenced_postgres_tx(&mut tx, &account_id, &mailbox.id)?;
             let credential: JobsProviderCredential =
                 parse_json(locked.get(2), "Jobs provider credential")?;
             let current = tx.query_one(
@@ -2462,6 +2592,19 @@ pub fn claim_communication_action(
             {
                 anyhow::bail!("communication action approval or provider grant changed")
             }
+            let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+            if current.next_attempt_at_ms > effect_now_ms
+                || current.attempt_count >= COMMUNICATION_ACTION_MAX_ATTEMPTS
+            {
+                tx.commit()?;
+                compare_exchange_operational_hold_scan_cursor(
+                    &COMMUNICATION_OPERATIONAL_HOLD_SCAN_CURSORS,
+                    initial_scan_cursor.as_ref(),
+                    next_scan_cursor,
+                );
+                return Ok(None);
+            }
+            let effect_expires_at_ms = effect_now_ms.saturating_add(COMMUNICATION_ACTION_LEASE_MS);
             tx.execute(
                 "INSERT INTO jobs_communication_action_attempts (
                     id, account_id, action_id, connection_id, provider, dispatch_no, fence,
@@ -2481,7 +2624,7 @@ pub fn claim_communication_action(
                     &grant_revision,
                     &grant_sha256,
                     &provider_operation_key,
-                    &now,
+                    &effect_now_ms,
                 ],
             )?;
             let row = tx.query_one(
@@ -2502,11 +2645,11 @@ pub fn claim_communication_action(
                       RETURNING {COMMUNICATION_ACTION_SELECT}"
                 ),
                 &[
-                    &now,
+                    &effect_now_ms,
                     &owner_id,
                     &token_hash,
                     &fence,
-                    &expires_at,
+                    &effect_expires_at_ms,
                     &attempt_id,
                     &action_id,
                     &account_id,
@@ -2601,8 +2744,7 @@ fn validate_communication_success_evidence(
 ) -> Result<()> {
     let action_id_sha256 = hex::encode(Sha256::digest(action.id.as_bytes()));
     if evidence.get("provider").and_then(Value::as_str) != Some(action.provider.as_str())
-        || evidence.get("provider_object_id").and_then(Value::as_str)
-            != Some(provider_object_id)
+        || evidence.get("provider_object_id").and_then(Value::as_str) != Some(provider_object_id)
         || evidence.get("payload_sha256").and_then(Value::as_str)
             != Some(action.payload_sha256.as_str())
         || evidence.get("action_id_sha256").and_then(Value::as_str)
@@ -2657,8 +2799,7 @@ fn validate_communication_provider_success_proof(
     let operation_key_sha256 = hex::encode(Sha256::digest(provider_operation_key.as_bytes()));
     let valid = match action.provider.as_str() {
         "gmail" | "outlook_email" => {
-            let operation_message_id =
-                communication_operation_message_id(provider_operation_key);
+            let operation_message_id = communication_operation_message_id(provider_operation_key);
             let (metadata_key, evidence_key) = if action.provider == "gmail" {
                 ("thread_id", "thread_sha256")
             } else {
@@ -2669,9 +2810,7 @@ fn validate_communication_provider_success_proof(
                 .and_then(Value::as_str)
                 .filter(|value| !value.trim().is_empty())
                 .map(|value| hex::encode(Sha256::digest(value.as_bytes())));
-            evidence
-                .get("operation_message_id")
-                .and_then(Value::as_str)
+            evidence.get("operation_message_id").and_then(Value::as_str)
                 == Some(operation_message_id.as_str())
                 && expected_source_sha256.as_deref().is_some_and(|expected| {
                     evidence.get(evidence_key).and_then(Value::as_str) == Some(expected)
@@ -2680,16 +2819,18 @@ fn validate_communication_provider_success_proof(
         "google_calendar" => {
             let event_id = communication_google_event_id(provider_operation_key);
             provider_object_id == event_id
-                && evidence.get("deterministic_event_id").and_then(Value::as_str)
+                && evidence
+                    .get("deterministic_event_id")
+                    .and_then(Value::as_str)
                     == Some(event_id.as_str())
-                && evidence.get("private_marker_sha256").and_then(Value::as_str)
+                && evidence
+                    .get("private_marker_sha256")
+                    .and_then(Value::as_str)
                     == Some(operation_key_sha256.as_str())
         }
         "outlook_calendar" => {
-            let transaction_id =
-                communication_microsoft_transaction_id(provider_operation_key);
-            evidence.get("transaction_id").and_then(Value::as_str)
-                == Some(transaction_id.as_str())
+            let transaction_id = communication_microsoft_transaction_id(provider_operation_key);
+            evidence.get("transaction_id").and_then(Value::as_str) == Some(transaction_id.as_str())
                 && evidence
                     .get("extended_property_sha256")
                     .and_then(Value::as_str)
@@ -2816,11 +2957,7 @@ pub fn mark_communication_action_request_started(
                 params![lease.account_id, lease.action_id],
                 |row| row.get(0),
             )?;
-            require_communication_write_unfenced_sqlite_tx(
-                &tx,
-                &lease.account_id,
-                &connection_id,
-            )?;
+            require_communication_write_unfenced_sqlite_tx(&tx, &lease.account_id, &connection_id)?;
             if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
                 anyhow::bail!("communication execution is not enabled")
             }
@@ -2845,16 +2982,16 @@ pub fn mark_communication_action_request_started(
             let authority_sha256 = communication_authority_sha256(&lease.account_id, &action)?;
             let (mailbox_json, credential_json, mailbox_provider): (String, String, String) = tx
                 .query_row(
-                "SELECT mailbox.connection_json, credential.credential_json, mailbox.provider
+                    "SELECT mailbox.connection_json, credential.credential_json, mailbox.provider
                    FROM jobs_mailbox_connections mailbox
                    JOIN jobs_provider_credentials credential
                      ON credential.account_id = mailbox.account_id
                     AND credential.connection_id = mailbox.id
                   WHERE mailbox.account_id = ?1 AND mailbox.id = ?2
                     AND mailbox.status = 'connected'",
-                params![lease.account_id, action.connection_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )?;
+                    params![lease.account_id, action.connection_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
             let mailbox: MailboxConnection = parse_json(mailbox_json, "mailbox connection")?;
             if mailbox.provider != mailbox_provider {
                 anyhow::bail!("communication mailbox authority changed")
@@ -2886,10 +3023,14 @@ pub fn mark_communication_action_request_started(
                     ],
                     |row| row.get(0),
                 )?;
-                let source: JobsProviderMessage =
-                    parse_json(source_json, "Jobs provider message")?;
+                let source: JobsProviderMessage = parse_json(source_json, "Jobs provider message")?;
                 validate_communication_reply_source(&action, &source)?;
             }
+            let employer_domain = communication_employer_domain_sqlite_tx(
+                &tx,
+                &lease.account_id,
+                &action.application_id,
+            )?;
             let existing_evidence_sha256 = tx
                 .query_row(
                     "SELECT evidence_sha256
@@ -2906,11 +3047,12 @@ pub fn mark_communication_action_request_started(
                 tx.commit()?;
                 return Ok(Some(action));
             }
-            if communication_dispatch_is_held_sqlite_tx(
+            if communication_dispatch_is_held_sqlite_tx_after_authority(
                 &tx,
                 &lease.account_id,
                 &action.application_id,
                 &mailbox_provider,
+                &employer_domain,
             )? {
                 let changed = tx.execute(
                     "UPDATE jobs_communication_actions
@@ -2977,6 +3119,8 @@ pub fn mark_communication_action_request_started(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)?;
+            lock_postgres_ats_certification(&mut tx)?;
             lock_discovery_account_shared_postgres(&mut tx, &lease.account_id)?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx,
@@ -2997,16 +3141,18 @@ pub fn mark_communication_action_request_started(
             if !communication_flag_enabled("BLUEY_JOBS_COMMUNICATION_DISPATCH_ENABLED") {
                 anyhow::bail!("communication execution is not enabled")
             }
-            let row = tx.query_opt(
-                &format!(
-                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+            let row = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
                       FROM jobs_communication_actions
                       WHERE account_id = $1 AND id = $2 AND status = 'dispatching'
                         AND lease_kind = 'dispatch' AND fence = $3
-                        AND lease_expires_at_ms > $4 FOR UPDATE"
-                ),
-                &[&lease.account_id, &lease.action_id, &lease.fence, &now],
-            )?.ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
+                      FOR UPDATE"
+                    ),
+                    &[&lease.account_id, &lease.action_id, &lease.fence],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
             let token_hash: String = row.get(29);
             let action = communication_action_from_row(postgres_communication_row(row))?;
             validate_communication_lease_binding(&action, lease, "dispatch")?;
@@ -3027,8 +3173,7 @@ pub fn mark_communication_action_request_started(
                   FOR UPDATE OF mailbox, credential",
                 &[&lease.account_id, &action.connection_id],
             )?;
-            let mailbox: MailboxConnection =
-                parse_json(grant_row.get(0), "mailbox connection")?;
+            let mailbox: MailboxConnection = parse_json(grant_row.get(0), "mailbox connection")?;
             let mailbox_provider = grant_row.get::<_, String>(2);
             if mailbox.provider != mailbox_provider {
                 anyhow::bail!("communication mailbox authority changed")
@@ -3063,6 +3208,12 @@ pub fn mark_communication_action_request_started(
                     parse_json(source_row.get(0), "Jobs provider message")?;
                 validate_communication_reply_source(&action, &source)?;
             }
+            let employer_domain =
+                communication_employer_domain_postgres_tx_after_authority_prelock(
+                    &mut tx,
+                    &lease.account_id,
+                    &action.application_id,
+                )?;
             let existing_evidence_sha256 = tx
                 .query_opt(
                     "SELECT evidence_sha256
@@ -3073,18 +3224,25 @@ pub fn mark_communication_action_request_started(
                 )?
                 .map(|row| row.get::<_, String>(0));
             if let Some(existing_evidence_sha256) = existing_evidence_sha256 {
+                let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+                require_communication_lease_current_at_ms(&action, effect_now_ms)?;
                 if existing_evidence_sha256 != evidence_sha256 {
                     anyhow::bail!("communication request-start evidence changed")
                 }
                 tx.commit()?;
                 return Ok(Some(action));
             }
-            if communication_dispatch_is_held_postgres_tx(
-                &mut tx,
-                &lease.account_id,
-                &action.application_id,
-                &mailbox_provider,
-            )? {
+            let dispatch_held =
+                communication_dispatch_is_held_postgres_tx_with_domain_after_authority_prelock(
+                    &mut tx,
+                    &lease.account_id,
+                    &action.application_id,
+                    &mailbox_provider,
+                    &employer_domain,
+                )?;
+            let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+            require_communication_lease_current_at_ms(&action, effect_now_ms)?;
+            if dispatch_held {
                 let changed = tx.execute(
                     "UPDATE jobs_communication_actions
                         SET status = 'needs_input', lease_owner = NULL, lease_kind = NULL,
@@ -3102,7 +3260,7 @@ pub fn mark_communication_action_request_started(
                         AND action_revision < 9007199254740991
                         AND updated_at_ms < 9223372036854775807",
                     &[
-                        &now,
+                        &effect_now_ms,
                         &lease.account_id,
                         &lease.action_id,
                         &lease.fence,
@@ -3128,17 +3286,19 @@ pub fn mark_communication_action_request_started(
                     &lease.attempt_id,
                     &evidence_sha256,
                     &evidence_json,
-                    &now,
+                    &effect_now_ms,
                 ],
             )?;
             if inserted == 0 {
-                let exact: bool = tx.query_one(
-                    "SELECT EXISTS(SELECT 1
+                let exact: bool = tx
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1
                        FROM jobs_communication_action_attempt_evidence
                       WHERE attempt_id = $1 AND event_kind = 'request_started'
                         AND evidence_sha256 = $2)",
-                    &[&lease.attempt_id, &evidence_sha256],
-                )?.get(0);
+                        &[&lease.attempt_id, &evidence_sha256],
+                    )?
+                    .get(0);
                 if !exact {
                     anyhow::bail!("communication request-start evidence changed")
                 }
@@ -3207,11 +3367,8 @@ pub fn finish_communication_action(
             )?;
             validate_communication_outcome(&action, &outcome, provider_object_id, &evidence)?;
             if matches!(outcome.as_str(), "sent" | "calendar_created") {
-                let source = communication_reply_source_sqlite_tx(
-                    &tx,
-                    &finish.lease.account_id,
-                    &action,
-                )?;
+                let source =
+                    communication_reply_source_sqlite_tx(&tx, &finish.lease.account_id, &action)?;
                 validate_communication_reconciliation_evidence(
                     &action,
                     &provider_operation_key,
@@ -3231,8 +3388,10 @@ pub fn finish_communication_action(
                 params![finish.lease.attempt_id],
                 |row| row.get(0),
             )?;
-            if matches!(outcome.as_str(), "sent" | "calendar_created" | "side_effect_unknown")
-                && !request_started
+            if matches!(
+                outcome.as_str(),
+                "sent" | "calendar_created" | "side_effect_unknown"
+            ) && !request_started
             {
                 anyhow::bail!("communication provider request was not durably started")
             }
@@ -3301,21 +3460,22 @@ pub fn finish_communication_action(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let row = tx.query_opt(
-                &format!(
-                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+            let row = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
                        FROM jobs_communication_actions
                       WHERE account_id = $1 AND id = $2 AND fence = $3
                         AND status IN ('dispatching', 'side_effect_unknown')
-                        AND lease_kind = 'dispatch' AND lease_expires_at_ms > $4 FOR UPDATE"
-                ),
-                &[
-                    &finish.lease.account_id,
-                    &finish.lease.action_id,
-                    &finish.lease.fence,
-                    &now,
-                ],
-            )?.ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
+                        AND lease_kind = 'dispatch' FOR UPDATE"
+                    ),
+                    &[
+                        &finish.lease.account_id,
+                        &finish.lease.action_id,
+                        &finish.lease.fence,
+                    ],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
             let token_hash: String = row.get(29);
             let action = communication_action_from_row(postgres_communication_row(row))?;
             validate_communication_lease_binding(&action, &finish.lease, "dispatch")?;
@@ -3360,16 +3520,22 @@ pub fn finish_communication_action(
                     source.as_ref(),
                 )?;
             }
-            let request_started: bool = tx.query_one(
-                "SELECT EXISTS(SELECT 1 FROM jobs_communication_action_attempt_evidence
+            let request_started: bool = tx
+                .query_one(
+                    "SELECT EXISTS(SELECT 1 FROM jobs_communication_action_attempt_evidence
                   WHERE attempt_id = $1 AND event_kind = 'request_started')",
-                &[&finish.lease.attempt_id],
-            )?.get(0);
-            if matches!(outcome.as_str(), "sent" | "calendar_created" | "side_effect_unknown")
-                && !request_started
+                    &[&finish.lease.attempt_id],
+                )?
+                .get(0);
+            if matches!(
+                outcome.as_str(),
+                "sent" | "calendar_created" | "side_effect_unknown"
+            ) && !request_started
             {
                 anyhow::bail!("communication provider request was not durably started")
             }
+            let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+            require_communication_lease_current_at_ms(&action, effect_now_ms)?;
             tx.execute(
                 "INSERT INTO jobs_communication_action_attempt_evidence (
                     id, account_id, action_id, attempt_id, event_kind, provider_object_id,
@@ -3384,7 +3550,7 @@ pub fn finish_communication_action(
                     &provider_object_id,
                     &evidence_sha256,
                     &evidence_json,
-                    &now,
+                    &effect_now_ms,
                 ],
             )?;
             let row = tx.query_one(
@@ -3418,7 +3584,7 @@ pub fn finish_communication_action(
                     &finish.lease.fence,
                     &outcome,
                     &provider_object_id,
-                    &now,
+                    &effect_now_ms,
                 ],
             )?;
             tx.commit()?;
@@ -3476,8 +3642,15 @@ pub fn claim_communication_action_reconciliation(
                     params![now],
                     |row| {
                         Ok((
-                            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?,
-                            row.get(5)?, row.get(6)?, row.get(7)?, row.get(8)?,
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
                         ))
                     },
                 )
@@ -3492,7 +3665,8 @@ pub fn claim_communication_action_reconciliation(
                 authority_sha256,
                 grant_revision,
                 grant_sha256,
-            )) = candidate else {
+            )) = candidate
+            else {
                 tx.commit()?;
                 return Ok(None);
             };
@@ -3586,7 +3760,8 @@ pub fn claim_communication_action_reconciliation(
             let locked = tx.query_opt(
                 "SELECT attempt.id, a.fence, attempt.provider_operation_key,
                         attempt.approval_revision, attempt.authority_sha256,
-                        attempt.grant_revision, attempt.grant_sha256
+                        attempt.grant_revision, attempt.grant_sha256,
+                        a.next_attempt_at_ms, a.lease_kind, a.lease_expires_at_ms
                    FROM jobs_communication_actions a
                    JOIN jobs_communication_action_attempts attempt
                      ON attempt.id = a.active_attempt_id
@@ -3600,14 +3775,12 @@ pub fn claim_communication_action_reconciliation(
                     AND a.status = 'side_effect_unknown'
                     AND a.reconciliation_count < 20
                     AND a.action_revision <= 9007199254740989
-                    AND a.next_attempt_at_ms <= $3
-                    AND (a.lease_kind IS NULL OR a.lease_expires_at_ms <= $3)
                     AND NOT EXISTS (
                       SELECT 1 FROM account_deletion_intents deletion
                        WHERE deletion.account_id = a.account_id
                     )
                   FOR UPDATE OF a, mailbox",
-                &[&action_id, &account_id, &now],
+                &[&action_id, &account_id],
             )?;
             let Some(locked) = locked else {
                 tx.commit()?;
@@ -3623,6 +3796,21 @@ pub fn claim_communication_action_reconciliation(
             let authority_sha256: String = locked.get(4);
             let grant_revision: i64 = locked.get(5);
             let grant_sha256: String = locked.get(6);
+            let next_attempt_at_ms: i64 = locked.get(7);
+            let existing_lease_kind: Option<String> = locked.get(8);
+            let existing_lease_expires_at_ms: Option<i64> = locked.get(9);
+            let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+            let existing_lease_available =
+                match (existing_lease_kind.as_deref(), existing_lease_expires_at_ms) {
+                    (None, None) => true,
+                    (Some(_), Some(expires_at_ms)) => expires_at_ms <= effect_now_ms,
+                    _ => false,
+                };
+            if next_attempt_at_ms > effect_now_ms || !existing_lease_available {
+                tx.commit()?;
+                return Ok(None);
+            }
+            let effect_expires_at_ms = effect_now_ms.saturating_add(COMMUNICATION_ACTION_LEASE_MS);
             let row = tx.query_one(
                 &format!(
                     "UPDATE jobs_communication_actions
@@ -3638,7 +3826,15 @@ pub fn claim_communication_action_reconciliation(
                         AND updated_at_ms < 9223372036854775807
                       RETURNING {COMMUNICATION_ACTION_SELECT}"
                 ),
-                &[&now, &owner_id, &token_hash, &fence, &expires_at, &account_id, &action_id],
+                &[
+                    &effect_now_ms,
+                    &owner_id,
+                    &token_hash,
+                    &fence,
+                    &effect_expires_at_ms,
+                    &account_id,
+                    &action_id,
+                ],
             )?;
             tx.commit()?;
             Ok(Some(JobsCommunicationActionLease {
@@ -3683,7 +3879,10 @@ pub fn reconcile_communication_action(
         anyhow::bail!("communication reconciliation needs provider evidence")
     }
     if resolution == "confirmed_absent"
-        && evidence.get("authoritative_absence").and_then(Value::as_bool) != Some(true)
+        && evidence
+            .get("authoritative_absence")
+            .and_then(Value::as_bool)
+            != Some(true)
     {
         anyhow::bail!("communication absence needs authoritative provider evidence")
     }
@@ -3844,7 +4043,11 @@ pub fn reconcile_communication_action(
                     reconciliation.lease.fence,
                     status,
                     provider_object_id,
-                    if status == "side_effect_unknown" { now.saturating_add(5 * 60_000) } else { now },
+                    if status == "side_effect_unknown" {
+                        now.saturating_add(5 * 60_000)
+                    } else {
+                        now
+                    },
                     now,
                 ],
             )?;
@@ -3856,7 +4059,10 @@ pub fn reconcile_communication_action(
                     "SELECT {COMMUNICATION_ACTION_SELECT}
                        FROM jobs_communication_actions WHERE account_id = ?1 AND id = ?2"
                 ),
-                params![reconciliation.lease.account_id, reconciliation.lease.action_id],
+                params![
+                    reconciliation.lease.account_id,
+                    reconciliation.lease.action_id
+                ],
                 sqlite_communication_row,
             )?;
             tx.commit()?;
@@ -3872,22 +4078,22 @@ pub fn reconcile_communication_action(
                 &mut tx,
                 &reconciliation.lease.account_id,
             )?;
-            let row = tx.query_opt(
-                &format!(
-                    "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
+            let row = tx
+                .query_opt(
+                    &format!(
+                        "SELECT {COMMUNICATION_ACTION_SELECT}, lease_token_sha256
                       FROM jobs_communication_actions
                       WHERE account_id = $1 AND id = $2 AND fence = $3
                         AND status = 'side_effect_unknown' AND lease_kind = 'reconcile'
-                        AND lease_expires_at_ms > $4
                       FOR UPDATE"
-                ),
-                &[
-                    &reconciliation.lease.account_id,
-                    &reconciliation.lease.action_id,
-                    &reconciliation.lease.fence,
-                    &now,
-                ],
-            )?.ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
+                    ),
+                    &[
+                        &reconciliation.lease.account_id,
+                        &reconciliation.lease.action_id,
+                        &reconciliation.lease.fence,
+                    ],
+                )?
+                .ok_or_else(|| anyhow::anyhow!("communication action lease not found"))?;
             let token_hash: String = row.get(29);
             let action = communication_action_from_row(postgres_communication_row(row))?;
             tx.query_one(
@@ -3913,14 +4119,6 @@ pub fn reconcile_communication_action(
                 &provider_operation_key,
                 &evidence,
             )?;
-            if resolution == "confirmed_absent"
-                && action.dispatched_at_ms.is_none_or(|dispatched_at| {
-                    now < dispatched_at
-                        .saturating_add(COMMUNICATION_RECONCILIATION_ABSENCE_MIN_AGE_MS)
-                })
-            {
-                anyhow::bail!("communication absence was checked before the minimum age")
-            }
             if !execution_lease_token_matches(&token_hash, &reconciliation.lease.lease_token) {
                 anyhow::bail!("communication action lease not found")
             }
@@ -3970,6 +4168,17 @@ pub fn reconcile_communication_action(
                     source.as_ref(),
                 )?;
             }
+            let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)?;
+            require_communication_lease_current_at_ms(&action, effect_now_ms)?;
+            if resolution == "confirmed_absent"
+                && action.dispatched_at_ms.is_none_or(|dispatched_at| {
+                    effect_now_ms
+                        < dispatched_at
+                            .saturating_add(COMMUNICATION_RECONCILIATION_ABSENCE_MIN_AGE_MS)
+                })
+            {
+                anyhow::bail!("communication absence was checked before the minimum age")
+            }
             tx.execute(
                 "INSERT INTO jobs_communication_action_reconciliations (
                     id, account_id, action_id, attempt_id, fence, resolution,
@@ -3985,13 +4194,13 @@ pub fn reconcile_communication_action(
                     &provider_object_id,
                     &evidence_sha256,
                     &evidence_json,
-                    &now,
+                    &effect_now_ms,
                 ],
             )?;
             let next_attempt_at = if status == "side_effect_unknown" {
-                now.saturating_add(5 * 60_000)
+                effect_now_ms.saturating_add(5 * 60_000)
             } else {
-                now
+                effect_now_ms
             };
             let row = tx.query_one(
                 &format!(
@@ -4026,11 +4235,529 @@ pub fn reconcile_communication_action(
                     &status,
                     &provider_object_id,
                     &next_attempt_at,
-                    &now,
+                    &effect_now_ms,
                 ],
             )?;
             tx.commit()?;
             communication_action_from_row(postgres_communication_row(row))
         }
     })
+}
+
+#[cfg(test)]
+#[test]
+fn fix_728_communication_dispatch_uses_submitted_domain_after_one_canonical_prelock() {
+    let source = include_str!("communication_actions.rs");
+    let held = source
+        .split("fn communication_dispatch_is_held_postgres_tx_after_authority_prelock(")
+        .nth(1)
+        .expect("PostgreSQL CommunicationDispatch hold helper")
+        .split("fn communication_employer_domain_sqlite_tx(")
+        .next()
+        .expect("bounded PostgreSQL CommunicationDispatch hold helper");
+    assert!(held.contains("communication_employer_domain_postgres_tx_after_authority_prelock"));
+    assert!(held
+        .contains("operational_hold_context_for_application_postgres_tx_after_authority_prelock"));
+    assert!(held.contains("evaluate_operational_capability_postgres_tx_after_authority_prelock"));
+    for forbidden in [
+        "lock_operational_hold_shared_postgres_tx",
+        "lock_managed_cloud_release_registry_shared_postgres_tx",
+        "lock_postgres_ats_certification",
+        "lock_discovery_account_shared_postgres",
+        "operational_hold_context_for_application_postgres_tx(",
+        "evaluate_operational_capability_postgres_tx(",
+    ] {
+        assert!(
+            !held.contains(forbidden),
+            "communication hold relocks {forbidden}"
+        );
+    }
+    let historical_domain = source
+        .split("fn communication_employer_domain_postgres_tx_after_authority_prelock(")
+        .nth(1)
+        .expect("PostgreSQL submitted communication domain helper")
+        .split("type CommunicationActionRow")
+        .next()
+        .expect("bounded submitted communication domain helper");
+    assert!(historical_domain.contains("submitted_execution_employer_domain"));
+
+    let claim = source
+        .split("pub fn claim_communication_action(")
+        .nth(1)
+        .expect("CommunicationDispatch claim")
+        .split("fn validate_communication_success_evidence(")
+        .next()
+        .expect("bounded CommunicationDispatch claim")
+        .split("DbPool::Postgres(_) =>")
+        .nth(1)
+        .expect("PostgreSQL CommunicationDispatch claim");
+    let assert_ordered = |path: &str, operations: &[&str], label: &str| {
+        let mut previous = 0;
+        for operation in operations {
+            let position = path
+                .find(operation)
+                .unwrap_or_else(|| panic!("missing {label} operation {operation}"));
+            assert!(position >= previous, "{label} order inverted at {operation}");
+            previous = position;
+        }
+    };
+    assert_ordered(
+        claim,
+        &[
+            "lock_operational_hold_shared_postgres_tx",
+            "lock_managed_cloud_release_registry_shared_postgres_tx",
+            "lock_postgres_ats_certification",
+        ],
+        "communication claim common prelock",
+    );
+    let expired = claim
+        .split("if let Some(expired)")
+        .nth(1)
+        .expect("expired CommunicationDispatch reclaim")
+        .split("let initial_scan_cursor =")
+        .next()
+        .expect("bounded expired CommunicationDispatch reclaim");
+    assert_ordered(
+        expired,
+        &[
+            "lock_discovery_account_shared_postgres",
+            "require_active_account_write_fence_postgres_tx",
+            "FOR UPDATE",
+            "communication_post_lock_db_now_postgres_tx",
+            "SET status = 'side_effect_unknown'",
+        ],
+        "expired communication reclaim",
+    );
+    let fresh = claim
+        .split("let initial_scan_cursor =")
+        .nth(1)
+        .expect("fresh CommunicationDispatch claim");
+    assert_ordered(
+        fresh,
+        &[
+            "lock_discovery_account_shared_postgres",
+            "communication_dispatch_is_held_postgres_tx_after_authority_prelock",
+            "require_active_account_write_fence_postgres_tx",
+            "FOR UPDATE OF a, c, credential",
+            "FOR SHARE",
+            "communication_post_lock_db_now_postgres_tx",
+            "INSERT INTO jobs_communication_action_attempts",
+            "SET status = 'dispatching'",
+        ],
+        "fresh communication claim",
+    );
+
+    let request_start = source
+        .split("pub fn mark_communication_action_request_started(")
+        .nth(1)
+        .expect("CommunicationDispatch request-start")
+        .split("pub fn finish_communication_action(")
+        .next()
+        .expect("bounded CommunicationDispatch request-start")
+        .split("DbPool::Postgres(_) =>")
+        .nth(1)
+        .expect("PostgreSQL CommunicationDispatch request-start");
+    let mut previous = 0;
+    for operation in [
+        "lock_operational_hold_shared_postgres_tx",
+        "lock_managed_cloud_release_registry_shared_postgres_tx",
+        "lock_postgres_ats_certification",
+        "lock_discovery_account_shared_postgres",
+        "communication_employer_domain_postgres_tx_after_authority_prelock",
+        "SELECT evidence_sha256",
+    ] {
+        let position = request_start
+            .find(operation)
+            .unwrap_or_else(|| panic!("missing request-start operation {operation}"));
+        assert!(
+            position >= previous,
+            "request-start order inverted at {operation}"
+        );
+        previous = position;
+    }
+    let replay = request_start
+        .split("if let Some(existing_evidence_sha256)")
+        .nth(1)
+        .expect("request-start durable replay")
+        .split("let dispatch_held =")
+        .next()
+        .expect("bounded request-start durable replay");
+    let replay_time = replay
+        .find("communication_post_lock_db_now_postgres_tx")
+        .expect("request-start replay database time");
+    let replay_lease = replay
+        .find("require_communication_lease_current_at_ms")
+        .expect("request-start replay lease validation");
+    let replay_exact = replay
+        .find("existing_evidence_sha256 != evidence_sha256")
+        .expect("request-start replay exact evidence check");
+    let replay_commit = replay.find("tx.commit()?").expect("request-start replay commit");
+    assert!(replay_time < replay_lease && replay_lease < replay_exact);
+    assert!(replay_exact < replay_commit);
+
+    let fresh = request_start
+        .split("let dispatch_held =")
+        .nth(1)
+        .expect("request-start fresh path")
+        .split("if inserted == 0")
+        .next()
+        .expect("bounded request-start fresh path");
+    let mut previous = 0;
+    for operation in [
+        "communication_dispatch_is_held_postgres_tx_with_domain_after_authority_prelock",
+        "communication_post_lock_db_now_postgres_tx",
+        "require_communication_lease_current_at_ms",
+        "INSERT INTO jobs_communication_action_attempt_evidence",
+    ] {
+        let position = fresh
+            .find(operation)
+            .unwrap_or_else(|| panic!("missing fresh request-start operation {operation}"));
+        assert!(
+            position >= previous,
+            "fresh request-start order inverted at {operation}"
+        );
+        previous = position;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fix_753_postgres_communication_lease_paths_sample_time_after_final_lock() {
+    let source = include_str!("communication_actions.rs");
+    let bounded = |start: &str, end: &str| {
+        source
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing communication path {start}"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("missing communication path boundary {end}"))
+    };
+
+    let finish = bounded(
+        "pub fn finish_communication_action(",
+        "pub fn claim_communication_action_reconciliation(",
+    )
+    .split("DbPool::Postgres(_) =>")
+    .nth(1)
+    .expect("PostgreSQL communication finish");
+    let finish_action = finish.find("FOR UPDATE").expect("finish action lock");
+    let finish_source = finish
+        .find("communication_reply_source_postgres_tx")
+        .expect("finish reply-source lock");
+    let finish_time = finish
+        .find("communication_post_lock_db_now_postgres_tx")
+        .expect("finish post-lock database time");
+    let finish_current = finish
+        .find("require_communication_lease_current_at_ms")
+        .expect("finish current-lease validation");
+    let finish_mutation = finish
+        .find("INSERT INTO jobs_communication_action_attempt_evidence")
+        .expect("finish evidence mutation");
+    assert!(finish_action < finish_source);
+    assert!(finish_source < finish_time && finish_time < finish_current);
+    assert!(finish_current < finish_mutation);
+    assert!(!finish[..finish_time].contains("lease_expires_at_ms > $"));
+
+    let reconcile = bounded("pub fn reconcile_communication_action(", "#[cfg(test)]")
+        .split("DbPool::Postgres(_) =>")
+        .nth(1)
+        .expect("PostgreSQL communication reconciliation");
+    let reconcile_action = reconcile.find("FOR UPDATE").expect("reconcile action lock");
+    let reconcile_mailbox = reconcile.find("FOR SHARE").expect("reconcile mailbox lock");
+    let reconcile_source = reconcile
+        .find("communication_reply_source_postgres_tx")
+        .expect("reconcile reply-source lock");
+    let reconcile_time = reconcile
+        .find("communication_post_lock_db_now_postgres_tx")
+        .expect("reconcile post-lock database time");
+    let reconcile_current = reconcile
+        .find("require_communication_lease_current_at_ms")
+        .expect("reconcile current-lease validation");
+    let reconcile_mutation = reconcile
+        .find("INSERT INTO jobs_communication_action_reconciliations")
+        .expect("reconcile evidence mutation");
+    assert!(reconcile_action < reconcile_mailbox);
+    assert!(reconcile_mailbox < reconcile_source);
+    assert!(reconcile_source < reconcile_time && reconcile_time < reconcile_current);
+    assert!(reconcile_current < reconcile_mutation);
+    assert!(!reconcile[..reconcile_time].contains("lease_expires_at_ms > $"));
+
+    let reconciliation_claim = bounded(
+        "pub fn claim_communication_action_reconciliation(",
+        "pub fn reconcile_communication_action(",
+    )
+    .split("DbPool::Postgres(_) =>")
+    .nth(1)
+    .expect("PostgreSQL communication reconciliation claim");
+    let claim_lock = reconciliation_claim
+        .find("FOR UPDATE OF a, mailbox")
+        .expect("reconciliation action/mailbox lock");
+    let claim_time = reconciliation_claim
+        .find("communication_post_lock_db_now_postgres_tx")
+        .expect("reconciliation-claim post-lock database time");
+    let claim_mutation = reconciliation_claim
+        .find("UPDATE jobs_communication_actions")
+        .expect("reconciliation-claim mutation");
+    assert!(claim_lock < claim_time && claim_time < claim_mutation);
+    assert!(!reconciliation_claim[claim_lock..claim_time].contains("a.lease_expires_at_ms <= $"));
+}
+
+#[cfg(test)]
+fn wait_for_communication_postgres_lock_wait(
+    tx: &mut postgres::Transaction<'_>,
+    application_name: &str,
+) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let waiting: i64 = tx
+            .query_one(
+                "SELECT COUNT(*)::bigint FROM pg_stat_activity
+                  WHERE application_name = $1 AND wait_event_type = 'Lock'",
+                &[&application_name],
+            )
+            .expect("observe communication lock waiter")
+            .get(0);
+        if waiting == 1 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn fix_753_postgres_communication_contention_uses_post_lock_time() {
+    let Ok(url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let schema = format!("fix753_communication_{suffix}");
+    let request_waiter_name = format!(
+        "bluey-fix753-communication-request-{}",
+        &suffix[..16]
+    );
+    let claim_waiter_name = format!(
+        "bluey-fix753-communication-claim-{}",
+        &suffix[..16]
+    );
+    let mut setup = postgres::Client::connect(&url, postgres::NoTls)
+        .expect("connect FIX-753 communication PostgreSQL setup client");
+    let setup_now_ms: i64 = setup
+        .query_one(
+            "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+            &[],
+        )
+        .expect("sample FIX-753 communication setup time")
+        .get(0);
+    let request_expires_at_ms = setup_now_ms.saturating_add(500);
+    setup
+        .batch_execute(&format!(
+            "CREATE SCHEMA {schema};
+             CREATE TABLE {schema}.actions (
+                 id text PRIMARY KEY,
+                 status text NOT NULL,
+                 lease_expires_at_ms bigint,
+                 updated_at_ms bigint NOT NULL DEFAULT 0
+             );
+             CREATE TABLE {schema}.evidence (
+                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 action_id text NOT NULL
+             );
+             INSERT INTO {schema}.actions(id,status,lease_expires_at_ms)
+             VALUES ('request','dispatching',{request_expires_at_ms}),
+                    ('claim','approved',NULL);"
+        ))
+        .expect("create isolated FIX-753 communication fixture");
+
+    let mut request_holder = setup
+        .transaction()
+        .expect("begin FIX-753 communication request holder");
+    request_holder
+        .query_one(
+            &format!("SELECT id FROM {schema}.actions WHERE id = 'request' FOR UPDATE"),
+            &[],
+        )
+        .expect("lock FIX-753 communication request row");
+    let request_url = url.clone();
+    let request_schema = schema.clone();
+    let request_application_name = request_waiter_name.clone();
+    let (request_started_tx, request_started_rx) = std::sync::mpsc::channel();
+    let request_waiter = std::thread::spawn(move || -> std::result::Result<bool, String> {
+        let mut client = postgres::Client::connect(&request_url, postgres::NoTls)
+            .map_err(|error| error.to_string())?;
+        client
+            .query_one(
+                "SELECT set_config('application_name', $1, false)",
+                &[&request_application_name],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut tx = client.transaction().map_err(|error| error.to_string())?;
+        request_started_tx
+            .send(())
+            .map_err(|error| error.to_string())?;
+        let expires_at_ms: i64 = tx
+            .query_one(
+                &format!(
+                    "SELECT lease_expires_at_ms FROM {request_schema}.actions
+                      WHERE id = 'request' FOR UPDATE"
+                ),
+                &[],
+            )
+            .map_err(|error| error.to_string())?
+            .get(0);
+        let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)
+            .map_err(|error| error.to_string())?;
+        let authorized = expires_at_ms > effect_now_ms;
+        if authorized {
+            tx.execute(
+                &format!("INSERT INTO {request_schema}.evidence(action_id) VALUES ('request')"),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(authorized)
+    });
+    request_started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("FIX-753 communication request waiter started");
+    let request_waited =
+        wait_for_communication_postgres_lock_wait(&mut request_holder, &request_waiter_name);
+    loop {
+        let database_now_ms: i64 = request_holder
+            .query_one(
+                "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample held FIX-753 communication request time")
+            .get(0);
+        if database_now_ms > request_expires_at_ms {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    request_holder
+        .commit()
+        .expect("release FIX-753 communication request row");
+    let request_authorized = request_waiter
+        .join()
+        .expect("join FIX-753 communication request waiter")
+        .expect("complete FIX-753 communication request waiter");
+    let request_evidence_count: i64 = setup
+        .query_one(
+            &format!("SELECT COUNT(*)::bigint FROM {schema}.evidence WHERE action_id = 'request'"),
+            &[],
+        )
+        .expect("count FIX-753 denied communication request evidence")
+        .get(0);
+    assert!(
+        request_waited,
+        "communication request did not wait on its exact row"
+    );
+    assert!(
+        !request_authorized,
+        "expired communication request was authorized"
+    );
+    assert_eq!(request_evidence_count, 0, "expired request wrote evidence");
+
+    const TEST_LEASE_TTL_MS: i64 = 250;
+    let mut claim_holder = setup
+        .transaction()
+        .expect("begin FIX-753 communication claim holder");
+    claim_holder
+        .query_one(
+            &format!("SELECT id FROM {schema}.actions WHERE id = 'claim' FOR UPDATE"),
+            &[],
+        )
+        .expect("lock FIX-753 communication claim row");
+    let claim_url = url.clone();
+    let claim_schema = schema.clone();
+    let claim_application_name = claim_waiter_name.clone();
+    let (claim_preliminary_tx, claim_preliminary_rx) = std::sync::mpsc::channel();
+    let claim_waiter =
+        std::thread::spawn(move || -> std::result::Result<(i64, i64, i64), String> {
+            let mut client = postgres::Client::connect(&claim_url, postgres::NoTls)
+                .map_err(|error| error.to_string())?;
+            client
+                .query_one(
+                    "SELECT set_config('application_name', $1, false)",
+                    &[&claim_application_name],
+                )
+                .map_err(|error| error.to_string())?;
+            let preliminary_now_ms: i64 = client
+                .query_one(
+                    "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )
+                .map_err(|error| error.to_string())?
+                .get(0);
+            let mut tx = client.transaction().map_err(|error| error.to_string())?;
+            claim_preliminary_tx
+                .send(preliminary_now_ms)
+                .map_err(|error| error.to_string())?;
+            tx.query_one(
+                &format!("SELECT id FROM {claim_schema}.actions WHERE id = 'claim' FOR UPDATE"),
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+            let effect_now_ms = communication_post_lock_db_now_postgres_tx(&mut tx)
+                .map_err(|error| error.to_string())?;
+            let expires_at_ms = effect_now_ms.saturating_add(TEST_LEASE_TTL_MS);
+            tx.execute(
+                &format!(
+                    "UPDATE {claim_schema}.actions
+                        SET status = 'dispatching', lease_expires_at_ms = $1,
+                            updated_at_ms = $2 WHERE id = 'claim'"
+                ),
+                &[&expires_at_ms, &effect_now_ms],
+            )
+            .map_err(|error| error.to_string())?;
+            tx.commit().map_err(|error| error.to_string())?;
+            Ok((preliminary_now_ms, effect_now_ms, expires_at_ms))
+        });
+    let claim_preliminary_now_ms = claim_preliminary_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("FIX-753 communication claim waiter started");
+    let claim_waited =
+        wait_for_communication_postgres_lock_wait(&mut claim_holder, &claim_waiter_name);
+    loop {
+        let database_now_ms: i64 = claim_holder
+            .query_one(
+                "SELECT FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint",
+                &[],
+            )
+            .expect("sample held FIX-753 communication claim time")
+            .get(0);
+        if database_now_ms > claim_preliminary_now_ms.saturating_add(TEST_LEASE_TTL_MS) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    claim_holder
+        .commit()
+        .expect("release FIX-753 communication claim row");
+    let (preliminary_now_ms, effect_now_ms, expires_at_ms) = claim_waiter
+        .join()
+        .expect("join FIX-753 communication claim waiter")
+        .expect("complete FIX-753 communication claim waiter");
+    setup
+        .batch_execute(&format!("DROP SCHEMA {schema} CASCADE"))
+        .expect("remove isolated FIX-753 communication fixture");
+    assert!(
+        claim_waited,
+        "communication claim did not wait on its exact row"
+    );
+    assert!(
+        effect_now_ms > preliminary_now_ms.saturating_add(TEST_LEASE_TTL_MS),
+        "communication claim reused its expired preliminary lease clock"
+    );
+    assert_eq!(
+        expires_at_ms,
+        effect_now_ms.saturating_add(TEST_LEASE_TTL_MS),
+        "communication claim did not derive expiry from post-lock time"
+    );
 }

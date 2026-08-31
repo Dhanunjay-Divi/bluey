@@ -7,6 +7,7 @@ import {
   ChevronDown,
   CircleUserRound,
   FileText,
+  House,
   LayoutDashboard,
   LogOut,
   Moon,
@@ -35,6 +36,18 @@ const navItems = [
   { to: "/resume", label: "Resume", icon: FileText },
   { to: "/automation", label: "Automation", icon: PanelsTopLeft },
   { to: "/settings", label: "Settings", icon: Settings },
+];
+
+const overviewNavItem = { to: "/overview", label: "Overview", icon: House };
+
+const desktopNavItems = [
+  overviewNavItem,
+  ...navItems,
+];
+
+const mobileNavItems = [
+  overviewNavItem,
+  ...navItems.filter((item) => item.to !== "/settings"),
 ];
 
 export function AppShell({ children, account, workspace, onRefresh, preview, previewSearch }: Props) {
@@ -92,13 +105,13 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
     <div className="jobs-shell">
       <a className="jobs-skip-link" href="#jobs-main">Skip to Jobs content</a>
       <header className="app-header">
-        <Link className="brand-lockup small" to={destination("/matches")} aria-label="Bluey Jobs home">
+        <Link className="brand-lockup small" to={destination("/overview")} aria-label="Bluey Jobs home">
           <img className="brand-icon" src={blueyIcon} alt="" />
           <img className="brand-wordmark" src={blueyWordmark} alt="" />
           <b>jobs</b>
         </Link>
         <nav className="desktop-nav" aria-label="Jobs navigation">
-          {navItems.map(({ to, label, icon: Icon }) => (
+          {desktopNavItems.map(({ to, label, icon: Icon }) => (
             <NavLink key={to} to={destination(to)} className={({ isActive }) => (isActive ? "active" : "")}>
               <Icon size={16} />{label}
             </NavLink>
@@ -159,7 +172,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
       <main id="jobs-main" tabIndex={-1} className="app-main">{children}</main>
 
       <nav className="mobile-nav" aria-label="Jobs navigation">
-        {navItems.map(({ to, label, icon: Icon }) => (
+        {mobileNavItems.map(({ to, label, icon: Icon }) => (
           <NavLink key={to} to={destination(to)} className={({ isActive }) => (isActive ? "active" : "")}>
             <Icon size={19} /><span>{label}</span>
           </NavLink>

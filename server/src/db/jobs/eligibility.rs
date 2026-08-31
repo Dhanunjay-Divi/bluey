@@ -47,8 +47,18 @@ fn apply_posting_discovery_evidence(
             "Bluey blocked this posting after an employer or job-risk check.",
         );
     }
-    if matches!(original_status.as_str(), "closed" | "mismatch")
-        || !evidence.original_source_mismatched_fields.is_empty()
+    if matches!(
+        original_status.as_str(),
+        "closed"
+            | "verified_closed"
+            | "mismatch"
+            | "identity_mismatch"
+            | "materially_changed"
+            | "source_untrusted"
+            | "expired"
+            | "quarantined"
+            | "redirected_to_unknown"
+    ) || !evidence.original_source_mismatched_fields.is_empty()
     {
         push_reason(
             hard_failures,
@@ -95,9 +105,8 @@ fn apply_posting_discovery_evidence(
         .filter(|domain| !domain.is_empty());
     let application_domain_matches = canonical_url_host.is_some()
         && evidence_application_domain.as_ref() == canonical_url_host.as_ref();
-    let employer_source_bound =
-        matches!(employer_status.as_str(), "verified" | "ats_tenant_verified");
-    if employer_source_bound && !application_domain_matches {
+    let ats_tenant_claimed = matches!(employer_status.as_str(), "verified" | "ats_tenant_verified");
+    if ats_tenant_claimed && !application_domain_matches {
         push_reason(
             hard_failures,
             "application_domain_mismatch",
@@ -105,16 +114,20 @@ fn apply_posting_discovery_evidence(
         );
     }
 
-    let employer_bound = employer_source_bound
+    let ats_tenant_bound = ats_tenant_claimed && application_domain_matches;
+    let employer_identity_bound = evidence
+        .employer_id
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
         && evidence
-            .employer_id
+            .canonical_employer_domain
             .as_deref()
-            .is_some_and(|value| !value.trim().is_empty())
-        && application_domain_matches;
-    let employer_verified = employer_status == "verified" && employer_bound;
+            .is_some_and(|value| !normalize_discovery_domain(value).is_empty());
+    let employer_verified =
+        employer_status == "verified" && employer_identity_bound && ats_tenant_bound;
     if employer_verified {
         passed_checks.push("employer_identity_verified".to_string());
-    } else if employer_bound {
+    } else if ats_tenant_bound {
         passed_checks.push("ats_tenant_bound".to_string());
         push_reason(
             review_reasons,
@@ -167,7 +180,18 @@ fn apply_posting_discovery_evidence(
             "original_source_refresh_required",
             "Bluey must refresh the original employer posting before a runner starts.",
         );
-    } else if !matches!(original_status.as_str(), "closed" | "mismatch") {
+    } else if !matches!(
+        original_status.as_str(),
+        "closed"
+            | "verified_closed"
+            | "mismatch"
+            | "identity_mismatch"
+            | "materially_changed"
+            | "source_untrusted"
+            | "expired"
+            | "quarantined"
+            | "redirected_to_unknown"
+    ) {
         push_reason(
             review_reasons,
             "original_source_unverified",
@@ -175,7 +199,8 @@ fn apply_posting_discovery_evidence(
         );
     }
 
-    let original_source_provenance = evidence.provenance == "original_source";
+    let original_source_provenance =
+        evidence.provenance == "original_source" || test_fixture_original_source(evidence);
     if evidence.provenance == "external_feed" {
         push_reason(
             review_reasons,
@@ -194,9 +219,9 @@ fn apply_posting_discovery_evidence(
     let hard_blocked = !hard_failures.is_empty();
     let reviewable_original = original_source_provenance
         && canonical_verified
-        && employer_bound
+        && ats_tenant_bound
         && scam_screened
-        && original_evidence_present
+        && original_evidence_current
         && !evidence.requires_original_revalidation;
     let unattended_original = reviewable_original && employer_verified && scam_clear;
     DiscoveryExecutionGate {
@@ -371,13 +396,392 @@ pub fn evaluate_job_eligibility(
     require_live_verification: bool,
     existing_application_id: Option<&str>,
 ) -> Result<JobEligibilityDecision> {
+    let composed = resolve_composed_job_integrity_projection(pool, account_id, posting)?;
+    let posting = posting_with_original_source_projection(posting, &composed.original_source);
+    evaluate_job_eligibility_with_composed_projection(
+        pool,
+        account_id,
+        &posting,
+        &composed,
+        require_live_verification,
+        existing_application_id,
+    )
+}
+
+fn posting_with_original_source_projection(
+    posting: &JobPosting,
+    projection: &OriginalSourceVerificationProjection,
+) -> JobPosting {
+    let mut projected = posting.clone();
+    // Posting JSON is mutable compatibility material. Never allow its legacy
+    // execution-grade labels to stand in for relational employer/risk
+    // authority, even while the v2 verifier release is inactive.
+    sanitize_mutable_execution_labels(&mut projected.discovery_evidence);
+    if projection.feature_active {
+        merge_original_source_projection(
+            &mut projected.discovery_evidence,
+            projection.evidence.as_ref(),
+        );
+    }
+    projected
+}
+
+fn sanitize_mutable_execution_labels(evidence: &mut JobDiscoveryEvidence) {
+    if test_fixture_original_source(evidence) {
+        return;
+    }
+    if evidence
+        .employer_verification_status
+        .trim()
+        .eq_ignore_ascii_case("verified")
+    {
+        evidence.employer_verification_status = "unknown".to_string();
+        evidence.employer_id = None;
+        evidence.canonical_employer_domain = None;
+    }
+    if evidence
+        .scam_risk_status
+        .trim()
+        .eq_ignore_ascii_case("clear")
+    {
+        evidence.scam_risk_status = "unknown".to_string();
+    }
+}
+
+fn test_fixture_original_source(evidence: &JobDiscoveryEvidence) -> bool {
+    #[cfg(test)]
+    {
+        evidence.provenance == "test_fixture_original_source"
+    }
+    #[cfg(not(test))]
+    {
+        let _ = evidence;
+        false
+    }
+}
+
+fn merge_original_source_projection(
+    target: &mut JobDiscoveryEvidence,
+    source: Option<&JobDiscoveryEvidence>,
+) {
+    let employer_status = target
+        .employer_verification_status
+        .trim()
+        .to_ascii_lowercase();
+    let employer_rejected = matches!(employer_status.as_str(), "mismatch" | "impersonated");
+    let scam_blocked = target
+        .scam_risk_status
+        .trim()
+        .eq_ignore_ascii_case("blocked");
+    let canonical_status = target.canonical_status.trim().to_ascii_lowercase();
+    let canonical_rejected = matches!(
+        canonical_status.as_str(),
+        "duplicate" | "repost" | "invalid" | "malformed"
+    );
+    let Some(source) = source else {
+        let source_rejected = original_source_status_is_hard_denial(&target.original_source_status)
+            || !target.original_source_mismatched_fields.is_empty();
+        if !source_rejected {
+            target.original_source_status = "unknown".to_string();
+            target.original_source_checked_at_ms = None;
+            target.original_source_snapshot_expires_at_ms = None;
+            target.original_source_evidence_hash = None;
+            target.original_source_mismatched_fields.clear();
+        }
+        target.requires_original_revalidation = true;
+        return;
+    };
+
+    target.provenance = source.provenance.clone();
+    if !canonical_rejected {
+        target.canonical_status = source.canonical_status.clone();
+        target.canonical_job_id = source.canonical_job_id.clone();
+    }
+    if !employer_rejected {
+        target.employer_verification_status = source.employer_verification_status.clone();
+        target.employer_id = source.employer_id.clone();
+        target.canonical_employer_domain = source.canonical_employer_domain.clone();
+    }
+    target.application_domain = source.application_domain.clone();
+    if !scam_blocked {
+        target.scam_risk_status = source.scam_risk_status.clone();
+    }
+    target.original_source_status = source.original_source_status.clone();
+    target.original_source_checked_at_ms = source.original_source_checked_at_ms;
+    target.original_source_snapshot_expires_at_ms = source.original_source_snapshot_expires_at_ms;
+    target.original_source_evidence_hash = source.original_source_evidence_hash.clone();
+    target.original_source_mismatched_fields = source.original_source_mismatched_fields.clone();
+    target.requires_original_revalidation = source.requires_original_revalidation;
+}
+
+#[cfg(test)]
+mod original_source_projection_tests {
+    use super::*;
+
+    #[test]
+    fn mutable_execution_labels_are_never_relational_authority() {
+        let mut evidence = JobDiscoveryEvidence {
+            employer_verification_status: " VERIFIED ".to_string(),
+            employer_id: Some("mutable-employer".to_string()),
+            canonical_employer_domain: Some("mutable.example".to_string()),
+            scam_risk_status: "CLEAR".to_string(),
+            ..JobDiscoveryEvidence::default()
+        };
+
+        sanitize_mutable_execution_labels(&mut evidence);
+
+        assert_eq!(evidence.employer_verification_status, "unknown");
+        assert_eq!(evidence.employer_id, None);
+        assert_eq!(evidence.canonical_employer_domain, None);
+        assert_eq!(evidence.scam_risk_status, "unknown");
+    }
+
+    fn source_bound_posting() -> JobPosting {
+        let checked_at_ms = 1_800_000_000_000;
+        JobPosting {
+            id: "job-source-bound".to_string(),
+            canonical_key: "canonical-job-source-bound".to_string(),
+            source: "greenhouse_import".to_string(),
+            external_id: "123".to_string(),
+            company: "Acme".to_string(),
+            title: "Platform Engineer".to_string(),
+            location: "Remote".to_string(),
+            workplace: "remote".to_string(),
+            canonical_url: "https://boards.greenhouse.io/acme/jobs/123".to_string(),
+            description: "Build reliable systems.".to_string(),
+            compensation: String::new(),
+            employment_type: "full_time".to_string(),
+            track_id: "track-default".to_string(),
+            match_score: 100,
+            matched_reasons: Vec::new(),
+            missing_requirements: Vec::new(),
+            posted_at_ms: Some(checked_at_ms),
+            last_verified_at_ms: Some(checked_at_ms),
+            availability_status: "active".to_string(),
+            status: "matched".to_string(),
+            created_at_ms: checked_at_ms,
+            updated_at_ms: checked_at_ms,
+            discovery_evidence: JobDiscoveryEvidence {
+                provenance: "original_source".to_string(),
+                canonical_status: "canonical".to_string(),
+                canonical_job_id: Some("canonical-job-source-bound".to_string()),
+                employer_verification_status: "ats_tenant_verified".to_string(),
+                employer_id: None,
+                canonical_employer_domain: None,
+                application_domain: Some("boards.greenhouse.io".to_string()),
+                scam_risk_status: "source_screened".to_string(),
+                scam_signals: Vec::new(),
+                original_source_status: "verified_open".to_string(),
+                original_source_checked_at_ms: Some(checked_at_ms),
+                original_source_snapshot_expires_at_ms: Some(checked_at_ms + DAY_MS),
+                original_source_evidence_hash: Some("a".repeat(64)),
+                original_source_mismatched_fields: Vec::new(),
+                requires_original_revalidation: false,
+            },
+            eligibility: None,
+        }
+    }
+
+    #[test]
+    fn ats_tenant_binding_is_review_first_without_employer_identity() {
+        let posting = source_bound_posting();
+        let mut hard_failures = Vec::new();
+        let mut review_reasons = Vec::new();
+        let mut passed_checks = Vec::new();
+
+        let gate = apply_posting_discovery_evidence(
+            &posting,
+            1_800_000_000_000,
+            &mut hard_failures,
+            &mut review_reasons,
+            &mut passed_checks,
+        );
+
+        assert!(gate.can_prepare);
+        assert!(!gate.can_queue);
+        assert!(hard_failures.is_empty());
+        assert!(passed_checks.contains(&"ats_tenant_bound".to_string()));
+        assert!(review_reasons
+            .iter()
+            .any(|reason| reason.code == "employer_identity_review_required"));
+        assert!(review_reasons
+            .iter()
+            .any(|reason| reason.code == "job_risk_review_required"));
+    }
+
+    #[test]
+    fn composed_employer_identity_does_not_require_the_ats_domain() {
+        let mut posting = source_bound_posting();
+        posting.discovery_evidence.employer_verification_status = "verified".to_string();
+        posting.discovery_evidence.employer_id = Some("employer-acme".to_string());
+        posting.discovery_evidence.canonical_employer_domain = Some("acme.example".to_string());
+        posting.discovery_evidence.scam_risk_status = "clear".to_string();
+        let mut hard_failures = Vec::new();
+        let mut review_reasons = Vec::new();
+        let mut passed_checks = Vec::new();
+
+        let gate = apply_posting_discovery_evidence(
+            &posting,
+            1_800_000_000_000,
+            &mut hard_failures,
+            &mut review_reasons,
+            &mut passed_checks,
+        );
+
+        assert!(gate.can_prepare);
+        assert!(gate.can_queue);
+        assert!(hard_failures.is_empty());
+        assert!(review_reasons.is_empty());
+        assert!(passed_checks.contains(&"employer_identity_verified".to_string()));
+        assert!(passed_checks.contains(&"job_risk_clear".to_string()));
+        assert_ne!(
+            posting.discovery_evidence.application_domain,
+            posting.discovery_evidence.canonical_employer_domain
+        );
+    }
+
+    #[test]
+    fn source_projection_never_erases_independent_hard_denials() {
+        let mut target = JobDiscoveryEvidence {
+            canonical_status: "invalid".to_string(),
+            employer_verification_status: "impersonated".to_string(),
+            scam_risk_status: "blocked".to_string(),
+            scam_signals: vec![DiscoveryScamSignal {
+                code: "lookalike_domain".to_string(),
+                source: "risk_engine".to_string(),
+            }],
+            ..JobDiscoveryEvidence::default()
+        };
+        let source = JobDiscoveryEvidence::provider_verified_original_source(
+            "canonical-job".to_string(),
+            "employer".to_string(),
+            Some("jobs.example.com".to_string()),
+            1_800_000_000_000,
+            "a".repeat(64),
+        );
+
+        merge_original_source_projection(&mut target, Some(&source));
+
+        assert_eq!(target.canonical_status, "invalid");
+        assert_eq!(target.employer_verification_status, "impersonated");
+        assert_eq!(target.scam_risk_status, "blocked");
+        assert_eq!(target.scam_signals.len(), 1);
+        assert_eq!(
+            target.application_domain.as_deref(),
+            Some("jobs.example.com")
+        );
+        assert_eq!(target.original_source_status, "verified_open");
+    }
+
+    #[test]
+    fn absent_relational_projection_never_erases_a_persisted_source_denial() {
+        let mut target = JobDiscoveryEvidence {
+            provenance: "original_source".to_string(),
+            original_source_status: "identity_mismatch".to_string(),
+            original_source_checked_at_ms: Some(100),
+            original_source_snapshot_expires_at_ms: Some(200),
+            original_source_evidence_hash: Some("a".repeat(64)),
+            original_source_mismatched_fields: vec!["provider_record_id".to_string()],
+            requires_original_revalidation: false,
+            ..JobDiscoveryEvidence::default()
+        };
+
+        merge_original_source_projection(&mut target, None);
+
+        assert_eq!(target.original_source_status, "identity_mismatch");
+        assert_eq!(target.original_source_checked_at_ms, Some(100));
+        assert_eq!(target.original_source_snapshot_expires_at_ms, Some(200));
+        assert_eq!(target.original_source_evidence_hash, Some("a".repeat(64)));
+        assert_eq!(
+            target.original_source_mismatched_fields,
+            vec!["provider_record_id"]
+        );
+        assert!(target.requires_original_revalidation);
+    }
+
+    #[test]
+    fn relational_negative_source_projection_reaches_the_hard_eligibility_gate() {
+        let at_ms = 1_800_000_000_000;
+        let mut posting = source_bound_posting();
+        let mut evidence = posting.discovery_evidence.clone();
+        evidence.original_source_status = "closed".to_string();
+        evidence.requires_original_revalidation = true;
+        let projection = OriginalSourceVerificationProjection {
+            feature_active: true,
+            evidence: Some(evidence),
+            expected_head: None,
+            integrity_binding: None,
+            db_time_ms: at_ms,
+        };
+        posting = posting_with_original_source_projection(&posting, &projection);
+        let mut hard_failures = Vec::new();
+        let mut review_reasons = Vec::new();
+        let mut passed_checks = Vec::new();
+
+        let gate = apply_posting_discovery_evidence(
+            &posting,
+            at_ms,
+            &mut hard_failures,
+            &mut review_reasons,
+            &mut passed_checks,
+        );
+
+        assert!(!gate.can_prepare);
+        assert!(!gate.can_queue);
+        assert!(hard_failures
+            .iter()
+            .any(|reason| reason.code == "original_source_rejected"));
+    }
+}
+
+fn application_original_source_expected_head(
+    application: &JobApplication,
+) -> Result<Option<OriginalSourceVerificationExpectedHead>> {
+    let Some(value) = application.receipt.get("original_source_verification") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .context("decode frozen original-source verification head")
+}
+
+fn original_source_projection_matches_application(
+    application: &JobApplication,
+    projection: &OriginalSourceVerificationProjection,
+) -> Result<bool> {
+    let expected = application_original_source_expected_head(application)?;
+    Ok(if projection.feature_active {
+        projection.evidence.is_some()
+            && projection.expected_head.as_ref().is_some_and(|current| {
+                expected
+                    .as_ref()
+                    .is_some_and(|expected| expected == current)
+            })
+    } else {
+        expected.is_none()
+    })
+}
+
+fn evaluate_job_eligibility_with_composed_projection(
+    pool: &DbPool,
+    account_id: &str,
+    posting: &JobPosting,
+    composed: &ComposedJobIntegrityProjection,
+    require_live_verification: bool,
+    existing_application_id: Option<&str>,
+) -> Result<JobEligibilityDecision> {
     let profile = get_profile(pool, account_id, "")?;
     let preferences = get_preferences(pool, account_id)?;
     let tracks = list_tracks(pool, account_id)?;
     let track = tracks.iter().find(|track| track.id == posting.track_id);
     let reservations = list_attempt_reservations(pool, account_id)?;
+    let mut authoritative_posting = posting.clone();
+    authoritative_posting.discovery_evidence = composed.discovery_evidence.clone();
     let mut decision = build_job_eligibility(
-        posting,
+        &authoritative_posting,
         &profile,
         &preferences,
         &reservations,
@@ -385,31 +789,11 @@ pub fn evaluate_job_eligibility(
         existing_application_id,
         track,
     );
-    apply_discovery_authority(pool, account_id, posting, &mut decision)?;
-    apply_current_ats_certification(pool, account_id, posting, &mut decision)?;
-    Ok(decision)
-}
-
-fn apply_current_ats_certification(
-    pool: &DbPool,
-    account_id: &str,
-    posting: &JobPosting,
-    decision: &mut JobEligibilityDecision,
-) -> Result<()> {
-    match resolve_ats_certification_for_posting(
-        pool,
-        account_id,
-        posting,
-        None,
-        decision.evaluated_at_ms,
-    ) {
-        Ok(resolution) => {
-            apply_ats_certification_resolution(posting, decision, &resolution);
-            Ok(())
-        }
-        Err(AtsCertificationAuthorityError::Storage(error)) => Err(error),
-        Err(_) => Ok(()),
+    apply_discovery_authority(pool, account_id, &authoritative_posting, &mut decision)?;
+    if let Some(resolution) = composed.ats_certification.as_ref() {
+        apply_ats_certification_resolution(&authoritative_posting, &mut decision, resolution);
     }
+    Ok(decision)
 }
 
 fn apply_ats_certification_resolution(
@@ -555,6 +939,13 @@ fn build_job_eligibility(
     let mut hard_failures = Vec::new();
     let mut review_reasons = Vec::new();
     let mut passed_checks = Vec::new();
+    let mut track_policy_ready = false;
+    let mut role_match_proven = false;
+    let mut location_match_proven = false;
+    let mut employment_type_match_proven = preferences.employment_types.is_empty();
+    let mut engagement_type_match_proven = preferences.engagement_types.is_empty();
+    let mut track_employment_type_match_proven = true;
+    let mut track_engagement_type_match_proven = true;
     let experience_evidence = role_experience_evidence(profile, track, posting);
     let experience_requirement = experience_requirement(posting);
 
@@ -577,24 +968,55 @@ fn build_job_eligibility(
         Some(track) => {
             passed_checks.push("career_track_active".to_string());
             passed_checks.push("application_identity_bound".to_string());
-            let posting_family = posting_role_family(posting);
-            if posting_family != ROLE_FAMILY_GENERIC
-                && experience_evidence.role_family != ROLE_FAMILY_GENERIC
-                && posting_family != experience_evidence.role_family
-            {
+            let authority = &track.policy.authority;
+            let preferences_sha256 = job_preferences_policy_sha256(preferences).ok();
+            track_policy_ready = authority.review_state == "approved"
+                && authority.taxonomy_version == crate::jobs_taxonomy::taxonomy_version()
+                && authority.taxonomy_sha256 == crate::jobs_taxonomy::taxonomy_sha256()
+                && authority.source_resume_asset_id == profile.source_resume_asset_id
+                && authority.source_resume_sha256 == profile.source_resume_sha256
+                && preferences_sha256.as_deref() == Some(authority.job_preferences_sha256.as_str());
+            if track_policy_ready {
+                passed_checks.push("career_track_policy_current".to_string());
+            } else {
                 push_reason(
-                    &mut hard_failures,
-                    "role_family_mismatch",
-                    "This role belongs to a different Career Track.",
+                    &mut review_reasons,
+                    "career_track_policy_review_required",
+                    "Review this Career Track after any role, location, identity, resume, or Jobs setting changes before a runner can use it.",
                 );
-            } else if posting.track_id != track.id {
+            }
+            if posting.track_id != track.id {
                 push_reason(
                     &mut hard_failures,
                     "career_track_binding_changed",
                     "This job is not bound to the selected Career Track.",
                 );
             } else {
-                passed_checks.push("role_family_aligned".to_string());
+                match crate::jobs_taxonomy::classify_posting_role(&posting.title) {
+                    crate::jobs_taxonomy::PostingRoleClassification::Known {
+                        family_id, ..
+                    } if experience_evidence.role_family != ROLE_FAMILY_GENERIC
+                        && family_id != experience_evidence.role_family =>
+                    {
+                        push_reason(
+                            &mut hard_failures,
+                            "role_family_mismatch",
+                            "This role belongs to a different Career Track.",
+                        );
+                    }
+                    crate::jobs_taxonomy::PostingRoleClassification::Known { .. } => {
+                        role_match_proven = true;
+                        passed_checks.push("role_family_aligned".to_string());
+                    }
+                    crate::jobs_taxonomy::PostingRoleClassification::Ambiguous { .. }
+                    | crate::jobs_taxonomy::PostingRoleClassification::Unknown { .. } => {
+                        push_reason(
+                            &mut review_reasons,
+                            "posting_role_review_required",
+                            "Bluey could not prove this posting belongs to the selected canonical role family.",
+                        );
+                    }
+                }
             }
         }
     }
@@ -684,32 +1106,43 @@ fn build_job_eligibility(
         }
     }
 
-    if let Some(reason) = location_failure(posting, profile, preferences) {
-        if preferences.location_policy == "ask" {
+    match canonical_location_decision(posting, profile, preferences, track) {
+        CanonicalLocationDecision::Allowed => {
+            location_match_proven = true;
+            passed_checks.push("location_allowed".to_string());
+        }
+        CanonicalLocationDecision::Denied(reason) if preferences.location_policy == "ask" => {
             push_reason(&mut review_reasons, "location_needs_confirmation", &reason);
-        } else {
+        }
+        CanonicalLocationDecision::Denied(reason) => {
             push_reason(&mut hard_failures, "location_mismatch", &reason);
         }
-    } else {
-        passed_checks.push("location_allowed".to_string());
+        CanonicalLocationDecision::ReviewRequired(reason) => {
+            push_reason(
+                &mut review_reasons,
+                "location_taxonomy_review_required",
+                &reason,
+            );
+        }
     }
 
     if !preferences.employment_types.is_empty() {
         match candidate_employment_type(posting) {
-            Some(kind)
+            CandidateCategoryClassification::Known(kind)
                 if preferences
                     .employment_types
                     .iter()
                     .any(|allowed| normalize_candidate_employment_type(allowed) == Some(kind)) =>
             {
+                employment_type_match_proven = true;
                 passed_checks.push("employment_type_allowed".to_string());
             }
-            Some(_) => push_reason(
+            CandidateCategoryClassification::Known(_) => push_reason(
                 &mut hard_failures,
                 "employment_type_mismatch",
                 "This job uses an employment type you did not select.",
             ),
-            None => push_reason(
+            CandidateCategoryClassification::Unknown(_) => push_reason(
                 &mut review_reasons,
                 "employment_type_unverified",
                 "Bluey must confirm this job's employment type before Auto-submit.",
@@ -719,19 +1152,20 @@ fn build_job_eligibility(
 
     if !preferences.engagement_types.is_empty() {
         match candidate_engagement_type(posting) {
-            Some(kind)
+            CandidateCategoryClassification::Known(kind)
                 if preferences.engagement_types.iter().any(|allowed| {
                     normalize_candidate_engagement_type(allowed) == Some(kind)
                 }) =>
             {
+                engagement_type_match_proven = true;
                 passed_checks.push("engagement_type_allowed".to_string());
             }
-            Some(_) => push_reason(
+            CandidateCategoryClassification::Known(_) => push_reason(
                 &mut hard_failures,
                 "engagement_type_mismatch",
                 "This job uses an engagement type you did not select.",
             ),
-            None => push_reason(
+            CandidateCategoryClassification::Unknown(_) => push_reason(
                 &mut review_reasons,
                 "engagement_type_unverified",
                 "Bluey must confirm whether this role is W2, C2C, 1099, or direct hire before Auto-submit.",
@@ -739,23 +1173,49 @@ fn build_job_eligibility(
         }
     }
 
-    if let Some(reason) = track_employment_type_failure(posting, track) {
-        push_reason(
-            &mut hard_failures,
-            "track_employment_type_mismatch",
-            &reason,
-        );
-    } else if track.is_some() {
-        passed_checks.push("track_employment_type_allowed".to_string());
+    match track_employment_type_decision(posting, track) {
+        Some(CandidatePolicyFilterDecision::Allowed) => {
+            passed_checks.push("track_employment_type_allowed".to_string());
+        }
+        Some(CandidatePolicyFilterDecision::Mismatch(reason)) => {
+            track_employment_type_match_proven = false;
+            push_reason(
+                &mut hard_failures,
+                "track_employment_type_mismatch",
+                &reason,
+            );
+        }
+        Some(CandidatePolicyFilterDecision::ReviewRequired(reason)) => {
+            track_employment_type_match_proven = false;
+            push_reason(
+                &mut review_reasons,
+                "track_employment_type_unverified",
+                &reason,
+            );
+        }
+        None => {}
     }
-    if let Some(reason) = track_engagement_type_failure(posting, track) {
-        push_reason(
-            &mut hard_failures,
-            "track_engagement_type_mismatch",
-            &reason,
-        );
-    } else if track.is_some() {
-        passed_checks.push("track_engagement_type_allowed".to_string());
+    match track_engagement_type_decision(posting, track) {
+        Some(CandidatePolicyFilterDecision::Allowed) => {
+            passed_checks.push("track_engagement_type_allowed".to_string());
+        }
+        Some(CandidatePolicyFilterDecision::Mismatch(reason)) => {
+            track_engagement_type_match_proven = false;
+            push_reason(
+                &mut hard_failures,
+                "track_engagement_type_mismatch",
+                &reason,
+            );
+        }
+        Some(CandidatePolicyFilterDecision::ReviewRequired(reason)) => {
+            track_engagement_type_match_proven = false;
+            push_reason(
+                &mut review_reasons,
+                "track_engagement_type_unverified",
+                &reason,
+            );
+        }
+        None => {}
     }
     if let Some(reason) = track_work_authorization_failure(profile, posting, track) {
         push_reason(&mut hard_failures, "work_authorization_mismatch", &reason);
@@ -797,34 +1257,36 @@ fn build_job_eligibility(
         );
     }
 
-    if preferences.sponsorship == "required" {
-        if clearly_blocks_sponsorship(posting) {
-            push_reason(
-                &mut hard_failures,
-                "sponsorship_unavailable",
-                "This job appears to reject sponsorship.",
-            );
-        } else if clearly_offers_sponsorship(posting) {
+    match preferences.sponsorship.as_str() {
+        "required" if clearly_blocks_sponsorship(posting) => push_reason(
+            &mut hard_failures,
+            "sponsorship_unavailable",
+            "This job appears to reject sponsorship.",
+        ),
+        "required" if clearly_offers_sponsorship(posting) => {
             passed_checks.push("sponsorship_available".to_string());
-        } else {
-            push_reason(
-                &mut review_reasons,
-                "sponsorship_needs_confirmation",
-                "Sponsorship support must be confirmed before Auto-submit.",
-            );
         }
-    } else if preferences.sponsorship == "ask" {
-        if clearly_offers_sponsorship(posting) {
+        "required" => push_reason(
+            &mut review_reasons,
+            "sponsorship_needs_confirmation",
+            "Sponsorship support must be confirmed before Auto-submit.",
+        ),
+        "ask" if clearly_offers_sponsorship(posting) => {
             passed_checks.push("sponsorship_available".to_string());
-        } else {
-            push_reason(
-                &mut review_reasons,
-                "sponsorship_answer_required",
-                "Confirm the sponsorship answer before Auto-submit.",
-            );
         }
-    } else {
-        passed_checks.push("sponsorship_policy_passed".to_string());
+        "ask" => push_reason(
+            &mut review_reasons,
+            "sponsorship_answer_required",
+            "Confirm the sponsorship answer before Auto-submit.",
+        ),
+        "not_required" | "any" => {
+            passed_checks.push("sponsorship_policy_passed".to_string());
+        }
+        _ => push_reason(
+            &mut hard_failures,
+            "sponsorship_policy_invalid",
+            "The saved sponsorship policy is invalid and must be reviewed.",
+        ),
     }
 
     let active_company_key = normalize_company_key(&posting.company);
@@ -921,6 +1383,13 @@ fn build_job_eligibility(
         && discovery_gate.can_queue
         && hard_failures.is_empty()
         && queue_capable
+        && track_policy_ready
+        && role_match_proven
+        && location_match_proven
+        && employment_type_match_proven
+        && engagement_type_match_proven
+        && track_employment_type_match_proven
+        && track_engagement_type_match_proven
         && !live_verification_missing;
     let can_auto_submit = can_queue
         && capability == "certified"
@@ -1043,61 +1512,97 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
             .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
-fn location_failure(
+enum CanonicalLocationDecision {
+    Allowed,
+    Denied(String),
+    ReviewRequired(String),
+}
+
+fn canonical_location_decision(
     posting: &JobPosting,
     profile: &CareerProfile,
     preferences: &JobPreferences,
-) -> Option<String> {
-    let workplace = format!("{} {}", posting.workplace, posting.location).to_ascii_lowercase();
-    let is_remote = workplace.contains("remote");
-    let is_hybrid = workplace.contains("hybrid");
-    let is_onsite = workplace.contains("on-site")
-        || workplace.contains("onsite")
-        || workplace.contains("on site");
-
-    if (preferences.location_policy == "remote_only"
-        || preferences.remote_preference == "remote_only")
-        && !is_remote
+    track: Option<&CareerTrack>,
+) -> CanonicalLocationDecision {
+    let workplace =
+        crate::jobs_taxonomy::classify_posting_workplace(&posting.workplace, &posting.location);
+    let workplace_kind = match workplace {
+        crate::jobs_taxonomy::WorkplaceClassification::Known { kind, .. } => kind,
+        crate::jobs_taxonomy::WorkplaceClassification::Unknown { .. } => {
+            return CanonicalLocationDecision::ReviewRequired(
+                "Bluey could not prove one unambiguous posting workplace type.".to_string(),
+            );
+        }
+    };
+    let remote_preference = track
+        .map(|track| track.remote_preference.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(preferences.remote_preference.as_str());
+    if !remote_preference.trim().is_empty()
+        && !matches!(
+            remote_preference,
+            "remote_only" | "remote_or_hybrid" | "hybrid_ok" | "onsite_ok" | "any"
+        )
     {
-        return Some("Your settings allow remote jobs only.".to_string());
-    }
-    if preferences.remote_preference == "remote_or_hybrid" && is_onsite && !is_hybrid {
-        return Some(
-            "Your settings allow remote or hybrid jobs, not on-site-only jobs.".to_string(),
+        return CanonicalLocationDecision::ReviewRequired(
+            "Bluey could not prove this Career Track's workplace preference.".to_string(),
         );
     }
 
-    if preferences.desired_locations.is_empty() || is_remote {
-        return None;
+    if (preferences.location_policy == "remote_only" || remote_preference == "remote_only")
+        && workplace_kind != crate::jobs_taxonomy::WorkplaceKind::Remote
+    {
+        return CanonicalLocationDecision::Denied(
+            "Your Career Track allows remote jobs only.".to_string(),
+        );
     }
-    let posting_location = normalized_location(&posting.location);
-    let mut allowed_locations = preferences.desired_locations.clone();
-    if preferences.location_policy == "local" && !profile.current_location.trim().is_empty() {
+    if remote_preference == "remote_or_hybrid"
+        && workplace_kind == crate::jobs_taxonomy::WorkplaceKind::Onsite
+    {
+        return CanonicalLocationDecision::Denied(
+            "Your Career Track allows remote or hybrid jobs, not on-site-only jobs.".to_string(),
+        );
+    }
+
+    let mut allowed_locations = track
+        .filter(|track| !track.locations.is_empty())
+        .map(|track| track.locations.clone())
+        .unwrap_or_else(|| preferences.desired_locations.clone());
+    if track.is_none()
+        && preferences.location_policy == "local"
+        && !profile.current_location.trim().is_empty()
+    {
         allowed_locations.push(profile.current_location.clone());
     }
-    let matches_location = allowed_locations.iter().any(|candidate| {
-        let candidate = normalized_location(candidate);
-        !candidate.is_empty()
-            && (posting_location.contains(&candidate) || candidate.contains(&posting_location))
-    });
-    (!matches_location).then(|| {
-        format!(
-            "{} is outside your selected job locations.",
-            if posting.location.trim().is_empty() {
-                "This location"
-            } else {
-                posting.location.trim()
-            }
-        )
-    })
-}
-
-fn normalized_location(value: &str) -> String {
-    value
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect()
+    match crate::jobs_taxonomy::geography_allows(
+        &posting.location,
+        &allowed_locations,
+        &posting.workplace,
+    ) {
+        crate::jobs_taxonomy::GeographyMatchDecision::Allowed { .. } => {
+            CanonicalLocationDecision::Allowed
+        }
+        crate::jobs_taxonomy::GeographyMatchDecision::Denied { .. } => {
+            CanonicalLocationDecision::Denied(format!(
+                "{} is outside your selected job locations.",
+                if posting.location.trim().is_empty() {
+                    "This location"
+                } else {
+                    posting.location.trim()
+                }
+            ))
+        }
+        crate::jobs_taxonomy::GeographyMatchDecision::ReviewRequired { .. } => {
+            CanonicalLocationDecision::ReviewRequired(format!(
+                "Bluey could not prove that {} belongs to this Career Track's typed geography.",
+                if posting.location.trim().is_empty() {
+                    "this posting location"
+                } else {
+                    posting.location.trim()
+                }
+            ))
+        }
+    }
 }
 
 fn eligibility_error_message(decision: &JobEligibilityDecision) -> String {
@@ -1265,11 +1770,8 @@ fn score_posting(
     let mut score = 25i64;
     let mut reasons = Vec::new();
     let mut missing = Vec::new();
-    let title = posting.title.to_lowercase();
-    let description = posting.description.to_lowercase();
-    let location = posting.location.to_lowercase();
 
-    let target_roles = track
+    let target_roles: Vec<_> = track
         .map(|value| vec![value.role.as_str()])
         .unwrap_or_else(|| {
             preferences
@@ -1277,44 +1779,69 @@ fn score_posting(
                 .iter()
                 .map(String::as_str)
                 .collect()
-        });
-    let role_text_matches = target_roles.iter().any(|role| {
-        let role = role.to_lowercase();
-        !role.trim().is_empty() && (title.contains(&role) || role.contains(&title))
-    });
-    let target_family = canonical_role_family(track, posting);
-    let posting_family = posting_role_family(posting);
-    if role_text_matches {
+        })
+        .into_iter()
+        .filter_map(
+            |role| match crate::jobs_taxonomy::resolve_target_role(role) {
+                crate::jobs_taxonomy::TargetRoleResolution::Known {
+                    role_id, family_id, ..
+                } => Some((role_id, family_id)),
+                crate::jobs_taxonomy::TargetRoleResolution::Ambiguous { .. }
+                | crate::jobs_taxonomy::TargetRoleResolution::CustomReview { .. } => None,
+            },
+        )
+        .collect();
+    let posting_role = crate::jobs_taxonomy::classify_posting_role(&posting.title);
+    let (exact_role_match, family_role_match, proven_role_mismatch) = match &posting_role {
+        crate::jobs_taxonomy::PostingRoleClassification::Known {
+            family_id,
+            matched_role_ids,
+            ..
+        } => (
+            target_roles
+                .iter()
+                .any(|(role_id, _)| matched_role_ids.contains(role_id)),
+            target_roles
+                .iter()
+                .any(|(_, target_family_id)| target_family_id == family_id),
+            !target_roles.is_empty()
+                && target_roles
+                    .iter()
+                    .all(|(_, target_family_id)| target_family_id != family_id),
+        ),
+        crate::jobs_taxonomy::PostingRoleClassification::Ambiguous { .. }
+        | crate::jobs_taxonomy::PostingRoleClassification::Unknown { .. } => (false, false, false),
+    };
+    if exact_role_match {
         score += 25;
         reasons.push("Role matches this Career Track".to_string());
-    } else if target_family == posting_family && target_family != ROLE_FAMILY_GENERIC {
+    } else if family_role_match {
         score += 15;
         reasons.push("Role family matches this Career Track".to_string());
-    } else if target_family != ROLE_FAMILY_GENERIC && posting_family != ROLE_FAMILY_GENERIC {
+    } else if proven_role_mismatch {
         score -= 20;
         missing.push("Role belongs to a different Career Track".to_string());
     }
 
+    let posting_skill_text = format!("{}\n{}", posting.title, posting.description);
     let matching_skills: Vec<String> = profile
         .skills
         .iter()
-        .filter(|skill| description.contains(&skill.to_lowercase()))
+        .filter(|skill| crate::jobs_taxonomy::skill_matches_text(&posting_skill_text, skill))
         .take(5)
         .cloned()
         .collect();
     if !matching_skills.is_empty() {
         score += (matching_skills.len() as i64 * 5).min(25);
         reasons.push(format!("Matches {} profile skills", matching_skills.len()));
-    } else if !profile.skills.is_empty() && !description.is_empty() {
+    } else if !profile.skills.is_empty() && !posting.description.is_empty() {
         missing.push("No direct skill overlap found yet".to_string());
     }
 
-    if preferences.desired_locations.iter().any(|candidate| {
-        let candidate = candidate.to_lowercase();
-        location.contains(&candidate) || candidate.contains(&location)
-    }) || (preferences.remote_preference.contains("remote")
-        && (posting.workplace.eq_ignore_ascii_case("remote") || location.contains("remote")))
-    {
+    if matches!(
+        canonical_location_decision(posting, profile, preferences, track),
+        CanonicalLocationDecision::Allowed
+    ) {
         score += 15;
         reasons.push("Location preference fits".to_string());
     }
@@ -1403,6 +1930,341 @@ fn posting_snapshot_fingerprint(posting: &JobPosting) -> Result<String> {
     Ok(hex::encode(Sha256::digest(encoded)))
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ApplicationAttemptAdmissionError {
+    #[error("application attempt requires current authority review ({reason_code})")]
+    ReviewRequired { reason_code: String },
+    #[error("application attempt is blocked by current authority ({reason_code})")]
+    Blocked { reason_code: String },
+}
+
+fn attempt_review_required(reason_code: &str) -> anyhow::Error {
+    anyhow::Error::new(ApplicationAttemptAdmissionError::ReviewRequired {
+        reason_code: reason_code.to_string(),
+    })
+}
+
+fn attempt_blocked(reason_code: &str) -> anyhow::Error {
+    anyhow::Error::new(ApplicationAttemptAdmissionError::Blocked {
+        reason_code: reason_code.to_string(),
+    })
+}
+
+fn current_attempt_employer_domain(
+    application: &JobApplication,
+    composed: &ComposedJobIntegrityProjection,
+) -> Result<OperationalHoldEmployerDomain> {
+    match composed.job_integrity.status {
+        JobIntegrityResolutionStatus::Verified => {}
+        JobIntegrityResolutionStatus::Blocked
+        | JobIntegrityResolutionStatus::Mismatch
+        | JobIntegrityResolutionStatus::Revoked => {
+            return Err(attempt_blocked(&composed.job_integrity.reason_code));
+        }
+        JobIntegrityResolutionStatus::Absent
+        | JobIntegrityResolutionStatus::ReviewRequired
+        | JobIntegrityResolutionStatus::Expired => {
+            return Err(attempt_review_required(&composed.job_integrity.reason_code));
+        }
+    }
+    if !original_source_projection_matches_application(application, &composed.original_source)? {
+        return Err(attempt_blocked("original_source_receipt_mismatch"));
+    }
+    if !job_integrity_resolution_matches_application(application, &composed.job_integrity)? {
+        return Err(attempt_blocked("job_integrity_receipt_mismatch"));
+    }
+    let authority = composed
+        .job_integrity
+        .authority
+        .as_ref()
+        .ok_or_else(|| attempt_review_required("job_integrity_authority_missing"))?;
+    OperationalHoldEmployerDomain::from_current_job_integrity_authority(authority)
+        .map_err(anyhow::Error::new)
+}
+
+fn load_attempt_authority_inputs_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<(JobApplication, JobPosting)> {
+    let (job_id, application_json, posting_id, posting_json) = tx
+        .query_row(
+            "SELECT application.job_id, application.application_json,
+                    posting.id, posting.posting_json
+               FROM jobs_applications application
+               JOIN jobs_postings posting
+                 ON posting.account_id = application.account_id
+                AND posting.id = application.job_id
+              WHERE application.account_id = ?1 AND application.id = ?2",
+            params![account_id, application_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| anyhow::anyhow!("application or job not found"))?;
+    let application = parse_application_json(
+        application_json,
+        application_id,
+        &job_id,
+        "Jobs attempt authority application",
+    )?;
+    let mut posting: JobPosting = parse_json(posting_json, "Jobs attempt authority posting")?;
+    posting.id = posting_id;
+    Ok((application, posting))
+}
+
+fn load_attempt_authority_inputs_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> Result<(JobApplication, JobPosting)> {
+    let row = tx
+        .query_opt(
+            "SELECT application.job_id, application.application_json,
+                    posting.id, posting.posting_json
+               FROM jobs_applications application
+               JOIN jobs_postings posting
+                 ON posting.account_id = application.account_id
+                AND posting.id = application.job_id
+              WHERE application.account_id = $1 AND application.id = $2
+              FOR SHARE OF application, posting",
+            &[&account_id, &application_id],
+        )?
+        .ok_or_else(|| anyhow::anyhow!("application or job not found"))?;
+    let job_id = row.get::<_, String>(0);
+    let application = parse_application_json(
+        row.get(1),
+        application_id,
+        &job_id,
+        "Jobs attempt authority application",
+    )?;
+    let mut posting: JobPosting = parse_json(row.get(3), "Jobs attempt authority posting")?;
+    posting.id = row.get(2);
+    Ok((application, posting))
+}
+
+fn require_attempt_runner_capability_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    employer_domain: &OperationalHoldEmployerDomain,
+    runner: &'static str,
+    runner_authority: ExecutionAuthorityRunner,
+    entitled: bool,
+) -> Result<()> {
+    if !entitled {
+        return Err(attempt_review_required("runner_entitlement_unavailable"));
+    }
+    let mut hold_context = operational_hold_context_for_application_sqlite_tx_after_authority(
+        tx,
+        account_id,
+        &application.id,
+        employer_domain,
+        Some(runner),
+        None,
+        None,
+    )
+    .map_err(anyhow::Error::new)?;
+    add_candidate_queue_hold_scopes(&mut hold_context, application)?;
+    require_operational_capability_sqlite_tx(
+        tx,
+        OperationalCapability::ApplicationQueue,
+        &hold_context,
+    )
+    .map_err(anyhow::Error::new)?;
+    if !current_execution_authorized_sqlite(tx, account_id, application, runner_authority)? {
+        return Err(attempt_review_required(
+            "current_execution_authority_denied",
+        ));
+    }
+    Ok(())
+}
+
+fn require_attempt_account_hold_clear_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    let context = OperationalHoldContext::new()
+        .with_scope(OperationalHoldScopeKind::Account, account_id)
+        .map_err(anyhow::Error::new)?;
+    require_operational_capability_sqlite_tx(tx, OperationalCapability::ApplicationQueue, &context)
+        .map_err(anyhow::Error::new)
+}
+
+fn require_attempt_account_hold_clear_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> Result<()> {
+    let context = OperationalHoldContext::new()
+        .with_scope(OperationalHoldScopeKind::Account, account_id)
+        .map_err(anyhow::Error::new)?;
+    require_operational_capability_postgres_tx_after_authority_prelock(
+        tx,
+        OperationalCapability::ApplicationQueue,
+        &context,
+    )
+    .map_err(anyhow::Error::new)
+}
+
+fn require_attempt_runner_capability_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    employer_domain: &OperationalHoldEmployerDomain,
+    runner: &'static str,
+    runner_authority: ExecutionAuthorityRunner,
+    entitled: bool,
+) -> Result<()> {
+    if !entitled {
+        return Err(attempt_review_required("runner_entitlement_unavailable"));
+    }
+    let mut hold_context =
+        operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+            tx,
+            account_id,
+            &application.id,
+            employer_domain,
+            Some(runner),
+            None,
+            None,
+        )
+        .map_err(anyhow::Error::new)?;
+    add_candidate_queue_hold_scopes(&mut hold_context, application)?;
+    require_operational_capability_postgres_tx_after_authority_prelock(
+        tx,
+        OperationalCapability::ApplicationQueue,
+        &hold_context,
+    )
+    .map_err(anyhow::Error::new)?;
+    if !current_execution_authorized_postgres_after_prelock(
+        tx,
+        account_id,
+        application,
+        runner_authority,
+    )? {
+        return Err(attempt_review_required(
+            "current_execution_authority_denied",
+        ));
+    }
+    Ok(())
+}
+
+fn require_requested_attempt_runner_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    employer_domain: &OperationalHoldEmployerDomain,
+    runner: &str,
+    entitlements: (bool, bool),
+) -> Result<()> {
+    match runner {
+        "local" => require_attempt_runner_capability_sqlite_tx(
+            tx,
+            account_id,
+            application,
+            employer_domain,
+            "local",
+            ExecutionAuthorityRunner::Local,
+            entitlements.0,
+        ),
+        "cloud" => require_attempt_runner_capability_sqlite_tx(
+            tx,
+            account_id,
+            application,
+            employer_domain,
+            "cloud",
+            ExecutionAuthorityRunner::Cloud,
+            entitlements.1,
+        ),
+        "unassigned" => {
+            let local = require_attempt_runner_capability_sqlite_tx(
+                tx,
+                account_id,
+                application,
+                employer_domain,
+                "local",
+                ExecutionAuthorityRunner::Local,
+                entitlements.0,
+            );
+            if local.is_ok() {
+                return Ok(());
+            }
+            require_attempt_runner_capability_sqlite_tx(
+                tx,
+                account_id,
+                application,
+                employer_domain,
+                "cloud",
+                ExecutionAuthorityRunner::Cloud,
+                entitlements.1,
+            )
+            .or(local)
+        }
+        _ => anyhow::bail!("application runner is invalid"),
+    }
+}
+
+fn require_requested_attempt_runner_postgres_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    employer_domain: &OperationalHoldEmployerDomain,
+    runner: &str,
+    entitlements: (bool, bool),
+) -> Result<()> {
+    match runner {
+        "local" => require_attempt_runner_capability_postgres_tx_after_prelock(
+            tx,
+            account_id,
+            application,
+            employer_domain,
+            "local",
+            ExecutionAuthorityRunner::Local,
+            entitlements.0,
+        ),
+        "cloud" => require_attempt_runner_capability_postgres_tx_after_prelock(
+            tx,
+            account_id,
+            application,
+            employer_domain,
+            "cloud",
+            ExecutionAuthorityRunner::Cloud,
+            entitlements.1,
+        ),
+        "unassigned" => {
+            let local = require_attempt_runner_capability_postgres_tx_after_prelock(
+                tx,
+                account_id,
+                application,
+                employer_domain,
+                "local",
+                ExecutionAuthorityRunner::Local,
+                entitlements.0,
+            );
+            if local.is_ok() {
+                return Ok(());
+            }
+            require_attempt_runner_capability_postgres_tx_after_prelock(
+                tx,
+                account_id,
+                application,
+                employer_domain,
+                "cloud",
+                ExecutionAuthorityRunner::Cloud,
+                entitlements.1,
+            )
+            .or(local)
+        }
+        _ => anyhow::bail!("application runner is invalid"),
+    }
+}
+
 pub fn list_attempt_reservations(
     pool: &DbPool,
     account_id: &str,
@@ -1462,42 +2324,57 @@ pub fn reserve_application_attempt(
     application_id: &str,
     runner: &str,
 ) -> Result<AttemptReservation> {
-    let runner_kind = match runner {
-        "cloud" | "local" => Some(runner),
-        "unassigned" => None,
-        _ => anyhow::bail!("application runner is invalid"),
-    };
-    let application = get_application(pool, account_id, application_id)?
-        .ok_or_else(|| anyhow::anyhow!("application not found"))?;
-    let posting = get_posting(pool, account_id, &application.job_id)?
-        .ok_or_else(|| anyhow::anyhow!("job not found"))?;
-    let preferences = get_preferences(pool, account_id)?;
-    let _ = get_entitlement(pool, account_id)?;
-    let company_key = normalize_company_key(&posting.company);
-    let period_key = attempt_period_key(now_ms(), preferences.time_zone_offset_minutes);
-    let daily_limit = preferences.daily_limit.clamp(1, 50);
-    let now = now_ms();
-    let id = format!("attempt-{application_id}");
+    if !matches!(runner, "cloud" | "local" | "unassigned") {
+        anyhow::bail!("application runner is invalid")
+    }
 
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let hold_context = operational_hold_context_for_application_sqlite_tx(
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            require_attempt_account_hold_clear_sqlite_tx(&tx, account_id)?;
+            let (application, posting) =
+                load_attempt_authority_inputs_sqlite_tx(&tx, account_id, application_id)?;
+            let employer_domain = ensure_original_source_application_authority_sqlite_tx(
                 &tx,
                 account_id,
-                application_id,
-                runner_kind,
-                None,
-                None,
-            )
-            .map_err(anyhow::Error::new)?;
-            require_operational_capability_sqlite_tx(
+                &application,
+                &posting,
+            )?;
+            let entitlements = tx
+                .query_row(
+                    "SELECT local_browser, cloud_browser FROM jobs_entitlements
+                      WHERE account_id = ?1",
+                    params![account_id],
+                    |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+                )
+                .optional()?
+                .ok_or_else(|| attempt_review_required("runner_entitlement_unavailable"))?;
+            require_requested_attempt_runner_sqlite_tx(
                 &tx,
-                OperationalCapability::ApplicationQueue,
-                &hold_context,
-            )
-            .map_err(anyhow::Error::new)?;
+                account_id,
+                &application,
+                &employer_domain,
+                runner,
+                entitlements,
+            )?;
+
+            let now = now_ms();
+            let preferences_json: String = tx.query_row(
+                "SELECT preferences_json FROM jobs_preferences WHERE account_id = ?1",
+                params![account_id],
+                |row| row.get(0),
+            )?;
+            let preferences: JobPreferences =
+                parse_json(preferences_json, "Jobs reservation preferences")?;
+            let period_key = attempt_period_key(now, preferences.time_zone_offset_minutes);
+            let daily_limit = preferences.daily_limit.clamp(1, 50);
+            let company_key = normalize_company_key(&posting.company);
+            let id = format!("attempt-{application_id}");
+
             if let Some(existing) = tx
                 .query_row(
                     "SELECT id, application_id, company_key, period_key, runner, status,
@@ -1521,41 +2398,28 @@ pub fn reserve_application_attempt(
                 .optional()?
             {
                 if active_attempt_status(&existing.status) {
-                    tx.execute(
+                    if existing.runner == runner {
+                        tx.commit()?;
+                        return Ok(existing);
+                    }
+                    if existing.status != "reserved" {
+                        anyhow::bail!("an active application attempt cannot change runners")
+                    }
+                    if tx.execute(
                         "UPDATE jobs_attempt_reservations SET runner = ?3, updated_at_ms = ?4
-                          WHERE account_id = ?1 AND application_id = ?2",
-                        params![account_id, application_id, runner, now],
-                    )?;
+                          WHERE account_id = ?1 AND application_id = ?2
+                            AND runner = ?5 AND status = 'reserved'",
+                        params![account_id, application_id, runner, now, existing.runner],
+                    )? != 1
+                    {
+                        anyhow::bail!("application attempt changed before runner assignment")
+                    }
                     tx.commit()?;
                     return Ok(AttemptReservation {
                         runner: runner.to_string(),
                         updated_at_ms: now,
                         ..existing
                     });
-                }
-            }
-            let discovered: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM jobs_discovery_memberships
-                  WHERE account_id = ?1 AND job_id = ?2",
-                params![account_id, posting.id],
-                |row| row.get(0),
-            )?;
-            if discovered > 0 {
-                let healthy: i64 = tx.query_row(
-                    "SELECT COUNT(*)
-                       FROM jobs_discovery_memberships m
-                       JOIN jobs_discovery_sources s ON s.id = m.source_id
-                      WHERE m.account_id = ?1 AND m.job_id = ?2
-                        AND m.availability_status = 'active'
-                        AND m.last_seen_at_ms >= ?3
-                        AND s.status = 'active' AND s.health = 'healthy'",
-                    params![account_id, posting.id, now - LIVE_VERIFICATION_MAX_AGE_MS],
-                    |row| row.get(0),
-                )?;
-                if healthy == 0 {
-                    anyhow::bail!(
-                        "the discovery source must be healthy before reserving this application"
-                    )
                 }
             }
             let used: i64 = tx.query_row(
@@ -1607,34 +2471,41 @@ pub fn reserve_application_attempt(
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
             lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+            lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                .map_err(anyhow::Error::new)?;
+            lock_postgres_ats_certification(&mut tx).map_err(anyhow::Error::new)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+            require_attempt_account_hold_clear_postgres_tx(&mut tx, account_id)?;
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let (application, posting) =
+                load_attempt_authority_inputs_postgres_tx(&mut tx, account_id, application_id)?;
             tx.query_one(
                 "SELECT account_id FROM jobs_entitlements WHERE account_id = $1 FOR UPDATE",
                 &[&account_id],
             )?;
-            let hold_context = operational_hold_context_for_application_postgres_tx(
-                &mut tx,
-                account_id,
-                application_id,
-                runner_kind,
-                None,
-                None,
-            )
-            .map_err(anyhow::Error::new)?;
-            require_operational_capability_postgres_tx(
-                &mut tx,
-                OperationalCapability::ApplicationQueue,
-                &hold_context,
-            )
-            .map_err(anyhow::Error::new)?;
-            if let Some(row) = tx.query_opt(
-                "SELECT id, application_id, company_key, period_key, runner, status,
+            let entitlement = tx
+                .query_opt(
+                    "SELECT local_browser, cloud_browser FROM jobs_entitlements
+                      WHERE account_id = $1",
+                    &[&account_id],
+                )?
+                .ok_or_else(|| attempt_review_required("runner_entitlement_unavailable"))?;
+            let entitlements = (
+                entitlement.get::<_, i32>(0) != 0,
+                entitlement.get::<_, i32>(1) != 0,
+            );
+
+            let existing = tx
+                .query_opt(
+                    "SELECT id, application_id, company_key, period_key, runner, status,
                         reserved_at_ms, updated_at_ms
                    FROM jobs_attempt_reservations
-                  WHERE account_id = $1 AND application_id = $2",
-                &[&account_id, &application_id],
-            )? {
-                let existing = AttemptReservation {
+                  WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+                    &[&account_id, &application_id],
+                )?
+                .map(|row| AttemptReservation {
                     id: row.get(0),
                     application_id: row.get(1),
                     company_key: row.get(2),
@@ -1643,40 +2514,64 @@ pub fn reserve_application_attempt(
                     status: row.get(5),
                     reserved_at_ms: row.get(6),
                     updated_at_ms: row.get(7),
-                };
+                });
+            let employer_domain = ensure_original_source_application_authority_postgres_tx(
+                &mut tx,
+                account_id,
+                &application,
+                &posting,
+            )?;
+            require_requested_attempt_runner_postgres_tx_after_prelock(
+                &mut tx,
+                account_id,
+                &application,
+                &employer_domain,
+                runner,
+                entitlements,
+            )?;
+            let now = now_ms();
+            let preferences_json: String = tx
+                .query_one(
+                    "SELECT preferences_json FROM jobs_preferences WHERE account_id = $1",
+                    &[&account_id],
+                )?
+                .get(0);
+            let preferences: JobPreferences =
+                parse_json(preferences_json, "Jobs reservation preferences")?;
+            let period_key = attempt_period_key(now, preferences.time_zone_offset_minutes);
+            let daily_limit = preferences.daily_limit.clamp(1, 50);
+            let company_key = normalize_company_key(&posting.company);
+            let id = format!("attempt-{application_id}");
+            if let Some(existing) = existing {
                 if active_attempt_status(&existing.status) {
-                    tx.execute(
+                    if existing.runner == runner {
+                        tx.commit()?;
+                        return Ok(existing);
+                    }
+                    if existing.status != "reserved" {
+                        anyhow::bail!("an active application attempt cannot change runners")
+                    }
+                    if tx.execute(
                         "UPDATE jobs_attempt_reservations SET runner = $3, updated_at_ms = $4
-                          WHERE account_id = $1 AND application_id = $2",
-                        &[&account_id, &application_id, &runner, &now],
-                    )?;
+                          WHERE account_id = $1 AND application_id = $2
+                            AND runner = $5 AND status = 'reserved'",
+                        &[
+                            &account_id,
+                            &application_id,
+                            &runner,
+                            &now,
+                            &existing.runner,
+                        ],
+                    )? != 1
+                    {
+                        anyhow::bail!("application attempt changed before runner assignment")
+                    }
                     tx.commit()?;
                     return Ok(AttemptReservation {
                         runner: runner.to_string(),
                         updated_at_ms: now,
                         ..existing
                     });
-                }
-            }
-            let authorities = tx.query(
-                "SELECT s.status, s.health, m.availability_status, m.last_seen_at_ms
-                  FROM jobs_discovery_memberships m
-                   JOIN jobs_discovery_sources s ON s.id = m.source_id
-                  WHERE m.account_id = $1 AND m.job_id = $2
-                  FOR SHARE OF s, m",
-                &[&account_id, &posting.id],
-            )?;
-            if !authorities.is_empty() {
-                let healthy = authorities.iter().any(|row| {
-                    row.get::<_, String>(0) == "active"
-                        && row.get::<_, String>(1) == "healthy"
-                        && row.get::<_, String>(2) == "active"
-                        && row.get::<_, i64>(3) >= now - LIVE_VERIFICATION_MAX_AGE_MS
-                });
-                if !healthy {
-                    anyhow::bail!(
-                        "the discovery source must be healthy before reserving this application"
-                    )
                 }
             }
             let used: i64 = tx
@@ -1741,7 +2636,7 @@ pub fn update_attempt_reservation_status(
     ) {
         anyhow::bail!("invalid application attempt status")
     }
-    let now = now_ms();
+    let requires_running_capability = matches!(status, "reserved" | "running");
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
@@ -1749,19 +2644,84 @@ pub fn update_attempt_reservation_status(
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
-            if status == "running" {
-                let job_id: String = tx.query_row(
-                    "SELECT job_id FROM jobs_applications
-                      WHERE account_id = ?1 AND id = ?2",
+            let existing = tx
+                .query_row(
+                    "SELECT id, application_id, company_key, period_key, runner, status,
+                            reserved_at_ms, updated_at_ms
+                       FROM jobs_attempt_reservations
+                      WHERE account_id = ?1 AND application_id = ?2",
                     params![account_id, application_id],
-                    |row| row.get(0),
+                    |row| {
+                        Ok(AttemptReservation {
+                            id: row.get(0)?,
+                            application_id: row.get(1)?,
+                            company_key: row.get(2)?,
+                            period_key: row.get(3)?,
+                            runner: row.get(4)?,
+                            status: row.get(5)?,
+                            reserved_at_ms: row.get(6)?,
+                            updated_at_ms: row.get(7)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(existing) = existing else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            if requires_running_capability {
+                require_attempt_account_hold_clear_sqlite_tx(&tx, account_id)?;
+                if status == "running" && existing.runner == "unassigned" {
+                    return Err(attempt_review_required("exact_runner_assignment_required"));
+                }
+                if status == "running"
+                    && !matches!(existing.status.as_str(), "reserved" | "running")
+                {
+                    anyhow::bail!("only a reserved application attempt can start running")
+                }
+                let (application, posting) =
+                    load_attempt_authority_inputs_sqlite_tx(&tx, account_id, application_id)?;
+                let employer_domain = ensure_original_source_application_authority_sqlite_tx(
+                    &tx,
+                    account_id,
+                    &application,
+                    &posting,
                 )?;
-                ensure_discovery_authority_in_sqlite_tx(&tx, account_id, &job_id, now)?;
+                let entitlements = tx
+                    .query_row(
+                        "SELECT local_browser, cloud_browser FROM jobs_entitlements
+                          WHERE account_id = ?1",
+                        params![account_id],
+                        |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, i64>(1)? != 0)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| attempt_review_required("runner_entitlement_unavailable"))?;
+                require_requested_attempt_runner_sqlite_tx(
+                    &tx,
+                    account_id,
+                    &application,
+                    &employer_domain,
+                    &existing.runner,
+                    entitlements,
+                )?;
             }
+            if existing.status == status {
+                tx.commit()?;
+                return Ok(true);
+            }
+            let now = now_ms();
             let changed = tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = ?3, updated_at_ms = ?4
-                  WHERE account_id = ?1 AND application_id = ?2",
-                params![account_id, application_id, status, now],
+                  WHERE account_id = ?1 AND application_id = ?2
+                    AND runner = ?5 AND status = ?6",
+                params![
+                    account_id,
+                    application_id,
+                    status,
+                    now,
+                    existing.runner,
+                    existing.status
+                ],
             )? > 0;
             tx.commit()?;
             Ok(changed)
@@ -1769,23 +2729,103 @@ pub fn update_attempt_reservation_status(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            if requires_running_capability {
+                lock_operational_hold_shared_postgres_tx(&mut tx).map_err(anyhow::Error::new)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                    .map_err(anyhow::Error::new)?;
+                lock_postgres_ats_certification(&mut tx).map_err(anyhow::Error::new)?;
+                lock_discovery_account_shared_postgres(&mut tx, account_id)?;
+                require_attempt_account_hold_clear_postgres_tx(&mut tx, account_id)?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
-            if status == "running" {
-                let job_id: String = tx
-                    .query_one(
-                        "SELECT job_id FROM jobs_applications
-                          WHERE account_id = $1 AND id = $2 FOR UPDATE",
-                        &[&account_id, &application_id],
+            let current_authority = if requires_running_capability {
+                let (application, posting) =
+                    load_attempt_authority_inputs_postgres_tx(&mut tx, account_id, application_id)?;
+                let entitlement = tx
+                    .query_opt(
+                        "SELECT local_browser, cloud_browser FROM jobs_entitlements
+                          WHERE account_id = $1 FOR UPDATE",
+                        &[&account_id],
                     )?
-                    .get(0);
-                ensure_discovery_authority_in_pg_tx(&mut tx, account_id, &job_id, now)?;
+                    .ok_or_else(|| attempt_review_required("runner_entitlement_unavailable"))?;
+                Some((
+                    application,
+                    posting,
+                    (
+                        entitlement.get::<_, i32>(0) != 0,
+                        entitlement.get::<_, i32>(1) != 0,
+                    ),
+                ))
+            } else {
+                None
+            };
+            let existing = tx.query_opt(
+                "SELECT id, application_id, company_key, period_key, runner, status,
+                        reserved_at_ms, updated_at_ms
+                   FROM jobs_attempt_reservations
+                  WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+                &[&account_id, &application_id],
+            )?;
+            let Some(existing) = existing.map(|row| AttemptReservation {
+                id: row.get(0),
+                application_id: row.get(1),
+                company_key: row.get(2),
+                period_key: row.get(3),
+                runner: row.get(4),
+                status: row.get(5),
+                reserved_at_ms: row.get(6),
+                updated_at_ms: row.get(7),
+            }) else {
+                tx.commit()?;
+                return Ok(false);
+            };
+            if requires_running_capability {
+                if status == "running" && existing.runner == "unassigned" {
+                    return Err(attempt_review_required("exact_runner_assignment_required"));
+                }
+                if status == "running"
+                    && !matches!(existing.status.as_str(), "reserved" | "running")
+                {
+                    anyhow::bail!("only a reserved application attempt can start running")
+                }
+                let (application, posting, entitlements) =
+                    current_authority.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("current application attempt authority is unavailable")
+                    })?;
+                let employer_domain = ensure_original_source_application_authority_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application,
+                    posting,
+                )?;
+                require_requested_attempt_runner_postgres_tx_after_prelock(
+                    &mut tx,
+                    account_id,
+                    application,
+                    &employer_domain,
+                    &existing.runner,
+                    *entitlements,
+                )?;
             }
+            if existing.status == status {
+                tx.commit()?;
+                return Ok(true);
+            }
+            let now = now_ms();
             let changed = tx.execute(
                 "UPDATE jobs_attempt_reservations SET status = $3, updated_at_ms = $4
-                  WHERE account_id = $1 AND application_id = $2",
-                &[&account_id, &application_id, &status, &now],
+                  WHERE account_id = $1 AND application_id = $2
+                    AND runner = $5 AND status = $6",
+                &[
+                    &account_id,
+                    &application_id,
+                    &status,
+                    &now,
+                    &existing.runner,
+                    &existing.status,
+                ],
             )? > 0;
             tx.commit()?;
             Ok(changed)
@@ -1793,63 +2833,154 @@ pub fn update_attempt_reservation_status(
     })
 }
 
-fn ensure_discovery_authority_in_sqlite_tx(
+fn ensure_original_source_application_authority_sqlite_tx(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
-    job_id: &str,
-    now: i64,
-) -> Result<()> {
-    let discovered: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM jobs_discovery_memberships
-          WHERE account_id = ?1 AND job_id = ?2",
-        params![account_id, job_id],
-        |row| row.get(0),
-    )?;
-    if discovered == 0 {
-        return Ok(());
-    }
-    let healthy: i64 = tx.query_row(
-        "SELECT COUNT(*)
-           FROM jobs_discovery_memberships m
-           JOIN jobs_discovery_sources s ON s.id = m.source_id
-          WHERE m.account_id = ?1 AND m.job_id = ?2
-            AND m.availability_status = 'active'
-            AND m.last_seen_at_ms >= ?3
-            AND s.status = 'active' AND s.health = 'healthy'",
-        params![account_id, job_id, now - LIVE_VERIFICATION_MAX_AGE_MS],
-        |row| row.get(0),
-    )?;
-    if healthy == 0 {
-        anyhow::bail!("the discovery source must be healthy before the runner starts")
-    }
-    Ok(())
+    application: &JobApplication,
+    posting: &JobPosting,
+) -> Result<OperationalHoldEmployerDomain> {
+    approved_submission_snapshot(account_id, application)?;
+    let composed = resolve_composed_job_integrity_projection_sqlite_tx(tx, account_id, posting)?;
+    current_attempt_employer_domain(application, &composed)
 }
 
-fn ensure_discovery_authority_in_pg_tx(
+fn ensure_original_source_application_authority_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
-    job_id: &str,
-    now: i64,
-) -> Result<()> {
-    let authorities = tx.query(
-        "SELECT s.status, s.health, m.availability_status, m.last_seen_at_ms
-           FROM jobs_discovery_memberships m
-           JOIN jobs_discovery_sources s ON s.id = m.source_id
-          WHERE m.account_id = $1 AND m.job_id = $2
-          FOR SHARE OF s, m",
-        &[&account_id, &job_id],
+    application: &JobApplication,
+    posting: &JobPosting,
+) -> Result<OperationalHoldEmployerDomain> {
+    approved_submission_snapshot(account_id, application)?;
+    let composed = resolve_composed_job_integrity_projection_postgres_tx_after_prelock(
+        tx, account_id, posting,
     )?;
-    if authorities.is_empty() {
-        return Ok(());
+    current_attempt_employer_domain(application, &composed)
+}
+
+#[cfg(test)]
+mod application_attempt_admission_tests {
+    use super::*;
+
+    fn section<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+        source
+            .split(start)
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing section start: {start}"))
+            .split(end)
+            .next()
+            .unwrap_or_else(|| panic!("missing section end: {end}"))
     }
-    let healthy = authorities.iter().any(|row| {
-        row.get::<_, String>(0) == "active"
-            && row.get::<_, String>(1) == "healthy"
-            && row.get::<_, String>(2) == "active"
-            && row.get::<_, i64>(3) >= now - LIVE_VERIFICATION_MAX_AGE_MS
-    });
-    if !healthy {
-        anyhow::bail!("the discovery source must be healthy before the runner starts")
+
+    fn assert_ordered(source: &str, needles: &[&str]) {
+        let mut previous = None;
+        for needle in needles {
+            let position = source
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing ordered marker: {needle}"));
+            if let Some(previous) = previous {
+                assert!(previous < position, "authority or mutation order inverted");
+            }
+            previous = Some(position);
+        }
     }
-    Ok(())
+
+    #[test]
+    fn attempt_denials_preserve_review_required_and_blocked_types() {
+        let review = attempt_review_required("ats_certification_inactive");
+        assert_eq!(
+            review.downcast_ref::<ApplicationAttemptAdmissionError>(),
+            Some(&ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "ats_certification_inactive".to_string(),
+            })
+        );
+
+        let blocked = attempt_blocked("job_risk_blocked");
+        assert_eq!(
+            blocked.downcast_ref::<ApplicationAttemptAdmissionError>(),
+            Some(&ApplicationAttemptAdmissionError::Blocked {
+                reason_code: "job_risk_blocked".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn reservation_and_running_mutations_follow_complete_current_authority() {
+        let source = include_str!("eligibility.rs");
+        let reservation = section(
+            source,
+            "pub fn reserve_application_attempt(",
+            "pub fn update_attempt_reservation_status(",
+        );
+        let (reservation_sqlite, reservation_postgres) = reservation
+            .split_once("DbPool::Postgres(_) =>")
+            .expect("reservation backend branches");
+        assert_ordered(
+            reservation_sqlite,
+            &[
+                "ensure_original_source_application_authority_sqlite_tx",
+                "require_requested_attempt_runner_sqlite_tx",
+                "UPDATE jobs_attempt_reservations",
+                "INSERT INTO jobs_attempt_reservations",
+            ],
+        );
+        assert_ordered(
+            reservation_postgres,
+            &[
+                "lock_operational_hold_shared_postgres_tx",
+                "lock_managed_cloud_release_registry_shared_postgres_tx",
+                "lock_postgres_ats_certification",
+                "lock_discovery_account_shared_postgres",
+                "load_attempt_authority_inputs_postgres_tx",
+                "SELECT account_id FROM jobs_entitlements",
+                "FROM jobs_attempt_reservations",
+                "ensure_original_source_application_authority_postgres_tx",
+                "require_requested_attempt_runner_postgres_tx_after_prelock",
+                "UPDATE jobs_attempt_reservations",
+                "INSERT INTO jobs_attempt_reservations",
+            ],
+        );
+
+        let running = section(
+            source,
+            "pub fn update_attempt_reservation_status(",
+            "fn ensure_original_source_application_authority_sqlite_tx(",
+        );
+        let (running_sqlite, running_postgres) = running
+            .split_once("DbPool::Postgres(_) =>")
+            .expect("running backend branches");
+        assert!(running.contains(
+            "let requires_running_capability = matches!(status, \"reserved\" | \"running\")"
+        ));
+        assert_ordered(
+            running_sqlite,
+            &[
+                "ensure_original_source_application_authority_sqlite_tx",
+                "require_requested_attempt_runner_sqlite_tx",
+                "UPDATE jobs_attempt_reservations",
+            ],
+        );
+        assert_ordered(
+            running_postgres,
+            &[
+                "lock_operational_hold_shared_postgres_tx",
+                "lock_managed_cloud_release_registry_shared_postgres_tx",
+                "lock_postgres_ats_certification",
+                "lock_discovery_account_shared_postgres",
+                "load_attempt_authority_inputs_postgres_tx",
+                "SELECT local_browser, cloud_browser FROM jobs_entitlements",
+                "FROM jobs_attempt_reservations",
+                "ensure_original_source_application_authority_postgres_tx",
+                "require_requested_attempt_runner_postgres_tx_after_prelock",
+                "UPDATE jobs_attempt_reservations",
+            ],
+        );
+
+        let postgres_capability = section(
+            source,
+            "fn require_attempt_runner_capability_postgres_tx_after_prelock(",
+            "fn require_requested_attempt_runner_sqlite_tx(",
+        );
+        assert!(postgres_capability.contains("current_execution_authorized_postgres_after_prelock"));
+        assert!(!postgres_capability.contains("current_execution_authorized_postgres("));
+    }
 }

@@ -4879,7 +4879,7 @@ fn record_jobs_legacy_target_receipt(
                             first_request_started_at_ms = NULL,
                             last_outcome_code = 'absence_proved', lease_owner = NULL,
                             lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
-                            next_attempt_at_ms = $1 + $2,
+                            next_attempt_at_ms = $1::BIGINT + $2::BIGINT,
                             updated_at_ms = GREATEST($1, updated_at_ms + 1)
                       WHERE generation = $3 AND target_identity_hmac_sha256 = $4
                         AND proof_epoch = $5",
@@ -5717,7 +5717,7 @@ fn record_jobs_v2_target_receipt_postgres(
                     cleanup_request_id = NULL, first_request_started_at_ms = NULL,
                     last_outcome_code = 'absence_observed', lease_owner = NULL,
                     lease_token_sha256 = NULL, lease_expires_at_ms = NULL,
-                    next_attempt_at_ms = $1 + $2,
+                    next_attempt_at_ms = $1::BIGINT + $2::BIGINT,
                     updated_at_ms = GREATEST($1, updated_at_ms + 1)
               WHERE account_id = $3 AND workflow_cleanup_generation = $4
                 AND workflow_id = $5",

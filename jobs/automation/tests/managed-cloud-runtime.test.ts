@@ -156,6 +156,29 @@ describe("managed-cloud runtime configuration", () => {
     rmSync(unmeasuredPath);
   });
 
+  it("accepts the measured successor verifier only in jobs-workflows", () => {
+    const successor = {
+      ...MEASUREMENT,
+      roles: [
+        "original_source_verifier",
+        "workflow_gateway",
+        "workflow_worker",
+      ],
+    };
+    writeFileSync(MEASUREMENT_PATH, JSON.stringify(successor) + "\n");
+    const verifier = measureManagedCloudRuntimeIdentity(
+      "original_source_verifier",
+      MEASUREMENT_OPTIONS,
+    );
+    const worker = measureManagedCloudRuntimeIdentity(
+      "workflow_worker",
+      MEASUREMENT_OPTIONS,
+    );
+    expect(verifier.componentId).toBe("jobs-workflows");
+    expect(verifier.runtimeIdentitySha256).not.toBe(worker.runtimeIdentitySha256);
+    writeFileSync(MEASUREMENT_PATH, JSON.stringify(MEASUREMENT) + "\n");
+  });
+
   it("measures the normalized regular managed runner Node binary", () => {
     const root = mkdtempSync(join(tmpdir(), "bluey-runner-measurement-"));
     const files = [

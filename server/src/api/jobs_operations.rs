@@ -562,7 +562,15 @@ mod tests {
         .unwrap();
 
         assert!(!readiness.ready);
-        assert_eq!(readiness.capabilities.len(), 7);
+        assert_eq!(readiness.capabilities.len(), 8);
+        let original_source_verification = readiness
+            .capabilities
+            .iter()
+            .find(|value| value.capability == OperationalCapability::OriginalSourceVerification)
+            .unwrap();
+        assert_eq!(original_source_verification.operational_hold_count, 1);
+        assert_eq!(original_source_verification.native_blocker_count, 0);
+        assert_eq!(original_source_verification.blocker_count, 1);
         let generation = readiness
             .capabilities
             .iter()

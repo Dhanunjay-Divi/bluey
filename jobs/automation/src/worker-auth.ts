@@ -4,6 +4,8 @@ const SIGNATURE_VERSION = "bluey-jobs-worker-v1";
 const MANAGED_CLOUD_SIGNATURE_VERSION = "bluey-jobs-worker-v2";
 const SIGNATURE_AUDIENCE = "bluey-jobs-api";
 const SAFE_IDENTIFIER = /^[A-Za-z0-9._:-]+$/;
+const ORIGINAL_SOURCE_ASSIGNMENT_ROUTE =
+  /^\/api\/jobs\/internal\/original-source-verifications\/[A-Za-z0-9_-]{20,128}\/(?:heartbeat|complete|fail)$/;
 
 export type JobsWorkerScope =
   | "application-state"
@@ -11,6 +13,7 @@ export type JobsWorkerScope =
   | "execution"
   | "intervention"
   | "managed-cloud-runtime"
+  | "original-source-verification"
   | "receipt"
   | "runner-volume"
   | "run-events"
@@ -120,6 +123,10 @@ export function jobsWorkerScope(method: string, path: string): JobsWorkerScope |
   if (/^\/api\/jobs\/internal\/managed-cloud\/runtime-grants\/[A-Za-z0-9_-]{20,128}\/claim$/.test(path)
     || /^\/api\/jobs\/internal\/managed-cloud\/runtime-instances\/[A-Za-z0-9_-]{20,128}\/heartbeats$/.test(path)) {
     return "managed-cloud-runtime";
+  }
+  if (path === "/api/jobs/internal/original-source-verifications/lease"
+    || ORIGINAL_SOURCE_ASSIGNMENT_ROUTE.test(path)) {
+    return "original-source-verification";
   }
   if (path.includes("/runner-volumes/")) return "runner-volume";
   if (path.includes("/execution-leases/")) return "execution";

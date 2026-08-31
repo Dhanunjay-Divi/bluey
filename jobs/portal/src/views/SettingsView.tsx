@@ -56,6 +56,7 @@ import {
   BLUEY_MAX_POSTING_AGE_DAYS,
 } from "../lib/search-policy";
 import { money, titleCase } from "../lib/format";
+import { isApprovedTrackPolicyAuthority } from "../lib/track-policy-authority";
 
 interface Props {
   workspace: JobsWorkspace;
@@ -79,6 +80,40 @@ interface Props {
   onDeleteMailbox(connection: MailboxConnection): Promise<void>;
   onSaveAnswerMemory(answer: AnswerMemory): Promise<AnswerMemory>;
   onDeleteAnswerMemory(answer: AnswerMemory): Promise<void>;
+}
+
+export async function saveSearchAndAutomationDefaults(
+  preferences: JobPreferences,
+  profile: CareerProfile,
+  onSavePreferences: Props["onSavePreferences"],
+  onSaveProfile: Props["onSaveProfile"],
+): Promise<void> {
+  // Both saves trigger a server-authoritative workspace readback. Keep them in
+  // commit order so an earlier readback cannot overwrite the later mutation.
+  await onSavePreferences({
+    ...preferences,
+    desired_roles: canonicalTargetRoles(preferences.desired_roles),
+    daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+    max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
+  });
+  await onSaveProfile({
+    ...profile,
+    auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
+    daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
+  });
+}
+
+export type TrackAutoSubmitReadiness = "active" | "needs_review" | "review_first";
+
+export function trackAutoSubmitReadiness(
+  authorizationStatus: string | undefined,
+  policyApproved: boolean,
+): TrackAutoSubmitReadiness {
+  if (authorizationStatus === "active" && policyApproved) return "active";
+  if (authorizationStatus === "active" || authorizationStatus === "needs_review") {
+    return "needs_review";
+  }
+  return "review_first";
 }
 
 export function SettingsView({
@@ -167,19 +202,12 @@ export function SettingsView({
     setLocalError("");
     setSaved("");
     try {
-      await Promise.all([
-        onSavePreferences({
-          ...preferences,
-          desired_roles: canonicalTargetRoles(preferences.desired_roles),
-          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
-          max_posting_age_days: BLUEY_MAX_POSTING_AGE_DAYS,
-        }),
-        onSaveProfile({
-          ...profile,
-          auto_submit_threshold: BLUEY_AUTO_SUBMIT_THRESHOLD,
-          daily_limit: BLUEY_DAILY_APPLICATION_LIMIT,
-        }),
-      ]);
+      await saveSearchAndAutomationDefaults(
+        preferences,
+        profile,
+        onSavePreferences,
+        onSaveProfile,
+      );
       setSearchDirty(false);
       setSaved("Search and automation defaults saved.");
       window.setTimeout(() => setSaved(""), 2600);
@@ -209,13 +237,27 @@ export function SettingsView({
             const autoSubmit = workspace.auto_submit_authorizations.find(
               (authorization) => authorization.career_track_id === track.id,
             );
-            const autoSubmitActive = autoSubmit?.status === "active";
+            const policyAuthority = track.policy.authority;
+            const policyApproved = isApprovedTrackPolicyAuthority(
+              policyAuthority,
+              {
+                ...workspace.profile,
+                applicationIdentityId: track.application_identity_id,
+              },
+            );
+            const autoSubmitReadiness = trackAutoSubmitReadiness(
+              autoSubmit?.status,
+              policyApproved,
+            );
+            const autoSubmitActive = autoSubmitReadiness === "active";
+            const autoSubmitNeedsReview = autoSubmitReadiness === "needs_review";
             const canAuthorize = track.active
               && identity?.verification_status === "verified"
-              && Boolean(workspace.profile.source_resume_asset_id);
+              && Boolean(workspace.profile.source_resume_asset_id)
+              && policyApproved;
             const autoSubmitDetail = autoSubmitActive
               ? "Eligible certified jobs may queue automatically after every server check passes."
-              : autoSubmit?.status === "needs_review"
+              : autoSubmitNeedsReview
                 ? "This Track, resume, or application email changed. Review it before enabling again."
                 : "Review first stays on until you authorize this exact Track, resume, and application email.";
             return (
@@ -231,6 +273,9 @@ export function SettingsView({
                     <small><MapPin size={12} />{track.locations.join(" · ") || "No locations"}</small>
                     <small><MailCheck size={12} />{identity?.email || "Application email required"}</small>
                     <small><FileText size={12} />{workspace.profile.source_resume_name || "Source resume required"}</small>
+                    <small><ShieldCheck size={12} />{policyApproved
+                      ? `Canonical policy approved · revision ${policyAuthority.policy_revision_no}`
+                      : "Canonical policy review required"}</small>
                   </div>
                   <span className={track.active ? "agent-state active" : "agent-state"}>{track.active ? "Active" : "Paused"}</span>
                   <ChevronRight size={17} />
@@ -240,14 +285,14 @@ export function SettingsView({
                     <ShieldCheck size={16} />
                   </span>
                   <div>
-                    <b>{autoSubmitActive ? "Auto-submit enabled" : autoSubmit?.status === "needs_review" ? "Auto-submit needs review" : "Review first"}</b>
+                    <b>{autoSubmitActive ? "Auto-submit enabled" : autoSubmitNeedsReview ? "Auto-submit needs review" : "Review first"}</b>
                     <small>{autoSubmitDetail}</small>
                   </div>
                   <button
                     className={autoSubmitActive ? "button secondary compact" : "button primary compact"}
                     disabled={autoSubmitBusyTrackId === track.id || (!autoSubmitActive && !canAuthorize)}
                     title={!canAuthorize && !autoSubmitActive
-                      ? "Activate the Track, verify its application email, and review the current resume first."
+                      ? "Activate the Track, verify its application email, and approve its current canonical policy first."
                       : undefined}
                     onClick={() => {
                       setLocalError("");
@@ -264,7 +309,7 @@ export function SettingsView({
                       ? "Saving..."
                       : autoSubmitActive
                         ? "Turn off"
-                        : autoSubmit?.status === "needs_review"
+                        : autoSubmitNeedsReview
                           ? "Enable again"
                           : "Enable Auto-submit"}
                   </button>
@@ -662,7 +707,7 @@ function showError(setError: (message: string) => void): (error: unknown) => voi
 
 function emptyTrack(applicationIdentityId?: string): CareerTrack {
   return {
-    id: "",
+    id: crypto.randomUUID(),
     name: "",
     role: "",
     locations: [],
@@ -693,6 +738,7 @@ function normalizeTrack(track: CareerTrack | null, applicationIdentityId?: strin
       employment_types: track.policy?.employment_types || [],
       engagement_types: track.policy?.engagement_types || [],
       work_authorizations: track.policy?.work_authorizations || [],
+      authority: track.policy?.authority,
     },
   };
 }

@@ -5,6 +5,7 @@ ARG BLUEY_JOBS_CONFIG_SCHEMA_SHA256
 ARG BLUEY_JOBS_MIGRATION_SET_SHA256
 ARG BLUEY_JOBS_PROTOCOL_SET_SHA256
 ARG BLUEY_JOBS_SOURCE_COMMIT
+ARG BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=workflow_gateway,workflow_worker
 FROM ${BLUEY_JOBS_NODE_IMAGE} AS build
 
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
@@ -44,6 +45,7 @@ ARG BLUEY_JOBS_CONFIG_SCHEMA_SHA256
 ARG BLUEY_JOBS_MIGRATION_SET_SHA256
 ARG BLUEY_JOBS_PROTOCOL_SET_SHA256
 ARG BLUEY_JOBS_SOURCE_COMMIT
+ARG BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES=workflow_gateway,workflow_worker
 
 WORKDIR /app
 COPY --from=build --chown=node:node /build/node_modules ./node_modules
@@ -62,7 +64,7 @@ RUN node /tmp/managed-cloud-release-gate.mjs runtime-measurement \
         --config-schema-sha256 "$BLUEY_JOBS_CONFIG_SCHEMA_SHA256" \
         --migration-set-sha256 "$BLUEY_JOBS_MIGRATION_SET_SHA256" \
         --protocol-set-sha256 "$BLUEY_JOBS_PROTOCOL_SET_SHA256" \
-        --roles workflow_gateway,workflow_worker \
+        --roles "$BLUEY_JOBS_WORKFLOW_RUNTIME_ROLES" \
         --source-commit "$BLUEY_JOBS_SOURCE_COMMIT" \
         --out /app/.bluey/managed-cloud-runtime-measurement.json \
     && rm -rf /usr/local/lib/node_modules /root/.npm /tmp/* \

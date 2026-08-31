@@ -3,7 +3,12 @@ import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-import { compareJobsSchemas } from "./check-jobs-schema-parity.mjs";
+import {
+  checkPhase613MigrationRegistration,
+  checkPhase614MigrationRegistration,
+  checkPhase614BMigrationRegistration,
+  compareJobsSchemas,
+} from "./check-jobs-schema-parity.mjs";
 import {
   inventoryPackageLock,
   parseProvenanceRows,
@@ -11,11 +16,14 @@ import {
   validateWorkspaceLock,
 } from "./check-provenance-licenses.mjs";
 import { classifyTrackedPath, scanTextForSecrets } from "./privacy-gate.mjs";
+import { checkBusinessMessagingSimulatorContainment } from "./check-business-messaging-simulator-containment.mjs";
 
 const repoRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../..",
 );
+
+const JOBS_CI_TIMEOUT_MINUTES = 90;
 
 function runnerVolumeParitySchema(integerType) {
   const migrationPath =
@@ -66,6 +74,14 @@ function operationalHoldsParitySchema(integerType) {
     integerType === "INTEGER"
       ? "infra/sqlite/server-runtime/052_jobs_operational_holds.sql"
       : "infra/postgres/server-runtime/030_jobs_operational_holds.sql";
+  return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
+}
+
+function phase613ParitySchema(integerType) {
+  const migrationPath =
+    integerType === "INTEGER"
+      ? "infra/sqlite/server-runtime/056_jobs_canonical_taxonomy_authority.sql"
+      : "infra/postgres/server-runtime/034_jobs_canonical_taxonomy_authority.sql";
   return fs.readFileSync(path.join(repoRoot, migrationPath), "utf8");
 }
 
@@ -184,6 +200,119 @@ function testPortalBundleFreshnessWorkflowGuard() {
     assert(
       freshnessIndex > buildIndex,
       `${workflowPath} must reject a stale checked-in Jobs portal bundle after the build`,
+    );
+  }
+}
+
+function validateJobsCiTimeBudget(workflow) {
+  const lines = workflow.split(/\r?\n/);
+  const jobStart = lines.findIndex((line) => line === "  jobs-ci:");
+  if (jobStart < 0) {
+    return ["Jobs CI workflow must define the jobs-ci job"];
+  }
+
+  const nextJobOffset = lines
+    .slice(jobStart + 1)
+    .findIndex((line) => /^  [^\s].*:$/.test(line));
+  const jobEnd =
+    nextJobOffset < 0 ? lines.length : jobStart + 1 + nextJobOffset;
+  const timeoutLines = lines
+    .slice(jobStart + 1, jobEnd)
+    .filter((line) => /^    timeout-minutes:\s*/.test(line));
+  if (timeoutLines.length !== 1) {
+    return ["Jobs CI jobs-ci job must define exactly one timeout-minutes value"];
+  }
+
+  const match = timeoutLines[0].match(/^    timeout-minutes:\s*(\d+)\s*$/);
+  if (!match || Number(match[1]) !== JOBS_CI_TIMEOUT_MINUTES) {
+    return [
+      `Jobs CI jobs-ci timeout must remain exactly ${JOBS_CI_TIMEOUT_MINUTES} minutes`,
+    ];
+  }
+  return [];
+}
+
+function testJobsCiTimeBudgetGuard() {
+  const workflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/jobs-ci.yml"),
+    "utf8",
+  );
+  assert.deepEqual(validateJobsCiTimeBudget(workflow), []);
+
+  const lowered = workflow.replace(
+    `    timeout-minutes: ${JOBS_CI_TIMEOUT_MINUTES}`,
+    "    timeout-minutes: 45",
+  );
+  assert(
+    validateJobsCiTimeBudget(lowered).some((issue) =>
+      issue.includes(`exactly ${JOBS_CI_TIMEOUT_MINUTES} minutes`),
+    ),
+    "Jobs CI guard must reject a regression to the exhausted 45-minute budget",
+  );
+}
+
+function testIntegrationTestSupportContainmentGuard() {
+  const cargo = fs.readFileSync(path.join(repoRoot, "server/Cargo.toml"), "utf8");
+  assert.match(cargo, /\[features\]\s+default = \[\]\s+integration-test-support = \["dep:serial_test"\]/);
+  assert.match(
+    cargo,
+    /\[\[test\]\]\s+name = "integration_e2e"\s+path = "tests\/integration_e2e\.rs"\s+required-features = \["integration-test-support"\]/,
+  );
+  assert.match(cargo, /^bluey-server = \{ path = "\." \}$/m);
+  assert.doesNotMatch(
+    cargo,
+    /^bluey-server = \{ path = "\.", features = \["integration-test-support"\] \}$/m,
+  );
+
+  const normalize = (value) => value.replace(/\s+/g, " ").trim();
+  const occurrences = (value, needle) => value.split(needle).length - 1;
+  const library = normalize(
+    fs.readFileSync(path.join(repoRoot, "server/src/lib.rs"), "utf8"),
+  );
+  assert.match(
+    library,
+    /#\[cfg\(all\(feature = "integration-test-support", not\(debug_assertions\)\)\)\] compile_error!\("integration-test-support must never be enabled in release builds"\);/,
+  );
+
+  const supportPrefix =
+    "cargo test --manifest-path server/Cargo.toml --no-default-features " +
+    "--features integration-test-support --test integration_e2e";
+  const supportClippy =
+    "cargo clippy --manifest-path server/Cargo.toml --no-default-features " +
+    "--features integration-test-support --test integration_e2e -- -D warnings";
+  const jobsCi = normalize(
+    fs.readFileSync(path.join(repoRoot, ".github/workflows/jobs-ci.yml"), "utf8"),
+  );
+  assert.equal(occurrences(jobsCi, supportClippy), 1);
+  assert.equal(occurrences(jobsCi, supportPrefix), 1);
+  assert.equal(occurrences(jobsCi, `${supportPrefix} jobs_`), 0);
+
+  const release = normalize(
+    fs.readFileSync(path.join(repoRoot, ".github/workflows/release.yml"), "utf8"),
+  );
+  assert.equal(occurrences(release, supportClippy), 1);
+  assert.equal(occurrences(release, supportPrefix), 1);
+  assert.equal(
+    occurrences(
+      release,
+      "cargo clippy --manifest-path server/Cargo.toml --all-targets -- -D warnings",
+    ),
+    1,
+  );
+  assert.equal(
+    occurrences(release, "cargo test --manifest-path server/Cargo.toml --all-targets"),
+    1,
+  );
+
+  for (const productionPath of [
+    "server/Dockerfile.jobs",
+    ".github/workflows/jobs-managed-cloud-release.yml",
+  ]) {
+    const productionBuild = fs.readFileSync(path.join(repoRoot, productionPath), "utf8");
+    assert.doesNotMatch(
+      productionBuild,
+      /integration-test-support/,
+      `${productionPath} must never enable integration test support`,
     );
   }
 }
@@ -331,6 +460,7 @@ function jobsParitySchema(integerType) {
     ${atsCertificationParitySchema(integerType)}
     ${communicationExecutionParitySchema(integerType)}
     ${operationalHoldsParitySchema(integerType)}
+    ${phase613ParitySchema(integerType)}
   `;
 }
 
@@ -378,10 +508,123 @@ function assertOperationalHoldDriftRejected({
   );
 }
 
+function assertPhase613DriftRejected({
+  dialect,
+  invariant,
+  original,
+  replacement,
+  sqlite,
+  postgres,
+}) {
+  const phase613Migration = phase613ParitySchema(
+    dialect === "SQLite" ? "INTEGER" : "BIGINT",
+  );
+  const mutatedMigration = replaceFirstForGuardTest(
+    phase613Migration,
+    original,
+    replacement,
+    invariant,
+  );
+  const source = dialect === "SQLite" ? sqlite : postgres;
+  assert(
+    source.includes(phase613Migration),
+    `${dialect} guard fixture must contain the Phase 613 migration`,
+  );
+  const mutated = source.replace(phase613Migration, () => mutatedMigration);
+  const issues =
+    dialect === "SQLite"
+      ? compareJobsSchemas(mutated, postgres)
+      : compareJobsSchemas(sqlite, mutated);
+  assert(
+    issues.some((issue) =>
+      issue.includes(`${dialect} Phase 613 invariant ${invariant}`),
+    ),
+    `${dialect} ${invariant} drift must fail the Phase 613 semantic guard; ` +
+      `issues=${JSON.stringify(issues)}`,
+  );
+}
+
+function assertPhase614BDriftRejected({
+  dialect,
+  invariant,
+  original,
+  replacement,
+  sqlite,
+  postgres,
+}) {
+  const source = dialect === "SQLite" ? sqlite : postgres;
+  const mutated = replaceFirstForGuardTest(
+    source,
+    original,
+    replacement,
+    invariant,
+  );
+  const issues =
+    dialect === "SQLite"
+      ? compareJobsSchemas(mutated, postgres)
+      : compareJobsSchemas(sqlite, mutated);
+  assert(
+    issues.some((issue) =>
+      issue.includes(`${dialect} Phase 614B invariant`),
+    ),
+    `${dialect} ${invariant} drift must fail the Phase 614B semantic guard; ` +
+      `issues=${JSON.stringify(issues)}`,
+  );
+}
+
 function testSchemaParity() {
-  const sqlite = jobsParitySchema("INTEGER");
-  const postgres = jobsParitySchema("BIGINT");
+  const sqlite = [
+    jobsParitySchema("INTEGER"),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/057_jobs_original_source_verification_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql",
+      ),
+      "utf8",
+    ),
+  ].join("\n");
+  const postgres = [
+    jobsParitySchema("BIGINT"),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/035_jobs_original_source_verification_authority.sql",
+      ),
+      "utf8",
+    ),
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql",
+      ),
+      "utf8",
+    ),
+  ].join("\n");
   assert.deepEqual(compareJobsSchemas(sqlite, postgres), []);
+
+  for (const mutation of [
+    {
+      dialect: "SQLite",
+      invariant: "trust-policy root-anchor continuity",
+      original: "predecessor.root_anchor_sha256=NEW.root_anchor_sha256",
+      replacement: "predecessor.root_anchor_sha256<>NEW.root_anchor_sha256",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "signed-authority immutability",
+      original: "RAISE EXCEPTION 'job-integrity signed authority is immutable'",
+      replacement: "RETURN OLD",
+    },
+  ]) {
+    assertPhase614BDriftRejected({ ...mutation, sqlite, postgres });
+  }
 
   for (const mutation of [
     {
@@ -554,6 +797,308 @@ function testSchemaParity() {
   ]) {
     assertOperationalHoldDriftRejected({ ...mutation, sqlite, postgres });
   }
+
+  for (const mutation of [
+    {
+      dialect: "Postgres",
+      invariant: "taxonomy version bounded length",
+      original:
+        "  taxonomy_version                       TEXT NOT NULL\n" +
+        "    CHECK(length(taxonomy_version) BETWEEN 1 AND 64),",
+      replacement:
+        "  taxonomy_version                       TEXT NOT NULL\n" +
+        "    CHECK(length(taxonomy_version) <= 64),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "taxonomy activation timestamp safe-integer range",
+      original:
+        "  activated_at_ms                        BIGINT NOT NULL\n" +
+        "    CHECK(activated_at_ms BETWEEN 0 AND 9007199254740991),",
+      replacement:
+        "  activated_at_ms                        BIGINT NOT NULL\n" +
+        "    CHECK(activated_at_ms >= 0),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "account input generation safe-integer range",
+      original:
+        "  account_id                             TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  account_id                             TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "account previous input generation safe-integer range",
+      original:
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation BETWEEN 0 AND 9007199254740991),",
+      replacement:
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation >= 0),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "account input timestamp safe-integer range",
+      original:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms BETWEEN 0 AND 9007199254740991),\n" +
+        "  UNIQUE(account_id, input_generation),",
+      replacement:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms >= 0),\n" +
+        "  UNIQUE(account_id, input_generation),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "Track input generation safe-integer range",
+      original:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "Track previous input generation safe-integer range",
+      original:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation BETWEEN 0 AND 9007199254740991),",
+      replacement:
+        "  career_track_id                        TEXT NOT NULL,\n" +
+        "  input_generation                       BIGINT NOT NULL\n" +
+        "    CHECK(input_generation BETWEEN 1 AND 9007199254740991),\n" +
+        "  previous_input_generation              BIGINT NOT NULL\n" +
+        "    CHECK(previous_input_generation >= 0),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "Track input timestamp safe-integer range",
+      original:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms BETWEEN 0 AND 9007199254740991),\n" +
+        "  UNIQUE(account_id, career_track_id, input_generation),",
+      replacement:
+        "  changed_at_ms                          BIGINT NOT NULL\n" +
+        "    CHECK(changed_at_ms >= 0),\n" +
+        "  UNIQUE(account_id, career_track_id, input_generation),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision taxonomy activation epoch safe-integer range",
+      original:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision canonicalizer version safe-integer range",
+      original:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch BETWEEN 1 AND 9007199254740991),\n" +
+        "  canonicalizer_schema_version           BIGINT NOT NULL\n" +
+        "    CHECK(canonicalizer_schema_version BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  taxonomy_activation_epoch              BIGINT NOT NULL\n" +
+        "    CHECK(taxonomy_activation_epoch BETWEEN 1 AND 9007199254740991),\n" +
+        "  canonicalizer_schema_version           BIGINT NOT NULL\n" +
+        "    CHECK(canonicalizer_schema_version >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision account input generation safe-integer range",
+      original:
+        "  account_input_generation               BIGINT NOT NULL\n" +
+        "    CHECK(account_input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  account_input_generation               BIGINT NOT NULL\n" +
+        "    CHECK(account_input_generation >= 1),",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy revision Track input generation safe-integer range",
+      original:
+        "  track_input_generation                 BIGINT NOT NULL\n" +
+        "    CHECK(track_input_generation BETWEEN 1 AND 9007199254740991),",
+      replacement:
+        "  track_input_generation                 BIGINT NOT NULL\n" +
+        "    CHECK(track_input_generation >= 1),",
+    },
+    {
+      dialect: "SQLite",
+      invariant: "policy head advances exactly one generation",
+      original: "NEW.head_generation <> OLD.head_generation + 1",
+      replacement: "NEW.head_generation <= OLD.head_generation",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy head predecessor transition binds old head",
+      original:
+        "NEW.predecessor_head_transition_sha256 <> OLD.head_transition_sha256",
+      replacement:
+        "NEW.predecessor_head_transition_sha256 = OLD.head_transition_sha256",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "policy head binds immutable event review receipt",
+      original: "AND event.review_receipt_id = NEW.review_receipt_id",
+      replacement: "AND event.review_receipt_id <> NEW.review_receipt_id",
+    },
+    {
+      dialect: "Postgres",
+      invariant: "taxonomy activation changed-tuple requirement",
+      original:
+        "AND NOT (\n" +
+        "             predecessor.taxonomy_version = NEW.taxonomy_version",
+      replacement:
+        "AND (\n" +
+        "             predecessor.taxonomy_version = NEW.taxonomy_version",
+    },
+  ]) {
+    assertPhase613DriftRejected({ ...mutation, sqlite, postgres });
+  }
+
+  const missingTrackPolicyTable = sqlite.replace(
+    /CREATE TABLE IF NOT EXISTS jobs_track_policy_taxonomy_activation_events \([\s\S]*?\n\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(missingTrackPolicyTable, postgres).some((issue) =>
+      issue.includes("SQLite parity tables"),
+    ),
+  );
+
+  const missingTrackPolicyIndex = postgres.replace(
+    /CREATE INDEX IF NOT EXISTS idx_jobs_track_policy_account_input_transitions_history[\s\S]*?input_generation DESC\s*\);/,
+    "",
+  );
+  assert(
+    compareJobsSchemas(sqlite, missingTrackPolicyIndex).some((issue) =>
+      issue.includes(
+        "Postgres jobs_track_policy_account_input_transitions required index",
+      ),
+    ),
+  );
+
+  const migrationRunner = fs.readFileSync(
+    path.join(repoRoot, "server/src/db/mod.rs"),
+    "utf8",
+  );
+  assert.deepEqual(checkPhase613MigrationRegistration(migrationRunner), []);
+  assert.deepEqual(checkPhase614MigrationRegistration(migrationRunner), []);
+  assert.deepEqual(checkPhase614BMigrationRegistration(migrationRunner), []);
+  const missingSqliteMigrationRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n" +
+      "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
+      "    // lease, circuit, quarantine, and exact current-head authority.\n" +
+      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "    // 0057 - replay-safe original-source assignment, receipt, transition,\n" +
+      "    // lease, circuit, quarantine, and exact current-head authority.\n" +
+      "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "SQLite 056 migration registration",
+  );
+  assert(
+    checkPhase613MigrationRegistration(missingSqliteMigrationRegistration).some(
+      (issue) => issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresMigrationRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,\n" +
+      "    ),\n",
+    "",
+    "Postgres 034 migration registration",
+  );
+  assert(
+    checkPhase613MigrationRegistration(
+      missingPostgresMigrationRegistration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
+  const missingSqlitePhase614Registration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "    // 0058 - dual-role signed employer-identity and job-risk authority.\n" +
+      "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n];",
+    "SQLite 057 migration registration",
+  );
+  assert(
+    checkPhase614MigrationRegistration(missingSqlitePhase614Registration).some(
+      (issue) => issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresPhase614Registration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,\n" +
+      "    ),\n",
+    "",
+    "Postgres 035 migration registration",
+  );
+  assert(
+    checkPhase614MigrationRegistration(
+      missingPostgresPhase614Registration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
+  const missingSqlitePhase614BRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n",
+    "",
+    "SQLite 058 migration registration",
+  );
+  assert(
+    checkPhase614BMigrationRegistration(
+      missingSqlitePhase614BRegistration,
+    ).some((issue) =>
+      issue.includes("SQLite migration runner must register"),
+    ),
+  );
+  const missingPostgresPhase614BRegistration = replaceFirstForGuardTest(
+    migrationRunner,
+    "    (\n" +
+      "        JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,\n" +
+      "        POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,\n" +
+      "    ),\n",
+    "",
+    "Postgres 036 migration registration",
+  );
+  assert(
+    checkPhase614BMigrationRegistration(
+      missingPostgresPhase614BRegistration,
+    ).some((issue) =>
+      issue.includes("Postgres migration runner must register"),
+    ),
+  );
 
   const missingAtsBindingTable = sqlite.replace(
     /CREATE TABLE IF NOT EXISTS jobs_application_ats_certification_bindings \([\s\S]*?\n\);/,
@@ -1000,11 +1545,14 @@ function testProvenance() {
 testPrivacyPaths();
 testSecretScanning();
 testPortalBundleFreshnessWorkflowGuard();
+testJobsCiTimeBudgetGuard();
+testIntegrationTestSupportContainmentGuard();
+checkBusinessMessagingSimulatorContainment();
 testSchemaParity();
 testLicenseInventory();
 testProvenance();
 
 console.log(
-  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, " +
-    "lock inventory, and provenance).",
+  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, time budget, schema parity, " +
+  "integration and business-messaging simulator containment, lock inventory, and provenance).",
 );

@@ -1,0 +1,1223 @@
+{
+  "schema_version": 1,
+  "taxonomy_version": "bluey-jobs-taxonomy-v1-2026-08-25",
+  "role_families": [
+    { "id": "software-engineering", "label": "Software Engineering" },
+    { "id": "data-and-ai", "label": "Data and AI" },
+    { "id": "product-management", "label": "Product Management" },
+    { "id": "project-management", "label": "Project Management" },
+    { "id": "program-management", "label": "Program Management" },
+    { "id": "clinical-research", "label": "Clinical Research" },
+    { "id": "healthcare-data", "label": "Healthcare Data" },
+    { "id": "regulatory-affairs", "label": "Regulatory Affairs" },
+    { "id": "design-and-research", "label": "Design and Research" },
+    { "id": "business-and-operations", "label": "Business and Operations" },
+    { "id": "finance-and-accounting", "label": "Finance and Accounting" },
+    { "id": "marketing-and-growth", "label": "Marketing and Growth" },
+    { "id": "sales", "label": "Sales" },
+    { "id": "customer-success", "label": "Customer Success" },
+    { "id": "people-and-talent", "label": "People and Talent" },
+    { "id": "solutions-engineering", "label": "Solutions Engineering" }
+  ],
+  "roles": [
+    {
+      "id": "software-engineer",
+      "label": "Software Engineer",
+      "family_id": "software-engineering",
+      "aliases": [
+        "Software Engineer",
+        "Software Developer",
+        "Software Development Engineer",
+        "Application Developer",
+        "Senior Software Engineer",
+        "Staff Software Engineer",
+        "Principal Software Engineer",
+        "SWE",
+        "SDE"
+      ]
+    },
+    {
+      "id": "backend-engineer",
+      "label": "Backend Engineer",
+      "family_id": "software-engineering",
+      "aliases": [
+        "Backend Engineer",
+        "Back-end Engineer",
+        "Backend Developer",
+        "Backend",
+        "Back-end",
+        "Server Engineer"
+      ]
+    },
+    {
+      "id": "frontend-engineer",
+      "label": "Frontend Engineer",
+      "family_id": "software-engineering",
+      "aliases": [
+        "Frontend Engineer",
+        "Front-end Engineer",
+        "Frontend Developer",
+        "Frontend",
+        "Front-end",
+        "UI Engineer"
+      ]
+    },
+    {
+      "id": "full-stack-engineer",
+      "label": "Full-stack Engineer",
+      "family_id": "software-engineering",
+      "aliases": [
+        "Full-stack Engineer",
+        "Full Stack Engineer",
+        "Fullstack Engineer",
+        "Full Stack",
+        "Fullstack",
+        "Full Stack Developer"
+      ]
+    },
+    {
+      "id": "platform-engineer",
+      "label": "Platform Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["Platform Engineer"]
+    },
+    {
+      "id": "devops-engineer",
+      "label": "DevOps Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["DevOps Engineer", "DevOps"]
+    },
+    {
+      "id": "site-reliability-engineer",
+      "label": "Site Reliability Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["Site Reliability Engineer", "SRE"]
+    },
+    {
+      "id": "mobile-engineer",
+      "label": "Mobile Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["Mobile Engineer", "Mobile Developer"]
+    },
+    {
+      "id": "cloud-engineer",
+      "label": "Cloud Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["Cloud Engineer"]
+    },
+    {
+      "id": "security-engineer",
+      "label": "Security Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["Security Engineer"]
+    },
+    {
+      "id": "quality-assurance-engineer",
+      "label": "Quality Assurance Engineer",
+      "family_id": "software-engineering",
+      "aliases": ["Quality Assurance Engineer", "QA Engineer", "Test Engineer", "QA"]
+    },
+    {
+      "id": "data-engineer",
+      "label": "Data Engineer",
+      "family_id": "data-and-ai",
+      "aliases": ["Data Engineer", "Senior Data Engineer", "Data Developer", "DE"]
+    },
+    {
+      "id": "data-analyst",
+      "label": "Data Analyst",
+      "family_id": "data-and-ai",
+      "aliases": ["Data Analyst"]
+    },
+    {
+      "id": "data-scientist",
+      "label": "Data Scientist",
+      "family_id": "data-and-ai",
+      "aliases": ["Data Scientist"]
+    },
+    {
+      "id": "machine-learning-engineer",
+      "label": "Machine Learning Engineer",
+      "family_id": "data-and-ai",
+      "aliases": ["Machine Learning Engineer", "ML Engineer", "MLE"]
+    },
+    {
+      "id": "ai-engineer",
+      "label": "AI Engineer",
+      "family_id": "data-and-ai",
+      "aliases": ["AI Engineer", "Artificial Intelligence Engineer"]
+    },
+    {
+      "id": "business-intelligence-analyst",
+      "label": "Business Intelligence Analyst",
+      "family_id": "data-and-ai",
+      "aliases": ["Business Intelligence Analyst", "BI Analyst"]
+    },
+    {
+      "id": "product-manager",
+      "label": "Product Manager",
+      "family_id": "product-management",
+      "aliases": ["Product Manager", "Product Owner"]
+    },
+    {
+      "id": "technical-product-manager",
+      "label": "Technical Product Manager",
+      "family_id": "product-management",
+      "aliases": ["Technical Product Manager"]
+    },
+    {
+      "id": "project-manager",
+      "label": "Project Manager",
+      "family_id": "project-management",
+      "aliases": ["Project Manager"]
+    },
+    {
+      "id": "program-manager",
+      "label": "Program Manager",
+      "family_id": "program-management",
+      "aliases": ["Program Manager"]
+    },
+    {
+      "id": "technical-program-manager",
+      "label": "Technical Program Manager",
+      "family_id": "program-management",
+      "aliases": ["Technical Program Manager"]
+    },
+    {
+      "id": "clinical-research-associate",
+      "label": "Clinical Research Associate",
+      "family_id": "clinical-research",
+      "aliases": ["Clinical Research Associate", "CRA"]
+    },
+    {
+      "id": "clinical-research-coordinator",
+      "label": "Clinical Research Coordinator",
+      "family_id": "clinical-research",
+      "aliases": ["Clinical Research Coordinator", "CRC"]
+    },
+    {
+      "id": "clinical-research-analyst",
+      "label": "Clinical Research Analyst",
+      "family_id": "clinical-research",
+      "aliases": ["Clinical Research Analyst", "Lead Clinical Research Analyst"]
+    },
+    {
+      "id": "clinical-operations-manager",
+      "label": "Clinical Operations Manager",
+      "family_id": "clinical-research",
+      "aliases": ["Clinical Operations Manager", "Director of Clinical Operations"]
+    },
+    {
+      "id": "healthcare-data-analyst",
+      "label": "Healthcare Data Analyst",
+      "family_id": "healthcare-data",
+      "aliases": ["Healthcare Data Analyst"]
+    },
+    {
+      "id": "health-informatics-analyst",
+      "label": "Health Informatics Analyst",
+      "family_id": "healthcare-data",
+      "aliases": ["Health Informatics Analyst"]
+    },
+    {
+      "id": "epic-analyst",
+      "label": "Epic Analyst",
+      "family_id": "healthcare-data",
+      "aliases": ["Epic Analyst"]
+    },
+    {
+      "id": "medical-records-analyst",
+      "label": "Medical Records Analyst",
+      "family_id": "healthcare-data",
+      "aliases": ["Medical Records Analyst"]
+    },
+    {
+      "id": "regulatory-affairs-specialist",
+      "label": "Regulatory Affairs Specialist",
+      "family_id": "regulatory-affairs",
+      "aliases": ["Regulatory Affairs Specialist"]
+    },
+    {
+      "id": "research-program-manager",
+      "label": "Research Program Manager",
+      "family_id": "program-management",
+      "aliases": ["Research Program Manager"]
+    },
+    {
+      "id": "ux-designer",
+      "label": "UX Designer",
+      "family_id": "design-and-research",
+      "aliases": ["UX Designer", "User Experience Designer"]
+    },
+    {
+      "id": "product-designer",
+      "label": "Product Designer",
+      "family_id": "design-and-research",
+      "aliases": ["Product Designer"]
+    },
+    {
+      "id": "ux-researcher",
+      "label": "UX Researcher",
+      "family_id": "design-and-research",
+      "aliases": ["UX Researcher", "User Experience Researcher"]
+    },
+    {
+      "id": "business-analyst",
+      "label": "Business Analyst",
+      "family_id": "business-and-operations",
+      "aliases": ["Business Analyst"]
+    },
+    {
+      "id": "operations-manager",
+      "label": "Operations Manager",
+      "family_id": "business-and-operations",
+      "aliases": ["Operations Manager"]
+    },
+    {
+      "id": "strategy-consultant",
+      "label": "Strategy Consultant",
+      "family_id": "business-and-operations",
+      "aliases": ["Strategy Consultant"]
+    },
+    {
+      "id": "financial-analyst",
+      "label": "Financial Analyst",
+      "family_id": "finance-and-accounting",
+      "aliases": ["Financial Analyst"]
+    },
+    {
+      "id": "accountant",
+      "label": "Accountant",
+      "family_id": "finance-and-accounting",
+      "aliases": ["Accountant"]
+    },
+    {
+      "id": "marketing-manager",
+      "label": "Marketing Manager",
+      "family_id": "marketing-and-growth",
+      "aliases": ["Marketing Manager"]
+    },
+    {
+      "id": "growth-marketing-manager",
+      "label": "Growth Marketing Manager",
+      "family_id": "marketing-and-growth",
+      "aliases": ["Growth Marketing Manager"]
+    },
+    {
+      "id": "sales-development-representative",
+      "label": "Sales Development Representative",
+      "family_id": "sales",
+      "aliases": ["Sales Development Representative", "SDR"]
+    },
+    {
+      "id": "account-executive",
+      "label": "Account Executive",
+      "family_id": "sales",
+      "aliases": ["Account Executive"]
+    },
+    {
+      "id": "customer-success-manager",
+      "label": "Customer Success Manager",
+      "family_id": "customer-success",
+      "aliases": ["Customer Success Manager", "CSM"]
+    },
+    {
+      "id": "human-resources-business-partner",
+      "label": "Human Resources Business Partner",
+      "family_id": "people-and-talent",
+      "aliases": ["Human Resources Business Partner", "HR Business Partner", "HRBP"]
+    },
+    {
+      "id": "recruiter",
+      "label": "Recruiter",
+      "family_id": "people-and-talent",
+      "aliases": ["Recruiter"]
+    },
+    {
+      "id": "solutions-architect",
+      "label": "Solutions Architect",
+      "family_id": "solutions-engineering",
+      "aliases": ["Solutions Architect", "Solution Architect"]
+    },
+    {
+      "id": "solutions-engineer",
+      "label": "Solutions Engineer",
+      "family_id": "solutions-engineering",
+      "aliases": ["Solutions Engineer", "Solution Engineer"]
+    }
+  ],
+  "ambiguous_role_aliases": [
+    {
+      "alias": "PM",
+      "candidate_role_ids": ["product-manager", "project-manager", "program-manager"],
+      "reason": "PM can mean product manager, project manager, or program manager."
+    },
+    {
+      "alias": "TPM",
+      "candidate_role_ids": [
+        "technical-product-manager",
+        "technical-program-manager"
+      ],
+      "reason": "TPM can mean technical product manager or technical program manager."
+    }
+  ],
+  "skills": [
+    { "id": "go", "label": "Go", "aliases": ["Go", "Golang"] },
+    { "id": "r", "label": "R", "aliases": ["R", "R language", "R programming"] },
+    { "id": "c", "label": "C", "aliases": ["C", "C language", "C programming"] },
+    { "id": "cpp", "label": "C++", "aliases": ["C++", "CPP"] },
+    { "id": "csharp", "label": "C#", "aliases": ["C#", "C Sharp"] },
+    { "id": "fsharp", "label": "F#", "aliases": ["F#", "F Sharp"] },
+    { "id": "dotnet", "label": ".NET", "aliases": [".NET", "dotnet", "ASP.NET"] },
+    {
+      "id": "objective-c",
+      "label": "Objective-C",
+      "aliases": ["Objective-C", "Objective C", "Obj-C"]
+    },
+    {
+      "id": "nodejs",
+      "label": "Node.js",
+      "aliases": ["Node.js", "NodeJS", "Node JS"]
+    },
+    {
+      "id": "artificial-intelligence",
+      "label": "Artificial Intelligence",
+      "aliases": ["AI", "Artificial Intelligence"]
+    },
+    {
+      "id": "clinical-research",
+      "label": "Clinical Research",
+      "aliases": ["Clinical Research"]
+    },
+    {
+      "id": "clinical-operations",
+      "label": "Clinical Operations",
+      "aliases": ["Clinical Operations"]
+    },
+    {
+      "id": "clinical-documentation",
+      "label": "Clinical Documentation",
+      "aliases": ["Clinical Documentation"]
+    },
+    {
+      "id": "health-informatics",
+      "label": "Health Informatics",
+      "aliases": ["Health Informatics"]
+    },
+    { "id": "epic-emr", "label": "Epic EMR", "aliases": ["Epic EMR", "Epic"] },
+    { "id": "redcap", "label": "REDCap", "aliases": ["REDCap"] },
+    { "id": "hipaa", "label": "HIPAA", "aliases": ["HIPAA"] },
+    {
+      "id": "good-clinical-practice",
+      "label": "Good Clinical Practice",
+      "aliases": ["Good Clinical Practice", "GCP"]
+    },
+    {
+      "id": "protocol-development",
+      "label": "Protocol Development",
+      "aliases": ["Protocol Development"]
+    },
+    {
+      "id": "regulatory-compliance",
+      "label": "Regulatory Compliance",
+      "aliases": ["Regulatory Compliance"]
+    },
+    {
+      "id": "patient-recruitment",
+      "label": "Patient Recruitment",
+      "aliases": ["Patient Recruitment"]
+    },
+    {
+      "id": "data-management",
+      "label": "Data Management",
+      "aliases": ["Data Management"]
+    },
+    { "id": "python", "label": "Python", "aliases": ["Python"] },
+    { "id": "rust", "label": "Rust", "aliases": ["Rust"] },
+    { "id": "java", "label": "Java", "aliases": ["Java"] },
+    {
+      "id": "javascript",
+      "label": "JavaScript",
+      "aliases": ["JavaScript", "JS"]
+    },
+    {
+      "id": "typescript",
+      "label": "TypeScript",
+      "aliases": ["TypeScript", "TS"]
+    },
+    { "id": "sql", "label": "SQL", "aliases": ["SQL"] },
+    {
+      "id": "postgresql",
+      "label": "PostgreSQL",
+      "aliases": ["PostgreSQL", "Postgres"]
+    },
+    { "id": "react", "label": "React", "aliases": ["React", "React.js", "ReactJS"] },
+    { "id": "aws", "label": "AWS", "aliases": ["AWS", "Amazon Web Services"] },
+    { "id": "azure", "label": "Azure", "aliases": ["Azure", "Microsoft Azure"] },
+    {
+      "id": "google-cloud",
+      "label": "Google Cloud",
+      "aliases": ["Google Cloud", "Google Cloud Platform"]
+    },
+    { "id": "docker", "label": "Docker", "aliases": ["Docker"] },
+    {
+      "id": "kubernetes",
+      "label": "Kubernetes",
+      "aliases": ["Kubernetes", "K8s"]
+    },
+    {
+      "id": "machine-learning",
+      "label": "Machine Learning",
+      "aliases": ["Machine Learning", "ML"]
+    },
+    {
+      "id": "data-analysis",
+      "label": "Data Analysis",
+      "aliases": ["Data Analysis", "Data Analytics"]
+    },
+    {
+      "id": "project-management",
+      "label": "Project Management",
+      "aliases": ["Project Management"]
+    },
+    {
+      "id": "product-management",
+      "label": "Product Management",
+      "aliases": ["Product Management"]
+    },
+    { "id": "agile", "label": "Agile", "aliases": ["Agile"] },
+    { "id": "figma", "label": "Figma", "aliases": ["Figma"] },
+    { "id": "tableau", "label": "Tableau", "aliases": ["Tableau"] },
+    { "id": "power-bi", "label": "Power BI", "aliases": ["Power BI", "PowerBI"] },
+    { "id": "salesforce", "label": "Salesforce", "aliases": ["Salesforce"] }
+  ],
+  "countries": [
+    {
+      "code": "US",
+      "label": "United States",
+      "aliases": [
+        "United States",
+        "United States of America",
+        "USA",
+        "U.S.",
+        "U.S.A.",
+        "US only",
+        "United States only"
+      ]
+    },
+    {
+      "code": "CA",
+      "label": "Canada",
+      "aliases": ["Canada", "Canada only"]
+    },
+    {
+      "code": "GB",
+      "label": "United Kingdom",
+      "aliases": ["United Kingdom", "UK", "U.K.", "Great Britain", "Britain"]
+    },
+    {
+      "code": "IN",
+      "label": "India",
+      "aliases": ["India", "Republic of India"]
+    }
+  ],
+  "subdivisions": [
+    { "country_code": "US", "code": "AL", "label": "Alabama", "aliases": [] },
+    { "country_code": "US", "code": "AK", "label": "Alaska", "aliases": [] },
+    { "country_code": "US", "code": "AZ", "label": "Arizona", "aliases": [] },
+    { "country_code": "US", "code": "AR", "label": "Arkansas", "aliases": [] },
+    { "country_code": "US", "code": "CA", "label": "California", "aliases": [] },
+    { "country_code": "US", "code": "CO", "label": "Colorado", "aliases": [] },
+    { "country_code": "US", "code": "CT", "label": "Connecticut", "aliases": [] },
+    { "country_code": "US", "code": "DE", "label": "Delaware", "aliases": [] },
+    {
+      "country_code": "US",
+      "code": "DC",
+      "label": "District of Columbia",
+      "aliases": ["Washington DC", "Washington D.C."]
+    },
+    { "country_code": "US", "code": "FL", "label": "Florida", "aliases": [] },
+    { "country_code": "US", "code": "GA", "label": "Georgia", "aliases": [] },
+    { "country_code": "US", "code": "HI", "label": "Hawaii", "aliases": [] },
+    { "country_code": "US", "code": "ID", "label": "Idaho", "aliases": [] },
+    { "country_code": "US", "code": "IL", "label": "Illinois", "aliases": [] },
+    { "country_code": "US", "code": "IN", "label": "Indiana", "aliases": [] },
+    { "country_code": "US", "code": "IA", "label": "Iowa", "aliases": [] },
+    { "country_code": "US", "code": "KS", "label": "Kansas", "aliases": [] },
+    { "country_code": "US", "code": "KY", "label": "Kentucky", "aliases": [] },
+    { "country_code": "US", "code": "LA", "label": "Louisiana", "aliases": [] },
+    { "country_code": "US", "code": "ME", "label": "Maine", "aliases": [] },
+    { "country_code": "US", "code": "MD", "label": "Maryland", "aliases": [] },
+    { "country_code": "US", "code": "MA", "label": "Massachusetts", "aliases": [] },
+    { "country_code": "US", "code": "MI", "label": "Michigan", "aliases": [] },
+    { "country_code": "US", "code": "MN", "label": "Minnesota", "aliases": [] },
+    { "country_code": "US", "code": "MS", "label": "Mississippi", "aliases": [] },
+    { "country_code": "US", "code": "MO", "label": "Missouri", "aliases": [] },
+    { "country_code": "US", "code": "MT", "label": "Montana", "aliases": [] },
+    { "country_code": "US", "code": "NE", "label": "Nebraska", "aliases": [] },
+    { "country_code": "US", "code": "NV", "label": "Nevada", "aliases": [] },
+    { "country_code": "US", "code": "NH", "label": "New Hampshire", "aliases": [] },
+    { "country_code": "US", "code": "NJ", "label": "New Jersey", "aliases": [] },
+    { "country_code": "US", "code": "NM", "label": "New Mexico", "aliases": [] },
+    { "country_code": "US", "code": "NY", "label": "New York", "aliases": [] },
+    { "country_code": "US", "code": "NC", "label": "North Carolina", "aliases": [] },
+    { "country_code": "US", "code": "ND", "label": "North Dakota", "aliases": [] },
+    { "country_code": "US", "code": "OH", "label": "Ohio", "aliases": [] },
+    { "country_code": "US", "code": "OK", "label": "Oklahoma", "aliases": [] },
+    { "country_code": "US", "code": "OR", "label": "Oregon", "aliases": [] },
+    { "country_code": "US", "code": "PA", "label": "Pennsylvania", "aliases": [] },
+    { "country_code": "US", "code": "RI", "label": "Rhode Island", "aliases": [] },
+    { "country_code": "US", "code": "SC", "label": "South Carolina", "aliases": [] },
+    { "country_code": "US", "code": "SD", "label": "South Dakota", "aliases": [] },
+    { "country_code": "US", "code": "TN", "label": "Tennessee", "aliases": [] },
+    { "country_code": "US", "code": "TX", "label": "Texas", "aliases": [] },
+    { "country_code": "US", "code": "UT", "label": "Utah", "aliases": [] },
+    { "country_code": "US", "code": "VT", "label": "Vermont", "aliases": [] },
+    { "country_code": "US", "code": "VA", "label": "Virginia", "aliases": [] },
+    { "country_code": "US", "code": "WA", "label": "Washington", "aliases": [] },
+    { "country_code": "US", "code": "WV", "label": "West Virginia", "aliases": [] },
+    { "country_code": "US", "code": "WI", "label": "Wisconsin", "aliases": [] },
+    { "country_code": "US", "code": "WY", "label": "Wyoming", "aliases": [] },
+    { "country_code": "CA", "code": "AB", "label": "Alberta", "aliases": [] },
+    {
+      "country_code": "CA",
+      "code": "BC",
+      "label": "British Columbia",
+      "aliases": []
+    },
+    { "country_code": "CA", "code": "MB", "label": "Manitoba", "aliases": [] },
+    { "country_code": "CA", "code": "NB", "label": "New Brunswick", "aliases": [] },
+    {
+      "country_code": "CA",
+      "code": "NL",
+      "label": "Newfoundland and Labrador",
+      "aliases": ["Newfoundland", "Labrador"]
+    },
+    { "country_code": "CA", "code": "NS", "label": "Nova Scotia", "aliases": [] },
+    {
+      "country_code": "CA",
+      "code": "NT",
+      "label": "Northwest Territories",
+      "aliases": []
+    },
+    { "country_code": "CA", "code": "NU", "label": "Nunavut", "aliases": [] },
+    { "country_code": "CA", "code": "ON", "label": "Ontario", "aliases": [] },
+    {
+      "country_code": "CA",
+      "code": "PE",
+      "label": "Prince Edward Island",
+      "aliases": ["PEI"]
+    },
+    { "country_code": "CA", "code": "QC", "label": "Quebec", "aliases": ["Quebec"] },
+    { "country_code": "CA", "code": "SK", "label": "Saskatchewan", "aliases": [] },
+    { "country_code": "CA", "code": "YT", "label": "Yukon", "aliases": [] }
+  ],
+  "metros": [
+    {
+      "id": "US-NY-new-york-metro",
+      "label": "New York City Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-NY"],
+      "aliases": ["New York Metro", "NYC Metro", "New York Metropolitan Area"],
+      "cities": [
+        {
+          "id": "US-NY-new-york",
+          "label": "New York",
+          "subdivision_id": "US-NY",
+          "aliases": ["New York City", "NYC"]
+        }
+      ]
+    },
+    {
+      "id": "US-CA-san-francisco-bay-area",
+      "label": "San Francisco Bay Area",
+      "country_code": "US",
+      "subdivision_ids": ["US-CA"],
+      "aliases": ["Bay Area", "SF Bay Area", "San Francisco Metro"],
+      "cities": [
+        {
+          "id": "US-CA-san-francisco",
+          "label": "San Francisco",
+          "subdivision_id": "US-CA",
+          "aliases": ["SF"]
+        },
+        {
+          "id": "US-CA-san-jose",
+          "label": "San Jose",
+          "subdivision_id": "US-CA",
+          "aliases": ["San José"]
+        }
+      ]
+    },
+    {
+      "id": "US-CA-los-angeles-metro",
+      "label": "Los Angeles Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-CA"],
+      "aliases": ["Greater Los Angeles", "LA Metro"],
+      "cities": [
+        {
+          "id": "US-CA-los-angeles",
+          "label": "Los Angeles",
+          "subdivision_id": "US-CA",
+          "aliases": ["LA"]
+        }
+      ]
+    },
+    {
+      "id": "US-CA-san-diego-metro",
+      "label": "San Diego Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-CA"],
+      "aliases": ["San Diego Metropolitan Area"],
+      "cities": [
+        {
+          "id": "US-CA-san-diego",
+          "label": "San Diego",
+          "subdivision_id": "US-CA",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-WA-seattle-metro",
+      "label": "Seattle Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-WA"],
+      "aliases": ["Greater Seattle"],
+      "cities": [
+        {
+          "id": "US-WA-seattle",
+          "label": "Seattle",
+          "subdivision_id": "US-WA",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-TX-austin-metro",
+      "label": "Austin Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-TX"],
+      "aliases": ["Greater Austin"],
+      "cities": [
+        {
+          "id": "US-TX-austin",
+          "label": "Austin",
+          "subdivision_id": "US-TX",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-TX-dallas-fort-worth",
+      "label": "Dallas-Fort Worth Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-TX"],
+      "aliases": ["Dallas Metro", "DFW", "Dallas-Fort Worth"],
+      "cities": [
+        {
+          "id": "US-TX-dallas",
+          "label": "Dallas",
+          "subdivision_id": "US-TX",
+          "aliases": []
+        },
+        {
+          "id": "US-TX-fort-worth",
+          "label": "Fort Worth",
+          "subdivision_id": "US-TX",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-TX-houston-metro",
+      "label": "Houston Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-TX"],
+      "aliases": ["Greater Houston"],
+      "cities": [
+        {
+          "id": "US-TX-houston",
+          "label": "Houston",
+          "subdivision_id": "US-TX",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-IL-chicago-metro",
+      "label": "Chicago Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-IL"],
+      "aliases": ["Chicagoland", "Greater Chicago"],
+      "cities": [
+        {
+          "id": "US-IL-chicago",
+          "label": "Chicago",
+          "subdivision_id": "US-IL",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-MA-boston-metro",
+      "label": "Boston Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-MA"],
+      "aliases": ["Greater Boston"],
+      "cities": [
+        {
+          "id": "US-MA-boston",
+          "label": "Boston",
+          "subdivision_id": "US-MA",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-DC-washington-metro",
+      "label": "Washington Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-DC", "US-VA"],
+      "aliases": ["DC Metro", "DMV", "Washington Metropolitan Area"],
+      "cities": [
+        {
+          "id": "US-DC-washington",
+          "label": "Washington",
+          "subdivision_id": "US-DC",
+          "aliases": ["Washington DC", "Washington D.C."]
+        },
+        {
+          "id": "US-VA-arlington",
+          "label": "Arlington",
+          "subdivision_id": "US-VA",
+          "aliases": []
+        },
+        {
+          "id": "US-VA-falls-church",
+          "label": "Falls Church",
+          "subdivision_id": "US-VA",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-GA-atlanta-metro",
+      "label": "Atlanta Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-GA"],
+      "aliases": ["Metro Atlanta", "Greater Atlanta"],
+      "cities": [
+        {
+          "id": "US-GA-atlanta",
+          "label": "Atlanta",
+          "subdivision_id": "US-GA",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-CO-denver-metro",
+      "label": "Denver Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-CO"],
+      "aliases": ["Greater Denver"],
+      "cities": [
+        {
+          "id": "US-CO-denver",
+          "label": "Denver",
+          "subdivision_id": "US-CO",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-NC-raleigh-metro",
+      "label": "Raleigh Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-NC"],
+      "aliases": ["Research Triangle", "Raleigh-Durham", "Triangle Area"],
+      "cities": [
+        {
+          "id": "US-NC-raleigh",
+          "label": "Raleigh",
+          "subdivision_id": "US-NC",
+          "aliases": []
+        },
+        {
+          "id": "US-NC-durham",
+          "label": "Durham",
+          "subdivision_id": "US-NC",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-NC-charlotte-metro",
+      "label": "Charlotte Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-NC"],
+      "aliases": ["Metrolina", "Greater Charlotte"],
+      "cities": [
+        {
+          "id": "US-NC-charlotte",
+          "label": "Charlotte",
+          "subdivision_id": "US-NC",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-PA-philadelphia-metro",
+      "label": "Philadelphia Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-PA"],
+      "aliases": ["Greater Philadelphia", "Philly Metro"],
+      "cities": [
+        {
+          "id": "US-PA-philadelphia",
+          "label": "Philadelphia",
+          "subdivision_id": "US-PA",
+          "aliases": ["Philly"]
+        }
+      ]
+    },
+    {
+      "id": "US-PA-pittsburgh-metro",
+      "label": "Pittsburgh Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-PA"],
+      "aliases": ["Greater Pittsburgh"],
+      "cities": [
+        {
+          "id": "US-PA-pittsburgh",
+          "label": "Pittsburgh",
+          "subdivision_id": "US-PA",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-AZ-phoenix-metro",
+      "label": "Phoenix Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-AZ"],
+      "aliases": ["Valley of the Sun", "Greater Phoenix"],
+      "cities": [
+        {
+          "id": "US-AZ-phoenix",
+          "label": "Phoenix",
+          "subdivision_id": "US-AZ",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-OR-portland-metro",
+      "label": "Portland Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-OR"],
+      "aliases": ["Greater Portland Oregon"],
+      "cities": [
+        {
+          "id": "US-OR-portland",
+          "label": "Portland",
+          "subdivision_id": "US-OR",
+          "aliases": ["Portland Oregon"]
+        }
+      ]
+    },
+    {
+      "id": "US-MN-minneapolis-saint-paul",
+      "label": "Minneapolis-Saint Paul Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-MN"],
+      "aliases": ["Twin Cities", "Minneapolis-St. Paul"],
+      "cities": [
+        {
+          "id": "US-MN-minneapolis",
+          "label": "Minneapolis",
+          "subdivision_id": "US-MN",
+          "aliases": []
+        },
+        {
+          "id": "US-MN-saint-paul",
+          "label": "Saint Paul",
+          "subdivision_id": "US-MN",
+          "aliases": ["St. Paul", "St Paul"]
+        }
+      ]
+    },
+    {
+      "id": "US-MI-detroit-metro",
+      "label": "Detroit Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-MI"],
+      "aliases": ["Metro Detroit"],
+      "cities": [
+        {
+          "id": "US-MI-detroit",
+          "label": "Detroit",
+          "subdivision_id": "US-MI",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-OH-columbus-metro",
+      "label": "Columbus Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-OH"],
+      "aliases": ["Greater Columbus Ohio"],
+      "cities": [
+        {
+          "id": "US-OH-columbus",
+          "label": "Columbus",
+          "subdivision_id": "US-OH",
+          "aliases": ["Columbus Ohio"]
+        }
+      ]
+    },
+    {
+      "id": "US-IN-indianapolis-metro",
+      "label": "Indianapolis Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-IN"],
+      "aliases": ["Greater Indianapolis"],
+      "cities": [
+        {
+          "id": "US-IN-indianapolis",
+          "label": "Indianapolis",
+          "subdivision_id": "US-IN",
+          "aliases": ["Indy"]
+        }
+      ]
+    },
+    {
+      "id": "US-TN-nashville-metro",
+      "label": "Nashville Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-TN"],
+      "aliases": ["Greater Nashville"],
+      "cities": [
+        {
+          "id": "US-TN-nashville",
+          "label": "Nashville",
+          "subdivision_id": "US-TN",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-FL-miami-metro",
+      "label": "Miami Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-FL"],
+      "aliases": ["Greater Miami", "South Florida Metro"],
+      "cities": [
+        {
+          "id": "US-FL-miami",
+          "label": "Miami",
+          "subdivision_id": "US-FL",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-FL-tampa-bay",
+      "label": "Tampa Bay Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-FL"],
+      "aliases": ["Tampa Bay", "Greater Tampa"],
+      "cities": [
+        {
+          "id": "US-FL-tampa",
+          "label": "Tampa",
+          "subdivision_id": "US-FL",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "US-UT-salt-lake-city-metro",
+      "label": "Salt Lake City Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-UT"],
+      "aliases": ["Salt Lake Metro", "SLC Metro"],
+      "cities": [
+        {
+          "id": "US-UT-salt-lake-city",
+          "label": "Salt Lake City",
+          "subdivision_id": "US-UT",
+          "aliases": ["SLC"]
+        }
+      ]
+    },
+    {
+      "id": "US-MO-kansas-city-metro",
+      "label": "Kansas City Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-MO"],
+      "aliases": ["Greater Kansas City", "KC Metro"],
+      "cities": [
+        {
+          "id": "US-MO-kansas-city",
+          "label": "Kansas City",
+          "subdivision_id": "US-MO",
+          "aliases": ["KCMO"]
+        }
+      ]
+    },
+    {
+      "id": "US-MO-saint-louis-metro",
+      "label": "Saint Louis Metro",
+      "country_code": "US",
+      "subdivision_ids": ["US-MO"],
+      "aliases": ["St. Louis Metro", "Greater St. Louis"],
+      "cities": [
+        {
+          "id": "US-MO-saint-louis",
+          "label": "Saint Louis",
+          "subdivision_id": "US-MO",
+          "aliases": ["St. Louis", "St Louis"]
+        }
+      ]
+    },
+    {
+      "id": "IN-hyderabad-metro",
+      "label": "Hyderabad Metro",
+      "country_code": "IN",
+      "subdivision_ids": [],
+      "aliases": ["Hyderabad Metropolitan Area"],
+      "cities": [
+        {
+          "id": "IN-hyderabad",
+          "label": "Hyderabad",
+          "subdivision_id": null,
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "IN-bengaluru-metro",
+      "label": "Bengaluru Metro",
+      "country_code": "IN",
+      "subdivision_ids": [],
+      "aliases": ["Bangalore Metro"],
+      "cities": [
+        {
+          "id": "IN-bengaluru",
+          "label": "Bengaluru",
+          "subdivision_id": null,
+          "aliases": ["Bangalore"]
+        }
+      ]
+    },
+    {
+      "id": "IN-mumbai-metro",
+      "label": "Mumbai Metro",
+      "country_code": "IN",
+      "subdivision_ids": [],
+      "aliases": ["Mumbai Metropolitan Region"],
+      "cities": [
+        {
+          "id": "IN-mumbai",
+          "label": "Mumbai",
+          "subdivision_id": null,
+          "aliases": ["Bombay"]
+        }
+      ]
+    },
+    {
+      "id": "IN-pune-metro",
+      "label": "Pune Metro",
+      "country_code": "IN",
+      "subdivision_ids": [],
+      "aliases": ["Pune Metropolitan Region"],
+      "cities": [
+        {
+          "id": "IN-pune",
+          "label": "Pune",
+          "subdivision_id": null,
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "IN-chennai-metro",
+      "label": "Chennai Metro",
+      "country_code": "IN",
+      "subdivision_ids": [],
+      "aliases": ["Chennai Metropolitan Area"],
+      "cities": [
+        {
+          "id": "IN-chennai",
+          "label": "Chennai",
+          "subdivision_id": null,
+          "aliases": ["Madras"]
+        }
+      ]
+    },
+    {
+      "id": "IN-visakhapatnam-metro",
+      "label": "Visakhapatnam Metro",
+      "country_code": "IN",
+      "subdivision_ids": [],
+      "aliases": ["Visakhapatnam Metropolitan Region", "Vizag Metro"],
+      "cities": [
+        {
+          "id": "IN-visakhapatnam",
+          "label": "Visakhapatnam",
+          "subdivision_id": null,
+          "aliases": ["Vizag"]
+        }
+      ]
+    },
+    {
+      "id": "CA-ON-toronto-metro",
+      "label": "Toronto Metro",
+      "country_code": "CA",
+      "subdivision_ids": ["CA-ON"],
+      "aliases": ["Greater Toronto Area", "GTA"],
+      "cities": [
+        {
+          "id": "CA-ON-toronto",
+          "label": "Toronto",
+          "subdivision_id": "CA-ON",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "CA-BC-vancouver-metro",
+      "label": "Vancouver Metro",
+      "country_code": "CA",
+      "subdivision_ids": ["CA-BC"],
+      "aliases": ["Metro Vancouver", "Greater Vancouver"],
+      "cities": [
+        {
+          "id": "CA-BC-vancouver",
+          "label": "Vancouver",
+          "subdivision_id": "CA-BC",
+          "aliases": []
+        }
+      ]
+    },
+    {
+      "id": "GB-london-metro",
+      "label": "London Metro",
+      "country_code": "GB",
+      "subdivision_ids": [],
+      "aliases": ["Greater London", "London Metropolitan Area"],
+      "cities": [
+        {
+          "id": "GB-london",
+          "label": "London",
+          "subdivision_id": null,
+          "aliases": []
+        }
+      ]
+    }
+  ]
+}

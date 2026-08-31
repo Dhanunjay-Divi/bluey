@@ -1,0 +1,445 @@
+{
+  "version": 1,
+  "vectors": [
+    {
+      "name": "stop_precedes_all_grants",
+      "input": {
+        "version": 1,
+        "provider": "whatsapp_business_platform",
+        "command": "sToP",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_whatsapp",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": false,
+          "consent_active": false,
+          "provider_eligible": false,
+          "track_eligible": false,
+          "source_verified": false,
+          "integrity_verified": false,
+          "suppression_active": true,
+          "kill_switch_active": true
+        },
+        "provider_policy": {
+          "mode": "whatsapp_customer_service_window",
+          "status_evidence_revision": "rev_test_whatsapp_status_schema_v1"
+        },
+        "scripted_outcome": "simulated_no_effect"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":null,\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"stop\",\"normalized\":\"STOP\",\"version\":1}\n",
+        "command_sha256": "4b5604cc12ea10fcac698d886dbaa33cf5bfa9786169f9bfb74d0ccea3f84698",
+        "plan_canonical": null,
+        "plan_sha256": null,
+        "operation_canonical": null,
+        "operation_sha256": null,
+        "receipt_canonical": "{\"assertion\":\"stopped\",\"command_sha256\":\"4b5604cc12ea10fcac698d886dbaa33cf5bfa9786169f9bfb74d0ccea3f84698\",\"operation_sha256\":null,\"plan_sha256\":null,\"provider\":\"whatsapp_business_platform\",\"provider_evidence_revision\":null,\"request_started\":false,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "10c7913cfe00cf7e52a17931a972b308a8bc70ad1e6582c4a5b35c5fb04ae7fa"
+      }
+    },
+    {
+      "name": "approve_requires_authenticated_step_up",
+      "input": {
+        "version": 1,
+        "provider": "apple_messages_for_business",
+        "command": "approve P-ABCDEFGHJK",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_apple",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "apple_active_conversation",
+          "status_evidence_revision": "rev_test_apple_gateway_v1"
+        },
+        "scripted_outcome": "simulated_no_effect"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":null,\"limit\":null,\"pass_reason\":null,\"plan_ref\":\"P-ABCDEFGHJK\"},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"approve\",\"normalized\":\"APPROVE P-ABCDEFGHJK\",\"version\":1}\n",
+        "command_sha256": "8cfb8c9ad70e4914b325dae10593b198c2070cd7cb8c1a28207b9ee25da6ae16",
+        "plan_canonical": null,
+        "plan_sha256": null,
+        "operation_canonical": null,
+        "operation_sha256": null,
+        "receipt_canonical": "{\"assertion\":\"step_up_required\",\"command_sha256\":\"8cfb8c9ad70e4914b325dae10593b198c2070cd7cb8c1a28207b9ee25da6ae16\",\"operation_sha256\":null,\"plan_sha256\":null,\"provider\":\"apple_messages_for_business\",\"provider_evidence_revision\":null,\"request_started\":false,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "fa246e55b72764bb0440e89b6da94c6d2b97d68207f7b0682edbe4a0d5ef0873"
+      }
+    },
+    {
+      "name": "prepare_positive_jobs_authority",
+      "input": {
+        "version": 1,
+        "provider": "whatsapp_business_platform",
+        "command": "PREPARE J-0123456789",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_whatsapp",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "whatsapp_customer_service_window",
+          "status_evidence_revision": "rev_test_whatsapp_status_schema_v1"
+        },
+        "scripted_outcome": "simulated_no_effect"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":\"J-0123456789\",\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"prepare\",\"normalized\":\"PREPARE J-0123456789\",\"version\":1}\n",
+        "command_sha256": "c9caaf26a6deacd65f1567559a36319c1416375a912e1da3ff76343f9ec259cf",
+        "plan_canonical": "{\"account_id\":\"acct_test_owner\",\"action\":\"prepare\",\"authority\":{\"connection_active\":true,\"consent_active\":true,\"integrity_verified\":true,\"kill_switch_active\":false,\"provider_eligible\":true,\"source_verified\":true,\"suppression_active\":false,\"track_eligible\":true},\"business_endpoint_id\":\"endpoint_test_whatsapp\",\"command_sha256\":\"c9caaf26a6deacd65f1567559a36319c1416375a912e1da3ff76343f9ec259cf\",\"connection_id\":\"conn_test_primary\",\"expires_at_ms\":2000000300000,\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"provider\":\"whatsapp_business_platform\",\"provider_policy\":{\"mode\":\"whatsapp_customer_service_window\",\"status_evidence_revision\":\"rev_test_whatsapp_status_schema_v1\"},\"provider_subject_id\":\"subject_test_owner\",\"read_set\":{\"adapter_release_revision\":\"rev_test_adapter_v1\",\"career_track_revision\":\"rev_test_track_v1\",\"command_parser_revision\":\"rev_test_command_v1\",\"connection_revision\":\"rev_test_connection_v1\",\"consent_revision\":\"rev_test_consent_v1\",\"job_integrity_revision\":\"rev_test_integrity_v1\",\"jobs_workspace_revision\":\"rev_test_workspace_v1\",\"kill_switch_revision\":\"rev_test_kill_switch_v1\",\"locale_table_revision\":\"rev_test_locale_v1\",\"opt_out_parser_revision\":\"rev_test_opt_out_v1\",\"original_source_revision\":\"rev_test_source_v1\",\"provider_eligibility_revision\":\"rev_test_provider_eligibility_v1\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\"},\"required_step_up\":\"authenticated_web\",\"state\":\"simulated\",\"version\":1}\n",
+        "plan_sha256": "c00711e6d6fde8bb6caf788a273c837bd1e1dca6857568d43ecc15e4db638fe9",
+        "operation_canonical": "{\"action\":\"prepare\",\"adapter_release_revision\":\"rev_test_adapter_v1\",\"operation_key_sha256\":\"b1cf4b04a442a8f252858c9371f4f6523e5c02df3c91004dd485e67e373a9de0\",\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"plan_sha256\":\"c00711e6d6fde8bb6caf788a273c837bd1e1dca6857568d43ecc15e4db638fe9\",\"provider\":\"whatsapp_business_platform\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\",\"request_state\":\"request_not_started\",\"scripted_outcome\":\"simulated_no_effect\",\"version\":1}\n",
+        "operation_sha256": "6faf52cfc7af49b95e6ef93d7fdefb201e5ad60d58106d7bcce2c6f401ea8f5f",
+        "receipt_canonical": "{\"assertion\":\"simulated_no_effect\",\"command_sha256\":\"c9caaf26a6deacd65f1567559a36319c1416375a912e1da3ff76343f9ec259cf\",\"operation_sha256\":\"6faf52cfc7af49b95e6ef93d7fdefb201e5ad60d58106d7bcce2c6f401ea8f5f\",\"plan_sha256\":\"c00711e6d6fde8bb6caf788a273c837bd1e1dca6857568d43ecc15e4db638fe9\",\"provider\":\"whatsapp_business_platform\",\"provider_evidence_revision\":null,\"request_started\":false,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "2d4d884ab247bca10f6007765f259a5b729e9bf0409c955029a0cb5cef55d840"
+      }
+    },
+    {
+      "name": "prepare_source_revision_drift",
+      "input": {
+        "version": 1,
+        "provider": "whatsapp_business_platform",
+        "command": "PREPARE J-0123456789",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_whatsapp",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v2",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "whatsapp_customer_service_window",
+          "status_evidence_revision": "rev_test_whatsapp_status_schema_v1"
+        },
+        "scripted_outcome": "simulated_no_effect"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":\"J-0123456789\",\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"prepare\",\"normalized\":\"PREPARE J-0123456789\",\"version\":1}\n",
+        "command_sha256": "c9caaf26a6deacd65f1567559a36319c1416375a912e1da3ff76343f9ec259cf",
+        "plan_canonical": "{\"account_id\":\"acct_test_owner\",\"action\":\"prepare\",\"authority\":{\"connection_active\":true,\"consent_active\":true,\"integrity_verified\":true,\"kill_switch_active\":false,\"provider_eligible\":true,\"source_verified\":true,\"suppression_active\":false,\"track_eligible\":true},\"business_endpoint_id\":\"endpoint_test_whatsapp\",\"command_sha256\":\"c9caaf26a6deacd65f1567559a36319c1416375a912e1da3ff76343f9ec259cf\",\"connection_id\":\"conn_test_primary\",\"expires_at_ms\":2000000300000,\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"provider\":\"whatsapp_business_platform\",\"provider_policy\":{\"mode\":\"whatsapp_customer_service_window\",\"status_evidence_revision\":\"rev_test_whatsapp_status_schema_v1\"},\"provider_subject_id\":\"subject_test_owner\",\"read_set\":{\"adapter_release_revision\":\"rev_test_adapter_v1\",\"career_track_revision\":\"rev_test_track_v1\",\"command_parser_revision\":\"rev_test_command_v1\",\"connection_revision\":\"rev_test_connection_v1\",\"consent_revision\":\"rev_test_consent_v1\",\"job_integrity_revision\":\"rev_test_integrity_v1\",\"jobs_workspace_revision\":\"rev_test_workspace_v1\",\"kill_switch_revision\":\"rev_test_kill_switch_v1\",\"locale_table_revision\":\"rev_test_locale_v1\",\"opt_out_parser_revision\":\"rev_test_opt_out_v1\",\"original_source_revision\":\"rev_test_source_v2\",\"provider_eligibility_revision\":\"rev_test_provider_eligibility_v1\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\"},\"required_step_up\":\"authenticated_web\",\"state\":\"simulated\",\"version\":1}\n",
+        "plan_sha256": "6cf8e0dedebeaf24cea8836f1141807273167eb95d65e030dde5850b616735ed",
+        "operation_canonical": "{\"action\":\"prepare\",\"adapter_release_revision\":\"rev_test_adapter_v1\",\"operation_key_sha256\":\"b40d58f3884b7a3050d101014d9ace04adf72cb48b0ca8bff4ad0fa945bffb9a\",\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"plan_sha256\":\"6cf8e0dedebeaf24cea8836f1141807273167eb95d65e030dde5850b616735ed\",\"provider\":\"whatsapp_business_platform\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\",\"request_state\":\"request_not_started\",\"scripted_outcome\":\"simulated_no_effect\",\"version\":1}\n",
+        "operation_sha256": "169ce96a6ff1ecec62364f0bbf3404674b1b686a63cba6493a8484b6ec4d8e50",
+        "receipt_canonical": "{\"assertion\":\"simulated_no_effect\",\"command_sha256\":\"c9caaf26a6deacd65f1567559a36319c1416375a912e1da3ff76343f9ec259cf\",\"operation_sha256\":\"169ce96a6ff1ecec62364f0bbf3404674b1b686a63cba6493a8484b6ec4d8e50\",\"plan_sha256\":\"6cf8e0dedebeaf24cea8836f1141807273167eb95d65e030dde5850b616735ed\",\"provider\":\"whatsapp_business_platform\",\"provider_evidence_revision\":null,\"request_started\":false,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "20758d54194766dcf293189581a9a7e8e47334f6f39ff080a6dd5e18e893933c"
+      }
+    },
+    {
+      "name": "whatsapp_read_with_pinned_evidence",
+      "input": {
+        "version": 1,
+        "provider": "whatsapp_business_platform",
+        "command": "SAVE J-0123456789",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_whatsapp",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "whatsapp_customer_service_window",
+          "status_evidence_revision": "rev_test_whatsapp_status_schema_v1"
+        },
+        "scripted_outcome": "whatsapp_read"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":\"J-0123456789\",\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"save\",\"normalized\":\"SAVE J-0123456789\",\"version\":1}\n",
+        "command_sha256": "6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27",
+        "plan_canonical": "{\"account_id\":\"acct_test_owner\",\"action\":\"save\",\"authority\":{\"connection_active\":true,\"consent_active\":true,\"integrity_verified\":true,\"kill_switch_active\":false,\"provider_eligible\":true,\"source_verified\":true,\"suppression_active\":false,\"track_eligible\":true},\"business_endpoint_id\":\"endpoint_test_whatsapp\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"connection_id\":\"conn_test_primary\",\"expires_at_ms\":2000000300000,\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"provider\":\"whatsapp_business_platform\",\"provider_policy\":{\"mode\":\"whatsapp_customer_service_window\",\"status_evidence_revision\":\"rev_test_whatsapp_status_schema_v1\"},\"provider_subject_id\":\"subject_test_owner\",\"read_set\":{\"adapter_release_revision\":\"rev_test_adapter_v1\",\"career_track_revision\":\"rev_test_track_v1\",\"command_parser_revision\":\"rev_test_command_v1\",\"connection_revision\":\"rev_test_connection_v1\",\"consent_revision\":\"rev_test_consent_v1\",\"job_integrity_revision\":\"rev_test_integrity_v1\",\"jobs_workspace_revision\":\"rev_test_workspace_v1\",\"kill_switch_revision\":\"rev_test_kill_switch_v1\",\"locale_table_revision\":\"rev_test_locale_v1\",\"opt_out_parser_revision\":\"rev_test_opt_out_v1\",\"original_source_revision\":\"rev_test_source_v1\",\"provider_eligibility_revision\":\"rev_test_provider_eligibility_v1\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\"},\"required_step_up\":\"none\",\"state\":\"simulated\",\"version\":1}\n",
+        "plan_sha256": "ddaf0ca1117933c6691320117230d444e05c5376e47a6d85ed9a55da98e527fd",
+        "operation_canonical": "{\"action\":\"save\",\"adapter_release_revision\":\"rev_test_adapter_v1\",\"operation_key_sha256\":\"de1bddec5ea4659e6cc1c6f36271925532c5188c70497a39f45c0920046c9920\",\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"plan_sha256\":\"ddaf0ca1117933c6691320117230d444e05c5376e47a6d85ed9a55da98e527fd\",\"provider\":\"whatsapp_business_platform\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\",\"request_state\":\"request_started\",\"scripted_outcome\":\"whatsapp_read\",\"version\":1}\n",
+        "operation_sha256": "614d686d6b2c87b7c782ab16b6825b8a73fa385e1a3b7bc08c337ffa1e670d00",
+        "receipt_canonical": "{\"assertion\":\"read\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"operation_sha256\":\"614d686d6b2c87b7c782ab16b6825b8a73fa385e1a3b7bc08c337ffa1e670d00\",\"plan_sha256\":\"ddaf0ca1117933c6691320117230d444e05c5376e47a6d85ed9a55da98e527fd\",\"provider\":\"whatsapp_business_platform\",\"provider_evidence_revision\":\"rev_test_whatsapp_status_schema_v1\",\"request_started\":true,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "969319da0d71cfc0806719a5e51176b329b7469c0a7b4d66ddc720301c8d6bd1"
+      }
+    },
+    {
+      "name": "apple_success_ceiling",
+      "input": {
+        "version": 1,
+        "provider": "apple_messages_for_business",
+        "command": "SAVE J-0123456789",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_apple",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "apple_active_conversation",
+          "status_evidence_revision": "rev_test_apple_gateway_v1"
+        },
+        "scripted_outcome": "provider_accepted"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":\"J-0123456789\",\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"save\",\"normalized\":\"SAVE J-0123456789\",\"version\":1}\n",
+        "command_sha256": "6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27",
+        "plan_canonical": "{\"account_id\":\"acct_test_owner\",\"action\":\"save\",\"authority\":{\"connection_active\":true,\"consent_active\":true,\"integrity_verified\":true,\"kill_switch_active\":false,\"provider_eligible\":true,\"source_verified\":true,\"suppression_active\":false,\"track_eligible\":true},\"business_endpoint_id\":\"endpoint_test_apple\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"connection_id\":\"conn_test_primary\",\"expires_at_ms\":2000000300000,\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"provider\":\"apple_messages_for_business\",\"provider_policy\":{\"mode\":\"apple_active_conversation\",\"status_evidence_revision\":\"rev_test_apple_gateway_v1\"},\"provider_subject_id\":\"subject_test_owner\",\"read_set\":{\"adapter_release_revision\":\"rev_test_adapter_v1\",\"career_track_revision\":\"rev_test_track_v1\",\"command_parser_revision\":\"rev_test_command_v1\",\"connection_revision\":\"rev_test_connection_v1\",\"consent_revision\":\"rev_test_consent_v1\",\"job_integrity_revision\":\"rev_test_integrity_v1\",\"jobs_workspace_revision\":\"rev_test_workspace_v1\",\"kill_switch_revision\":\"rev_test_kill_switch_v1\",\"locale_table_revision\":\"rev_test_locale_v1\",\"opt_out_parser_revision\":\"rev_test_opt_out_v1\",\"original_source_revision\":\"rev_test_source_v1\",\"provider_eligibility_revision\":\"rev_test_provider_eligibility_v1\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\"},\"required_step_up\":\"none\",\"state\":\"simulated\",\"version\":1}\n",
+        "plan_sha256": "2df7163cc3d5bda9ed6db0d5f120791e4285bc7da65d80e8527779ccebc05aa2",
+        "operation_canonical": "{\"action\":\"save\",\"adapter_release_revision\":\"rev_test_adapter_v1\",\"operation_key_sha256\":\"688f9150da5d5a8f9874ff2ce1fcea3f9b59d2191e565d588ea5d202f8caa0ea\",\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"plan_sha256\":\"2df7163cc3d5bda9ed6db0d5f120791e4285bc7da65d80e8527779ccebc05aa2\",\"provider\":\"apple_messages_for_business\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\",\"request_state\":\"request_started\",\"scripted_outcome\":\"provider_accepted\",\"version\":1}\n",
+        "operation_sha256": "a881f3dfc6033fd74faa531ad2d9ae8165fcb8b1059ced6b621077f46450ce48",
+        "receipt_canonical": "{\"assertion\":\"provider_accepted\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"operation_sha256\":\"a881f3dfc6033fd74faa531ad2d9ae8165fcb8b1059ced6b621077f46450ce48\",\"plan_sha256\":\"2df7163cc3d5bda9ed6db0d5f120791e4285bc7da65d80e8527779ccebc05aa2\",\"provider\":\"apple_messages_for_business\",\"provider_evidence_revision\":\"rev_test_apple_gateway_v1\",\"request_started\":true,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "ba8f1eb2ab6af563ec5c1efda737359c7364935632dc6c77dbdb62533c891773"
+      }
+    },
+    {
+      "name": "failure_before_request_start",
+      "input": {
+        "version": 1,
+        "provider": "apple_messages_for_business",
+        "command": "SAVE J-0123456789",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_apple",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "apple_active_conversation",
+          "status_evidence_revision": "rev_test_apple_gateway_v1"
+        },
+        "scripted_outcome": "failed_pre_request"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":\"J-0123456789\",\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"save\",\"normalized\":\"SAVE J-0123456789\",\"version\":1}\n",
+        "command_sha256": "6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27",
+        "plan_canonical": "{\"account_id\":\"acct_test_owner\",\"action\":\"save\",\"authority\":{\"connection_active\":true,\"consent_active\":true,\"integrity_verified\":true,\"kill_switch_active\":false,\"provider_eligible\":true,\"source_verified\":true,\"suppression_active\":false,\"track_eligible\":true},\"business_endpoint_id\":\"endpoint_test_apple\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"connection_id\":\"conn_test_primary\",\"expires_at_ms\":2000000300000,\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"provider\":\"apple_messages_for_business\",\"provider_policy\":{\"mode\":\"apple_active_conversation\",\"status_evidence_revision\":\"rev_test_apple_gateway_v1\"},\"provider_subject_id\":\"subject_test_owner\",\"read_set\":{\"adapter_release_revision\":\"rev_test_adapter_v1\",\"career_track_revision\":\"rev_test_track_v1\",\"command_parser_revision\":\"rev_test_command_v1\",\"connection_revision\":\"rev_test_connection_v1\",\"consent_revision\":\"rev_test_consent_v1\",\"job_integrity_revision\":\"rev_test_integrity_v1\",\"jobs_workspace_revision\":\"rev_test_workspace_v1\",\"kill_switch_revision\":\"rev_test_kill_switch_v1\",\"locale_table_revision\":\"rev_test_locale_v1\",\"opt_out_parser_revision\":\"rev_test_opt_out_v1\",\"original_source_revision\":\"rev_test_source_v1\",\"provider_eligibility_revision\":\"rev_test_provider_eligibility_v1\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\"},\"required_step_up\":\"none\",\"state\":\"simulated\",\"version\":1}\n",
+        "plan_sha256": "2df7163cc3d5bda9ed6db0d5f120791e4285bc7da65d80e8527779ccebc05aa2",
+        "operation_canonical": "{\"action\":\"save\",\"adapter_release_revision\":\"rev_test_adapter_v1\",\"operation_key_sha256\":\"688f9150da5d5a8f9874ff2ce1fcea3f9b59d2191e565d588ea5d202f8caa0ea\",\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"plan_sha256\":\"2df7163cc3d5bda9ed6db0d5f120791e4285bc7da65d80e8527779ccebc05aa2\",\"provider\":\"apple_messages_for_business\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\",\"request_state\":\"request_not_started\",\"scripted_outcome\":\"failed_pre_request\",\"version\":1}\n",
+        "operation_sha256": "101d31be8c06dfa7196289feccfb688fbec5a37e3de2b3ae4d85dc9480733b4e",
+        "receipt_canonical": "{\"assertion\":\"failed_pre_effect\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"operation_sha256\":\"101d31be8c06dfa7196289feccfb688fbec5a37e3de2b3ae4d85dc9480733b4e\",\"plan_sha256\":\"2df7163cc3d5bda9ed6db0d5f120791e4285bc7da65d80e8527779ccebc05aa2\",\"provider\":\"apple_messages_for_business\",\"provider_evidence_revision\":null,\"request_started\":false,\"retry_allowed\":true,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "80b046a6790336c6a724bd85d2cebabb6620523a82d520df7379923c04f6639d"
+      }
+    },
+    {
+      "name": "timeout_after_request_start",
+      "input": {
+        "version": 1,
+        "provider": "whatsapp_business_platform",
+        "command": "SAVE J-0123456789",
+        "now_ms": 2000000000000,
+        "plan_id": "P-ABCDEFGHJK",
+        "plan_revision": 1,
+        "account_id": "acct_test_owner",
+        "connection_id": "conn_test_primary",
+        "business_endpoint_id": "endpoint_test_whatsapp",
+        "provider_subject_id": "subject_test_owner",
+        "read_set": {
+          "connection_revision": "rev_test_connection_v1",
+          "consent_revision": "rev_test_consent_v1",
+          "opt_out_parser_revision": "rev_test_opt_out_v1",
+          "command_parser_revision": "rev_test_command_v1",
+          "locale_table_revision": "rev_test_locale_v1",
+          "provider_policy_revision": "rev_test_provider_policy_v1",
+          "provider_eligibility_revision": "rev_test_provider_eligibility_v1",
+          "jobs_workspace_revision": "rev_test_workspace_v1",
+          "career_track_revision": "rev_test_track_v1",
+          "original_source_revision": "rev_test_source_v1",
+          "job_integrity_revision": "rev_test_integrity_v1",
+          "adapter_release_revision": "rev_test_adapter_v1",
+          "kill_switch_revision": "rev_test_kill_switch_v1"
+        },
+        "authority": {
+          "connection_active": true,
+          "consent_active": true,
+          "provider_eligible": true,
+          "track_eligible": true,
+          "source_verified": true,
+          "integrity_verified": true,
+          "suppression_active": false,
+          "kill_switch_active": false
+        },
+        "provider_policy": {
+          "mode": "whatsapp_customer_service_window",
+          "status_evidence_revision": "rev_test_whatsapp_status_schema_v1"
+        },
+        "scripted_outcome": "timeout_after_request_start"
+      },
+      "expected": {
+        "command_canonical": "{\"arguments\":{\"job_ref\":\"J-0123456789\",\"limit\":null,\"pass_reason\":null,\"plan_ref\":null},\"grammar_version\":\"business_messaging_command_grammar_v1\",\"kind\":\"save\",\"normalized\":\"SAVE J-0123456789\",\"version\":1}\n",
+        "command_sha256": "6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27",
+        "plan_canonical": "{\"account_id\":\"acct_test_owner\",\"action\":\"save\",\"authority\":{\"connection_active\":true,\"consent_active\":true,\"integrity_verified\":true,\"kill_switch_active\":false,\"provider_eligible\":true,\"source_verified\":true,\"suppression_active\":false,\"track_eligible\":true},\"business_endpoint_id\":\"endpoint_test_whatsapp\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"connection_id\":\"conn_test_primary\",\"expires_at_ms\":2000000300000,\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"provider\":\"whatsapp_business_platform\",\"provider_policy\":{\"mode\":\"whatsapp_customer_service_window\",\"status_evidence_revision\":\"rev_test_whatsapp_status_schema_v1\"},\"provider_subject_id\":\"subject_test_owner\",\"read_set\":{\"adapter_release_revision\":\"rev_test_adapter_v1\",\"career_track_revision\":\"rev_test_track_v1\",\"command_parser_revision\":\"rev_test_command_v1\",\"connection_revision\":\"rev_test_connection_v1\",\"consent_revision\":\"rev_test_consent_v1\",\"job_integrity_revision\":\"rev_test_integrity_v1\",\"jobs_workspace_revision\":\"rev_test_workspace_v1\",\"kill_switch_revision\":\"rev_test_kill_switch_v1\",\"locale_table_revision\":\"rev_test_locale_v1\",\"opt_out_parser_revision\":\"rev_test_opt_out_v1\",\"original_source_revision\":\"rev_test_source_v1\",\"provider_eligibility_revision\":\"rev_test_provider_eligibility_v1\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\"},\"required_step_up\":\"none\",\"state\":\"simulated\",\"version\":1}\n",
+        "plan_sha256": "ddaf0ca1117933c6691320117230d444e05c5376e47a6d85ed9a55da98e527fd",
+        "operation_canonical": "{\"action\":\"save\",\"adapter_release_revision\":\"rev_test_adapter_v1\",\"operation_key_sha256\":\"de1bddec5ea4659e6cc1c6f36271925532c5188c70497a39f45c0920046c9920\",\"plan_id\":\"P-ABCDEFGHJK\",\"plan_revision\":1,\"plan_sha256\":\"ddaf0ca1117933c6691320117230d444e05c5376e47a6d85ed9a55da98e527fd\",\"provider\":\"whatsapp_business_platform\",\"provider_policy_revision\":\"rev_test_provider_policy_v1\",\"request_state\":\"request_started\",\"scripted_outcome\":\"timeout_after_request_start\",\"version\":1}\n",
+        "operation_sha256": "6e69fb711494892e7e5ad0ce886fa3fe32f5872d5c80a3c67a449440fef97b9f",
+        "receipt_canonical": "{\"assertion\":\"side_effect_unknown\",\"command_sha256\":\"6fcbf081ca561a18de02bda4c2b82150d09a660cf8530aea36f4e4c1c77bef27\",\"operation_sha256\":\"6e69fb711494892e7e5ad0ce886fa3fe32f5872d5c80a3c67a449440fef97b9f\",\"plan_sha256\":\"ddaf0ca1117933c6691320117230d444e05c5376e47a6d85ed9a55da98e527fd\",\"provider\":\"whatsapp_business_platform\",\"provider_evidence_revision\":null,\"request_started\":true,\"retry_allowed\":false,\"simulated\":true,\"terminal_at_ms\":2000000000000,\"version\":1,\"zero_effect_audit\":{\"browser_attempts\":0,\"credential_reads\":0,\"external_writes\":0,\"jobs_mutations\":0,\"network_attempts\":0,\"process_attempts\":0,\"provider_attempts\":0}}\n",
+        "receipt_sha256": "1c67c4c008e8c8247abe7b072141eb9728b69d29fcbc8b71f7720198a6d021ca"
+      }
+    }
+  ]
+}

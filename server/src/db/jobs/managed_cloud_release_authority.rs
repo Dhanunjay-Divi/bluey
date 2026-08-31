@@ -1,5 +1,7 @@
 const MANAGED_CLOUD_RELEASE_AUDIENCE: &str = "bluey-jobs-managed-cloud-release-v1";
 const MANAGED_CLOUD_ACTIVATION_AUDIENCE: &str = "bluey-jobs-managed-cloud-activation-v1";
+const MANAGED_CLOUD_RELEASE_V2_AUDIENCE: &str = "bluey-jobs-managed-cloud-release-v2";
+const MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE: &str = "bluey-jobs-managed-cloud-activation-v2";
 const MANAGED_CLOUD_COHORT_AUDIENCE: &str = "bluey-jobs-managed-cloud-cohort-v1";
 const MANAGED_CLOUD_ROLLBACK_AUDIENCE: &str = "bluey-jobs-managed-cloud-rollback-v1";
 const MANAGED_CLOUD_REVOCATION_AUDIENCE: &str = "bluey-jobs-managed-cloud-revocation-v1";
@@ -37,8 +39,12 @@ const MANAGED_CLOUD_TEMPORAL_EVIDENCE_AUDIENCE: &str =
 const MANAGED_CLOUD_ROOT_TRUST_ANCHOR_ENV: &str = "BLUEY_JOBS_MANAGED_CLOUD_ROOT_TRUST_ANCHOR_JSON";
 const MANAGED_CLOUD_ROOT_TRUST_ANCHOR_SHA256_ENV: &str =
     "BLUEY_JOBS_MANAGED_CLOUD_ROOT_TRUST_ANCHOR_SHA256";
-const MANAGED_CLOUD_SQLITE_MIGRATION_HEAD: &str = "055_jobs_managed_cloud_release_authority.sql";
-const MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD: &str = "033_jobs_managed_cloud_release_authority.sql";
+const MANAGED_CLOUD_SQLITE_MIGRATION_HEAD: &str = "056_jobs_canonical_taxonomy_authority.sql";
+const MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD: &str = "034_jobs_canonical_taxonomy_authority.sql";
+const MANAGED_CLOUD_SQLITE_V2_MIGRATION_HEAD: &str =
+    "057_jobs_original_source_verification_authority.sql";
+const MANAGED_CLOUD_POSTGRES_V2_MIGRATION_HEAD: &str =
+    "035_jobs_original_source_verification_authority.sql";
 const MANAGED_CLOUD_MAX_ENVELOPE_BYTES: usize = 128 * 1024;
 const MANAGED_CLOUD_MAX_CONTENT_INVENTORY_BYTES: usize = 12 * 1024 * 1024;
 const MANAGED_CLOUD_MAX_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
@@ -57,8 +63,14 @@ const MANAGED_CLOUD_RUNTIME_IDENTITY_DOMAIN: &[u8] =
     b"bluey-jobs-managed-cloud-runtime-identity-v1\0";
 const MANAGED_CLOUD_RUNTIME_MEASUREMENT_AUDIENCE: &str =
     "bluey-jobs-managed-cloud-runtime-measurement-v1";
+const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_AUDIENCE: &str =
+    "bluey-jobs-original-source-verification-authority-v1";
+const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_AUTHORITY_AUDIENCE: &str =
+    "bluey-jobs-original-source-verifier-runtime-authority-v1";
 const MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH: &str =
     "app/.bluey/managed-cloud-runtime-measurement.json";
+const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH: &str =
+    "app/workflows/dist/original-source-verifier.js";
 const MANAGED_CLOUD_MAX_RUNTIME_MEASUREMENT_FILES: usize = 512;
 const MANAGED_CLOUD_RUNNER_NODE_EXECUTABLE: &str = "/usr/local/bin/node";
 const MANAGED_CLOUD_RUNNER_NODE_INVENTORY_PATH: &str = "usr/local/bin/node";
@@ -130,6 +142,58 @@ const MANAGED_CLOUD_PROTOCOLS: [(&str, i64); 11] = [
     ("workflow_cleanup", 3),
     ("workflow_command", 2),
 ];
+
+const MANAGED_CLOUD_V2_PROTOCOLS: [(&str, i64); 12] = [
+    ("ats_certification", 1),
+    ("execution_lease", 1),
+    ("gateway_command", 3),
+    ("managed_cloud_release", 1),
+    ("object_evidence", 1),
+    ("runner_checkpoint", 2),
+    ("runner_profile_snapshot", 1),
+    ("runner_result", 2),
+    ("runtime_heartbeat", 1),
+    ("source_verification", 1),
+    ("workflow_cleanup", 3),
+    ("workflow_command", 2),
+];
+
+#[derive(Clone, Copy)]
+struct ManagedCloudReleaseContract {
+    sqlite_migration_head: &'static str,
+    postgres_migration_head: &'static str,
+    protocols: &'static [(&'static str, i64)],
+    source_verification_required: bool,
+}
+
+fn managed_cloud_release_contract(
+    version: i64,
+    audience: &str,
+) -> Option<ManagedCloudReleaseContract> {
+    match (version, audience) {
+        (1, MANAGED_CLOUD_RELEASE_AUDIENCE) => Some(ManagedCloudReleaseContract {
+            sqlite_migration_head: MANAGED_CLOUD_SQLITE_MIGRATION_HEAD,
+            postgres_migration_head: MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD,
+            protocols: &MANAGED_CLOUD_PROTOCOLS,
+            source_verification_required: false,
+        }),
+        (2, MANAGED_CLOUD_RELEASE_V2_AUDIENCE) => Some(ManagedCloudReleaseContract {
+            sqlite_migration_head: MANAGED_CLOUD_SQLITE_V2_MIGRATION_HEAD,
+            postgres_migration_head: MANAGED_CLOUD_POSTGRES_V2_MIGRATION_HEAD,
+            protocols: &MANAGED_CLOUD_V2_PROTOCOLS,
+            source_verification_required: true,
+        }),
+        _ => None,
+    }
+}
+
+fn managed_cloud_activation_contract(version: i64, audience: &str) -> Option<bool> {
+    match (version, audience) {
+        (1, MANAGED_CLOUD_ACTIVATION_AUDIENCE) => Some(false),
+        (2, MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE) => Some(true),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -302,6 +366,7 @@ struct ManagedCloudResolvedHead {
     task_queue_sha256: String,
     failure_converter_sha256: String,
     activation_expires_at_ms: i64,
+    source_verification: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +387,23 @@ struct ManagedCloudReadinessDigestAuthority<'a> {
     missing_roles: &'a [String],
     stale_roles: &'a [String],
     cohort_eligible: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedCloudOriginalSourceVerifierRuntimeAuthority<'a> {
+    version: i64,
+    audience: &'a str,
+    activation_sha256: &'a str,
+    component_id: &'a str,
+    head_revision: i64,
+    manifest_sha256: &'a str,
+    role: &'a str,
+    runtime_identity_sha256: &'a str,
+    runtime_instance_epoch: i64,
+    runtime_instance_id: &'a str,
+    transition_sha256: &'a str,
+    worker_id: &'a str,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -577,6 +659,19 @@ pub struct ManagedCloudRequestStartAuthority {
     pub replayed: bool,
     pub reconcile_only: bool,
     pub attempt_replayed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ManagedCloudRequestStartResolution {
+    pub authority: Option<ManagedCloudRequestStartAuthority>,
+    pub db_time_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedCloudExecutionLeaseClaimResolution {
+    pub authority: Option<ManagedCloudExecutionLeaseAuthority>,
+    pub db_time_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1637,7 +1732,7 @@ pub fn inspect_managed_cloud_runtime_identity(
 ) -> ManagedCloudResult<ManagedCloudRuntimeMeasurementIdentity> {
     if !matches!(component_id, "jobs-api" | "jobs-runner" | "jobs-workflows")
         || !managed_cloud_runtime_role(role)
-        || role == "original_source_verifier"
+        || (role == "original_source_verifier" && component_id != "jobs-workflows")
     {
         return Err(ManagedCloudRegistryError::InvalidRequest);
     }
@@ -1681,6 +1776,15 @@ pub fn inspect_managed_cloud_runtime_identity(
                 "workflow_command_dispatcher",
             ]) || measurement.measured_files.len() != 1
                 || measurement.measured_files[0].path != "usr/local/bin/bluey-jobs-api"))
+        || (role == "original_source_verifier"
+            && (measurement.roles.iter().map(String::as_str).ne([
+                "original_source_verifier",
+                "workflow_gateway",
+                "workflow_worker",
+            ]) || !measurement
+                .measured_files
+                .iter()
+                .any(|file| file.path == MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH)))
     {
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
@@ -1862,10 +1966,12 @@ fn validate_managed_cloud_trust_policy(
 fn validate_managed_cloud_signature_set(
     signature_set: &ManagedCloudSignatureSetAuthority,
 ) -> ManagedCloudResult<()> {
-    const TARGETS: [&str; 6] = [
+    const TARGETS: [&str; 8] = [
         MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+        MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
         MANAGED_CLOUD_COHORT_AUDIENCE,
         MANAGED_CLOUD_RELEASE_AUDIENCE,
+        MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
         MANAGED_CLOUD_REVOCATION_AUDIENCE,
         MANAGED_CLOUD_ROLLBACK_AUDIENCE,
         MANAGED_CLOUD_TRUST_POLICY_AUDIENCE,
@@ -2258,9 +2364,9 @@ fn managed_cloud_artifact_ref(
 fn validate_managed_cloud_release(
     release: &ManagedCloudReleaseAuthority,
 ) -> ManagedCloudResult<()> {
-    if release.version != 1
-        || release.audience != MANAGED_CLOUD_RELEASE_AUDIENCE
-        || !managed_cloud_token(&release.manifest_id, 128)
+    let contract = managed_cloud_release_contract(release.version, &release.audience)
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    if !managed_cloud_token(&release.manifest_id, 128)
         || !managed_cloud_safe_integer(release.manifest_generation, true)
         || !managed_cloud_token(&release.release_id, 128)
         || !managed_cloud_safe_integer(release.release_sequence, true)
@@ -2271,8 +2377,8 @@ fn validate_managed_cloud_release(
             .all(|byte| byte.is_ascii_hexdigit())
         || release.source_commit != release.source_commit.to_ascii_lowercase()
         || !managed_cloud_safe_integer(release.published_at_ms, false)
-        || release.sqlite_migration_head != MANAGED_CLOUD_SQLITE_MIGRATION_HEAD
-        || release.postgres_migration_head != MANAGED_CLOUD_POSTGRES_MIGRATION_HEAD
+        || release.sqlite_migration_head != contract.sqlite_migration_head
+        || release.postgres_migration_head != contract.postgres_migration_head
         || !managed_cloud_hex64(&release.migration_set_sha256)
         || !managed_cloud_hex64(&release.config_schema_sha256)
         || !managed_cloud_hex64(&release.protocol_set_sha256)
@@ -2280,13 +2386,13 @@ fn validate_managed_cloud_release(
         || !managed_cloud_hex64(&release.feature_authority_sha256)
         || !managed_cloud_hex64(&release.verification_evidence_sha256)
         || release.components.len() != 4
-        || release.protocols.len() != MANAGED_CLOUD_PROTOCOLS.len()
+        || release.protocols.len() != contract.protocols.len()
         || !release.feature_authority.cloud_distribution
         || !release.feature_authority.workflow_command_dispatch
         || !release.feature_authority.workflow_cleanup
         || release.feature_authority.direct_discovery
         || release.feature_authority.global_discovery
-        || release.feature_authority.source_verification
+        || release.feature_authority.source_verification != contract.source_verification_required
     {
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
@@ -2344,6 +2450,9 @@ fn validate_managed_cloud_release(
     if release.feature_authority.global_discovery {
         expected_capabilities.push(("jobs-workflows", "global_discovery_worker"));
     }
+    if release.feature_authority.source_verification {
+        expected_capabilities.push(("jobs-workflows", "original_source_verifier"));
+    }
     expected_capabilities.extend([
         ("jobs-workflows", "workflow_gateway"),
         ("jobs-workflows", "workflow_worker"),
@@ -2358,7 +2467,7 @@ fn validate_managed_cloud_release(
         }
     }
     for ((expected_id, expected_version), protocol) in
-        MANAGED_CLOUD_PROTOCOLS.iter().zip(&release.protocols)
+        contract.protocols.iter().zip(&release.protocols)
     {
         if protocol.protocol_id != *expected_id
             || protocol.protocol_version != *expected_version
@@ -2410,6 +2519,16 @@ fn validate_managed_cloud_verification_evidence(
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
     const OCI_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    const SOURCE_VERIFICATION_WORKFLOW_PATHS: [&str; 8] = [
+        "app/.bluey/managed-cloud-runtime-measurement.json",
+        "app/workflows/dist/discovery-worker.js",
+        "app/workflows/dist/failure-converter.js",
+        "app/workflows/dist/gateway.js",
+        "app/workflows/dist/global-discovery-worker.js",
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH,
+        "app/workflows/dist/worker.js",
+        "usr/local/bin/node",
+    ];
     let runtime_contracts: [ManagedCloudVerificationRuntimeContract; 4] = [
         (
             "jobs-api",
@@ -2463,7 +2582,10 @@ fn validate_managed_cloud_verification_evidence(
         .zip(runtime_contracts.map(|entry| entry.0))
         .zip(runtime_contracts)
     {
-        let (_, runtime_path, runtime_user, entrypoint, cmd, required_paths) = contract;
+        let (_, runtime_path, runtime_user, entrypoint, cmd, mut required_paths) = contract;
+        if component_id == "jobs-workflows" && release.feature_authority.source_verification {
+            required_paths = &SOURCE_VERIFICATION_WORKFLOW_PATHS;
+        }
         let expected_runtime_roles = release
             .capabilities
             .iter()
@@ -3012,9 +3134,10 @@ fn validate_managed_cloud_activation(
     activation: &ManagedCloudActivationAuthority,
 ) -> ManagedCloudResult<()> {
     validate_managed_cloud_scope(&activation.scope)?;
-    if activation.version != 1
-        || activation.audience != MANAGED_CLOUD_ACTIVATION_AUDIENCE
-        || !managed_cloud_token(&activation.activation_id, 128)
+    let source_verification_required =
+        managed_cloud_activation_contract(activation.version, &activation.audience)
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    if !managed_cloud_token(&activation.activation_id, 128)
         || !managed_cloud_safe_integer(activation.activation_generation, true)
         || !managed_cloud_safe_integer(activation.trust_generation, true)
         || !managed_cloud_safe_integer(activation.channel_sequence, true)
@@ -3043,7 +3166,7 @@ fn validate_managed_cloud_activation(
         || !activation.feature_authority.workflow_cleanup
         || activation.feature_authority.direct_discovery
         || activation.feature_authority.global_discovery
-        || activation.feature_authority.source_verification
+        || activation.feature_authority.source_verification != source_verification_required
         || !managed_cloud_hex64(&activation.runner_fleet_evidence_sha256)
         || !managed_cloud_hex64(&activation.cleanup_authority_sha256)
         || !managed_cloud_hex64(&activation.temporal_namespace_sha256)
@@ -3288,6 +3411,9 @@ fn validate_managed_cloud_activation_evidence(
     }
     if activation.feature_authority.global_discovery {
         expected_check_ids.push("global-discovery-worker-readiness");
+    }
+    if activation.feature_authority.source_verification {
+        expected_check_ids.push("original-source-verifier-readiness");
     }
     expected_check_ids.sort_unstable();
     if evidence.canary.checks.len() != expected_check_ids.len()
@@ -3978,6 +4104,15 @@ pub fn import_managed_cloud_trust_policy(
     envelope: &ManagedCloudAuthorityEnvelope,
     recorded_by: &str,
 ) -> ManagedCloudResult<ManagedCloudImportResult> {
+    import_managed_cloud_trust_policy_with_bootstrap_anchor(pool, envelope, recorded_by, None)
+}
+
+fn import_managed_cloud_trust_policy_with_bootstrap_anchor(
+    pool: &DbPool,
+    envelope: &ManagedCloudAuthorityEnvelope,
+    recorded_by: &str,
+    bootstrap_anchor: Option<&ManagedCloudRootTrustAnchor>,
+) -> ManagedCloudResult<ManagedCloudImportResult> {
     if !managed_cloud_actor(recorded_by) {
         return Err(ManagedCloudRegistryError::InvalidRequest);
     }
@@ -4026,7 +4161,10 @@ pub fn import_managed_cloud_trust_policy(
             let latest = sqlite_latest_managed_cloud_policy(&tx)?;
             match latest.as_ref() {
                 None if policy.trust_generation == 1 => {
-                    let anchor = managed_cloud_root_anchor_from_environment()?;
+                    let anchor = bootstrap_anchor
+                        .cloned()
+                        .map(Ok)
+                        .unwrap_or_else(managed_cloud_root_anchor_from_environment)?;
                     verify_managed_cloud_bootstrap_union_signature_set(
                         &policy_bytes,
                         &signature_set,
@@ -4112,7 +4250,10 @@ pub fn import_managed_cloud_trust_policy(
             let latest = postgres_latest_managed_cloud_policy(&mut tx)?;
             match latest.as_ref() {
                 None if policy.trust_generation == 1 => {
-                    let anchor = managed_cloud_root_anchor_from_environment()?;
+                    let anchor = bootstrap_anchor
+                        .cloned()
+                        .map(Ok)
+                        .unwrap_or_else(managed_cloud_root_anchor_from_environment)?;
                     verify_managed_cloud_bootstrap_union_signature_set(
                         &policy_bytes,
                         &signature_set,
@@ -4248,7 +4389,7 @@ fn insert_sqlite_managed_cloud_release(
                 .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?,
             i64::try_from(release.capabilities.len())
                 .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?,
-            i64::try_from(release.protocols.len())
+            i64::try_from(MANAGED_CLOUD_PROTOCOLS.len())
                 .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?,
             canonical_base64url,
             signature_set_sha256,
@@ -4310,7 +4451,12 @@ fn insert_sqlite_managed_cloud_release(
         else {
             continue;
         };
-        for (ordinal, identity) in evidence_component.runtime_identities.iter().enumerate() {
+        for (ordinal, identity) in evidence_component
+            .runtime_identities
+            .iter()
+            .enumerate()
+            .filter(|(_, identity)| identity.role != "original_source_verifier")
+        {
             tx.execute(
                 "INSERT INTO jobs_managed_cloud_manifest_runtime_identities(
                    manifest_sha256,component_id,role,runtime_measurement_sha256,
@@ -4329,7 +4475,12 @@ fn insert_sqlite_managed_cloud_release(
             .map_err(managed_cloud_storage)?;
         }
     }
-    for (ordinal, protocol) in release.protocols.iter().enumerate() {
+    for (ordinal, protocol) in release
+        .protocols
+        .iter()
+        .enumerate()
+        .filter(|(_, protocol)| protocol.protocol_id != "source_verification")
+    {
         tx.execute(
             "INSERT INTO jobs_managed_cloud_manifest_protocols(
                manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
@@ -4341,6 +4492,46 @@ fn insert_sqlite_managed_cloud_release(
                 protocol.schema_sha256,
                 i64::try_from(ordinal).map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?,
             ],
+        )
+        .map_err(managed_cloud_storage)?;
+    }
+    if release.feature_authority.source_verification {
+        let workflow = evidence
+            .components
+            .iter()
+            .find(|component| component.component_id == "jobs-workflows")
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        let measurement_sha256 = workflow
+            .runtime_measurement_sha256
+            .as_deref()
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        let identity = workflow
+            .runtime_identities
+            .iter()
+            .find(|identity| identity.role == "original_source_verifier")
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_manifest_original_source_verifier_identities(
+               manifest_sha256,component_id,role,runtime_measurement_sha256,
+               runtime_identity_sha256,ordinal
+             ) VALUES(?1,'jobs-workflows','original_source_verifier',?2,?3,0)",
+            params![
+                manifest_sha256,
+                measurement_sha256,
+                identity.runtime_identity_sha256,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+        let protocol = release
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol_id == "source_verification")
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_manifest_source_verification_protocols(
+               manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
+             ) VALUES(?1,'source_verification',1,?2,9)",
+            params![manifest_sha256, protocol.schema_sha256],
         )
         .map_err(managed_cloud_storage)?;
     }
@@ -4366,7 +4557,7 @@ fn insert_postgres_managed_cloud_release(
         .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
     let capability_count = i64::try_from(release.capabilities.len())
         .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
-    let protocol_count = i64::try_from(release.protocols.len())
+    let protocol_count = i64::try_from(MANAGED_CLOUD_PROTOCOLS.len())
         .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
     tx.execute(
         "INSERT INTO jobs_managed_cloud_manifests(
@@ -4474,7 +4665,12 @@ fn insert_postgres_managed_cloud_release(
         else {
             continue;
         };
-        for (ordinal, identity) in evidence_component.runtime_identities.iter().enumerate() {
+        for (ordinal, identity) in evidence_component
+            .runtime_identities
+            .iter()
+            .enumerate()
+            .filter(|(_, identity)| identity.role != "original_source_verifier")
+        {
             let ordinal =
                 i64::try_from(ordinal).map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
             tx.execute(
@@ -4494,7 +4690,12 @@ fn insert_postgres_managed_cloud_release(
             .map_err(managed_cloud_storage)?;
         }
     }
-    for (ordinal, protocol) in release.protocols.iter().enumerate() {
+    for (ordinal, protocol) in release
+        .protocols
+        .iter()
+        .enumerate()
+        .filter(|(_, protocol)| protocol.protocol_id != "source_verification")
+    {
         let ordinal =
             i64::try_from(ordinal).map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
         tx.execute(
@@ -4508,6 +4709,46 @@ fn insert_postgres_managed_cloud_release(
                 &protocol.schema_sha256,
                 &ordinal,
             ],
+        )
+        .map_err(managed_cloud_storage)?;
+    }
+    if release.feature_authority.source_verification {
+        let workflow = evidence
+            .components
+            .iter()
+            .find(|component| component.component_id == "jobs-workflows")
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        let measurement_sha256 = workflow
+            .runtime_measurement_sha256
+            .as_deref()
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        let identity = workflow
+            .runtime_identities
+            .iter()
+            .find(|identity| identity.role == "original_source_verifier")
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_manifest_original_source_verifier_identities(
+               manifest_sha256,component_id,role,runtime_measurement_sha256,
+               runtime_identity_sha256,ordinal
+             ) VALUES($1,'jobs-workflows','original_source_verifier',$2,$3,0)",
+            &[
+                &manifest_sha256,
+                &measurement_sha256,
+                &identity.runtime_identity_sha256,
+            ],
+        )
+        .map_err(managed_cloud_storage)?;
+        let protocol = release
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol_id == "source_verification")
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+        tx.execute(
+            "INSERT INTO jobs_managed_cloud_manifest_source_verification_protocols(
+               manifest_sha256,protocol_id,protocol_version,schema_sha256,ordinal
+             ) VALUES($1,'source_verification',1,$2,9)",
+            &[&manifest_sha256, &protocol.schema_sha256],
         )
         .map_err(managed_cloud_storage)?;
     }
@@ -4605,7 +4846,7 @@ pub fn import_managed_cloud_release(
                 &signature_set,
                 &policy.policy,
                 "release",
-                MANAGED_CLOUD_RELEASE_AUDIENCE,
+                &release.audience,
                 release.published_at_ms,
                 now_ms,
             )?;
@@ -4727,7 +4968,7 @@ pub fn import_managed_cloud_release(
                 &signature_set,
                 &policy.policy,
                 "release",
-                MANAGED_CLOUD_RELEASE_AUDIENCE,
+                &release.audience,
                 release.published_at_ms,
                 now_ms,
             )?;
@@ -5238,6 +5479,7 @@ struct ManagedCloudActivationDependencies {
     cohort_issued_at_ms: i64,
     cohort_not_before_ms: i64,
     cohort_expires_at_ms: i64,
+    canonical_manifest_base64url: String,
 }
 
 fn sqlite_managed_cloud_activation_dependencies(
@@ -5257,7 +5499,8 @@ fn sqlite_managed_cloud_activation_dependencies(
                 manifest.source_verification_enabled,
                 manifest.failure_converter_sha256,portal.artifact_sha256,
                 manifest.published_at_ms,cohort.issued_at_ms,
-                cohort.not_before_ms,cohort.expires_at_ms
+                cohort.not_before_ms,cohort.expires_at_ms,
+                manifest.canonical_manifest_base64url
            FROM jobs_managed_cloud_manifests manifest
            JOIN jobs_managed_cloud_manifest_components portal
              ON portal.manifest_sha256=manifest.manifest_sha256
@@ -5294,6 +5537,7 @@ fn sqlite_managed_cloud_activation_dependencies(
                 cohort_issued_at_ms: row.get(13)?,
                 cohort_not_before_ms: row.get(14)?,
                 cohort_expires_at_ms: row.get(15)?,
+                canonical_manifest_base64url: row.get(16)?,
             })
         },
     )
@@ -5319,7 +5563,8 @@ fn postgres_managed_cloud_activation_dependencies(
                 manifest.source_verification_enabled,
                 manifest.failure_converter_sha256,portal.artifact_sha256,
                 manifest.published_at_ms,cohort.issued_at_ms,
-                cohort.not_before_ms,cohort.expires_at_ms
+                cohort.not_before_ms,cohort.expires_at_ms,
+                manifest.canonical_manifest_base64url
            FROM jobs_managed_cloud_manifests manifest
            JOIN jobs_managed_cloud_manifest_components portal
              ON portal.manifest_sha256=manifest.manifest_sha256
@@ -5358,6 +5603,7 @@ fn postgres_managed_cloud_activation_dependencies(
         cohort_issued_at_ms: row.get(13),
         cohort_not_before_ms: row.get(14),
         cohort_expires_at_ms: row.get(15),
+        canonical_manifest_base64url: row.get(16),
     })
     .ok_or(ManagedCloudRegistryError::NotFound)
 }
@@ -5366,12 +5612,21 @@ fn validate_managed_cloud_activation_dependencies(
     activation: &ManagedCloudActivationAuthority,
     dependencies: &ManagedCloudActivationDependencies,
 ) -> ManagedCloudResult<()> {
-    if dependencies.trust_generation != activation.trust_generation
+    let manifest_bytes =
+        managed_cloud_decode_base64url(&dependencies.canonical_manifest_base64url)?;
+    let manifest: ManagedCloudReleaseAuthority = managed_cloud_parse_canonical(&manifest_bytes)?;
+    validate_managed_cloud_release(&manifest)?;
+    if managed_cloud_sha256(&manifest_bytes) != activation.manifest_sha256
+        || manifest.version != activation.version
+        || (manifest.version == 1 && activation.audience != MANAGED_CLOUD_ACTIVATION_AUDIENCE)
+        || (manifest.version == 2 && activation.audience != MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE)
+        || dependencies.trust_generation != activation.trust_generation
         || dependencies.manifest_signature_set_sha256 != activation.manifest_signature_set_sha256
         || dependencies.cohort_signature_set_sha256 != activation.cohort_signature_set_sha256
         || dependencies.feature_authority_sha256 != activation.feature_authority_sha256
         || dependencies.feature_authority != activation.feature_authority
         || dependencies.failure_converter_sha256 != activation.failure_converter_sha256
+        || manifest.feature_authority != activation.feature_authority
     {
         return Err(ManagedCloudRegistryError::IdentityConflict);
     }
@@ -5887,7 +6142,7 @@ pub fn import_managed_cloud_activation(
                 &signature_set,
                 &policy.policy,
                 role,
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+                &activation.audience,
                 activation.issued_at_ms,
                 now_ms,
             )?;
@@ -6073,7 +6328,7 @@ pub fn import_managed_cloud_activation(
                 &signature_set,
                 &policy.policy,
                 role,
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+                &activation.audience,
                 activation.issued_at_ms,
                 now_ms,
             )?;
@@ -6599,7 +6854,7 @@ pub fn apply_managed_cloud_activation(
                 &signature_set,
                 &policy.policy,
                 role,
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+                &activation.audience,
                 activation.issued_at_ms,
                 now_ms,
             )?;
@@ -6771,7 +7026,7 @@ pub fn apply_managed_cloud_activation(
                 &signature_set,
                 &policy.policy,
                 role,
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+                &activation.audience,
                 activation.issued_at_ms,
                 now_ms,
             )?;
@@ -7449,7 +7704,7 @@ pub fn apply_managed_cloud_rollback(
                 &activation_signature,
                 &policy.policy,
                 activation_role,
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+                &activation.audience,
                 activation.issued_at_ms,
                 now_ms,
             )?;
@@ -7671,7 +7926,7 @@ pub fn apply_managed_cloud_rollback(
                 &activation_signature,
                 &policy.policy,
                 activation_role,
-                MANAGED_CLOUD_ACTIVATION_AUDIENCE,
+                &activation.audience,
                 activation.issued_at_ms,
                 now_ms,
             )?;
@@ -7844,13 +8099,19 @@ fn sqlite_managed_cloud_revocation_subject_exists(
         ),
         "runtime_grant" => tx.query_row(
             "SELECT 1 FROM jobs_managed_cloud_runtime_grants
-              WHERE grant_id=?1 AND token_sha256=?2",
+              WHERE grant_id=?1 AND token_sha256=?2
+             UNION ALL
+             SELECT 1 FROM jobs_managed_cloud_original_source_verifier_runtime_grants
+              WHERE grant_id=?1 AND token_sha256=?2 LIMIT 1",
             params![revocation.subject_id, revocation.subject_sha256],
             |_| Ok(()),
         ),
         "runtime_instance" => tx.query_row(
             "SELECT 1 FROM jobs_managed_cloud_runtime_instances
-              WHERE runtime_instance_id=?1 AND runtime_identity_sha256=?2",
+              WHERE runtime_instance_id=?1 AND runtime_identity_sha256=?2
+             UNION ALL
+             SELECT 1 FROM jobs_managed_cloud_original_source_verifier_runtime_instances
+              WHERE runtime_instance_id=?1 AND runtime_identity_sha256=?2 LIMIT 1",
             params![revocation.subject_id, revocation.subject_sha256],
             |_| Ok(()),
         ),
@@ -7887,6 +8148,51 @@ fn postgres_managed_cloud_revocation_subject_exists(
                 .is_ok_and(|bytes| managed_cloud_sha256(&bytes) == revocation.subject_sha256)
         }));
     }
+    if revocation.subject_kind == "runtime_grant" {
+        let values: [&(dyn postgres::types::ToSql + Sync); 2] =
+            [&revocation.subject_id, &revocation.subject_sha256];
+        let base = tx
+            .query_opt(
+                "SELECT 1 FROM jobs_managed_cloud_runtime_grants
+                  WHERE grant_id=$1 AND token_sha256=$2 FOR SHARE",
+                &values,
+            )
+            .map_err(managed_cloud_storage)?;
+        let verifier = tx
+            .query_opt(
+                "SELECT 1 FROM jobs_managed_cloud_original_source_verifier_runtime_grants
+                  WHERE grant_id=$1 AND token_sha256=$2 FOR SHARE",
+                &values,
+            )
+            .map_err(managed_cloud_storage)?;
+        if base.is_some() && verifier.is_some() {
+            return Err(ManagedCloudRegistryError::IdentityConflict);
+        }
+        return Ok(base.is_some() || verifier.is_some());
+    }
+    if revocation.subject_kind == "runtime_instance" {
+        let values: [&(dyn postgres::types::ToSql + Sync); 2] =
+            [&revocation.subject_id, &revocation.subject_sha256];
+        let base = tx
+            .query_opt(
+                "SELECT 1 FROM jobs_managed_cloud_runtime_instances
+                  WHERE runtime_instance_id=$1 AND runtime_identity_sha256=$2 FOR SHARE",
+                &values,
+            )
+            .map_err(managed_cloud_storage)?;
+        let verifier = tx
+            .query_opt(
+                "SELECT 1
+                   FROM jobs_managed_cloud_original_source_verifier_runtime_instances
+                  WHERE runtime_instance_id=$1 AND runtime_identity_sha256=$2 FOR SHARE",
+                &values,
+            )
+            .map_err(managed_cloud_storage)?;
+        if base.is_some() && verifier.is_some() {
+            return Err(ManagedCloudRegistryError::IdentityConflict);
+        }
+        return Ok(base.is_some() || verifier.is_some());
+    }
     let (query, values): (&str, [&(dyn postgres::types::ToSql + Sync); 2]) =
         match revocation.subject_kind.as_str() {
             "activation" => (
@@ -7917,16 +8223,6 @@ fn postgres_managed_cloud_revocation_subject_exists(
             "rollback" => (
                 "SELECT 1 FROM jobs_managed_cloud_rollbacks
                   WHERE rollback_id=$1 AND rollback_sha256=$2 FOR SHARE",
-                [&revocation.subject_id, &revocation.subject_sha256],
-            ),
-            "runtime_grant" => (
-                "SELECT 1 FROM jobs_managed_cloud_runtime_grants
-                  WHERE grant_id=$1 AND token_sha256=$2 FOR SHARE",
-                [&revocation.subject_id, &revocation.subject_sha256],
-            ),
-            "runtime_instance" => (
-                "SELECT 1 FROM jobs_managed_cloud_runtime_instances
-                  WHERE runtime_instance_id=$1 AND runtime_identity_sha256=$2 FOR SHARE",
                 [&revocation.subject_id, &revocation.subject_sha256],
             ),
             "trust_policy" => (
@@ -8266,7 +8562,8 @@ fn sqlite_managed_cloud_resolved_head(
                 activation.cohort_sha256,activation.trust_generation,
                 activation.channel_sequence,manifest.release_id,
                 manifest.release_sequence,activation.task_queue_sha256,
-                activation.failure_converter_sha256,activation.expires_at_ms
+                activation.failure_converter_sha256,activation.expires_at_ms,
+                activation.source_verification_enabled
            FROM jobs_managed_cloud_heads head
            JOIN jobs_managed_cloud_activations activation
              ON activation.activation_sha256=head.current_activation_sha256
@@ -8292,6 +8589,7 @@ fn sqlite_managed_cloud_resolved_head(
                 task_queue_sha256: row.get(9)?,
                 failure_converter_sha256: row.get(10)?,
                 activation_expires_at_ms: row.get(11)?,
+                source_verification: row.get(12)?,
             })
         },
     )
@@ -8310,7 +8608,8 @@ fn postgres_managed_cloud_resolved_head(
                 activation.cohort_sha256,activation.trust_generation,
                 activation.channel_sequence,manifest.release_id,
                 manifest.release_sequence,activation.task_queue_sha256,
-                activation.failure_converter_sha256,activation.expires_at_ms
+                activation.failure_converter_sha256,activation.expires_at_ms,
+                activation.source_verification_enabled
            FROM jobs_managed_cloud_heads head
            JOIN jobs_managed_cloud_activations activation
              ON activation.activation_sha256=head.current_activation_sha256
@@ -8338,6 +8637,7 @@ fn postgres_managed_cloud_resolved_head(
         task_queue_sha256: row.get(9),
         failure_converter_sha256: row.get(10),
         activation_expires_at_ms: row.get(11),
+        source_verification: row.get(12),
     }))
 }
 
@@ -8466,12 +8766,20 @@ fn managed_cloud_resolver_input(
     }
 }
 
-fn managed_cloud_phase611_runtime_set_exact(runtimes: &[ManagedCloudRequiredRuntime]) -> bool {
-    runtimes.len() == MANAGED_CLOUD_BASE_RUNTIME_ROLES.len()
+fn managed_cloud_runtime_set_exact(
+    runtimes: &[ManagedCloudRequiredRuntime],
+    source_verification: bool,
+) -> bool {
+    let mut expected = MANAGED_CLOUD_BASE_RUNTIME_ROLES.to_vec();
+    if source_verification {
+        expected.push("original_source_verifier");
+        expected.sort_unstable();
+    }
+    runtimes.len() == expected.len()
         && runtimes
             .iter()
             .map(|runtime| runtime.role.as_str())
-            .eq(MANAGED_CLOUD_BASE_RUNTIME_ROLES)
+            .eq(expected)
 }
 
 fn sqlite_managed_cloud_runtime_readiness(
@@ -8480,50 +8788,59 @@ fn sqlite_managed_cloud_runtime_readiness(
     runtime: &ManagedCloudRequiredRuntime,
     now_ms: i64,
 ) -> ManagedCloudResult<(bool, bool)> {
+    let tables = managed_cloud_runtime_tables_for_role(&runtime.role);
     tx.query_row(
-        "SELECT
+        &format!(
+            "SELECT
            EXISTS(
-             SELECT 1 FROM jobs_managed_cloud_runtime_heartbeats heartbeat
+             SELECT 1 FROM {} heartbeat
               WHERE heartbeat.activation_sha256=?1 AND heartbeat.manifest_sha256=?2
                 AND heartbeat.role=?3 AND heartbeat.observed_head_revision=?4
                 AND heartbeat.observed_transition_sha256=?5
            ),
            EXISTS(
-             SELECT 1 FROM jobs_managed_cloud_runtime_heartbeats heartbeat
-             JOIN jobs_managed_cloud_runtime_instances instance
+             SELECT 1 FROM {} heartbeat
+             JOIN {} instance
                ON instance.runtime_instance_id=heartbeat.runtime_instance_id
               AND instance.instance_epoch=heartbeat.instance_epoch
-             JOIN jobs_managed_cloud_runtime_grants grant
-               ON grant.grant_id=instance.grant_id
-              AND grant.activation_sha256=heartbeat.activation_sha256
-              AND grant.manifest_sha256=heartbeat.manifest_sha256
-              AND grant.component_id=heartbeat.component_id
-              AND grant.role=heartbeat.role
-              AND grant.expected_worker_id=heartbeat.worker_id
-              AND grant.expected_dependency_evidence_sha256=
+             JOIN {} runtime_grant
+               ON runtime_grant.grant_id=instance.grant_id
+              AND runtime_grant.activation_sha256=heartbeat.activation_sha256
+              AND runtime_grant.manifest_sha256=heartbeat.manifest_sha256
+              AND runtime_grant.component_id=heartbeat.component_id
+              AND runtime_grant.role=heartbeat.role
+              AND runtime_grant.expected_worker_id=heartbeat.worker_id
+              AND runtime_grant.expected_dependency_evidence_sha256=
                   heartbeat.dependency_evidence_sha256
               WHERE heartbeat.activation_sha256=?1 AND heartbeat.manifest_sha256=?2
                 AND heartbeat.role=?3 AND heartbeat.observed_head_revision=?4
                 AND heartbeat.observed_transition_sha256=?5
                 AND heartbeat.dependency_evidence_sha256=?6
                 AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
-                AND heartbeat.heartbeat_at_ms+?7>?8 AND grant.expires_at_ms>?8
+                AND heartbeat.heartbeat_at_ms+?7>?8
+                AND runtime_grant.expires_at_ms>?8
                 AND NOT EXISTS(
-                  SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations direct
-                   WHERE direct.grant_id=grant.grant_id
+                  SELECT 1 FROM {} direct
+                   WHERE direct.grant_id=runtime_grant.grant_id
                 )
                 AND NOT EXISTS(
                   SELECT 1 FROM jobs_managed_cloud_revocations revoked
                    WHERE revoked.effective_at_ms<=?8 AND (
                      (revoked.subject_kind='runtime_grant'
-                       AND revoked.subject_id=grant.grant_id
-                       AND revoked.subject_sha256=grant.token_sha256)
+                       AND revoked.subject_id=runtime_grant.grant_id
+                       AND revoked.subject_sha256=runtime_grant.token_sha256)
                      OR (revoked.subject_kind='runtime_instance'
                        AND revoked.subject_id=instance.runtime_instance_id
                        AND revoked.subject_sha256=instance.runtime_identity_sha256)
                    )
                 )
            )",
+            tables.heartbeats,
+            tables.heartbeats,
+            tables.instances,
+            tables.grants,
+            tables.grant_revocations
+        ),
         params![
             head.activation_sha256,
             head.manifest_sha256,
@@ -8545,50 +8862,59 @@ fn postgres_managed_cloud_runtime_readiness(
     runtime: &ManagedCloudRequiredRuntime,
     now_ms: i64,
 ) -> ManagedCloudResult<(bool, bool)> {
+    let tables = managed_cloud_runtime_tables_for_role(&runtime.role);
     tx.query_one(
-        "SELECT
+        &format!(
+            "SELECT
            EXISTS(
-             SELECT 1 FROM jobs_managed_cloud_runtime_heartbeats heartbeat
+             SELECT 1 FROM {} heartbeat
               WHERE heartbeat.activation_sha256=$1 AND heartbeat.manifest_sha256=$2
                 AND heartbeat.role=$3 AND heartbeat.observed_head_revision=$4
                 AND heartbeat.observed_transition_sha256=$5
            ),
            EXISTS(
-             SELECT 1 FROM jobs_managed_cloud_runtime_heartbeats heartbeat
-             JOIN jobs_managed_cloud_runtime_instances instance
+             SELECT 1 FROM {} heartbeat
+             JOIN {} instance
                ON instance.runtime_instance_id=heartbeat.runtime_instance_id
               AND instance.instance_epoch=heartbeat.instance_epoch
-             JOIN jobs_managed_cloud_runtime_grants grant
-               ON grant.grant_id=instance.grant_id
-              AND grant.activation_sha256=heartbeat.activation_sha256
-              AND grant.manifest_sha256=heartbeat.manifest_sha256
-              AND grant.component_id=heartbeat.component_id
-              AND grant.role=heartbeat.role
-              AND grant.expected_worker_id=heartbeat.worker_id
-              AND grant.expected_dependency_evidence_sha256=
+             JOIN {} runtime_grant
+               ON runtime_grant.grant_id=instance.grant_id
+              AND runtime_grant.activation_sha256=heartbeat.activation_sha256
+              AND runtime_grant.manifest_sha256=heartbeat.manifest_sha256
+              AND runtime_grant.component_id=heartbeat.component_id
+              AND runtime_grant.role=heartbeat.role
+              AND runtime_grant.expected_worker_id=heartbeat.worker_id
+              AND runtime_grant.expected_dependency_evidence_sha256=
                   heartbeat.dependency_evidence_sha256
               WHERE heartbeat.activation_sha256=$1 AND heartbeat.manifest_sha256=$2
                 AND heartbeat.role=$3 AND heartbeat.observed_head_revision=$4
                 AND heartbeat.observed_transition_sha256=$5
                 AND heartbeat.dependency_evidence_sha256=$6
                 AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
-                AND heartbeat.heartbeat_at_ms+$7>$8 AND grant.expires_at_ms>$8
+                AND heartbeat.heartbeat_at_ms+$7>$8
+                AND runtime_grant.expires_at_ms>$8
                 AND NOT EXISTS(
-                  SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations direct
-                   WHERE direct.grant_id=grant.grant_id
+                  SELECT 1 FROM {} direct
+                   WHERE direct.grant_id=runtime_grant.grant_id
                 )
                 AND NOT EXISTS(
                   SELECT 1 FROM jobs_managed_cloud_revocations revoked
                    WHERE revoked.effective_at_ms<=$8 AND (
                      (revoked.subject_kind='runtime_grant'
-                       AND revoked.subject_id=grant.grant_id
-                       AND revoked.subject_sha256=grant.token_sha256)
+                       AND revoked.subject_id=runtime_grant.grant_id
+                       AND revoked.subject_sha256=runtime_grant.token_sha256)
                      OR (revoked.subject_kind='runtime_instance'
                        AND revoked.subject_id=instance.runtime_instance_id
                        AND revoked.subject_sha256=instance.runtime_identity_sha256)
                    )
                 )
            )",
+            tables.heartbeats,
+            tables.heartbeats,
+            tables.instances,
+            tables.grants,
+            tables.grant_revocations
+        ),
         &[
             &head.activation_sha256,
             &head.manifest_sha256,
@@ -8645,7 +8971,7 @@ fn resolve_sqlite_managed_cloud_readiness_tx(
         );
     };
     let runtimes = sqlite_managed_cloud_required_runtimes(tx, &head)?;
-    let mut authority_valid = managed_cloud_phase611_runtime_set_exact(&runtimes);
+    let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
     if authority_valid {
         for runtime in &runtimes {
             match resolve_sqlite_managed_cloud_grant_authority(
@@ -8753,7 +9079,7 @@ fn resolve_postgres_managed_cloud_readiness_tx(
         );
     };
     let runtimes = postgres_managed_cloud_required_runtimes(tx, &head)?;
-    let mut authority_valid = managed_cloud_phase611_runtime_set_exact(&runtimes);
+    let mut authority_valid = managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
     if authority_valid {
         for runtime in &runtimes {
             match resolve_postgres_managed_cloud_grant_authority(
@@ -8864,7 +9190,8 @@ pub fn resolve_managed_cloud_readiness(
                 );
             };
             let runtimes = sqlite_managed_cloud_required_runtimes(&tx, &head)?;
-            let mut authority_valid = managed_cloud_phase611_runtime_set_exact(&runtimes);
+            let mut authority_valid =
+                managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
             if authority_valid {
                 for runtime in &runtimes {
                     match resolve_sqlite_managed_cloud_grant_authority(
@@ -8977,7 +9304,8 @@ pub fn resolve_managed_cloud_readiness(
                 );
             };
             let runtimes = postgres_managed_cloud_required_runtimes(&mut tx, &head)?;
-            let mut authority_valid = managed_cloud_phase611_runtime_set_exact(&runtimes);
+            let mut authority_valid =
+                managed_cloud_runtime_set_exact(&runtimes, head.source_verification);
             if authority_valid {
                 for runtime in &runtimes {
                     match resolve_postgres_managed_cloud_grant_authority(
@@ -9628,6 +9956,21 @@ pub(crate) fn lock_managed_cloud_release_registry_postgres_tx(
     Ok(())
 }
 
+/// Serializes read-only authority snapshots with managed-release writers
+/// without forcing independent readers through the exclusive registry fence.
+/// Callers that also take ATS or discovery locks must acquire this first.
+pub(crate) fn lock_managed_cloud_release_registry_shared_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+) -> ManagedCloudResult<()> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock_shared(
+           hashtextextended('jobs-managed-cloud-release-registry',0))",
+        &[],
+    )
+    .map_err(managed_cloud_storage)?;
+    Ok(())
+}
+
 pub(crate) fn lock_managed_cloud_workflow_admission_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
     scope: &ManagedCloudScope,
@@ -9797,9 +10140,15 @@ fn require_sqlite_managed_cloud_effect_admission(
     if !entitled {
         return Err(ManagedCloudRegistryError::Unavailable);
     }
-    let (application, _) =
+    let (application, posting) =
         load_stage_application_sqlite_tx(tx, &input.account_id, &input.application_id)
             .map_err(managed_cloud_storage)?;
+    let composed =
+        resolve_composed_job_integrity_projection_sqlite_tx(tx, &input.account_id, &posting)
+            .map_err(|_| ManagedCloudRegistryError::Unavailable)?;
+    let employer_domain = current_execution_employer_domain(&application, &composed)
+        .map_err(|_| ManagedCloudRegistryError::Unavailable)?
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
     if !current_execution_authorized_sqlite(
         tx,
         &input.account_id,
@@ -9810,10 +10159,11 @@ fn require_sqlite_managed_cloud_effect_admission(
     {
         return Err(ManagedCloudRegistryError::Unavailable);
     }
-    let hold_context = operational_hold_context_for_application_sqlite_tx(
+    let hold_context = operational_hold_context_for_application_sqlite_tx_after_authority(
         tx,
         &input.account_id,
         &input.application_id,
+        &employer_domain,
         Some("cloud"),
         None,
         None,
@@ -9836,20 +10186,10 @@ fn require_sqlite_managed_cloud_effect_admission(
     managed_cloud_admission_from_readiness(&readiness)
 }
 
-fn require_postgres_managed_cloud_effect_admission(
+fn prelock_postgres_managed_cloud_effect_admission_inputs(
     tx: &mut postgres::Transaction<'_>,
     input: &ManagedCloudWorkflowBindingInput,
-    now_ms: i64,
-) -> ManagedCloudResult<ManagedCloudAdmissionAuthority> {
-    lock_managed_cloud_workflow_admission_postgres_tx(tx, &input.scope)?;
-    require_postgres_managed_cloud_effect_admission_after_prelock(tx, input, now_ms)
-}
-
-fn require_postgres_managed_cloud_effect_admission_after_prelock(
-    tx: &mut postgres::Transaction<'_>,
-    input: &ManagedCloudWorkflowBindingInput,
-    now_ms: i64,
-) -> ManagedCloudResult<ManagedCloudAdmissionAuthority> {
+) -> ManagedCloudResult<JobApplication> {
     if crate::jobs_managed_cloud_runtime::managed_cloud_scope_for_admission().as_ref()
         != Some(&input.scope)
         || !cloud_distribution_ready_postgres_tx(tx).map_err(managed_cloud_storage)?
@@ -9863,6 +10203,9 @@ fn require_postgres_managed_cloud_effect_admission_after_prelock(
     .map_err(managed_cloud_storage)?;
     require_no_workflow_cleanup_postgres_tx(tx, &input.account_id)
         .map_err(managed_cloud_storage)?;
+    let (application, _) =
+        load_stage_application_postgres_tx(tx, &input.account_id, &input.application_id)
+            .map_err(managed_cloud_storage)?;
     let entitled = tx
         .query_opt(
             "SELECT cloud_browser FROM jobs_entitlements
@@ -9874,29 +10217,47 @@ fn require_postgres_managed_cloud_effect_admission_after_prelock(
     if !entitled {
         return Err(ManagedCloudRegistryError::Unavailable);
     }
-    let (application, _) =
-        load_stage_application_postgres_tx(tx, &input.account_id, &input.application_id)
-            .map_err(managed_cloud_storage)?;
-    if !current_execution_authorized_postgres(
-        tx,
-        &input.account_id,
-        &application,
-        ExecutionAuthorityRunner::Cloud,
-    )
-    .map_err(managed_cloud_storage)?
+    if !lock_current_execution_authority_postgres_after_prelock(tx, &input.account_id, &application)
+        .map_err(managed_cloud_storage)?
     {
         return Err(ManagedCloudRegistryError::Unavailable);
     }
-    let hold_context = operational_hold_context_for_application_postgres_tx(
+    Ok(application)
+}
+
+fn require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(
+    tx: &mut postgres::Transaction<'_>,
+    input: &ManagedCloudWorkflowBindingInput,
+    application: &JobApplication,
+    now_ms: i64,
+) -> ManagedCloudResult<ManagedCloudAdmissionAuthority> {
+    let current_execution = resolve_current_execution_authority_postgres_after_prelock_at_ms(
         tx,
         &input.account_id,
-        &input.application_id,
-        Some("cloud"),
-        None,
-        None,
+        application,
+        ExecutionAuthorityRunner::Cloud,
+        now_ms,
     )
-    .map_err(map_managed_cloud_operational_error)?;
-    require_operational_capability_postgres_tx(
+    .map_err(managed_cloud_storage)?;
+    if !current_execution.authorized {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    let employer_domain = current_execution
+        .employer_domain
+        .as_ref()
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let hold_context =
+        operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+            tx,
+            &input.account_id,
+            &input.application_id,
+            employer_domain,
+            Some("cloud"),
+            None,
+            None,
+        )
+        .map_err(map_managed_cloud_operational_error)?;
+    require_operational_capability_postgres_tx_after_authority_prelock(
         tx,
         OperationalCapability::ApplicationQueue,
         &hold_context,
@@ -10291,7 +10652,7 @@ pub(crate) fn bind_managed_cloud_workflow_sqlite_tx(
     Ok(result)
 }
 
-pub(crate) fn bind_managed_cloud_workflow_postgres_tx(
+pub(crate) fn bind_managed_cloud_workflow_postgres_tx_after_prelock(
     tx: &mut postgres::Transaction<'_>,
     input: &ManagedCloudWorkflowBindingInput,
 ) -> ManagedCloudResult<ManagedCloudWorkflowBinding> {
@@ -10303,13 +10664,26 @@ pub(crate) fn bind_managed_cloud_workflow_postgres_tx(
     if let Some(existing) = postgres_managed_cloud_workflow_binding(tx, &input.command_id)? {
         return require_exact_managed_cloud_workflow_binding(&existing, input);
     }
+    let start = if command_kind == "resume" {
+        Some(postgres_managed_cloud_start_binding_for_resume(
+            tx, input, true,
+        )?)
+    } else {
+        None
+    };
+    let application = prelock_postgres_managed_cloud_effect_admission_inputs(tx, input)?;
     let now_ms = managed_cloud_db_now_postgres(tx)?;
-    let current_admission = require_postgres_managed_cloud_effect_admission(tx, input, now_ms)?;
+    let current_admission =
+        require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(
+            tx,
+            input,
+            &application,
+            now_ms,
+        )?;
     if let Some(existing) = postgres_managed_cloud_workflow_binding(tx, &input.command_id)? {
         return require_exact_managed_cloud_workflow_binding(&existing, input);
     }
-    let frozen_admission = if command_kind == "resume" {
-        let start = postgres_managed_cloud_start_binding_for_resume(tx, input, true)?;
+    let frozen_admission = if let Some(start) = start {
         if !postgres_managed_cloud_recovery_accepts(
             tx,
             &current_admission,
@@ -10493,6 +10867,28 @@ fn require_postgres_managed_cloud_command_lease_replay(
         return Err(ManagedCloudRegistryError::IdentityConflict);
     }
     Ok(())
+}
+
+/// Lock the request command before any attempt row. Recovery and request-start
+/// both use this order, so a concurrent recovery cannot form command -> attempt
+/// against request-start's former attempt -> command order.
+fn lock_postgres_managed_cloud_request_start_command(
+    tx: &mut postgres::Transaction<'_>,
+    lease: &JobsWorkflowCommandLease,
+) -> ManagedCloudResult<()> {
+    let row = tx
+        .query_opt(
+            &format!(
+                "SELECT {WORKFLOW_COMMAND_SELECT} FROM jobs_workflow_commands
+                  WHERE id=$1 AND account_id=$2 FOR UPDATE"
+            ),
+            &[&lease.command.id, &lease.command.account_id],
+        )
+        .map_err(managed_cloud_storage)?
+        .ok_or(ManagedCloudRegistryError::NotFound)?;
+    let stored = workflow_command_from_stored(postgres_workflow_command_row(&row))
+        .map_err(|_| ManagedCloudRegistryError::InvalidAuthority)?;
+    require_managed_cloud_workflow_command_identity(&stored, &lease.command)
 }
 
 fn lock_postgres_managed_cloud_request_start_attempt(
@@ -10807,18 +11203,17 @@ fn resolve_postgres_managed_cloud_stored_request_start_authority(
     tx: &mut postgres::Transaction<'_>,
     lease: &JobsWorkflowCommandLease,
     stored: &ManagedCloudStoredRequestStartAuthority,
-) -> ManagedCloudResult<ManagedCloudRequestStartAuthority> {
-    let now_ms = managed_cloud_db_now_postgres(tx)?;
+) -> ManagedCloudResult<ManagedCloudRequestStartResolution> {
     let bytes = managed_cloud_decode_base64url(&stored.gateway_authority_base64url)?;
     let managed_cloud: ManagedCloudGatewayAuthority = managed_cloud_parse_canonical(&bytes)?;
     let input =
         managed_cloud_binding_input_from_lease(lease, &managed_cloud.execution.admission.scope);
     validate_managed_cloud_workflow_binding_input(&input)?;
+    lock_postgres_managed_cloud_request_start_command(tx, lease)?;
     let (authority_required, command_kind) = postgres_managed_cloud_command_marker(tx, &input)?;
     if !authority_required || !matches!(command_kind.as_str(), "start" | "resume") {
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
-    require_postgres_managed_cloud_command_lease_replay(tx, lease, now_ms)?;
     let binding = postgres_managed_cloud_workflow_binding(tx, &input.command_id)?
         .as_ref()
         .map(|binding| require_exact_managed_cloud_workflow_binding(binding, &input))
@@ -10831,12 +11226,19 @@ fn resolve_postgres_managed_cloud_stored_request_start_authority(
         &binding,
         true,
     )?;
-    require_exact_managed_cloud_stored_request_start_authority(
+    lock_postgres_managed_cloud_request_start_attempt(tx, lease)?;
+    let now_ms = managed_cloud_db_now_postgres(tx)?;
+    require_postgres_managed_cloud_command_lease_replay(tx, lease, now_ms)?;
+    let authority = require_exact_managed_cloud_stored_request_start_authority(
         stored,
         lease,
         binding,
         &execution_binding,
-    )
+    )?;
+    Ok(ManagedCloudRequestStartResolution {
+        authority: Some(authority),
+        db_time_ms: now_ms,
+    })
 }
 
 fn insert_sqlite_managed_cloud_request_start_authority(
@@ -10964,14 +11366,18 @@ pub(crate) fn resolve_managed_cloud_request_start_sqlite_tx(
     Ok(Some(authority))
 }
 
-pub(crate) fn resolve_managed_cloud_request_start_postgres_tx(
+pub(crate) fn resolve_managed_cloud_request_start_postgres_tx_after_prelock(
     tx: &mut postgres::Transaction<'_>,
     lease: &JobsWorkflowCommandLease,
     scope: Option<&ManagedCloudScope>,
-) -> ManagedCloudResult<Option<ManagedCloudRequestStartAuthority>> {
+) -> ManagedCloudResult<ManagedCloudRequestStartResolution> {
     let authority_required =
         postgres_managed_cloud_command_requires_authority(tx, &lease.command.id)?;
     if !authority_required {
+        lock_postgres_managed_cloud_request_start_command(tx, lease)?;
+        if postgres_managed_cloud_command_requires_authority(tx, &lease.command.id)? {
+            return Err(ManagedCloudRegistryError::InvalidAuthority);
+        }
         if postgres_managed_cloud_workflow_binding(tx, &lease.command.id)?.is_some()
             || postgres_managed_cloud_stored_request_start_authority(tx, &lease.command.id)?
                 .is_some()
@@ -10980,38 +11386,31 @@ pub(crate) fn resolve_managed_cloud_request_start_postgres_tx(
         }
         let now_ms = managed_cloud_db_now_postgres(tx)?;
         require_postgres_managed_cloud_command_lease(tx, lease, now_ms)?;
-        return Ok(None);
+        return Ok(ManagedCloudRequestStartResolution {
+            authority: None,
+            db_time_ms: now_ms,
+        });
     }
     if let Some(stored) =
         postgres_managed_cloud_stored_request_start_authority(tx, &lease.command.id)?
     {
-        lock_postgres_managed_cloud_request_start_attempt(tx, lease)?;
-        return resolve_postgres_managed_cloud_stored_request_start_authority(tx, lease, &stored)
-            .map(Some);
+        return resolve_postgres_managed_cloud_stored_request_start_authority(tx, lease, &stored);
     }
     let scope = scope.ok_or(ManagedCloudRegistryError::Unavailable)?;
     let input = managed_cloud_binding_input_from_lease(lease, scope);
     validate_managed_cloud_workflow_binding_input(&input)?;
-    lock_managed_cloud_workflow_admission_postgres_tx(tx, scope)?;
     if let Some(stored) =
         postgres_managed_cloud_stored_request_start_authority(tx, &lease.command.id)?
     {
-        lock_postgres_managed_cloud_request_start_attempt(tx, lease)?;
-        return resolve_postgres_managed_cloud_stored_request_start_authority(tx, lease, &stored)
-            .map(Some);
+        return resolve_postgres_managed_cloud_stored_request_start_authority(tx, lease, &stored);
     }
-    let preliminary_now_ms = managed_cloud_db_now_postgres(tx)?;
-    require_postgres_managed_cloud_effect_admission(tx, &input, preliminary_now_ms)?;
-    lock_postgres_managed_cloud_request_start_attempt(tx, lease)?;
+    let application = prelock_postgres_managed_cloud_effect_admission_inputs(tx, &input)?;
+    lock_postgres_managed_cloud_request_start_command(tx, lease)?;
     if let Some(stored) =
         postgres_managed_cloud_stored_request_start_authority(tx, &lease.command.id)?
     {
-        return resolve_postgres_managed_cloud_stored_request_start_authority(tx, lease, &stored)
-            .map(Some);
+        return resolve_postgres_managed_cloud_stored_request_start_authority(tx, lease, &stored);
     }
-    let now_ms = managed_cloud_db_now_postgres(tx)?;
-    let current = require_postgres_managed_cloud_effect_admission(tx, &input, now_ms)?;
-    require_postgres_managed_cloud_command_lease(tx, lease, now_ms)?;
     let (authority_required, command_kind) = postgres_managed_cloud_command_marker(tx, &input)?;
     if !authority_required || !matches!(command_kind.as_str(), "start" | "resume") {
         return Err(ManagedCloudRegistryError::InvalidAuthority);
@@ -11029,13 +11428,25 @@ pub(crate) fn resolve_managed_cloud_request_start_postgres_tx(
         &binding,
         true,
     )?;
+    lock_postgres_managed_cloud_request_start_attempt(tx, lease)?;
+    let now_ms = managed_cloud_db_now_postgres(tx)?;
+    let current = require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(
+        tx,
+        &input,
+        &application,
+        now_ms,
+    )?;
+    require_postgres_managed_cloud_command_lease(tx, lease, now_ms)?;
     if !postgres_managed_cloud_recovery_accepts(tx, &current, &execution_binding.admission, now_ms)?
     {
         return Err(ManagedCloudRegistryError::RecoveryNotAccepted);
     }
     let authority = managed_cloud_request_start_authority(binding, execution_binding, current)?;
     insert_postgres_managed_cloud_request_start_authority(tx, lease, &authority)?;
-    Ok(Some(authority))
+    Ok(ManagedCloudRequestStartResolution {
+        authority: Some(authority),
+        db_time_ms: now_ms,
+    })
 }
 
 fn require_managed_cloud_workflow_command_identity(
@@ -11259,6 +11670,18 @@ fn sqlite_managed_cloud_execution_is_managed(
     Ok(complete_start)
 }
 
+pub(crate) fn require_unmanaged_cloud_execution_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> ManagedCloudResult<()> {
+    if sqlite_managed_cloud_execution_is_managed(tx, account_id, application_id, run_id)? {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    Ok(())
+}
+
 fn postgres_managed_cloud_execution_is_managed(
     tx: &mut postgres::Transaction<'_>,
     account_id: &str,
@@ -11300,6 +11723,18 @@ fn postgres_managed_cloud_execution_is_managed(
         return Err(ManagedCloudRegistryError::InvalidAuthority);
     }
     Ok(complete_start)
+}
+
+pub(crate) fn require_unmanaged_cloud_execution_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> ManagedCloudResult<()> {
+    if postgres_managed_cloud_execution_is_managed(tx, account_id, application_id, run_id)? {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    Ok(())
 }
 
 fn validate_managed_cloud_execution_lease_claim_input(
@@ -11562,9 +11997,12 @@ fn require_sqlite_managed_cloud_runner_instance_ready(
     volume_worker_id: &str,
     now_ms: i64,
 ) -> ManagedCloudResult<ManagedCloudRuntimeInstance> {
-    let (instance, _) =
-        sqlite_managed_cloud_runtime_instance_by_runtime_id(tx, runtime_instance_id)?
-            .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let (instance, _) = sqlite_managed_cloud_runtime_instance_by_runtime_id(
+        tx,
+        runtime_instance_id,
+        MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+    )?
+    .ok_or(ManagedCloudRegistryError::Unavailable)?;
     require_managed_cloud_runner_instance_matches_current(
         &instance,
         current,
@@ -11576,8 +12014,9 @@ fn require_sqlite_managed_cloud_runner_instance_ready(
     require_sqlite_managed_cloud_runtime_authority_active(tx, &instance, now_ms)?;
     let ready = tx
         .query_row(
-            "SELECT 1
-               FROM jobs_managed_cloud_runtime_heartbeats heartbeat
+            &format!(
+                "SELECT 1
+               FROM {} heartbeat
                JOIN jobs_managed_cloud_activation_requirements requirement
                  ON requirement.activation_sha256=heartbeat.activation_sha256
                 AND requirement.role=heartbeat.role
@@ -11598,6 +12037,8 @@ fn require_sqlite_managed_cloud_runner_instance_ready(
                 AND heartbeat.dependency_evidence_sha256=?14
                 AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
                 AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>?15",
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES.heartbeats
+            ),
             params![
                 instance.runtime_instance_id,
                 instance.instance_epoch,
@@ -11639,8 +12080,8 @@ fn require_postgres_managed_cloud_runner_instance_ready(
         .query_opt(
             &format!(
                 "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-                   FROM jobs_managed_cloud_runtime_instances
-                  WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR SHARE"
+                   FROM {} WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR SHARE",
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES.instances
             ),
             &[&runtime_instance_id, &runtime_instance_epoch],
         )
@@ -11656,8 +12097,10 @@ fn require_postgres_managed_cloud_runner_instance_ready(
         volume_worker_id,
     )?;
     tx.query_opt(
-        "SELECT 1 FROM jobs_managed_cloud_runtime_grants
-          WHERE grant_id=$1 FOR SHARE",
+        &format!(
+            "SELECT 1 FROM {} WHERE grant_id=$1 FOR SHARE",
+            MANAGED_CLOUD_BASE_RUNTIME_TABLES.grants
+        ),
         &[&instance.grant_id],
     )
     .map_err(managed_cloud_storage)?
@@ -11665,8 +12108,9 @@ fn require_postgres_managed_cloud_runner_instance_ready(
     require_postgres_managed_cloud_runtime_authority_active(tx, &instance, now_ms)?;
     let ready = tx
         .query_opt(
-            "SELECT 1
-               FROM jobs_managed_cloud_runtime_heartbeats heartbeat
+            &format!(
+                "SELECT 1
+               FROM {} heartbeat
                JOIN jobs_managed_cloud_activation_requirements requirement
                  ON requirement.activation_sha256=heartbeat.activation_sha256
                 AND requirement.role=heartbeat.role
@@ -11688,6 +12132,8 @@ fn require_postgres_managed_cloud_runner_instance_ready(
                 AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
                 AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>$15
               FOR SHARE OF heartbeat,requirement",
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES.heartbeats
+            ),
             &[
                 &instance.runtime_instance_id,
                 &instance.instance_epoch,
@@ -11802,11 +12248,14 @@ pub(crate) fn resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prel
     input: Option<&ManagedCloudExecutionLeaseClaimInput>,
     authenticated_worker_id: &str,
     volume_worker_id: &str,
-) -> ManagedCloudResult<Option<ManagedCloudExecutionLeaseAuthority>> {
+) -> ManagedCloudResult<ManagedCloudExecutionLeaseClaimResolution> {
     let managed =
         postgres_managed_cloud_execution_is_managed(tx, account_id, application_id, run_id)?;
     let Some(input) = require_managed_cloud_execution_input(managed, input)? else {
-        return Ok(None);
+        return Ok(ManagedCloudExecutionLeaseClaimResolution {
+            authority: None,
+            db_time_ms: managed_cloud_db_now_postgres(tx)?,
+        });
     };
     validate_managed_cloud_execution_lease_claim_input(input)?;
     let discovered_command = postgres_managed_cloud_execution_command_authority(
@@ -11817,11 +12266,9 @@ pub(crate) fn resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prel
         input,
         false,
     )?;
-    let now_ms = managed_cloud_db_now_postgres(tx)?;
-    let current = require_postgres_managed_cloud_effect_admission_after_prelock(
+    let application = prelock_postgres_managed_cloud_effect_admission_inputs(
         tx,
         &discovered_command.binding_input,
-        now_ms,
     )?;
     let command = postgres_managed_cloud_execution_command_authority(
         tx,
@@ -11834,6 +12281,13 @@ pub(crate) fn resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prel
     if command != discovered_command {
         return Err(ManagedCloudRegistryError::IdentityConflict);
     }
+    let now_ms = managed_cloud_db_now_postgres(tx)?;
+    let current = require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(
+        tx,
+        &command.binding_input,
+        &application,
+        now_ms,
+    )?;
     if !postgres_managed_cloud_recovery_accepts(
         tx,
         &current,
@@ -11851,8 +12305,12 @@ pub(crate) fn resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prel
         volume_worker_id,
         now_ms,
     )?;
-    managed_cloud_execution_lease_authority(command, input, current, authenticated_worker_id)
-        .map(Some)
+    let authority =
+        managed_cloud_execution_lease_authority(command, input, current, authenticated_worker_id)?;
+    Ok(ManagedCloudExecutionLeaseClaimResolution {
+        authority: Some(authority),
+        db_time_ms: now_ms,
+    })
 }
 
 pub(crate) fn bind_managed_cloud_execution_lease_authority(
@@ -12166,6 +12624,11 @@ pub(crate) fn resolve_managed_cloud_execution_effect_sqlite_tx(
 /// ATS/fleet locks and call this helper after the account lock but before the
 /// execution lease is locked. The helper locks entitlement/application,
 /// command/binding, then the exact lease in that order.
+pub(crate) struct PostgresManagedCloudExecutionEffectResolution {
+    pub(crate) authority: ManagedCloudExecutionLeaseAuthority,
+    pub(crate) db_time_ms: i64,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
     tx: &mut postgres::Transaction<'_>,
@@ -12177,7 +12640,7 @@ pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
     input: Option<&ManagedCloudExecutionLeaseClaimInput>,
     authenticated_worker_id: &str,
     volume_worker_id: &str,
-) -> ManagedCloudResult<Option<ManagedCloudExecutionLeaseAuthority>> {
+) -> ManagedCloudResult<Option<PostgresManagedCloudExecutionEffectResolution>> {
     let managed =
         postgres_managed_cloud_execution_is_managed(tx, account_id, application_id, run_id)?;
     let Some(input) = require_managed_cloud_execution_input(managed, input)? else {
@@ -12192,12 +12655,17 @@ pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
         input,
         false,
     )?;
-    let now_ms = managed_cloud_db_now_postgres(tx)?;
-    let current = require_postgres_managed_cloud_effect_admission_after_prelock(
+    let application = prelock_postgres_managed_cloud_effect_admission_inputs(
         tx,
         &discovered_command.binding_input,
-        now_ms,
     )?;
+    tx.query_opt(
+        "SELECT application_id FROM jobs_attempt_reservations
+          WHERE account_id=$1 AND application_id=$2 FOR UPDATE",
+        &[&account_id, &application_id],
+    )
+    .map_err(managed_cloud_storage)?
+    .ok_or(ManagedCloudRegistryError::Unavailable)?;
     let command = postgres_managed_cloud_execution_command_authority(
         tx,
         account_id,
@@ -12215,7 +12683,7 @@ pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
                 "SELECT {MANAGED_CLOUD_EXECUTION_LEASE_AUTHORITY_COLUMNS}
                    FROM jobs_execution_leases
                   WHERE run_id=$1 AND account_id=$2 AND application_id=$3
-                    AND fence=$4 AND lease_token_sha256=$5 FOR SHARE"
+                    AND fence=$4 AND lease_token_sha256=$5 FOR UPDATE"
             ),
             &[
                 &run_id,
@@ -12227,6 +12695,17 @@ pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
         )
         .map_err(managed_cloud_storage)?
         .ok_or(ManagedCloudRegistryError::NotFound)?;
+    // The preliminary pass is read-only and exists only to acquire every managed readiness row.
+    // Its result never authorizes an execution effect. After those rows and the exact lease are
+    // locked, one final database scalar drives every temporal decision returned to the caller.
+    let preliminary_now_ms = managed_cloud_db_now_postgres(tx)?;
+    let preliminary_current =
+        require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(
+            tx,
+            &command.binding_input,
+            &application,
+            preliminary_now_ms,
+        )?;
     let stored = managed_cloud_execution_lease_authority_from_postgres(&row);
     require_managed_cloud_stored_claim_allows_effect(
         &stored,
@@ -12239,6 +12718,31 @@ pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
             authenticated_worker_id,
             volume_worker_id,
         },
+    )?;
+    if !postgres_managed_cloud_recovery_accepts(
+        tx,
+        &preliminary_current,
+        &command.execution_binding.admission,
+        preliminary_now_ms,
+    )? {
+        return Err(ManagedCloudRegistryError::RecoveryNotAccepted);
+    }
+    require_postgres_managed_cloud_runner_instance_ready(
+        tx,
+        &preliminary_current,
+        &input.managed_cloud_runtime_instance_id,
+        input.managed_cloud_runtime_instance_epoch,
+        authenticated_worker_id,
+        volume_worker_id,
+        preliminary_now_ms,
+    )?;
+
+    let now_ms = managed_cloud_db_now_postgres(tx)?;
+    let current = require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(
+        tx,
+        &command.binding_input,
+        &application,
+        now_ms,
     )?;
     if !postgres_managed_cloud_recovery_accepts(
         tx,
@@ -12257,8 +12761,12 @@ pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
         volume_worker_id,
         now_ms,
     )?;
-    managed_cloud_execution_lease_authority(command, input, current, authenticated_worker_id)
-        .map(Some)
+    let authority =
+        managed_cloud_execution_lease_authority(command, input, current, authenticated_worker_id)?;
+    Ok(Some(PostgresManagedCloudExecutionEffectResolution {
+        authority,
+        db_time_ms: now_ms,
+    }))
 }
 
 const MANAGED_CLOUD_IRREVERSIBLE_RECEIPT_COLUMNS: &str =
@@ -12727,7 +13235,7 @@ fn validate_new_managed_cloud_runtime_grant(
             "jobs-api" | "jobs-runner" | "jobs-workflows"
         )
         || !managed_cloud_runtime_role(&input.role)
-        || input.role == "original_source_verifier"
+        || (input.role == "original_source_verifier" && input.component_id != "jobs-workflows")
         || !managed_cloud_route_id(&input.expected_worker_id)
         || !managed_cloud_route_id(&input.authorization_ref)
         || !managed_cloud_actor(&input.created_by)
@@ -12904,6 +13412,41 @@ const MANAGED_CLOUD_RUNTIME_GRANT_COLUMNS: &str =
      expected_runtime_identity_sha256,\
      expected_worker_id,authorization_ref,created_by,activation_expires_at_ms,expires_at_ms,created_at_ms";
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ManagedCloudRuntimeAuthorityTables {
+    grants: &'static str,
+    grant_revocations: &'static str,
+    instances: &'static str,
+    heartbeats: &'static str,
+    heartbeat_audit: &'static str,
+}
+
+const MANAGED_CLOUD_BASE_RUNTIME_TABLES: ManagedCloudRuntimeAuthorityTables =
+    ManagedCloudRuntimeAuthorityTables {
+        grants: "jobs_managed_cloud_runtime_grants",
+        grant_revocations: "jobs_managed_cloud_runtime_grant_revocations",
+        instances: "jobs_managed_cloud_runtime_instances",
+        heartbeats: "jobs_managed_cloud_runtime_heartbeats",
+        heartbeat_audit: "jobs_managed_cloud_runtime_heartbeat_audit",
+    };
+
+const MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES: ManagedCloudRuntimeAuthorityTables =
+    ManagedCloudRuntimeAuthorityTables {
+        grants: "jobs_managed_cloud_original_source_verifier_runtime_grants",
+        grant_revocations: "jobs_managed_cloud_original_source_verifier_grant_revocations",
+        instances: "jobs_managed_cloud_original_source_verifier_runtime_instances",
+        heartbeats: "jobs_managed_cloud_original_source_verifier_runtime_heartbeats",
+        heartbeat_audit: "jobs_managed_cloud_original_source_verifier_runtime_heartbeat_audit",
+    };
+
+fn managed_cloud_runtime_tables_for_role(role: &str) -> ManagedCloudRuntimeAuthorityTables {
+    if role == "original_source_verifier" {
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES
+    } else {
+        MANAGED_CLOUD_BASE_RUNTIME_TABLES
+    }
+}
+
 fn require_exact_managed_cloud_runtime_grant_replay(
     existing: &ManagedCloudRuntimeGrant,
     input: &NewManagedCloudRuntimeGrant,
@@ -12927,11 +13470,13 @@ fn require_exact_managed_cloud_runtime_grant_replay(
 fn sqlite_managed_cloud_runtime_grant_by_issuance_ref(
     tx: &rusqlite::Transaction<'_>,
     issuance_ref: &str,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<ManagedCloudRuntimeGrant>> {
     tx.query_row(
         &format!(
             "SELECT {MANAGED_CLOUD_RUNTIME_GRANT_COLUMNS}
-               FROM jobs_managed_cloud_runtime_grants WHERE issuance_ref=?1"
+               FROM {} WHERE issuance_ref=?1",
+            tables.grants
         ),
         params![issuance_ref],
         managed_cloud_runtime_grant_from_sqlite,
@@ -12943,11 +13488,13 @@ fn sqlite_managed_cloud_runtime_grant_by_issuance_ref(
 fn postgres_managed_cloud_runtime_grant_by_issuance_ref(
     tx: &mut postgres::Transaction<'_>,
     issuance_ref: &str,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<ManagedCloudRuntimeGrant>> {
     tx.query_opt(
         &format!(
             "SELECT {MANAGED_CLOUD_RUNTIME_GRANT_COLUMNS}
-               FROM jobs_managed_cloud_runtime_grants WHERE issuance_ref=$1 FOR UPDATE"
+               FROM {} WHERE issuance_ref=$1 FOR UPDATE",
+            tables.grants
         ),
         &[&issuance_ref],
     )
@@ -12958,11 +13505,13 @@ fn postgres_managed_cloud_runtime_grant_by_issuance_ref(
 fn sqlite_managed_cloud_runtime_grant_by_id(
     tx: &rusqlite::Transaction<'_>,
     grant_id: &str,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<ManagedCloudRuntimeGrant>> {
     tx.query_row(
         &format!(
             "SELECT {MANAGED_CLOUD_RUNTIME_GRANT_COLUMNS} \
-               FROM jobs_managed_cloud_runtime_grants WHERE grant_id=?1"
+               FROM {} WHERE grant_id=?1",
+            tables.grants
         ),
         params![grant_id],
         managed_cloud_runtime_grant_from_sqlite,
@@ -12974,16 +13523,115 @@ fn sqlite_managed_cloud_runtime_grant_by_id(
 fn postgres_managed_cloud_runtime_grant_by_id(
     tx: &mut postgres::Transaction<'_>,
     grant_id: &str,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<ManagedCloudRuntimeGrant>> {
     tx.query_opt(
         &format!(
             "SELECT {MANAGED_CLOUD_RUNTIME_GRANT_COLUMNS} \
-               FROM jobs_managed_cloud_runtime_grants WHERE grant_id=$1"
+               FROM {} WHERE grant_id=$1 FOR UPDATE",
+            tables.grants
         ),
         &[&grant_id],
     )
     .map(|row| row.as_ref().map(managed_cloud_runtime_grant_from_postgres))
     .map_err(managed_cloud_storage)
+}
+
+fn sqlite_managed_cloud_runtime_grant_by_issuance_ref_any(
+    tx: &rusqlite::Transaction<'_>,
+    issuance_ref: &str,
+) -> ManagedCloudResult<Option<(ManagedCloudRuntimeGrant, ManagedCloudRuntimeAuthorityTables)>> {
+    let base = sqlite_managed_cloud_runtime_grant_by_issuance_ref(
+        tx,
+        issuance_ref,
+        MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+    )?;
+    let verifier = sqlite_managed_cloud_runtime_grant_by_issuance_ref(
+        tx,
+        issuance_ref,
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+    )?;
+    match (base, verifier) {
+        (Some(_), Some(_)) => Err(ManagedCloudRegistryError::IdentityConflict),
+        (Some(grant), None) => Ok(Some((grant, MANAGED_CLOUD_BASE_RUNTIME_TABLES))),
+        (None, Some(grant)) => Ok(Some((
+            grant,
+            MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn postgres_managed_cloud_runtime_grant_by_issuance_ref_any(
+    tx: &mut postgres::Transaction<'_>,
+    issuance_ref: &str,
+) -> ManagedCloudResult<Option<(ManagedCloudRuntimeGrant, ManagedCloudRuntimeAuthorityTables)>> {
+    let base = postgres_managed_cloud_runtime_grant_by_issuance_ref(
+        tx,
+        issuance_ref,
+        MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+    )?;
+    let verifier = postgres_managed_cloud_runtime_grant_by_issuance_ref(
+        tx,
+        issuance_ref,
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+    )?;
+    match (base, verifier) {
+        (Some(_), Some(_)) => Err(ManagedCloudRegistryError::IdentityConflict),
+        (Some(grant), None) => Ok(Some((grant, MANAGED_CLOUD_BASE_RUNTIME_TABLES))),
+        (None, Some(grant)) => Ok(Some((
+            grant,
+            MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn sqlite_managed_cloud_runtime_grant_by_id_any(
+    tx: &rusqlite::Transaction<'_>,
+    grant_id: &str,
+) -> ManagedCloudResult<Option<(ManagedCloudRuntimeGrant, ManagedCloudRuntimeAuthorityTables)>> {
+    let base =
+        sqlite_managed_cloud_runtime_grant_by_id(tx, grant_id, MANAGED_CLOUD_BASE_RUNTIME_TABLES)?;
+    let verifier = sqlite_managed_cloud_runtime_grant_by_id(
+        tx,
+        grant_id,
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+    )?;
+    match (base, verifier) {
+        (Some(_), Some(_)) => Err(ManagedCloudRegistryError::IdentityConflict),
+        (Some(grant), None) => Ok(Some((grant, MANAGED_CLOUD_BASE_RUNTIME_TABLES))),
+        (None, Some(grant)) => Ok(Some((
+            grant,
+            MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn postgres_managed_cloud_runtime_grant_by_id_any(
+    tx: &mut postgres::Transaction<'_>,
+    grant_id: &str,
+) -> ManagedCloudResult<Option<(ManagedCloudRuntimeGrant, ManagedCloudRuntimeAuthorityTables)>> {
+    let base = postgres_managed_cloud_runtime_grant_by_id(
+        tx,
+        grant_id,
+        MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+    )?;
+    let verifier = postgres_managed_cloud_runtime_grant_by_id(
+        tx,
+        grant_id,
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+    )?;
+    match (base, verifier) {
+        (Some(_), Some(_)) => Err(ManagedCloudRegistryError::IdentityConflict),
+        (Some(grant), None) => Ok(Some((grant, MANAGED_CLOUD_BASE_RUNTIME_TABLES))),
+        (None, Some(grant)) => Ok(Some((
+            grant,
+            MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+        ))),
+        (None, None) => Ok(None),
+    }
 }
 
 fn managed_cloud_runtime_grant_result(
@@ -13034,15 +13682,19 @@ fn sqlite_managed_cloud_replay_grant_token(
     tx: &rusqlite::Transaction<'_>,
     grant: &ManagedCloudRuntimeGrant,
     now_ms: i64,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<String>> {
     let (ciphertext, consumed, revoked): (Option<String>, bool, bool) = tx
         .query_row(
-            "SELECT grant.grant_token_ciphertext,
-                    EXISTS(SELECT 1 FROM jobs_managed_cloud_runtime_instances instance
+            &format!(
+                "SELECT grant.grant_token_ciphertext,
+                    EXISTS(SELECT 1 FROM {} instance
                             WHERE instance.grant_id=grant.grant_id),
-                    EXISTS(SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations revoked
+                    EXISTS(SELECT 1 FROM {} revoked
                             WHERE revoked.grant_id=grant.grant_id)
-               FROM jobs_managed_cloud_runtime_grants grant WHERE grant.grant_id=?1",
+               FROM {} grant WHERE grant.grant_id=?1",
+                tables.instances, tables.grant_revocations, tables.grants
+            ),
             params![grant.grant_id],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
@@ -13050,9 +13702,12 @@ fn sqlite_managed_cloud_replay_grant_token(
     if grant.expires_at_ms <= now_ms || consumed || revoked {
         if ciphertext.is_some() {
             tx.execute(
-                "UPDATE jobs_managed_cloud_runtime_grants
+                &format!(
+                    "UPDATE {}
                     SET grant_token_ciphertext=NULL
                   WHERE grant_id=?1 AND grant_token_ciphertext IS NOT NULL",
+                    tables.grants
+                ),
                 params![grant.grant_id],
             )
             .map_err(managed_cloud_storage)?;
@@ -13078,15 +13733,19 @@ fn postgres_managed_cloud_replay_grant_token(
     tx: &mut postgres::Transaction<'_>,
     grant: &ManagedCloudRuntimeGrant,
     now_ms: i64,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<String>> {
     let row = tx
         .query_one(
-            "SELECT grant.grant_token_ciphertext,
-                    EXISTS(SELECT 1 FROM jobs_managed_cloud_runtime_instances instance
-                            WHERE instance.grant_id=grant.grant_id),
-                    EXISTS(SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations revoked
-                            WHERE revoked.grant_id=grant.grant_id)
-               FROM jobs_managed_cloud_runtime_grants grant WHERE grant.grant_id=$1",
+            &format!(
+                "SELECT runtime_grant.grant_token_ciphertext,
+                    EXISTS(SELECT 1 FROM {} instance
+                            WHERE instance.grant_id=runtime_grant.grant_id),
+                    EXISTS(SELECT 1 FROM {} revoked
+                            WHERE revoked.grant_id=runtime_grant.grant_id)
+               FROM {} runtime_grant WHERE runtime_grant.grant_id=$1",
+                tables.instances, tables.grant_revocations, tables.grants
+            ),
             &[&grant.grant_id],
         )
         .map_err(managed_cloud_storage)?;
@@ -13096,9 +13755,12 @@ fn postgres_managed_cloud_replay_grant_token(
     if grant.expires_at_ms <= now_ms || consumed || revoked {
         if ciphertext.is_some() {
             tx.execute(
-                "UPDATE jobs_managed_cloud_runtime_grants
+                &format!(
+                    "UPDATE {}
                     SET grant_token_ciphertext=NULL
                   WHERE grant_id=$1 AND grant_token_ciphertext IS NOT NULL",
+                    tables.grants
+                ),
                 &[&grant.grant_id],
             )
             .map_err(managed_cloud_storage)?;
@@ -13217,7 +13879,13 @@ fn resolve_sqlite_managed_cloud_grant_authority(
            JOIN jobs_managed_cloud_activation_requirements requirement
              ON requirement.activation_sha256=activation.activation_sha256
             AND requirement.role=capability.capability
-           JOIN jobs_managed_cloud_manifest_runtime_identities identity
+           JOIN (
+             SELECT manifest_sha256,component_id,role,runtime_identity_sha256
+               FROM jobs_managed_cloud_manifest_runtime_identities
+             UNION ALL
+             SELECT manifest_sha256,component_id,role,runtime_identity_sha256
+               FROM jobs_managed_cloud_manifest_original_source_verifier_identities
+           ) identity
              ON identity.manifest_sha256=manifest.manifest_sha256
             AND identity.component_id=capability.component_id
             AND identity.role=capability.capability
@@ -13231,7 +13899,19 @@ fn resolve_sqlite_managed_cloud_grant_authority(
             AND activation.workflow_cleanup_enabled=1
             AND activation.direct_discovery_enabled=0
             AND activation.global_discovery_enabled=0
-            AND activation.source_verification_enabled=0
+            AND (capability.capability<>'original_source_verifier'
+                 OR activation.source_verification_enabled=1)
+            AND (activation.source_verification_enabled=0 OR EXISTS(
+              SELECT 1
+                FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                  ON source_identity.manifest_sha256=source_protocol.manifest_sha256
+               WHERE source_protocol.manifest_sha256=manifest.manifest_sha256
+                 AND source_protocol.protocol_id='source_verification'
+                 AND source_protocol.protocol_version=1
+                 AND source_identity.component_id='jobs-workflows'
+                 AND source_identity.role='original_source_verifier'
+            ))
             AND (transition.transition_kind='activation'
                  OR rollback.rollback_sha256 IS NOT NULL)
             AND NOT EXISTS(
@@ -13333,7 +14013,13 @@ fn resolve_postgres_managed_cloud_grant_authority(
            JOIN jobs_managed_cloud_activation_requirements requirement
              ON requirement.activation_sha256=activation.activation_sha256
             AND requirement.role=capability.capability
-           JOIN jobs_managed_cloud_manifest_runtime_identities identity
+           JOIN (
+             SELECT manifest_sha256,component_id,role,runtime_identity_sha256
+               FROM jobs_managed_cloud_manifest_runtime_identities
+             UNION ALL
+             SELECT manifest_sha256,component_id,role,runtime_identity_sha256
+               FROM jobs_managed_cloud_manifest_original_source_verifier_identities
+           ) identity
              ON identity.manifest_sha256=manifest.manifest_sha256
             AND identity.component_id=capability.component_id
             AND identity.role=capability.capability
@@ -13347,7 +14033,19 @@ fn resolve_postgres_managed_cloud_grant_authority(
             AND activation.workflow_cleanup_enabled
             AND NOT activation.direct_discovery_enabled
             AND NOT activation.global_discovery_enabled
-            AND NOT activation.source_verification_enabled
+            AND (capability.capability<>'original_source_verifier'
+                 OR activation.source_verification_enabled)
+            AND (NOT activation.source_verification_enabled OR EXISTS(
+              SELECT 1
+                FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                  ON source_identity.manifest_sha256=source_protocol.manifest_sha256
+               WHERE source_protocol.manifest_sha256=manifest.manifest_sha256
+                 AND source_protocol.protocol_id='source_verification'
+                 AND source_protocol.protocol_version=1
+                 AND source_identity.component_id='jobs-workflows'
+                 AND source_identity.role='original_source_verifier'
+            ))
             AND (transition.transition_kind='activation'
                  OR rollback.rollback_sha256 IS NOT NULL)
             AND NOT EXISTS(
@@ -13406,26 +14104,31 @@ pub fn issue_managed_cloud_runtime_grant(
     input: &NewManagedCloudRuntimeGrant,
 ) -> ManagedCloudResult<ManagedCloudRuntimeGrant> {
     validate_new_managed_cloud_runtime_grant(input)?;
+    let tables = managed_cloud_runtime_tables_for_role(&input.role);
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut connection = pool.get().map_err(managed_cloud_storage)?;
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(managed_cloud_storage)?;
-            if let Some(existing) =
-                sqlite_managed_cloud_runtime_grant_by_issuance_ref(&tx, &input.issuance_ref)?
+            if let Some((existing, existing_tables)) =
+                sqlite_managed_cloud_runtime_grant_by_issuance_ref_any(&tx, &input.issuance_ref)?
             {
                 require_exact_managed_cloud_runtime_grant_replay(&existing, input)?;
                 let now_ms = managed_cloud_db_now_sqlite(&tx)?;
-                let grant_token =
-                    match sqlite_managed_cloud_replay_grant_token(&tx, &existing, now_ms) {
-                        Ok(token) => token,
-                        Err(ManagedCloudRegistryError::GrantExpired) => {
-                            tx.commit().map_err(managed_cloud_storage)?;
-                            return Err(ManagedCloudRegistryError::GrantExpired);
-                        }
-                        Err(error) => return Err(error),
-                    };
+                let grant_token = match sqlite_managed_cloud_replay_grant_token(
+                    &tx,
+                    &existing,
+                    now_ms,
+                    existing_tables,
+                ) {
+                    Ok(token) => token,
+                    Err(ManagedCloudRegistryError::GrantExpired) => {
+                        tx.commit().map_err(managed_cloud_storage)?;
+                        return Err(ManagedCloudRegistryError::GrantExpired);
+                    }
+                    Err(error) => return Err(error),
+                };
                 tx.commit().map_err(managed_cloud_storage)?;
                 return Ok(managed_cloud_runtime_grant_result(
                     existing,
@@ -13440,15 +14143,23 @@ pub fn issue_managed_cloud_runtime_grant(
                 &input.issuance_ref,
                 &grant_token,
             )?;
-            if tx
-                .query_row(
-                    "SELECT 1 FROM jobs_managed_cloud_runtime_grants WHERE token_sha256=?1",
+            if [
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+            ]
+            .into_iter()
+            .map(|candidate| {
+                tx.query_row(
+                    &format!("SELECT 1 FROM {} WHERE token_sha256=?1", candidate.grants),
                     params![token_sha256],
                     |_| Ok(()),
                 )
                 .optional()
-                .map_err(managed_cloud_storage)?
-                .is_some()
+                .map_err(managed_cloud_storage)
+            })
+            .collect::<ManagedCloudResult<Vec<_>>>()?
+            .into_iter()
+            .any(|row| row.is_some())
             {
                 return Err(ManagedCloudRegistryError::IdentityConflict);
             }
@@ -13462,7 +14173,8 @@ pub fn issue_managed_cloud_runtime_grant(
                 })
                 .ok_or(ManagedCloudRegistryError::InvalidRequest)?;
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_grants(
+                &format!(
+                    "INSERT INTO {}(
                    grant_id,token_sha256,grant_token_ciphertext,issuance_ref,
                    environment,region,channel,activation_sha256,
                    manifest_sha256,component_id,role,head_revision,transition_sha256,
@@ -13475,6 +14187,8 @@ pub fn issue_managed_cloud_runtime_grant(
                    ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
                    ?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27
                  )",
+                    tables.grants
+                ),
                 params![
                     grant_id,
                     token_sha256,
@@ -13506,7 +14220,7 @@ pub fn issue_managed_cloud_runtime_grant(
                 ],
             )
             .map_err(managed_cloud_storage)?;
-            let grant = sqlite_managed_cloud_runtime_grant_by_id(&tx, &grant_id)?.ok_or(
+            let grant = sqlite_managed_cloud_runtime_grant_by_id(&tx, &grant_id, tables)?.ok_or(
                 ManagedCloudRegistryError::Storage(anyhow::anyhow!(
                     "managed cloud runtime grant insert disappeared"
                 )),
@@ -13521,20 +14235,27 @@ pub fn issue_managed_cloud_runtime_grant(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
             let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
-            if let Some(existing) =
-                postgres_managed_cloud_runtime_grant_by_issuance_ref(&mut tx, &input.issuance_ref)?
+            if let Some((existing, existing_tables)) =
+                postgres_managed_cloud_runtime_grant_by_issuance_ref_any(
+                    &mut tx,
+                    &input.issuance_ref,
+                )?
             {
                 require_exact_managed_cloud_runtime_grant_replay(&existing, input)?;
                 let now_ms = managed_cloud_db_now_postgres(&mut tx)?;
-                let grant_token =
-                    match postgres_managed_cloud_replay_grant_token(&mut tx, &existing, now_ms) {
-                        Ok(token) => token,
-                        Err(ManagedCloudRegistryError::GrantExpired) => {
-                            tx.commit().map_err(managed_cloud_storage)?;
-                            return Err(ManagedCloudRegistryError::GrantExpired);
-                        }
-                        Err(error) => return Err(error),
-                    };
+                let grant_token = match postgres_managed_cloud_replay_grant_token(
+                    &mut tx,
+                    &existing,
+                    now_ms,
+                    existing_tables,
+                ) {
+                    Ok(token) => token,
+                    Err(ManagedCloudRegistryError::GrantExpired) => {
+                        tx.commit().map_err(managed_cloud_storage)?;
+                        return Err(ManagedCloudRegistryError::GrantExpired);
+                    }
+                    Err(error) => return Err(error),
+                };
                 tx.commit().map_err(managed_cloud_storage)?;
                 return Ok(managed_cloud_runtime_grant_result(
                     existing,
@@ -13557,20 +14278,27 @@ pub fn issue_managed_cloud_runtime_grant(
                 &[&lock_key],
             )
             .map_err(managed_cloud_storage)?;
-            if let Some(existing) =
-                postgres_managed_cloud_runtime_grant_by_issuance_ref(&mut tx, &input.issuance_ref)?
+            if let Some((existing, existing_tables)) =
+                postgres_managed_cloud_runtime_grant_by_issuance_ref_any(
+                    &mut tx,
+                    &input.issuance_ref,
+                )?
             {
                 require_exact_managed_cloud_runtime_grant_replay(&existing, input)?;
                 let now_ms = managed_cloud_db_now_postgres(&mut tx)?;
-                let grant_token =
-                    match postgres_managed_cloud_replay_grant_token(&mut tx, &existing, now_ms) {
-                        Ok(token) => token,
-                        Err(ManagedCloudRegistryError::GrantExpired) => {
-                            tx.commit().map_err(managed_cloud_storage)?;
-                            return Err(ManagedCloudRegistryError::GrantExpired);
-                        }
-                        Err(error) => return Err(error),
-                    };
+                let grant_token = match postgres_managed_cloud_replay_grant_token(
+                    &mut tx,
+                    &existing,
+                    now_ms,
+                    existing_tables,
+                ) {
+                    Ok(token) => token,
+                    Err(ManagedCloudRegistryError::GrantExpired) => {
+                        tx.commit().map_err(managed_cloud_storage)?;
+                        return Err(ManagedCloudRegistryError::GrantExpired);
+                    }
+                    Err(error) => return Err(error),
+                };
                 tx.commit().map_err(managed_cloud_storage)?;
                 return Ok(managed_cloud_runtime_grant_result(
                     existing,
@@ -13585,14 +14313,23 @@ pub fn issue_managed_cloud_runtime_grant(
                 &input.issuance_ref,
                 &grant_token,
             )?;
-            if tx
-                .query_opt(
-                    "SELECT 1 FROM jobs_managed_cloud_runtime_grants WHERE token_sha256=$1",
+            let token_collision = [
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+            ]
+            .into_iter()
+            .map(|candidate| {
+                tx.query_opt(
+                    &format!("SELECT 1 FROM {} WHERE token_sha256=$1", candidate.grants),
                     &[&token_sha256],
                 )
-                .map_err(managed_cloud_storage)?
-                .is_some()
-            {
+                .map(|row| row.is_some())
+                .map_err(managed_cloud_storage)
+            })
+            .collect::<ManagedCloudResult<Vec<_>>>()?
+            .into_iter()
+            .any(|present| present);
+            if token_collision {
                 return Err(ManagedCloudRegistryError::IdentityConflict);
             }
             let now_ms = managed_cloud_db_now_postgres(&mut tx)?;
@@ -13605,7 +14342,8 @@ pub fn issue_managed_cloud_runtime_grant(
                 })
                 .ok_or(ManagedCloudRegistryError::InvalidRequest)?;
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_grants(
+                &format!(
+                    "INSERT INTO {}(
                    grant_id,token_sha256,grant_token_ciphertext,issuance_ref,
                    environment,region,channel,activation_sha256,
                    manifest_sha256,component_id,role,head_revision,transition_sha256,
@@ -13618,6 +14356,8 @@ pub fn issue_managed_cloud_runtime_grant(
                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                    $17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27
                  )",
+                    tables.grants
+                ),
                 &[
                     &grant_id,
                     &token_sha256,
@@ -13649,11 +14389,10 @@ pub fn issue_managed_cloud_runtime_grant(
                 ],
             )
             .map_err(managed_cloud_storage)?;
-            let grant = postgres_managed_cloud_runtime_grant_by_id(&mut tx, &grant_id)?.ok_or(
-                ManagedCloudRegistryError::Storage(anyhow::anyhow!(
+            let grant = postgres_managed_cloud_runtime_grant_by_id(&mut tx, &grant_id, tables)?
+                .ok_or(ManagedCloudRegistryError::Storage(anyhow::anyhow!(
                     "managed cloud runtime grant insert disappeared"
-                )),
-            )?;
+                )))?;
             tx.commit().map_err(managed_cloud_storage)?;
             Ok(managed_cloud_runtime_grant_result(
                 grant,
@@ -13680,11 +14419,15 @@ pub fn revoke_managed_cloud_runtime_grant(
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(managed_cloud_storage)?;
+            let (_, tables) = sqlite_managed_cloud_runtime_grant_by_id_any(&tx, &input.grant_id)?
+                .ok_or(ManagedCloudRegistryError::NotFound)?;
             let existing = tx
                 .query_row(
-                    "SELECT reason_ref,revoked_by,revoked_at_ms
-                       FROM jobs_managed_cloud_runtime_grant_revocations
-                      WHERE grant_id=?1",
+                    &format!(
+                        "SELECT reason_ref,revoked_by,revoked_at_ms
+                           FROM {} WHERE grant_id=?1",
+                        tables.grant_revocations
+                    ),
                     params![input.grant_id],
                     |row| {
                         Ok(ManagedCloudRuntimeGrantRevocation {
@@ -13705,30 +14448,36 @@ pub fn revoke_managed_cloud_runtime_grant(
                     return Err(ManagedCloudRegistryError::IdentityConflict);
                 }
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_grants
+                    &format!(
+                        "UPDATE {}
                         SET grant_token_ciphertext=NULL
                       WHERE grant_id=?1 AND grant_token_ciphertext IS NOT NULL",
+                        tables.grants
+                    ),
                     params![input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
                 tx.commit().map_err(managed_cloud_storage)?;
                 return Ok(existing);
             }
-            if sqlite_managed_cloud_runtime_grant_by_id(&tx, &input.grant_id)?.is_none() {
-                return Err(ManagedCloudRegistryError::NotFound);
-            }
             let now_ms = managed_cloud_db_now_sqlite(&tx)?;
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_grant_revocations(
+                &format!(
+                    "INSERT INTO {}(
                    grant_id,reason_ref,revoked_by,revoked_at_ms
                  ) VALUES(?1,?2,?3,?4)",
+                    tables.grant_revocations
+                ),
                 params![input.grant_id, input.reason_ref, input.revoked_by, now_ms],
             )
             .map_err(managed_cloud_storage)?;
             tx.execute(
-                "UPDATE jobs_managed_cloud_runtime_grants
+                &format!(
+                    "UPDATE {}
                     SET grant_token_ciphertext=NULL
                   WHERE grant_id=?1 AND grant_token_ciphertext IS NOT NULL",
+                    tables.grants
+                ),
                 params![input.grant_id],
             )
             .map_err(managed_cloud_storage)?;
@@ -13744,22 +14493,24 @@ pub fn revoke_managed_cloud_runtime_grant(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
             let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
-            if tx
-                .query_opt(
-                    "SELECT 1 FROM jobs_managed_cloud_runtime_grants
-                      WHERE grant_id=$1 FOR UPDATE",
-                    &[&input.grant_id],
-                )
-                .map_err(managed_cloud_storage)?
-                .is_none()
-            {
-                return Err(ManagedCloudRegistryError::NotFound);
-            }
+            let (_, tables) =
+                postgres_managed_cloud_runtime_grant_by_id_any(&mut tx, &input.grant_id)?
+                    .ok_or(ManagedCloudRegistryError::NotFound)?;
+            tx.query_one(
+                &format!(
+                    "SELECT 1 FROM {} WHERE grant_id=$1 FOR UPDATE",
+                    tables.grants
+                ),
+                &[&input.grant_id],
+            )
+            .map_err(managed_cloud_storage)?;
             let existing = tx
                 .query_opt(
-                    "SELECT reason_ref,revoked_by,revoked_at_ms
-                       FROM jobs_managed_cloud_runtime_grant_revocations
-                      WHERE grant_id=$1",
+                    &format!(
+                        "SELECT reason_ref,revoked_by,revoked_at_ms
+                           FROM {} WHERE grant_id=$1",
+                        tables.grant_revocations
+                    ),
                     &[&input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
@@ -13777,9 +14528,12 @@ pub fn revoke_managed_cloud_runtime_grant(
                     return Err(ManagedCloudRegistryError::IdentityConflict);
                 }
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_grants
+                    &format!(
+                        "UPDATE {}
                         SET grant_token_ciphertext=NULL
                       WHERE grant_id=$1 AND grant_token_ciphertext IS NOT NULL",
+                        tables.grants
+                    ),
                     &[&input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
@@ -13788,9 +14542,12 @@ pub fn revoke_managed_cloud_runtime_grant(
             }
             let now_ms = managed_cloud_db_now_postgres(&mut tx)?;
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_grant_revocations(
+                &format!(
+                    "INSERT INTO {}(
                    grant_id,reason_ref,revoked_by,revoked_at_ms
                  ) VALUES($1,$2,$3,$4)",
+                    tables.grant_revocations
+                ),
                 &[
                     &input.grant_id,
                     &input.reason_ref,
@@ -13800,9 +14557,12 @@ pub fn revoke_managed_cloud_runtime_grant(
             )
             .map_err(managed_cloud_storage)?;
             tx.execute(
-                "UPDATE jobs_managed_cloud_runtime_grants
+                &format!(
+                    "UPDATE {}
                     SET grant_token_ciphertext=NULL
                   WHERE grant_id=$1 AND grant_token_ciphertext IS NOT NULL",
+                    tables.grants
+                ),
                 &[&input.grant_id],
             )
             .map_err(managed_cloud_storage)?;
@@ -13936,20 +14696,22 @@ fn require_sqlite_managed_cloud_grant_authority_active(
     grant: &ManagedCloudRuntimeGrant,
     now_ms: i64,
 ) -> ManagedCloudResult<()> {
+    let tables = managed_cloud_runtime_tables_for_role(&grant.role);
     let row = tx
         .query_row(
-            "SELECT activation.not_before_ms,activation.expires_at_ms,
+            &format!(
+                "SELECT activation.not_before_ms,activation.expires_at_ms,
                     cohort.not_before_ms,cohort.expires_at_ms,
                     policy.valid_from_ms,policy.expires_at_ms,
                     head.current_transition_sha256,
-                    EXISTS(SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations direct
-                            WHERE direct.grant_id=grant.grant_id)
+                    EXISTS(SELECT 1 FROM {} direct
+                            WHERE direct.grant_id=runtime_grant.grant_id)
                     OR EXISTS(
                       SELECT 1 FROM jobs_managed_cloud_revocations revoked
                        WHERE revoked.effective_at_ms<=?2 AND (
                          (revoked.subject_kind='runtime_grant'
-                           AND revoked.subject_id=grant.grant_id
-                           AND revoked.subject_sha256=grant.token_sha256)
+                           AND revoked.subject_id=runtime_grant.grant_id
+                           AND revoked.subject_sha256=runtime_grant.token_sha256)
                          OR (revoked.subject_kind='activation'
                            AND revoked.subject_sha256=activation.activation_sha256)
                          OR (revoked.subject_kind='manifest'
@@ -13957,8 +14719,8 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                          OR (revoked.subject_kind='cohort'
                            AND revoked.subject_sha256=cohort.cohort_sha256)
                          OR (revoked.subject_kind='component'
-                           AND revoked.subject_id=grant.component_id
-                           AND revoked.subject_sha256=grant.artifact_sha256)
+                           AND revoked.subject_id=runtime_grant.component_id
+                           AND revoked.subject_sha256=runtime_grant.artifact_sha256)
                          OR (revoked.subject_kind='release'
                            AND revoked.subject_id=manifest.release_id
                            AND revoked.subject_sha256=manifest.manifest_sha256)
@@ -13983,12 +14745,12 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                          ))
                        )
                     ) AS revoked
-               FROM jobs_managed_cloud_runtime_grants grant
+               FROM {} runtime_grant
                JOIN jobs_managed_cloud_activations activation
-                 ON activation.activation_sha256=grant.activation_sha256
-                AND activation.manifest_sha256=grant.manifest_sha256
+                 ON activation.activation_sha256=runtime_grant.activation_sha256
+                AND activation.manifest_sha256=runtime_grant.manifest_sha256
                JOIN jobs_managed_cloud_manifests manifest
-                 ON manifest.manifest_sha256=grant.manifest_sha256
+                 ON manifest.manifest_sha256=runtime_grant.manifest_sha256
                JOIN jobs_managed_cloud_cohorts cohort
                  ON cohort.cohort_sha256=activation.cohort_sha256
                 AND cohort.trust_generation=activation.trust_generation
@@ -13997,11 +14759,13 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                JOIN jobs_managed_cloud_trust_policies policy
                  ON policy.trust_generation=activation.trust_generation
                JOIN jobs_managed_cloud_heads head
-                 ON head.environment=grant.environment AND head.region=grant.region
-                AND head.channel=grant.channel AND head.head_revision=grant.head_revision
-                AND head.current_transition_sha256=grant.transition_sha256
-                AND head.current_activation_sha256=grant.activation_sha256
-                AND head.current_manifest_sha256=grant.manifest_sha256
+                 ON head.environment=runtime_grant.environment
+                AND head.region=runtime_grant.region
+                AND head.channel=runtime_grant.channel
+                AND head.head_revision=runtime_grant.head_revision
+                AND head.current_transition_sha256=runtime_grant.transition_sha256
+                AND head.current_activation_sha256=runtime_grant.activation_sha256
+                AND head.current_manifest_sha256=runtime_grant.manifest_sha256
                JOIN jobs_managed_cloud_head_transitions transition
                  ON transition.transition_sha256=head.current_transition_sha256
                 AND transition.environment=head.environment
@@ -14010,7 +14774,7 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                LEFT JOIN jobs_managed_cloud_rollbacks rollback
                  ON rollback.rollback_sha256=transition.rollback_authority_sha256
                 AND rollback.trust_generation=activation.trust_generation
-              WHERE grant.grant_id=?1
+              WHERE runtime_grant.grant_id=?1
                 AND (transition.transition_kind='activation'
                      OR rollback.rollback_sha256 IS NOT NULL)
                 AND activation.cloud_distribution_enabled=1
@@ -14018,7 +14782,21 @@ fn require_sqlite_managed_cloud_grant_authority_active(
                 AND activation.workflow_cleanup_enabled=1
                 AND activation.direct_discovery_enabled=0
                 AND activation.global_discovery_enabled=0
-                AND activation.source_verification_enabled=0",
+                AND (runtime_grant.role<>'original_source_verifier'
+                     OR activation.source_verification_enabled=1)
+                AND (activation.source_verification_enabled=0 OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                    JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                      ON source_identity.manifest_sha256=source_protocol.manifest_sha256
+                   WHERE source_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND source_protocol.protocol_id='source_verification'
+                     AND source_protocol.protocol_version=1
+                     AND source_identity.component_id='jobs-workflows'
+                     AND source_identity.role='original_source_verifier'
+                ))",
+                tables.grant_revocations, tables.grants
+            ),
             params![grant.grant_id, now_ms],
             |row| {
                 Ok((
@@ -14057,20 +14835,22 @@ fn require_postgres_managed_cloud_grant_authority_active(
     grant: &ManagedCloudRuntimeGrant,
     now_ms: i64,
 ) -> ManagedCloudResult<()> {
+    let tables = managed_cloud_runtime_tables_for_role(&grant.role);
     let row = tx
         .query_opt(
-            "SELECT activation.not_before_ms,activation.expires_at_ms,
+            &format!(
+                "SELECT activation.not_before_ms,activation.expires_at_ms,
                     cohort.not_before_ms,cohort.expires_at_ms,
                     policy.valid_from_ms,policy.expires_at_ms,
                     head.current_transition_sha256,
-                    EXISTS(SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations direct
-                            WHERE direct.grant_id=grant.grant_id)
+                    EXISTS(SELECT 1 FROM {} direct
+                            WHERE direct.grant_id=runtime_grant.grant_id)
                     OR EXISTS(
                       SELECT 1 FROM jobs_managed_cloud_revocations revoked
                        WHERE revoked.effective_at_ms<=$2 AND (
                          (revoked.subject_kind='runtime_grant'
-                           AND revoked.subject_id=grant.grant_id
-                           AND revoked.subject_sha256=grant.token_sha256)
+                           AND revoked.subject_id=runtime_grant.grant_id
+                           AND revoked.subject_sha256=runtime_grant.token_sha256)
                          OR (revoked.subject_kind='activation'
                            AND revoked.subject_sha256=activation.activation_sha256)
                          OR (revoked.subject_kind='manifest'
@@ -14078,8 +14858,8 @@ fn require_postgres_managed_cloud_grant_authority_active(
                          OR (revoked.subject_kind='cohort'
                            AND revoked.subject_sha256=cohort.cohort_sha256)
                          OR (revoked.subject_kind='component'
-                           AND revoked.subject_id=grant.component_id
-                           AND revoked.subject_sha256=grant.artifact_sha256)
+                           AND revoked.subject_id=runtime_grant.component_id
+                           AND revoked.subject_sha256=runtime_grant.artifact_sha256)
                          OR (revoked.subject_kind='release'
                            AND revoked.subject_id=manifest.release_id
                            AND revoked.subject_sha256=manifest.manifest_sha256)
@@ -14104,12 +14884,12 @@ fn require_postgres_managed_cloud_grant_authority_active(
                          ))
                        )
                     ) AS revoked
-               FROM jobs_managed_cloud_runtime_grants grant
+               FROM {} runtime_grant
                JOIN jobs_managed_cloud_activations activation
-                 ON activation.activation_sha256=grant.activation_sha256
-                AND activation.manifest_sha256=grant.manifest_sha256
+                 ON activation.activation_sha256=runtime_grant.activation_sha256
+                AND activation.manifest_sha256=runtime_grant.manifest_sha256
                JOIN jobs_managed_cloud_manifests manifest
-                 ON manifest.manifest_sha256=grant.manifest_sha256
+                 ON manifest.manifest_sha256=runtime_grant.manifest_sha256
                JOIN jobs_managed_cloud_cohorts cohort
                  ON cohort.cohort_sha256=activation.cohort_sha256
                 AND cohort.trust_generation=activation.trust_generation
@@ -14118,11 +14898,13 @@ fn require_postgres_managed_cloud_grant_authority_active(
                JOIN jobs_managed_cloud_trust_policies policy
                  ON policy.trust_generation=activation.trust_generation
                JOIN jobs_managed_cloud_heads head
-                 ON head.environment=grant.environment AND head.region=grant.region
-                AND head.channel=grant.channel AND head.head_revision=grant.head_revision
-                AND head.current_transition_sha256=grant.transition_sha256
-                AND head.current_activation_sha256=grant.activation_sha256
-                AND head.current_manifest_sha256=grant.manifest_sha256
+                 ON head.environment=runtime_grant.environment
+                AND head.region=runtime_grant.region
+                AND head.channel=runtime_grant.channel
+                AND head.head_revision=runtime_grant.head_revision
+                AND head.current_transition_sha256=runtime_grant.transition_sha256
+                AND head.current_activation_sha256=runtime_grant.activation_sha256
+                AND head.current_manifest_sha256=runtime_grant.manifest_sha256
                JOIN jobs_managed_cloud_head_transitions transition
                  ON transition.transition_sha256=head.current_transition_sha256
                 AND transition.environment=head.environment
@@ -14131,7 +14913,7 @@ fn require_postgres_managed_cloud_grant_authority_active(
                LEFT JOIN jobs_managed_cloud_rollbacks rollback
                  ON rollback.rollback_sha256=transition.rollback_authority_sha256
                 AND rollback.trust_generation=activation.trust_generation
-              WHERE grant.grant_id=$1
+              WHERE runtime_grant.grant_id=$1
                 AND (transition.transition_kind='activation'
                      OR rollback.rollback_sha256 IS NOT NULL)
                 AND activation.cloud_distribution_enabled
@@ -14139,8 +14921,22 @@ fn require_postgres_managed_cloud_grant_authority_active(
                 AND activation.workflow_cleanup_enabled
                 AND NOT activation.direct_discovery_enabled
                 AND NOT activation.global_discovery_enabled
-                AND NOT activation.source_verification_enabled
+                AND (runtime_grant.role<>'original_source_verifier'
+                     OR activation.source_verification_enabled)
+                AND (NOT activation.source_verification_enabled OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                    JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                      ON source_identity.manifest_sha256=source_protocol.manifest_sha256
+                   WHERE source_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND source_protocol.protocol_id='source_verification'
+                     AND source_protocol.protocol_version=1
+                     AND source_identity.component_id='jobs-workflows'
+                     AND source_identity.role='original_source_verifier'
+                ))
               FOR SHARE OF head",
+                tables.grant_revocations, tables.grants
+            ),
             &[&grant.grant_id, &now_ms],
         )
         .map_err(managed_cloud_storage)?
@@ -14179,8 +14975,9 @@ pub fn claim_managed_cloud_runtime_grant(
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(managed_cloud_storage)?;
-            let grant = sqlite_managed_cloud_runtime_grant_by_id(&tx, &input.grant_id)?
-                .ok_or(ManagedCloudRegistryError::NotFound)?;
+            let (grant, tables) =
+                sqlite_managed_cloud_runtime_grant_by_id_any(&tx, &input.grant_id)?
+                    .ok_or(ManagedCloudRegistryError::NotFound)?;
             require_managed_cloud_secret_match(&grant.token_sha256, &token_sha256)?;
             if grant.expected_runtime_identity_sha256 != input.runtime_identity_sha256
                 || grant.expected_worker_id != input.worker_id
@@ -14191,7 +14988,8 @@ pub fn claim_managed_cloud_runtime_grant(
                 .query_row(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_instances WHERE grant_id=?1"
+                           FROM {} WHERE grant_id=?1",
+                        tables.instances
                     ),
                     params![input.grant_id],
                     managed_cloud_runtime_instance_from_sqlite,
@@ -14201,20 +14999,26 @@ pub fn claim_managed_cloud_runtime_grant(
             if let Some(mut existing) = existing {
                 require_exact_managed_cloud_runtime_instance_replay(&existing, input)?;
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_grants
+                    &format!(
+                        "UPDATE {}
                         SET grant_token_ciphertext=NULL
                       WHERE grant_id=?1 AND grant_token_ciphertext IS NOT NULL",
+                        tables.grants
+                    ),
                     params![input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
                 existing.0.replayed = true;
                 existing.0.next_heartbeat_sequence = tx
                     .query_row(
-                        "SELECT COALESCE((
+                        &format!(
+                            "SELECT COALESCE((
                            SELECT heartbeat_sequence+1
-                             FROM jobs_managed_cloud_runtime_heartbeats
+                             FROM {}
                             WHERE runtime_instance_id=?1 AND instance_epoch=?2
                          ),1)",
+                            tables.heartbeats
+                        ),
                         params![existing.0.runtime_instance_id, existing.0.instance_epoch],
                         |row| row.get(0),
                     )
@@ -14222,25 +15026,38 @@ pub fn claim_managed_cloud_runtime_grant(
                 tx.commit().map_err(managed_cloud_storage)?;
                 return Ok(existing.0);
             }
-            if tx
-                .query_row(
-                    "SELECT 1 FROM jobs_managed_cloud_runtime_instances
-                      WHERE runtime_instance_id=?1",
+            let runtime_id_collision = [
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+            ]
+            .into_iter()
+            .map(|candidate| {
+                tx.query_row(
+                    &format!(
+                        "SELECT 1 FROM {} WHERE runtime_instance_id=?1",
+                        candidate.instances
+                    ),
                     params![input.runtime_instance_id],
                     |_| Ok(()),
                 )
                 .optional()
-                .map_err(managed_cloud_storage)?
-                .is_some()
-            {
+                .map_err(managed_cloud_storage)
+            })
+            .collect::<ManagedCloudResult<Vec<_>>>()?
+            .into_iter()
+            .any(|row| row.is_some());
+            if runtime_id_collision {
                 return Err(ManagedCloudRegistryError::IdentityConflict);
             }
             let now_ms = managed_cloud_db_now_sqlite(&tx)?;
             if grant.expires_at_ms <= now_ms {
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_grants
+                    &format!(
+                        "UPDATE {}
                         SET grant_token_ciphertext=NULL
                       WHERE grant_id=?1 AND grant_token_ciphertext IS NOT NULL",
+                        tables.grants
+                    ),
                     params![input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
@@ -14257,7 +15074,8 @@ pub fn claim_managed_cloud_runtime_grant(
                 instance_epoch,
             )?;
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_instances(
+                &format!(
+                    "INSERT INTO {}(
                    grant_id,runtime_instance_id,runtime_identity_sha256,worker_id,
                    session_proof_hmac_sha256,environment,region,channel,activation_sha256,
                    manifest_sha256,component_id,role,head_revision,transition_sha256,
@@ -14269,6 +15087,8 @@ pub fn claim_managed_cloud_runtime_grant(
                    ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,
                    ?18,?19,?20,?21,?22,?23,?24
                  )",
+                    tables.instances
+                ),
                 params![
                     grant.grant_id,
                     input.runtime_instance_id,
@@ -14298,8 +15118,10 @@ pub fn claim_managed_cloud_runtime_grant(
             )
             .map_err(managed_cloud_storage)?;
             tx.execute(
-                "UPDATE jobs_managed_cloud_runtime_grants
-                    SET grant_token_ciphertext=NULL WHERE grant_id=?1",
+                &format!(
+                    "UPDATE {} SET grant_token_ciphertext=NULL WHERE grant_id=?1",
+                    tables.grants
+                ),
                 params![input.grant_id],
             )
             .map_err(managed_cloud_storage)?;
@@ -14307,7 +15129,8 @@ pub fn claim_managed_cloud_runtime_grant(
                 .query_row(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_instances WHERE grant_id=?1"
+                           FROM {} WHERE grant_id=?1",
+                        tables.instances
                     ),
                     params![input.grant_id],
                     managed_cloud_runtime_instance_from_sqlite,
@@ -14321,18 +15144,18 @@ pub fn claim_managed_cloud_runtime_grant(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
             let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
-            let grant_row = tx
-                .query_opt(
-                    &format!(
-                        "SELECT {MANAGED_CLOUD_RUNTIME_GRANT_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_grants
-                          WHERE grant_id=$1 FOR UPDATE"
-                    ),
-                    &[&input.grant_id],
-                )
-                .map_err(managed_cloud_storage)?
-                .ok_or(ManagedCloudRegistryError::NotFound)?;
-            let grant = managed_cloud_runtime_grant_from_postgres(&grant_row);
+            let runtime_lock_key = format!(
+                "managed-cloud-runtime-instance:{}",
+                input.runtime_instance_id
+            );
+            tx.query_one(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                &[&runtime_lock_key],
+            )
+            .map_err(managed_cloud_storage)?;
+            let (grant, tables) =
+                postgres_managed_cloud_runtime_grant_by_id_any(&mut tx, &input.grant_id)?
+                    .ok_or(ManagedCloudRegistryError::NotFound)?;
             require_managed_cloud_secret_match(&grant.token_sha256, &token_sha256)?;
             if grant.expected_runtime_identity_sha256 != input.runtime_identity_sha256
                 || grant.expected_worker_id != input.worker_id
@@ -14343,8 +15166,8 @@ pub fn claim_managed_cloud_runtime_grant(
                 .query_opt(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_instances
-                          WHERE grant_id=$1 FOR UPDATE"
+                           FROM {} WHERE grant_id=$1 FOR UPDATE",
+                        tables.instances
                     ),
                     &[&input.grant_id],
                 )
@@ -14353,20 +15176,26 @@ pub fn claim_managed_cloud_runtime_grant(
                 let mut existing = managed_cloud_runtime_instance_from_postgres(&row);
                 require_exact_managed_cloud_runtime_instance_replay(&existing, input)?;
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_grants
+                    &format!(
+                        "UPDATE {}
                         SET grant_token_ciphertext=NULL
                       WHERE grant_id=$1 AND grant_token_ciphertext IS NOT NULL",
+                        tables.grants
+                    ),
                     &[&input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
                 existing.0.replayed = true;
                 existing.0.next_heartbeat_sequence = tx
                     .query_one(
-                        "SELECT COALESCE((
+                        &format!(
+                            "SELECT COALESCE((
                            SELECT heartbeat_sequence+1
-                             FROM jobs_managed_cloud_runtime_heartbeats
+                             FROM {}
                             WHERE runtime_instance_id=$1 AND instance_epoch=$2
                          ),1)",
+                            tables.heartbeats
+                        ),
                         &[&existing.0.runtime_instance_id, &existing.0.instance_epoch],
                     )
                     .map_err(managed_cloud_storage)?
@@ -14374,23 +15203,37 @@ pub fn claim_managed_cloud_runtime_grant(
                 tx.commit().map_err(managed_cloud_storage)?;
                 return Ok(existing.0);
             }
-            if tx
-                .query_opt(
-                    "SELECT 1 FROM jobs_managed_cloud_runtime_instances
-                      WHERE runtime_instance_id=$1 FOR UPDATE",
+            let runtime_id_collision = [
+                MANAGED_CLOUD_BASE_RUNTIME_TABLES,
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+            ]
+            .into_iter()
+            .map(|candidate| {
+                tx.query_opt(
+                    &format!(
+                        "SELECT 1 FROM {} WHERE runtime_instance_id=$1 FOR UPDATE",
+                        candidate.instances
+                    ),
                     &[&input.runtime_instance_id],
                 )
-                .map_err(managed_cloud_storage)?
-                .is_some()
-            {
+                .map(|row| row.is_some())
+                .map_err(managed_cloud_storage)
+            })
+            .collect::<ManagedCloudResult<Vec<_>>>()?
+            .into_iter()
+            .any(|present| present);
+            if runtime_id_collision {
                 return Err(ManagedCloudRegistryError::IdentityConflict);
             }
             let now_ms = managed_cloud_db_now_postgres(&mut tx)?;
             if grant.expires_at_ms <= now_ms {
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_grants
+                    &format!(
+                        "UPDATE {}
                         SET grant_token_ciphertext=NULL
                       WHERE grant_id=$1 AND grant_token_ciphertext IS NOT NULL",
+                        tables.grants
+                    ),
                     &[&input.grant_id],
                 )
                 .map_err(managed_cloud_storage)?;
@@ -14407,7 +15250,8 @@ pub fn claim_managed_cloud_runtime_grant(
                 instance_epoch,
             )?;
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_instances(
+                &format!(
+                    "INSERT INTO {}(
                    grant_id,runtime_instance_id,runtime_identity_sha256,worker_id,
                    session_proof_hmac_sha256,environment,region,channel,activation_sha256,
                    manifest_sha256,component_id,role,head_revision,transition_sha256,
@@ -14419,6 +15263,8 @@ pub fn claim_managed_cloud_runtime_grant(
                    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
                    $18,$19,$20,$21,$22,$23,$24
                  )",
+                    tables.instances
+                ),
                 &[
                     &grant.grant_id,
                     &input.runtime_instance_id,
@@ -14448,8 +15294,10 @@ pub fn claim_managed_cloud_runtime_grant(
             )
             .map_err(managed_cloud_storage)?;
             tx.execute(
-                "UPDATE jobs_managed_cloud_runtime_grants
-                    SET grant_token_ciphertext=NULL WHERE grant_id=$1",
+                &format!(
+                    "UPDATE {} SET grant_token_ciphertext=NULL WHERE grant_id=$1",
+                    tables.grants
+                ),
                 &[&input.grant_id],
             )
             .map_err(managed_cloud_storage)?;
@@ -14457,7 +15305,8 @@ pub fn claim_managed_cloud_runtime_grant(
                 .query_one(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_instances WHERE grant_id=$1"
+                           FROM {} WHERE grant_id=$1",
+                        tables.instances
                     ),
                     &[&input.grant_id],
                 )
@@ -14589,11 +15438,13 @@ fn require_exact_managed_cloud_heartbeat_replay(
 fn sqlite_managed_cloud_runtime_instance_by_runtime_id(
     tx: &rusqlite::Transaction<'_>,
     runtime_instance_id: &str,
+    tables: ManagedCloudRuntimeAuthorityTables,
 ) -> ManagedCloudResult<Option<(ManagedCloudRuntimeInstance, String)>> {
     tx.query_row(
         &format!(
             "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-               FROM jobs_managed_cloud_runtime_instances WHERE runtime_instance_id=?1"
+               FROM {} WHERE runtime_instance_id=?1",
+            tables.instances
         ),
         params![runtime_instance_id],
         managed_cloud_runtime_instance_from_sqlite,
@@ -14607,31 +15458,35 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
     instance: &ManagedCloudRuntimeInstance,
     now_ms: i64,
 ) -> ManagedCloudResult<()> {
+    let tables = managed_cloud_runtime_tables_for_role(&instance.role);
     let revoked = tx
         .query_row(
-            "SELECT 1
-               FROM jobs_managed_cloud_runtime_instances instance
-               JOIN jobs_managed_cloud_runtime_grants grant
-                 ON grant.grant_id=instance.grant_id
-                AND grant.environment=instance.environment
-                AND grant.region=instance.region AND grant.channel=instance.channel
-                AND grant.activation_sha256=instance.activation_sha256
-                AND grant.manifest_sha256=instance.manifest_sha256
-                AND grant.component_id=instance.component_id AND grant.role=instance.role
-                AND grant.head_revision=instance.head_revision
-                AND grant.transition_sha256=instance.transition_sha256
-                AND grant.artifact_sha256=instance.artifact_sha256
-                AND grant.config_schema_sha256=instance.config_schema_sha256
-                AND grant.migration_set_sha256=instance.migration_set_sha256
-                AND grant.protocol_set_sha256=instance.protocol_set_sha256
-                AND grant.task_queue_sha256=instance.task_queue_sha256
-                AND grant.failure_converter_sha256=instance.failure_converter_sha256
-                AND grant.expected_dependency_evidence_sha256=
+            &format!(
+                "SELECT 1
+               FROM {} instance
+               JOIN {} runtime_grant
+                 ON runtime_grant.grant_id=instance.grant_id
+                AND runtime_grant.environment=instance.environment
+                AND runtime_grant.region=instance.region
+                AND runtime_grant.channel=instance.channel
+                AND runtime_grant.activation_sha256=instance.activation_sha256
+                AND runtime_grant.manifest_sha256=instance.manifest_sha256
+                AND runtime_grant.component_id=instance.component_id
+                AND runtime_grant.role=instance.role
+                AND runtime_grant.head_revision=instance.head_revision
+                AND runtime_grant.transition_sha256=instance.transition_sha256
+                AND runtime_grant.artifact_sha256=instance.artifact_sha256
+                AND runtime_grant.config_schema_sha256=instance.config_schema_sha256
+                AND runtime_grant.migration_set_sha256=instance.migration_set_sha256
+                AND runtime_grant.protocol_set_sha256=instance.protocol_set_sha256
+                AND runtime_grant.task_queue_sha256=instance.task_queue_sha256
+                AND runtime_grant.failure_converter_sha256=instance.failure_converter_sha256
+                AND runtime_grant.expected_dependency_evidence_sha256=
                     instance.dependency_evidence_sha256
-                AND grant.expected_runtime_identity_sha256=
+                AND runtime_grant.expected_runtime_identity_sha256=
                     instance.runtime_identity_sha256
-                AND grant.expected_worker_id=instance.worker_id
-                AND grant.activation_expires_at_ms=instance.activation_expires_at_ms
+                AND runtime_grant.expected_worker_id=instance.worker_id
+                AND runtime_grant.activation_expires_at_ms=instance.activation_expires_at_ms
                JOIN jobs_managed_cloud_activations activation
                  ON activation.activation_sha256=instance.activation_sha256
                 AND activation.manifest_sha256=instance.manifest_sha256
@@ -14663,14 +15518,14 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
                 AND (transition.transition_kind='activation'
                      OR rollback.rollback_sha256 IS NOT NULL)
                 AND EXISTS(
-                SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations direct
-                 WHERE direct.grant_id=grant.grant_id
+                SELECT 1 FROM {} direct
+                 WHERE direct.grant_id=runtime_grant.grant_id
                 UNION ALL
                 SELECT 1 FROM jobs_managed_cloud_revocations revoked
                  WHERE revoked.effective_at_ms<=?2 AND (
                    (revoked.subject_kind='runtime_grant'
-                     AND revoked.subject_id=grant.grant_id
-                     AND revoked.subject_sha256=grant.token_sha256)
+                     AND revoked.subject_id=runtime_grant.grant_id
+                     AND revoked.subject_sha256=runtime_grant.token_sha256)
                    OR (revoked.subject_kind='runtime_instance'
                      AND revoked.subject_id=instance.runtime_instance_id
                      AND revoked.subject_sha256=instance.runtime_identity_sha256)
@@ -14706,6 +15561,8 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
                    ))
                  )
               ) LIMIT 1",
+                tables.instances, tables.grants, tables.grant_revocations
+            ),
             params![instance.runtime_instance_id, now_ms],
             |_| Ok(()),
         )
@@ -14717,9 +15574,10 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
     }
     let active = tx
         .query_row(
-            "SELECT 1
-               FROM jobs_managed_cloud_runtime_instances instance
-               JOIN jobs_managed_cloud_runtime_grants grant
+            &format!(
+                "SELECT 1
+               FROM {} instance
+               JOIN {} grant
                  ON grant.grant_id=instance.grant_id
                 AND grant.environment=instance.environment
                 AND grant.region=instance.region AND grant.channel=instance.channel
@@ -14745,6 +15603,9 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
                 AND activation.manifest_sha256=instance.manifest_sha256
                 AND activation.environment=instance.environment
                 AND activation.region=instance.region AND activation.channel=instance.channel
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=instance.manifest_sha256
+                AND manifest.trust_generation=activation.trust_generation
                JOIN jobs_managed_cloud_cohorts cohort
                  ON cohort.cohort_sha256=activation.cohort_sha256
                 AND cohort.authorization_signature_set_sha256=
@@ -14784,7 +15645,21 @@ fn require_sqlite_managed_cloud_runtime_authority_active(
                 AND activation.workflow_cleanup_enabled=1
                 AND activation.direct_discovery_enabled=0
                 AND activation.global_discovery_enabled=0
-                AND activation.source_verification_enabled=0",
+                AND (instance.role<>'original_source_verifier'
+                     OR activation.source_verification_enabled=1)
+                AND (activation.source_verification_enabled=0 OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                    JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                      ON source_identity.manifest_sha256=source_protocol.manifest_sha256
+                   WHERE source_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND source_protocol.protocol_id='source_verification'
+                     AND source_protocol.protocol_version=1
+                     AND source_identity.component_id='jobs-workflows'
+                     AND source_identity.role='original_source_verifier'
+                ))",
+                tables.instances, tables.grants
+            ),
             params![instance.runtime_instance_id, now_ms],
             |_| Ok(()),
         )
@@ -14802,31 +15677,35 @@ fn require_postgres_managed_cloud_runtime_authority_active(
     instance: &ManagedCloudRuntimeInstance,
     now_ms: i64,
 ) -> ManagedCloudResult<()> {
+    let tables = managed_cloud_runtime_tables_for_role(&instance.role);
     let revoked = tx
         .query_opt(
-            "SELECT 1
-               FROM jobs_managed_cloud_runtime_instances instance
-               JOIN jobs_managed_cloud_runtime_grants grant
-                 ON grant.grant_id=instance.grant_id
-                AND grant.environment=instance.environment
-                AND grant.region=instance.region AND grant.channel=instance.channel
-                AND grant.activation_sha256=instance.activation_sha256
-                AND grant.manifest_sha256=instance.manifest_sha256
-                AND grant.component_id=instance.component_id AND grant.role=instance.role
-                AND grant.head_revision=instance.head_revision
-                AND grant.transition_sha256=instance.transition_sha256
-                AND grant.artifact_sha256=instance.artifact_sha256
-                AND grant.config_schema_sha256=instance.config_schema_sha256
-                AND grant.migration_set_sha256=instance.migration_set_sha256
-                AND grant.protocol_set_sha256=instance.protocol_set_sha256
-                AND grant.task_queue_sha256=instance.task_queue_sha256
-                AND grant.failure_converter_sha256=instance.failure_converter_sha256
-                AND grant.expected_dependency_evidence_sha256=
+            &format!(
+                "SELECT 1
+               FROM {} instance
+               JOIN {} runtime_grant
+                 ON runtime_grant.grant_id=instance.grant_id
+                AND runtime_grant.environment=instance.environment
+                AND runtime_grant.region=instance.region
+                AND runtime_grant.channel=instance.channel
+                AND runtime_grant.activation_sha256=instance.activation_sha256
+                AND runtime_grant.manifest_sha256=instance.manifest_sha256
+                AND runtime_grant.component_id=instance.component_id
+                AND runtime_grant.role=instance.role
+                AND runtime_grant.head_revision=instance.head_revision
+                AND runtime_grant.transition_sha256=instance.transition_sha256
+                AND runtime_grant.artifact_sha256=instance.artifact_sha256
+                AND runtime_grant.config_schema_sha256=instance.config_schema_sha256
+                AND runtime_grant.migration_set_sha256=instance.migration_set_sha256
+                AND runtime_grant.protocol_set_sha256=instance.protocol_set_sha256
+                AND runtime_grant.task_queue_sha256=instance.task_queue_sha256
+                AND runtime_grant.failure_converter_sha256=instance.failure_converter_sha256
+                AND runtime_grant.expected_dependency_evidence_sha256=
                     instance.dependency_evidence_sha256
-                AND grant.expected_runtime_identity_sha256=
+                AND runtime_grant.expected_runtime_identity_sha256=
                     instance.runtime_identity_sha256
-                AND grant.expected_worker_id=instance.worker_id
-                AND grant.activation_expires_at_ms=instance.activation_expires_at_ms
+                AND runtime_grant.expected_worker_id=instance.worker_id
+                AND runtime_grant.activation_expires_at_ms=instance.activation_expires_at_ms
                JOIN jobs_managed_cloud_activations activation
                  ON activation.activation_sha256=instance.activation_sha256
                 AND activation.manifest_sha256=instance.manifest_sha256
@@ -14858,14 +15737,14 @@ fn require_postgres_managed_cloud_runtime_authority_active(
                 AND (transition.transition_kind='activation'
                      OR rollback.rollback_sha256 IS NOT NULL)
                 AND EXISTS(
-                SELECT 1 FROM jobs_managed_cloud_runtime_grant_revocations direct
-                 WHERE direct.grant_id=grant.grant_id
+                SELECT 1 FROM {} direct
+                 WHERE direct.grant_id=runtime_grant.grant_id
                 UNION ALL
                 SELECT 1 FROM jobs_managed_cloud_revocations revoked
                  WHERE revoked.effective_at_ms<=$2 AND (
                    (revoked.subject_kind='runtime_grant'
-                     AND revoked.subject_id=grant.grant_id
-                     AND revoked.subject_sha256=grant.token_sha256)
+                     AND revoked.subject_id=runtime_grant.grant_id
+                     AND revoked.subject_sha256=runtime_grant.token_sha256)
                    OR (revoked.subject_kind='runtime_instance'
                      AND revoked.subject_id=instance.runtime_instance_id
                      AND revoked.subject_sha256=instance.runtime_identity_sha256)
@@ -14901,6 +15780,8 @@ fn require_postgres_managed_cloud_runtime_authority_active(
                    ))
                  )
               ) LIMIT 1",
+                tables.instances, tables.grants, tables.grant_revocations
+            ),
             &[&instance.runtime_instance_id, &now_ms],
         )
         .map_err(managed_cloud_storage)?
@@ -14910,34 +15791,40 @@ fn require_postgres_managed_cloud_runtime_authority_active(
     }
     let active = tx
         .query_opt(
-            "SELECT 1
-               FROM jobs_managed_cloud_runtime_instances instance
-               JOIN jobs_managed_cloud_runtime_grants grant
-                 ON grant.grant_id=instance.grant_id
-                AND grant.environment=instance.environment
-                AND grant.region=instance.region AND grant.channel=instance.channel
-                AND grant.activation_sha256=instance.activation_sha256
-                AND grant.manifest_sha256=instance.manifest_sha256
-                AND grant.component_id=instance.component_id AND grant.role=instance.role
-                AND grant.head_revision=instance.head_revision
-                AND grant.transition_sha256=instance.transition_sha256
-                AND grant.artifact_sha256=instance.artifact_sha256
-                AND grant.config_schema_sha256=instance.config_schema_sha256
-                AND grant.migration_set_sha256=instance.migration_set_sha256
-                AND grant.protocol_set_sha256=instance.protocol_set_sha256
-                AND grant.task_queue_sha256=instance.task_queue_sha256
-                AND grant.failure_converter_sha256=instance.failure_converter_sha256
-                AND grant.expected_dependency_evidence_sha256=
+            &format!(
+                "SELECT 1
+               FROM {} instance
+               JOIN {} runtime_grant
+                 ON runtime_grant.grant_id=instance.grant_id
+                AND runtime_grant.environment=instance.environment
+                AND runtime_grant.region=instance.region
+                AND runtime_grant.channel=instance.channel
+                AND runtime_grant.activation_sha256=instance.activation_sha256
+                AND runtime_grant.manifest_sha256=instance.manifest_sha256
+                AND runtime_grant.component_id=instance.component_id
+                AND runtime_grant.role=instance.role
+                AND runtime_grant.head_revision=instance.head_revision
+                AND runtime_grant.transition_sha256=instance.transition_sha256
+                AND runtime_grant.artifact_sha256=instance.artifact_sha256
+                AND runtime_grant.config_schema_sha256=instance.config_schema_sha256
+                AND runtime_grant.migration_set_sha256=instance.migration_set_sha256
+                AND runtime_grant.protocol_set_sha256=instance.protocol_set_sha256
+                AND runtime_grant.task_queue_sha256=instance.task_queue_sha256
+                AND runtime_grant.failure_converter_sha256=instance.failure_converter_sha256
+                AND runtime_grant.expected_dependency_evidence_sha256=
                     instance.dependency_evidence_sha256
-                AND grant.expected_runtime_identity_sha256=
+                AND runtime_grant.expected_runtime_identity_sha256=
                     instance.runtime_identity_sha256
-                AND grant.expected_worker_id=instance.worker_id
-                AND grant.activation_expires_at_ms=instance.activation_expires_at_ms
+                AND runtime_grant.expected_worker_id=instance.worker_id
+                AND runtime_grant.activation_expires_at_ms=instance.activation_expires_at_ms
                JOIN jobs_managed_cloud_activations activation
                  ON activation.activation_sha256=instance.activation_sha256
                 AND activation.manifest_sha256=instance.manifest_sha256
                 AND activation.environment=instance.environment
                 AND activation.region=instance.region AND activation.channel=instance.channel
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=instance.manifest_sha256
+                AND manifest.trust_generation=activation.trust_generation
                JOIN jobs_managed_cloud_cohorts cohort
                  ON cohort.cohort_sha256=activation.cohort_sha256
                 AND cohort.authorization_signature_set_sha256=
@@ -14969,7 +15856,7 @@ fn require_postgres_managed_cloud_runtime_authority_active(
                      OR rollback.rollback_sha256 IS NOT NULL)
                 AND activation.not_before_ms<=$2 AND activation.expires_at_ms>$2
                 AND activation.expires_at_ms=instance.activation_expires_at_ms
-                AND grant.expires_at_ms>$2
+                AND runtime_grant.expires_at_ms>$2
                 AND cohort.not_before_ms<=$2 AND cohort.expires_at_ms>$2
                 AND policy.valid_from_ms<=$2 AND policy.expires_at_ms>$2
                 AND activation.cloud_distribution_enabled
@@ -14977,8 +15864,22 @@ fn require_postgres_managed_cloud_runtime_authority_active(
                 AND activation.workflow_cleanup_enabled
                 AND NOT activation.direct_discovery_enabled
                 AND NOT activation.global_discovery_enabled
-                AND NOT activation.source_verification_enabled
+                AND (instance.role<>'original_source_verifier'
+                     OR activation.source_verification_enabled)
+                AND (NOT activation.source_verification_enabled OR EXISTS(
+                  SELECT 1
+                    FROM jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                    JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                      ON source_identity.manifest_sha256=source_protocol.manifest_sha256
+                   WHERE source_protocol.manifest_sha256=manifest.manifest_sha256
+                     AND source_protocol.protocol_id='source_verification'
+                     AND source_protocol.protocol_version=1
+                     AND source_identity.component_id='jobs-workflows'
+                     AND source_identity.role='original_source_verifier'
+                ))
               FOR SHARE OF head",
+                tables.instances, tables.grants
+            ),
             &[&instance.runtime_instance_id, &now_ms],
         )
         .map_err(managed_cloud_storage)?
@@ -14987,6 +15888,1259 @@ fn require_postgres_managed_cloud_runtime_authority_active(
         return Err(ManagedCloudRegistryError::Unavailable);
     }
     Ok(())
+}
+
+fn validate_managed_cloud_v2_source_verification_pair(
+    activation_sha256: &str,
+    canonical_activation_base64url: &str,
+    manifest_sha256: &str,
+    canonical_manifest_base64url: &str,
+) -> ManagedCloudResult<(
+    ManagedCloudActivationAuthority,
+    ManagedCloudReleaseAuthority,
+)> {
+    let activation_bytes = managed_cloud_decode_base64url(canonical_activation_base64url)?;
+    let activation: ManagedCloudActivationAuthority =
+        managed_cloud_parse_canonical(&activation_bytes)?;
+    let manifest_bytes = managed_cloud_decode_base64url(canonical_manifest_base64url)?;
+    let manifest: ManagedCloudReleaseAuthority = managed_cloud_parse_canonical(&manifest_bytes)?;
+    validate_managed_cloud_activation(&activation)?;
+    validate_managed_cloud_release(&manifest)?;
+    if managed_cloud_sha256(&activation_bytes) != activation_sha256
+        || managed_cloud_sha256(&manifest_bytes) != manifest_sha256
+        || activation.version != 2
+        || activation.audience != MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE
+        || manifest.version != 2
+        || manifest.audience != MANAGED_CLOUD_RELEASE_V2_AUDIENCE
+        || activation.manifest_sha256 != manifest_sha256
+        || activation.feature_authority != manifest.feature_authority
+        || !activation.feature_authority.source_verification
+    {
+        return Err(ManagedCloudRegistryError::InvalidAuthority);
+    }
+    Ok((activation, manifest))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ManagedCloudOriginalSourceVerificationAuthority {
+    pub(crate) account_id: String,
+    pub(crate) scope: ManagedCloudScope,
+    pub(crate) head_revision: i64,
+    pub(crate) transition_sha256: String,
+    pub(crate) activation_sha256: String,
+    pub(crate) manifest_sha256: String,
+    pub(crate) cohort_sha256: String,
+    pub(crate) trust_generation: i64,
+    pub(crate) channel_sequence: i64,
+    pub(crate) release_id: String,
+    pub(crate) release_sequence: i64,
+    pub(crate) task_queue_sha256: String,
+    pub(crate) failure_converter_sha256: String,
+    pub(crate) activation_expires_at_ms: i64,
+    pub(crate) source_protocol_schema_sha256: String,
+    pub(crate) runtime_identity_sha256: String,
+    pub(crate) dependency_evidence_sha256: String,
+    pub(crate) heartbeat_ttl_ms: i64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ManagedCloudOriginalSourceVerificationCanonicalAuthority<'a> {
+    version: i64,
+    audience: &'static str,
+    account_id: &'a str,
+    scope: &'a ManagedCloudScope,
+    head_revision: i64,
+    transition_sha256: &'a str,
+    activation_sha256: &'a str,
+    manifest_sha256: &'a str,
+    cohort_sha256: &'a str,
+    trust_generation: i64,
+    channel_sequence: i64,
+    release_id: &'a str,
+    release_sequence: i64,
+    task_queue_sha256: &'a str,
+    failure_converter_sha256: &'a str,
+    activation_expires_at_ms: i64,
+    source_protocol_schema_sha256: &'a str,
+    runtime_identity_sha256: &'a str,
+    dependency_evidence_sha256: &'a str,
+    heartbeat_ttl_ms: i64,
+}
+
+impl ManagedCloudOriginalSourceVerificationAuthority {
+    pub(crate) fn canonical_json(&self) -> ManagedCloudResult<Vec<u8>> {
+        managed_cloud_canonical_json(&ManagedCloudOriginalSourceVerificationCanonicalAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_AUDIENCE,
+            account_id: &self.account_id,
+            scope: &self.scope,
+            head_revision: self.head_revision,
+            transition_sha256: &self.transition_sha256,
+            activation_sha256: &self.activation_sha256,
+            manifest_sha256: &self.manifest_sha256,
+            cohort_sha256: &self.cohort_sha256,
+            trust_generation: self.trust_generation,
+            channel_sequence: self.channel_sequence,
+            release_id: &self.release_id,
+            release_sequence: self.release_sequence,
+            task_queue_sha256: &self.task_queue_sha256,
+            failure_converter_sha256: &self.failure_converter_sha256,
+            activation_expires_at_ms: self.activation_expires_at_ms,
+            source_protocol_schema_sha256: &self.source_protocol_schema_sha256,
+            runtime_identity_sha256: &self.runtime_identity_sha256,
+            dependency_evidence_sha256: &self.dependency_evidence_sha256,
+            heartbeat_ttl_ms: self.heartbeat_ttl_ms,
+        })
+    }
+
+    pub(crate) fn authority_sha256(&self) -> ManagedCloudResult<String> {
+        self.canonical_json()
+            .map(|canonical| managed_cloud_sha256(&canonical))
+    }
+}
+
+#[derive(Debug)]
+struct ManagedCloudSourceVerificationFeatureCandidate {
+    scope: ManagedCloudScope,
+    cohort_rollout_mode: String,
+    account_is_cohort_member: bool,
+    head_revision: i64,
+    transition_sha256: String,
+    activation_sha256: String,
+    canonical_activation_base64url: String,
+    manifest_sha256: String,
+    canonical_manifest_base64url: String,
+    cohort_sha256: String,
+    trust_generation: i64,
+    channel_sequence: i64,
+    release_id: String,
+    release_sequence: i64,
+    task_queue_sha256: String,
+    failure_converter_sha256: String,
+    source_protocol_sha256: Option<String>,
+    source_runtime_identity_sha256: Option<String>,
+    dependency_evidence_sha256: Option<String>,
+    heartbeat_ttl_ms: Option<i64>,
+    activation_not_before_ms: i64,
+    activation_expires_at_ms: i64,
+    cohort_not_before_ms: i64,
+    cohort_expires_at_ms: i64,
+    policy_valid_from_ms: i64,
+    policy_expires_at_ms: i64,
+    transition_valid: bool,
+    revoked: bool,
+}
+
+fn managed_cloud_source_verification_scope_admits_account(
+    scope: &ManagedCloudScope,
+    cohort_rollout_mode: &str,
+    account_is_cohort_member: bool,
+) -> bool {
+    scope.environment == "production"
+        && ((scope.channel == "general" && cohort_rollout_mode == "all_eligible_accounts")
+            || (scope.channel == "canary"
+                && cohort_rollout_mode == "allowlist"
+                && account_is_cohort_member))
+}
+
+fn require_managed_cloud_source_verification_candidate_active(
+    candidate: &ManagedCloudSourceVerificationFeatureCandidate,
+    now_ms: i64,
+) -> ManagedCloudResult<()> {
+    if !managed_cloud_source_verification_scope_admits_account(
+        &candidate.scope,
+        &candidate.cohort_rollout_mode,
+        candidate.account_is_cohort_member,
+    ) {
+        return Err(ManagedCloudRegistryError::InvalidAuthority);
+    }
+    if candidate.revoked {
+        return Err(ManagedCloudRegistryError::Revoked);
+    }
+    if !candidate.transition_valid
+        || candidate.activation_not_before_ms > now_ms
+        || candidate.activation_expires_at_ms <= now_ms
+        || candidate.cohort_not_before_ms > now_ms
+        || candidate.cohort_expires_at_ms <= now_ms
+        || candidate.policy_valid_from_ms > now_ms
+        || candidate.policy_expires_at_ms <= now_ms
+    {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    let source_protocol_sha256 = candidate
+        .source_protocol_sha256
+        .as_deref()
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    if candidate.source_runtime_identity_sha256.is_none()
+        || candidate.dependency_evidence_sha256.is_none()
+        || candidate.heartbeat_ttl_ms.is_none()
+    {
+        return Err(ManagedCloudRegistryError::InvalidAuthority);
+    }
+    let (activation, manifest) = validate_managed_cloud_v2_source_verification_pair(
+        &candidate.activation_sha256,
+        &candidate.canonical_activation_base64url,
+        &candidate.manifest_sha256,
+        &candidate.canonical_manifest_base64url,
+    )?;
+    if activation.scope != candidate.scope
+        || activation.cohort_sha256 != candidate.cohort_sha256
+        || activation.trust_generation != candidate.trust_generation
+        || activation.channel_sequence != candidate.channel_sequence
+        || activation.task_queue_sha256 != candidate.task_queue_sha256
+        || activation.failure_converter_sha256 != candidate.failure_converter_sha256
+        || activation.not_before_ms != candidate.activation_not_before_ms
+        || activation.expires_at_ms != candidate.activation_expires_at_ms
+        || candidate.heartbeat_ttl_ms != Some(activation.heartbeat_ttl_ms)
+        || manifest.release_id != candidate.release_id
+        || manifest.release_sequence != candidate.release_sequence
+        || !candidate
+            .source_runtime_identity_sha256
+            .as_deref()
+            .is_some_and(managed_cloud_hex64)
+        || !candidate
+            .dependency_evidence_sha256
+            .as_deref()
+            .is_some_and(managed_cloud_hex64)
+        || manifest
+            .protocols
+            .iter()
+            .find(|protocol| protocol.protocol_id == "source_verification")
+            .is_none_or(|protocol| protocol.schema_sha256 != source_protocol_sha256)
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    Ok(())
+}
+
+fn managed_cloud_source_verification_candidate_head(
+    candidate: &ManagedCloudSourceVerificationFeatureCandidate,
+) -> ManagedCloudResolvedHead {
+    ManagedCloudResolvedHead {
+        scope: candidate.scope.clone(),
+        head_revision: candidate.head_revision,
+        transition_sha256: candidate.transition_sha256.clone(),
+        activation_sha256: candidate.activation_sha256.clone(),
+        manifest_sha256: candidate.manifest_sha256.clone(),
+        cohort_sha256: candidate.cohort_sha256.clone(),
+        trust_generation: candidate.trust_generation,
+        channel_sequence: candidate.channel_sequence,
+        release_id: candidate.release_id.clone(),
+        release_sequence: candidate.release_sequence,
+        task_queue_sha256: candidate.task_queue_sha256.clone(),
+        failure_converter_sha256: candidate.failure_converter_sha256.clone(),
+        activation_expires_at_ms: candidate.activation_expires_at_ms,
+        source_verification: true,
+    }
+}
+
+fn managed_cloud_source_verification_candidate_runtime(
+    candidate: &ManagedCloudSourceVerificationFeatureCandidate,
+) -> ManagedCloudResult<ManagedCloudRequiredRuntime> {
+    Ok(ManagedCloudRequiredRuntime {
+        role: "original_source_verifier".to_string(),
+        component_id: "jobs-workflows".to_string(),
+        dependency_evidence_sha256: candidate
+            .dependency_evidence_sha256
+            .clone()
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?,
+        heartbeat_ttl_ms: candidate
+            .heartbeat_ttl_ms
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?,
+    })
+}
+
+fn managed_cloud_source_verification_candidate_authority(
+    candidate: &ManagedCloudSourceVerificationFeatureCandidate,
+    account_id: &str,
+) -> ManagedCloudResult<ManagedCloudOriginalSourceVerificationAuthority> {
+    Ok(ManagedCloudOriginalSourceVerificationAuthority {
+        account_id: account_id.to_string(),
+        scope: candidate.scope.clone(),
+        head_revision: candidate.head_revision,
+        transition_sha256: candidate.transition_sha256.clone(),
+        activation_sha256: candidate.activation_sha256.clone(),
+        manifest_sha256: candidate.manifest_sha256.clone(),
+        cohort_sha256: candidate.cohort_sha256.clone(),
+        trust_generation: candidate.trust_generation,
+        channel_sequence: candidate.channel_sequence,
+        release_id: candidate.release_id.clone(),
+        release_sequence: candidate.release_sequence,
+        task_queue_sha256: candidate.task_queue_sha256.clone(),
+        failure_converter_sha256: candidate.failure_converter_sha256.clone(),
+        activation_expires_at_ms: candidate.activation_expires_at_ms,
+        source_protocol_schema_sha256: candidate
+            .source_protocol_sha256
+            .clone()
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?,
+        runtime_identity_sha256: candidate
+            .source_runtime_identity_sha256
+            .clone()
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?,
+        dependency_evidence_sha256: candidate
+            .dependency_evidence_sha256
+            .clone()
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?,
+        heartbeat_ttl_ms: candidate
+            .heartbeat_ttl_ms
+            .ok_or(ManagedCloudRegistryError::InvalidAuthority)?,
+    })
+}
+
+fn require_single_managed_cloud_source_verification_authority(
+    mut authorities: Vec<ManagedCloudOriginalSourceVerificationAuthority>,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    match authorities.len() {
+        0 => Ok(None),
+        1 => Ok(authorities.pop()),
+        _ => Err(ManagedCloudRegistryError::IdentityConflict),
+    }
+}
+
+fn lock_postgres_original_source_verifier_readiness(
+    tx: &mut postgres::Transaction<'_>,
+    candidate: &ManagedCloudSourceVerificationFeatureCandidate,
+    now_ms: i64,
+) -> ManagedCloudResult<bool> {
+    let dependency_evidence_sha256 = candidate
+        .dependency_evidence_sha256
+        .as_deref()
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    let heartbeat_ttl_ms = candidate
+        .heartbeat_ttl_ms
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    let runtime_identity_sha256 = candidate
+        .source_runtime_identity_sha256
+        .as_deref()
+        .ok_or(ManagedCloudRegistryError::InvalidAuthority)?;
+    tx.query_opt(
+        "SELECT 1
+           FROM jobs_managed_cloud_original_source_verifier_runtime_heartbeats heartbeat
+           JOIN jobs_managed_cloud_original_source_verifier_runtime_instances instance
+             ON instance.runtime_instance_id=heartbeat.runtime_instance_id
+            AND instance.instance_epoch=heartbeat.instance_epoch
+            AND instance.activation_sha256=heartbeat.activation_sha256
+            AND instance.manifest_sha256=heartbeat.manifest_sha256
+            AND instance.component_id=heartbeat.component_id
+            AND instance.role=heartbeat.role
+            AND instance.worker_id=heartbeat.worker_id
+            AND instance.runtime_identity_sha256=$8
+           JOIN jobs_managed_cloud_original_source_verifier_runtime_grants runtime_grant
+             ON runtime_grant.grant_id=instance.grant_id
+            AND runtime_grant.activation_sha256=heartbeat.activation_sha256
+            AND runtime_grant.manifest_sha256=heartbeat.manifest_sha256
+            AND runtime_grant.component_id=heartbeat.component_id
+            AND runtime_grant.role=heartbeat.role
+            AND runtime_grant.expected_worker_id=heartbeat.worker_id
+            AND runtime_grant.expected_runtime_identity_sha256=$8
+            AND runtime_grant.expected_dependency_evidence_sha256=
+                heartbeat.dependency_evidence_sha256
+           JOIN jobs_managed_cloud_activation_requirements requirement
+             ON requirement.activation_sha256=heartbeat.activation_sha256
+            AND requirement.role=heartbeat.role
+            AND requirement.dependency_evidence_sha256=
+                heartbeat.dependency_evidence_sha256
+            AND requirement.heartbeat_ttl_ms=$7
+          WHERE heartbeat.activation_sha256=$1 AND heartbeat.manifest_sha256=$2
+            AND heartbeat.component_id='jobs-workflows'
+            AND heartbeat.role='original_source_verifier'
+            AND heartbeat.observed_head_revision=$3
+            AND heartbeat.observed_transition_sha256=$4
+            AND heartbeat.dependency_evidence_sha256=$5
+            AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
+            AND heartbeat.heartbeat_at_ms+$7>$6 AND runtime_grant.expires_at_ms>$6
+            AND NOT EXISTS(
+              SELECT 1
+                FROM jobs_managed_cloud_original_source_verifier_grant_revocations direct
+               WHERE direct.grant_id=runtime_grant.grant_id
+            )
+            AND NOT EXISTS(
+              SELECT 1 FROM jobs_managed_cloud_revocations revoked
+               WHERE revoked.effective_at_ms<=$6 AND (
+                 (revoked.subject_kind='runtime_grant'
+                   AND revoked.subject_id=runtime_grant.grant_id
+                   AND revoked.subject_sha256=runtime_grant.token_sha256)
+                 OR (revoked.subject_kind='runtime_instance'
+                   AND revoked.subject_id=instance.runtime_instance_id
+                   AND revoked.subject_sha256=instance.runtime_identity_sha256)
+               )
+            )
+          LIMIT 1
+          FOR SHARE OF heartbeat,instance,runtime_grant,requirement",
+        &[
+            &candidate.activation_sha256,
+            &candidate.manifest_sha256,
+            &candidate.head_revision,
+            &candidate.transition_sha256,
+            &dependency_evidence_sha256,
+            &now_ms,
+            &heartbeat_ttl_ms,
+            &runtime_identity_sha256,
+        ],
+    )
+    .map(|row| row.is_some())
+    .map_err(managed_cloud_storage)
+}
+
+pub(crate) fn sqlite_original_source_verification_authority_for_account_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    if !managed_cloud_token(account_id, 128) {
+        return Err(ManagedCloudRegistryError::InvalidRequest);
+    }
+    let now_ms = managed_cloud_db_now_sqlite(tx)?;
+    let mut statement = tx
+        .prepare(
+            "SELECT head.environment,head.region,head.channel,cohort.rollout_mode,
+                    EXISTS(
+                      SELECT 1 FROM jobs_managed_cloud_cohort_members selected_member
+                       WHERE selected_member.cohort_sha256=cohort.cohort_sha256
+                         AND selected_member.account_id=?2
+                    ),
+                    head.head_revision,
+                    head.current_transition_sha256,
+                    activation.activation_sha256,activation.canonical_activation_base64url,
+                    manifest.manifest_sha256,manifest.canonical_manifest_base64url,
+                    cohort.cohort_sha256,activation.trust_generation,
+                    activation.channel_sequence,manifest.release_id,manifest.release_sequence,
+                    activation.task_queue_sha256,activation.failure_converter_sha256,
+                    source_protocol.schema_sha256,source_identity.runtime_identity_sha256,
+                    source_requirement.dependency_evidence_sha256,
+                    source_requirement.heartbeat_ttl_ms,
+                    activation.not_before_ms,activation.expires_at_ms,
+                    cohort.not_before_ms,cohort.expires_at_ms,
+                    policy.valid_from_ms,policy.expires_at_ms,
+                    (transition.transition_kind='activation'
+                     OR rollback.rollback_sha256 IS NOT NULL),
+                    EXISTS(
+                      SELECT 1 FROM jobs_managed_cloud_revocations revoked
+                       WHERE revoked.effective_at_ms<=?1 AND (
+                         (revoked.subject_kind='activation'
+                           AND revoked.subject_sha256=activation.activation_sha256)
+                         OR (revoked.subject_kind='manifest'
+                           AND revoked.subject_sha256=manifest.manifest_sha256)
+                         OR (revoked.subject_kind='cohort'
+                           AND revoked.subject_sha256=cohort.cohort_sha256)
+                         OR (revoked.subject_kind='release'
+                           AND revoked.subject_id=manifest.release_id
+                           AND revoked.subject_sha256=manifest.manifest_sha256)
+                         OR (revoked.subject_kind='rollback'
+                           AND rollback.rollback_sha256 IS NOT NULL
+                           AND revoked.subject_id=rollback.rollback_id
+                           AND revoked.subject_sha256=rollback.rollback_sha256)
+                         OR (revoked.subject_kind='trust_policy'
+                           AND revoked.subject_id=policy.policy_id
+                           AND revoked.subject_sha256=policy.policy_sha256)
+                         OR (revoked.subject_kind='component' AND EXISTS(
+                           SELECT 1 FROM jobs_managed_cloud_manifest_components component
+                            WHERE component.manifest_sha256=manifest.manifest_sha256
+                              AND component.component_id=revoked.subject_id
+                              AND component.artifact_sha256=revoked.subject_sha256
+                         ))
+                         OR (revoked.subject_kind='signing_key'
+                           AND revoked.subject_id IN (
+                             SELECT signature.key_id
+                               FROM jobs_managed_cloud_signatures signature
+                              WHERE signature.signature_set_sha256 IN (
+                                activation.authorization_signature_set_sha256,
+                                manifest.authorization_signature_set_sha256,
+                                cohort.authorization_signature_set_sha256,
+                                policy.authorization_signature_set_sha256
+                              ) OR signature.signature_set_sha256=
+                                   rollback.authorization_signature_set_sha256
+                           ))
+                       )
+                    )
+               FROM jobs_managed_cloud_heads head
+               JOIN jobs_managed_cloud_activations activation
+                 ON activation.activation_sha256=head.current_activation_sha256
+                AND activation.manifest_sha256=head.current_manifest_sha256
+                AND activation.environment=head.environment
+                AND activation.region=head.region AND activation.channel=head.channel
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=activation.manifest_sha256
+                AND manifest.trust_generation=activation.trust_generation
+               JOIN jobs_managed_cloud_cohorts cohort
+                 ON cohort.cohort_sha256=activation.cohort_sha256
+                AND cohort.trust_generation=activation.trust_generation
+                AND cohort.environment=activation.environment
+                AND cohort.region=activation.region AND cohort.channel=activation.channel
+               JOIN jobs_managed_cloud_trust_policies policy
+                 ON policy.trust_generation=activation.trust_generation
+               JOIN jobs_managed_cloud_head_transitions transition
+                 ON transition.transition_sha256=head.current_transition_sha256
+                AND transition.environment=head.environment
+                AND transition.region=head.region AND transition.channel=head.channel
+                AND transition.head_revision=head.head_revision
+                AND transition.next_activation_sha256=activation.activation_sha256
+                AND transition.next_manifest_sha256=manifest.manifest_sha256
+               LEFT JOIN jobs_managed_cloud_rollbacks rollback
+                 ON rollback.rollback_sha256=transition.rollback_authority_sha256
+                AND rollback.trust_generation=activation.trust_generation
+               LEFT JOIN jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                 ON source_protocol.manifest_sha256=manifest.manifest_sha256
+                AND source_protocol.protocol_id='source_verification'
+                AND source_protocol.protocol_version=1 AND source_protocol.ordinal=9
+               LEFT JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                 ON source_identity.manifest_sha256=manifest.manifest_sha256
+                AND source_identity.component_id='jobs-workflows'
+                AND source_identity.role='original_source_verifier'
+                AND source_identity.ordinal=0
+               LEFT JOIN jobs_managed_cloud_activation_requirements source_requirement
+                 ON source_requirement.activation_sha256=activation.activation_sha256
+                AND source_requirement.role='original_source_verifier'
+              WHERE activation.source_verification_enabled=1
+                AND head.environment='production'
+                AND (
+                  (head.channel='general' AND cohort.rollout_mode='all_eligible_accounts')
+                  OR (
+                    head.channel='canary' AND cohort.rollout_mode='allowlist'
+                    AND EXISTS(
+                      SELECT 1 FROM jobs_managed_cloud_cohort_members member
+                       WHERE member.cohort_sha256=cohort.cohort_sha256
+                         AND member.account_id=?2
+                    )
+                  )
+                )
+              ORDER BY head.environment,head.region,head.channel",
+        )
+        .map_err(managed_cloud_storage)?;
+    let candidates = statement
+        .query_map(params![now_ms, account_id], |row| {
+            Ok(ManagedCloudSourceVerificationFeatureCandidate {
+                scope: ManagedCloudScope {
+                    environment: row.get(0)?,
+                    region: row.get(1)?,
+                    channel: row.get(2)?,
+                },
+                cohort_rollout_mode: row.get(3)?,
+                account_is_cohort_member: row.get(4)?,
+                head_revision: row.get(5)?,
+                transition_sha256: row.get(6)?,
+                activation_sha256: row.get(7)?,
+                canonical_activation_base64url: row.get(8)?,
+                manifest_sha256: row.get(9)?,
+                canonical_manifest_base64url: row.get(10)?,
+                cohort_sha256: row.get(11)?,
+                trust_generation: row.get(12)?,
+                channel_sequence: row.get(13)?,
+                release_id: row.get(14)?,
+                release_sequence: row.get(15)?,
+                task_queue_sha256: row.get(16)?,
+                failure_converter_sha256: row.get(17)?,
+                source_protocol_sha256: row.get(18)?,
+                source_runtime_identity_sha256: row.get(19)?,
+                dependency_evidence_sha256: row.get(20)?,
+                heartbeat_ttl_ms: row.get(21)?,
+                activation_not_before_ms: row.get(22)?,
+                activation_expires_at_ms: row.get(23)?,
+                cohort_not_before_ms: row.get(24)?,
+                cohort_expires_at_ms: row.get(25)?,
+                policy_valid_from_ms: row.get(26)?,
+                policy_expires_at_ms: row.get(27)?,
+                transition_valid: row.get(28)?,
+                revoked: row.get(29)?,
+            })
+        })
+        .map_err(managed_cloud_storage)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(managed_cloud_storage)?;
+    let mut authorities = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        require_managed_cloud_source_verification_candidate_active(&candidate, now_ms)?;
+        let head = managed_cloud_source_verification_candidate_head(&candidate);
+        let runtime = managed_cloud_source_verification_candidate_runtime(&candidate)?;
+        let (_, ready) = sqlite_managed_cloud_runtime_readiness(tx, &head, &runtime, now_ms)?;
+        if !ready {
+            return Err(ManagedCloudRegistryError::Unavailable);
+        }
+        authorities.push(managed_cloud_source_verification_candidate_authority(
+            &candidate, account_id,
+        )?);
+    }
+    require_single_managed_cloud_source_verification_authority(authorities)
+}
+
+pub(crate) fn sqlite_original_source_verification_feature_active_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<bool> {
+    sqlite_original_source_verification_authority_for_account_tx(tx, account_id)
+        .map(|authority| authority.is_some())
+}
+
+fn original_source_verification_scheduling_authority(
+    authority: ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>>,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    match authority {
+        Ok(authority) => Ok(authority),
+        Err(ManagedCloudRegistryError::Unavailable | ManagedCloudRegistryError::Revoked) => {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) fn sqlite_original_source_verification_scheduling_authority_for_account_tx(
+    tx: &rusqlite::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    original_source_verification_scheduling_authority(
+        sqlite_original_source_verification_authority_for_account_tx(tx, account_id),
+    )
+}
+
+pub(crate) fn postgres_original_source_verification_authority_for_account_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    if !managed_cloud_token(account_id, 128) {
+        return Err(ManagedCloudRegistryError::InvalidRequest);
+    }
+    lock_managed_cloud_release_registry_shared_postgres_tx(tx)?;
+    postgres_original_source_verification_authority_for_account_tx_after_prelock(tx, account_id)
+}
+
+/// Resolve source-verifier release authority after the caller has acquired the
+/// shared managed-release registry lock in the common authority order.
+///
+/// This variant deliberately does not reacquire `M`; callers composing
+/// effect-capable authority must prelock `H -> M -> ATS -> D` first.
+pub(crate) fn postgres_original_source_verification_authority_for_account_tx_after_prelock(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    if !managed_cloud_token(account_id, 128) {
+        return Err(ManagedCloudRegistryError::InvalidRequest);
+    }
+    let now_ms = managed_cloud_db_now_postgres(tx)?;
+    let rows = tx
+        .query(
+            "SELECT head.environment,head.region,head.channel,cohort.rollout_mode,
+                    EXISTS(
+                      SELECT 1 FROM jobs_managed_cloud_cohort_members selected_member
+                       WHERE selected_member.cohort_sha256=cohort.cohort_sha256
+                         AND selected_member.account_id=$2
+                    ),
+                    head.head_revision,
+                    head.current_transition_sha256,
+                    activation.activation_sha256,activation.canonical_activation_base64url,
+                    manifest.manifest_sha256,manifest.canonical_manifest_base64url,
+                    cohort.cohort_sha256,activation.trust_generation,
+                    activation.channel_sequence,manifest.release_id,manifest.release_sequence,
+                    activation.task_queue_sha256,activation.failure_converter_sha256,
+                    source_protocol.schema_sha256,source_identity.runtime_identity_sha256,
+                    source_requirement.dependency_evidence_sha256,
+                    source_requirement.heartbeat_ttl_ms,
+                    activation.not_before_ms,activation.expires_at_ms,
+                    cohort.not_before_ms,cohort.expires_at_ms,
+                    policy.valid_from_ms,policy.expires_at_ms,
+                    (transition.transition_kind='activation'
+                     OR rollback.rollback_sha256 IS NOT NULL),
+                    EXISTS(
+                      SELECT 1 FROM jobs_managed_cloud_revocations revoked
+                       WHERE revoked.effective_at_ms<=$1 AND (
+                         (revoked.subject_kind='activation'
+                           AND revoked.subject_sha256=activation.activation_sha256)
+                         OR (revoked.subject_kind='manifest'
+                           AND revoked.subject_sha256=manifest.manifest_sha256)
+                         OR (revoked.subject_kind='cohort'
+                           AND revoked.subject_sha256=cohort.cohort_sha256)
+                         OR (revoked.subject_kind='release'
+                           AND revoked.subject_id=manifest.release_id
+                           AND revoked.subject_sha256=manifest.manifest_sha256)
+                         OR (revoked.subject_kind='rollback'
+                           AND rollback.rollback_sha256 IS NOT NULL
+                           AND revoked.subject_id=rollback.rollback_id
+                           AND revoked.subject_sha256=rollback.rollback_sha256)
+                         OR (revoked.subject_kind='trust_policy'
+                           AND revoked.subject_id=policy.policy_id
+                           AND revoked.subject_sha256=policy.policy_sha256)
+                         OR (revoked.subject_kind='component' AND EXISTS(
+                           SELECT 1 FROM jobs_managed_cloud_manifest_components component
+                            WHERE component.manifest_sha256=manifest.manifest_sha256
+                              AND component.component_id=revoked.subject_id
+                              AND component.artifact_sha256=revoked.subject_sha256
+                         ))
+                         OR (revoked.subject_kind='signing_key'
+                           AND revoked.subject_id IN (
+                             SELECT signature.key_id
+                               FROM jobs_managed_cloud_signatures signature
+                              WHERE signature.signature_set_sha256 IN (
+                                activation.authorization_signature_set_sha256,
+                                manifest.authorization_signature_set_sha256,
+                                cohort.authorization_signature_set_sha256,
+                                policy.authorization_signature_set_sha256
+                              ) OR signature.signature_set_sha256=
+                                   rollback.authorization_signature_set_sha256
+                           ))
+                       )
+                    )
+               FROM jobs_managed_cloud_heads head
+               JOIN jobs_managed_cloud_activations activation
+                 ON activation.activation_sha256=head.current_activation_sha256
+                AND activation.manifest_sha256=head.current_manifest_sha256
+                AND activation.environment=head.environment
+                AND activation.region=head.region AND activation.channel=head.channel
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=activation.manifest_sha256
+                AND manifest.trust_generation=activation.trust_generation
+               JOIN jobs_managed_cloud_cohorts cohort
+                 ON cohort.cohort_sha256=activation.cohort_sha256
+                AND cohort.trust_generation=activation.trust_generation
+                AND cohort.environment=activation.environment
+                AND cohort.region=activation.region AND cohort.channel=activation.channel
+               JOIN jobs_managed_cloud_trust_policies policy
+                 ON policy.trust_generation=activation.trust_generation
+               JOIN jobs_managed_cloud_head_transitions transition
+                 ON transition.transition_sha256=head.current_transition_sha256
+                AND transition.environment=head.environment
+                AND transition.region=head.region AND transition.channel=head.channel
+                AND transition.head_revision=head.head_revision
+                AND transition.next_activation_sha256=activation.activation_sha256
+                AND transition.next_manifest_sha256=manifest.manifest_sha256
+               LEFT JOIN jobs_managed_cloud_rollbacks rollback
+                 ON rollback.rollback_sha256=transition.rollback_authority_sha256
+                AND rollback.trust_generation=activation.trust_generation
+               LEFT JOIN jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                 ON source_protocol.manifest_sha256=manifest.manifest_sha256
+                AND source_protocol.protocol_id='source_verification'
+                AND source_protocol.protocol_version=1 AND source_protocol.ordinal=9
+               LEFT JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                 ON source_identity.manifest_sha256=manifest.manifest_sha256
+                AND source_identity.component_id='jobs-workflows'
+                AND source_identity.role='original_source_verifier'
+                AND source_identity.ordinal=0
+               LEFT JOIN jobs_managed_cloud_activation_requirements source_requirement
+                 ON source_requirement.activation_sha256=activation.activation_sha256
+                AND source_requirement.role='original_source_verifier'
+              WHERE activation.source_verification_enabled
+                AND head.environment='production'
+                AND (
+                  (head.channel='general' AND cohort.rollout_mode='all_eligible_accounts')
+                  OR (
+                    head.channel='canary' AND cohort.rollout_mode='allowlist'
+                    AND EXISTS(
+                      SELECT 1 FROM jobs_managed_cloud_cohort_members member
+                       WHERE member.cohort_sha256=cohort.cohort_sha256
+                         AND member.account_id=$2
+                    )
+                  )
+                )
+              ORDER BY head.environment,head.region,head.channel
+              FOR SHARE OF head,activation,manifest,cohort,policy,transition",
+            &[&now_ms, &account_id],
+        )
+        .map_err(managed_cloud_storage)?;
+    let mut authorities = Vec::with_capacity(rows.len());
+    for row in rows {
+        let candidate = ManagedCloudSourceVerificationFeatureCandidate {
+            scope: ManagedCloudScope {
+                environment: row.get(0),
+                region: row.get(1),
+                channel: row.get(2),
+            },
+            cohort_rollout_mode: row.get(3),
+            account_is_cohort_member: row.get(4),
+            head_revision: row.get(5),
+            transition_sha256: row.get(6),
+            activation_sha256: row.get(7),
+            canonical_activation_base64url: row.get(8),
+            manifest_sha256: row.get(9),
+            canonical_manifest_base64url: row.get(10),
+            cohort_sha256: row.get(11),
+            trust_generation: row.get(12),
+            channel_sequence: row.get(13),
+            release_id: row.get(14),
+            release_sequence: row.get(15),
+            task_queue_sha256: row.get(16),
+            failure_converter_sha256: row.get(17),
+            source_protocol_sha256: row.get(18),
+            source_runtime_identity_sha256: row.get(19),
+            dependency_evidence_sha256: row.get(20),
+            heartbeat_ttl_ms: row.get(21),
+            activation_not_before_ms: row.get(22),
+            activation_expires_at_ms: row.get(23),
+            cohort_not_before_ms: row.get(24),
+            cohort_expires_at_ms: row.get(25),
+            policy_valid_from_ms: row.get(26),
+            policy_expires_at_ms: row.get(27),
+            transition_valid: row.get(28),
+            revoked: row.get(29),
+        };
+        require_managed_cloud_source_verification_candidate_active(&candidate, now_ms)?;
+        let ready = lock_postgres_original_source_verifier_readiness(tx, &candidate, now_ms)?;
+        if !ready {
+            return Err(ManagedCloudRegistryError::Unavailable);
+        }
+        authorities.push(managed_cloud_source_verification_candidate_authority(
+            &candidate, account_id,
+        )?);
+    }
+    require_single_managed_cloud_source_verification_authority(authorities)
+}
+
+pub(crate) fn postgres_original_source_verification_feature_active_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<bool> {
+    postgres_original_source_verification_authority_for_account_tx(tx, account_id)
+        .map(|authority| authority.is_some())
+}
+
+pub(crate) fn postgres_original_source_verification_scheduling_authority_for_account_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    original_source_verification_scheduling_authority(
+        postgres_original_source_verification_authority_for_account_tx(tx, account_id),
+    )
+}
+
+#[cfg(any(test, feature = "integration-test-support"))]
+fn original_source_verification_authority_for_account(
+    pool: &DbPool,
+    account_id: &str,
+) -> ManagedCloudResult<Option<ManagedCloudOriginalSourceVerificationAuthority>> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut connection = pool.get().map_err(managed_cloud_storage)?;
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(managed_cloud_storage)?;
+            let authority =
+                sqlite_original_source_verification_authority_for_account_tx(&tx, account_id)?;
+            tx.commit().map_err(managed_cloud_storage)?;
+            Ok(authority)
+        }
+        DbPool::Postgres(_) => {
+            let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
+            let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
+            let authority = postgres_original_source_verification_authority_for_account_tx(
+                &mut tx, account_id,
+            )?;
+            tx.commit().map_err(managed_cloud_storage)?;
+            Ok(authority)
+        }
+    })
+}
+
+pub fn original_source_verification_feature_active(
+    pool: &DbPool,
+    account_id: &str,
+) -> ManagedCloudResult<bool> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut connection = pool.get().map_err(managed_cloud_storage)?;
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(managed_cloud_storage)?;
+            let active = sqlite_original_source_verification_feature_active_tx(&tx, account_id)?;
+            tx.commit().map_err(managed_cloud_storage)?;
+            Ok(active)
+        }
+        DbPool::Postgres(_) => {
+            let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
+            let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
+            let active =
+                postgres_original_source_verification_feature_active_tx(&mut tx, account_id)?;
+            tx.commit().map_err(managed_cloud_storage)?;
+            Ok(active)
+        }
+    })
+}
+
+fn original_source_verifier_runtime_authority_sha256(
+    instance: &ManagedCloudRuntimeInstance,
+) -> ManagedCloudResult<String> {
+    managed_cloud_digest(&ManagedCloudOriginalSourceVerifierRuntimeAuthority {
+        version: 1,
+        audience: MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_AUTHORITY_AUDIENCE,
+        activation_sha256: &instance.activation_sha256,
+        component_id: &instance.component_id,
+        head_revision: instance.head_revision,
+        manifest_sha256: &instance.manifest_sha256,
+        role: &instance.role,
+        runtime_identity_sha256: &instance.runtime_identity_sha256,
+        runtime_instance_epoch: instance.instance_epoch,
+        runtime_instance_id: &instance.runtime_instance_id,
+        transition_sha256: &instance.transition_sha256,
+        worker_id: &instance.worker_id,
+    })
+}
+
+fn require_original_source_verifier_runtime_authority(
+    instance: &ManagedCloudRuntimeInstance,
+    runtime_authority_sha256: &str,
+) -> ManagedCloudResult<()> {
+    if !managed_cloud_hex64(runtime_authority_sha256) {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    let expected_authority = original_source_verifier_runtime_authority_sha256(instance)?;
+    if expected_authority
+        .as_bytes()
+        .ct_eq(runtime_authority_sha256.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    Ok(())
+}
+
+fn require_original_source_verifier_runtime_binding(
+    instance: &ManagedCloudRuntimeInstance,
+    session_proof_hmac_sha256: &str,
+    worker_id: &str,
+    runtime_instance_id: &str,
+    runtime_session_token: &str,
+    instance_epoch: i64,
+    runtime_authority_sha256: &str,
+) -> ManagedCloudResult<()> {
+    if !managed_cloud_route_id(worker_id)
+        || !managed_cloud_route_id(runtime_instance_id)
+        || !managed_cloud_base64url_32(runtime_session_token)
+        || !managed_cloud_safe_integer(instance_epoch, true)
+        || instance.component_id != "jobs-workflows"
+        || instance.role != "original_source_verifier"
+        || instance.worker_id != worker_id
+        || instance.runtime_instance_id != runtime_instance_id
+        || instance.instance_epoch != instance_epoch
+    {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    require_original_source_verifier_runtime_authority(instance, runtime_authority_sha256)?;
+    let expected_proof = managed_cloud_runtime_session_proof_hmac(
+        runtime_session_token,
+        &instance.grant_id,
+        worker_id,
+        runtime_instance_id,
+        instance_epoch,
+    )?;
+    require_managed_cloud_secret_match(session_proof_hmac_sha256, &expected_proof)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn require_original_source_verifier_runtime_active_sqlite_tx(
+    tx: &rusqlite::Transaction<'_>,
+    worker_id: &str,
+    runtime_instance_id: &str,
+    runtime_session_token: &str,
+    instance_epoch: i64,
+    runtime_authority_sha256: &str,
+) -> ManagedCloudResult<()> {
+    let now_ms = managed_cloud_db_now_sqlite(tx)?;
+    let (instance, session_proof) = sqlite_managed_cloud_runtime_instance_by_runtime_id(
+        tx,
+        runtime_instance_id,
+        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES,
+    )?
+    .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    require_original_source_verifier_runtime_binding(
+        &instance,
+        &session_proof,
+        worker_id,
+        runtime_instance_id,
+        runtime_session_token,
+        instance_epoch,
+        runtime_authority_sha256,
+    )?;
+    require_sqlite_managed_cloud_runtime_authority_active(tx, &instance, now_ms)?;
+    let authority = tx
+        .query_row(
+            "SELECT activation.canonical_activation_base64url,
+                    manifest.canonical_manifest_base64url,
+                    source_protocol.schema_sha256
+               FROM jobs_managed_cloud_activations activation
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=activation.manifest_sha256
+               JOIN jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                 ON source_protocol.manifest_sha256=manifest.manifest_sha256
+                AND source_protocol.protocol_id='source_verification'
+                AND source_protocol.protocol_version=1 AND source_protocol.ordinal=9
+               JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                 ON source_identity.manifest_sha256=manifest.manifest_sha256
+                AND source_identity.component_id='jobs-workflows'
+                AND source_identity.role='original_source_verifier'
+                AND source_identity.runtime_identity_sha256=?3
+                AND source_identity.ordinal=0
+              WHERE activation.activation_sha256=?1
+                AND activation.manifest_sha256=?2
+                AND activation.source_verification_enabled=1",
+            params![
+                instance.activation_sha256,
+                instance.manifest_sha256,
+                instance.runtime_identity_sha256,
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(managed_cloud_storage)?
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let (_, manifest) = validate_managed_cloud_v2_source_verification_pair(
+        &instance.activation_sha256,
+        &authority.0,
+        &instance.manifest_sha256,
+        &authority.1,
+    )?;
+    if manifest
+        .protocols
+        .iter()
+        .find(|protocol| protocol.protocol_id == "source_verification")
+        .is_none_or(|protocol| protocol.schema_sha256 != authority.2)
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    let ready = tx
+        .query_row(
+            &format!(
+                "SELECT 1
+               FROM {} heartbeat
+               JOIN jobs_managed_cloud_activation_requirements requirement
+                 ON requirement.activation_sha256=heartbeat.activation_sha256
+                AND requirement.role=heartbeat.role
+                AND requirement.dependency_evidence_sha256=
+                    heartbeat.dependency_evidence_sha256
+              WHERE heartbeat.runtime_instance_id=?1 AND heartbeat.instance_epoch=?2
+                AND heartbeat.activation_sha256=?3 AND heartbeat.manifest_sha256=?4
+                AND heartbeat.component_id='jobs-workflows'
+                AND heartbeat.role='original_source_verifier'
+                AND heartbeat.worker_id=?5 AND heartbeat.artifact_sha256=?6
+                AND heartbeat.observed_head_revision=?7
+                AND heartbeat.observed_transition_sha256=?8
+                AND heartbeat.migration_set_sha256=?9
+                AND heartbeat.config_schema_sha256=?10
+                AND heartbeat.protocol_set_sha256=?11
+                AND heartbeat.task_queue_sha256=?12
+                AND heartbeat.failure_converter_sha256=?13
+                AND heartbeat.dependency_evidence_sha256=?14
+                AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
+                AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>?15",
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
+            ),
+            params![
+                instance.runtime_instance_id,
+                instance.instance_epoch,
+                instance.activation_sha256,
+                instance.manifest_sha256,
+                instance.worker_id,
+                instance.artifact_sha256,
+                instance.head_revision,
+                instance.transition_sha256,
+                instance.migration_set_sha256,
+                instance.config_schema_sha256,
+                instance.protocol_set_sha256,
+                instance.task_queue_sha256,
+                instance.failure_converter_sha256,
+                instance.dependency_evidence_sha256,
+                now_ms,
+            ],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(managed_cloud_storage)?
+        .is_some();
+    if !ready {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn require_original_source_verifier_runtime_active_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    worker_id: &str,
+    runtime_instance_id: &str,
+    runtime_session_token: &str,
+    instance_epoch: i64,
+    runtime_authority_sha256: &str,
+) -> ManagedCloudResult<()> {
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(
+           hashtextextended('jobs-managed-cloud-release-registry',0))",
+        &[],
+    )
+    .map_err(managed_cloud_storage)?;
+    let now_ms = managed_cloud_db_now_postgres(tx)?;
+    let row = tx
+        .query_opt(
+            &format!(
+                "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
+                   FROM {} WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR SHARE",
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.instances
+            ),
+            &[&runtime_instance_id, &instance_epoch],
+        )
+        .map_err(managed_cloud_storage)?
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let (instance, session_proof) = managed_cloud_runtime_instance_from_postgres(&row);
+    require_original_source_verifier_runtime_binding(
+        &instance,
+        &session_proof,
+        worker_id,
+        runtime_instance_id,
+        runtime_session_token,
+        instance_epoch,
+        runtime_authority_sha256,
+    )?;
+    tx.query_opt(
+        &format!(
+            "SELECT 1 FROM {} WHERE grant_id=$1 FOR SHARE",
+            MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.grants
+        ),
+        &[&instance.grant_id],
+    )
+    .map_err(managed_cloud_storage)?
+    .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    require_postgres_managed_cloud_runtime_authority_active(tx, &instance, now_ms)?;
+    let authority = tx
+        .query_opt(
+            "SELECT activation.canonical_activation_base64url,
+                    manifest.canonical_manifest_base64url,
+                    source_protocol.schema_sha256
+               FROM jobs_managed_cloud_activations activation
+               JOIN jobs_managed_cloud_manifests manifest
+                 ON manifest.manifest_sha256=activation.manifest_sha256
+               JOIN jobs_managed_cloud_manifest_source_verification_protocols source_protocol
+                 ON source_protocol.manifest_sha256=manifest.manifest_sha256
+                AND source_protocol.protocol_id='source_verification'
+                AND source_protocol.protocol_version=1 AND source_protocol.ordinal=9
+               JOIN jobs_managed_cloud_manifest_original_source_verifier_identities source_identity
+                 ON source_identity.manifest_sha256=manifest.manifest_sha256
+                AND source_identity.component_id='jobs-workflows'
+                AND source_identity.role='original_source_verifier'
+                AND source_identity.runtime_identity_sha256=$3
+                AND source_identity.ordinal=0
+              WHERE activation.activation_sha256=$1
+                AND activation.manifest_sha256=$2
+                AND activation.source_verification_enabled
+              FOR SHARE OF activation,manifest,source_protocol,source_identity",
+            &[
+                &instance.activation_sha256,
+                &instance.manifest_sha256,
+                &instance.runtime_identity_sha256,
+            ],
+        )
+        .map_err(managed_cloud_storage)?
+        .ok_or(ManagedCloudRegistryError::Unavailable)?;
+    let canonical_activation_base64url: String = authority.get(0);
+    let canonical_manifest_base64url: String = authority.get(1);
+    let source_protocol_sha256: String = authority.get(2);
+    let (_, manifest) = validate_managed_cloud_v2_source_verification_pair(
+        &instance.activation_sha256,
+        &canonical_activation_base64url,
+        &instance.manifest_sha256,
+        &canonical_manifest_base64url,
+    )?;
+    if manifest
+        .protocols
+        .iter()
+        .find(|protocol| protocol.protocol_id == "source_verification")
+        .is_none_or(|protocol| protocol.schema_sha256 != source_protocol_sha256)
+    {
+        return Err(ManagedCloudRegistryError::IdentityConflict);
+    }
+    let ready = tx
+        .query_opt(
+            &format!(
+                "SELECT 1
+               FROM {} heartbeat
+               JOIN jobs_managed_cloud_activation_requirements requirement
+                 ON requirement.activation_sha256=heartbeat.activation_sha256
+                AND requirement.role=heartbeat.role
+                AND requirement.dependency_evidence_sha256=
+                    heartbeat.dependency_evidence_sha256
+              WHERE heartbeat.runtime_instance_id=$1 AND heartbeat.instance_epoch=$2
+                AND heartbeat.activation_sha256=$3 AND heartbeat.manifest_sha256=$4
+                AND heartbeat.component_id='jobs-workflows'
+                AND heartbeat.role='original_source_verifier'
+                AND heartbeat.worker_id=$5 AND heartbeat.artifact_sha256=$6
+                AND heartbeat.observed_head_revision=$7
+                AND heartbeat.observed_transition_sha256=$8
+                AND heartbeat.migration_set_sha256=$9
+                AND heartbeat.config_schema_sha256=$10
+                AND heartbeat.protocol_set_sha256=$11
+                AND heartbeat.task_queue_sha256=$12
+                AND heartbeat.failure_converter_sha256=$13
+                AND heartbeat.dependency_evidence_sha256=$14
+                AND heartbeat.health_state='ready' AND heartbeat.reason_code IS NULL
+                AND heartbeat.heartbeat_at_ms+requirement.heartbeat_ttl_ms>$15
+              FOR SHARE OF heartbeat,requirement",
+                MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_RUNTIME_TABLES.heartbeats
+            ),
+            &[
+                &instance.runtime_instance_id,
+                &instance.instance_epoch,
+                &instance.activation_sha256,
+                &instance.manifest_sha256,
+                &instance.worker_id,
+                &instance.artifact_sha256,
+                &instance.head_revision,
+                &instance.transition_sha256,
+                &instance.migration_set_sha256,
+                &instance.config_schema_sha256,
+                &instance.protocol_set_sha256,
+                &instance.task_queue_sha256,
+                &instance.failure_converter_sha256,
+                &instance.dependency_evidence_sha256,
+                &now_ms,
+            ],
+        )
+        .map_err(managed_cloud_storage)?
+        .is_some();
+    if !ready {
+        return Err(ManagedCloudRegistryError::Unavailable);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn require_original_source_verifier_runtime_active(
+    pool: &DbPool,
+    worker_id: &str,
+    runtime_instance_id: &str,
+    runtime_session_token: &str,
+    instance_epoch: i64,
+    runtime_authority_sha256: &str,
+) -> ManagedCloudResult<()> {
+    crate::db::run_blocking_db(|| match pool {
+        DbPool::Sqlite(_) => {
+            let mut connection = pool.get().map_err(managed_cloud_storage)?;
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(managed_cloud_storage)?;
+            require_original_source_verifier_runtime_active_sqlite_tx(
+                &tx,
+                worker_id,
+                runtime_instance_id,
+                runtime_session_token,
+                instance_epoch,
+                runtime_authority_sha256,
+            )?;
+            tx.commit().map_err(managed_cloud_storage)
+        }
+        DbPool::Postgres(_) => {
+            let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
+            let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
+            require_original_source_verifier_runtime_active_postgres_tx(
+                &mut tx,
+                worker_id,
+                runtime_instance_id,
+                runtime_session_token,
+                instance_epoch,
+                runtime_authority_sha256,
+            )?;
+            tx.commit().map_err(managed_cloud_storage)
+        }
+    })
 }
 
 pub fn record_managed_cloud_runtime_heartbeat(
@@ -15000,9 +17154,11 @@ pub fn record_managed_cloud_runtime_heartbeat(
             let tx = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .map_err(managed_cloud_storage)?;
+            let tables = managed_cloud_runtime_tables_for_role(&input.role);
             let (instance, session_proof) = sqlite_managed_cloud_runtime_instance_by_runtime_id(
                 &tx,
                 &input.runtime_instance_id,
+                tables,
             )?
             .ok_or(ManagedCloudRegistryError::NotFound)?;
             require_managed_cloud_runtime_heartbeat_identity(&instance, input)?;
@@ -15018,8 +17174,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 .query_row(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_heartbeats
-                          WHERE runtime_instance_id=?1 AND instance_epoch=?2"
+                           FROM {} WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                        tables.heartbeats
                     ),
                     params![input.runtime_instance_id, instance.instance_epoch],
                     managed_cloud_runtime_heartbeat_from_sqlite,
@@ -15066,7 +17222,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
             ];
             let changed = if had_current {
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_heartbeats SET
+                    &format!(
+                        "UPDATE {} SET
                        heartbeat_sequence=?3,activation_sha256=?4,manifest_sha256=?5,
                        component_id=?6,role=?7,worker_id=?8,artifact_sha256=?9,
                        observed_head_revision=?10,observed_transition_sha256=?11,
@@ -15076,11 +17233,14 @@ pub fn record_managed_cloud_runtime_heartbeat(
                        health_state=?18,reason_code=?19,heartbeat_at_ms=?20
                      WHERE runtime_instance_id=?1 AND instance_epoch=?2
                        AND heartbeat_sequence=?3-1",
+                        tables.heartbeats
+                    ),
                     values,
                 )
             } else {
                 tx.execute(
-                    "INSERT INTO jobs_managed_cloud_runtime_heartbeats(
+                    &format!(
+                        "INSERT INTO {}(
                        runtime_instance_id,instance_epoch,heartbeat_sequence,
                        activation_sha256,manifest_sha256,component_id,role,worker_id,
                        artifact_sha256,observed_head_revision,observed_transition_sha256,
@@ -15091,6 +17251,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                        ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,
                        ?17,?18,?19,?20
                      )",
+                        tables.heartbeats
+                    ),
                     values,
                 )
             }
@@ -15099,7 +17261,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
             }
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_heartbeat_audit(
+                &format!(
+                    "INSERT INTO {}(
                    runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,
                    manifest_sha256,component_id,role,worker_id,artifact_sha256,
                    observed_head_revision,observed_transition_sha256,migration_set_sha256,
@@ -15112,15 +17275,20 @@ pub fn record_managed_cloud_runtime_heartbeat(
                           migration_set_sha256,config_schema_sha256,protocol_set_sha256,
                           task_queue_sha256,failure_converter_sha256,
                           dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms
-                     FROM jobs_managed_cloud_runtime_heartbeats
+                     FROM {}
                     WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                    tables.heartbeat_audit, tables.heartbeats
+                ),
                 params![input.runtime_instance_id, instance.instance_epoch],
             )
             .map_err(managed_cloud_storage)?;
             tx.execute(
-                "DELETE FROM jobs_managed_cloud_runtime_heartbeat_audit
+                &format!(
+                    "DELETE FROM {}
                   WHERE runtime_instance_id=?1 AND instance_epoch=?2
                     AND heartbeat_sequence<=?3-?4",
+                    tables.heartbeat_audit
+                ),
                 params![
                     input.runtime_instance_id,
                     instance.instance_epoch,
@@ -15133,8 +17301,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 .query_row(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_heartbeats
-                          WHERE runtime_instance_id=?1 AND instance_epoch=?2"
+                           FROM {} WHERE runtime_instance_id=?1 AND instance_epoch=?2",
+                        tables.heartbeats
                     ),
                     params![input.runtime_instance_id, instance.instance_epoch],
                     managed_cloud_runtime_heartbeat_from_sqlite,
@@ -15146,12 +17314,13 @@ pub fn record_managed_cloud_runtime_heartbeat(
         DbPool::Postgres(_) => {
             let mut connection = pool.get_pg().map_err(managed_cloud_storage)?;
             let mut tx = connection.transaction().map_err(managed_cloud_storage)?;
+            let tables = managed_cloud_runtime_tables_for_role(&input.role);
             let instance_row = tx
                 .query_opt(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_INSTANCE_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_instances
-                          WHERE runtime_instance_id=$1 FOR UPDATE"
+                           FROM {} WHERE runtime_instance_id=$1 FOR UPDATE",
+                        tables.instances
                     ),
                     &[&input.runtime_instance_id],
                 )
@@ -15172,8 +17341,9 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 .query_opt(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_heartbeats
-                          WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR UPDATE"
+                           FROM {}
+                          WHERE runtime_instance_id=$1 AND instance_epoch=$2 FOR UPDATE",
+                        tables.heartbeats
                     ),
                     &[&input.runtime_instance_id, &instance.instance_epoch],
                 )
@@ -15219,8 +17389,9 @@ pub fn record_managed_cloud_runtime_heartbeat(
             ];
             let changed = if had_current {
                 tx.execute(
-                    "UPDATE jobs_managed_cloud_runtime_heartbeats SET
-                       heartbeat_sequence=$3,activation_sha256=$4,manifest_sha256=$5,
+                    &format!(
+                        "UPDATE {} SET
+                       heartbeat_sequence=$3::BIGINT,activation_sha256=$4,manifest_sha256=$5,
                        component_id=$6,role=$7,worker_id=$8,artifact_sha256=$9,
                        observed_head_revision=$10,observed_transition_sha256=$11,
                        migration_set_sha256=$12,config_schema_sha256=$13,
@@ -15228,12 +17399,15 @@ pub fn record_managed_cloud_runtime_heartbeat(
                        failure_converter_sha256=$16,dependency_evidence_sha256=$17,
                        health_state=$18,reason_code=$19,heartbeat_at_ms=$20
                      WHERE runtime_instance_id=$1 AND instance_epoch=$2
-                       AND heartbeat_sequence=$3-1",
+                       AND heartbeat_sequence=$3::BIGINT-1",
+                        tables.heartbeats
+                    ),
                     &parameters,
                 )
             } else {
                 tx.execute(
-                    "INSERT INTO jobs_managed_cloud_runtime_heartbeats(
+                    &format!(
+                        "INSERT INTO {}(
                        runtime_instance_id,instance_epoch,heartbeat_sequence,
                        activation_sha256,manifest_sha256,component_id,role,worker_id,
                        artifact_sha256,observed_head_revision,observed_transition_sha256,
@@ -15244,6 +17418,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,
                        $17,$18,$19,$20
                      )",
+                        tables.heartbeats
+                    ),
                     &parameters,
                 )
             }
@@ -15252,7 +17428,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 return Err(ManagedCloudRegistryError::HeartbeatSequenceConflict);
             }
             tx.execute(
-                "INSERT INTO jobs_managed_cloud_runtime_heartbeat_audit(
+                &format!(
+                    "INSERT INTO {}(
                    runtime_instance_id,instance_epoch,heartbeat_sequence,activation_sha256,
                    manifest_sha256,component_id,role,worker_id,artifact_sha256,
                    observed_head_revision,observed_transition_sha256,migration_set_sha256,
@@ -15265,15 +17442,20 @@ pub fn record_managed_cloud_runtime_heartbeat(
                           migration_set_sha256,config_schema_sha256,protocol_set_sha256,
                           task_queue_sha256,failure_converter_sha256,
                           dependency_evidence_sha256,health_state,reason_code,heartbeat_at_ms
-                     FROM jobs_managed_cloud_runtime_heartbeats
+                     FROM {}
                     WHERE runtime_instance_id=$1 AND instance_epoch=$2",
+                    tables.heartbeat_audit, tables.heartbeats
+                ),
                 &[&input.runtime_instance_id, &instance.instance_epoch],
             )
             .map_err(managed_cloud_storage)?;
             tx.execute(
-                "DELETE FROM jobs_managed_cloud_runtime_heartbeat_audit
+                &format!(
+                    "DELETE FROM {}
                   WHERE runtime_instance_id=$1 AND instance_epoch=$2
-                    AND heartbeat_sequence<=$3-$4",
+                    AND heartbeat_sequence<=($3::BIGINT-$4::BIGINT)",
+                    tables.heartbeat_audit
+                ),
                 &[
                     &input.runtime_instance_id,
                     &instance.instance_epoch,
@@ -15286,8 +17468,8 @@ pub fn record_managed_cloud_runtime_heartbeat(
                 .query_one(
                     &format!(
                         "SELECT {MANAGED_CLOUD_RUNTIME_HEARTBEAT_COLUMNS}
-                           FROM jobs_managed_cloud_runtime_heartbeats
-                          WHERE runtime_instance_id=$1 AND instance_epoch=$2"
+                           FROM {} WHERE runtime_instance_id=$1 AND instance_epoch=$2",
+                        tables.heartbeats
                     ),
                     &[&input.runtime_instance_id, &instance.instance_epoch],
                 )
@@ -15299,9 +17481,2028 @@ pub fn record_managed_cloud_runtime_heartbeat(
     })
 }
 
-#[cfg(test)]
-mod managed_cloud_release_authority_tests {
+#[cfg(any(test, feature = "integration-test-support"))]
+#[cfg_attr(feature = "integration-test-support", allow(dead_code))]
+pub(crate) mod managed_cloud_release_authority_tests {
     use super::*;
+
+    fn managed_cloud_test_feature(source_verification: bool) -> ManagedCloudFeatureAuthority {
+        ManagedCloudFeatureAuthority {
+            cloud_distribution: true,
+            workflow_command_dispatch: true,
+            workflow_cleanup: true,
+            direct_discovery: false,
+            global_discovery: false,
+            source_verification,
+        }
+    }
+
+    fn refresh_managed_cloud_test_release_digests(release: &mut ManagedCloudReleaseAuthority) {
+        release.feature_authority_sha256 =
+            managed_cloud_digest(&release.feature_authority).expect("feature digest");
+        release.component_set_sha256 = managed_cloud_digest(&json!({
+            "version": 1,
+            "audience": MANAGED_CLOUD_COMPONENT_INVENTORY_AUDIENCE,
+            "components": &release.components,
+            "capabilities": &release.capabilities,
+        }))
+        .expect("component-set digest");
+    }
+
+    fn managed_cloud_test_release(
+        version: i64,
+        source_verification: bool,
+    ) -> ManagedCloudReleaseAuthority {
+        let release_id = "release-614";
+        let source_commit = "1".repeat(40);
+        let components = [
+            ("jobs-api", "oci_image", "linux", "x86_64"),
+            ("jobs-portal", "static_bundle", "web", "wasm"),
+            ("jobs-runner", "oci_image", "linux", "x86_64"),
+            ("jobs-workflows", "oci_image", "linux", "x86_64"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(
+            |(index, (component_id, artifact_kind, platform, architecture))| {
+                let artifact_sha256 = format!("{:064x}", index + 1);
+                let artifact_ref = if artifact_kind == "static_bundle" {
+                    format!(
+                        "https://artifacts.bluey.sh/releases/{release_id}/{artifact_sha256}.tar"
+                    )
+                } else {
+                    format!("ghcr.io/bluey/{component_id}@sha256:{artifact_sha256}")
+                };
+                ManagedCloudArtifactAuthority {
+                    component_id: component_id.to_string(),
+                    artifact_kind: artifact_kind.to_string(),
+                    artifact_ref,
+                    artifact_sha256,
+                    build_id: format!("build-614-{index}"),
+                    source_commit: source_commit.clone(),
+                    platform: platform.to_string(),
+                    architecture: architecture.to_string(),
+                    sbom_sha256: "a".repeat(64),
+                    provenance_sha256: "b".repeat(64),
+                    config_schema_sha256: "c".repeat(64),
+                }
+            },
+        )
+        .collect();
+        let mut capabilities = vec![
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-api".to_string(),
+                capability: "jobs_api".to_string(),
+            },
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-api".to_string(),
+                capability: "workflow_cleanup_dispatcher".to_string(),
+            },
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-api".to_string(),
+                capability: "workflow_command_dispatcher".to_string(),
+            },
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-portal".to_string(),
+                capability: "portal_static".to_string(),
+            },
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-runner".to_string(),
+                capability: "managed_runner".to_string(),
+            },
+        ];
+        if source_verification {
+            capabilities.push(ManagedCloudCapabilityAuthority {
+                component_id: "jobs-workflows".to_string(),
+                capability: "original_source_verifier".to_string(),
+            });
+        }
+        capabilities.extend([
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-workflows".to_string(),
+                capability: "workflow_gateway".to_string(),
+            },
+            ManagedCloudCapabilityAuthority {
+                component_id: "jobs-workflows".to_string(),
+                capability: "workflow_worker".to_string(),
+            },
+        ]);
+        let contract = if version == 1 {
+            managed_cloud_release_contract(1, MANAGED_CLOUD_RELEASE_AUDIENCE).expect("v1 contract")
+        } else {
+            managed_cloud_release_contract(2, MANAGED_CLOUD_RELEASE_V2_AUDIENCE)
+                .expect("v2 contract")
+        };
+        let protocols = contract
+            .protocols
+            .iter()
+            .map(
+                |(protocol_id, protocol_version)| ManagedCloudProtocolAuthority {
+                    protocol_id: (*protocol_id).to_string(),
+                    protocol_version: *protocol_version,
+                    schema_sha256: "d".repeat(64),
+                },
+            )
+            .collect();
+        let mut release = ManagedCloudReleaseAuthority {
+            version,
+            audience: if version == 1 {
+                MANAGED_CLOUD_RELEASE_AUDIENCE.to_string()
+            } else {
+                MANAGED_CLOUD_RELEASE_V2_AUDIENCE.to_string()
+            },
+            manifest_id: format!("managed-cloud-release-{version}"),
+            manifest_generation: version,
+            release_id: release_id.to_string(),
+            release_sequence: version,
+            source_commit,
+            published_at_ms: 1_000,
+            sqlite_migration_head: contract.sqlite_migration_head.to_string(),
+            postgres_migration_head: contract.postgres_migration_head.to_string(),
+            migration_set_sha256: "e".repeat(64),
+            config_schema_sha256: "c".repeat(64),
+            protocol_set_sha256: "f".repeat(64),
+            component_set_sha256: String::new(),
+            feature_authority_sha256: String::new(),
+            feature_authority: managed_cloud_test_feature(source_verification),
+            verification_evidence_sha256: "9".repeat(64),
+            components,
+            capabilities,
+            protocols,
+        };
+        refresh_managed_cloud_test_release_digests(&mut release);
+        release
+    }
+
+    fn managed_cloud_test_activation(
+        version: i64,
+        source_verification: bool,
+    ) -> ManagedCloudActivationAuthority {
+        let feature_authority = managed_cloud_test_feature(source_verification);
+        ManagedCloudActivationAuthority {
+            version,
+            audience: if version == 1 {
+                MANAGED_CLOUD_ACTIVATION_AUDIENCE.to_string()
+            } else {
+                MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE.to_string()
+            },
+            activation_id: format!("activation-614-{version}"),
+            activation_generation: version,
+            trust_generation: 1,
+            scope: ManagedCloudScope {
+                environment: "staging".to_string(),
+                region: "us-east-1".to_string(),
+                channel: "shadow".to_string(),
+            },
+            channel_sequence: version,
+            expected_head_revision: 0,
+            expected_transition_sha256: None,
+            predecessor_activation_sha256: None,
+            manifest_sha256: "1".repeat(64),
+            manifest_signature_set_sha256: "2".repeat(64),
+            cohort_sha256: "3".repeat(64),
+            cohort_signature_set_sha256: "4".repeat(64),
+            feature_authority_sha256: managed_cloud_digest(&feature_authority)
+                .expect("feature digest"),
+            feature_authority,
+            runner_fleet_evidence_sha256: "5".repeat(64),
+            cleanup_authority_sha256: "6".repeat(64),
+            temporal_namespace_sha256: "7".repeat(64),
+            storage_config_sha256: "8".repeat(64),
+            task_queue_sha256: "9".repeat(64),
+            failure_converter_sha256: "a".repeat(64),
+            canary_evidence_sha256: "b".repeat(64),
+            portal_readback_evidence_sha256: "c".repeat(64),
+            portal_readback_at_ms: 900,
+            portal_readback_ttl_ms: 120_000,
+            maximum_inflight: 0,
+            maximum_daily_admissions: 0,
+            heartbeat_ttl_ms: 5_000,
+            recovery_acceptances: Vec::new(),
+            issued_at_ms: 1_000,
+            not_before_ms: 1_000,
+            expires_at_ms: 120_000,
+        }
+    }
+
+    #[test]
+    fn managed_cloud_release_v1_rejects_source_verification_and_v2_requires_it() {
+        validate_managed_cloud_release(&managed_cloud_test_release(1, false))
+            .expect("exact v1 false release");
+        assert!(validate_managed_cloud_release(&managed_cloud_test_release(1, true)).is_err());
+        validate_managed_cloud_release(&managed_cloud_test_release(2, true))
+            .expect("exact v2 source-verification release");
+        assert!(validate_managed_cloud_release(&managed_cloud_test_release(2, false)).is_err());
+    }
+
+    #[test]
+    fn sqlite_signature_set_v2_constraint_rebuild_is_replay_safe() {
+        let database_path = std::env::temp_dir().join(format!(
+            "bluey-managed-cloud-signature-rebuild-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&database_path).expect("open signature rebuild fixture");
+        crate::db::run_migrations(&pool).expect("migrate signature rebuild fixture");
+        {
+            let connection = pool.get().expect("signature rebuild fixture connection");
+            connection
+                .execute(
+                    "INSERT INTO jobs_managed_cloud_signature_sets(
+                       signature_set_sha256,signature_set_id,trust_generation,role,
+                       target_audience,target_sha256,signed_at_ms,signature_count,
+                       canonical_signature_set_base64url,recorded_by,recorded_at_ms
+                     ) VALUES(?1,'phase614b-v1-preserved',1,'release',
+                       'bluey-jobs-managed-cloud-release-v1',?2,1,1,'eA','test',1)",
+                    params!["a".repeat(64), "b".repeat(64)],
+                )
+                .expect("seed v1 managed-cloud signature set");
+            connection
+                .execute(
+                    "INSERT INTO jobs_managed_cloud_signatures(
+                       signature_set_sha256,key_id,signature_base64url
+                     ) VALUES(?1,'phase614b-release-key',?2)",
+                    params!["a".repeat(64), "A".repeat(86)],
+                )
+                .expect("seed referencing managed-cloud signature");
+        }
+
+        crate::db::run_migrations(&pool).expect("first signature rebuild replay");
+        {
+            let connection = pool
+                .get()
+                .expect("assert first signature rebuild replay connection");
+            let foreign_keys_enabled: i64 = connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .expect("read foreign-key enforcement after first signature rebuild replay");
+            assert_eq!(foreign_keys_enabled, 1);
+        }
+        crate::db::run_migrations(&pool).expect("second signature rebuild replay");
+        {
+            let connection = pool.get().expect("assert signature rebuild fixture");
+            let foreign_keys_enabled: i64 = connection
+                .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+                .expect("read foreign-key enforcement after second signature rebuild replay");
+            assert_eq!(foreign_keys_enabled, 1);
+            let preserved: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*)
+                       FROM jobs_managed_cloud_signature_sets signature_set
+                       JOIN jobs_managed_cloud_signatures signature
+                         ON signature.signature_set_sha256=signature_set.signature_set_sha256
+                      WHERE signature_set.signature_set_id='phase614b-v1-preserved'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count preserved signature authority");
+            assert_eq!(preserved, 1);
+            let foreign_key_violations: i64 = connection
+                .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .expect("check signature rebuild foreign keys");
+            assert_eq!(foreign_key_violations, 0);
+            let index_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='index'
+                        AND name='idx_jobs_managed_cloud_signature_sets_target'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count rebuilt signature-set index");
+            assert_eq!(index_count, 1);
+            let trigger_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                      WHERE type='trigger' AND name IN (
+                        'trg_jobs_managed_cloud_signature_sets_no_update',
+                        'trg_jobs_managed_cloud_signature_sets_no_delete')",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("count rebuilt signature-set immutable triggers");
+            assert_eq!(trigger_count, 2);
+            for (sha256, signature_set_id, role, audience, target_sha256) in [
+                (
+                    "c".repeat(64),
+                    "phase614b-v2-release",
+                    "release",
+                    MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+                    "d".repeat(64),
+                ),
+                (
+                    "e".repeat(64),
+                    "phase614b-v2-activation",
+                    "general_promotion",
+                    MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+                    "f".repeat(64),
+                ),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO jobs_managed_cloud_signature_sets(
+                           signature_set_sha256,signature_set_id,trust_generation,role,
+                           target_audience,target_sha256,signed_at_ms,signature_count,
+                           canonical_signature_set_base64url,recorded_by,recorded_at_ms
+                         ) VALUES(?1,?2,1,?3,?4,?5,1,1,'eA','test',1)",
+                        params![sha256, signature_set_id, role, audience, target_sha256],
+                    )
+                    .expect("insert v2 managed-cloud signature-set audience");
+            }
+            assert!(connection
+                .execute(
+                    "INSERT INTO jobs_managed_cloud_signature_sets(
+                       signature_set_sha256,signature_set_id,trust_generation,role,
+                       target_audience,target_sha256,signed_at_ms,signature_count,
+                       canonical_signature_set_base64url,recorded_by,recorded_at_ms
+                     ) VALUES(?1,'phase614b-unknown',1,'release',
+                       'bluey-jobs-managed-cloud-unknown-v1',?2,1,1,'eA','test',1)",
+                    params!["0".repeat(64), "1".repeat(64)],
+                )
+                .is_err());
+            let immutable_error = connection
+                .execute(
+                    "UPDATE jobs_managed_cloud_signature_sets
+                        SET recorded_by='changed'
+                      WHERE signature_set_id='phase614b-v1-preserved'",
+                    [],
+                )
+                .expect_err("rebuilt signature set remains immutable");
+            assert!(immutable_error
+                .to_string()
+                .contains("managed cloud signature set is immutable"));
+            let immutable_delete_error = connection
+                .execute(
+                    "DELETE FROM jobs_managed_cloud_signature_sets
+                      WHERE signature_set_id='phase614b-v2-release'",
+                    [],
+                )
+                .expect_err("rebuilt signature set rejects deletes");
+            assert!(immutable_delete_error
+                .to_string()
+                .contains("managed cloud signature set is immutable"));
+        }
+        drop(pool);
+        std::fs::remove_file(database_path).ok();
+    }
+
+    #[test]
+    fn managed_cloud_release_v2_requires_exact_source_verification_bindings() {
+        let exact = managed_cloud_test_release(2, true);
+        validate_managed_cloud_release(&exact).expect("exact v2 bindings");
+
+        let mut missing_capability = exact.clone();
+        missing_capability
+            .capabilities
+            .retain(|capability| capability.capability != "original_source_verifier");
+        refresh_managed_cloud_test_release_digests(&mut missing_capability);
+        assert!(validate_managed_cloud_release(&missing_capability).is_err());
+
+        let mut missing_protocol = exact;
+        missing_protocol
+            .protocols
+            .retain(|protocol| protocol.protocol_id != "source_verification");
+        assert!(validate_managed_cloud_release(&missing_protocol).is_err());
+    }
+
+    #[test]
+    fn managed_cloud_activation_versions_bind_source_verification_exactly() {
+        validate_managed_cloud_activation(&managed_cloud_test_activation(1, false))
+            .expect("checked-in false activation remains valid as v1");
+        assert!(
+            validate_managed_cloud_activation(&managed_cloud_test_activation(1, true)).is_err()
+        );
+        validate_managed_cloud_activation(&managed_cloud_test_activation(2, true))
+            .expect("exact v2 source-verification activation");
+        assert!(
+            validate_managed_cloud_activation(&managed_cloud_test_activation(2, false)).is_err()
+        );
+    }
+
+    #[test]
+    fn original_source_verifier_identity_requires_exact_measured_entrypoint_and_roles() {
+        let artifact_root = std::env::temp_dir().join(format!(
+            "bluey-managed-cloud-verifier-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&artifact_root).expect("artifact root");
+        let verifier_path = artifact_root.join(MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH);
+        std::fs::create_dir_all(verifier_path.parent().expect("verifier parent"))
+            .expect("create verifier directory");
+        std::fs::write(&verifier_path, b"export const verifier = true;\n").expect("write verifier");
+        let verifier_sha256 =
+            managed_cloud_sha256(&std::fs::read(&verifier_path).expect("read verifier for digest"));
+        let mut measurement = ManagedCloudRuntimeMeasurementAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_RUNTIME_MEASUREMENT_AUDIENCE.to_string(),
+            build_id: "build-614-verifier".to_string(),
+            component_id: "jobs-workflows".to_string(),
+            config_schema_sha256: "a".repeat(64),
+            measured_files: vec![ManagedCloudRuntimeMeasurementFileAuthority {
+                path: MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH.to_string(),
+                sha256: verifier_sha256,
+            }],
+            migration_set_sha256: "b".repeat(64),
+            protocol_set_sha256: "c".repeat(64),
+            roles: vec![
+                "original_source_verifier".to_string(),
+                "workflow_gateway".to_string(),
+                "workflow_worker".to_string(),
+            ],
+            source_commit: "1".repeat(40),
+        };
+        let measurement_path = artifact_root.join(MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH);
+        std::fs::create_dir_all(measurement_path.parent().expect("measurement parent"))
+            .expect("create measurement directory");
+        std::fs::write(
+            &measurement_path,
+            managed_cloud_canonical_json(&measurement).expect("canonical measurement"),
+        )
+        .expect("write measurement");
+        inspect_managed_cloud_runtime_identity(
+            &artifact_root,
+            "jobs-workflows",
+            "original_source_verifier",
+        )
+        .expect("exact verifier identity");
+
+        let worker_path = artifact_root.join("app/workflows/dist/worker.js");
+        std::fs::write(&worker_path, b"export const worker = true;\n").expect("write worker");
+        measurement.measured_files[0] = ManagedCloudRuntimeMeasurementFileAuthority {
+            path: "app/workflows/dist/worker.js".to_string(),
+            sha256: managed_cloud_sha256(
+                &std::fs::read(&worker_path).expect("read worker for digest"),
+            ),
+        };
+        std::fs::write(
+            measurement_path,
+            managed_cloud_canonical_json(&measurement).expect("canonical changed measurement"),
+        )
+        .expect("rewrite measurement");
+        assert!(inspect_managed_cloud_runtime_identity(
+            &artifact_root,
+            "jobs-workflows",
+            "original_source_verifier",
+        )
+        .is_err());
+        std::fs::remove_dir_all(&artifact_root).expect("remove artifact root");
+    }
+
+    #[test]
+    fn original_source_verifier_grants_are_component_and_feature_role_scoped() {
+        let mut input = NewManagedCloudRuntimeGrant {
+            issuance_ref: "issuance-ref-1234567890".to_string(),
+            scope: ManagedCloudScope {
+                environment: "staging".to_string(),
+                region: "us-east-1".to_string(),
+                channel: "shadow".to_string(),
+            },
+            activation_sha256: "a".repeat(64),
+            manifest_sha256: "b".repeat(64),
+            component_id: "jobs-workflows".to_string(),
+            role: "original_source_verifier".to_string(),
+            expected_worker_id: "source-worker-1234567890".to_string(),
+            authorization_ref: "source-authority-12345678".to_string(),
+            created_by: "managed-release-test".to_string(),
+            ttl_ms: MANAGED_CLOUD_MIN_GRANT_TTL_MS,
+        };
+        validate_new_managed_cloud_runtime_grant(&input).expect("verifier grant input");
+        input.component_id = "jobs-api".to_string();
+        assert!(validate_new_managed_cloud_runtime_grant(&input).is_err());
+    }
+
+    #[test]
+    fn original_source_verification_admission_scope_is_account_scoped() {
+        let mut scope = ManagedCloudScope {
+            environment: "production".to_string(),
+            region: "us-east-1".to_string(),
+            channel: "general".to_string(),
+        };
+        assert!(managed_cloud_source_verification_scope_admits_account(
+            &scope,
+            "all_eligible_accounts",
+            false,
+        ));
+        scope.channel = "canary".to_string();
+        assert!(!managed_cloud_source_verification_scope_admits_account(
+            &scope,
+            "allowlist",
+            false,
+        ));
+        assert!(managed_cloud_source_verification_scope_admits_account(
+            &scope,
+            "allowlist",
+            true,
+        ));
+        scope.channel = "shadow".to_string();
+        assert!(!managed_cloud_source_verification_scope_admits_account(
+            &scope, "none", true,
+        ));
+        scope.environment = "staging".to_string();
+        scope.channel = "general".to_string();
+        assert!(!managed_cloud_source_verification_scope_admits_account(
+            &scope,
+            "all_eligible_accounts",
+            true,
+        ));
+    }
+
+    #[test]
+    fn original_source_verification_authority_digest_is_canonical_and_complete() {
+        let authority = ManagedCloudOriginalSourceVerificationAuthority {
+            account_id: "acct-614".to_string(),
+            scope: ManagedCloudScope {
+                environment: "production".to_string(),
+                region: "us-east-1".to_string(),
+                channel: "general".to_string(),
+            },
+            head_revision: 7,
+            transition_sha256: "1".repeat(64),
+            activation_sha256: "2".repeat(64),
+            manifest_sha256: "3".repeat(64),
+            cohort_sha256: "4".repeat(64),
+            trust_generation: 5,
+            channel_sequence: 6,
+            release_id: "release-614".to_string(),
+            release_sequence: 8,
+            task_queue_sha256: "5".repeat(64),
+            failure_converter_sha256: "6".repeat(64),
+            activation_expires_at_ms: 120_000,
+            source_protocol_schema_sha256: "7".repeat(64),
+            runtime_identity_sha256: "8".repeat(64),
+            dependency_evidence_sha256: "9".repeat(64),
+            heartbeat_ttl_ms: 5_000,
+        };
+        let canonical = authority.canonical_json().expect("canonical authority");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&canonical).expect("authority JSON"),
+            json!({
+                "version": 1,
+                "audience": MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_AUDIENCE,
+                "accountId": "acct-614",
+                "scope": {
+                    "environment": "production",
+                    "region": "us-east-1",
+                    "channel": "general",
+                },
+                "headRevision": 7,
+                "transitionSha256": "1".repeat(64),
+                "activationSha256": "2".repeat(64),
+                "manifestSha256": "3".repeat(64),
+                "cohortSha256": "4".repeat(64),
+                "trustGeneration": 5,
+                "channelSequence": 6,
+                "releaseId": "release-614",
+                "releaseSequence": 8,
+                "taskQueueSha256": "5".repeat(64),
+                "failureConverterSha256": "6".repeat(64),
+                "activationExpiresAtMs": 120_000,
+                "sourceProtocolSchemaSha256": "7".repeat(64),
+                "runtimeIdentitySha256": "8".repeat(64),
+                "dependencyEvidenceSha256": "9".repeat(64),
+                "heartbeatTtlMs": 5_000,
+            })
+        );
+        assert_eq!(
+            authority.authority_sha256().expect("authority digest"),
+            "ea7572766ea878d1c01025b80ab18c1c037f68f97f7375d144fe6d6b8b4e2db8"
+        );
+        let mut changed = authority;
+        changed.heartbeat_ttl_ms += 1;
+        assert_ne!(
+            changed
+                .authority_sha256()
+                .expect("changed authority digest"),
+            "ea7572766ea878d1c01025b80ab18c1c037f68f97f7375d144fe6d6b8b4e2db8"
+        );
+    }
+
+    #[test]
+    fn original_source_verification_scheduling_only_tolerates_operational_unavailability() {
+        assert!(original_source_verification_scheduling_authority(Err(
+            ManagedCloudRegistryError::Unavailable,
+        ))
+        .expect("stale runtime skips scheduling")
+        .is_none());
+        assert!(original_source_verification_scheduling_authority(Err(
+            ManagedCloudRegistryError::Revoked,
+        ))
+        .expect("revoked runtime skips scheduling")
+        .is_none());
+        assert!(matches!(
+            original_source_verification_scheduling_authority(Err(
+                ManagedCloudRegistryError::InvalidAuthority,
+            )),
+            Err(ManagedCloudRegistryError::InvalidAuthority)
+        ));
+        assert!(matches!(
+            original_source_verification_scheduling_authority(Err(
+                ManagedCloudRegistryError::IdentityConflict,
+            )),
+            Err(ManagedCloudRegistryError::IdentityConflict)
+        ));
+    }
+
+    #[test]
+    fn original_source_verifier_runtime_authority_matches_typescript_vector() {
+        let instance = ManagedCloudRuntimeInstance {
+            grant_id: "original-source-grant-123456789".to_string(),
+            runtime_instance_id: "original-source-runtime-instance-123".to_string(),
+            runtime_identity_sha256: "1".repeat(64),
+            worker_id: "original-source-verifier-test".to_string(),
+            scope: ManagedCloudScope {
+                environment: "staging".to_string(),
+                region: "us-east-1".to_string(),
+                channel: "shadow".to_string(),
+            },
+            activation_sha256: "2".repeat(64),
+            manifest_sha256: "3".repeat(64),
+            component_id: "jobs-workflows".to_string(),
+            role: "original_source_verifier".to_string(),
+            head_revision: 4,
+            transition_sha256: "5".repeat(64),
+            artifact_sha256: "6".repeat(64),
+            config_schema_sha256: "7".repeat(64),
+            migration_set_sha256: "8".repeat(64),
+            protocol_set_sha256: "9".repeat(64),
+            task_queue_sha256: "a".repeat(64),
+            failure_converter_sha256: "b".repeat(64),
+            dependency_evidence_sha256: "c".repeat(64),
+            activation_expires_at_ms: 120_000,
+            instance_epoch: 7,
+            next_heartbeat_sequence: 1,
+            claimed_at_ms: 1_000,
+            replayed: false,
+        };
+        let authority = original_source_verifier_runtime_authority_sha256(&instance)
+            .expect("runtime authority digest");
+        assert_eq!(
+            authority,
+            "34f63a889abc29ec7e865e2c398f63530cb1308ce1c43f9a13d36e493c2351ea"
+        );
+
+        require_original_source_verifier_runtime_authority(&instance, &authority)
+            .expect("exact runtime authority");
+        assert!(require_original_source_verifier_runtime_authority(
+            &instance,
+            &instance.runtime_identity_sha256,
+        )
+        .is_err());
+    }
+
+    struct ManagedCloudTestEnvelope {
+        envelope: ManagedCloudAuthorityEnvelope,
+    }
+
+    fn managed_cloud_test_signing_key(role: &str) -> ed25519_dalek::SigningKey {
+        let seed = match role {
+            "general_promotion" => 1,
+            "incident" => 2,
+            "promotion" => 3,
+            "release" => 4,
+            "root" => 5,
+            _ => panic!("unsupported managed-cloud test signing role {role}"),
+        };
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn managed_cloud_test_key_id(role: &str) -> String {
+        format!("phase614b-{role}").replace('_', "-")
+    }
+
+    fn managed_cloud_test_base64url<T: serde::Serialize>(value: &T) -> String {
+        let bytes = managed_cloud_canonical_json(value).expect("canonical managed-cloud fixture");
+        base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
+    }
+
+    fn managed_cloud_test_signed_envelope<T: serde::Serialize>(
+        authority: &T,
+        target_audience: &str,
+        role: &str,
+        signed_at_ms: i64,
+    ) -> ManagedCloudTestEnvelope {
+        use ed25519_dalek::Signer as _;
+
+        let authority_bytes =
+            managed_cloud_canonical_json(authority).expect("canonical managed-cloud authority");
+        let authority_sha256 = managed_cloud_sha256(&authority_bytes);
+        let signing_key = managed_cloud_test_signing_key(role);
+        let mut signature_set = ManagedCloudSignatureSetAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_SIGNATURE_SET_AUDIENCE.to_string(),
+            signature_set_id: format!("phase614b-{role}-{}", &authority_sha256[..16])
+                .replace('_', "-"),
+            trust_generation: 1,
+            role: role.to_string(),
+            target_audience: target_audience.to_string(),
+            target_sha256: authority_sha256.clone(),
+            signed_at_ms,
+            signatures: Vec::new(),
+        };
+        let payload = managed_cloud_signature_payload(&signature_set)
+            .expect("canonical managed-cloud signature payload");
+        signature_set
+            .signatures
+            .push(ManagedCloudDetachedSignatureAuthority {
+                key_id: managed_cloud_test_key_id(role),
+                signature: base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    signing_key.sign(&payload).to_bytes(),
+                ),
+            });
+        let signature_set_bytes = managed_cloud_canonical_json(&signature_set)
+            .expect("canonical managed-cloud signature set");
+        ManagedCloudTestEnvelope {
+            envelope: ManagedCloudAuthorityEnvelope {
+                canonical_base64url: base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    authority_bytes,
+                ),
+                signature_set_base64url: base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    signature_set_bytes,
+                ),
+            },
+        }
+    }
+
+    fn managed_cloud_test_file_sha256(component_id: &str, path: &str) -> String {
+        managed_cloud_sha256(format!("phase614b:{component_id}:{path}").as_bytes())
+    }
+
+    fn managed_cloud_test_inventory_entry(
+        path: &str,
+        sha256: String,
+    ) -> ManagedCloudContentInventoryEntry {
+        ManagedCloudContentInventoryEntry {
+            mode: if path.ends_with("chrome-headless-shell") {
+                "0755".to_string()
+            } else {
+                "0644".to_string()
+            },
+            path: path.to_string(),
+            resolved_target: None,
+            sha256: Some(sha256),
+            size_bytes: Some(1),
+            target: None,
+            entry_type: "file".to_string(),
+        }
+    }
+
+    fn managed_cloud_test_component_evidence(
+        release: &ManagedCloudReleaseAuthority,
+        component: &ManagedCloudArtifactAuthority,
+    ) -> (ManagedCloudVerificationComponentAuthority, String) {
+        const OCI_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+        let component_id = component.component_id.as_str();
+        let (runtime_path, runtime_user, entrypoint, cmd, required_paths, runtime) =
+            match component_id {
+                "jobs-api" => (
+                    Some(OCI_PATH.to_string()),
+                    "65532:65532".to_string(),
+                    vec!["/usr/local/bin/bluey-jobs-api".to_string()],
+                    Vec::new(),
+                    vec![
+                        MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH.to_string(),
+                        "usr/local/bin/bluey-jobs-api".to_string(),
+                    ],
+                    Some(ManagedCloudContentInventoryRuntime {
+                        cmd: Vec::new(),
+                        environment: vec![
+                            "BLUEY_JOBS_API_HOST=0.0.0.0".to_string(),
+                            "BLUEY_JOBS_API_PORT=8081".to_string(),
+                            format!("PATH={OCI_PATH}"),
+                        ],
+                        entrypoint: vec!["/usr/local/bin/bluey-jobs-api".to_string()],
+                        exposed_ports: vec!["8081/tcp".to_string()],
+                        user: "65532:65532".to_string(),
+                        working_directory: "/app".to_string(),
+                    }),
+                ),
+                "jobs-portal" => (
+                    None,
+                    "static".to_string(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec!["index.html".to_string()],
+                    None,
+                ),
+                "jobs-runner" => (
+                    Some(OCI_PATH.to_string()),
+                    "pwuser".to_string(),
+                    Vec::new(),
+                    vec![
+                        "/usr/local/bin/node".to_string(),
+                        "runner/dist/server.js".to_string(),
+                    ],
+                    vec![
+                        MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH.to_string(),
+                        "app/runner/dist/native/bluey_jobs_runner_native_storage.node".to_string(),
+                        "app/runner/dist/server.js".to_string(),
+                        "ms-playwright/chromium_headless_shell-1228/chrome-linux/chrome-headless-shell"
+                            .to_string(),
+                        "usr/local/bin/node".to_string(),
+                    ],
+                    Some(ManagedCloudContentInventoryRuntime {
+                        cmd: vec![
+                            "/usr/local/bin/node".to_string(),
+                            "runner/dist/server.js".to_string(),
+                        ],
+                        environment: vec![
+                            "BLUEY_JOBS_RUNNER_DATA=/var/lib/bluey-jobs-runner".to_string(),
+                            "NODE_ENV=production".to_string(),
+                            format!("PATH={OCI_PATH}"),
+                            "PLAYWRIGHT_BROWSERS_PATH=/ms-playwright".to_string(),
+                        ],
+                        entrypoint: Vec::new(),
+                        exposed_ports: vec!["8091/tcp".to_string()],
+                        user: "pwuser".to_string(),
+                        working_directory: "/app".to_string(),
+                    }),
+                ),
+                "jobs-workflows" => (
+                    Some(OCI_PATH.to_string()),
+                    "node".to_string(),
+                    Vec::new(),
+                    vec![
+                        "/usr/local/bin/node".to_string(),
+                        "workflows/dist/worker.js".to_string(),
+                    ],
+                    vec![
+                        MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH.to_string(),
+                        "app/workflows/dist/discovery-worker.js".to_string(),
+                        "app/workflows/dist/failure-converter.js".to_string(),
+                        "app/workflows/dist/gateway.js".to_string(),
+                        "app/workflows/dist/global-discovery-worker.js".to_string(),
+                        MANAGED_CLOUD_ORIGINAL_SOURCE_VERIFIER_PATH.to_string(),
+                        "app/workflows/dist/worker.js".to_string(),
+                        "usr/local/bin/node".to_string(),
+                    ],
+                    Some(ManagedCloudContentInventoryRuntime {
+                        cmd: vec![
+                            "/usr/local/bin/node".to_string(),
+                            "workflows/dist/worker.js".to_string(),
+                        ],
+                        environment: vec![
+                            "NODE_ENV=production".to_string(),
+                            format!("PATH={OCI_PATH}"),
+                        ],
+                        entrypoint: Vec::new(),
+                        exposed_ports: Vec::new(),
+                        user: "node".to_string(),
+                        working_directory: "/app".to_string(),
+                    }),
+                ),
+                _ => panic!("unsupported managed-cloud fixture component {component_id}"),
+            };
+        let roles = release
+            .capabilities
+            .iter()
+            .filter(|capability| {
+                capability.component_id == component_id && capability.capability != "portal_static"
+            })
+            .map(|capability| capability.capability.clone())
+            .collect::<Vec<_>>();
+        let measured_files = if component_id == "jobs-portal" {
+            Vec::new()
+        } else {
+            required_paths
+                .iter()
+                .filter(|path| path.as_str() != MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH)
+                .map(|path| ManagedCloudRuntimeMeasurementFileAuthority {
+                    path: path.clone(),
+                    sha256: managed_cloud_test_file_sha256(component_id, path),
+                })
+                .collect::<Vec<_>>()
+        };
+        let runtime_measurement =
+            (component_id != "jobs-portal").then(|| ManagedCloudRuntimeMeasurementAuthority {
+                version: 1,
+                audience: MANAGED_CLOUD_RUNTIME_MEASUREMENT_AUDIENCE.to_string(),
+                build_id: component.build_id.clone(),
+                component_id: component_id.to_string(),
+                config_schema_sha256: release.config_schema_sha256.clone(),
+                measured_files,
+                migration_set_sha256: release.migration_set_sha256.clone(),
+                protocol_set_sha256: release.protocol_set_sha256.clone(),
+                roles: roles.clone(),
+                source_commit: release.source_commit.clone(),
+            });
+        let runtime_measurement_sha256 = runtime_measurement
+            .as_ref()
+            .map(|measurement| managed_cloud_digest(measurement).expect("runtime measurement"));
+        let runtime_identities = runtime_measurement_sha256
+            .as_ref()
+            .map(|measurement_sha256| {
+                roles
+                    .iter()
+                    .map(|role| ManagedCloudRuntimeIdentityAuthority {
+                        role: role.clone(),
+                        runtime_identity_sha256: managed_cloud_runtime_identity_sha256(
+                            measurement_sha256,
+                            component_id,
+                            role,
+                        )
+                        .expect("runtime identity"),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut entries = required_paths
+            .iter()
+            .map(|path| {
+                let sha256 = if path == MANAGED_CLOUD_RUNTIME_MEASUREMENT_PATH {
+                    runtime_measurement_sha256
+                        .clone()
+                        .expect("OCI fixture has runtime measurement")
+                } else {
+                    managed_cloud_test_file_sha256(component_id, path)
+                };
+                managed_cloud_test_inventory_entry(path, sha256)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.path.cmp(&right.path));
+        let inventory = ManagedCloudContentInventoryAuthority {
+            version: 1,
+            audience: "bluey-jobs-managed-cloud-content-inventory-v1".to_string(),
+            component_id: component_id.to_string(),
+            artifact_kind: component.artifact_kind.clone(),
+            artifact_sha256: component.artifact_sha256.clone(),
+            entries,
+            runtime,
+        };
+        let inventory_bytes =
+            managed_cloud_canonical_json(&inventory).expect("canonical content inventory");
+        let inventory_base64url = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            &inventory_bytes,
+        );
+        (
+            ManagedCloudVerificationComponentAuthority {
+                component_id: component_id.to_string(),
+                artifact_sha256: component.artifact_sha256.clone(),
+                content_inventory_sha256: managed_cloud_sha256(&inventory_bytes),
+                sbom_sha256: component.sbom_sha256.clone(),
+                provenance_sha256: component.provenance_sha256.clone(),
+                runtime_path,
+                runtime_user,
+                entrypoint,
+                cmd,
+                required_paths,
+                runtime_measurement,
+                runtime_measurement_sha256,
+                runtime_identities,
+            },
+            inventory_base64url,
+        )
+    }
+
+    fn managed_cloud_test_release_import(
+        issued_at_ms: i64,
+    ) -> (
+        ManagedCloudReleaseAuthority,
+        ManagedCloudReleaseImportRequest,
+    ) {
+        let mut release = managed_cloud_test_release(2, true);
+        release.manifest_generation = 1;
+        release.release_sequence = 1;
+        release.published_at_ms = issued_at_ms;
+        let mut components = Vec::new();
+        let mut inventories = std::collections::HashMap::new();
+        for component in &release.components {
+            let (evidence, inventory) = managed_cloud_test_component_evidence(&release, component);
+            inventories.insert(component.component_id.clone(), inventory);
+            components.push(evidence);
+        }
+        let verification = ManagedCloudVerificationEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_VERIFICATION_EVIDENCE_AUDIENCE.to_string(),
+            source_commit: release.source_commit.clone(),
+            builder_policy_sha256: "1".repeat(64),
+            jobs_lock_sha256: "2".repeat(64),
+            server_lock_sha256: "3".repeat(64),
+            migration_contract_sha256: release.migration_set_sha256.clone(),
+            config_contract_sha256: release.config_schema_sha256.clone(),
+            protocol_contract_sha256: release.protocol_set_sha256.clone(),
+            test_evidence_sha256: "4".repeat(64),
+            components,
+        };
+        let verification_bytes =
+            managed_cloud_canonical_json(&verification).expect("canonical verification evidence");
+        release.verification_evidence_sha256 = managed_cloud_sha256(&verification_bytes);
+        refresh_managed_cloud_test_release_digests(&mut release);
+        validate_managed_cloud_release(&release).expect("valid production-positive v2 release");
+        let signed = managed_cloud_test_signed_envelope(
+            &release,
+            MANAGED_CLOUD_RELEASE_V2_AUDIENCE,
+            "release",
+            issued_at_ms.saturating_add(1_000),
+        );
+        (
+            release,
+            ManagedCloudReleaseImportRequest {
+                envelope: signed.envelope,
+                verification_evidence_base64url: base64::Engine::encode(
+                    &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                    verification_bytes,
+                ),
+                inventory_attachments: ManagedCloudContentInventoryAttachments {
+                    jobs_api: inventories.remove("jobs-api").expect("jobs-api inventory"),
+                    jobs_portal: inventories
+                        .remove("jobs-portal")
+                        .expect("jobs-portal inventory"),
+                    jobs_runner: inventories
+                        .remove("jobs-runner")
+                        .expect("jobs-runner inventory"),
+                    jobs_workflows: inventories
+                        .remove("jobs-workflows")
+                        .expect("jobs-workflows inventory"),
+                },
+            },
+        )
+    }
+
+    fn managed_cloud_test_activation_evidence(
+        activation: &mut ManagedCloudActivationAuthority,
+        release: &ManagedCloudReleaseAuthority,
+        observed_at_ms: i64,
+        expires_at_ms: i64,
+    ) -> ManagedCloudActivationEvidenceAttachments {
+        let manifest_sha256 = activation.manifest_sha256.clone();
+        let scope = activation.scope.clone();
+        let portal_artifact_sha256 = release
+            .components
+            .iter()
+            .find(|component| component.component_id == "jobs-portal")
+            .expect("portal component")
+            .artifact_sha256
+            .clone();
+        let failure_converter_sha256 = managed_cloud_test_file_sha256(
+            "jobs-workflows",
+            "app/workflows/dist/failure-converter.js",
+        );
+        let namespace = "bluey-jobs-phase614b".to_string();
+        let task_queue = "bluey-jobs-managed".to_string();
+        let task_queue_sha256 =
+            managed_cloud_task_queue_sha256(&namespace, &task_queue).expect("task queue digest");
+        let temporal_namespace_sha256 = managed_cloud_sha256(namespace.as_bytes());
+        let storage_config_sha256 = "5".repeat(64);
+        let cleanup_authority_sha256 = "6".repeat(64);
+        let mut check_ids = vec![
+            "artifact-registry-readback",
+            "jobs-api-runtime-artifact-attestation",
+            "jobs-api-readiness",
+            "jobs-portal-readback",
+            "jobs-workflows-runtime-artifact-attestation",
+            "managed-runner-runtime-artifact-attestation",
+            "managed-runner-readiness",
+            "migration-contract-readback",
+            "original-source-verifier-readiness",
+            "protocol-contract-readback",
+            "read-only-rootfs-policy",
+            "workflow-cleanup-dispatcher-readiness",
+            "workflow-command-dispatcher-readiness",
+            "workflow-gateway-readiness",
+            "workflow-worker-readiness",
+        ];
+        check_ids.sort_unstable();
+        let canary = ManagedCloudCanaryEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_CANARY_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            checks: check_ids
+                .into_iter()
+                .map(|check_id| ManagedCloudCanaryCheckAuthority {
+                    check_id: check_id.to_string(),
+                    evidence_sha256: managed_cloud_sha256(check_id.as_bytes()),
+                    status: "pass".to_string(),
+                })
+                .collect(),
+        };
+        let cleanup = ManagedCloudCleanupEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_CLEANUP_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            cleanup_authority_sha256: cleanup_authority_sha256.clone(),
+            dispatcher_ready: true,
+        };
+        let failure_converter = ManagedCloudFailureConverterEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_FAILURE_CONVERTER_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            deployed_file_sha256: failure_converter_sha256.clone(),
+        };
+        let portal = ManagedCloudPortalReadbackEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_PORTAL_READBACK_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            portal_artifact_sha256: portal_artifact_sha256.clone(),
+            readback_sha256: portal_artifact_sha256,
+        };
+        let runner = ManagedCloudRunnerFleetEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_RUNNER_FLEET_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            fleet_id_sha256: "7".repeat(64),
+            ready_instances: 1,
+            required_instances: 1,
+        };
+        let storage = ManagedCloudStorageEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_STORAGE_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            read_probe_sha256: "8".repeat(64),
+            storage_config_sha256: storage_config_sha256.clone(),
+            write_probe_sha256: "9".repeat(64),
+        };
+        let task_queue_evidence = ManagedCloudTaskQueueEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_TASK_QUEUE_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256: manifest_sha256.clone(),
+            scope: scope.clone(),
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            namespace: namespace.clone(),
+            task_queue,
+            task_queue_sha256: task_queue_sha256.clone(),
+        };
+        let temporal = ManagedCloudTemporalEvidenceAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_TEMPORAL_EVIDENCE_AUDIENCE.to_string(),
+            manifest_sha256,
+            scope,
+            status: "pass".to_string(),
+            observed_at_ms,
+            expires_at_ms,
+            gateway_ready: true,
+            namespace,
+            namespace_sha256: temporal_namespace_sha256.clone(),
+            workflow_worker_ready: true,
+        };
+        let canary_base64url = managed_cloud_test_base64url(&canary);
+        let portal_readback_base64url = managed_cloud_test_base64url(&portal);
+        let runner_fleet_base64url = managed_cloud_test_base64url(&runner);
+        activation.runner_fleet_evidence_sha256 = managed_cloud_sha256(
+            &managed_cloud_canonical_json(&runner).expect("canonical runner evidence"),
+        );
+        activation.cleanup_authority_sha256 = cleanup_authority_sha256;
+        activation.temporal_namespace_sha256 = temporal_namespace_sha256;
+        activation.storage_config_sha256 = storage_config_sha256;
+        activation.task_queue_sha256 = task_queue_sha256;
+        activation.failure_converter_sha256 = failure_converter_sha256;
+        activation.canary_evidence_sha256 = managed_cloud_sha256(
+            &managed_cloud_canonical_json(&canary).expect("canonical canary evidence"),
+        );
+        activation.portal_readback_evidence_sha256 = managed_cloud_sha256(
+            &managed_cloud_canonical_json(&portal).expect("canonical portal evidence"),
+        );
+        ManagedCloudActivationEvidenceAttachments {
+            canary_base64url,
+            cleanup_base64url: managed_cloud_test_base64url(&cleanup),
+            failure_converter_base64url: managed_cloud_test_base64url(&failure_converter),
+            portal_readback_base64url,
+            runner_fleet_base64url,
+            storage_base64url: managed_cloud_test_base64url(&storage),
+            task_queue_base64url: managed_cloud_test_base64url(&task_queue_evidence),
+            temporal_namespace_base64url: managed_cloud_test_base64url(&temporal),
+        }
+    }
+
+    fn managed_cloud_test_db_now(pool: &DbPool) -> i64 {
+        crate::db::run_blocking_db(|| match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .expect("managed-cloud fixture SQLite connection")
+                .query_row(
+                    "SELECT CAST(strftime('%s', 'now') AS INTEGER) * 1000",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("managed-cloud fixture SQLite clock"),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .expect("managed-cloud fixture PostgreSQL connection")
+                .query_one(
+                    "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+                    &[],
+                )
+                .expect("managed-cloud fixture PostgreSQL clock")
+                .get(0),
+        })
+    }
+
+    fn current_original_source_managed_head(
+        pool: &DbPool,
+        minimum_remaining_ms: i64,
+    ) -> Option<(String, String)> {
+        crate::db::run_blocking_db(|| match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .expect("managed-cloud fixture SQLite connection")
+                .query_row(
+                    "SELECT head.current_activation_sha256,head.current_manifest_sha256
+                       FROM jobs_managed_cloud_heads head
+                       JOIN jobs_managed_cloud_activations activation
+                         ON activation.activation_sha256=head.current_activation_sha256
+                        AND activation.manifest_sha256=head.current_manifest_sha256
+                       JOIN jobs_managed_cloud_cohorts cohort
+                         ON cohort.cohort_sha256=activation.cohort_sha256
+                      WHERE head.environment='production' AND head.region='us-east-1'
+                        AND head.channel='general'
+                        AND activation.source_verification_enabled=1
+                        AND cohort.rollout_mode='all_eligible_accounts'
+                        AND activation.expires_at_ms >
+                            CAST(strftime('%s', 'now') AS INTEGER) * 1000 + ?1
+                      LIMIT 1",
+                    params![minimum_remaining_ms],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .expect("query current SQLite original-source managed head"),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .expect("managed-cloud fixture PostgreSQL connection")
+                .query_opt(
+                    "SELECT head.current_activation_sha256,head.current_manifest_sha256
+                       FROM jobs_managed_cloud_heads head
+                       JOIN jobs_managed_cloud_activations activation
+                         ON activation.activation_sha256=head.current_activation_sha256
+                        AND activation.manifest_sha256=head.current_manifest_sha256
+                       JOIN jobs_managed_cloud_cohorts cohort
+                         ON cohort.cohort_sha256=activation.cohort_sha256
+                      WHERE head.environment='production' AND head.region='us-east-1'
+                        AND head.channel='general'
+                        AND activation.source_verification_enabled
+                        AND cohort.rollout_mode='all_eligible_accounts'
+                        AND activation.expires_at_ms >
+                            floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint + $1
+                      LIMIT 1",
+                    &[&minimum_remaining_ms],
+                )
+                .expect("query current PostgreSQL original-source managed head")
+                .map(|row| (row.get(0), row.get(1))),
+        })
+    }
+
+    fn install_valid_v2_original_source_managed_head(
+        pool: &DbPool,
+        now_ms: i64,
+        heartbeat_ttl_ms: i64,
+        authority_lifetime_ms: i64,
+        scope: ManagedCloudScope,
+        authority_label: &str,
+    ) -> (String, String) {
+        let issued_at_ms = now_ms.saturating_sub(5_000);
+        let signed_at_ms = now_ms.saturating_sub(1_000);
+        let activation_expires_at_ms = now_ms.saturating_add(authority_lifetime_ms);
+        let evidence_expires_at_ms = activation_expires_at_ms.saturating_add(60_000);
+        let policy_expires_at_ms = evidence_expires_at_ms.saturating_add(60_000);
+        let roles = [
+            "general_promotion",
+            "incident",
+            "promotion",
+            "release",
+            "root",
+        ];
+        let existing_release_published_at_ms = crate::db::run_blocking_db(|| match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .expect("managed-cloud fixture SQLite connection")
+                .query_row(
+                    "SELECT manifest.published_at_ms
+                       FROM jobs_managed_cloud_trust_policies policy
+                       JOIN jobs_managed_cloud_heads head
+                         ON head.environment='production' AND head.region='us-east-1'
+                        AND head.channel='general'
+                       JOIN jobs_managed_cloud_manifests manifest
+                         ON manifest.manifest_sha256=head.current_manifest_sha256
+                      WHERE policy.policy_id='phase614b-production-positive-policy'
+                        AND policy.trust_generation=1
+                      LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .expect("query existing SQLite managed-cloud fixture release"),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .expect("managed-cloud fixture PostgreSQL connection")
+                .query_opt(
+                    "SELECT manifest.published_at_ms
+                       FROM jobs_managed_cloud_trust_policies policy
+                       JOIN jobs_managed_cloud_heads head
+                         ON head.environment='production' AND head.region='us-east-1'
+                        AND head.channel='general'
+                       JOIN jobs_managed_cloud_manifests manifest
+                         ON manifest.manifest_sha256=head.current_manifest_sha256
+                      WHERE policy.policy_id='phase614b-production-positive-policy'
+                        AND policy.trust_generation=1
+                      LIMIT 1",
+                    &[],
+                )
+                .expect("query existing PostgreSQL managed-cloud fixture release")
+                .map(|row| row.get::<_, i64>(0)),
+        });
+        let policy = ManagedCloudTrustPolicyAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_TRUST_POLICY_AUDIENCE.to_string(),
+            policy_id: "phase614b-production-positive-policy".to_string(),
+            trust_generation: 1,
+            predecessor_policy_sha256: None,
+            issued_at_ms,
+            valid_from_ms: issued_at_ms,
+            expires_at_ms: policy_expires_at_ms,
+            roles: roles
+                .iter()
+                .map(|role| ManagedCloudTrustRoleAuthority {
+                    role: (*role).to_string(),
+                    threshold: 1,
+                })
+                .collect(),
+            keys: roles
+                .iter()
+                .map(|role| {
+                    let signing_key = managed_cloud_test_signing_key(role);
+                    ManagedCloudTrustKeyAuthority {
+                        key_id: managed_cloud_test_key_id(role),
+                        role: (*role).to_string(),
+                        public_key: base64::Engine::encode(
+                            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                            signing_key.verifying_key().to_bytes(),
+                        ),
+                        state: "active".to_string(),
+                        valid_from_ms: issued_at_ms,
+                        valid_until_ms: policy_expires_at_ms,
+                        minimum_trust_generation: 1,
+                        maximum_trust_generation: 1,
+                    }
+                })
+                .collect(),
+        };
+        if existing_release_published_at_ms.is_none() {
+            let root_signing_key = managed_cloud_test_signing_key("root");
+            let root_anchor = ManagedCloudRootTrustAnchor {
+                version: 1,
+                audience: MANAGED_CLOUD_ROOT_ANCHOR_AUDIENCE.to_string(),
+                threshold: 1,
+                keys: vec![ManagedCloudRootTrustKey {
+                    key_id: managed_cloud_test_key_id("root"),
+                    public_key: base64::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        root_signing_key.verifying_key().to_bytes(),
+                    ),
+                    valid_from_ms: issued_at_ms,
+                    valid_until_ms: policy_expires_at_ms,
+                }],
+            };
+            let policy_envelope = managed_cloud_test_signed_envelope(
+                &policy,
+                MANAGED_CLOUD_TRUST_POLICY_AUDIENCE,
+                "root",
+                signed_at_ms,
+            );
+            import_managed_cloud_trust_policy_with_bootstrap_anchor(
+                pool,
+                &policy_envelope.envelope,
+                "phase614b-production-positive",
+                Some(&root_anchor),
+            )
+            .expect("import signed managed-cloud trust policy");
+        }
+
+        let (release, release_request) = managed_cloud_test_release_import(
+            existing_release_published_at_ms.unwrap_or(issued_at_ms),
+        );
+        let release_import =
+            import_managed_cloud_release(pool, &release_request, "phase614b-production-positive")
+                .expect("import signed v2 managed-cloud release");
+        let cohort = ManagedCloudCohortAuthority {
+            version: 1,
+            audience: MANAGED_CLOUD_COHORT_AUDIENCE.to_string(),
+            cohort_id: format!("{authority_label}-general"),
+            cohort_generation: 1,
+            trust_generation: 1,
+            scope,
+            rollout_mode: "all_eligible_accounts".to_string(),
+            account_id_sha256s: Vec::new(),
+            approval_ref: format!("{authority_label}-approval"),
+            issued_at_ms,
+            not_before_ms: issued_at_ms,
+            expires_at_ms: evidence_expires_at_ms,
+        };
+        let cohort_envelope = managed_cloud_test_signed_envelope(
+            &cohort,
+            MANAGED_CLOUD_COHORT_AUDIENCE,
+            "general_promotion",
+            signed_at_ms,
+        );
+        let cohort_import = import_managed_cloud_cohort(
+            pool,
+            &ManagedCloudCohortImportRequest {
+                envelope: cohort_envelope.envelope,
+                account_ids: Vec::new(),
+            },
+            "phase614b-production-positive",
+        )
+        .expect("import signed managed-cloud cohort");
+
+        let mut activation = managed_cloud_test_activation(2, true);
+        activation.activation_id = format!("{authority_label}-activation");
+        activation.activation_generation = crate::db::run_blocking_db(|| match pool {
+            DbPool::Sqlite(_) => pool
+                .get()
+                .expect("managed-cloud fixture SQLite connection")
+                .query_row(
+                    "SELECT COALESCE(MAX(activation_generation),0)+1
+                       FROM jobs_managed_cloud_activations",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .expect("query next SQLite managed-cloud fixture activation generation"),
+            DbPool::Postgres(_) => pool
+                .get_pg()
+                .expect("managed-cloud fixture PostgreSQL connection")
+                .query_one(
+                    "SELECT COALESCE(MAX(activation_generation),0)+1
+                       FROM jobs_managed_cloud_activations",
+                    &[],
+                )
+                .expect("query next PostgreSQL managed-cloud fixture activation generation")
+                .get(0),
+        });
+        activation.trust_generation = 1;
+        activation.scope = cohort.scope.clone();
+        activation.channel_sequence = 1;
+        activation.expected_head_revision = 0;
+        activation.expected_transition_sha256 = None;
+        activation.predecessor_activation_sha256 = None;
+        activation.manifest_sha256 = release_import.authority_sha256.clone();
+        activation.manifest_signature_set_sha256 = release_import.signature_set_sha256;
+        activation.cohort_sha256 = cohort_import.authority_sha256;
+        activation.cohort_signature_set_sha256 = cohort_import.signature_set_sha256;
+        activation.feature_authority = release.feature_authority.clone();
+        activation.feature_authority_sha256 = release.feature_authority_sha256.clone();
+        activation.portal_readback_at_ms = issued_at_ms;
+        activation.portal_readback_ttl_ms = evidence_expires_at_ms - issued_at_ms;
+        activation.maximum_inflight = 8;
+        activation.maximum_daily_admissions = 100;
+        activation.heartbeat_ttl_ms = heartbeat_ttl_ms;
+        activation.recovery_acceptances = Vec::new();
+        activation.issued_at_ms = issued_at_ms;
+        activation.not_before_ms = issued_at_ms;
+        activation.expires_at_ms = activation_expires_at_ms;
+        let evidence = managed_cloud_test_activation_evidence(
+            &mut activation,
+            &release,
+            issued_at_ms,
+            evidence_expires_at_ms,
+        );
+        validate_managed_cloud_activation(&activation)
+            .expect("valid production-positive v2 activation");
+        let activation_envelope = managed_cloud_test_signed_envelope(
+            &activation,
+            MANAGED_CLOUD_ACTIVATION_V2_AUDIENCE,
+            "general_promotion",
+            signed_at_ms,
+        );
+        let activation_import = import_managed_cloud_activation(
+            pool,
+            &ManagedCloudActivationImportRequest {
+                envelope: activation_envelope.envelope,
+                evidence,
+            },
+            "phase614b-production-positive",
+        )
+        .expect("import signed v2 managed-cloud activation");
+        let transition = apply_managed_cloud_activation(
+            pool,
+            &ApplyManagedCloudActivationRequest {
+                activation_sha256: activation_import.authority_sha256.clone(),
+                expected_head_revision: 0,
+                expected_transition_sha256: None,
+            },
+            "phase614b-production-positive",
+        )
+        .expect("apply signed v2 managed-cloud activation");
+        assert_eq!(
+            transition.activation_sha256,
+            activation_import.authority_sha256
+        );
+        assert_eq!(transition.manifest_sha256, release_import.authority_sha256);
+        (
+            activation_import.authority_sha256,
+            release_import.authority_sha256,
+        )
+    }
+
+    pub(crate) struct OriginalSourceVerifierRuntimeTestFixture {
+        pub(crate) database_path: std::path::PathBuf,
+        pub(crate) pool: DbPool,
+        pub(crate) now_ms: i64,
+        pub(crate) account_id: String,
+        pub(crate) worker_id: String,
+        pub(crate) runtime_instance_id: String,
+        pub(crate) runtime_session_token: String,
+        pub(crate) runtime_instance_epoch: i64,
+        pub(crate) runtime_authority_sha256: String,
+        pub(crate) runtime_identity_sha256: String,
+        pub(crate) grant_id: String,
+    }
+
+    pub(crate) fn original_source_verifier_runtime_test_fixture(
+    ) -> OriginalSourceVerifierRuntimeTestFixture {
+        original_source_verifier_runtime_test_fixture_with_timing(60_000, 120_000, 5_000)
+    }
+
+    const LONG_HORIZON_VERIFIER_AUTHORITY_LIFETIME_MS: i64 = 20 * 60_000;
+    const LONG_HORIZON_VERIFIER_GRANT_TTL_MS: i64 = 15 * 60_000;
+    const LONG_HORIZON_VERIFIER_SETUP_MARGIN_MS: i64 = 60_000;
+    const _: () = assert!(
+        LONG_HORIZON_VERIFIER_AUTHORITY_LIFETIME_MS - LONG_HORIZON_VERIFIER_GRANT_TTL_MS
+            >= LONG_HORIZON_VERIFIER_SETUP_MARGIN_MS,
+        "long-horizon verifier fixture must reserve explicit setup time"
+    );
+
+    pub(crate) fn original_source_verifier_runtime_long_horizon_test_fixture(
+    ) -> OriginalSourceVerifierRuntimeTestFixture {
+        original_source_verifier_runtime_test_fixture_with_timing(
+            300_000,
+            LONG_HORIZON_VERIFIER_AUTHORITY_LIFETIME_MS,
+            LONG_HORIZON_VERIFIER_GRANT_TTL_MS,
+        )
+    }
+
+    pub(crate) fn install_original_source_verifier_runtime_test_fixture(
+        pool: &DbPool,
+        account_id: &str,
+    ) -> OriginalSourceVerifierRuntimeTestFixture {
+        assert!(!account_id.trim().is_empty(), "fixture account is required");
+        install_valid_original_source_verifier_runtime_test_fixture_in_pool(
+            pool.clone(),
+            std::path::PathBuf::new(),
+            account_id,
+            300_000,
+            24 * 60 * 60_000,
+            15 * 60_000,
+        )
+    }
+
+    #[test]
+    fn production_positive_runtime_fixture_preserves_requested_bounded_grant_ttl() {
+        assert_eq!(bounded_test_runtime_grant_ttl_ms(15 * 60_000), 15 * 60_000);
+        assert_eq!(
+            bounded_test_runtime_grant_ttl_ms(MANAGED_CLOUD_MAX_GRANT_TTL_MS + 1),
+            MANAGED_CLOUD_MAX_GRANT_TTL_MS
+        );
+    }
+
+    fn bounded_test_runtime_grant_ttl_ms(grant_ttl_ms: i64) -> i64 {
+        grant_ttl_ms.clamp(
+            MANAGED_CLOUD_MIN_GRANT_TTL_MS,
+            MANAGED_CLOUD_MAX_GRANT_TTL_MS,
+        )
+    }
+
+    fn original_source_verifier_runtime_test_fixture_with_timing(
+        heartbeat_ttl_ms: i64,
+        authority_lifetime_ms: i64,
+        grant_ttl_ms: i64,
+    ) -> OriginalSourceVerifierRuntimeTestFixture {
+        let database_path = std::env::temp_dir().join(format!(
+            "bluey-managed-cloud-verifier-runtime-{}-{}.sqlite3",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let pool = crate::db::open_pool(&database_path).expect("open verifier runtime fixture");
+        crate::db::run_migrations(&pool).expect("migrate verifier runtime fixture");
+        install_valid_original_source_verifier_runtime_test_fixture_in_pool(
+            pool,
+            database_path,
+            "account-original-source-123",
+            heartbeat_ttl_ms,
+            authority_lifetime_ms,
+            grant_ttl_ms,
+        )
+    }
+
+    fn install_valid_original_source_verifier_runtime_test_fixture_in_pool(
+        pool: DbPool,
+        database_path: std::path::PathBuf,
+        account_id: &str,
+        heartbeat_ttl_ms: i64,
+        authority_lifetime_ms: i64,
+        grant_ttl_ms: i64,
+    ) -> OriginalSourceVerifierRuntimeTestFixture {
+        let now_ms = managed_cloud_test_db_now(&pool);
+        let grant_ttl_ms = bounded_test_runtime_grant_ttl_ms(grant_ttl_ms);
+        let minimum_remaining_ms = grant_ttl_ms.saturating_add(5_000);
+        let (activation_sha256, manifest_sha256) =
+            current_original_source_managed_head(&pool, minimum_remaining_ms).unwrap_or_else(
+                || {
+                    install_valid_v2_original_source_managed_head(
+                        &pool,
+                        now_ms,
+                        heartbeat_ttl_ms,
+                        authority_lifetime_ms,
+                        ManagedCloudScope {
+                            environment: "production".to_string(),
+                            region: "us-east-1".to_string(),
+                            channel: "general".to_string(),
+                        },
+                        "phase614b-production-positive",
+                    )
+                },
+            );
+        let fixture_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let worker_id = format!("phase614b-source-worker-{fixture_suffix}");
+        let grant = issue_managed_cloud_runtime_grant(
+            &pool,
+            &NewManagedCloudRuntimeGrant {
+                issuance_ref: format!("phase614b-source-issuance-{fixture_suffix}"),
+                scope: ManagedCloudScope {
+                    environment: "production".to_string(),
+                    region: "us-east-1".to_string(),
+                    channel: "general".to_string(),
+                },
+                activation_sha256: activation_sha256.clone(),
+                manifest_sha256: manifest_sha256.clone(),
+                component_id: "jobs-workflows".to_string(),
+                role: "original_source_verifier".to_string(),
+                expected_worker_id: worker_id.clone(),
+                authorization_ref: format!("phase614b-source-authority-{fixture_suffix}"),
+                created_by: "phase614b-production-positive".to_string(),
+                ttl_ms: grant_ttl_ms,
+            },
+        )
+        .expect("issue production-positive verifier grant");
+        assert_eq!(
+            grant.expires_at_ms - grant.created_at_ms,
+            grant_ttl_ms,
+            "fixture grant must preserve the requested bounded TTL"
+        );
+        let grant_token = grant.grant_token.clone().expect("new verifier grant token");
+        let runtime_instance_id = format!("phase614b-source-instance-{fixture_suffix}");
+        let runtime_session_token = derive_managed_cloud_runtime_session_token(
+            &grant_token,
+            &grant.grant_id,
+            &runtime_instance_id,
+        )
+        .expect("derive verifier runtime session");
+        let instance = claim_managed_cloud_runtime_grant(
+            &pool,
+            &ClaimManagedCloudRuntimeGrant {
+                grant_id: grant.grant_id.clone(),
+                grant_token,
+                runtime_instance_id: runtime_instance_id.clone(),
+                worker_id: worker_id.clone(),
+                session_token: runtime_session_token.clone(),
+                runtime_identity_sha256: grant.expected_runtime_identity_sha256.clone(),
+            },
+        )
+        .expect("claim production-positive verifier runtime");
+        let heartbeat_input = ManagedCloudRuntimeHeartbeatInput {
+            runtime_instance_id: runtime_instance_id.clone(),
+            worker_id: worker_id.clone(),
+            session_token: runtime_session_token.clone(),
+            heartbeat_sequence: 1,
+            observed_head_revision: instance.head_revision,
+            observed_transition_sha256: instance.transition_sha256.clone(),
+            activation_sha256: instance.activation_sha256.clone(),
+            manifest_sha256: instance.manifest_sha256.clone(),
+            component_id: instance.component_id.clone(),
+            role: instance.role.clone(),
+            artifact_sha256: instance.artifact_sha256.clone(),
+            migration_set_sha256: instance.migration_set_sha256.clone(),
+            config_schema_sha256: instance.config_schema_sha256.clone(),
+            protocol_set_sha256: instance.protocol_set_sha256.clone(),
+            task_queue_sha256: instance.task_queue_sha256.clone(),
+            failure_converter_sha256: instance.failure_converter_sha256.clone(),
+            dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
+            health_state: "ready".to_string(),
+            reason_code: None,
+        };
+        let heartbeat = record_managed_cloud_runtime_heartbeat(&pool, &heartbeat_input)
+            .expect("record ready production-positive verifier heartbeat");
+        assert_eq!(heartbeat.health_state, "ready");
+        assert!(
+            original_source_verification_feature_active(&pool, account_id)
+                .expect("source-verification feature state")
+        );
+        let source_authority =
+            original_source_verification_authority_for_account(&pool, account_id)
+                .expect("source-verification authority state")
+                .expect("active source-verification authority");
+        assert_eq!(source_authority.account_id, account_id);
+        assert_eq!(source_authority.scope.environment, "production");
+        assert_eq!(source_authority.scope.channel, "general");
+        assert_eq!(source_authority.activation_sha256, activation_sha256);
+        assert_eq!(source_authority.manifest_sha256, manifest_sha256);
+
+        let runtime_authority_sha256 = original_source_verifier_runtime_authority_sha256(&instance)
+            .expect("derive verifier runtime authority");
+        require_original_source_verifier_runtime_active(
+            &pool,
+            &worker_id,
+            &runtime_instance_id,
+            &runtime_session_token,
+            instance.instance_epoch,
+            &runtime_authority_sha256,
+        )
+        .expect("fresh exact verifier runtime");
+        OriginalSourceVerifierRuntimeTestFixture {
+            database_path,
+            pool,
+            now_ms,
+            account_id: account_id.to_string(),
+            worker_id,
+            runtime_instance_id,
+            runtime_session_token,
+            runtime_instance_epoch: instance.instance_epoch,
+            runtime_authority_sha256,
+            runtime_identity_sha256: instance.runtime_identity_sha256,
+            grant_id: grant.grant_id,
+        }
+    }
+
+    pub(crate) struct ManagedRunnerRuntimeTestFixture {
+        pub(crate) scope: ManagedCloudScope,
+        pub(crate) runtime_instance_id: String,
+        pub(crate) runtime_instance_epoch: i64,
+    }
+
+    pub(crate) fn install_managed_runner_runtime_test_fixture(
+        pool: &DbPool,
+        worker_id: &str,
+        scope: ManagedCloudScope,
+        authority_now_ms: i64,
+    ) -> ManagedRunnerRuntimeTestFixture {
+        assert!(managed_cloud_route_id(worker_id), "fixture worker id is invalid");
+        let grant_ttl_ms: i64 = 15 * 60_000;
+        let existing_head = (scope.environment == "production"
+            && scope.region == "us-east-1"
+            && scope.channel == "general")
+            .then(|| current_original_source_managed_head(pool, grant_ttl_ms.saturating_add(5_000)))
+            .flatten();
+        let (activation_sha256, manifest_sha256) = existing_head.unwrap_or_else(|| {
+            install_valid_v2_original_source_managed_head(
+                pool,
+                authority_now_ms,
+                300_000,
+                24 * 60 * 60_000,
+                scope.clone(),
+                "phase614b-final-submit-runtime",
+            )
+        });
+        let fixture_suffix = uuid::Uuid::new_v4().simple().to_string();
+        let mut managed_runner = None;
+        for (role, component_id) in [
+            ("jobs_api", "jobs-api"),
+            ("managed_runner", "jobs-runner"),
+            ("original_source_verifier", "jobs-workflows"),
+            ("workflow_cleanup_dispatcher", "jobs-api"),
+            ("workflow_command_dispatcher", "jobs-api"),
+            ("workflow_gateway", "jobs-workflows"),
+            ("workflow_worker", "jobs-workflows"),
+        ] {
+            let runtime_worker_id = if role == "managed_runner" {
+                worker_id.to_string()
+            } else {
+                format!("phase614b-{role}-worker-{fixture_suffix}")
+            };
+            let grant = issue_managed_cloud_runtime_grant(
+                pool,
+                &NewManagedCloudRuntimeGrant {
+                    issuance_ref: format!("phase614b-{role}-issuance-{fixture_suffix}"),
+                    scope: scope.clone(),
+                    activation_sha256: activation_sha256.clone(),
+                    manifest_sha256: manifest_sha256.clone(),
+                    component_id: component_id.to_string(),
+                    role: role.to_string(),
+                    expected_worker_id: runtime_worker_id.clone(),
+                    authorization_ref: format!("phase614b-{role}-authority-{fixture_suffix}"),
+                    created_by: "phase614b-production-positive".to_string(),
+                    ttl_ms: grant_ttl_ms,
+                },
+            )
+            .unwrap_or_else(|error| panic!("issue production-positive {role} grant: {error}"));
+            let grant_token = grant
+                .grant_token
+                .clone()
+                .unwrap_or_else(|| panic!("new {role} grant token"));
+            let runtime_instance_id =
+                format!("phase614b-{role}-instance-{fixture_suffix}");
+            let runtime_session_token = derive_managed_cloud_runtime_session_token(
+                &grant_token,
+                &grant.grant_id,
+                &runtime_instance_id,
+            )
+            .unwrap_or_else(|error| panic!("derive {role} runtime session: {error}"));
+            let instance = claim_managed_cloud_runtime_grant(
+                pool,
+                &ClaimManagedCloudRuntimeGrant {
+                    grant_id: grant.grant_id,
+                    grant_token,
+                    runtime_instance_id: runtime_instance_id.clone(),
+                    worker_id: runtime_worker_id.clone(),
+                    session_token: runtime_session_token.clone(),
+                    runtime_identity_sha256: grant.expected_runtime_identity_sha256,
+                },
+            )
+            .unwrap_or_else(|error| panic!("claim production-positive {role} runtime: {error}"));
+            let heartbeat = record_managed_cloud_runtime_heartbeat(
+                pool,
+                &ManagedCloudRuntimeHeartbeatInput {
+                    runtime_instance_id: runtime_instance_id.clone(),
+                    worker_id: runtime_worker_id,
+                    session_token: runtime_session_token,
+                    heartbeat_sequence: 1,
+                    observed_head_revision: instance.head_revision,
+                    observed_transition_sha256: instance.transition_sha256.clone(),
+                    activation_sha256: instance.activation_sha256.clone(),
+                    manifest_sha256: instance.manifest_sha256.clone(),
+                    component_id: instance.component_id.clone(),
+                    role: instance.role.clone(),
+                    artifact_sha256: instance.artifact_sha256.clone(),
+                    migration_set_sha256: instance.migration_set_sha256.clone(),
+                    config_schema_sha256: instance.config_schema_sha256.clone(),
+                    protocol_set_sha256: instance.protocol_set_sha256.clone(),
+                    task_queue_sha256: instance.task_queue_sha256.clone(),
+                    failure_converter_sha256: instance.failure_converter_sha256.clone(),
+                    dependency_evidence_sha256: instance.dependency_evidence_sha256.clone(),
+                    health_state: "ready".to_string(),
+                    reason_code: None,
+                },
+            )
+            .unwrap_or_else(|error| {
+                panic!("record ready production-positive {role} heartbeat: {error}")
+            });
+            assert_eq!(heartbeat.health_state, "ready");
+            if role == "managed_runner" {
+                managed_runner = Some((runtime_instance_id, instance.instance_epoch));
+            }
+        }
+        let (runtime_instance_id, runtime_instance_epoch) =
+            managed_runner.expect("managed-runner fixture role");
+        ManagedRunnerRuntimeTestFixture {
+            scope,
+            runtime_instance_id,
+            runtime_instance_epoch,
+        }
+    }
+
+    #[test]
+    fn original_source_verifier_runtime_chain_is_fenced_and_revocable() {
+        let fixture = original_source_verifier_runtime_test_fixture();
+        let database_path = fixture.database_path.clone();
+        let pool = fixture.pool.clone();
+        let now_ms = fixture.now_ms;
+        let account_id = fixture.account_id.as_str();
+        let worker_id = fixture.worker_id.as_str();
+        let runtime_instance_id = fixture.runtime_instance_id.as_str();
+        let runtime_session_token = fixture.runtime_session_token.clone();
+        let runtime_instance_epoch = fixture.runtime_instance_epoch;
+        let runtime_authority_sha256 = fixture.runtime_authority_sha256.clone();
+        let grant_id = fixture.grant_id.clone();
+        let wrong_session = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            [0_u8; 32],
+        );
+        assert!(require_original_source_verifier_runtime_active(
+            &pool,
+            worker_id,
+            runtime_instance_id,
+            &wrong_session,
+            runtime_instance_epoch,
+            &runtime_authority_sha256,
+        )
+        .is_err());
+
+        {
+            let connection = pool.get().expect("stale fixture connection");
+            connection
+                .execute_batch(
+                    "DROP TRIGGER trg_jobs_managed_cloud_original_source_verifier_runtime_heartbeats_fenced_update;",
+                )
+                .expect("drop fixture-only heartbeat fence");
+            connection
+                .execute(
+                    "UPDATE jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+                        SET heartbeat_at_ms=?1 WHERE runtime_instance_id=?2",
+                    params![now_ms - 120_000, runtime_instance_id],
+                )
+                .expect("age fixture heartbeat");
+        }
+        assert!(require_original_source_verifier_runtime_active(
+            &pool,
+            worker_id,
+            runtime_instance_id,
+            &runtime_session_token,
+            runtime_instance_epoch,
+            &runtime_authority_sha256,
+        )
+        .is_err());
+        let after_stale = original_source_verification_feature_active(&pool, account_id);
+        assert!(
+            matches!(after_stale, Err(ManagedCloudRegistryError::Unavailable)),
+            "unexpected stale-runtime state: {after_stale:?}"
+        );
+        {
+            let connection = pool.get().expect("fresh fixture connection");
+            let fresh_now_ms: i64 = connection
+                .query_row(
+                    "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("database time");
+            connection
+                .execute(
+                    "UPDATE jobs_managed_cloud_original_source_verifier_runtime_heartbeats
+                        SET heartbeat_at_ms=?1 WHERE runtime_instance_id=?2",
+                    params![fresh_now_ms, runtime_instance_id],
+                )
+                .expect("refresh fixture heartbeat");
+        }
+        revoke_managed_cloud_runtime_grant(
+            &pool,
+            &RevokeManagedCloudRuntimeGrant {
+                grant_id,
+                reason_ref: "original-source-revocation-123".to_string(),
+                revoked_by: "managed-release-test".to_string(),
+            },
+        )
+        .expect("revoke verifier grant");
+        assert!(require_original_source_verifier_runtime_active(
+            &pool,
+            worker_id,
+            runtime_instance_id,
+            &runtime_session_token,
+            runtime_instance_epoch,
+            &runtime_authority_sha256,
+        )
+        .is_err());
+        let after_revocation = original_source_verification_feature_active(&pool, account_id);
+        assert!(
+            matches!(
+                after_revocation,
+                Err(ManagedCloudRegistryError::Unavailable)
+            ),
+            "unexpected revoked-runtime state: {after_revocation:?}"
+        );
+        let connection = pool.get().expect("assert verifier tables");
+        let verifier_instances: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM jobs_managed_cloud_original_source_verifier_runtime_instances",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count verifier instances");
+        let base_instances: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_managed_cloud_runtime_instances",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count base instances");
+        assert_eq!((verifier_instances, base_instances), (1, 0));
+        drop(connection);
+        drop(pool);
+        drop(fixture);
+        let _ = std::fs::remove_file(&database_path);
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-wal"));
+        let _ = std::fs::remove_file(database_path.with_extension("sqlite3-shm"));
+    }
 
     #[test]
     fn managed_cloud_canonical_json_matches_cross_runtime_golden() {
@@ -15559,6 +19760,315 @@ mod managed_cloud_release_authority_tests {
             .is_some());
         assert!(require_managed_cloud_execution_input(true, None).is_err());
         assert!(require_managed_cloud_execution_input(false, Some(&input)).is_err());
+    }
+
+    #[test]
+    fn sqlite_managed_unmanaged_submit_pairing_guards_are_fail_closed() {
+        let mut connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE jobs_workflow_commands (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    application_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    command_kind TEXT NOT NULL,
+                    managed_cloud_authority_required INTEGER NOT NULL,
+                    first_request_started_at_ms INTEGER
+                 );
+                 CREATE TABLE jobs_managed_cloud_workflow_bindings (
+                    command_id TEXT PRIMARY KEY
+                 );
+                 CREATE TABLE jobs_managed_cloud_request_start_authorities (
+                    command_id TEXT PRIMARY KEY
+                 );
+                 CREATE TABLE jobs_execution_leases (
+                    run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    application_id TEXT NOT NULL,
+                    fence INTEGER NOT NULL,
+                    lease_token_sha256 TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    managed_cloud_lease_authority_sha256 TEXT
+                 );
+                 CREATE TABLE jobs_managed_cloud_irreversible_effect_receipts (
+                    run_id TEXT,
+                    fence INTEGER,
+                    account_id TEXT,
+                    application_id TEXT,
+                    workflow_request_id TEXT,
+                    request_command_id TEXT,
+                    execution_command_id TEXT,
+                    binding_sha256 TEXT,
+                    release_memo_base64url TEXT,
+                    release_sha256 TEXT,
+                    runtime_instance_id TEXT,
+                    runtime_instance_epoch INTEGER,
+                    worker_id TEXT,
+                    gateway_authority_base64url TEXT,
+                    gateway_authority_sha256 TEXT,
+                    receipt_sha256 TEXT
+                 );",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+
+        require_unmanaged_cloud_execution_sqlite_tx(
+            &transaction,
+            "account-pairing",
+            "application-pairing",
+            "run-pairing",
+        )
+        .expect("absence of managed workflow state is explicitly unmanaged");
+        transaction
+            .execute(
+                "INSERT INTO jobs_workflow_commands (
+                    id, account_id, application_id, run_id, command_kind,
+                    managed_cloud_authority_required, first_request_started_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, 'start', 1, 1000)",
+                params![
+                    "command-managed-pairing",
+                    "account-pairing",
+                    "application-pairing",
+                    "run-pairing"
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO jobs_managed_cloud_workflow_bindings(command_id) VALUES (?1)",
+                params!["command-managed-pairing"],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO jobs_managed_cloud_request_start_authorities(command_id) VALUES (?1)",
+                params!["command-managed-pairing"],
+            )
+            .unwrap();
+        assert!(matches!(
+            require_unmanaged_cloud_execution_sqlite_tx(
+                &transaction,
+                "account-pairing",
+                "application-pairing",
+                "run-pairing",
+            ),
+            Err(ManagedCloudRegistryError::IdentityConflict)
+        ));
+        transaction
+            .execute(
+                "DELETE FROM jobs_managed_cloud_request_start_authorities",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            require_unmanaged_cloud_execution_sqlite_tx(
+                &transaction,
+                "account-pairing",
+                "application-pairing",
+                "run-pairing",
+            ),
+            Err(ManagedCloudRegistryError::InvalidAuthority)
+        ));
+
+        for (run_id, managed_sha256) in [
+            ("run-managed-replay", Some("a".repeat(64))),
+            ("run-unmanaged-replay", None),
+        ] {
+            transaction
+                .execute(
+                    "INSERT INTO jobs_execution_leases (
+                        run_id, account_id, application_id, fence,
+                        lease_token_sha256, phase, managed_cloud_lease_authority_sha256
+                     ) VALUES (?1, 'account-pairing', 'application-pairing', 1,
+                        ?2, 'click_started', ?3)",
+                    params![run_id, "b".repeat(64), managed_sha256],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            load_managed_cloud_irreversible_effect_receipt_sqlite_tx(
+                &transaction,
+                "account-pairing",
+                "application-pairing",
+                "run-managed-replay",
+                1,
+                &"b".repeat(64),
+                None,
+                "worker-pairing",
+            ),
+            Err(ManagedCloudRegistryError::IdentityConflict)
+        ));
+        assert!(load_managed_cloud_irreversible_effect_receipt_sqlite_tx(
+            &transaction,
+            "account-pairing",
+            "application-pairing",
+            "run-unmanaged-replay",
+            1,
+            &"b".repeat(64),
+            None,
+            "worker-pairing",
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn postgres_managed_unmanaged_submit_pairing_guards_are_fail_closed_when_configured() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            eprintln!(
+                "skipped postgres_managed_unmanaged_submit_pairing_guards_are_fail_closed_when_configured: \
+                 BLUEY_TEST_POSTGRES_URL is unavailable"
+            );
+            return;
+        };
+        let mut connection = postgres::Client::connect(&database_url, postgres::NoTls).unwrap();
+        let mut transaction = connection.transaction().unwrap();
+        transaction
+            .batch_execute(
+                "CREATE TEMP TABLE jobs_workflow_commands (
+                    id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    application_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    command_kind TEXT NOT NULL,
+                    managed_cloud_authority_required BOOLEAN NOT NULL,
+                    first_request_started_at_ms BIGINT
+                 ) ON COMMIT DROP;
+                 CREATE TEMP TABLE jobs_managed_cloud_workflow_bindings (
+                    command_id TEXT PRIMARY KEY
+                 ) ON COMMIT DROP;
+                 CREATE TEMP TABLE jobs_managed_cloud_request_start_authorities (
+                    command_id TEXT PRIMARY KEY
+                 ) ON COMMIT DROP;
+                 CREATE TEMP TABLE jobs_execution_leases (
+                    run_id TEXT NOT NULL,
+                    account_id TEXT NOT NULL,
+                    application_id TEXT NOT NULL,
+                    fence BIGINT NOT NULL,
+                    lease_token_sha256 TEXT NOT NULL,
+                    phase TEXT NOT NULL,
+                    managed_cloud_lease_authority_sha256 TEXT
+                 ) ON COMMIT DROP;
+                 CREATE TEMP TABLE jobs_managed_cloud_irreversible_effect_receipts (
+                    run_id TEXT,
+                    fence BIGINT,
+                    account_id TEXT,
+                    application_id TEXT,
+                    workflow_request_id TEXT,
+                    request_command_id TEXT,
+                    execution_command_id TEXT,
+                    binding_sha256 TEXT,
+                    release_memo_base64url TEXT,
+                    release_sha256 TEXT,
+                    runtime_instance_id TEXT,
+                    runtime_instance_epoch BIGINT,
+                    worker_id TEXT,
+                    gateway_authority_base64url TEXT,
+                    gateway_authority_sha256 TEXT,
+                    receipt_sha256 TEXT
+                 ) ON COMMIT DROP;",
+            )
+            .unwrap();
+
+        require_unmanaged_cloud_execution_postgres_tx(
+            &mut transaction,
+            "account-pairing",
+            "application-pairing",
+            "run-pairing",
+        )
+        .expect("absence of managed workflow state is explicitly unmanaged");
+        transaction
+            .execute(
+                "INSERT INTO jobs_workflow_commands (
+                    id, account_id, application_id, run_id, command_kind,
+                    managed_cloud_authority_required, first_request_started_at_ms
+                 ) VALUES ($1, $2, $3, $4, 'start', TRUE, 1000)",
+                &[
+                    &"command-managed-pairing",
+                    &"account-pairing",
+                    &"application-pairing",
+                    &"run-pairing",
+                ],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO jobs_managed_cloud_workflow_bindings(command_id) VALUES ($1)",
+                &[&"command-managed-pairing"],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO jobs_managed_cloud_request_start_authorities(command_id) VALUES ($1)",
+                &[&"command-managed-pairing"],
+            )
+            .unwrap();
+        assert!(matches!(
+            require_unmanaged_cloud_execution_postgres_tx(
+                &mut transaction,
+                "account-pairing",
+                "application-pairing",
+                "run-pairing",
+            ),
+            Err(ManagedCloudRegistryError::IdentityConflict)
+        ));
+        transaction
+            .execute(
+                "DELETE FROM jobs_managed_cloud_request_start_authorities",
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            require_unmanaged_cloud_execution_postgres_tx(
+                &mut transaction,
+                "account-pairing",
+                "application-pairing",
+                "run-pairing",
+            ),
+            Err(ManagedCloudRegistryError::InvalidAuthority)
+        ));
+
+        for (run_id, managed_sha256) in [
+            ("run-managed-replay", Some("a".repeat(64))),
+            ("run-unmanaged-replay", None),
+        ] {
+            transaction
+                .execute(
+                    "INSERT INTO jobs_execution_leases (
+                        run_id, account_id, application_id, fence,
+                        lease_token_sha256, phase, managed_cloud_lease_authority_sha256
+                     ) VALUES ($1, 'account-pairing', 'application-pairing', 1,
+                        $2, 'click_started', $3)",
+                    &[&run_id, &"b".repeat(64), &managed_sha256],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            load_managed_cloud_irreversible_effect_receipt_postgres_tx(
+                &mut transaction,
+                "account-pairing",
+                "application-pairing",
+                "run-managed-replay",
+                1,
+                &"b".repeat(64),
+                None,
+                "worker-pairing",
+            ),
+            Err(ManagedCloudRegistryError::IdentityConflict)
+        ));
+        assert!(load_managed_cloud_irreversible_effect_receipt_postgres_tx(
+            &mut transaction,
+            "account-pairing",
+            "application-pairing",
+            "run-unmanaged-replay",
+            1,
+            &"b".repeat(64),
+            None,
+            "worker-pairing",
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -15886,6 +20396,55 @@ mod managed_cloud_release_authority_tests {
     #[test]
     fn managed_cloud_execution_effect_is_fresh_without_rewriting_claim_tuple() {
         let source = include_str!("managed_cloud_release_authority.rs");
+        let effect_prelock = source
+            .split_once("fn prelock_postgres_managed_cloud_effect_admission_inputs(")
+            .expect("PostgreSQL managed-cloud effect prelock")
+            .1
+            .split_once(
+                "fn require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(",
+            )
+            .expect("PostgreSQL managed-cloud effect prelock boundary")
+            .0;
+        let application = effect_prelock
+            .find("load_stage_application_postgres_tx")
+            .expect("managed-cloud application prelock");
+        let entitlement = effect_prelock
+            .find("SELECT cloud_browser FROM jobs_entitlements")
+            .expect("managed-cloud entitlement prelock");
+        assert!(application < entitlement);
+        let admission_after_prelock = source
+            .split_once(
+                "fn require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(",
+            )
+            .expect("PostgreSQL managed-cloud after-prelock admission")
+            .1
+            .split_once("fn managed_cloud_current_is_frozen(")
+            .expect("PostgreSQL managed-cloud after-prelock admission boundary")
+            .0;
+        assert!(admission_after_prelock
+            .contains("resolve_current_execution_authority_postgres_after_prelock"));
+        assert!(admission_after_prelock.contains(
+            "operational_hold_context_for_application_postgres_tx_after_authority_prelock"
+        ));
+        assert!(admission_after_prelock
+            .contains("require_operational_capability_postgres_tx_after_authority_prelock"));
+        assert!(!admission_after_prelock.contains("load_stage_application_postgres_tx"));
+        assert!(!admission_after_prelock.contains("SELECT cloud_browser FROM jobs_entitlements"));
+        for forbidden_relock in [
+            "lock_managed_cloud_workflow_admission_postgres_tx",
+            "lock_operational_hold_shared_postgres_tx",
+            "lock_managed_cloud_release_registry_shared_postgres_tx",
+            "lock_postgres_ats_certification",
+            "lock_discovery_account_shared_postgres",
+            "current_execution_authorized_postgres(",
+            "operational_hold_context_for_application_postgres_tx(",
+            "require_operational_capability_postgres_tx(",
+        ] {
+            assert!(
+                !admission_after_prelock.contains(forbidden_relock),
+                "managed admission reacquires {forbidden_relock}"
+            );
+        }
         let effect = source
             .split_once("pub(crate) fn resolve_managed_cloud_execution_effect_sqlite_tx(")
             .expect("SQLite execution-effect resolver")
@@ -15932,12 +20491,172 @@ mod managed_cloud_release_authority_tests {
             .find("false,")
             .expect("nonlocking command discovery");
         let admission = postgres_effect
-            .find("require_postgres_managed_cloud_effect_admission_after_prelock")
-            .expect("fresh effect admission");
+            .find("prelock_postgres_managed_cloud_effect_admission_inputs")
+            .expect("canonical application/entitlement prelock");
         let locked = postgres_effect[admission..]
             .find("true,")
             .map(|offset| admission + offset)
             .expect("locked command revalidation");
-        assert!(discovery < admission && admission < locked);
+        let lease = postgres_effect[locked..]
+            .find("FROM jobs_execution_leases")
+            .map(|offset| locked + offset)
+            .expect("locked execution lease");
+        let db_time = postgres_effect[lease..]
+            .find("managed_cloud_db_now_postgres")
+            .map(|offset| lease + offset)
+            .expect("final managed-cloud effect DB time");
+        let current = postgres_effect[db_time..]
+            .find("require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms")
+            .map(|offset| db_time + offset)
+            .expect("fresh effect admission");
+        assert!(
+            discovery < admission
+                && admission < locked
+                && locked < lease
+                && lease < db_time
+                && db_time < current
+        );
+    }
+
+    #[test]
+    fn postgres_execution_paths_prelock_managed_registry_before_ats_and_discovery() {
+        fn section<'a>(source: &'a str, start: &str, end: &str, label: &str) -> &'a str {
+            source
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {label} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {label} end"))
+                .0
+        }
+
+        fn assert_ordered(section: &str, needles: &[&str], label: &str) {
+            let mut previous = 0;
+            for needle in needles {
+                let position = section
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("missing {needle:?} in {label}"));
+                assert!(position >= previous, "{label} lock order is inverted");
+                previous = position;
+            }
+        }
+
+        const H: &str = "lock_operational_hold_shared_postgres_tx";
+        const M: &str = "lock_managed_cloud_release_registry_shared_postgres_tx";
+        const ATS: &str = "lock_postgres_ats_certification";
+        const D: &str = "lock_discovery_account_shared_postgres";
+
+        let managed = include_str!("managed_cloud_release_authority.rs");
+        let shared_registry = section(
+            managed,
+            "pub(crate) fn lock_managed_cloud_release_registry_shared_postgres_tx(",
+            "pub(crate) fn lock_managed_cloud_workflow_admission_postgres_tx(",
+            "shared managed-release registry lock",
+        );
+        assert!(shared_registry.contains("pg_advisory_xact_lock_shared("));
+        let source_authority = section(
+            managed,
+            "pub(crate) fn postgres_original_source_verification_authority_for_account_tx(",
+            "pub(crate) fn postgres_original_source_verification_feature_active_tx(",
+            "original-source managed authority resolver",
+        );
+        assert!(source_authority.contains(M));
+        assert!(!source_authority.contains("pg_advisory_xact_lock("));
+
+        let execution_authority = include_str!("execution_authority.rs");
+        let current = section(
+            execution_authority,
+            "fn resolve_current_execution_authority_postgres_after_prelock(",
+            "fn lock_current_execution_authority_postgres_after_prelock(",
+            "current PostgreSQL execution authority",
+        );
+        assert_ordered(
+            current,
+            &[
+                "lock_current_execution_authority_postgres_after_prelock",
+                "original_source_db_now_postgres",
+                "resolve_current_execution_authority_postgres_after_prelock_at_ms",
+            ],
+            "current PostgreSQL execution authority",
+        );
+        for prelock in [H, M, ATS, D] {
+            assert!(
+                !current.contains(prelock),
+                "current PostgreSQL execution authority reacquires {prelock}"
+            );
+        }
+
+        let execution_leases = include_str!("execution_leases.rs");
+        let claim = section(
+            execution_leases,
+            "fn claim_execution_lease_inner(",
+            "pub const SUBMISSION_EVIDENCE_PAYLOAD_RESERVED_BYTES",
+            "execution-lease claim",
+        );
+        assert_ordered(claim, &[H, M, ATS, D], "unmanaged execution-lease claim");
+        let final_effect = execution_leases
+            .rsplit_once("fn start_irreversible_submission_inner(")
+            .expect("new irreversible execution effect start")
+            .1
+            .split_once("fn execution_finish_allowed(")
+            .expect("new irreversible execution effect end")
+            .0
+            .split_once("DbPool::Postgres(_) =>")
+            .expect("PostgreSQL irreversible execution effect")
+            .1
+            .split_once("if let Some((Some(input), _)) = managed_cloud_context {")
+            .expect("fresh irreversible execution effect")
+            .1;
+        assert_ordered(
+            final_effect,
+            &[H, M, ATS, D],
+            "unmanaged irreversible execution effect",
+        );
+
+        let local_runner = include_str!("local_runner.rs");
+        let local_claim = section(
+            local_runner,
+            "pub fn claim_authorized_local_run_ticket(",
+            "pub(crate) struct LocalRunSubmitAuthorization",
+            "local-run claim",
+        );
+        assert_ordered(local_claim, &[H, M, ATS, D], "local-run claim");
+        let local_submit = local_runner
+            .rsplit_once("fn local_run_submit_authorization_inner(")
+            .expect("local-run submit start")
+            .1
+            .split_once("fn local_click_started_ticket_matches(")
+            .expect("local-run submit end")
+            .0;
+        assert_ordered(local_submit, &[H, M, ATS, D], "local-run submit");
+
+        let eligibility = include_str!("eligibility.rs");
+        let reservation = section(
+            eligibility,
+            "pub fn reserve_application_attempt(",
+            "pub fn update_attempt_reservation_status(",
+            "attempt reservation",
+        );
+        assert_ordered(reservation, &[H, M, D], "PostgreSQL attempt reservation");
+        let running_reservation = section(
+            eligibility,
+            "pub fn update_attempt_reservation_status(",
+            "fn ensure_original_source_application_authority_sqlite_tx(",
+            "running attempt reservation",
+        );
+        assert_ordered(
+            running_reservation,
+            &[H, M, D, "require_active_account_write_fence_postgres_tx"],
+            "PostgreSQL running attempt reservation",
+        );
+
+        let applications = include_str!("applications.rs");
+        let queue = section(
+            applications,
+            "fn save_application(",
+            "fn validate_application_transition(",
+            "application queue persistence",
+        );
+        assert_ordered(queue, &[H, M, ATS, D], "PostgreSQL application queue persistence");
     }
 }

@@ -7,6 +7,7 @@ import type {
   CareerFact,
   CareerProfile,
   CareerTrack,
+  CareerTrackPolicyAuthority,
   CandidateEvent,
   CandidateEventInput,
   CommunicationActionSummary,
@@ -39,6 +40,10 @@ import {
   decodeMailboxOAuthStart,
   decodeMailboxProviderAvailability,
 } from "./lib/mailbox-oauth";
+import {
+  canonicalTaxonomyDescriptor,
+  checkJobsTaxonomyResponse,
+} from "./lib/canonical-taxonomy";
 
 const ACCESS_TOKEN_KEY = "bluey_access_token";
 const REFRESH_TOKEN_KEY = "bluey_refresh_token";
@@ -205,6 +210,84 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
   return body as T;
 }
 
+async function taxonomyWriteHeaders(): Promise<Headers> {
+  const local = await canonicalTaxonomyDescriptor();
+  const server = await request<unknown>("/api/jobs/taxonomy");
+  const check = checkJobsTaxonomyResponse(server, local);
+  if (check.status !== "current" || !local.digest_sha256) {
+    throw new ApiError(
+      409,
+      "Career Track taxonomy changed. Refresh Bluey Jobs and review this Track before saving.",
+    );
+  }
+  return new Headers({
+    "X-Bluey-Jobs-Taxonomy-Version": local.taxonomy_version,
+    "X-Bluey-Jobs-Taxonomy-SHA256": local.digest_sha256,
+  });
+}
+
+type WireCareerTrackPolicyAuthority = Omit<
+  CareerTrackPolicyAuthority,
+  "applicationIdentityId"
+> & {
+  application_identity_id?: unknown;
+  applicationIdentityId?: unknown;
+};
+
+function policyAuthorityFromWire(
+  authority: WireCareerTrackPolicyAuthority,
+): CareerTrackPolicyAuthority {
+  const {
+    application_identity_id: applicationIdentityIdFromWire,
+    applicationIdentityId: existingApplicationIdentityId,
+    ...rest
+  } = authority;
+  return {
+    ...rest,
+    applicationIdentityId: typeof applicationIdentityIdFromWire === "string"
+      ? applicationIdentityIdFromWire
+      : typeof existingApplicationIdentityId === "string"
+        ? existingApplicationIdentityId
+        : "",
+  };
+}
+
+function trackFromWire(track: CareerTrack): CareerTrack {
+  if (!track.policy?.authority) return track;
+  return {
+    ...track,
+    policy: {
+      ...track.policy,
+      authority: policyAuthorityFromWire(
+        track.policy.authority as unknown as WireCareerTrackPolicyAuthority,
+      ),
+    },
+  };
+}
+
+function workspaceFromWire(workspace: JobsWorkspace): JobsWorkspace {
+  if (!Array.isArray(workspace.tracks)) return workspace;
+  return {
+    ...workspace,
+    tracks: workspace.tracks.map(trackFromWire),
+  };
+}
+
+function trackToWire(track: CareerTrack): CareerTrack {
+  if (!track.policy?.authority) return track;
+  const { applicationIdentityId, ...authority } = track.policy.authority;
+  return {
+    ...track,
+    policy: {
+      ...track.policy,
+      authority: {
+        ...authority,
+        application_identity_id: applicationIdentityId,
+      } as unknown as CareerTrackPolicyAuthority,
+    },
+  };
+}
+
 async function requestDownload(
   path: string,
   fallbackName: string,
@@ -255,13 +338,21 @@ async function fileBase64(file: File): Promise<string> {
 }
 
 export const jobsApi = {
-  workspace: () => request<JobsWorkspace>("/api/jobs/workspace"),
+  workspace: async () => workspaceFromWire(
+    await request<JobsWorkspace>("/api/jobs/workspace"),
+  ),
   account: () => request<AccountSummary>("/account/me"),
-  completeOnboarding: (profile: CareerProfile, preferences: JobPreferences, track: CareerTrack) =>
-    request<JobsWorkspace>("/api/jobs/onboarding/complete", {
+  completeOnboarding: async (
+    profile: CareerProfile,
+    preferences: JobPreferences,
+    track: CareerTrack,
+  ) => workspaceFromWire(
+    await request<JobsWorkspace>("/api/jobs/onboarding/complete", {
       method: "POST",
-      body: JSON.stringify({ profile, preferences, track }),
+      headers: await taxonomyWriteHeaders(),
+      body: JSON.stringify({ profile, preferences, track: trackToWire(track) }),
     }),
+  ),
   prepareInterview: (applicationId: string) =>
     request<InterviewPrepCompletionResponse>(`/api/jobs/applications/${encodeURIComponent(applicationId)}/interview-prep`, {
       method: "POST",
@@ -307,11 +398,15 @@ export const jobsApi = {
     }),
   }),
   deleteFact: (id: string) => request<void>(`/api/jobs/facts/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  saveTrack: (track: CareerTrack) =>
-    request<CareerTrack>(track.id ? `/api/jobs/tracks/${encodeURIComponent(track.id)}` : "/api/jobs/tracks", {
-      method: track.id ? "PUT" : "POST",
-      body: JSON.stringify(track),
-    }),
+  saveTrack: async (track: CareerTrack) => {
+    const creating = track.created_at_ms <= 0;
+    const saved = await request<CareerTrack>(creating ? "/api/jobs/tracks" : `/api/jobs/tracks/${encodeURIComponent(track.id)}`, {
+      method: creating ? "POST" : "PUT",
+      headers: await taxonomyWriteHeaders(),
+      body: JSON.stringify(trackToWire(track)),
+    });
+    return trackFromWire(saved);
+  },
   deleteTrack: (id: string) =>
     request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}`, { method: "DELETE" }),
   authorizeTrackAutoSubmit: (id: string) =>

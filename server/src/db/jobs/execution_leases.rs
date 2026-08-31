@@ -34,6 +34,12 @@ fn execution_lease_from_managed_cloud_error(
     }
 }
 
+fn execution_lease_from_original_source_error(
+    error: OriginalSourceVerificationError,
+) -> ExecutionLeaseError {
+    ExecutionLeaseError::Storage(anyhow::Error::new(error))
+}
+
 #[derive(Debug)]
 struct StoredExecutionLease {
     account_id: String,
@@ -871,12 +877,55 @@ fn validate_execution_target_payloads(
     Ok(())
 }
 
+struct ExecutionTargetAuthority {
+    application: JobApplication,
+    browser_profile_id: String,
+    employer_domain: OperationalHoldEmployerDomain,
+}
+
+fn job_application_snapshot_matches(discovered: &JobApplication, locked: &JobApplication) -> bool {
+    discovered.id == locked.id
+        && discovered.job_id == locked.job_id
+        && discovered.resume_version_id == locked.resume_version_id
+        && discovered.state == locked.state
+        && discovered.submission_mode == locked.submission_mode
+        && discovered.match_score == locked.match_score
+        && discovered.answers == locked.answers
+        && discovered.cover_letter == locked.cover_letter
+        && discovered.receipt == locked.receipt
+        && discovered.run_id == locked.run_id
+        && discovered.created_at_ms == locked.created_at_ms
+        && discovered.updated_at_ms == locked.updated_at_ms
+        && discovered.submitted_at_ms == locked.submitted_at_ms
+}
+
+fn discover_postgres_execution_application(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> ExecutionLeaseResult<JobApplication> {
+    let row = tx
+        .query_opt(
+            "SELECT job_id, application_json FROM jobs_applications
+              WHERE account_id = $1 AND id = $2",
+            &[&account_id, &application_id],
+        )?
+        .ok_or(ExecutionLeaseError::NotFound)?;
+    let job_id: String = row.get(0);
+    Ok(parse_application_json(
+        row.get(1),
+        application_id,
+        &job_id,
+        "discovered execution application",
+    )?)
+}
+
 fn sqlite_execution_target(
     tx: &rusqlite::Transaction<'_>,
     account_id: &str,
     application_id: &str,
     run_id: &str,
-) -> ExecutionLeaseResult<String> {
+) -> ExecutionLeaseResult<ExecutionTargetAuthority> {
     let (application_job_id, application_raw, application_state): (String, String, String) = tx
         .query_row(
             "SELECT job_id, application_json, state FROM jobs_applications
@@ -896,7 +945,8 @@ fn sqlite_execution_target(
         .receipt
         .pointer("/application_identity/id")
         .and_then(Value::as_str)
-        .ok_or(ExecutionLeaseError::Conflict)?;
+        .ok_or(ExecutionLeaseError::Conflict)?
+        .to_string();
     let (session_raw, session_runner): (String, String) = tx
         .query_row(
             "SELECT session_json, runner FROM jobs_browser_sessions
@@ -911,7 +961,7 @@ fn sqlite_execution_target(
             "SELECT identity_json, verification_status
                FROM jobs_application_identities
               WHERE account_id = ?1 AND id = ?2",
-            params![account_id, identity_id],
+            params![account_id, &identity_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
@@ -927,15 +977,23 @@ fn sqlite_execution_target(
         application_id,
         run_id,
     )?;
-    if !current_execution_authorized_sqlite(
+    let current = resolve_current_execution_authority_sqlite_after_prelock(
         tx,
         account_id,
         &application,
         ExecutionAuthorityRunner::Cloud,
-    )? {
+    )?;
+    if !current.authorized {
         return Err(ExecutionLeaseError::Conflict);
     }
-    Ok(execution_browser_profile_id(account_id, identity_id))
+    let employer_domain = current
+        .employer_domain
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    Ok(ExecutionTargetAuthority {
+        application,
+        browser_profile_id: execution_browser_profile_id(account_id, &identity_id),
+        employer_domain,
+    })
 }
 
 fn postgres_execution_target(
@@ -943,7 +1001,7 @@ fn postgres_execution_target(
     account_id: &str,
     application_id: &str,
     run_id: &str,
-) -> ExecutionLeaseResult<String> {
+) -> ExecutionLeaseResult<ExecutionTargetAuthority> {
     let row = tx
         .query_opt(
             "SELECT job_id, application_json, state FROM jobs_applications
@@ -996,15 +1054,23 @@ fn postgres_execution_target(
         application_id,
         run_id,
     )?;
-    if !current_execution_authorized_postgres(
+    let current = resolve_current_execution_authority_postgres_after_prelock(
         tx,
         account_id,
         &application,
         ExecutionAuthorityRunner::Cloud,
-    )? {
+    )?;
+    if !current.authorized {
         return Err(ExecutionLeaseError::Conflict);
     }
-    Ok(execution_browser_profile_id(account_id, &identity_id))
+    let employer_domain = current
+        .employer_domain
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    Ok(ExecutionTargetAuthority {
+        application,
+        browser_profile_id: execution_browser_profile_id(account_id, &identity_id),
+        employer_domain,
+    })
 }
 
 fn sqlite_next_execution_fence(
@@ -1073,6 +1139,63 @@ fn postgres_bind_cloud_attempt(
     if updated != 1 {
         return Err(ExecutionLeaseError::Conflict);
     }
+    Ok(())
+}
+
+fn prelock_postgres_cloud_attempt(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+) -> ExecutionLeaseResult<()> {
+    let row = tx
+        .query_opt(
+            "SELECT runner, status FROM jobs_attempt_reservations
+              WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+            &[&account_id, &application_id],
+        )?
+        .ok_or(ExecutionLeaseError::Conflict)?;
+    let runner: String = row.get(0);
+    let status: String = row.get(1);
+    if !matches!(status.as_str(), "reserved" | "running")
+        || !matches!(runner.as_str(), "unassigned" | "cloud")
+    {
+        return Err(ExecutionLeaseError::Conflict);
+    }
+    Ok(())
+}
+
+fn prelock_postgres_cloud_ats_phase_a_rows(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application: &JobApplication,
+    run_id: &str,
+) -> ExecutionLeaseResult<()> {
+    tx.query_opt(
+        "SELECT id FROM jobs_postings WHERE account_id = $1 AND id = $2 FOR UPDATE",
+        &[&account_id, &application.job_id],
+    )?
+    .ok_or(ExecutionLeaseError::NotFound)?;
+    tx.query(
+        "SELECT binding_id FROM jobs_application_ats_certification_bindings
+          WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+          ORDER BY binding_id FOR UPDATE",
+        &[&account_id, &application.id, &run_id],
+    )?;
+    Ok(())
+}
+
+fn prelock_postgres_execution_lease_set(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    browser_profile_id: &str,
+) -> ExecutionLeaseResult<()> {
+    tx.query(
+        "SELECT run_id FROM jobs_execution_leases
+          WHERE account_id = $1 AND (application_id = $2 OR browser_profile_id = $3)
+          ORDER BY run_id FOR UPDATE",
+        &[&account_id, &application_id, &browser_profile_id],
+    )?;
     Ok(())
 }
 
@@ -1185,7 +1308,7 @@ fn create_cloud_ats_phase_a_postgres_tx(
     let trusted_runtime = context
         .trusted_runtime
         .ok_or(ExecutionLeaseError::Conflict)?;
-    create_ats_application_certification_binding_from_context_postgres_tx(
+    create_ats_application_certification_binding_from_context_postgres_tx_after_prelock(
         tx,
         &AtsCertificationPhaseAContextRequest {
             account_id: context.account_id.to_string(),
@@ -1390,6 +1513,31 @@ fn claim_execution_lease_inner(
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
+                &tx, account_id,
+            )?;
+            let execution_target =
+                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
+            if execution_target.browser_profile_id != supplied_browser_profile_id {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let hold_context = operational_hold_context_for_application_sqlite_tx_after_authority(
+                &tx,
+                account_id,
+                application_id,
+                &execution_target.employer_domain,
+                Some("cloud"),
+                None,
+                None,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::RunnerClaim,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            let browser_profile_id = execution_target.browser_profile_id;
             let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
                 (Some(binding), Some(subject)) => Some(
                     prepare_runner_volume_lease_binding_sqlite_tx(&tx, binding, subject)
@@ -1430,29 +1578,6 @@ fn claim_execution_lease_inner(
                     binding.now_ms,
                 )
                 .map_err(execution_lease_from_runner_volume_error)?;
-            }
-            crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
-                &tx, account_id,
-            )?;
-            let hold_context = operational_hold_context_for_application_sqlite_tx(
-                &tx,
-                account_id,
-                application_id,
-                Some("cloud"),
-                None,
-                None,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
-            require_operational_capability_sqlite_tx(
-                &tx,
-                OperationalCapability::RunnerClaim,
-                &hold_context,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
-            let browser_profile_id =
-                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
-            if browser_profile_id != supplied_browser_profile_id {
-                return Err(ExecutionLeaseError::Conflict);
             }
             sqlite_bind_cloud_attempt(&tx, account_id, application_id, now)?;
             create_cloud_ats_phase_a_sqlite_tx(
@@ -1723,12 +1848,83 @@ fn claim_execution_lease_inner(
                     &input.managed_cloud_release.execution.admission.scope,
                 )
                 .map_err(execution_lease_from_managed_cloud_error)?;
+            } else {
+                lock_operational_hold_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_operational_hold_error)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_managed_cloud_error)?;
+                lock_postgres_ats_certification(&mut tx)
+                    .map_err(execution_lease_from_ats_certification_error)?;
             }
-            lock_operational_hold_shared_postgres_tx(&mut tx)
-                .map_err(execution_lease_from_operational_hold_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
-            let managed_cloud_authority = match managed_cloud_context {
-                Some(context) => {
+            let discovered_application =
+                discover_postgres_execution_application(&mut tx, account_id, application_id)?;
+            if !lock_current_execution_authority_postgres_after_prelock(
+                &mut tx,
+                account_id,
+                &discovered_application,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            match (volume_binding, proposed_subject.as_deref()) {
+                (Some(binding), Some(subject)) => {
+                    prepare_runner_volume_lease_binding_postgres_tx(&mut tx, binding, subject)
+                        .map_err(execution_lease_from_runner_volume_error)?;
+                }
+                (None, None) => {}
+                _ => return Err(ExecutionLeaseError::Conflict),
+            }
+            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
+                &mut tx, account_id,
+            )?;
+            let execution_target =
+                postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
+            if execution_target.browser_profile_id != supplied_browser_profile_id {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if !job_application_snapshot_matches(
+                &discovered_application,
+                &execution_target.application,
+            ) {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            prelock_postgres_cloud_ats_phase_a_rows(
+                &mut tx,
+                account_id,
+                &execution_target.application,
+                run_id,
+            )?;
+            let entitled = tx
+                .query_opt(
+                    "SELECT cloud_browser FROM jobs_entitlements
+                      WHERE account_id = $1 FOR UPDATE",
+                    &[&account_id],
+                )?
+                .is_some_and(|row| row.get::<_, bool>(0));
+            if !entitled {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            prelock_postgres_cloud_attempt(&mut tx, account_id, application_id)?;
+            let hold_context =
+                operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    &execution_target.employer_domain,
+                    Some("cloud"),
+                    None,
+                    None,
+                )
+                .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_postgres_tx_after_authority_prelock(
+                &mut tx,
+                OperationalCapability::RunnerClaim,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            let browser_profile_id = execution_target.browser_profile_id;
+            if let Some(context) = managed_cloud_context {
+                let _preliminary_managed =
                     resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prelock(
                         &mut tx,
                         account_id,
@@ -1738,21 +1934,122 @@ fn claim_execution_lease_inner(
                         context.authenticated_worker_id,
                         context.volume_worker_id,
                     )
-                    .map_err(execution_lease_from_managed_cloud_error)?
+                    .map_err(execution_lease_from_managed_cloud_error)?;
+            }
+            match (volume_binding, expected_runtime) {
+                (Some(binding), Some((expected_grant_id, expected_runtime_sha256))) => {
+                    let runtime = require_runner_process_runtime_postgres_tx(
+                        &mut tx,
+                        &binding.worker_id,
+                        &binding.volume_id,
+                        binding.enrollment_epoch,
+                        &binding.process_instance_id,
+                    )
+                    .map_err(execution_lease_from_runner_volume_error)?;
+                    if runtime.runtime_grant_id != expected_grant_id
+                        || runtime.runtime_sha256 != expected_runtime_sha256
+                    {
+                        return Err(ExecutionLeaseError::Conflict);
+                    }
                 }
+                (Some(_), None) if cfg!(debug_assertions) && volume_authority.is_none() => {}
+                (None, None) => {}
+                _ => return Err(ExecutionLeaseError::Conflict),
+            }
+            if let Some(authority) = volume_authority {
+                prelock_runner_volume_authority_use_postgres_tx(&mut tx, authority)
+                    .map_err(execution_lease_from_runner_volume_error)?;
+            }
+            if tx
+                .query_opt(
+                    "SELECT id FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &run_id],
+                )?
+                .is_none()
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            prelock_postgres_execution_lease_set(
+                &mut tx,
+                account_id,
+                application_id,
+                &browser_profile_id,
+            )?;
+            let existing = tx
+                .query_opt(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
+                       FROM jobs_execution_leases WHERE run_id = $1 FOR UPDATE",
+                    &[&run_id],
+                )?
+                .map(execution_lease_from_pg_row);
+            let managed_resolution = match managed_cloud_context {
+                Some(context) => Some(
+                    resolve_managed_cloud_execution_lease_claim_postgres_tx_after_prelock(
+                        &mut tx,
+                        account_id,
+                        application_id,
+                        run_id,
+                        context.input,
+                        context.authenticated_worker_id,
+                        context.volume_worker_id,
+                    )
+                    .map_err(execution_lease_from_managed_cloud_error)?,
+                ),
                 None => None,
             };
-            lock_postgres_ats_certification(&mut tx)
-                .map_err(execution_lease_from_ats_certification_error)?;
-            let prepared_binding = match (volume_binding, proposed_subject.as_deref()) {
-                (Some(binding), Some(subject)) => Some(
-                    prepare_runner_volume_lease_binding_postgres_tx(&mut tx, binding, subject)
-                        .map_err(execution_lease_from_runner_volume_error)?,
-                ),
-                (None, None) => None,
-                _ => return Err(ExecutionLeaseError::Conflict),
+            let now = match managed_resolution.as_ref() {
+                Some(resolution) => resolution.db_time_ms,
+                None => original_source_db_now_postgres(&mut tx)
+                    .map_err(execution_lease_from_original_source_error)?,
             };
-            let trusted_runtime = match (volume_binding, expected_runtime) {
+            let current = resolve_current_execution_authority_postgres_after_prelock_at_ms(
+                &mut tx,
+                account_id,
+                &execution_target.application,
+                ExecutionAuthorityRunner::Cloud,
+                now,
+            )?;
+            let current_employer_domain = current
+                .authorized
+                .then_some(current.employer_domain)
+                .flatten()
+                .ok_or(ExecutionLeaseError::Conflict)?;
+            if current_employer_domain != execution_target.employer_domain {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let final_hold_context =
+                operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    &current_employer_domain,
+                    Some("cloud"),
+                    None,
+                    None,
+                )
+                .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_postgres_tx_after_authority_prelock(
+                &mut tx,
+                OperationalCapability::RunnerClaim,
+                &final_hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            let final_volume_binding = volume_binding.cloned().map(|mut binding| {
+                binding.now_ms = now;
+                binding
+            });
+            let prepared_binding =
+                match (final_volume_binding.as_ref(), proposed_subject.as_deref()) {
+                    (Some(binding), Some(subject)) => Some(
+                        prepare_runner_volume_lease_binding_postgres_tx(&mut tx, binding, subject)
+                            .map_err(execution_lease_from_runner_volume_error)?,
+                    ),
+                    (None, None) => None,
+                    _ => return Err(ExecutionLeaseError::Conflict),
+                };
+            let trusted_runtime = match (final_volume_binding.as_ref(), expected_runtime) {
                 (Some(binding), Some((expected_grant_id, expected_runtime_sha256))) => {
                     let runtime = require_runner_process_runtime_postgres_tx(
                         &mut tx,
@@ -1773,7 +2070,12 @@ fn claim_execution_lease_inner(
                 (None, None) => None,
                 _ => return Err(ExecutionLeaseError::Conflict),
             };
-            if let (Some(binding), Some(authority)) = (volume_binding, volume_authority) {
+            let managed_cloud_authority =
+                managed_resolution.and_then(|resolution| resolution.authority);
+            let lease_expires_at_ms = now.saturating_add(EXECUTION_LEASE_TTL_MS);
+            if let (Some(binding), Some(authority)) =
+                (final_volume_binding.as_ref(), volume_authority)
+            {
                 consume_runner_volume_authority_postgres_tx(
                     &mut tx,
                     authority,
@@ -1781,32 +2083,9 @@ fn claim_execution_lease_inner(
                     &binding.volume_id,
                     binding.enrollment_epoch,
                     &binding.process_instance_id,
-                    binding.now_ms,
+                    now,
                 )
                 .map_err(execution_lease_from_runner_volume_error)?;
-            }
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx, account_id,
-            )?;
-            let hold_context = operational_hold_context_for_application_postgres_tx(
-                &mut tx,
-                account_id,
-                application_id,
-                Some("cloud"),
-                None,
-                None,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
-            require_operational_capability_postgres_tx(
-                &mut tx,
-                OperationalCapability::RunnerClaim,
-                &hold_context,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
-            let browser_profile_id =
-                postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
-            if browser_profile_id != supplied_browser_profile_id {
-                return Err(ExecutionLeaseError::Conflict);
             }
             postgres_bind_cloud_attempt(&mut tx, account_id, application_id, now)?;
             create_cloud_ats_phase_a_postgres_tx(
@@ -1821,14 +2100,6 @@ fn claim_execution_lease_inner(
                     now_ms: now,
                 },
             )?;
-            let existing = tx
-                .query_opt(
-                    "SELECT run_id, account_id, application_id, browser_profile_id,
-                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
-                       FROM jobs_execution_leases WHERE run_id = $1 FOR UPDATE",
-                    &[&run_id],
-                )?
-                .map(execution_lease_from_pg_row);
             let (fence, bound_managed_cloud) = if let Some(existing) = existing {
                 if existing.account_id != account_id
                     || existing.application_id != application_id
@@ -2029,7 +2300,7 @@ fn claim_execution_lease_inner(
                 }
                 (fence, bound_managed_cloud)
             };
-            let bound_volume = match (volume_binding, prepared_binding.as_ref()) {
+            let bound_volume = match (final_volume_binding.as_ref(), prepared_binding.as_ref()) {
                 (Some(binding), Some(prepared)) => Some(
                     finalize_runner_volume_lease_binding_postgres_tx(&mut tx, binding, prepared)
                         .map_err(execution_lease_from_runner_volume_error)?,
@@ -2302,15 +2573,10 @@ pub fn heartbeat_execution_lease(
     fence: i64,
 ) -> ExecutionLeaseResult<ExecutionLeaseRecord> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
-    let now = now_ms();
-    let lease_expires_at_ms = now.saturating_add(EXECUTION_LEASE_TTL_MS);
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            require_current_runner_volume_binding_sqlite_for_operation(
-                &tx, account_id, run_id, now,
-            )?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
@@ -2325,6 +2591,12 @@ pub fn heartbeat_execution_lease(
                 )
                 .optional()?
                 .ok_or(ExecutionLeaseError::NotFound)?;
+            let now = original_source_db_now_sqlite(&tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            let lease_expires_at_ms = now.saturating_add(EXECUTION_LEASE_TTL_MS);
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
             if lease.fence != fence
                 || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
                 || !matches!(lease.phase.as_str(), "prepared" | "click_started")
@@ -2363,8 +2635,15 @@ pub fn heartbeat_execution_lease(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // This first pass only acquires and checks the runner-volume rows. The result never
+            // authorizes a renewal; every temporal check is repeated after the exact lease lock.
+            let preliminary_now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
             require_current_runner_volume_binding_postgres_for_operation(
-                &mut tx, account_id, run_id, now,
+                &mut tx,
+                account_id,
+                run_id,
+                preliminary_now,
             )?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
@@ -2380,6 +2659,12 @@ pub fn heartbeat_execution_lease(
                 )?
                 .map(execution_lease_from_pg_row)
                 .ok_or(ExecutionLeaseError::NotFound)?;
+            let now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            let lease_expires_at_ms = now.saturating_add(EXECUTION_LEASE_TTL_MS);
+            require_current_runner_volume_binding_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
             if lease.fence != fence
                 || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
                 || !matches!(lease.phase.as_str(), "prepared" | "click_started")
@@ -2426,7 +2711,7 @@ pub fn authorize_managed_execution_effect(
     run_id: &str,
     lease_token: &str,
     fence: i64,
-    managed_cloud: Option<&ManagedCloudExecutionLeaseClaimInput>,
+    managed_cloud: &ManagedCloudExecutionLeaseClaimInput,
     authenticated_worker_id: &str,
 ) -> ExecutionLeaseResult<AuthorizedExecutionLeaseRecord> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
@@ -2434,7 +2719,6 @@ pub fn authorize_managed_execution_effect(
         return Err(ExecutionLeaseError::InvalidRequest);
     }
     let lease_token_sha256 = execution_lease_token_hash(lease_token);
-    let now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
@@ -2442,30 +2726,16 @@ pub fn authorize_managed_execution_effect(
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
-            let volume_worker_id = match managed_cloud {
-                Some(_) => managed_execution_volume_worker_sqlite_tx(
-                    &tx,
-                    account_id,
-                    run_id,
-                    authenticated_worker_id,
-                    now,
-                )?,
-                None => authenticated_worker_id.to_string(),
-            };
-            let managed_cloud = resolve_managed_cloud_execution_effect_sqlite_tx(
+            let execution_target =
+                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
+            let preliminary_now = original_source_db_now_sqlite(&tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            managed_execution_volume_worker_sqlite_tx(
                 &tx,
                 account_id,
-                application_id,
                 run_id,
-                fence,
-                &lease_token_sha256,
-                managed_cloud,
                 authenticated_worker_id,
-                &volume_worker_id,
-            )
-            .map_err(execution_lease_from_managed_cloud_error)?;
-            require_current_runner_volume_binding_sqlite_for_operation(
-                &tx, account_id, run_id, now,
+                preliminary_now,
             )?;
             let lease = tx
                 .query_row(
@@ -2478,6 +2748,41 @@ pub fn authorize_managed_execution_effect(
                 )
                 .optional()?
                 .ok_or(ExecutionLeaseError::NotFound)?;
+            let now = original_source_db_now_sqlite(&tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            let current = resolve_current_execution_authority_sqlite_after_prelock_at_ms(
+                &tx,
+                account_id,
+                &execution_target.application,
+                ExecutionAuthorityRunner::Cloud,
+                now,
+            )?;
+            if !current.authorized {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let volume_worker_id = managed_execution_volume_worker_sqlite_tx(
+                &tx,
+                account_id,
+                run_id,
+                authenticated_worker_id,
+                now,
+            )?;
+            let managed_cloud = resolve_managed_cloud_execution_effect_sqlite_tx(
+                &tx,
+                account_id,
+                application_id,
+                run_id,
+                fence,
+                &lease_token_sha256,
+                Some(managed_cloud),
+                authenticated_worker_id,
+                &volume_worker_id,
+            )
+            .map_err(execution_lease_from_managed_cloud_error)?
+            .ok_or(ExecutionLeaseError::Conflict)?;
+            require_current_runner_volume_binding_sqlite_for_operation(
+                &tx, account_id, run_id, now,
+            )?;
             if lease.fence != fence
                 || lease.lease_token_sha256 != lease_token_sha256
                 || lease.phase != "prepared"
@@ -2492,7 +2797,7 @@ pub fn authorize_managed_execution_effect(
                     lease_expires_at_ms: lease.lease_expires_at_ms,
                     phase: lease.phase,
                 },
-                managed_cloud,
+                managed_cloud: Some(managed_cloud),
             };
             tx.commit()?;
             Ok(record)
@@ -2500,43 +2805,60 @@ pub fn authorize_managed_execution_effect(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
-            let managed_requested = managed_cloud.is_some();
-            if let Some(input) = managed_cloud {
-                lock_managed_cloud_workflow_admission_postgres_tx(
-                    &mut tx,
-                    &input.managed_cloud_release.execution.admission.scope,
-                )
-                .map_err(execution_lease_from_managed_cloud_error)?;
-            }
+            lock_managed_cloud_workflow_admission_postgres_tx(
+                &mut tx,
+                &managed_cloud
+                    .managed_cloud_release
+                    .execution
+                    .admission
+                    .scope,
+            )
+            .map_err(execution_lease_from_managed_cloud_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
-            let volume_worker_id = match managed_cloud {
-                Some(_) => discover_managed_execution_volume_worker_postgres_tx(
-                    &mut tx,
-                    run_id,
-                    authenticated_worker_id,
-                )?,
-                None => authenticated_worker_id.to_string(),
-            };
-            let managed_cloud = resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
+            let volume_worker_id = discover_managed_execution_volume_worker_postgres_tx(
+                &mut tx,
+                run_id,
+                authenticated_worker_id,
+            )?;
+            resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
                 &mut tx,
                 account_id,
                 application_id,
                 run_id,
                 fence,
                 &lease_token_sha256,
-                managed_cloud,
+                Some(managed_cloud),
                 authenticated_worker_id,
                 &volume_worker_id,
             )
-            .map_err(execution_lease_from_managed_cloud_error)?;
-            if !managed_requested {
-                require_current_runner_volume_binding_postgres_for_operation(
-                    &mut tx, account_id, run_id, now,
-                )?;
-            }
-            crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
-                &mut tx, account_id,
+            .map_err(execution_lease_from_managed_cloud_error)?
+            .ok_or(ExecutionLeaseError::Conflict)?;
+            let preliminary_now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            revalidate_managed_execution_volume_worker_postgres_tx(
+                &mut tx,
+                account_id,
+                run_id,
+                authenticated_worker_id,
+                &volume_worker_id,
+                preliminary_now,
             )?;
+            let managed_resolution =
+                resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    fence,
+                    &lease_token_sha256,
+                    Some(managed_cloud),
+                    authenticated_worker_id,
+                    &volume_worker_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?
+                .ok_or(ExecutionLeaseError::Conflict)?;
+            let now = managed_resolution.db_time_ms;
+            let managed_cloud = managed_resolution.authority;
             let lease = tx
                 .query_opt(
                     "SELECT run_id, account_id, application_id, browser_profile_id,
@@ -2555,16 +2877,14 @@ pub fn authorize_managed_execution_effect(
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
-            if managed_requested {
-                revalidate_managed_execution_volume_worker_postgres_tx(
-                    &mut tx,
-                    account_id,
-                    run_id,
-                    authenticated_worker_id,
-                    &volume_worker_id,
-                    now,
-                )?;
-            }
+            revalidate_managed_execution_volume_worker_postgres_tx(
+                &mut tx,
+                account_id,
+                run_id,
+                authenticated_worker_id,
+                &volume_worker_id,
+                now,
+            )?;
             let record = AuthorizedExecutionLeaseRecord {
                 lease: ExecutionLeaseRecord {
                     run_id: run_id.to_string(),
@@ -2572,12 +2892,211 @@ pub fn authorize_managed_execution_effect(
                     lease_expires_at_ms: lease.lease_expires_at_ms,
                     phase: lease.phase,
                 },
-                managed_cloud,
+                managed_cloud: Some(managed_cloud),
             };
             tx.commit()?;
             Ok(record)
         }
     })
+}
+
+#[cfg(test)]
+type ManagedExecutionEffectBoundary = fn(
+    &DbPool,
+    &str,
+    &str,
+    &str,
+    &str,
+    i64,
+    &ManagedCloudExecutionLeaseClaimInput,
+    &str,
+) -> ExecutionLeaseResult<AuthorizedExecutionLeaseRecord>;
+
+#[cfg(test)]
+type IrreversibleSubmitWorkerBoundary = fn(
+    &DbPool,
+    &str,
+    &str,
+    &str,
+    &str,
+    i64,
+    &FinalSubmitProof,
+    &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    Option<&ManagedCloudExecutionLeaseClaimInput>,
+    &str,
+) -> ExecutionLeaseResult<AuthorizedIrreversibleExecutionLeaseRecord>;
+
+#[cfg(test)]
+#[test]
+fn managed_execution_effect_boundary_requires_authority_in_type() {
+    let boundary: ManagedExecutionEffectBoundary = authorize_managed_execution_effect;
+    let _ = boundary;
+}
+
+#[cfg(test)]
+#[test]
+fn irreversible_submit_worker_boundary_preserves_optional_input_for_authoritative_pairing() {
+    let boundary: IrreversibleSubmitWorkerBoundary = start_irreversible_submission_authorized;
+    let _ = boundary;
+
+    let source = include_str!("execution_leases.rs");
+    let effect = source
+        .rsplit("fn start_irreversible_submission_inner(")
+        .next()
+        .expect("irreversible-submit implementation")
+        .split("fn execution_finish_allowed(")
+        .next()
+        .expect("bounded irreversible-submit implementation");
+    assert!(effect.contains("require_unmanaged_cloud_execution_sqlite_tx("));
+    assert!(effect.contains("require_unmanaged_cloud_execution_postgres_tx("));
+    assert_eq!(effect.matches("unwrap_or((None, \"\"))").count(), 2);
+    assert!(effect.contains("load_managed_cloud_irreversible_effect_receipt_sqlite_tx("));
+    assert!(effect.contains("load_managed_cloud_irreversible_effect_receipt_postgres_tx("));
+}
+
+#[cfg(test)]
+#[test]
+fn managed_execution_effect_rechecks_composed_authority_after_canonical_prelock() {
+    let source = include_str!("execution_leases.rs");
+    let section = source
+        .split("pub fn authorize_managed_execution_effect(")
+        .nth(1)
+        .expect("managed execution effect boundary")
+        .split("\n#[cfg(test)]")
+        .next()
+        .expect("bounded managed execution effect boundary");
+    let mut previous = 0;
+    for operation in [
+        "lock_managed_cloud_workflow_admission_postgres_tx",
+        "lock_discovery_account_shared_postgres",
+        "resolve_managed_cloud_execution_effect_postgres_tx_after_prelock",
+    ] {
+        let position = section
+            .find(operation)
+            .unwrap_or_else(|| panic!("missing managed effect operation {operation}"));
+        assert!(
+            position >= previous,
+            "managed effect order inverted at {operation}"
+        );
+        previous = position;
+    }
+    assert!(!section.contains("current_execution_authorized_postgres("));
+
+    let managed_source = include_str!("managed_cloud_release_authority.rs");
+    let prelock = managed_source
+        .split("fn prelock_postgres_managed_cloud_effect_admission_inputs(")
+        .nth(1)
+        .expect("managed effect application/entitlement prelock")
+        .split("fn require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms(")
+        .next()
+        .expect("bounded managed effect application/entitlement prelock");
+    assert!(prelock.contains("lock_current_execution_authority_postgres_after_prelock"));
+
+    let resolver = managed_source
+        .split("pub(crate) fn resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(")
+        .nth(1)
+        .expect("managed effect PostgreSQL resolver")
+        .split("const MANAGED_CLOUD_IRREVERSIBLE_RECEIPT_COLUMNS")
+        .next()
+        .expect("bounded managed effect PostgreSQL resolver");
+    let final_time = resolver
+        .rfind("let now_ms = managed_cloud_db_now_postgres")
+        .expect("managed effect final database time");
+    assert!(resolver[final_time..]
+        .contains("require_postgres_managed_cloud_effect_admission_after_full_prelock_at_ms"));
+}
+
+#[cfg(test)]
+#[test]
+fn fix_728_cloud_claim_and_submit_hold_checks_precede_effect_mutation_without_relocks() {
+    let source = include_str!("execution_leases.rs");
+    let claim = source
+        .split("fn claim_execution_lease_inner(")
+        .nth(1)
+        .expect("cloud claim implementation")
+        .split("\nfn execution_lease_from_runner_volume_error(")
+        .next()
+        .expect("bounded cloud claim implementation")
+        .split("DbPool::Postgres(_) =>")
+        .nth(1)
+        .expect("PostgreSQL cloud claim implementation");
+    let mut previous = 0;
+    for operation in [
+        "lock_discovery_account_shared_postgres",
+        "postgres_execution_target",
+        "operational_hold_context_for_application_postgres_tx_after_authority_prelock",
+        "require_operational_capability_postgres_tx_after_authority_prelock",
+        "prepare_runner_volume_lease_binding_postgres_tx",
+        "postgres_bind_cloud_attempt",
+        "create_cloud_ats_phase_a_postgres_tx",
+    ] {
+        let relative = claim[previous..]
+            .find(operation)
+            .unwrap_or_else(|| panic!("missing cloud claim operation {operation}"));
+        previous += relative + operation.len();
+    }
+    for forbidden in [
+        "operational_hold_context_for_application_postgres_tx(",
+        "require_operational_capability_postgres_tx(",
+        "create_ats_application_certification_binding_from_context_postgres_tx(",
+    ] {
+        assert!(
+            !claim.contains(forbidden),
+            "cloud claim uses legacy {forbidden}"
+        );
+    }
+    let phase_a = source
+        .split("fn create_cloud_ats_phase_a_postgres_tx(")
+        .nth(1)
+        .expect("PostgreSQL cloud Phase A helper")
+        .split("fn claim_execution_lease_inner(")
+        .next()
+        .expect("bounded PostgreSQL cloud Phase A helper");
+    assert!(phase_a.contains(
+        "create_ats_application_certification_binding_from_context_postgres_tx_after_prelock"
+    ));
+    assert!(
+        !phase_a.contains("create_ats_application_certification_binding_from_context_postgres_tx(")
+    );
+
+    let submit = source
+        .rsplit("fn start_irreversible_submission_inner(")
+        .next()
+        .expect("cloud final-submit implementation")
+        .split("pub fn finish_execution_lease(")
+        .next()
+        .expect("bounded cloud final-submit implementation")
+        .split("DbPool::Postgres(_) =>")
+        .nth(1)
+        .expect("PostgreSQL cloud final-submit implementation");
+    let mut previous = 0;
+    for operation in [
+        "lock_discovery_account_shared_postgres",
+        "postgres_execution_target",
+        "operational_hold_context_for_application_postgres_tx_after_authority_prelock",
+        "require_operational_capability_postgres_tx_after_authority_prelock",
+        "resolve_managed_cloud_execution_effect_postgres_tx_after_prelock",
+        "FROM jobs_execution_leases",
+        "validate_consume_reserve_ats_application_certification_from_context_postgres_tx_after_prelock",
+        "bind_final_submit_proof_postgres_tx",
+        "reserve_submission_evidence_capacity_postgres_tx",
+        "SET phase = 'click_started'",
+    ] {
+        let relative = submit[previous..]
+            .find(operation)
+            .unwrap_or_else(|| panic!("missing cloud submit operation {operation}"));
+        previous += relative + operation.len();
+    }
+    for forbidden in [
+        "operational_hold_context_for_application_postgres_tx(",
+        "require_operational_capability_postgres_tx(",
+        "validate_consume_reserve_ats_application_certification_from_context_postgres_tx(",
+    ] {
+        assert!(
+            !submit.contains(forbidden),
+            "cloud submit uses legacy {forbidden}"
+        );
+    }
 }
 
 pub const SUBMISSION_EVIDENCE_PAYLOAD_RESERVED_BYTES: i64 = 40 * 1024 * 1024;
@@ -2617,6 +3136,16 @@ fn validate_submission_evidence_capacity_binding(
         return Err(ExecutionLeaseError::InvalidRequest);
     }
     Ok(())
+}
+
+fn submission_evidence_capacity_at_ms(
+    capacity: &crate::db::object_uploads::NewSubmissionEvidenceCapacity,
+    now_ms: i64,
+) -> crate::db::object_uploads::NewSubmissionEvidenceCapacity {
+    let mut capacity = capacity.clone();
+    capacity.now_ms = now_ms;
+    capacity.expires_at_ms = now_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS);
+    capacity
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2997,13 +3526,15 @@ fn start_irreversible_submission_inner(
         return Err(ExecutionLeaseError::InvalidRequest);
     }
     let lease_token_sha256 = execution_lease_token_hash(lease_token);
-    let now = now_ms();
+    // This wall-clock validation is input-shape/early-denial only. Each database branch repeats
+    // the complete capacity and execution validation using a post-lock database scalar.
+    let preliminary_now = now_ms();
     validate_submission_evidence_capacity_binding(
         account_id,
         application_id,
         run_id,
         capacity,
-        now,
+        preliminary_now,
     )?;
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
@@ -3020,29 +3551,36 @@ fn start_irreversible_submission_inner(
                 )
                 .optional()?
                 .ok_or(ExecutionLeaseError::NotFound)?;
+            let now = original_source_db_now_sqlite(&tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            let capacity = submission_evidence_capacity_at_ms(capacity, now);
+            validate_submission_evidence_capacity_binding(
+                account_id,
+                application_id,
+                run_id,
+                &capacity,
+                now,
+            )?;
             if lease.fence != fence
                 || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
             if lease.phase == "click_started" {
-                let managed_cloud = match managed_cloud_context {
-                    Some((input, authenticated_worker_id)) => {
-                        load_managed_cloud_irreversible_effect_receipt_sqlite_tx(
-                            &tx,
-                            account_id,
-                            application_id,
-                            run_id,
-                            fence,
-                            &lease_token_sha256,
-                            input,
-                            authenticated_worker_id,
-                        )
-                        .map_err(execution_lease_from_managed_cloud_error)?
-                        .map(|receipt| receipt.authority)
-                    }
-                    None => None,
-                };
+                let (input, authenticated_worker_id) =
+                    managed_cloud_context.unwrap_or((None, ""));
+                let managed_cloud = load_managed_cloud_irreversible_effect_receipt_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    fence,
+                    &lease_token_sha256,
+                    input,
+                    authenticated_worker_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?
+                .map(|receipt| receipt.authority);
                 if final_submit_proof.schema_version != 4 {
                     return Err(ExecutionLeaseError::Conflict);
                 }
@@ -3070,9 +3608,42 @@ fn start_irreversible_submission_inner(
                     managed_cloud,
                 });
             }
+            if managed_cloud_context
+                .and_then(|(input, _)| input)
+                .is_none()
+            {
+                require_unmanaged_cloud_execution_sqlite_tx(
+                    &tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
             )?;
+            let execution_target =
+                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
+            if lease.browser_profile_id != execution_target.browser_profile_id {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let hold_context = operational_hold_context_for_application_sqlite_tx_after_authority(
+                &tx,
+                account_id,
+                application_id,
+                &execution_target.employer_domain,
+                Some("cloud"),
+                None,
+                None,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_sqlite_tx(
+                &tx,
+                OperationalCapability::FinalSubmit,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
             let managed_cloud = match managed_cloud_context {
                 Some((input, authenticated_worker_id)) => {
                     let volume_worker_id = match input {
@@ -3100,32 +3671,12 @@ fn start_irreversible_submission_inner(
                 }
                 None => None,
             };
-            let hold_context = operational_hold_context_for_application_sqlite_tx(
-                &tx,
-                account_id,
-                application_id,
-                Some("cloud"),
-                None,
-                None,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
-            require_operational_capability_sqlite_tx(
-                &tx,
-                OperationalCapability::FinalSubmit,
-                &hold_context,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
             if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
                 return Err(ExecutionLeaseError::Conflict);
             }
             require_current_runner_volume_binding_sqlite_for_operation(
                 &tx, account_id, run_id, now,
             )?;
-            let browser_profile_id =
-                sqlite_execution_target(&tx, account_id, application_id, run_id)?;
-            if lease.browser_profile_id != browser_profile_id {
-                return Err(ExecutionLeaseError::Conflict);
-            }
             let ats_certified_receipt_authority = match ats_phase_b_context(
                 account_id,
                 application_id,
@@ -3156,7 +3707,7 @@ fn start_irreversible_submission_inner(
                 now,
             )?;
             crate::db::object_uploads::reserve_submission_evidence_capacity_sqlite_tx(
-                &tx, capacity,
+                &tx, &capacity,
             )?;
             if tx.execute(
                 "UPDATE jobs_execution_leases
@@ -3223,23 +3774,20 @@ fn start_irreversible_submission_inner(
             {
                 lock_postgres_ats_certification(&mut tx)
                     .map_err(execution_lease_from_ats_certification_error)?;
-                let managed_cloud = match managed_cloud_context {
-                    Some((input, authenticated_worker_id)) => {
-                        load_managed_cloud_irreversible_effect_receipt_postgres_tx(
-                            &mut tx,
-                            account_id,
-                            application_id,
-                            run_id,
-                            fence,
-                            &lease_token_sha256,
-                            input,
-                            authenticated_worker_id,
-                        )
-                        .map_err(execution_lease_from_managed_cloud_error)?
-                        .map(|receipt| receipt.authority)
-                    }
-                    None => None,
-                };
+                let (input, authenticated_worker_id) =
+                    managed_cloud_context.unwrap_or((None, ""));
+                let managed_cloud = load_managed_cloud_irreversible_effect_receipt_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    fence,
+                    &lease_token_sha256,
+                    input,
+                    authenticated_worker_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?
+                .map(|receipt| receipt.authority);
                 let lease_expires_at_ms: i64 = tx
                     .query_opt(
                         "SELECT lease_expires_at_ms FROM jobs_execution_leases
@@ -3283,50 +3831,140 @@ fn start_irreversible_submission_inner(
                 tx.commit()?;
                 return Ok(record);
             }
-            let managed_requested = matches!(managed_cloud_context, Some((Some(_), _)));
             if let Some((Some(input), _)) = managed_cloud_context {
                 lock_managed_cloud_workflow_admission_postgres_tx(
                     &mut tx,
                     &input.managed_cloud_release.execution.admission.scope,
                 )
                 .map_err(execution_lease_from_managed_cloud_error)?;
+            } else {
+                lock_operational_hold_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_operational_hold_error)?;
+                lock_managed_cloud_release_registry_shared_postgres_tx(&mut tx)
+                    .map_err(execution_lease_from_managed_cloud_error)?;
+                lock_postgres_ats_certification(&mut tx)
+                    .map_err(execution_lease_from_ats_certification_error)?;
             }
-            lock_operational_hold_shared_postgres_tx(&mut tx)
-                .map_err(execution_lease_from_operational_hold_error)?;
             lock_discovery_account_shared_postgres(&mut tx, account_id)?;
-            let managed_cloud = match managed_cloud_context {
-                Some((input, authenticated_worker_id)) => {
-                    let volume_worker_id = match input {
-                        Some(_) => discover_managed_execution_volume_worker_postgres_tx(
-                            &mut tx,
-                            run_id,
-                            authenticated_worker_id,
-                        )?,
-                        None => authenticated_worker_id.to_string(),
-                    };
-                    resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
-                        &mut tx,
-                        account_id,
-                        application_id,
-                        run_id,
-                        fence,
-                        &lease_token_sha256,
-                        input,
-                        authenticated_worker_id,
-                        &volume_worker_id,
-                    )
-                    .map_err(execution_lease_from_managed_cloud_error)?
-                }
-                None => None,
-            };
-            lock_postgres_ats_certification(&mut tx)
-                .map_err(execution_lease_from_ats_certification_error)?;
+            if managed_cloud_context
+                .and_then(|(input, _)| input)
+                .is_none()
+            {
+                require_unmanaged_cloud_execution_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?;
+            }
+            let discovered_application =
+                discover_postgres_execution_application(&mut tx, account_id, application_id)?;
+            if !lock_current_execution_authority_postgres_after_prelock(
+                &mut tx,
+                account_id,
+                &discovered_application,
+            )? {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx,
+                account_id,
+                run_id,
+                preliminary_now,
+            )?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
             )?;
-            if !managed_requested {
+            let execution_target =
+                postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
+            if !job_application_snapshot_matches(
+                &discovered_application,
+                &execution_target.application,
+            ) {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let entitled = tx
+                .query_opt(
+                    "SELECT cloud_browser FROM jobs_entitlements
+                      WHERE account_id = $1 FOR UPDATE",
+                    &[&account_id],
+                )?
+                .is_some_and(|row| row.get::<_, bool>(0));
+            if !entitled {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if tx
+                .query_opt(
+                    "SELECT application_id FROM jobs_attempt_reservations
+                      WHERE account_id = $1 AND application_id = $2 FOR UPDATE",
+                    &[&account_id, &application_id],
+                )?
+                .is_none()
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            let hold_context =
+                operational_hold_context_for_application_postgres_tx_after_authority_prelock(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    &execution_target.employer_domain,
+                    Some("cloud"),
+                    None,
+                    None,
+                )
+                .map_err(execution_lease_from_operational_hold_error)?;
+            require_operational_capability_postgres_tx_after_authority_prelock(
+                &mut tx,
+                OperationalCapability::FinalSubmit,
+                &hold_context,
+            )
+            .map_err(execution_lease_from_operational_hold_error)?;
+            let managed_worker = match managed_cloud_context {
+                Some((Some(input), authenticated_worker_id)) => Some((
+                    input,
+                    authenticated_worker_id,
+                    discover_managed_execution_volume_worker_postgres_tx(
+                        &mut tx,
+                        run_id,
+                        authenticated_worker_id,
+                    )?,
+                )),
+                _ => None,
+            };
+            let preliminary_now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            if let Some((input, authenticated_worker_id, volume_worker_id)) =
+                managed_worker.as_ref()
+            {
+                revalidate_managed_execution_volume_worker_postgres_tx(
+                    &mut tx,
+                    account_id,
+                    run_id,
+                    authenticated_worker_id,
+                    volume_worker_id,
+                    preliminary_now,
+                )?;
+                resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
+                    &mut tx,
+                    account_id,
+                    application_id,
+                    run_id,
+                    fence,
+                    &lease_token_sha256,
+                    Some(*input),
+                    authenticated_worker_id,
+                    volume_worker_id,
+                )
+                .map_err(execution_lease_from_managed_cloud_error)?
+                .ok_or(ExecutionLeaseError::Conflict)?;
+            } else {
                 require_current_runner_volume_binding_postgres_for_operation(
-                    &mut tx, account_id, run_id, now,
+                    &mut tx,
+                    account_id,
+                    run_id,
+                    preliminary_now,
                 )?;
             }
             let lease = tx
@@ -3345,43 +3983,84 @@ fn start_irreversible_submission_inner(
             {
                 return Err(ExecutionLeaseError::Conflict);
             }
-            if let Some((Some(_), authenticated_worker_id)) = managed_cloud_context {
+            if tx
+                .query_opt(
+                    "SELECT id FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &run_id],
+                )?
+                .is_none()
+            {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            tx.query(
+                "SELECT application_id, run_id FROM jobs_submission_evidence_capacity
+                  WHERE account_id = $1 ORDER BY application_id, run_id FOR UPDATE",
+                &[&account_id],
+            )?;
+            let (managed_cloud, now) =
+                if let Some((input, authenticated_worker_id, volume_worker_id)) =
+                    managed_worker.as_ref()
+                {
+                    let resolution =
+                        resolve_managed_cloud_execution_effect_postgres_tx_after_prelock(
+                            &mut tx,
+                            account_id,
+                            application_id,
+                            run_id,
+                            fence,
+                            &lease_token_sha256,
+                            Some(*input),
+                            authenticated_worker_id,
+                            volume_worker_id,
+                        )
+                        .map_err(execution_lease_from_managed_cloud_error)?
+                        .ok_or(ExecutionLeaseError::Conflict)?;
+                    (Some(resolution.authority), resolution.db_time_ms)
+                } else {
+                    let now = original_source_db_now_postgres(&mut tx)
+                        .map_err(execution_lease_from_original_source_error)?;
+                    let current = resolve_current_execution_authority_postgres_after_prelock_at_ms(
+                        &mut tx,
+                        account_id,
+                        &execution_target.application,
+                        ExecutionAuthorityRunner::Cloud,
+                        now,
+                    )?;
+                    if !current.authorized {
+                        return Err(ExecutionLeaseError::Conflict);
+                    }
+                    (None, now)
+                };
+            let capacity = submission_evidence_capacity_at_ms(capacity, now);
+            validate_submission_evidence_capacity_binding(
+                account_id,
+                application_id,
+                run_id,
+                &capacity,
+                now,
+            )?;
+            if let Some((_, authenticated_worker_id, volume_worker_id)) = managed_worker.as_ref() {
                 revalidate_managed_execution_volume_worker_postgres_tx(
                     &mut tx,
                     account_id,
                     run_id,
                     authenticated_worker_id,
-                    &managed_cloud
-                        .as_ref()
-                        .ok_or(ExecutionLeaseError::Conflict)?
-                        .managed_cloud_worker_id,
+                    volume_worker_id,
                     now,
+                )?;
+            } else {
+                require_current_runner_volume_binding_postgres_for_operation(
+                    &mut tx, account_id, run_id, now,
                 )?;
             }
             if lease.phase == "click_started" {
                 return Err(ExecutionLeaseError::Conflict);
             }
-            let hold_context = operational_hold_context_for_application_postgres_tx(
-                &mut tx,
-                account_id,
-                application_id,
-                Some("cloud"),
-                None,
-                None,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
-            require_operational_capability_postgres_tx(
-                &mut tx,
-                OperationalCapability::FinalSubmit,
-                &hold_context,
-            )
-            .map_err(execution_lease_from_operational_hold_error)?;
             if lease.phase != "prepared" || lease.lease_expires_at_ms <= now {
                 return Err(ExecutionLeaseError::Conflict);
             }
-            let browser_profile_id =
-                postgres_execution_target(&mut tx, account_id, application_id, run_id)?;
-            if lease.browser_profile_id != browser_profile_id {
+            if lease.browser_profile_id != execution_target.browser_profile_id {
                 return Err(ExecutionLeaseError::Conflict);
             }
             let ats_certified_receipt_authority = match ats_phase_b_context(
@@ -3391,7 +4070,7 @@ fn start_irreversible_submission_inner(
                 final_submit_proof,
             )? {
                 Some(request) => match
-                    validate_consume_reserve_ats_application_certification_from_context_postgres_tx(
+                    validate_consume_reserve_ats_application_certification_from_context_postgres_tx_after_prelock(
                         &mut tx, &request, now,
                     )
                     .map_err(execution_lease_from_ats_certification_error)?
@@ -3414,7 +4093,8 @@ fn start_irreversible_submission_inner(
                 now,
             )?;
             crate::db::object_uploads::reserve_submission_evidence_capacity_postgres_tx(
-                &mut tx, capacity,
+                &mut tx,
+                &capacity,
             )?;
             if tx.execute(
                 "UPDATE jobs_execution_leases
@@ -3866,6 +4546,34 @@ pub struct ExecutionReceiptAuthority {
     pub phase: String,
 }
 
+#[derive(Debug)]
+struct LockedSubmissionEvidenceCapacity {
+    runner: String,
+    state: String,
+    expires_at_ms: i64,
+}
+
+fn lock_submission_evidence_capacity_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    account_id: &str,
+    application_id: &str,
+    run_id: &str,
+) -> ExecutionLeaseResult<Option<LockedSubmissionEvidenceCapacity>> {
+    Ok(tx
+        .query_opt(
+            "SELECT runner, state, expires_at_ms
+               FROM jobs_submission_evidence_capacity
+              WHERE account_id = $1 AND application_id = $2 AND run_id = $3
+              FOR UPDATE",
+            &[&account_id, &application_id, &run_id],
+        )?
+        .map(|row| LockedSubmissionEvidenceCapacity {
+            runner: row.get(0),
+            state: row.get(1),
+            expires_at_ms: row.get(2),
+        }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_execution_receipt_authority(
     lease: StoredExecutionLease,
@@ -3920,13 +4628,13 @@ pub fn execution_receipt_authority(
     fence: i64,
 ) -> ExecutionLeaseResult<ExecutionReceiptAuthority> {
     validate_execution_access(account_id, application_id, run_id, lease_token, fence)?;
-    let now = now_ms();
+    let caller_now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             require_current_runner_volume_identity_sqlite_for_operation(
-                &tx, account_id, run_id, now,
+                &tx, account_id, run_id, caller_now,
             )?;
             let (lease, finished_at_ms, capacity_runner, capacity_state, capacity_expires_at_ms) =
                 tx.query_row(
@@ -3961,7 +4669,7 @@ pub fn execution_receipt_authority(
                 capacity_expires_at_ms,
                 lease_token,
                 fence,
-                now,
+                caller_now,
             )?;
             tx.commit()?;
             Ok(authority)
@@ -3969,8 +4677,11 @@ pub fn execution_receipt_authority(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // This first call is a mutation-free prelock/early-denial pass. Its
+            // process clock is not authoritative; every temporal predicate is
+            // repeated below with a DB clock sampled after the exact rows lock.
             require_current_runner_volume_identity_postgres_for_operation(
-                &mut tx, account_id, run_id, now,
+                &mut tx, account_id, run_id, caller_now,
             )?;
             let lease_row = tx
                 .query_opt(
@@ -3985,23 +4696,23 @@ pub fn execution_receipt_authority(
                 .ok_or(ExecutionLeaseError::NotFound)?;
             let finished_at_ms = lease_row.get::<_, Option<i64>>(9);
             let lease = execution_lease_from_pg_row(lease_row);
-            let capacity = tx.query_opt(
-                "SELECT runner, state, expires_at_ms
-                   FROM jobs_submission_evidence_capacity
-                  WHERE account_id = $1 AND application_id = $2 AND run_id = $3
-                  FOR UPDATE",
-                &[&account_id, &application_id, &run_id],
+            let capacity = lock_submission_evidence_capacity_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
             )?;
-            let (capacity_runner, capacity_state, capacity_expires_at_ms) = capacity
-                .map_or((None, None, None), |row| {
-                    (Some(row.get(0)), Some(row.get(1)), Some(row.get(2)))
-                });
+            let now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
             let authority = validate_execution_receipt_authority(
                 lease,
                 finished_at_ms,
-                capacity_runner,
-                capacity_state,
-                capacity_expires_at_ms,
+                capacity.as_ref().map(|value| value.runner.clone()),
+                capacity.as_ref().map(|value| value.state.clone()),
+                capacity.as_ref().map(|value| value.expires_at_ms),
                 lease_token,
                 fence,
                 now,
@@ -4028,13 +4739,13 @@ pub fn finish_execution_lease(
     ) {
         return Err(ExecutionLeaseError::InvalidRequest);
     }
-    let now = now_ms();
+    let caller_now = now_ms();
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let mut conn = pool.get()?;
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             require_current_runner_volume_identity_sqlite_for_operation(
-                &tx, account_id, run_id, now,
+                &tx, account_id, run_id, caller_now,
             )?;
             crate::db::object_uploads::require_active_account_write_fence_sqlite_tx(
                 &tx, account_id,
@@ -4071,7 +4782,7 @@ pub fn finish_execution_lease(
                         &lease.phase,
                         outcome,
                         finished_at_ms,
-                        now,
+                        caller_now,
                         false,
                     )?;
                 }
@@ -4093,7 +4804,7 @@ pub fn finish_execution_lease(
                     lease.lease_token_sha256,
                     fence,
                     outcome,
-                    now,
+                    caller_now,
                     lease.phase,
                 ],
             )? != 1
@@ -4107,8 +4818,8 @@ pub fn finish_execution_lease(
                 run_id,
                 &lease.phase,
                 outcome,
-                now,
-                now,
+                caller_now,
+                caller_now,
                 matches!(outcome, "submitted" | "side_effect_unknown"),
             )?;
             tx.commit()?;
@@ -4117,8 +4828,10 @@ pub fn finish_execution_lease(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Mutation-free prelock only. The caller clock cannot authorize a
+            // terminal effect after a wait on the exact lease/capacity rows.
             require_current_runner_volume_identity_postgres_for_operation(
-                &mut tx, account_id, run_id, now,
+                &mut tx, account_id, run_id, caller_now,
             )?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
@@ -4138,6 +4851,17 @@ pub fn finish_execution_lease(
                     (execution_lease_from_pg_row(row), finished_at_ms)
                 })
                 .ok_or(ExecutionLeaseError::NotFound)?;
+            let _capacity = lock_submission_evidence_capacity_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+            )?;
+            let now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
             if lease.fence != fence
                 || !execution_lease_token_matches(&lease.lease_token_sha256, lease_token)
             {
@@ -4161,6 +4885,11 @@ pub fn finish_execution_lease(
                 return Ok(());
             }
             if !execution_finish_allowed(&lease.phase, outcome) {
+                return Err(ExecutionLeaseError::Conflict);
+            }
+            if matches!(outcome, "submitted" | "side_effect_unknown")
+                && lease.lease_expires_at_ms <= now
+            {
                 return Err(ExecutionLeaseError::Conflict);
             }
             if tx.execute(
@@ -4458,29 +5187,14 @@ pub fn reconcile_execution_lease_checkpoint(
         DbPool::Postgres(_) => {
             let mut conn = pool.get_pg()?;
             let mut tx = conn.transaction()?;
+            // Mutation-free fleet/account/volume prelock. The process clock is
+            // intentionally non-authoritative and is repeated after every exact
+            // reconciliation row has been acquired below.
             require_current_runner_volume_identity_postgres_for_operation(
                 &mut tx, account_id, run_id, now,
             )?;
             crate::db::object_uploads::require_active_account_write_fence_postgres_tx(
                 &mut tx, account_id,
-            )?;
-            let lease = tx
-                .query_opt(
-                    "SELECT run_id, account_id, application_id, browser_profile_id,
-                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
-                       FROM jobs_execution_leases
-                      WHERE run_id = $1 AND account_id = $2 AND application_id = $3
-                      FOR UPDATE",
-                    &[&run_id, &account_id, &application_id],
-                )?
-                .map(execution_lease_from_pg_row)
-                .ok_or(ExecutionLeaseError::NotFound)?;
-            validate_checkpoint_lease_access(
-                &lease,
-                owner_id,
-                lease_token,
-                fence,
-                checkpoint_version,
             )?;
             let application_row = tx
                 .query_opt(
@@ -4499,32 +5213,6 @@ pub fn reconcile_execution_lease_checkpoint(
                     &[&account_id, &application_id],
                 )?
                 .get(0);
-            if validate_trusted_submitted_checkpoint(
-                &request,
-                &lease,
-                &application_job_id,
-                application_raw.clone(),
-                &application_state,
-                evidence_count,
-            )? {
-                tx.commit()?;
-                return Ok(ExecutionLeaseRecord {
-                    run_id: run_id.to_string(),
-                    fence,
-                    lease_expires_at_ms: lease.lease_expires_at_ms,
-                    phase: "submitted".to_string(),
-                });
-            }
-            let session_row = tx
-                .query_opt(
-                    "SELECT session_json, runner, status FROM jobs_browser_sessions
-                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
-                    &[&account_id, &run_id],
-                )?
-                .ok_or(ExecutionLeaseError::NotFound)?;
-            let session_raw: String = session_row.get(0);
-            let session_runner: String = session_row.get(1);
-            let session_status: String = session_row.get(2);
             let attempt = tx
                 .query_opt(
                     "SELECT id, application_id, company_key, period_key, runner, status,
@@ -4543,6 +5231,61 @@ pub fn reconcile_execution_lease_checkpoint(
                     reserved_at_ms: row.get(6),
                     updated_at_ms: row.get(7),
                 });
+            let lease = tx
+                .query_opt(
+                    "SELECT run_id, account_id, application_id, browser_profile_id,
+                            owner_id, lease_token_sha256, fence, phase, lease_expires_at_ms
+                       FROM jobs_execution_leases
+                      WHERE run_id = $1 AND account_id = $2 AND application_id = $3
+                      FOR UPDATE",
+                    &[&run_id, &account_id, &application_id],
+                )?
+                .map(execution_lease_from_pg_row)
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let session_row = tx
+                .query_opt(
+                    "SELECT session_json, runner, status FROM jobs_browser_sessions
+                      WHERE account_id = $1 AND id = $2 FOR UPDATE",
+                    &[&account_id, &run_id],
+                )?
+                .ok_or(ExecutionLeaseError::NotFound)?;
+            let session_raw: String = session_row.get(0);
+            let session_runner: String = session_row.get(1);
+            let session_status: String = session_row.get(2);
+            let _capacity = lock_submission_evidence_capacity_postgres_tx(
+                &mut tx,
+                account_id,
+                application_id,
+                run_id,
+            )?;
+            let now = original_source_db_now_postgres(&mut tx)
+                .map_err(execution_lease_from_original_source_error)?;
+            require_current_runner_volume_identity_postgres_for_operation(
+                &mut tx, account_id, run_id, now,
+            )?;
+            validate_checkpoint_lease_access(
+                &lease,
+                owner_id,
+                lease_token,
+                fence,
+                checkpoint_version,
+            )?;
+            if validate_trusted_submitted_checkpoint(
+                &request,
+                &lease,
+                &application_job_id,
+                application_raw.clone(),
+                &application_state,
+                evidence_count,
+            )? {
+                tx.commit()?;
+                return Ok(ExecutionLeaseRecord {
+                    run_id: run_id.to_string(),
+                    fence,
+                    lease_expires_at_ms: lease.lease_expires_at_ms,
+                    phase: "submitted".to_string(),
+                });
+            }
             if let Some(outcome) = exact_checkpoint_recovery_replay(
                 account_id,
                 application_id,

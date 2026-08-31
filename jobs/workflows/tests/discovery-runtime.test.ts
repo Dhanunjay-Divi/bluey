@@ -233,7 +233,7 @@ describe("discovery worker runtime", () => {
           canonical_url: "https://boards.greenhouse.io/acme/jobs/job-1",
           title: "Platform Engineer",
           location: "Remote",
-          workplace: "remote",
+          workplace: "unknown",
           description: "Build reliable systems.",
           compensation: "",
           employment_type: "",

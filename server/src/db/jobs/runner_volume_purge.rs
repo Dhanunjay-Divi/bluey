@@ -3200,6 +3200,7 @@ pub struct VerifiedRunnerVolumeAuthority {
     payload_sha256: String,
     process_instance_id: String,
     issued_at_ms: i64,
+    maximum_clock_skew_ms: i64,
 }
 
 impl VerifiedRunnerVolumeAuthority {
@@ -3241,6 +3242,7 @@ pub fn verify_runner_volume_authority_proof(
         payload_sha256: proof.payload_sha256.clone(),
         process_instance_id: proof.process_instance_id.clone(),
         issued_at_ms: proof.issued_at_ms,
+        maximum_clock_skew_ms,
     })
 }
 
@@ -3257,6 +3259,9 @@ fn validate_runner_volume_authority_use(
         || authority.volume.volume_id != volume_id
         || authority.volume.current_epoch != enrollment_epoch
         || authority.process_instance_id != process_instance_id
+        || consumed_at_ms.abs_diff(authority.issued_at_ms)
+            > u64::try_from(authority.maximum_clock_skew_ms)
+                .map_err(|_| RunnerVolumePurgeError::InvalidRequest)?
     {
         return Err(RunnerVolumePurgeError::Unauthorized);
     }
@@ -3307,6 +3312,21 @@ fn consume_runner_volume_authority_sqlite_tx(
     Ok(())
 }
 
+pub(crate) fn prelock_runner_volume_authority_use_postgres_tx(
+    tx: &mut postgres::Transaction<'_>,
+    authority: &VerifiedRunnerVolumeAuthority,
+) -> RunnerVolumePurgeResult<()> {
+    let namespace = format!(
+        "jobs-runner-volume-authority-use:{}:{}:{}",
+        authority.volume.volume_id, authority.volume.current_epoch, authority.request_id
+    );
+    tx.query_one(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        &[&namespace],
+    )?;
+    Ok(())
+}
+
 fn consume_runner_volume_authority_postgres_tx(
     tx: &mut postgres::Transaction<'_>,
     authority: &VerifiedRunnerVolumeAuthority,
@@ -3324,11 +3344,7 @@ fn consume_runner_volume_authority_postgres_tx(
         process_instance_id,
         consumed_at_ms,
     )?;
-    let expired_before_ms = consumed_at_ms.saturating_sub(RUNNER_VOLUME_AUTHORITY_USE_RETENTION_MS);
-    tx.execute(
-        "DELETE FROM jobs_runner_volume_authority_uses WHERE consumed_at_ms < $1",
-        &[&expired_before_ms],
-    )?;
+    prelock_runner_volume_authority_use_postgres_tx(tx, authority)?;
     if tx.execute(
         "INSERT INTO jobs_runner_volume_authority_uses ( \
             volume_id, enrollment_epoch, request_id, operation, payload_sha256, \
@@ -7444,17 +7460,18 @@ fn ensure_postgres_subject_for_prepare(
     )? {
         return Ok(runner_account_subject_from_pg_row(row));
     }
-    tx.execute(
-        "INSERT INTO jobs_runner_account_subjects ( \
-            account_id, purge_subject, legacy_unresolved, created_at_ms, updated_at_ms \
-         ) VALUES ($1, $2, 0, $3, $3)",
-        &[&account_id, &proposed_subject, &now_ms],
-    )?;
-    Ok(runner_account_subject_from_pg_row(tx.query_one(
-        "SELECT account_id, purge_subject, legacy_unresolved, created_at_ms, updated_at_ms \
-           FROM jobs_runner_account_subjects WHERE account_id = $1",
-        &[&account_id],
-    )?))
+    // The account row is already locked, so absence is stable for this
+    // transaction. Preparation is intentionally mutation-free: the caller may
+    // still need to wait on later effect rows and must sample its authoritative
+    // clock before creating the subject.
+    Ok(RunnerAccountPurgeSubject {
+        account_id: account_id.to_string(),
+        purge_subject: proposed_subject.to_string(),
+        legacy_unresolved: false,
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        disposition: RunnerVolumeWriteDisposition::Applied,
+    })
 }
 
 fn load_postgres_frozen_targets(
@@ -11214,7 +11231,7 @@ pub(crate) fn prepare_runner_volume_lease_binding_postgres_tx(
     let fleet_ready: bool = tx
         .query_one(
             "SELECT cutover_state = 'ready' FROM jobs_runner_volume_fleet_state \
-              WHERE singleton_id = 1 FOR UPDATE",
+              WHERE singleton_id = 1 FOR SHARE",
             &[],
         )?
         .get(0);
@@ -11275,6 +11292,20 @@ pub(crate) fn prepare_runner_volume_lease_binding_postgres_tx(
     }
     let volume_key_fingerprint: String = volume.get(1);
     let purge_subject_sha256 = runner_purge_subject_sha256(&subject.purge_subject)?;
+    tx.query_opt(
+        "SELECT state, purge_generation FROM jobs_runner_volume_residencies
+          WHERE purge_subject = $1 AND volume_id = $2 AND volume_epoch = $3 FOR UPDATE",
+        &[
+            &subject.purge_subject,
+            &input.volume_id,
+            &input.enrollment_epoch,
+        ],
+    )?;
+    tx.query_opt(
+        "SELECT volume_id FROM jobs_execution_lease_volume_bindings
+          WHERE run_id = $1 FOR UPDATE",
+        &[&input.run_id],
+    )?;
     Ok(PreparedRunnerVolumeLeaseBinding {
         account_id: input.account_id.clone(),
         run_id: input.run_id.clone(),
@@ -11295,6 +11326,21 @@ pub(crate) fn finalize_runner_volume_lease_binding_postgres_tx(
     prepared: &PreparedRunnerVolumeLeaseBinding,
 ) -> RunnerVolumePurgeResult<RunnerVolumeResidencyBinding> {
     require_prepared_lease_binding_matches(prepared, input)?;
+    tx.execute(
+        "INSERT INTO jobs_runner_account_subjects (
+            account_id, purge_subject, legacy_unresolved, created_at_ms, updated_at_ms
+         ) VALUES ($1, $2, FALSE, $3, $3)
+         ON CONFLICT(account_id) DO NOTHING",
+        &[&input.account_id, &prepared.purge_subject, &input.now_ms],
+    )?;
+    let stored_subject = runner_account_subject_from_pg_row(tx.query_one(
+        "SELECT account_id, purge_subject, legacy_unresolved, created_at_ms, updated_at_ms
+           FROM jobs_runner_account_subjects WHERE account_id = $1 FOR UPDATE",
+        &[&input.account_id],
+    )?);
+    if stored_subject.purge_subject != prepared.purge_subject || stored_subject.legacy_unresolved {
+        return Err(RunnerVolumePurgeError::Conflict);
+    }
     let lease_valid: bool = tx
         .query_opt(
             "SELECT account_id = $2 AND phase = 'prepared' AND lease_expires_at_ms > $3 \
@@ -11526,7 +11572,7 @@ pub(crate) fn require_current_runner_volume_identity_binding_postgres_tx(
     let fleet_ready: bool = tx
         .query_one(
             "SELECT cutover_state = 'ready' FROM jobs_runner_volume_fleet_state \
-              WHERE singleton_id = 1 FOR UPDATE",
+              WHERE singleton_id = 1 FOR SHARE",
             &[],
         )?
         .get(0);
@@ -11953,6 +11999,10 @@ fn insert_sqlite_standalone_residency(
 #[cfg(test)]
 pub(super) mod runner_volume_purge_tests {
     use super::*;
+    use super::production_positive_authority_fixture::{
+        install_production_positive_job_authorities_for_runner,
+        save_production_positive_verified_import,
+    };
     use crate::db;
     use std::path::PathBuf;
 
@@ -12569,8 +12619,37 @@ pub(super) mod runner_volume_purge_tests {
     ) -> (String, String, String) {
         let identity = ensure_primary_application_identity(pool, account_id, email)
             .expect("create runner test identity");
+        let now = now_ms();
+        let source = ResumeSourceAsset {
+            id: format!("resume-source-{account_id}"),
+            file_name: "fixture-source-resume.pdf".to_string(),
+            media_type: "application/pdf".to_string(),
+            file_type: "pdf".to_string(),
+            storage_key: format!("accounts/{account_id}/jobs/fixture-source-resume.pdf"),
+            sha256: "e".repeat(64),
+            size_bytes: 1_024,
+            page_count: Some(1),
+            template_status: "converted_layout".to_string(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let mut profile = default_profile(email);
+        profile.onboarding_complete = true;
+        profile.source_resume_name = source.file_name.clone();
+        profile.source_resume_asset_id = source.id.clone();
+        profile.source_resume_sha256 = source.sha256.clone();
+        profile.source_resume_media_type = source.media_type.clone();
+        profile.source_resume_template_status = source.template_status.clone();
+        let (_, profile) = save_resume_source_asset(pool, account_id, &source, &profile)
+            .expect("save runner test source resume");
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let preferences =
+            save_preferences(pool, account_id, &preferences).expect("save runner test preferences");
         let track_id = format!("track-{suffix}");
-        upsert_track(
+        let track = upsert_track(
             pool,
             account_id,
             &CareerTrack {
@@ -12591,26 +12670,29 @@ pub(super) mod runner_volume_purge_tests {
             },
         )
         .expect("create runner test track");
-        let profile = default_profile(email);
-        save_profile(pool, account_id, &profile).expect("save runner test profile");
-        let preferences = JobPreferences {
-            sponsorship: "not_required".to_string(),
-            ..JobPreferences::default()
-        };
-        save_preferences(pool, account_id, &preferences).expect("save runner test preferences");
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert!(track.policy.authority.policy_revision_no > 0);
+        set_entitlement_plan(pool, account_id, "cloud")
+            .expect("enable runner test cloud entitlement");
         let checked_at_ms = now_ms();
-        let canonical_url = format!("https://boards.greenhouse.io/acme/jobs/{suffix}");
-        let mut posting = JobPosting {
+        let greenhouse_tenant = format!("acme-{suffix}");
+        let canonical_url =
+            format!("https://boards.greenhouse.io/{greenhouse_tenant}/jobs/{suffix}");
+        let mut posting_input = JobPosting {
             id: String::new(),
             canonical_key: String::new(),
-            source: "greenhouse".to_string(),
-            external_id: canonical_url.clone(),
-            company: "Acme".to_string(),
+            source: "greenhouse_import".to_string(),
+            external_id: suffix.to_string(),
+            company: format!("Acme {suffix}"),
             title: "Software Engineer".to_string(),
             location: "New York, NY".to_string(),
             workplace: "hybrid".to_string(),
             canonical_url,
-            description: "Build reliable products with Rust and TypeScript.".to_string(),
+            description: concat!(
+                "Build reliable products with Rust and TypeScript. Requires 1+ years of ",
+                "software engineering experience."
+            )
+            .to_string(),
             compensation: "$170k-$200k".to_string(),
             employment_type: "full_time".to_string(),
             track_id,
@@ -12626,28 +12708,26 @@ pub(super) mod runner_volume_purge_tests {
             discovery_evidence: JobDiscoveryEvidence::default(),
             eligibility: None,
         };
-        posting.canonical_key = canonical_job_key(&posting);
-        posting.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
-            posting.canonical_key.clone(),
-            "greenhouse:test".to_string(),
-            Some("boards.greenhouse.io".to_string()),
-            checked_at_ms,
-            "a".repeat(64),
+        posting_input.canonical_key = canonical_job_key(&posting_input);
+        let (posting, managed) = save_production_positive_verified_import(
+            pool,
+            account_id,
+            &posting_input,
+            &profile,
+            &preferences,
         );
-        let posting = upsert_posting(pool, account_id, &posting, &profile, &preferences)
-            .expect("create runner test posting");
+        let authority_fixture = install_production_positive_job_authorities_for_runner(
+            pool,
+            account_id,
+            &posting,
+            &managed,
+            &format!("{greenhouse_tenant}.example"),
+            suffix,
+            "cloud",
+        );
         let (application, _) =
             prepare_application(pool, account_id, &posting.id, "factual", "review_first")
                 .expect("prepare runner test application");
-        let application = update_application(
-            pool,
-            account_id,
-            &application.id,
-            "queued",
-            Some("review_first"),
-        )
-        .expect("queue runner test application")
-        .expect("runner test application exists");
         let run_id = format!("cloud-run-{suffix}");
         upsert_browser_session(
             pool,
@@ -12656,7 +12736,7 @@ pub(super) mod runner_volume_purge_tests {
                 id: run_id.clone(),
                 runner: "cloud".to_string(),
                 status: "queued".to_string(),
-                current_company: "Acme".to_string(),
+                current_company: authority_fixture.posting.company.clone(),
                 current_step: "Waiting for a browser".to_string(),
                 application_id: Some(application.id.clone()),
                 takeover_url: None,
@@ -12665,32 +12745,27 @@ pub(super) mod runner_volume_purge_tests {
             },
         )
         .expect("create runner test browser session");
-        let mut application = assign_application_run(pool, account_id, &application.id, &run_id)
+        let application = assign_application_run(pool, account_id, &application.id, &run_id)
             .expect("assign runner test run")
             .expect("assigned runner test application exists");
-        pool.get()
-            .expect("open runner fixture connection")
-            .execute(
-                "INSERT INTO jobs_attempt_reservations ( \
-                    id, account_id, application_id, company_key, period_key, runner, status, \
-                    reserved_at_ms, updated_at_ms \
-                 ) VALUES (?1, ?2, ?3, ?4, 'test-period', 'unassigned', 'reserved', ?5, ?5)",
-                params![
-                    format!("attempt-{}", application.id),
-                    account_id,
-                    application.id,
-                    format!("company-{suffix}"),
-                    checked_at_ms,
-                ],
-            )
-            .expect("reserve runner test attempt");
-        let identity_id = application
+        let authority = current_application_approval_authority(
+            pool,
+            account_id,
+            email,
+            &application.id,
+        )
+        .expect("load current runner test application approval authority")
+        .expect("runner test application approval authority exists");
+        assert_eq!(authority.posting.id, authority_fixture.posting.id);
+        let identity_id = authority
+            .application
             .receipt
             .pointer("/application_identity/id")
             .and_then(Value::as_str)
             .expect("runner application identity id")
             .to_string();
-        let identity_email = application
+        let identity_email = authority
+            .application
             .receipt
             .pointer("/application_identity/email")
             .and_then(Value::as_str)
@@ -12700,7 +12775,8 @@ pub(super) mod runner_volume_purge_tests {
         let resume = get_resume_version(
             pool,
             account_id,
-            application
+            authority
+                .application
                 .resume_version_id
                 .as_deref()
                 .expect("runner fixture resume id"),
@@ -12708,11 +12784,11 @@ pub(super) mod runner_volume_purge_tests {
         .expect("load runner fixture resume")
         .expect("runner fixture resume exists");
         let approved_packet = json!({
-            "applicationId": application.id,
-            "jobId": application.job_id,
+            "applicationId": authority.application.id,
+            "jobId": authority.posting.id,
             "resumeVersionId": resume.id,
             "resumeContent": resume.content,
-            "coverLetterContent": application.cover_letter,
+            "coverLetterContent": authority.application.cover_letter,
             "answers": {},
             "verifiedClaimIds": resume.claim_ids,
             "applicationIdentityId": identity_id,
@@ -12720,31 +12796,42 @@ pub(super) mod runner_volume_purge_tests {
             "browserProfileId": browser_profile_id,
         });
         let approved_job = json!({
-            "externalId": posting.external_id,
-            "canonicalUrl": posting.canonical_url,
-            "company": posting.company,
-            "title": posting.title,
-            "location": posting.location,
-            "workplace": posting.workplace,
-            "description": posting.description,
-            "source": posting.source,
-            "compensation": posting.compensation,
+            "externalId": authority.posting.external_id,
+            "canonicalUrl": authority.posting.canonical_url,
+            "company": authority.posting.company,
+            "title": authority.posting.title,
+            "location": authority.posting.location,
+            "workplace": authority.posting.workplace,
+            "description": authority.posting.description,
+            "source": authority.posting.source,
+            "compensation": authority.posting.compensation,
         });
         let admission = json!({ "kind": "review_approval" });
         let checksum =
             approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
                 .expect("checksum runner fixture approval");
-        application.receipt["approved_execution"] = json!({
+        let approved_execution = json!({
             "schema_version": 2,
-            "approved_at_ms": checked_at_ms,
+            "approved_at_ms": authority.evaluated_at_ms,
             "checksum": checksum,
             "admission": admission,
             "packet": approved_packet,
             "job": approved_job,
         });
-        replace_application_receipt(pool, account_id, &application.id, application.receipt)
-            .expect("persist runner fixture approval")
-            .expect("runner fixture application remains");
+        let application = persist_current_application_approval(
+            pool,
+            account_id,
+            email,
+            &authority,
+            &approved_execution,
+        )
+        .expect("persist current runner test application approval")
+        .expect("runner test application remains available for approval");
+        reserve_application_attempt(pool, account_id, &application.id, "unassigned")
+            .expect("reserve unassigned runner test attempt");
+        let application = update_application(pool, account_id, &application.id, "queued", None)
+            .expect("queue runner test application")
+            .expect("runner test application remains available for queueing");
         (application.id, run_id, browser_profile_id)
     }
 
@@ -13105,15 +13192,8 @@ pub(super) mod runner_volume_purge_tests {
 
     #[test]
     fn certified_cloud_runtime_fixture_authorizes_exact_execution_lease_claim() {
-        let database = TestDatabase::new(&["acct-certified-cloud"]);
-        let (application_id, run_id, browser_profile_id) = runner_execution_lease_fixture(
-            &database.pool,
-            "acct-certified-cloud",
-            "runner-purge-0@example.test",
-            "certified-cloud-runtime",
-        );
+        let pool = super::tests::test_pool();
         let owner_id = "round604-certified-cloud-owner";
-        let now = now_ms();
         let runtime = RunnerProcessRuntimeAttestation {
             runner_image_sha256: sha256("certified-cloud-image"),
             runner_build_id: "runner-604.1".to_string(),
@@ -13124,9 +13204,21 @@ pub(super) mod runner_volume_purge_tests {
             chromium_revision: "123456".to_string(),
             chromium_executable_sha256: sha256("certified-cloud-chromium"),
         };
+        let runtime_target = super::tests::certified_cloud_runtime_target(&runtime);
+        let fixture = super::tests::certified_application_fixture(
+            &pool,
+            "certified-cloud-runtime",
+            "cloud",
+            runtime_target.clone(),
+            "",
+        );
+        let application_id = fixture.application.id;
+        let run_id = fixture.run_id;
+        let browser_profile_id = fixture.browser_profile_id;
+        let now = now_ms();
         let installed = install_certified_cloud_runtime_fixture(
-            &database.pool,
-            "acct-certified-cloud",
+            &pool,
+            "acct-jobs",
             &application_id,
             &run_id,
             &browser_profile_id,
@@ -13135,7 +13227,7 @@ pub(super) mod runner_volume_purge_tests {
             now,
         )
         .expect("install exact certified cloud runtime fixture");
-        assert_eq!(installed.runtime_target.runtime_kind, "cloud");
+        assert_eq!(installed.runtime_target, runtime_target);
         assert_eq!(
             installed.runtime_target.runner_image_sha256.as_deref(),
             Some(runtime.runner_image_sha256.as_str())
@@ -13144,12 +13236,12 @@ pub(super) mod runner_volume_purge_tests {
             installed.runtime_target.runtime_sha256,
             installed.runtime_sha256
         );
-        assert_eq!(installed.binding_request.account_id, "acct-certified-cloud");
+        assert_eq!(installed.binding_request.account_id, "acct-jobs");
         assert_eq!(installed.binding_request.run_id, run_id);
 
         let grant = claim_execution_lease_for_runner_volume_authorized(
-            &database.pool,
-            "acct-certified-cloud",
+            &pool,
+            "acct-jobs",
             &application_id,
             &run_id,
             &browser_profile_id,

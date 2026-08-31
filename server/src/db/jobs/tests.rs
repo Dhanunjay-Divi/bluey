@@ -1,5 +1,11 @@
 #[cfg(test)]
 mod tests {
+    use super::production_positive_authority_fixture::{
+        install_production_positive_job_authorities,
+        install_production_positive_job_authorities_for_runner,
+        install_production_positive_job_authorities_with_runtime_surface,
+        save_production_positive_verified_import,
+    };
     use super::*;
     use crate::db;
     use crate::db::object_uploads::{
@@ -8,7 +14,7 @@ mod tests {
     };
     use crate::object_storage::UploadLimits;
 
-    fn test_pool() -> DbPool {
+    pub(super) fn test_pool() -> DbPool {
         let path = std::env::temp_dir().join(format!(
             "bluey-jobs-test-{}-{}.sqlite3",
             std::process::id(),
@@ -48,6 +54,52 @@ mod tests {
         )
         .unwrap();
         pool
+    }
+
+    fn execution_policy_fixture(
+        pool: &DbPool,
+        account_id: &str,
+        email: &str,
+        track_id: &str,
+    ) -> (CareerProfile, JobPreferences) {
+        let now = now_ms();
+        let source = get_resume_source_asset(pool, account_id)
+            .unwrap()
+            .unwrap_or_else(|| ResumeSourceAsset {
+                id: format!("resume-source-{account_id}"),
+                file_name: "fixture-source-resume.pdf".to_string(),
+                media_type: "application/pdf".to_string(),
+                file_type: "pdf".to_string(),
+                storage_key: format!("accounts/{account_id}/jobs/fixture-source-resume.pdf"),
+                sha256: "e".repeat(64),
+                size_bytes: 1_024,
+                page_count: Some(1),
+                template_status: "converted_layout".to_string(),
+                created_at_ms: now,
+                updated_at_ms: now,
+            });
+        let mut profile = default_profile(email);
+        profile.onboarding_complete = true;
+        profile.source_resume_name = source.file_name.clone();
+        profile.source_resume_asset_id = source.id.clone();
+        profile.source_resume_sha256 = source.sha256.clone();
+        profile.source_resume_media_type = source.media_type.clone();
+        profile.source_resume_template_status = source.template_status.clone();
+        let (_, profile) = save_resume_source_asset(pool, account_id, &source, &profile).unwrap();
+        let preferences = JobPreferences {
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        let preferences = save_preferences(pool, account_id, &preferences).unwrap();
+        let track = list_tracks(pool, account_id)
+            .unwrap()
+            .into_iter()
+            .find(|track| track.id == track_id)
+            .expect("execution fixture Career Track exists");
+        let track = upsert_track(pool, account_id, &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert!(track.policy.authority.policy_revision_no > 0);
+        (profile, preferences)
     }
 
     fn append_account_operational_hold(
@@ -342,7 +394,7 @@ mod tests {
         let application_domain = reqwest::Url::parse(&posting.canonical_url)
             .ok()
             .and_then(|parsed| parsed.host_str().map(str::to_string));
-        posting.discovery_evidence = JobDiscoveryEvidence::verified_original_source(
+        posting.discovery_evidence = JobDiscoveryEvidence::provider_verified_original_source(
             posting.canonical_key.clone(),
             format!("{}:test", posting.source),
             application_domain,
@@ -357,7 +409,8 @@ mod tests {
         require_live_verification: bool,
     ) -> JobEligibilityDecision {
         let profile = default_profile("jobs@example.com");
-        let track = CareerTrack {
+        let preferences = JobPreferences::default();
+        let mut track = CareerTrack {
             id: "track-default".to_string(),
             name: "Software engineering".to_string(),
             role: "Software Engineer".to_string(),
@@ -373,10 +426,17 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         };
+        track.policy.authority.review_state = "approved".to_string();
+        track.policy.authority.taxonomy_version = crate::jobs_taxonomy::taxonomy_version().into();
+        track.policy.authority.taxonomy_sha256 = crate::jobs_taxonomy::taxonomy_sha256();
+        track.policy.authority.source_resume_asset_id = profile.source_resume_asset_id.clone();
+        track.policy.authority.source_resume_sha256 = profile.source_resume_sha256.clone();
+        track.policy.authority.job_preferences_sha256 =
+            job_preferences_policy_sha256(&preferences).expect("canonical test preferences");
         build_job_eligibility(
             posting,
             &profile,
-            &JobPreferences::default(),
+            &preferences,
             &[],
             require_live_verification,
             None,
@@ -393,6 +453,122 @@ mod tests {
     }
 
     #[test]
+    fn postgres_auto_submit_execution_and_revocation_share_one_lock_order() {
+        fn assert_ordered(source: &str, needles: &[&str], label: &str) {
+            let mut previous = 0;
+            for needle in needles {
+                let position = source
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("missing {needle:?} in {label}"));
+                assert!(position >= previous, "{label} lock order is inverted");
+                previous = position;
+            }
+        }
+
+        let execution_source = include_str!("execution_authority.rs");
+        let prelock = execution_source
+            .split("fn lock_current_execution_authority_postgres_after_prelock(")
+            .nth(1)
+            .expect("PostgreSQL execution authority prelock implementation")
+            .split("fn resolve_current_execution_authority_postgres_after_prelock_at_ms(")
+            .next()
+            .expect("bounded PostgreSQL execution authority prelock implementation");
+        for forbidden_relock in [
+            "lock_operational_hold_shared_postgres_tx",
+            "lock_managed_cloud_release_registry_shared_postgres_tx",
+            "lock_postgres_ats_certification",
+            "lock_discovery_account_shared_postgres",
+        ] {
+            assert!(
+                !prelock.contains(forbidden_relock),
+                "execution authority prelock reacquires {forbidden_relock}"
+            );
+        }
+        assert_ordered(
+            prelock,
+            &[
+                "lock_job_integrity_publication_fence_shared_postgres_tx(tx)",
+                "lock_account_policy_inputs_postgres(tx, account_id, false)",
+                "lock_auto_submit_authority_postgres(tx, account_id, &track.id, false)",
+            ],
+            "PostgreSQL execution authority prelock",
+        );
+
+        let resolver = execution_source
+            .split("fn resolve_current_execution_authority_postgres_after_prelock(")
+            .nth(1)
+            .expect("PostgreSQL execution authority resolver")
+            .split("fn lock_current_execution_authority_postgres_after_prelock(")
+            .next()
+            .expect("bounded PostgreSQL execution authority resolver");
+        assert_ordered(
+            resolver,
+            &[
+                "lock_current_execution_authority_postgres_after_prelock(",
+                "original_source_db_now_postgres(tx)",
+                "resolve_current_execution_authority_postgres_after_prelock_at_ms(",
+            ],
+            "PostgreSQL execution authority clock",
+        );
+
+        let at_ms = execution_source
+            .split("fn resolve_current_execution_authority_postgres_after_prelock_at_ms(")
+            .nth(1)
+            .expect("PostgreSQL execution authority at-ms resolver")
+            .split("fn current_execution_authority_matches(")
+            .next()
+            .expect("bounded PostgreSQL execution authority at-ms resolver");
+        for forbidden_lock in [
+            "lock_job_integrity_publication_fence_shared_postgres_tx",
+            "lock_account_policy_inputs_postgres",
+            "lock_auto_submit_authority_postgres",
+        ] {
+            assert!(!at_ms.contains(forbidden_lock));
+        }
+        assert!(!at_ms.contains("FOR SHARE"));
+        assert!(!at_ms.contains("FOR UPDATE"));
+        assert!(at_ms.contains("validate_track_policy_ledger_postgres"));
+        assert!(
+            !at_ms.contains("resolve_composed_job_integrity_projection_postgres_tx_after_prelock(")
+        );
+        assert!(at_ms.contains(
+            "resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms("
+        ));
+        let authorization_query = at_ms
+            .split("let auto_submit_authorization =")
+            .nth(1)
+            .expect("bounded PostgreSQL active Auto-submit authority query")
+            .split("let preferences =")
+            .next()
+            .expect("bounded PostgreSQL active Auto-submit authority query");
+        assert!(authorization_query.contains("FROM jobs_auto_submit_authorizations"));
+        assert!(!authorization_query.contains("FOR SHARE"));
+
+        let revoke = include_str!("auto_submit.rs")
+            .split("pub fn revoke_auto_submit(")
+            .nth(1)
+            .expect("Auto-submit revocation implementation")
+            .split("pub fn require_valid_auto_submit_authorization(")
+            .next()
+            .expect("bounded Auto-submit revocation implementation")
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL Auto-submit revocation implementation");
+        assert_ordered(
+            revoke,
+            &[
+                "let mut tx = conn.transaction()?",
+                "lock_discovery_account_shared_postgres(&mut tx, account_id)",
+                "lock_account_policy_inputs_postgres(&mut tx, account_id, false)",
+                "lock_auto_submit_authority_postgres(&mut tx, account_id, track_id, true)",
+                "UPDATE jobs_auto_submit_authorizations",
+                "tx.commit()?",
+            ],
+            "PostgreSQL Auto-submit revocation",
+        );
+    }
+
+    #[test]
     fn postgres_browser_release_readers_lock_registry_before_authority_checks() {
         let claim_source = include_str!("browser_release_authority.rs");
         let claim = claim_source
@@ -403,44 +579,69 @@ mod tests {
             .next()
             .expect("bounded PostgreSQL Browser claim implementation");
         let ticket = claim
-            .find("postgres_local_run_authority")
+            .find("postgres_local_run_authority_prelock")
             .expect("ticket authority before registry lock");
-        let reservation = claim
-            .find("reservation_status")
-            .expect("reservation authority before registry lock");
         let shared_lock = claim
             .find("postgres_lock_browser_release_registry_shared(tx)")
             .expect("shared registry lock");
+        let db_time = claim
+            .find("local_run_claim_db_now_postgres(tx)")
+            .expect("claim database time after registry lock");
+        let current = claim
+            .find("postgres_local_run_authority_after_prelock_at_ms")
+            .expect("current ticket authority after database time");
         let release = claim
             .find("postgres_browser_release_for_claim_tx")
             .expect("release authority after registry lock");
-        assert!(ticket < reservation && reservation < shared_lock && shared_lock < release);
+        assert!(ticket < shared_lock && shared_lock < db_time);
+        assert!(db_time < current && current < release);
 
         let submit_source = include_str!("local_runner.rs");
         let submit = submit_source
-            .split("pub fn claim_authorized_local_run_ticket")
-            .nth(1)
-            .expect("pre-click submit implementation")
-            .split("fn sqlite_local_run_authority")
+            .rsplit("fn local_run_submit_authorization_inner(")
             .next()
-            .expect("bounded pre-click submit implementation");
+            .expect("pre-click submit implementation")
+            .split("fn local_click_started_ticket_matches(")
+            .next()
+            .expect("bounded pre-click submit implementation")
+            .split("DbPool::Postgres(_) =>")
+            .nth(1)
+            .expect("PostgreSQL pre-click submit implementation");
         let ticket = submit
-            .find("postgres_local_run_authority")
+            .find("postgres_local_run_authority_prelock")
             .expect("ticket authority before registry lock");
+        let discovery_lock = submit
+            .find("lock_discovery_account_shared_postgres(&mut tx, &capacity.account_id)")
+            .expect("shared discovery-account lock");
+        let account_fence = submit
+            .find("require_active_account_write_fence_postgres_tx")
+            .expect("active account write fence");
         let shared_lock = submit
             .find("postgres_lock_browser_release_registry_shared(&mut tx)")
             .expect("shared registry lock");
+        let capacity_prelock = submit
+            .find("prelock_local_submission_evidence_capacity_postgres_tx")
+            .expect("capacity prelock after release registry lock");
+        let db_time = submit
+            .find("local_run_claim_db_now_postgres(&mut tx)")
+            .expect("submit database time after authority prelocks");
+        let current = submit
+            .find("postgres_local_run_authority_after_prelock_at_ms")
+            .expect("current submit authority after database time");
         let release = submit
-            .find("postgres_bound_browser_release_submit_allowed")
+            .find("postgres_bound_browser_release_submit_allowed_at_ms")
             .expect("bound release authority after registry lock");
         let capacity = submit
             .find("reserve_submission_evidence_capacity_postgres_tx")
             .expect("capacity reservation after release authority");
-        assert!(ticket < shared_lock && shared_lock < release && release < capacity);
+        assert!(discovery_lock < account_fence && account_fence < ticket);
+        assert!(ticket < shared_lock && shared_lock < capacity_prelock);
+        assert!(capacity_prelock < db_time && db_time < current);
+        assert!(current < release && release < capacity);
 
         let replay = submit_source
-            .split("fn postgres_local_click_started_submit_replay")
-            .nth(1)
+            .rsplit("fn postgres_local_click_started_submit_replay")
+            .next()
             .expect("PostgreSQL click-started replay implementation")
             .split("fn local_ats_observed_surface")
             .next()
@@ -464,8 +665,14 @@ mod tests {
             .find("SELECT session_json, runner, status FROM jobs_browser_sessions")
             .expect("click-started session lock");
         let capacity = replay
-            .find("postgres_local_click_started_capacity_matches")
+            .find("postgres_local_click_started_capacity_expires_at_ms")
             .expect("click-started capacity authority");
+        let db_time = replay
+            .find("local_run_claim_db_now_postgres")
+            .expect("click-started database time");
+        let expiry = replay
+            .find("capacity_expires_at_ms <= now")
+            .expect("click-started capacity expiry check");
         assert!(
             ticket_lock < shared_lock
                 && shared_lock < release
@@ -473,6 +680,8 @@ mod tests {
                 && ats < application
                 && application < session
                 && session < capacity
+                && capacity < db_time
+                && db_time < expiry
         );
 
         let availability = claim_source
@@ -576,8 +785,8 @@ mod tests {
 
         let local_submit_source = include_str!("local_runner.rs");
         let local_phase_b = local_submit_source
-            .split("fn local_run_submit_authorization_inner(")
-            .nth(1)
+            .rsplit("fn local_run_submit_authorization_inner(")
+            .next()
             .expect("local pre-click transaction")
             .split("fn local_ats_observed_surface")
             .next()
@@ -586,8 +795,8 @@ mod tests {
             .find("lock_postgres_ats_certification(&mut tx)")
             .expect("local Phase B ATS advisory lock");
         let local_phase_b_first_row = local_phase_b
-            .find("postgres_runner_volume_fleet_distribution_ready")
-            .expect("local Phase B runner row authority");
+            .find("SELECT account_id, status FROM jobs_local_run_tickets")
+            .expect("local Phase B ticket row authority");
         assert!(local_phase_b_lock < local_phase_b_first_row);
     }
 
@@ -618,9 +827,11 @@ mod tests {
                 + operation[after_begin..]
                     .find(hold_lock)
                     .unwrap_or_else(|| panic!("missing {label} operational-hold lock"));
+            let prefix = &operation[after_begin..hold];
             assert!(
-                operation[after_begin..hold].trim().is_empty(),
-                "{label} must acquire the operational-hold lock immediately after BEGIN"
+                prefix.trim().is_empty(),
+                "{label} operational-hold lock is not the exact first transaction operation: \
+                 {prefix:?}"
             );
             let protected = after_begin
                 + operation[after_begin..]
@@ -678,7 +889,12 @@ mod tests {
         let fleet = managed_prelock_body
             .find("jobs_runner_volume_fleet_state")
             .expect("managed-cloud prelock fleet");
-        assert!(managed_prelock_body[..hold].trim().is_empty());
+        for forbidden in ["lock_", ".query_", ".execute(", "FOR UPDATE", "FOR SHARE"] {
+            assert!(
+                !managed_prelock_body[..hold].contains(forbidden),
+                "managed-cloud prelock acquires protected authority before its hold lock"
+            );
+        }
         assert!(hold < registry && registry < ats && ats < fleet);
 
         let browser = include_str!("browser_release_authority.rs");
@@ -724,42 +940,39 @@ mod tests {
         );
 
         let local_runner = include_str!("local_runner.rs");
+        let local_final_submit = local_runner
+            .rsplit_once("fn local_run_submit_authorization_inner(")
+            .expect("local final-submit admission start")
+            .1
+            .split_once("fn local_click_started_ticket_matches(")
+            .expect("local final-submit admission end")
+            .0;
         assert_first_lock(
-            operation(
-                local_runner,
-                "fn local_run_submit_authorization_inner",
-                "fn local_ats_observed_surface",
-                "local final-submit admission",
-            ),
+            local_final_submit,
             "let mut tx = conn.transaction()?;",
             "lock_operational_hold_shared_postgres_tx(&mut tx)",
             "lock_postgres_ats_certification(&mut tx)",
             "local final-submit admission",
         );
-        let local_submit = operation(
-            local_runner,
-            "fn local_run_submit_authorization_inner",
-            "fn local_ats_observed_surface",
-            "local final-submit admission",
-        );
+        let local_submit = local_final_submit;
         let (local_submit_sqlite, local_submit_postgres) = local_submit
             .split_once("DbPool::Postgres(_) =>")
             .expect("local final-submit SQLite/PostgreSQL branches");
-        for (branch, replay) in [
+        for (branch, replay, hold_evaluation) in [
             (
                 local_submit_sqlite,
                 "sqlite_local_click_started_submit_replay",
+                "require_local_run_operational_capability_sqlite_after_authority",
             ),
             (
                 local_submit_postgres,
                 "postgres_local_click_started_submit_replay",
+                "require_local_run_operational_capability_postgres_after_authority_prelock",
             ),
         ] {
             assert!(
                 branch.find(replay).unwrap()
-                    < branch
-                        .find("operational_hold_context_for_application")
-                        .unwrap(),
+                    < branch.find(hold_evaluation).unwrap(),
                 "durable local click-started replay must remain before hold evaluation"
             );
         }
@@ -783,7 +996,7 @@ mod tests {
         );
         assert_managed_prelock_is_first_statement(
             cloud_submit,
-            "let managed_requested = matches!(managed_cloud_context, Some((Some(_), _)));",
+            "if let Some((Some(input), _)) = managed_cloud_context {",
             "cloud final-submit admission",
         );
         let cloud_submit_postgres = cloud_submit
@@ -792,7 +1005,7 @@ mod tests {
             .expect("PostgreSQL cloud final-submit admission");
         assert!(
             cloud_submit_postgres
-                .find("lease.phase == \"click_started\"")
+                .find("if discovered_lease")
                 .unwrap()
                 < cloud_submit_postgres
                     .find("operational_hold_context_for_application_postgres_tx")
@@ -880,37 +1093,69 @@ mod tests {
         ));
 
         let holds = include_str!("operational_holds.rs");
-        for (start, end, label) in [
+        let section = |start: &str, end: &str, label: &str| {
+            holds
+                .split_once(start)
+                .unwrap_or_else(|| panic!("missing {label} start"))
+                .1
+                .split_once(end)
+                .unwrap_or_else(|| panic!("missing {label} end"))
+                .0
+        };
+        for (legacy_start, after_prelock_start, implementation_start, end, label) in [
             (
                 "pub(crate) fn operational_hold_context_for_application_postgres_tx(",
+                "pub fn operational_hold_context_for_application_postgres_tx_after_authority_prelock(",
+                "fn operational_hold_context_for_application_postgres_tx_impl(",
                 "pub(crate) fn operational_hold_context_for_job_sqlite_tx(",
                 "application context",
             ),
             (
                 "pub(crate) fn operational_hold_context_for_job_postgres_tx(",
+                "pub fn operational_hold_context_for_job_postgres_tx_after_authority_prelock(",
+                "fn operational_hold_context_for_job_postgres_tx_impl(",
                 "pub(crate) fn operational_hold_context_for_mailbox_sqlite_tx(",
                 "job context",
             ),
         ] {
-            let operation = holds
-                .split(start)
-                .nth(1)
-                .unwrap_or_else(|| panic!("missing PostgreSQL {label}"))
-                .split(end)
-                .next()
-                .unwrap_or_else(|| panic!("unbounded PostgreSQL {label}"));
-            let fence = operation
-                .find("lock_discovery_account_shared_postgres")
-                .unwrap_or_else(|| panic!("missing shared account fence in {label}"));
-            let posting = operation
-                .find("FROM jobs_postings")
-                .unwrap_or_else(|| panic!("missing posting snapshot in {label}"));
-            assert!(
-                fence < posting,
-                "{label} reads posting before its account fence"
+            let legacy = section(
+                legacy_start,
+                after_prelock_start,
+                &format!("legacy PostgreSQL {label}"),
             );
-            assert!(operation.contains("FOR SHARE"));
-            assert!(!operation.contains("FOR UPDATE OF membership, source"));
+            let fence = legacy
+                .find("lock_discovery_account_shared_postgres")
+                .unwrap_or_else(|| panic!("missing shared account fence in legacy {label}"));
+            let implementation_call = legacy
+                .find(implementation_start.trim_start_matches("fn ").trim_end_matches('('))
+                .unwrap_or_else(|| panic!("missing implementation call in legacy {label}"));
+            assert!(
+                fence < implementation_call,
+                "legacy {label} delegates before its account fence"
+            );
+
+            let after_prelock = section(
+                after_prelock_start,
+                implementation_start,
+                &format!("after-prelock PostgreSQL {label}"),
+            );
+            assert!(after_prelock.contains("Some(employer_domain)"));
+            assert!(!after_prelock.contains("lock_discovery_account_shared_postgres("));
+            assert!(!after_prelock.contains("lock_operational_hold_shared_postgres_tx("));
+
+            let implementation = section(
+                implementation_start,
+                end,
+                &format!("PostgreSQL {label} implementation"),
+            );
+            assert!(!implementation.contains("lock_discovery_account_shared_postgres("));
+            assert!(!implementation.contains("lock_operational_hold_shared_postgres_tx("));
+            assert!(
+                implementation.contains("FROM jobs_postings"),
+                "missing posting snapshot in {label}"
+            );
+            assert!(implementation.contains("FOR SHARE"));
+            assert!(!implementation.contains("FOR UPDATE OF membership, source"));
         }
 
         let materialization = include_str!("global_materialization.rs")
@@ -933,8 +1178,15 @@ mod tests {
         assert!(writer_fence < membership_write);
 
         let eligibility = include_str!("eligibility.rs");
-        assert!(eligibility.matches("FOR SHARE OF s, m").count() >= 2);
-        assert!(!eligibility.contains("FOR UPDATE OF s, m"));
+        let attempt_inputs = eligibility
+            .split_once("fn load_attempt_authority_inputs_postgres_tx(")
+            .expect("attempt authority PostgreSQL input loader")
+            .1
+            .split_once("fn require_attempt_runner_capability_sqlite_tx(")
+            .expect("bounded attempt authority PostgreSQL input loader")
+            .0;
+        assert!(attempt_inputs.contains("FOR SHARE OF application, posting"));
+        assert!(!attempt_inputs.contains("FOR UPDATE"));
     }
 
     #[test]
@@ -1000,10 +1252,10 @@ mod tests {
     fn layout_drift_denial_commits_before_irreversible_submit_writes() {
         let local_source = include_str!("local_runner.rs");
         let local_submit = local_source
-            .split("fn local_run_submit_authorization_inner(")
-            .nth(1)
+            .rsplit("fn local_run_submit_authorization_inner(")
+            .next()
             .expect("local submit transaction")
-            .split("fn local_ats_observed_surface")
+            .split("fn local_click_started_ticket_matches")
             .next()
             .expect("bounded local submit transaction");
         let (local_sqlite, local_postgres) = local_submit
@@ -1275,11 +1527,72 @@ mod tests {
         profile.source_resume_template_status = first_asset.template_status.clone();
         let (_, profile) =
             save_resume_source_asset(&pool, "acct-jobs", &first_asset, &profile).unwrap();
+        let track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let track = upsert_track(&pool, "acct-jobs", &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert_eq!(track.policy.authority.policy_revision_no, 1);
 
         let authorization =
             authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").unwrap();
         assert_eq!(authorization.status, "active");
         assert_eq!(authorization.source_resume_asset_id, first_asset.id);
+
+        let mut changed_preferences = get_preferences(&pool, "acct-jobs").unwrap();
+        changed_preferences
+            .excluded_titles
+            .push("Staffing-only role".to_string());
+        save_preferences(&pool, "acct-jobs", &changed_preferences).unwrap();
+        let changed_policy =
+            list_auto_submit_authorizations(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        assert_eq!(changed_policy[0].status, "needs_review");
+        assert!(
+            authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").is_err()
+        );
+        let changed_track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        assert_eq!(changed_track.policy.authority.review_state, "needs_review");
+        let changed_track = upsert_track(&pool, "acct-jobs", &changed_track).unwrap();
+        assert_eq!(changed_track.policy.authority.review_state, "approved");
+        assert_eq!(changed_track.policy.authority.policy_revision_no, 2);
+        let conn = pool.get().unwrap();
+        let (compatibility, review_state): (String, String) = conn
+            .query_row(
+                "SELECT compatibility_classification, review_state
+                   FROM jobs_track_policy_revisions
+                  WHERE account_id = ?1 AND career_track_id = ?2 AND revision_no = 2",
+                rusqlite::params!["acct-jobs", "track-default"],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(compatibility, "review_required");
+        assert_eq!(review_state, "approved");
+        let approved_receipts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_track_policy_review_receipts
+                  WHERE account_id = ?1 AND career_track_id = ?2
+                    AND policy_revision_no = 2 AND decision = 'approved'",
+                rusqlite::params!["acct-jobs", "track-default"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(approved_receipts, 1);
+        drop(conn);
+        let same_track = upsert_track(&pool, "acct-jobs", &changed_track).unwrap();
+        assert_eq!(same_track.policy.authority.policy_revision_no, 2);
+        let revision_count: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_track_policy_revisions
+                  WHERE account_id = ?1 AND career_track_id = ?2",
+                rusqlite::params!["acct-jobs", "track-default"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_count, 2, "no-op policy saves must reuse the head");
+        let reauthorized =
+            authorize_auto_submit(&pool, "acct-jobs", "jobs@example.com", "track-default").unwrap();
+        assert_eq!(reauthorized.status, "active");
+        assert_eq!(reauthorized.revision_no, authorization.revision_no + 1);
 
         let replacement_asset = ResumeSourceAsset {
             id: "resume-source-two".to_string(),
@@ -1957,36 +2270,41 @@ mod tests {
     }
 
     fn execution_lease_fixture(pool: &DbPool, suffix: &str) -> (JobApplication, String, String) {
-        let profile = default_profile("jobs@example.com");
-        save_profile(pool, "acct-jobs", &profile).unwrap();
-        let preferences = JobPreferences {
-            sponsorship: "not_required".to_string(),
-            ..JobPreferences::default()
-        };
-        save_preferences(pool, "acct-jobs", &preferences).unwrap();
-        let posting = upsert_posting(
+        let (profile, preferences) =
+            execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
+        set_entitlement_plan(pool, "acct-jobs", "cloud").unwrap();
+        let greenhouse_tenant = format!("acme-{suffix}");
+        let mut posting_input = test_posting(
+            &format!("https://boards.greenhouse.io/{greenhouse_tenant}/jobs/{suffix}"),
+            now_ms(),
+            now_ms(),
+        );
+        posting_input.company = format!("Acme {suffix}");
+        posting_input.source = "greenhouse_import".to_string();
+        posting_input.external_id = suffix.to_string();
+        posting_input.description =
+            "Build reliable products with Rust and TypeScript. Requires 1+ years of software engineering experience."
+                .to_string();
+        posting_input.canonical_key = canonical_job_key(&posting_input);
+        posting_input.discovery_evidence = JobDiscoveryEvidence::default();
+        let (posting, managed) = save_production_positive_verified_import(
             pool,
             "acct-jobs",
-            &test_posting(
-                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
-                now_ms(),
-                now_ms(),
-            ),
+            &posting_input,
             &profile,
             &preferences,
-        )
-        .unwrap();
-        let (application, _) =
-            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
-        let application = update_application(
+        );
+        let authority_fixture = install_production_positive_job_authorities_for_runner(
             pool,
             "acct-jobs",
-            &application.id,
-            "queued",
-            Some("review_first"),
-        )
-        .unwrap()
-        .unwrap();
+            &posting,
+            &managed,
+            &format!("{greenhouse_tenant}.example"),
+            suffix,
+            "cloud",
+        );
+        let (application, _) =
+            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
         let run_id = format!("cloud-run-{suffix}");
         upsert_browser_session(
             pool,
@@ -1995,7 +2313,7 @@ mod tests {
                 id: run_id.clone(),
                 runner: "cloud".to_string(),
                 status: "queued".to_string(),
-                current_company: "Acme".to_string(),
+                current_company: authority_fixture.posting.company.clone(),
                 current_step: "Waiting for a browser".to_string(),
                 application_id: Some(application.id.clone()),
                 takeover_url: None,
@@ -2004,33 +2322,27 @@ mod tests {
             },
         )
         .unwrap();
-        let mut application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
+        let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
             .unwrap()
             .unwrap();
-        let now = now_ms();
-        pool.get()
-            .unwrap()
-            .execute(
-                "INSERT INTO jobs_attempt_reservations (
-                    id, account_id, application_id, company_key, period_key,
-                    runner, status, reserved_at_ms, updated_at_ms
-                 ) VALUES (?1, 'acct-jobs', ?2, ?3, 'test-period',
-                           'unassigned', 'reserved', ?4, ?4)",
-                params![
-                    format!("attempt-{}", application.id),
-                    application.id,
-                    format!("test-company-{suffix}"),
-                    now,
-                ],
-            )
-            .unwrap();
-        let identity_id = application
+        let authority = current_application_approval_authority(
+            pool,
+            "acct-jobs",
+            "jobs@example.com",
+            &application.id,
+        )
+        .unwrap()
+        .expect("current production-positive application approval authority");
+        assert_eq!(authority.posting.id, authority_fixture.posting.id);
+        let identity_id = authority
+            .application
             .receipt
             .pointer("/application_identity/id")
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
-        let identity_email = application
+        let identity_email = authority
+            .application
             .receipt
             .pointer("/application_identity/email")
             .and_then(Value::as_str)
@@ -2040,7 +2352,8 @@ mod tests {
         let resume = get_resume_version(
             pool,
             "acct-jobs",
-            application
+            authority
+                .application
                 .resume_version_id
                 .as_deref()
                 .expect("fixture application has a resume"),
@@ -2048,11 +2361,11 @@ mod tests {
         .unwrap()
         .unwrap();
         let approved_packet = json!({
-            "applicationId": application.id,
-            "jobId": application.job_id,
+            "applicationId": authority.application.id,
+            "jobId": authority.posting.id,
             "resumeVersionId": resume.id,
             "resumeContent": resume.content,
-            "coverLetterContent": application.cover_letter,
+            "coverLetterContent": authority.application.cover_letter,
             "answers": {},
             "verifiedClaimIds": resume.claim_ids,
             "applicationIdentityId": identity_id,
@@ -2060,37 +2373,45 @@ mod tests {
             "browserProfileId": browser_profile_id,
         });
         let approved_job = json!({
-            "externalId": posting.external_id,
-            "canonicalUrl": posting.canonical_url,
-            "company": posting.company,
-            "title": posting.title,
-            "location": posting.location,
-            "workplace": posting.workplace,
-            "description": posting.description,
-            "source": posting.source,
-            "compensation": posting.compensation,
+            "externalId": authority.posting.external_id,
+            "canonicalUrl": authority.posting.canonical_url,
+            "company": authority.posting.company,
+            "title": authority.posting.title,
+            "location": authority.posting.location,
+            "workplace": authority.posting.workplace,
+            "description": authority.posting.description,
+            "source": authority.posting.source,
+            "compensation": authority.posting.compensation,
         });
         let admission = json!({ "kind": "review_approval" });
         let checksum =
             approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
                 .unwrap();
-        application.receipt["approved_execution"] = json!({
+        let approved_execution = json!({
             "schema_version": 2,
-            "approved_at_ms": now_ms(),
+            "approved_at_ms": authority.evaluated_at_ms,
             "checksum": checksum,
             "admission": admission,
             "packet": approved_packet,
             "job": approved_job,
         });
-        application = replace_application_receipt(
+        let application = persist_current_application_approval(
             pool,
             "acct-jobs",
-            &application.id,
-            application.receipt.clone(),
+            "jobs@example.com",
+            &authority,
+            &approved_execution,
         )
         .unwrap()
-        .unwrap();
-        (application, run_id, browser_profile_id)
+        .expect("persist production-positive application approval");
+        reserve_application_attempt(pool, "acct-jobs", &application.id, "cloud").unwrap();
+        let application =
+            update_application(pool, "acct-jobs", &application.id, "queued", None).unwrap();
+        (
+            application.expect("queue production-positive application"),
+            run_id,
+            browser_profile_id,
+        )
     }
 
     struct FinalSubmissionFixture {
@@ -2140,6 +2461,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn submission_evidence_capacity_uses_the_final_database_time_window() {
+        let capacity = test_submission_evidence_capacity("application", "run");
+        let database_now_ms = capacity.now_ms.saturating_add(37);
+        for rebound in [
+            submission_evidence_capacity_at_ms(&capacity, database_now_ms),
+            local_submission_evidence_capacity_at_ms(&capacity, database_now_ms),
+        ] {
+            assert_eq!(rebound.now_ms, database_now_ms);
+            assert_eq!(
+                rebound.expires_at_ms,
+                database_now_ms.saturating_add(SUBMISSION_RECONCILIATION_GRACE_MS)
+            );
+        }
+    }
+
     fn test_final_submit_proof(application: &JobApplication) -> FinalSubmitProof {
         let canonical_url = application
             .receipt
@@ -2152,13 +2489,21 @@ mod tests {
             .and_then(Value::as_str)
             .or(application.resume_version_id.as_deref())
             .expect("test application has a frozen resume version");
-        let mut documents = Vec::new();
-        if application
+        let has_cover_letter = application
             .receipt
             .pointer("/approved_execution/packet/coverLetterContent")
             .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-        {
+            .is_some_and(|value| !value.trim().is_empty());
+        test_final_submit_proof_for_shape(canonical_url, resume_version_id, has_cover_letter)
+    }
+
+    fn test_final_submit_proof_for_shape(
+        canonical_url: &str,
+        resume_version_id: &str,
+        has_cover_letter: bool,
+    ) -> FinalSubmitProof {
+        let mut documents = Vec::new();
+        if has_cover_letter {
             documents.push(FinalSubmitDocumentProof {
                 kind: "cover_letter".to_string(),
                 version_id: None,
@@ -2234,161 +2579,217 @@ mod tests {
         }
     }
 
-    fn certified_local_runtime_target() -> AtsCertificationRuntimeTarget {
-        AtsCertificationRuntimeTarget {
-            runtime_kind: "local".to_string(),
-            runtime_id: "local:test-browser-release".to_string(),
-            runtime_sha256: "d".repeat(64),
-            platform: "macos".to_string(),
-            architecture: "arm64".to_string(),
-            automation_bundle_sha256: "4".repeat(64),
-            browser_release_manifest_sha256: Some("1".repeat(64)),
-            browser_artifact_sha256: Some("2".repeat(64)),
-            browser_build_descriptor_sha256: Some("3".repeat(64)),
-            runner_build_id: None,
-            runner_image_sha256: None,
-            playwright_version: "1.61.1".to_string(),
-            chromium_revision: "1228".to_string(),
-            chromium_executable_sha256: "7".repeat(64),
+    pub(super) struct CertifiedApplicationFixture {
+        pub(super) application: JobApplication,
+        pub(super) run_id: String,
+        pub(super) browser_profile_id: String,
+        target_evidence: AtsCertificationFreshTargetEvidence,
+        runtime_target: AtsCertificationRuntimeTarget,
+        surface: AtsObservedSurface,
+        managed_authority_now_ms: i64,
+        ticket_hash: Option<String>,
+        proof: FinalSubmitProof,
+    }
+
+    fn certified_final_submit_surface(cover_letter: &str) -> AtsObservedSurface {
+        let proof = test_final_submit_proof_for_shape(
+            "https://boards.greenhouse.io/bluey-certified/jobs/surface",
+            "certified-surface-resume",
+            !cover_letter.trim().is_empty(),
+        );
+        AtsObservedSurface {
+            variant_key: "greenhouse_public".to_string(),
+            layout_contract_version: 1,
+            surface_sha256: final_submit_surface_sha256(&proof).unwrap(),
         }
     }
 
-    fn install_certified_application(
-        pool: &DbPool,
-        application: JobApplication,
-        runtime_target: AtsCertificationRuntimeTarget,
-    ) -> (JobApplication, FinalSubmitProof) {
-        let now = now_ms();
-        let mut posting = get_posting(pool, "acct-jobs", &application.job_id)
-            .unwrap()
-            .expect("certified fixture posting exists");
-        posting.match_score = 90;
-        pool.get()
-            .unwrap()
-            .execute(
-                "UPDATE jobs_postings SET posting_json = ?3, match_score = ?4
-                  WHERE account_id = ?1 AND id = ?2",
-                params![
-                    "acct-jobs",
-                    posting.id,
-                    to_json(&posting, "certified fixture posting").unwrap(),
-                    posting.match_score,
-                ],
-            )
-            .unwrap();
-        let target_evidence =
-            ats_certification_fresh_target_evidence_from_posting(&posting, now).unwrap();
-        let base_proof = test_final_submit_proof(&application);
-        let surface = AtsObservedSurface {
-            variant_key: "greenhouse_public".to_string(),
-            layout_contract_version: 1,
-            surface_sha256: final_submit_surface_sha256(&base_proof).unwrap(),
-        };
-        let installed =
-            super::ats_certification_authority_tests::install_signed_ats_authority_fixture(
-                pool,
-                target_evidence,
-                surface.clone(),
-                runtime_target.clone(),
-                now,
-            )
-            .expect("install exact signed ATS authority fixture");
-        assert_eq!(installed.surface, surface);
-        assert_eq!(installed.runtime_target, runtime_target);
-        assert_eq!(
-            installed.target_evidence.canonical_url,
-            posting.canonical_url
-        );
-        assert_eq!(installed.manifest_sha256.len(), 64);
-        assert_eq!(installed.activation_sha256.len(), 64);
+    fn certified_cloud_runtime(suffix: &str) -> RunnerProcessRuntimeAttestation {
+        RunnerProcessRuntimeAttestation {
+            runner_image_sha256: hex::encode(Sha256::digest(
+                format!("certified-cloud-image-{suffix}").as_bytes(),
+            )),
+            runner_build_id: format!("runner-614b-{suffix}"),
+            platform: "linux".to_string(),
+            architecture: "x86_64".to_string(),
+            automation_bundle_sha256: hex::encode(Sha256::digest(
+                format!("certified-cloud-automation-{suffix}").as_bytes(),
+            )),
+            playwright_version: "1.61.1".to_string(),
+            chromium_revision: "123456".to_string(),
+            chromium_executable_sha256: hex::encode(Sha256::digest(
+                format!("certified-cloud-chromium-{suffix}").as_bytes(),
+            )),
+        }
+    }
 
-        let active = resolve_active_ats_certification(
+    pub(super) fn certified_cloud_runtime_target(
+        runtime: &RunnerProcessRuntimeAttestation,
+    ) -> AtsCertificationRuntimeTarget {
+        AtsCertificationRuntimeTarget {
+            runtime_kind: "cloud".to_string(),
+            runtime_id: format!("cloud:{}", runtime.runner_build_id),
+            runtime_sha256: runner_process_runtime_sha256(runtime).unwrap(),
+            platform: runtime.platform.clone(),
+            architecture: runtime.architecture.clone(),
+            automation_bundle_sha256: runtime.automation_bundle_sha256.clone(),
+            browser_release_manifest_sha256: None,
+            browser_artifact_sha256: None,
+            browser_build_descriptor_sha256: None,
+            runner_build_id: Some(runtime.runner_build_id.clone()),
+            runner_image_sha256: Some(runtime.runner_image_sha256.clone()),
+            playwright_version: runtime.playwright_version.clone(),
+            chromium_revision: runtime.chromium_revision.clone(),
+            chromium_executable_sha256: runtime.chromium_executable_sha256.clone(),
+        }
+    }
+
+    pub(super) fn certified_application_fixture(
+        pool: &DbPool,
+        suffix: &str,
+        runner: &str,
+        runtime_target: AtsCertificationRuntimeTarget,
+        cover_letter: &str,
+    ) -> CertifiedApplicationFixture {
+        assert_eq!(runtime_target.runtime_kind, runner);
+        let (mut profile, preferences) =
+            execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
+        set_entitlement_plan(
             pool,
-            &posting.canonical_url,
-            Some(&runtime_target.runtime_sha256),
-            Some(&surface),
-            now,
+            "acct-jobs",
+            if runner == "cloud" { "cloud" } else { "pro" },
         )
-        .unwrap()
-        .expect("signed ATS authority resolves for the exact runtime");
-        assert_eq!(active.selected_runtime.as_ref(), Some(&runtime_target));
-        let frozen = ats_frozen_certification_admission_projection(&active).unwrap();
-        let certification = ats_certification_admission_projection(&active).unwrap();
-        let authorization_id = format!("ats-auth-{}", application.id);
-        let identity_id = application
-            .receipt
-            .pointer("/application_identity/id")
-            .and_then(Value::as_str)
-            .expect("certified application identity")
-            .to_string();
-        let profile = get_profile(pool, "acct-jobs", "jobs@example.com").unwrap();
-        let facts = list_facts(pool, "acct-jobs").unwrap();
+        .unwrap();
+        profile.skills = vec![
+            "Rust".to_string(),
+            "TypeScript".to_string(),
+            "PostgreSQL".to_string(),
+        ];
+        let profile = save_profile(pool, "acct-jobs", &profile).unwrap();
         let track = list_tracks(pool, "acct-jobs")
             .unwrap()
             .into_iter()
             .find(|track| track.id == "track-default")
-            .expect("certified application track");
-        let identity = get_application_identity(pool, "acct-jobs", &identity_id)
-            .unwrap()
-            .expect("certified application identity row");
-        let authorization_fingerprint =
-            auto_submit_authority_fingerprint(&profile, &facts, &track, &identity).unwrap();
-        let source_resume_asset_id = profile.source_resume_asset_id;
-        pool.get()
-            .unwrap()
-            .execute(
-                "INSERT INTO jobs_auto_submit_authorizations (
-                    id, account_id, career_track_id, application_identity_id,
-                    source_resume_asset_id, authority_fingerprint, revision_no,
-                    authorized_at_ms, revoked_at_ms
-                 ) VALUES (?1, 'acct-jobs', 'track-default', ?2, ?3, ?4, 1, ?5, NULL)",
-                params![
-                    authorization_id,
-                    identity_id,
-                    source_resume_asset_id,
-                    authorization_fingerprint,
-                    now,
-                ],
+            .expect("certified application Career Track exists");
+        let track = upsert_track(pool, "acct-jobs", &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+        assert!(track.policy.authority.policy_revision_no > 0);
+        let greenhouse_tenant = format!("bluey-{runner}-{suffix}");
+        let mut posting_input = test_posting(
+            &format!("https://boards.greenhouse.io/{greenhouse_tenant}/jobs/{suffix}"),
+            now_ms(),
+            now_ms(),
+        );
+        posting_input.company = format!("Acme {suffix}");
+        posting_input.source = "greenhouse_import".to_string();
+        posting_input.external_id = suffix.to_string();
+        posting_input.description =
+            "Build reliable products with Rust, TypeScript, and PostgreSQL.".to_string();
+        posting_input.canonical_key = canonical_job_key(&posting_input);
+        posting_input.discovery_evidence = JobDiscoveryEvidence::default();
+        let (posting, managed) = save_production_positive_verified_import(
+            pool,
+            "acct-jobs",
+            &posting_input,
+            &profile,
+            &preferences,
+        );
+        let managed_authority_now_ms = managed.now_ms;
+        assert!(
+            posting.match_score >= profile.auto_submit_threshold,
+            "production-positive posting must meet the public Auto-submit threshold"
+        );
+        assert!(
+            posting.missing_requirements.is_empty(),
+            "production-positive posting must have no unresolved eligibility requirements"
+        );
+        let surface = certified_final_submit_surface(cover_letter);
+        let authority_fixture = install_production_positive_job_authorities_with_runtime_surface(
+            pool,
+            "acct-jobs",
+            &posting,
+            &managed,
+            &format!("{greenhouse_tenant}.example"),
+            suffix,
+            runtime_target.clone(),
+            surface.clone(),
+        );
+        assert_eq!(authority_fixture.runtime_target, runtime_target);
+        assert_eq!(authority_fixture.surface, surface);
+        let authorization = authorize_auto_submit(
+            pool,
+            "acct-jobs",
+            "jobs@example.com",
+            "track-default",
+        )
+        .unwrap();
+        let prepared = prepare_application_draft(
+            pool,
+            "acct-jobs",
+            &posting.id,
+            "factual",
+            "auto_submit",
+        )
+        .expect("prepare certified Auto-submit application through the production lifecycle");
+        let eligibility: JobEligibilityDecision =
+            serde_json::from_value(prepared.application.receipt["eligibility"].clone()).unwrap();
+        assert!(eligibility.can_auto_submit, "{eligibility:#?}");
+        assert_eq!(
+            eligibility.ats_certification.certified_runner_kinds,
+            vec![runner.to_string()],
+        );
+        let (application, _) = finalize_prepared_application_kit(
+            pool,
+            "acct-jobs",
+            &prepared,
+            prepared.baseline_resume.content.clone(),
+            prepared.baseline_resume.diff.clone(),
+            cover_letter.to_string(),
+            json!({
+                "status": "deterministic",
+                "provider": "bluey-evidence-planner",
+                "claims_added": 0,
+            }),
+        )
+        .expect("freeze certified Auto-submit admission through the production lifecycle");
+        assert_eq!(application.state, "queued");
+        assert_eq!(application.submission_mode, "auto_submit");
+        assert_eq!(
+            application
+                .receipt
+                .pointer("/approved_execution/admission/authorization_id")
+                .and_then(Value::as_str),
+            Some(authorization.id.as_str())
+        );
+        assert_eq!(
+            application_job_integrity_receipt(&application)
+                .unwrap()
+                .as_ref(),
+            Some(&job_integrity_receipt_projection(
+                &authority_fixture.integrity
+            ))
+        );
+        let active = authority_fixture
+            .ats
+            .active_binding
+            .as_ref()
+            .expect("certified application has one active ATS binding");
+        assert_eq!(
+            application
+                .receipt
+                .pointer("/approved_execution/admission/ats_certification"),
+            Some(&serde_json::to_value(
+                ats_frozen_certification_admission_projection(active).unwrap()
             )
-            .unwrap();
+            .unwrap())
+        );
 
-        let mut application = update_application(
-            pool,
-            "acct-jobs",
-            &application.id,
-            &application.state,
-            Some("auto_submit"),
-        )
-        .unwrap()
-        .expect("promote certified application mode");
-        let packet = application.receipt["approved_execution"]["packet"].clone();
-        let job = application.receipt["approved_execution"]["job"].clone();
-        let admission = json!({
-            "kind": "track_auto_submit",
-            "authorization_id": authorization_id,
-            "career_track_id": "track-default",
-            "revision_no": 1,
-            "authority_fingerprint": authorization_fingerprint,
-            "ats_certification": frozen,
-        });
-        let checksum = approved_submission_checksum(3, &packet, &job, Some(&admission)).unwrap();
-        application.receipt["approved_execution"] = json!({
-            "schema_version": 3,
-            "approved_at_ms": now,
-            "checksum": checksum,
-            "admission": admission,
-            "packet": packet,
-            "job": job,
-        });
-        application = replace_application_receipt(
-            pool,
-            "acct-jobs",
-            &application.id,
-            application.receipt.clone(),
-        )
-        .unwrap()
-        .expect("freeze certified application admission");
-
+        let base_proof = test_final_submit_proof(&application);
+        assert_eq!(
+            final_submit_surface_sha256(&base_proof).unwrap(),
+            surface.surface_sha256
+        );
+        let certification = ats_certification_admission_projection(active).unwrap();
         let proof = FinalSubmitProof {
             schema_version: 4,
             certification: Some(certification),
@@ -2408,7 +2809,549 @@ mod tests {
                 .expect("schema-four surface")
                 .surface_sha256
         );
-        (application, proof)
+        let identity_id = application
+            .receipt
+            .pointer("/application_identity/id")
+            .and_then(Value::as_str)
+            .expect("certified application identity")
+            .to_string();
+        let browser_profile_id = execution_browser_profile_id("acct-jobs", &identity_id);
+        let run_id = format!("{runner}-run-{suffix}");
+        upsert_browser_session(
+            pool,
+            "acct-jobs",
+            &BrowserSession {
+                id: run_id.clone(),
+                runner: runner.to_string(),
+                status: "queued".to_string(),
+                current_company: authority_fixture.posting.company.clone(),
+                current_step: format!("Waiting for the {runner} runner"),
+                application_id: Some(application.id.clone()),
+                takeover_url: None,
+                created_at_ms: 0,
+                updated_at_ms: 0,
+            },
+        )
+        .unwrap();
+        let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
+            .unwrap()
+            .expect("assign certified application run");
+        reserve_application_attempt(pool, "acct-jobs", &application.id, runner).unwrap();
+        let ticket_hash = (runner == "local").then(|| {
+            let ticket_hash = format!("ticket-hash-{suffix}");
+            save_local_run_ticket(
+                pool,
+                "acct-jobs",
+                &application.id,
+                &run_id,
+                &ticket_hash,
+                &format!("ticket-secret-{suffix}"),
+                json!({
+                    "accountId": "acct-jobs",
+                    "applicationId": application.id,
+                    "jobId": authority_fixture.posting.id,
+                    "applicationIdentityId": identity_id,
+                    "browserProfileId": browser_profile_id,
+                    "runner": "local",
+                    "url": authority_fixture.posting.canonical_url,
+                    "runId": run_id,
+                }),
+                now_ms() + 60_000,
+            )
+            .unwrap();
+            ticket_hash
+        });
+        let target_evidence = ats_certification_fresh_target_evidence_from_posting(
+            &authority_fixture.posting,
+            authority_fixture.source.db_time_ms,
+        )
+        .expect("certified application exposes exact ATS target evidence");
+        CertifiedApplicationFixture {
+            application,
+            run_id,
+            browser_profile_id,
+            target_evidence,
+            runtime_target: authority_fixture.runtime_target,
+            surface: authority_fixture.surface,
+            managed_authority_now_ms,
+            ticket_hash,
+            proof,
+        }
+    }
+
+    fn install_certified_ats_successor(
+        pool: &DbPool,
+        fixture: &CertifiedApplicationFixture,
+        suffix: &str,
+    ) {
+        let mut runtime_target = fixture.runtime_target.clone();
+        runtime_target.runtime_id = format!("{}:ats-successor-{suffix}", runtime_target.runtime_kind);
+        runtime_target.runtime_sha256 =
+            ats_certification_sha256(format!("ats-successor-runtime-{suffix}").as_bytes());
+        runtime_target.automation_bundle_sha256 =
+            ats_certification_sha256(format!("ats-successor-automation-{suffix}").as_bytes());
+        runtime_target.chromium_executable_sha256 =
+            ats_certification_sha256(format!("ats-successor-chromium-{suffix}").as_bytes());
+        if runtime_target.runtime_kind == "cloud" {
+            runtime_target.runner_build_id = Some(format!("runner-ats-successor-{suffix}"));
+            runtime_target.runner_image_sha256 = Some(ats_certification_sha256(
+                format!("ats-successor-image-{suffix}").as_bytes(),
+            ));
+        }
+        ats_certification_authority_tests::install_signed_ats_authority_fixture(
+            pool,
+            fixture.target_evidence.clone(),
+            fixture.surface.clone(),
+            runtime_target,
+            now_ms().saturating_add(1),
+        )
+        .expect("publish signed ATS successor for the exact certified scope");
+    }
+
+    fn certified_reservation(pool: &DbPool, application_id: &str) -> AttemptReservation {
+        list_attempt_reservations(pool, "acct-jobs")
+            .unwrap()
+            .into_iter()
+            .find(|reservation| reservation.application_id == application_id)
+            .expect("certified application reservation exists")
+    }
+
+    fn assert_current_execution_authority_denied(error: &anyhow::Error) {
+        assert_eq!(
+            error.downcast_ref::<ApplicationAttemptAdmissionError>(),
+            Some(&ApplicationAttemptAdmissionError::ReviewRequired {
+                reason_code: "current_execution_authority_denied".to_string(),
+            })
+        );
+    }
+
+    fn assert_prepared_auto_submit_finalization_employer_hold_is_typed_and_atomic(
+        pool: &DbPool,
+        suffix: &str,
+    ) {
+        let runtime = certified_cloud_runtime(suffix);
+        let fixture = certified_application_fixture(
+            pool,
+            suffix,
+            "cloud",
+            certified_cloud_runtime_target(&runtime),
+            "",
+        );
+        let prepared = prepare_application_draft(
+            pool,
+            "acct-jobs",
+            &fixture.application.job_id,
+            "factual",
+            "auto_submit",
+        )
+        .expect("prepare a second certified Auto-submit packet before the queue hold");
+        let mut content = prepared.baseline_resume.content.clone();
+        content["provenance"]["resume_generation"] = json!({
+            "kind": "model",
+            "schema_version": 1,
+            "truth_guard": "passed",
+            "claims_added": 0,
+        });
+        let generation = content["provenance"]["resume_generation"].clone();
+        let employer_domain = application_job_integrity_receipt(&fixture.application)
+            .unwrap()
+            .expect("certified application has a frozen job-integrity receipt")
+            .canonical_employer_domain;
+        let held_event_id = format!("fix758-prepared-held-{suffix}");
+        let released_event_id = format!("fix758-prepared-released-{suffix}");
+
+        let application_before = serde_json::to_value(
+            get_application(pool, "acct-jobs", &fixture.application.id)
+                .unwrap()
+                .expect("certified application remains stored"),
+        )
+        .unwrap();
+        let resumes_before =
+            serde_json::to_value(list_resume_versions(pool, "acct-jobs").unwrap()).unwrap();
+        let reservations_before = list_attempt_reservations(pool, "acct-jobs").unwrap();
+        let browser_sessions_before =
+            serde_json::to_value(list_browser_sessions(pool, "acct-jobs").unwrap()).unwrap();
+        let run_events_before =
+            serde_json::to_value(list_run_events(pool, "acct-jobs", &fixture.run_id).unwrap())
+                .unwrap();
+
+        append_operational_hold_for_scope(
+            pool,
+            OperationalCapability::ApplicationQueue,
+            OperationalHoldScopeKind::EmployerDomain,
+            &employer_domain,
+            &held_event_id,
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        let finalization = finalize_prepared_application_kit(
+            pool,
+            "acct-jobs",
+            &prepared,
+            content,
+            prepared.baseline_resume.diff.clone(),
+            String::new(),
+            generation,
+        );
+        let application_after = serde_json::to_value(
+            get_application(pool, "acct-jobs", &fixture.application.id)
+                .unwrap()
+                .expect("held prepared finalization preserves the application"),
+        )
+        .unwrap();
+        let resumes_after =
+            serde_json::to_value(list_resume_versions(pool, "acct-jobs").unwrap()).unwrap();
+        let reservations_after = list_attempt_reservations(pool, "acct-jobs").unwrap();
+        let browser_sessions_after =
+            serde_json::to_value(list_browser_sessions(pool, "acct-jobs").unwrap()).unwrap();
+        let run_events_after =
+            serde_json::to_value(list_run_events(pool, "acct-jobs", &fixture.run_id).unwrap())
+                .unwrap();
+        append_operational_hold_for_scope(
+            pool,
+            OperationalCapability::ApplicationQueue,
+            OperationalHoldScopeKind::EmployerDomain,
+            &employer_domain,
+            &released_event_id,
+            OperationalHoldTransition::Released,
+            1,
+            Some(&held_event_id),
+        );
+
+        let error = finalization.expect_err("the current employer hold must block finalization");
+        let block = match error.downcast_ref::<OperationalHoldError>() {
+            Some(OperationalHoldError::Held(block)) => block,
+            other => panic!("prepared finalization lost its typed hold: {other:?}"),
+        };
+        assert_eq!(block.capability, OperationalCapability::ApplicationQueue);
+        assert_eq!(block.scope_kind, OperationalHoldScopeKind::EmployerDomain);
+        assert_eq!(block.scope_id, employer_domain);
+        assert_eq!(block.reason_code, OperationalHoldReasonCode::Incident);
+        assert_eq!(block.head_revision, 1);
+        assert_eq!(application_after, application_before);
+        assert_eq!(resumes_after, resumes_before);
+        assert_eq!(reservations_after, reservations_before);
+        assert_eq!(browser_sessions_after, browser_sessions_before);
+        assert_eq!(run_events_after, run_events_before);
+    }
+
+    #[test]
+    fn prepared_auto_submit_finalization_preserves_typed_employer_hold_and_mutates_nothing() {
+        let pool = test_pool();
+        assert_prepared_auto_submit_finalization_employer_hold_is_typed_and_atomic(
+            &pool,
+            "sqlite-prepared-hold",
+        );
+    }
+
+    #[test]
+    fn ats_head_replacement_cannot_reserve_frozen_auto_submit_capacity() {
+        let pool = test_pool();
+        let runtime = certified_cloud_runtime("ats-head-reserve");
+        let fixture = certified_application_fixture(
+            &pool,
+            "ats-head-reserve",
+            "cloud",
+            certified_cloud_runtime_target(&runtime),
+            "",
+        );
+        assert!(update_attempt_reservation_status(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            "released",
+        )
+        .unwrap());
+        let before = certified_reservation(&pool, &fixture.application.id);
+        assert_eq!(before.status, "released");
+        install_certified_ats_successor(&pool, &fixture, "reserve");
+
+        let error = reserve_application_attempt(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            "cloud",
+        )
+        .unwrap_err();
+        assert_current_execution_authority_denied(&error);
+        assert_eq!(
+            certified_reservation(&pool, &fixture.application.id),
+            before,
+            "ATS head drift must not reserve or rewrite capacity",
+        );
+    }
+
+    #[test]
+    fn ats_head_replacement_cannot_start_or_persist_a_frozen_auto_submit_run() {
+        let pool = test_pool();
+        let runtime = certified_cloud_runtime("ats-head-running");
+        let fixture = certified_application_fixture(
+            &pool,
+            "ats-head-running",
+            "cloud",
+            certified_cloud_runtime_target(&runtime),
+            "",
+        );
+        let reservation_before = certified_reservation(&pool, &fixture.application.id);
+        assert_eq!(reservation_before.status, "reserved");
+        let (application_before, expected_revision) = get_application_with_revision(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+        )
+        .unwrap()
+        .expect("certified application exists");
+        install_certified_ats_successor(&pool, &fixture, "running");
+
+        let error = update_attempt_reservation_status(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            "running",
+        )
+        .unwrap_err();
+        assert_current_execution_authority_denied(&error);
+        assert_eq!(
+            certified_reservation(&pool, &fixture.application.id),
+            reservation_before,
+            "ATS head drift must not start a reserved attempt",
+        );
+
+        let mut attempted = application_before.clone();
+        attempted.state = "running".to_string();
+        attempted.updated_at_ms = attempted.updated_at_ms.saturating_add(1);
+        assert!(save_application(
+            &pool,
+            "acct-jobs",
+            &attempted,
+            &expected_revision,
+        )
+        .is_err());
+        let application_after = get_application(&pool, "acct-jobs", &fixture.application.id)
+            .unwrap()
+            .expect("certified application remains stored");
+        assert_eq!(
+            serde_json::to_value(application_after).unwrap(),
+            serde_json::to_value(application_before).unwrap(),
+            "ATS head drift must not persist a running application",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_ats_head_replacement_cannot_reserve_or_start_when_configured() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = db::open_postgres_pool(&database_url).unwrap();
+        db::run_migrations(&pool).unwrap();
+        db::run_migrations(&pool).unwrap();
+        pool.get_pg()
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id = 'acct-jobs'", &[])
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..16];
+
+        let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut conn = pool.get_pg().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-jobs', 'jobs@example.com', 'hash', 0)",
+                &[],
+            )
+            .unwrap();
+            drop(conn);
+            let identity =
+                ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com")
+                    .unwrap();
+            upsert_track(
+                &pool,
+                "acct-jobs",
+                &CareerTrack {
+                    id: "track-default".to_string(),
+                    name: "Software engineering".to_string(),
+                    role: "Software Engineer".to_string(),
+                    locations: vec!["New York, NY".to_string()],
+                    remote_preference: "hybrid_ok".to_string(),
+                    application_identity_id: Some(identity.id),
+                    policy: CareerTrackPolicy {
+                        role_family: "software_engineering".to_string(),
+                        ..CareerTrackPolicy::default()
+                    },
+                    active: true,
+                    match_count: 0,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .unwrap();
+
+            let reserve_suffix = format!("postgres-ats-head-reserve-{suffix}");
+            let reserve_runtime = certified_cloud_runtime(&reserve_suffix);
+            let reserve_fixture = certified_application_fixture(
+                &pool,
+                &reserve_suffix,
+                "cloud",
+                certified_cloud_runtime_target(&reserve_runtime),
+                "",
+            );
+            assert!(update_attempt_reservation_status(
+                &pool,
+                "acct-jobs",
+                &reserve_fixture.application.id,
+                "released",
+            )
+            .unwrap());
+            let reservation_before =
+                certified_reservation(&pool, &reserve_fixture.application.id);
+            install_certified_ats_successor(
+                &pool,
+                &reserve_fixture,
+                &format!("postgres-reserve-{suffix}"),
+            );
+            let reserve_error = reserve_application_attempt(
+                &pool,
+                "acct-jobs",
+                &reserve_fixture.application.id,
+                "cloud",
+            )
+            .unwrap_err();
+            assert_current_execution_authority_denied(&reserve_error);
+            assert_eq!(
+                certified_reservation(&pool, &reserve_fixture.application.id),
+                reservation_before
+            );
+
+            let running_suffix = format!("postgres-ats-head-running-{suffix}");
+            let running_runtime = certified_cloud_runtime(&running_suffix);
+            let running_fixture = certified_application_fixture(
+                &pool,
+                &running_suffix,
+                "cloud",
+                certified_cloud_runtime_target(&running_runtime),
+                "",
+            );
+            let reservation_before =
+                certified_reservation(&pool, &running_fixture.application.id);
+            let (application_before, expected_revision) = get_application_with_revision(
+                &pool,
+                "acct-jobs",
+                &running_fixture.application.id,
+            )
+            .unwrap()
+            .expect("PostgreSQL certified application exists");
+            install_certified_ats_successor(
+                &pool,
+                &running_fixture,
+                &format!("postgres-running-{suffix}"),
+            );
+            let running_error = update_attempt_reservation_status(
+                &pool,
+                "acct-jobs",
+                &running_fixture.application.id,
+                "running",
+            )
+            .unwrap_err();
+            assert_current_execution_authority_denied(&running_error);
+            assert_eq!(
+                certified_reservation(&pool, &running_fixture.application.id),
+                reservation_before
+            );
+
+            let mut attempted = application_before.clone();
+            attempted.state = "running".to_string();
+            attempted.updated_at_ms = attempted.updated_at_ms.saturating_add(1);
+            assert!(save_application(
+                &pool,
+                "acct-jobs",
+                &attempted,
+                &expected_revision,
+            )
+            .is_err());
+            let application_after =
+                get_application(&pool, "acct-jobs", &running_fixture.application.id)
+                    .unwrap()
+                    .expect("PostgreSQL certified application remains stored");
+            assert_eq!(
+                serde_json::to_value(application_after).unwrap(),
+                serde_json::to_value(application_before).unwrap()
+            );
+        }));
+
+        pool.get_pg()
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id = 'acct-jobs'", &[])
+            .unwrap();
+        if let Err(panic) = test_result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn postgres_prepared_auto_submit_finalization_preserves_typed_employer_hold_when_configured() {
+        let Ok(database_url) = std::env::var("BLUEY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let pool = db::open_postgres_pool(&database_url).unwrap();
+        db::run_migrations(&pool).unwrap();
+        db::run_migrations(&pool).unwrap();
+        pool.get_pg()
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id = 'acct-jobs'", &[])
+            .unwrap();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let suffix = &suffix[..16];
+
+        let test_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut conn = pool.get_pg().unwrap();
+            conn.execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-jobs', 'jobs@example.com', 'hash', 0)",
+                &[],
+            )
+            .unwrap();
+            drop(conn);
+            let identity =
+                ensure_primary_application_identity(&pool, "acct-jobs", "jobs@example.com")
+                    .unwrap();
+            upsert_track(
+                &pool,
+                "acct-jobs",
+                &CareerTrack {
+                    id: "track-default".to_string(),
+                    name: "Software engineering".to_string(),
+                    role: "Software Engineer".to_string(),
+                    locations: vec!["New York, NY".to_string()],
+                    remote_preference: "hybrid_ok".to_string(),
+                    application_identity_id: Some(identity.id),
+                    policy: CareerTrackPolicy {
+                        role_family: "software_engineering".to_string(),
+                        ..CareerTrackPolicy::default()
+                    },
+                    active: true,
+                    match_count: 0,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                },
+            )
+            .unwrap();
+
+            assert_prepared_auto_submit_finalization_employer_hold_is_typed_and_atomic(
+                &pool,
+                &format!("pg-prepared-hold-{suffix}"),
+            );
+        }));
+
+        pool.get_pg()
+            .unwrap()
+            .execute("DELETE FROM accounts WHERE id = 'acct-jobs'", &[])
+            .unwrap();
+        if let Err(panic) = test_result {
+            std::panic::resume_unwind(panic);
+        }
     }
 
     fn proof_with_unknown_layout(mut proof: FinalSubmitProof) -> FinalSubmitProof {
@@ -3385,6 +4328,7 @@ mod tests {
     }
 
     fn final_submission_fixture(pool: &DbPool, suffix: &str) -> FinalSubmissionFixture {
+        set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
         let (mut application, run_id, browser_profile_id) = execution_lease_fixture(pool, suffix);
         let posting = get_posting(pool, "acct-jobs", &application.job_id)
             .unwrap()
@@ -3580,11 +4524,14 @@ mod tests {
                 "schemaVersion": 1,
             },
         });
+        let pre_submission_receipt_sha256 =
+            submission_pre_receipt_sha256(&application.receipt).unwrap();
         receipt.as_object_mut().unwrap().insert(
             SERVER_SUBMISSION_AUTHORITY_KEY.to_string(),
             json!({
                 "schemaVersion": 1,
                 "preSubmissionReceipt": application.receipt,
+                "preSubmissionReceiptSha256": pre_submission_receipt_sha256,
                 "executionAuthority": {
                     "kind": "cloud_execution_lease",
                     "ownerId": format!("{suffix}-worker"),
@@ -3714,37 +4661,36 @@ mod tests {
         pool: &DbPool,
         suffix: &str,
     ) -> (JobApplication, String, String, String) {
-        let profile = default_profile("jobs@example.com");
-        save_profile(pool, "acct-jobs", &profile).unwrap();
-        let preferences = JobPreferences {
-            sponsorship: "not_required".to_string(),
-            ..JobPreferences::default()
-        };
-        save_preferences(pool, "acct-jobs", &preferences).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(pool, "acct-jobs", "jobs@example.com", "track-default");
         set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
-        let posting = upsert_posting(
+        let mut posting_input = test_posting(
+            &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
+            now_ms(),
+            now_ms(),
+        );
+        posting_input.source = "greenhouse_import".to_string();
+        posting_input.external_id = suffix.to_string();
+        posting_input.match_score = 90;
+        posting_input.canonical_key = canonical_job_key(&posting_input);
+        posting_input.discovery_evidence = JobDiscoveryEvidence::default();
+        let (posting, managed) = save_production_positive_verified_import(
             pool,
             "acct-jobs",
-            &test_posting(
-                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
-                now_ms(),
-                now_ms(),
-            ),
+            &posting_input,
             &profile,
             &preferences,
-        )
-        .unwrap();
-        let (application, _) =
-            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
-        let application = update_application(
+        );
+        let authority_fixture = install_production_positive_job_authorities(
             pool,
             "acct-jobs",
-            &application.id,
-            "queued",
-            Some("review_first"),
-        )
-        .unwrap()
-        .unwrap();
+            &posting,
+            &managed,
+            "acme.com",
+            suffix,
+        );
+        let (application, _) =
+            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
         let run_id = format!("local-run-{suffix}");
         upsert_browser_session(
             pool,
@@ -3762,17 +4708,28 @@ mod tests {
             },
         )
         .unwrap();
-        let mut application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
+        let application = assign_application_run(pool, "acct-jobs", &application.id, &run_id)
             .unwrap()
             .unwrap();
-        let identity_id = application
+        let authority = current_application_approval_authority(
+            pool,
+            "acct-jobs",
+            "jobs@example.com",
+            &application.id,
+        )
+        .unwrap()
+        .expect("current production-positive local application approval authority");
+        assert_eq!(authority.posting.id, authority_fixture.posting.id);
+        let identity_id = authority
+            .application
             .receipt
             .pointer("/application_identity/id")
             .and_then(Value::as_str)
             .unwrap()
             .to_string();
         let browser_profile_id = execution_browser_profile_id("acct-jobs", &identity_id);
-        let identity_email = application
+        let identity_email = authority
+            .application
             .receipt
             .pointer("/application_identity/email")
             .and_then(Value::as_str)
@@ -3781,7 +4738,8 @@ mod tests {
         let resume = get_resume_version(
             pool,
             "acct-jobs",
-            application
+            authority
+                .application
                 .resume_version_id
                 .as_deref()
                 .expect("fixture application has a resume"),
@@ -3789,11 +4747,11 @@ mod tests {
         .unwrap()
         .unwrap();
         let approved_packet = json!({
-            "applicationId": application.id,
-            "jobId": application.job_id,
+            "applicationId": authority.application.id,
+            "jobId": authority.posting.id,
             "resumeVersionId": resume.id,
             "resumeContent": resume.content,
-            "coverLetterContent": application.cover_letter,
+            "coverLetterContent": authority.application.cover_letter,
             "answers": {},
             "verifiedClaimIds": resume.claim_ids,
             "applicationIdentityId": identity_id,
@@ -3801,36 +4759,41 @@ mod tests {
             "browserProfileId": browser_profile_id,
         });
         let approved_job = json!({
-            "externalId": posting.external_id,
-            "canonicalUrl": posting.canonical_url,
-            "company": posting.company,
-            "title": posting.title,
-            "location": posting.location,
-            "workplace": posting.workplace,
-            "description": posting.description,
-            "source": posting.source,
-            "compensation": posting.compensation,
+            "externalId": authority.posting.external_id,
+            "canonicalUrl": authority.posting.canonical_url,
+            "company": authority.posting.company,
+            "title": authority.posting.title,
+            "location": authority.posting.location,
+            "workplace": authority.posting.workplace,
+            "description": authority.posting.description,
+            "source": authority.posting.source,
+            "compensation": authority.posting.compensation,
         });
         let admission = json!({ "kind": "review_approval" });
         let checksum =
             approved_submission_checksum(2, &approved_packet, &approved_job, Some(&admission))
                 .unwrap();
-        application.receipt["approved_execution"] = json!({
+        let approved_execution = json!({
             "schema_version": 2,
-            "approved_at_ms": now_ms(),
+            "approved_at_ms": authority.evaluated_at_ms,
             "checksum": checksum,
             "admission": admission,
             "packet": approved_packet,
             "job": approved_job,
         });
-        application = replace_application_receipt(
+        let application = persist_current_application_approval(
             pool,
             "acct-jobs",
-            &application.id,
-            application.receipt.clone(),
+            "jobs@example.com",
+            &authority,
+            &approved_execution,
         )
         .unwrap()
-        .unwrap();
+        .expect("persist production-positive local application approval");
+        reserve_application_attempt(pool, "acct-jobs", &application.id, "local").unwrap();
+        let application = update_application(pool, "acct-jobs", &application.id, "queued", None)
+            .unwrap()
+            .expect("queue production-positive local application");
         let ticket_hash = format!("ticket-hash-{suffix}");
         save_local_run_ticket(
             pool,
@@ -3846,7 +4809,7 @@ mod tests {
                 "applicationIdentityId": identity_id,
                 "browserProfileId": browser_profile_id,
                 "runner": "local",
-                "url": posting.canonical_url,
+                "url": authority.posting.canonical_url,
                 "runId": run_id,
             }),
             now_ms() + 60_000,
@@ -4866,13 +5829,23 @@ mod tests {
         pool: &DbPool,
         suffix: &str,
     ) -> (JobApplication, String, String, FinalSubmitProof) {
-        let (application, run_id, ticket_hash, _) =
-            local_run_authority_fixture_unbound(pool, suffix);
-        reserve_application_attempt(pool, "acct-jobs", &application.id, "local").unwrap();
-        let descriptor = seed_test_local_browser_release_authority(pool);
-        let application = require_frozen_cover_letter(pool, application);
-        let (application, proof) =
-            install_certified_application(pool, application, certified_local_runtime_target());
+        let browser = browser_release_registry_tests::install_signed_browser_release_fixture(
+            pool,
+            "acct-jobs",
+        );
+        let fixture = certified_application_fixture(
+            pool,
+            suffix,
+            "local",
+            browser.runtime_target.clone(),
+            "Dear Acme, I am excited to apply.",
+        );
+        let run_id = fixture.run_id;
+        let ticket_hash = fixture
+            .ticket_hash
+            .expect("certified local fixture has a ticket hash");
+        let proof = fixture.proof;
+        let descriptor = browser.descriptor;
         assert_eq!(proof.documents.len(), 2);
         let claim = claim_local_run_with_browser_release(
             pool,
@@ -4885,7 +5858,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(claim, BrowserLocalRunClaimDisposition::Success(_)));
-        let application = get_application(pool, "acct-jobs", &application.id)
+        let application = get_application(pool, "acct-jobs", &fixture.application.id)
             .unwrap()
             .unwrap();
         assert_eq!(application.state, "running");
@@ -4905,48 +5878,36 @@ mod tests {
         pool: &DbPool,
         suffix: &str,
     ) -> CertifiedCloudExecutionFixture {
-        set_entitlement_plan(pool, "acct-jobs", "pro").unwrap();
-        let (application, run_id, browser_profile_id) = execution_lease_fixture(pool, suffix);
         let owner_id = format!("certified-cloud-owner-{suffix}");
+        let runtime = certified_cloud_runtime(suffix);
+        let runtime_target = certified_cloud_runtime_target(&runtime);
+        let fixture = certified_application_fixture(
+            pool,
+            suffix,
+            "cloud",
+            runtime_target.clone(),
+            "Dear Acme, I am excited to apply.",
+        );
+        assert_eq!(fixture.proof.documents.len(), 2);
         let fixture_now = now_ms();
-        let runtime = RunnerProcessRuntimeAttestation {
-            runner_image_sha256: hex::encode(Sha256::digest(
-                format!("certified-cloud-image-{suffix}").as_bytes(),
-            )),
-            runner_build_id: "runner-604.1".to_string(),
-            platform: "linux".to_string(),
-            architecture: "x86_64".to_string(),
-            automation_bundle_sha256: hex::encode(Sha256::digest(
-                format!("certified-cloud-automation-{suffix}").as_bytes(),
-            )),
-            playwright_version: "1.61.1".to_string(),
-            chromium_revision: "123456".to_string(),
-            chromium_executable_sha256: hex::encode(Sha256::digest(
-                format!("certified-cloud-chromium-{suffix}").as_bytes(),
-            )),
-        };
         let installed = super::runner_volume_purge_tests::install_certified_cloud_runtime_fixture(
             pool,
             "acct-jobs",
-            &application.id,
-            &run_id,
-            &browser_profile_id,
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.browser_profile_id,
             &owner_id,
             runtime,
             fixture_now,
         )
         .expect("install exact certified cloud runtime fixture");
-        let runtime_target = installed.runtime_target.clone();
-        let application = require_frozen_cover_letter(pool, application);
-        let (application, proof) =
-            install_certified_application(pool, application, runtime_target.clone());
-        assert_eq!(proof.documents.len(), 2);
+        assert_eq!(installed.runtime_target, runtime_target);
         let grant = claim_execution_lease_for_runner_volume_authorized(
             pool,
             "acct-jobs",
-            &application.id,
-            &run_id,
-            &browser_profile_id,
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.browser_profile_id,
             &owner_id,
             &installed.binding_request,
             &installed.runtime_grant_id,
@@ -4957,18 +5918,318 @@ mod tests {
         assert_eq!(grant.lease.phase, "prepared");
         assert_eq!(grant.runtime_grant_id, installed.runtime_grant_id);
         assert_eq!(grant.runtime_sha256, installed.runtime_sha256);
-        update_attempt_reservation_status(pool, "acct-jobs", &application.id, "running").unwrap();
-        let application = update_application(pool, "acct-jobs", &application.id, "running", None)
-            .unwrap()
-            .unwrap();
+        update_attempt_reservation_status(
+            pool,
+            "acct-jobs",
+            &fixture.application.id,
+            "running",
+        )
+        .unwrap();
+        let application = update_application(
+            pool,
+            "acct-jobs",
+            &fixture.application.id,
+            "running",
+            None,
+        )
+        .unwrap()
+        .unwrap();
         CertifiedCloudExecutionFixture {
             application,
-            run_id,
+            run_id: fixture.run_id,
             lease_token: grant.lease.lease_token,
             lease_fence: grant.lease.fence,
-            proof,
+            proof: fixture.proof,
             runtime_target,
         }
+    }
+
+    struct ManagedCloudAdmissionEnvironment {
+        prior: [(&'static str, Option<std::ffi::OsString>); 7],
+    }
+
+    impl ManagedCloudAdmissionEnvironment {
+        fn staging() -> Self {
+            let prior = [
+                "BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT",
+                "BLUEY_JOBS_MANAGED_CLOUD_REGION",
+                "BLUEY_JOBS_MANAGED_CLOUD_CHANNEL",
+                "BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED",
+                "BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED",
+                "BLUEY_JOBS_WORKFLOW_ORIGIN",
+                "BLUEY_JOBS_WORKFLOW_TOKEN",
+            ]
+            .map(|name| (name, std::env::var_os(name)));
+            std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_ENVIRONMENT", "staging");
+            std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_REGION", "us-east-1");
+            std::env::set_var("BLUEY_JOBS_MANAGED_CLOUD_CHANNEL", "general");
+            std::env::set_var("BLUEY_JOBS_CLOUD_BROWSER_DISTRIBUTION_ENABLED", "1");
+            std::env::set_var("BLUEY_JOBS_WORKFLOW_COMMAND_DISPATCH_ENABLED", "1");
+            std::env::set_var(
+                "BLUEY_JOBS_WORKFLOW_ORIGIN",
+                "https://workflow.example.com",
+            );
+            std::env::set_var("BLUEY_JOBS_WORKFLOW_TOKEN", "x".repeat(32));
+            Self { prior }
+        }
+    }
+
+    impl Drop for ManagedCloudAdmissionEnvironment {
+        fn drop(&mut self) {
+            for (name, value) in &self.prior {
+                match value {
+                    Some(value) => std::env::set_var(*name, value),
+                    None => std::env::remove_var(*name),
+                }
+            }
+        }
+    }
+
+    struct ManagedFinalSubmitExecutionFixture {
+        cloud: CertifiedCloudExecutionFixture,
+        managed_cloud: ManagedCloudExecutionLeaseClaimInput,
+        worker_id: String,
+    }
+
+    fn sqlite_test_db_now(pool: &DbPool) -> i64 {
+        pool.get()
+            .unwrap()
+            .query_row(
+                "SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER)",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    fn managed_final_submit_execution_fixture(
+        pool: &DbPool,
+        suffix: &str,
+    ) -> ManagedFinalSubmitExecutionFixture {
+        let owner_id = format!("certified-cloud-owner-{suffix}");
+        let runtime = certified_cloud_runtime(suffix);
+        let runtime_target = certified_cloud_runtime_target(&runtime);
+        let application_fixture = certified_application_fixture(
+            pool,
+            suffix,
+            "cloud",
+            runtime_target.clone(),
+            "Dear Acme, I am excited to apply.",
+        );
+        assert_eq!(application_fixture.proof.documents.len(), 2);
+        let fixture_now = now_ms();
+        let installed = super::runner_volume_purge_tests::install_certified_cloud_runtime_fixture(
+            pool,
+            "acct-jobs",
+            &application_fixture.application.id,
+            &application_fixture.run_id,
+            &application_fixture.browser_profile_id,
+            &owner_id,
+            runtime,
+            fixture_now,
+        )
+        .expect("install exact certified cloud runtime fixture");
+        assert_eq!(installed.runtime_target, runtime_target);
+        let worker_id = installed.binding_request.worker_id.clone();
+        let scope = ManagedCloudScope {
+            environment: "staging".to_string(),
+            region: "us-east-1".to_string(),
+            channel: "general".to_string(),
+        };
+        let managed_runtime = super::managed_cloud_release_authority_tests::
+            install_managed_runner_runtime_test_fixture(
+                pool,
+                &worker_id,
+                scope.clone(),
+                application_fixture.managed_authority_now_ms,
+            );
+        let now = sqlite_test_db_now(pool);
+        let workflow_id = new_jobs_workflow_id();
+        let mut command = NewJobsWorkflowCommand {
+            account_id: "acct-jobs".to_string(),
+            application_id: application_fixture.application.id.clone(),
+            run_id: application_fixture.run_id.clone(),
+            workflow_id,
+            intervention_id: None,
+            command_kind: JobsWorkflowCommandKind::Start,
+            idempotency_key: format!("managed-final-submit-{suffix}"),
+            request: Value::Null,
+            payload: JobsWorkflowCommandPayload::Start(JobsWorkflowStartMaterial {
+                workflow_input: json!({ "fixture": suffix }),
+                browser_session_id: application_fixture.run_id.clone(),
+                result_request_id: format!("managed-final-submit-result-{suffix}"),
+            }),
+            now_ms: now,
+        };
+        command.request = stage_workflow_command_request(&command);
+        let (admission, binding) = {
+            let mut connection = pool.get().unwrap();
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            let admission =
+                admit_jobs_workflow_command_sqlite_tx(&transaction, &command, true).unwrap();
+            let binding = bind_managed_cloud_workflow_sqlite_tx(
+                &transaction,
+                &managed_cloud_binding_input(&admission, scope.clone()),
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            (admission, binding)
+        };
+        let command_lease = claim_jobs_workflow_command(
+            pool,
+            &worker_id,
+            sqlite_test_db_now(pool),
+            60_000,
+        )
+        .unwrap()
+        .expect("claim managed workflow command");
+        assert_eq!(command_lease.command.id, admission.command.id);
+        let (_, request_start) = mark_jobs_workflow_command_request_started_with_managed_cloud(
+            pool,
+            &command_lease,
+            sqlite_test_db_now(pool),
+        )
+        .expect("mark exact managed workflow request-start");
+        assert!(request_start.is_some());
+        let (managed_cloud_release, _, _, managed_cloud_release_sha256) =
+            managed_cloud_release_memo(&binding.binding_sha256, &binding.admission).unwrap();
+        assert_eq!(
+            managed_cloud_release_sha256,
+            binding.release_memo_sha256
+        );
+        let managed_cloud = ManagedCloudExecutionLeaseClaimInput {
+            workflow_request_id: command_lease.command.request_id,
+            managed_cloud_release,
+            managed_cloud_release_sha256,
+            managed_cloud_runtime_instance_id: managed_runtime.runtime_instance_id,
+            managed_cloud_runtime_instance_epoch: managed_runtime.runtime_instance_epoch,
+        };
+        assert_eq!(managed_runtime.scope, scope);
+        let grant = claim_managed_execution_lease_for_runner_volume_authorized(
+            pool,
+            "acct-jobs",
+            &application_fixture.application.id,
+            &application_fixture.run_id,
+            &application_fixture.browser_profile_id,
+            &owner_id,
+            &installed.binding_request,
+            &installed.runtime_grant_id,
+            &installed.runtime_sha256,
+            &installed.verified_authority,
+            Some(&managed_cloud),
+            &worker_id,
+            &worker_id,
+        )
+        .expect("claim exact managed certified cloud runtime");
+        assert!(grant.managed_cloud.is_some());
+        update_attempt_reservation_status(
+            pool,
+            "acct-jobs",
+            &application_fixture.application.id,
+            "running",
+        )
+        .unwrap();
+        let application = update_application(
+            pool,
+            "acct-jobs",
+            &application_fixture.application.id,
+            "running",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let cloud = CertifiedCloudExecutionFixture {
+            application,
+            run_id: application_fixture.run_id,
+            lease_token: grant.grant.lease.lease_token,
+            lease_fence: grant.grant.lease.fence,
+            proof: application_fixture.proof,
+            runtime_target,
+        };
+        assert_eq!(
+            heartbeat_execution_lease(
+                pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+            )
+            .unwrap()
+            .phase,
+            "prepared"
+        );
+        ManagedFinalSubmitExecutionFixture {
+            cloud,
+            managed_cloud,
+            worker_id,
+        }
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct ManagedFinalSubmitBoundaryState {
+        lease_phase: String,
+        certification_phase: String,
+        certification_fence: i64,
+        phase_b_request_sha256: Option<String>,
+        canary_reservation_count: i64,
+        capacity_count: i64,
+        managed_receipt_count: i64,
+        final_submit_proof_present: bool,
+    }
+
+    fn managed_final_submit_boundary_state(
+        pool: &DbPool,
+        application_id: &str,
+        run_id: &str,
+    ) -> ManagedFinalSubmitBoundaryState {
+        let application = get_application(pool, "acct-jobs", application_id)
+            .unwrap()
+            .unwrap();
+        let mut state = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT lease.phase, binding.phase, binding.fence,
+                        binding.phase_b_request_sha256,
+                        (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations
+                          WHERE binding_id = binding.binding_id),
+                        (SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                          WHERE account_id = lease.account_id
+                            AND application_id = lease.application_id
+                            AND run_id = lease.run_id),
+                        (SELECT COUNT(*)
+                           FROM jobs_managed_cloud_irreversible_effect_receipts
+                          WHERE account_id = lease.account_id
+                            AND application_id = lease.application_id
+                            AND run_id = lease.run_id)
+                   FROM jobs_execution_leases lease
+                   JOIN jobs_application_ats_certification_bindings binding
+                     ON binding.account_id = lease.account_id
+                    AND binding.application_id = lease.application_id
+                    AND binding.run_id = lease.run_id
+                  WHERE lease.account_id = 'acct-jobs'
+                    AND lease.application_id = ?1 AND lease.run_id = ?2",
+                params![application_id, run_id],
+                |row| {
+                    Ok(ManagedFinalSubmitBoundaryState {
+                        lease_phase: row.get(0)?,
+                        certification_phase: row.get(1)?,
+                        certification_fence: row.get(2)?,
+                        phase_b_request_sha256: row.get(3)?,
+                        canary_reservation_count: row.get(4)?,
+                        capacity_count: row.get(5)?,
+                        managed_receipt_count: row.get(6)?,
+                        final_submit_proof_present: false,
+                    })
+                },
+            )
+            .unwrap();
+        state.final_submit_proof_present =
+            application.receipt.get(FINAL_SUBMIT_PROOF_KEY).is_some();
+        state
     }
 
     fn put_application_in_answer_intervention(
@@ -5388,6 +6649,17 @@ mod tests {
                 "/{SERVER_SUBMISSION_AUTHORITY_KEY}/preSubmissionReceipt/packet_revisions/0"
             ))
             .is_some());
+        let expected_pre_submission_receipt_sha256 =
+            submission_pre_receipt_sha256(&fixture.application.receipt).unwrap();
+        assert_eq!(
+            fixture
+                .receipt
+                .pointer(&format!(
+                    "/{SERVER_SUBMISSION_AUTHORITY_KEY}/preSubmissionReceiptSha256"
+                ))
+                .and_then(Value::as_str),
+            Some(expected_pre_submission_receipt_sha256.as_str())
+        );
 
         let mut stale_authority = fixture.receipt.clone();
         stale_authority[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
@@ -5468,6 +6740,112 @@ mod tests {
             SUBMISSION_EVIDENCE_ACCOUNT_LIFETIME_EXPIRES_AT_MS
         );
         assert!(capacity_completed_at_ms.is_some());
+    }
+
+    #[test]
+    fn fix_728_submitted_domain_requires_an_authentic_final_receipt_envelope() {
+        let pool = test_pool();
+        let fixture = final_submission_fixture(&pool, "submitted-domain-authority");
+        let expected_domain = application_job_integrity_receipt(&fixture.application)
+            .unwrap()
+            .expect("pre-submission application has signed job-integrity authority")
+            .canonical_employer_domain;
+        assert!(submitted_execution_employer_domain("acct-jobs", &fixture.application).is_err());
+
+        let finalized = finalize_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt.clone(),
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
+        )
+        .unwrap();
+        let application = match finalized {
+            SubmissionFinalizeResult::Committed(application)
+            | SubmissionFinalizeResult::Replayed(application) => application,
+        };
+        let employer_domain =
+            submitted_execution_employer_domain("acct-jobs", &application).unwrap();
+        assert_eq!(employer_domain.as_str(), expected_domain);
+        assert!(matches!(
+            finalize_submission(
+                &pool,
+                "acct-jobs",
+                &fixture.application.id,
+                &fixture.run_id,
+                "cloud",
+                fixture.receipt.clone(),
+                &fixture.fingerprint,
+                &fixture.evidence,
+                &fixture.object_uploads,
+                &fixture.session,
+                None,
+            )
+            .unwrap(),
+            SubmissionFinalizeResult::Replayed(_)
+        ));
+
+        let mut tampered = application.clone();
+        tampered.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            ["approved_execution"]["checksum"] = json!("0".repeat(64));
+        assert!(submitted_execution_employer_domain("acct-jobs", &tampered).is_err());
+
+        let mut domain_tampered = application.clone();
+        domain_tampered.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            ["job_integrity"]["canonicalEmployerDomain"] = json!("lookalike.example");
+        assert!(submitted_execution_employer_domain("acct-jobs", &domain_tampered).is_err());
+        let domain_tampered_payload =
+            to_json(&domain_tampered, "tampered submitted application").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?2 WHERE id = ?1",
+                params![domain_tampered.id, domain_tampered_payload],
+            )
+            .unwrap();
+        let stored_before_replay: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT application_json FROM jobs_applications WHERE id = ?1",
+                params![fixture.application.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(finalize_submission(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
+        )
+        .is_err());
+        let stored_after_replay: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT application_json FROM jobs_applications WHERE id = ?1",
+                params![fixture.application.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_after_replay, stored_before_replay);
+
+        let mut wrong_run = application;
+        wrong_run.receipt["runId"] = json!("different-submitted-run");
+        assert!(submitted_execution_employer_domain("acct-jobs", &wrong_run).is_err());
     }
 
     #[test]
@@ -5769,6 +7147,128 @@ mod tests {
             &fixture.application,
             &fixture.run_id,
             &changed_job,
+            "cloud",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn final_submission_schema_two_certified_envelope_is_closed_and_exact() {
+        let pool = test_pool();
+        let mut fixture = final_submission_fixture(&pool, "receipt-schema-two-certified");
+        fixture.application.submission_mode = "auto_submit".to_string();
+        let packet = fixture.application.receipt["approved_execution"]["packet"].clone();
+        let job = fixture.application.receipt["approved_execution"]["job"].clone();
+        let admission = json!({
+            "kind": "track_auto_submit",
+            "authorization_id": "schema-two-authorization",
+            "career_track_id": "track-default",
+            "revision_no": 1,
+            "authority_fingerprint": "a".repeat(64),
+            "ats_certification": {
+                "schema_version": 1,
+                "provider": "greenhouse",
+                "adapter_version": "2026.07.1-beta.1",
+                "manifest_sha256": "1".repeat(64),
+                "activation_sha256": "2".repeat(64),
+                "activation_generation": 1,
+                "target_key_sha256": "3".repeat(64),
+                "layout_set_sha256": "4".repeat(64),
+                "variant_key": "greenhouse_public",
+                "layout_contract_version": 1,
+                "surface_sha256": "5".repeat(64),
+                "adapter_bundle_sha256": "6".repeat(64),
+                "runner_target_sha256s": ["7".repeat(64)],
+                "expires_at_ms": now_ms() + 60_000,
+            },
+        });
+        let checksum = approved_submission_checksum(3, &packet, &job, Some(&admission)).unwrap();
+        fixture.application.receipt["approved_execution"] = json!({
+            "schema_version": 3,
+            "approved_at_ms": now_ms(),
+            "checksum": checksum.clone(),
+            "admission": admission,
+            "packet": packet,
+            "job": job,
+        });
+        fixture.receipt["schemaVersion"] = json!(2);
+        fixture.receipt["packet"]["approvedPacketChecksum"] = json!(checksum);
+        fixture.receipt["packet"]["approvedExecutionSchemaVersion"] = json!(3);
+        fixture.receipt["packet"]["approvedExecutionAdmission"] =
+            fixture.application.receipt["approved_execution"]["admission"].clone();
+        fixture.receipt["atsCertifiedReceiptAuthority"] =
+            serde_json::to_value(AtsCertifiedReceiptAuthority {
+                schema_version: 1,
+                account_id: "acct-jobs".to_string(),
+                application_id: fixture.application.id.clone(),
+                run_id: fixture.run_id.clone(),
+                provider: "greenhouse".to_string(),
+                adapter: "greenhouse".to_string(),
+                adapter_version: "2026.07.1-beta.1".to_string(),
+                manifest_sha256: "1".repeat(64),
+                activation_sha256: "2".repeat(64),
+                activation_generation: 1,
+                target_key_sha256: "3".repeat(64),
+                layout_set_sha256: "4".repeat(64),
+                layout_observation_sha256: "8".repeat(64),
+                observed_surface_sha256: "5".repeat(64),
+                adapter_bundle_sha256: "6".repeat(64),
+                runner_kind: "cloud".to_string(),
+                runner_target_sha256: "7".repeat(64),
+                binding_sha256: "9".repeat(64),
+                binding_fence: 1,
+                binding_consumed_at_ms: now_ms(),
+                application_attempt_id: "schema-two-attempt".to_string(),
+                phase_b_request_id: "schema-two-phase-b".to_string(),
+                rollout_channel: "general".to_string(),
+                canary_reservation_sha256: "b".repeat(64),
+                metering_reservation_sha256: "c".repeat(64),
+            })
+            .unwrap();
+        fixture.receipt["receiptObject"]["schemaVersion"] = json!(2);
+        fixture.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"] =
+            fixture.application.receipt.clone();
+        fixture.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceiptSha256"] =
+            json!(submission_pre_receipt_sha256(&fixture.application.receipt).unwrap());
+
+        validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &fixture.receipt,
+            "cloud",
+        )
+        .unwrap();
+        let prepared = prepare_submission_evidence(
+            &fixture.application.id,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            now_ms(),
+        )
+        .unwrap();
+        validate_submission_receipt_evidence(&fixture.receipt, &prepared).unwrap();
+
+        let mut downgraded = fixture.receipt.clone();
+        downgraded["schemaVersion"] = json!(1);
+        assert!(validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &downgraded,
+            "cloud",
+        )
+        .is_err());
+
+        let mut missing_terminal_authority = fixture.receipt;
+        missing_terminal_authority
+            .as_object_mut()
+            .unwrap()
+            .remove("atsCertifiedReceiptAuthority");
+        assert!(validate_submission_authority_snapshot(
+            "acct-jobs",
+            &fixture.application,
+            &fixture.run_id,
+            &missing_terminal_authority,
             "cloud",
         )
         .is_err());
@@ -6574,6 +8074,103 @@ mod tests {
         assert!(ensure_managed_curated_discovery_source(&pool, "acct-jobs")
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn track_readback_uses_the_relational_activation_authority() {
+        let pool = test_pool();
+        let track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let mut stale_projection = track.clone();
+        stale_projection.active = true;
+        let stale_json = to_json(&stale_projection, "stale Career Track").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?2, active = 0 WHERE id = ?1",
+                params![track.id, stale_json],
+            )
+            .unwrap();
+
+        let projected = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        assert!(!projected.active);
+
+        let mut stale_projection = projected;
+        stale_projection.active = false;
+        let stale_json = to_json(&stale_projection, "stale Career Track").unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_tracks SET track_json = ?2, active = 1 WHERE id = ?1",
+                params![stale_projection.id, stale_json],
+            )
+            .unwrap();
+
+        assert!(list_tracks(&pool, "acct-jobs").unwrap().remove(0).active);
+    }
+
+    #[test]
+    fn track_id_collision_cannot_return_a_cross_account_phantom_save() {
+        let pool = test_pool();
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO accounts (id, email, password_hash, trial_seconds_remaining)
+                 VALUES ('acct-other', 'other@example.com', 'hash', 0)",
+                [],
+            )
+            .unwrap();
+        let existing = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+
+        let error = upsert_track(&pool, "acct-other", &existing).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already assigned to another account"));
+        assert!(list_tracks(&pool, "acct-other").unwrap().is_empty());
+        assert_eq!(list_tracks(&pool, "acct-jobs").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn concurrent_track_creates_cannot_exceed_the_active_plan_limit() {
+        let pool = test_pool();
+        let template = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for index in 0..2 {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            let mut track = template.clone();
+            track.id = format!("concurrent-track-{index}");
+            track.name = format!("Concurrent track {index}");
+            track.created_at_ms = 0;
+            track.updated_at_ms = 0;
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                upsert_track_with_limit(&pool, "acct-jobs", &track, 2)
+            }));
+        }
+        barrier.wait();
+
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        let error = results
+            .into_iter()
+            .find_map(Result::err)
+            .expect("one concurrent create must lose the plan-limit race");
+        assert_eq!(
+            error.downcast_ref::<CareerTrackLimitExceeded>(),
+            Some(&CareerTrackLimitExceeded)
+        );
+        assert_eq!(
+            list_tracks(&pool, "acct-jobs")
+                .unwrap()
+                .into_iter()
+                .filter(|track| track.active)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -7974,6 +9571,19 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
         assert_eq!(membership_job_ids, vec![feed_lead.id]);
+        let verifier_assignments: i64 = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM jobs_original_source_verification_assignments",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            verifier_assignments, 0,
+            "feature-off v1 imports must not schedule v2 verifier work"
+        );
     }
 
     #[test]
@@ -9956,6 +11566,24 @@ mod tests {
         pool.get()
             .unwrap()
             .execute(
+                "UPDATE jobs_attempt_reservations SET runner = 'unassigned'
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![&application.id],
+            )
+            .unwrap();
+        let attempt_runner_before: String = pool
+            .get()
+            .unwrap()
+            .query_row(
+                "SELECT runner FROM jobs_attempt_reservations
+                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
+                params![&application.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        pool.get()
+            .unwrap()
+            .execute(
                 "INSERT INTO account_deletion_intents (
                     account_id, requested_at_ms, last_checked_at_ms,
                     fresh_upload_cutoff_ms, fresh_in_flight_puts
@@ -9998,7 +11626,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(lease_count, 0);
-        assert_eq!(attempt_runner, "unassigned");
+        assert_eq!(attempt_runner, attempt_runner_before);
     }
 
     #[test]
@@ -10489,6 +12117,76 @@ mod tests {
         let (second_application, second_run, second_profile) =
             execution_lease_fixture(&pool, "profile-second");
         assert_eq!(first_profile, second_profile);
+        let current_track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        assert_eq!(
+            first_application
+                .receipt
+                .pointer("/career_track_policy_authority"),
+            Some(&serde_json::to_value(&current_track.policy.authority).unwrap()),
+            "a second fixture must not mutate the first application's policy authority"
+        );
+        let first_posting = get_posting(&pool, "acct-jobs", &first_application.job_id)
+            .unwrap()
+            .unwrap();
+        let current_profile = get_profile(&pool, "acct-jobs", "jobs@example.com").unwrap();
+        let current_facts = list_facts(&pool, "acct-jobs").unwrap();
+        let identity_id = first_application
+            .receipt
+            .pointer("/application_identity/id")
+            .and_then(Value::as_str)
+            .unwrap();
+        let current_identity = get_application_identity(&pool, "acct-jobs", identity_id)
+            .unwrap()
+            .unwrap();
+        let experience =
+            role_experience_evidence(&current_profile, Some(&current_track), &first_posting);
+        let current_evidence = build_profile_evidence_revision(
+            "acct-jobs",
+            &current_profile,
+            &current_facts,
+            &current_track,
+            &current_identity,
+            &experience,
+        )
+        .unwrap();
+        assert_eq!(
+            first_application
+                .receipt
+                .pointer("/evidence_revision_id")
+                .and_then(Value::as_str),
+            Some(current_evidence.id.as_str()),
+            "a second fixture must not change the first application's evidence revision"
+        );
+        assert_eq!(
+            first_application
+                .receipt
+                .pointer("/evidence_content_hash")
+                .and_then(Value::as_str),
+            Some(current_evidence.content_hash.as_str()),
+            "a second fixture must not change the first application's evidence content"
+        );
+        let mut authority_conn = pool.get().unwrap();
+        let authority_tx = authority_conn.transaction().unwrap();
+        assert!(
+            stored_execution_evidence_matches_sqlite(
+                &authority_tx,
+                "acct-jobs",
+                &first_application,
+            )
+            .unwrap(),
+            "the first application must retain its immutable resume/evidence binding"
+        );
+        assert!(
+            current_execution_authorized_sqlite(
+                &authority_tx,
+                "acct-jobs",
+                &first_application,
+                ExecutionAuthorityRunner::Cloud,
+            )
+            .unwrap(),
+            "the first application must retain exact execution authority"
+        );
+        authority_tx.commit().unwrap();
         let first = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -10594,7 +12292,7 @@ mod tests {
     }
 
     #[test]
-    fn current_original_source_evidence_allows_preparation_and_queueing() {
+    fn current_provider_source_evidence_allows_preparation_but_not_queueing() {
         let posting = test_posting(
             "https://boards.greenhouse.io/acme/jobs/current-evidence",
             now_ms(),
@@ -10602,8 +12300,20 @@ mod tests {
         );
         let decision = discovery_decision(&posting, true);
         assert!(decision.can_prepare, "{decision:?}");
-        assert!(decision.can_queue_local, "{decision:?}");
-        assert!(decision.can_queue_cloud, "{decision:?}");
+        assert!(!decision.can_queue_local, "{decision:?}");
+        assert!(!decision.can_queue_cloud, "{decision:?}");
+        for reason in [
+            "employer_identity_review_required",
+            "job_risk_review_required",
+        ] {
+            assert!(
+                decision
+                    .review_reasons
+                    .iter()
+                    .any(|candidate| candidate.code == reason),
+                "missing {reason}: {decision:#?}"
+            );
+        }
     }
 
     #[test]
@@ -10636,20 +12346,49 @@ mod tests {
     }
 
     #[test]
-    fn stale_original_source_evidence_requires_refresh_before_queueing() {
+    fn stale_original_source_evidence_requires_refresh_before_preparation() {
         let posting = test_posting(
             "https://boards.greenhouse.io/acme/jobs/stale-evidence",
             now_ms(),
             now_ms() - 2 * DAY_MS,
         );
         let decision = discovery_decision(&posting, false);
-        assert!(decision.can_prepare, "{decision:?}");
+        assert!(!decision.can_prepare, "{decision:?}");
         assert!(!decision.can_queue_local);
         assert!(!decision.can_queue_cloud);
         assert!(decision
             .review_reasons
             .iter()
             .any(|reason| reason.code == "original_source_refresh_required"));
+    }
+
+    #[test]
+    fn original_source_verdict_vocabulary_fails_closed_consistently() {
+        for status in [
+            "closed",
+            "verified_closed",
+            "mismatch",
+            "identity_mismatch",
+            "materially_changed",
+            "source_untrusted",
+            "expired",
+            "quarantined",
+            "redirected_to_unknown",
+        ] {
+            let mut posting = test_posting(
+                "https://boards.greenhouse.io/acme/jobs/rejected-evidence",
+                now_ms(),
+                now_ms(),
+            );
+            posting.discovery_evidence.original_source_status = status.to_string();
+            let decision = discovery_decision(&posting, false);
+            assert!(!decision.can_prepare, "status={status} {decision:?}");
+            assert!(!decision.can_queue_local, "status={status} {decision:?}");
+            assert!(decision
+                .hard_failures
+                .iter()
+                .any(|reason| reason.code == "original_source_rejected"));
+        }
     }
 
     #[test]
@@ -10756,44 +12495,58 @@ mod tests {
     }
 
     #[test]
-    fn queueing_rechecks_that_a_recent_job_is_still_open() {
+    fn queueing_rechecks_source_freshness_and_requires_independent_review_authority() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
         let mut posting = upsert_posting(
             &pool,
             "acct-jobs",
             &test_posting(
                 "https://boards.greenhouse.io/acme/jobs/recheck",
                 now_ms() - 2 * DAY_MS,
-                now_ms() - 2 * DAY_MS,
+                now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
 
-        let stale_verification =
-            update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
-        assert!(stale_verification.to_string().contains("still open"));
+        let stale_at_ms = now_ms() - 2 * DAY_MS;
+        posting.last_verified_at_ms = Some(stale_at_ms);
+        posting = verified_test_posting(posting, stale_at_ms);
+        posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let stale_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, Some(&application.id))
+                .unwrap();
+        assert!(!stale_decision.can_queue_local);
+        assert!(!stale_decision.can_queue_cloud);
+        assert!(stale_decision.review_reasons.iter().any(|reason| {
+            matches!(
+                reason.code.as_str(),
+                "live_verification_required" | "original_source_refresh_required"
+            )
+        }));
+        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
 
         posting.last_verified_at_ms = Some(now_ms());
         posting = verified_test_posting(posting, now_ms());
-        upsert_posting(
-            &pool,
-            "acct-jobs",
-            &posting,
-            &profile,
-            &JobPreferences::default(),
-        )
-        .unwrap();
-        let queued = update_application(&pool, "acct-jobs", &application.id, "queued", None)
-            .unwrap()
-            .unwrap();
-        assert_eq!(queued.state, "queued");
+        posting = upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+        let current_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, Some(&application.id))
+                .unwrap();
+        assert!(!current_decision.can_queue_local);
+        assert!(!current_decision.can_queue_cloud);
+        assert!(current_decision.review_reasons.iter().any(|reason| {
+            matches!(
+                reason.code.as_str(),
+                "employer_identity_review_required" | "job_risk_review_required"
+            )
+        }));
+        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
     }
 
     #[test]
@@ -10830,8 +12583,8 @@ mod tests {
     #[test]
     fn submitted_applications_require_verified_runner_finalization() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
@@ -10841,14 +12594,12 @@ mod tests {
                 now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, resume) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
-        update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap();
-        update_application(&pool, "acct-jobs", &application.id, "running", None).unwrap();
 
         let resume_evidence = ApplicationEvidence {
             id: "resume-evidence".to_string(),
@@ -10906,7 +12657,7 @@ mod tests {
         let unchanged = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
-        assert_eq!(unchanged.state, "running");
+        assert_eq!(unchanged.state, "awaiting_review");
         assert!(unchanged.submitted_at_ms.is_none());
     }
 
@@ -11188,7 +12939,12 @@ mod tests {
         let (sde_application, _) =
             prepare_application(&pool, "acct-jobs", &sde_job.id, "factual", "review_first")
                 .unwrap();
-        reserve_application_attempt(&pool, "acct-jobs", &sde_application.id, "local").unwrap();
+        seed_active_reservation_for_quota_eligibility(
+            &pool,
+            &sde_application,
+            &sde_job,
+            &saved_preferences,
+        );
         update_attempt_reservation_status(&pool, "acct-jobs", &sde_application.id, "submitted")
             .unwrap();
 
@@ -12254,7 +14010,7 @@ mod tests {
     }
 
     #[test]
-    fn active_ats_status_enables_only_certified_runners_and_requires_a_loaded_binding() {
+    fn active_ats_status_cannot_elevate_an_unreviewed_track_or_uncertified_runner() {
         let now = now_ms();
         let posting = test_posting("https://boards.greenhouse.io/acme/jobs/posting-1", now, now);
         let profile = default_profile("jobs@example.com");
@@ -12314,13 +14070,17 @@ mod tests {
         let mut certified = baseline.clone();
         apply_ats_certification_status(&posting, &mut certified, &status, true);
         assert_eq!(certified.capability, "certified");
-        assert!(certified.can_auto_submit);
-        assert!(certified.can_queue_local);
+        assert!(!certified.can_auto_submit);
+        assert!(!certified.can_queue_local);
         assert!(!certified.can_queue_cloud);
         assert!(!certified
             .review_reasons
             .iter()
             .any(|reason| reason.code == "ats_review_required"));
+        assert!(certified
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "career_track_policy_review_required"));
         assert_eq!(
             certified.ats_certification.certified_runner_kinds,
             vec!["local"]
@@ -12543,10 +14303,192 @@ mod tests {
         let decision = evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
         assert!(decision.can_prepare, "unexpected decision: {decision:#?}");
         assert!(!decision.can_auto_submit);
+        assert!(!decision.can_queue_local);
+        assert!(!decision.can_queue_cloud);
         assert!(decision
             .review_reasons
             .iter()
             .any(|reason| reason.code == "engagement_type_unverified"));
+        assert!(decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "track_engagement_type_unverified"));
+        assert!(!decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "track_engagement_type_allowed"));
+    }
+
+    #[test]
+    fn typed_job_categories_preserve_positive_controls_without_minting_queue_authority() {
+        let pool = test_pool();
+        let (profile, _) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
+        let preferences = JobPreferences {
+            desired_locations: vec!["New York, NY".to_string()],
+            employment_types: vec!["full_time".to_string()],
+            engagement_types: vec!["w2".to_string()],
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.policy.employment_types = vec!["full_time".to_string()];
+        track.policy.engagement_types = vec!["w2".to_string()];
+        let track = upsert_track(&pool, "acct-jobs", &track).unwrap();
+        assert_eq!(track.policy.authority.review_state, "approved");
+
+        let mut exact = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/exact-full-time-w2",
+            now_ms(),
+            now_ms(),
+        );
+        exact.employment_type = "full_time w2".to_string();
+        let exact = upsert_posting(&pool, "acct-jobs", &exact, &profile, &preferences).unwrap();
+        let exact_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &exact, true, None).unwrap();
+        assert!(exact_decision.can_prepare, "{exact_decision:#?}");
+        assert!(!exact_decision.can_queue_local, "{exact_decision:#?}");
+        assert!(!exact_decision.can_queue_cloud, "{exact_decision:#?}");
+        for check in [
+            "employment_type_allowed",
+            "engagement_type_allowed",
+            "track_employment_type_allowed",
+            "track_engagement_type_allowed",
+        ] {
+            assert!(
+                exact_decision
+                    .passed_checks
+                    .iter()
+                    .any(|value| value == check),
+                "missing {check}: {exact_decision:#?}"
+            );
+        }
+
+        let mut unknown_employment = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/unknown-employment-w2",
+            now_ms(),
+            now_ms(),
+        );
+        unknown_employment.employment_type = "w2".to_string();
+        let unknown_employment = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &unknown_employment,
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let unknown_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &unknown_employment, true, None).unwrap();
+        assert!(unknown_decision.can_prepare, "{unknown_decision:#?}");
+        assert!(!unknown_decision.can_queue_local);
+        assert!(!unknown_decision.can_queue_cloud);
+        for code in [
+            "employment_type_unverified",
+            "track_employment_type_unverified",
+        ] {
+            assert!(
+                unknown_decision
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == code),
+                "missing {code}: {unknown_decision:#?}"
+            );
+        }
+        assert!(!unknown_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "track_employment_type_allowed"));
+
+        let mut negated_internship = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/internship-not-offered",
+            now_ms(),
+            now_ms(),
+        );
+        negated_internship.employment_type = "internship".to_string();
+        negated_internship.description =
+            "Internship is not offered. Build reliable products.".to_string();
+        let negated_internship = upsert_posting(
+            &pool,
+            "acct-jobs",
+            &negated_internship,
+            &profile,
+            &preferences,
+        )
+        .unwrap();
+        let negated_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &negated_internship, true, None).unwrap();
+        assert!(!negated_decision.can_queue_local);
+        assert!(!negated_decision.can_queue_cloud);
+        for code in [
+            "employment_type_unverified",
+            "track_employment_type_unverified",
+        ] {
+            assert!(
+                negated_decision
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == code),
+                "missing {code}: {negated_decision:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn negated_c2c_evidence_never_satisfies_c2c_only_track() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            desired_locations: vec!["New York, NY".to_string()],
+            employment_types: vec!["contract".to_string()],
+            engagement_types: vec!["c2c".to_string()],
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.policy.employment_types = vec!["contract".to_string()];
+        track.policy.engagement_types = vec!["c2c".to_string()];
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+
+        for (suffix, description) in [
+            ("no-c2c-w2-only", "No C2C; W2 only."),
+            ("c2c-do-not-accept", "We do not accept C2C."),
+            ("c2c-not-supported", "C2C is not supported."),
+        ] {
+            let mut posting = test_posting(
+                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}"),
+                now_ms(),
+                now_ms(),
+            );
+            posting.employment_type = "contract c2c".to_string();
+            posting.description = format!("{description} Build reliable products.");
+            let posting =
+                upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+            let decision =
+                evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+            assert!(decision.can_prepare, "{decision:#?}");
+            assert!(!decision.can_queue_local);
+            assert!(!decision.can_queue_cloud);
+            for code in [
+                "engagement_type_unverified",
+                "track_engagement_type_unverified",
+            ] {
+                assert!(
+                    decision
+                        .review_reasons
+                        .iter()
+                        .any(|reason| reason.code == code),
+                    "missing {code}: {decision:#?}"
+                );
+            }
+            assert!(!decision
+                .passed_checks
+                .iter()
+                .any(|check| check == "track_engagement_type_allowed"));
+        }
     }
 
     #[test]
@@ -12680,7 +14622,141 @@ mod tests {
     }
 
     #[test]
-    fn attempt_reservations_enforce_company_and_daily_limits_atomically() {
+    fn workplace_evidence_cannot_bypass_remote_only_queue_authority() {
+        let pool = test_pool();
+        let profile = default_profile("jobs@example.com");
+        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let preferences = JobPreferences {
+            desired_locations: vec!["Remote - United States".to_string()],
+            location_policy: "remote_only".to_string(),
+            remote_preference: "remote_only".to_string(),
+            sponsorship: "not_required".to_string(),
+            ..JobPreferences::default()
+        };
+        save_preferences(&pool, "acct-jobs", &preferences).unwrap();
+        let mut track = list_tracks(&pool, "acct-jobs").unwrap().remove(0);
+        track.locations = vec!["Remote - United States".to_string()];
+        track.remote_preference = "remote_only".to_string();
+        upsert_track(&pool, "acct-jobs", &track).unwrap();
+
+        let mut hybrid = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/hybrid-not-remote",
+            now_ms(),
+            now_ms(),
+        );
+        hybrid.location = "United States".to_string();
+        hybrid.workplace = "hybrid".to_string();
+        let hybrid = upsert_posting(&pool, "acct-jobs", &hybrid, &profile, &preferences).unwrap();
+        let hybrid_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &hybrid, true, None).unwrap();
+        assert!(!hybrid_decision.can_queue_local);
+        assert!(!hybrid_decision.can_queue_cloud);
+        assert!(hybrid_decision
+            .hard_failures
+            .iter()
+            .any(|reason| reason.code == "location_mismatch"));
+
+        for (suffix, workplace) in [
+            ("negated", "not remote"),
+            ("cannot-be-remote", "cannot be remote"),
+            ("remote-disallowed", "does not allow remote"),
+            ("mixed", "remote or hybrid"),
+            ("unknown", "flexible"),
+        ] {
+            let mut posting = test_posting(
+                &format!("https://boards.greenhouse.io/acme/jobs/{suffix}-workplace"),
+                now_ms(),
+                now_ms(),
+            );
+            posting.location = "United States".to_string();
+            posting.workplace = workplace.to_string();
+            let posting =
+                upsert_posting(&pool, "acct-jobs", &posting, &profile, &preferences).unwrap();
+            let decision =
+                evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+            assert!(
+                !decision.can_queue_local,
+                "unexpected local queue for {workplace}"
+            );
+            assert!(
+                !decision.can_queue_cloud,
+                "unexpected cloud queue for {workplace}"
+            );
+            assert!(
+                decision
+                    .review_reasons
+                    .iter()
+                    .any(|reason| reason.code == "location_taxonomy_review_required"),
+                "missing typed workplace review for {workplace}: {decision:#?}"
+            );
+        }
+
+        let mut excluded = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/remote-outside-us",
+            now_ms(),
+            now_ms(),
+        );
+        excluded.location = "Remote outside United States".to_string();
+        excluded.workplace = "remote".to_string();
+        let excluded =
+            upsert_posting(&pool, "acct-jobs", &excluded, &profile, &preferences).unwrap();
+        let excluded_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &excluded, true, None).unwrap();
+        assert!(!excluded_decision.can_queue_local);
+        assert!(!excluded_decision.can_queue_cloud);
+        assert!(excluded_decision
+            .review_reasons
+            .iter()
+            .any(|reason| reason.code == "location_taxonomy_review_required"));
+        assert!(!excluded_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "location_allowed"));
+
+        let mut remote = test_posting(
+            "https://boards.greenhouse.io/acme/jobs/proven-remote",
+            now_ms(),
+            now_ms(),
+        );
+        remote.location = "United States".to_string();
+        remote.workplace = "remote".to_string();
+        let remote = upsert_posting(&pool, "acct-jobs", &remote, &profile, &preferences).unwrap();
+        let remote_decision =
+            evaluate_job_eligibility(&pool, "acct-jobs", &remote, true, None).unwrap();
+        assert!(remote_decision
+            .passed_checks
+            .iter()
+            .any(|check| check == "location_allowed"));
+    }
+
+    fn seed_active_reservation_for_quota_eligibility(
+        pool: &DbPool,
+        application: &JobApplication,
+        posting: &JobPosting,
+        preferences: &JobPreferences,
+    ) {
+        let at_ms = now_ms();
+        let period_key = attempt_period_key(at_ms, preferences.time_zone_offset_minutes);
+        pool.get()
+            .unwrap()
+            .execute(
+                "INSERT INTO jobs_attempt_reservations (
+                    id, account_id, application_id, company_key, period_key, runner, status,
+                    reserved_at_ms, updated_at_ms
+                 ) VALUES (?1, 'acct-jobs', ?2, ?3, ?4, 'local', 'reserved', ?5, ?5)",
+                params![
+                    format!("quota-reservation-{}", application.id),
+                    application.id,
+                    normalize_company_key(&posting.company),
+                    period_key,
+                    at_ms,
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn eligibility_enforces_company_and_daily_limits_from_active_reservations() {
         let pool = test_pool();
         let profile = default_profile("jobs@example.com");
         save_profile(&pool, "acct-jobs", &profile).unwrap();
@@ -12702,7 +14778,12 @@ mod tests {
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &first.id, "factual", "review_first").unwrap();
         assert_eq!(application.state, "awaiting_review");
-        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+        seed_active_reservation_for_quota_eligibility(
+            &pool,
+            &application,
+            &first,
+            &preferences,
+        );
 
         let mut second = test_posting(
             "https://boards.greenhouse.io/acme/jobs/two",
@@ -12733,7 +14814,12 @@ mod tests {
             let (application, _) =
                 prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                     .unwrap();
-            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
+            seed_active_reservation_for_quota_eligibility(
+                &pool,
+                &application,
+                &posting,
+                &preferences,
+            );
         }
 
         let mut final_posting = test_posting(
@@ -12791,60 +14877,51 @@ mod tests {
     #[test]
     fn application_updates_enforce_state_machine_and_submission_mode() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
+        let now = now_ms();
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
-            &verified_test_posting(
-                JobPosting {
-                    id: String::new(),
-                    canonical_key: String::new(),
-                    source: "greenhouse".to_string(),
-                    external_id: String::new(),
-                    company: "Acme".to_string(),
-                    title: "Engineer".to_string(),
-                    location: "Remote".to_string(),
-                    workplace: "remote".to_string(),
-                    canonical_url: "https://boards.greenhouse.io/acme/jobs/state-machine"
-                        .to_string(),
-                    description: String::new(),
-                    compensation: String::new(),
-                    employment_type: String::new(),
-                    track_id: "track-default".to_string(),
-                    match_score: 84,
-                    matched_reasons: Vec::new(),
-                    missing_requirements: Vec::new(),
-                    posted_at_ms: Some(now_ms()),
-                    last_verified_at_ms: Some(now_ms()),
-                    availability_status: "active".to_string(),
-                    status: "matched".to_string(),
-                    created_at_ms: 0,
-                    updated_at_ms: 0,
-                    discovery_evidence: JobDiscoveryEvidence::default(),
-                    eligibility: None,
-                },
-                now_ms(),
+            &test_posting(
+                "https://boards.greenhouse.io/acme/jobs/state-machine",
+                now,
+                now,
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
+        let eligibility =
+            evaluate_job_eligibility(&pool, "acct-jobs", &posting, true, None).unwrap();
+        assert!(eligibility.can_prepare, "{eligibility:#?}");
+        assert!(!eligibility.can_queue_local, "{eligibility:#?}");
+        assert!(!eligibility.can_queue_cloud, "{eligibility:#?}");
+        assert!(!eligibility.can_auto_submit, "{eligibility:#?}");
+        for reason in [
+            "employer_identity_review_required",
+            "job_risk_review_required",
+        ] {
+            assert!(
+                eligibility
+                    .review_reasons
+                    .iter()
+                    .any(|candidate| candidate.code == reason),
+                "missing {reason}: {eligibility:#?}"
+            );
+        }
         let (application, _) =
             prepare_application(&pool, "acct-jobs", &posting.id, "factual", "review_first")
                 .unwrap();
 
-        let queued = update_application(
+        let queue_without_approved_execution = update_application(
             &pool,
             "acct-jobs",
             &application.id,
             "queued",
             Some("auto_submit"),
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(queued.state, "queued");
-        assert_eq!(queued.submission_mode, "auto_submit");
+        );
+        assert!(queue_without_approved_execution.is_err());
 
         let invalid_transition =
             update_application(&pool, "acct-jobs", &application.id, "submitted", None);
@@ -12854,7 +14931,7 @@ mod tests {
             &pool,
             "acct-jobs",
             &application.id,
-            "running",
+            "awaiting_review",
             Some("surprise_me"),
         );
         assert!(invalid_mode.is_err());
@@ -12862,8 +14939,8 @@ mod tests {
         let unchanged = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
             .unwrap();
-        assert_eq!(unchanged.state, "queued");
-        assert_eq!(unchanged.submission_mode, "auto_submit");
+        assert_eq!(unchanged.state, "awaiting_review");
+        assert_eq!(unchanged.submission_mode, "review_first");
     }
 
     #[test]
@@ -13899,23 +15976,25 @@ mod tests {
     }
 
     fn communication_test_application(pool: &DbPool) -> JobApplication {
-        let profile = default_profile("jobs@example.com");
-        save_profile(pool, "acct-jobs", &profile).unwrap();
-        let posting = upsert_posting(
+        let fixture = final_submission_fixture(pool, "communication-action");
+        let finalized = finalize_submission(
             pool,
             "acct-jobs",
-            &test_posting(
-                "https://boards.greenhouse.io/acme/jobs/communication-action",
-                now_ms(),
-                now_ms(),
-            ),
-            &profile,
-            &JobPreferences::default(),
+            &fixture.application.id,
+            &fixture.run_id,
+            "cloud",
+            fixture.receipt,
+            &fixture.fingerprint,
+            &fixture.evidence,
+            &fixture.object_uploads,
+            &fixture.session,
+            None,
         )
         .unwrap();
-        let (application, _) =
-            prepare_application(pool, "acct-jobs", &posting.id, "factual", "review_first").unwrap();
-        application
+        match finalized {
+            SubmissionFinalizeResult::Committed(application)
+            | SubmissionFinalizeResult::Replayed(application) => application,
+        }
     }
 
     fn communication_test_application_mailbox_and_message(
@@ -14257,6 +16336,140 @@ mod tests {
             ))),
         );
         Value::Object(object)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fix_728_communication_dispatch_authenticates_submitted_domain_before_effect() {
+        let _flags = CommunicationFlagGuard::enabled();
+        let positive_pool = test_pool();
+        let (positive_application, positive_mailbox, positive_message) =
+            communication_test_application_mailbox_and_message(&positive_pool);
+        assert_eq!(positive_application.state, "submitted");
+        let positive = communication_test_action(
+            &positive_application,
+            &positive_mailbox,
+            &positive_message,
+            "fix-728-submitted-communication-positive",
+        );
+        let (positive, _) =
+            create_communication_action(&positive_pool, "acct-jobs", &positive).unwrap();
+        approve_communication_action(&positive_pool, "acct-jobs", &positive.id)
+            .unwrap()
+            .unwrap();
+        let lease =
+            claim_communication_action(&positive_pool, "fix-728-submitted-communication-worker")
+                .unwrap()
+                .expect("validated submitted communication claim");
+        let access = communication_lease_access(&lease, "fix-728-submitted-communication-worker");
+        let started = mark_communication_action_request_started(&positive_pool, &access).unwrap();
+        assert_eq!(started.status, "dispatching");
+        let replayed = mark_communication_action_request_started(&positive_pool, &access).unwrap();
+        assert_eq!(replayed.id, started.id);
+        assert_eq!(
+            positive_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                      WHERE attempt_id = ?1 AND event_kind = 'request_started'",
+                    params![lease.attempt_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let mut replay_tampered_application = positive_application.clone();
+        replay_tampered_application.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]
+            ["preSubmissionReceipt"]["job_integrity"]["canonicalEmployerDomain"] =
+            json!("replay-lookalike.example");
+        positive_pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?2 WHERE id = ?1",
+                params![
+                    replay_tampered_application.id,
+                    to_json(
+                        &replay_tampered_application,
+                        "tampered communication replay application",
+                    )
+                    .unwrap(),
+                ],
+            )
+            .unwrap();
+        assert!(mark_communication_action_request_started(&positive_pool, &access).is_err());
+        assert_eq!(
+            positive_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_communication_action_attempt_evidence
+                      WHERE attempt_id = ?1 AND event_kind = 'request_started'",
+                    params![lease.attempt_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let replay_unchanged = communication_action(&positive_pool, "acct-jobs", &started.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay_unchanged.status, "dispatching");
+        assert_eq!(
+            replay_unchanged.active_attempt_id.as_deref(),
+            Some(lease.attempt_id.as_str())
+        );
+
+        let tampered_pool = test_pool();
+        let (mut tampered_application, tampered_mailbox, tampered_message) =
+            communication_test_application_mailbox_and_message(&tampered_pool);
+        let tampered = communication_test_action(
+            &tampered_application,
+            &tampered_mailbox,
+            &tampered_message,
+            "fix-728-submitted-communication-tampered",
+        );
+        let (tampered, _) =
+            create_communication_action(&tampered_pool, "acct-jobs", &tampered).unwrap();
+        let tampered = approve_communication_action(&tampered_pool, "acct-jobs", &tampered.id)
+            .unwrap()
+            .unwrap();
+        tampered_application.receipt[SERVER_SUBMISSION_AUTHORITY_KEY]["preSubmissionReceipt"]
+            ["job_integrity"]["canonicalEmployerDomain"] = json!("claim-lookalike.example");
+        let tampered_payload =
+            to_json(&tampered_application, "tampered communication application").unwrap();
+        tampered_pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?2 WHERE id = ?1",
+                params![tampered_application.id, tampered_payload],
+            )
+            .unwrap();
+        assert!(claim_communication_action(
+            &tampered_pool,
+            "fix-728-tampered-communication-worker",
+        )
+        .is_err());
+        let unchanged = communication_action(&tampered_pool, "acct-jobs", &tampered.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "approved");
+        assert_eq!(unchanged.attempt_count, 0);
+        assert!(unchanged.active_attempt_id.is_none());
+        assert_eq!(
+            tampered_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_communication_action_attempts WHERE action_id = ?1",
+                    params![tampered.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -16744,6 +18957,22 @@ mod tests {
                 .and_then(Value::as_str),
             Some("applications@example.com")
         );
+        let frozen_policy = application
+            .receipt
+            .pointer("/career_track_policy_authority")
+            .expect("application receipt must freeze the exact Track policy authority");
+        assert_eq!(
+            resume
+                .content
+                .pointer("/provenance/career_track_policy_authority"),
+            Some(frozen_policy)
+        );
+        assert_eq!(
+            frozen_policy
+                .get("taxonomy_version")
+                .and_then(Value::as_str),
+            Some(crate::jobs_taxonomy::taxonomy_version())
+        );
     }
 
     #[test]
@@ -17453,12 +19682,29 @@ mod tests {
     #[test]
     fn certified_local_production_path_is_single_submit_even_after_response_loss() {
         let pool = test_pool();
-        let (application, run_id, ticket_hash, _) =
-            local_run_authority_fixture_unbound(&pool, "certified-local-production");
-        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
-        let descriptor = seed_test_local_browser_release_authority(&pool);
-        let (application, proof) =
-            install_certified_application(&pool, application, certified_local_runtime_target());
+        let browser = browser_release_registry_tests::install_signed_browser_release_fixture(
+            &pool,
+            "acct-jobs",
+        );
+        assert_eq!(
+            browser.binding.build_descriptor_sha256,
+            browser.descriptor.descriptor_sha256
+        );
+        let runtime_target = browser.runtime_target.clone();
+        let fixture = certified_application_fixture(
+            &pool,
+            "certified-local-production",
+            "local",
+            runtime_target.clone(),
+            "",
+        );
+        let application = fixture.application;
+        let run_id = fixture.run_id;
+        let ticket_hash = fixture
+            .ticket_hash
+            .expect("certified local fixture has a ticket hash");
+        let proof = fixture.proof;
+        let descriptor = browser.descriptor;
         let nonce = "a".repeat(64);
         let claim = claim_local_run_with_browser_release(
             &pool,
@@ -17512,12 +19758,18 @@ mod tests {
             (
                 "preflight".to_string(),
                 0,
-                "d".repeat(64),
-                "macos".to_string(),
-                "arm64".to_string(),
-                "1".repeat(64),
-                "2".repeat(64),
-                "3".repeat(64),
+                runtime_target.runtime_sha256,
+                runtime_target.platform,
+                runtime_target.architecture,
+                runtime_target
+                    .browser_release_manifest_sha256
+                    .expect("signed local runtime has a Browser release manifest"),
+                runtime_target
+                    .browser_artifact_sha256
+                    .expect("signed local runtime has a Browser artifact"),
+                runtime_target
+                    .browser_build_descriptor_sha256
+                    .expect("signed local runtime has a Browser build descriptor"),
             )
         );
 
@@ -17656,12 +19908,24 @@ mod tests {
     #[test]
     fn certified_local_layout_drift_quarantines_before_any_submit_write() {
         let pool = test_pool();
-        let (application, run_id, ticket_hash, _) =
-            local_run_authority_fixture_unbound(&pool, "certified-local-drift");
-        reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap();
-        let descriptor = seed_test_local_browser_release_authority(&pool);
-        let (application, proof) =
-            install_certified_application(&pool, application, certified_local_runtime_target());
+        let browser = browser_release_registry_tests::install_signed_browser_release_fixture(
+            &pool,
+            "acct-jobs",
+        );
+        let fixture = certified_application_fixture(
+            &pool,
+            "certified-local-drift",
+            "local",
+            browser.runtime_target.clone(),
+            "",
+        );
+        let application = fixture.application;
+        let run_id = fixture.run_id;
+        let ticket_hash = fixture
+            .ticket_hash
+            .expect("certified local fixture has a ticket hash");
+        let proof = fixture.proof;
+        let descriptor = browser.descriptor;
         let nonce = "b".repeat(64);
         assert!(matches!(
             claim_local_run_with_browser_release(
@@ -17899,6 +20163,234 @@ mod tests {
                 1,
                 1,
             )
+        );
+    }
+
+    #[test]
+    fn unmanaged_cloud_worker_submit_and_replay_accept_absent_managed_authority() {
+        let pool = test_pool();
+        let fixture = certified_cloud_execution_fixture(
+            &pool,
+            "unmanaged-worker-final-submit-pairing",
+        );
+        let capacity = test_submission_evidence_capacity(&fixture.application.id, &fixture.run_id);
+        let worker_id = "unmanaged-cloud-worker-final-submit";
+
+        let started = start_irreversible_submission_authorized(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.lease_token,
+            fixture.lease_fence,
+            &fixture.proof,
+            &capacity,
+            None,
+            worker_id,
+        )
+        .expect("unmanaged authenticated worker may start with an absent managed tuple");
+        assert_eq!(started.record.phase, "click_started");
+        assert!(started.managed_cloud.is_none());
+
+        let replay = start_irreversible_submission_authorized(
+            &pool,
+            "acct-jobs",
+            &fixture.application.id,
+            &fixture.run_id,
+            &fixture.lease_token,
+            fixture.lease_fence,
+            &fixture.proof,
+            &capacity,
+            None,
+            worker_id,
+        )
+        .expect("unmanaged authenticated worker may replay the exact stored outcome");
+        assert_eq!(replay, started);
+        assert_eq!(
+            submission_capacity_count(&pool, &fixture.application.id, &fixture.run_id),
+            1
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn managed_cloud_final_submit_boundary_denies_omission_and_wrong_worker_without_mutation() {
+        let _managed_cloud_environment = ManagedCloudAdmissionEnvironment::staging();
+        let pool = test_pool();
+        let fixture = managed_final_submit_execution_fixture(
+            &pool,
+            "managed-worker-final-submit-pairing",
+        );
+        let cloud = &fixture.cloud;
+        let capacity = test_submission_evidence_capacity(&cloud.application.id, &cloud.run_id);
+        let prepared = managed_final_submit_boundary_state(
+            &pool,
+            &cloud.application.id,
+            &cloud.run_id,
+        );
+        assert_eq!(prepared.lease_phase, "prepared");
+        assert_eq!(prepared.certification_phase, "preflight");
+        assert_eq!(prepared.certification_fence, 0);
+        assert!(prepared.phase_b_request_sha256.is_none());
+        assert_eq!(prepared.canary_reservation_count, 0);
+        assert_eq!(prepared.capacity_count, 0);
+        assert_eq!(prepared.managed_receipt_count, 0);
+        assert!(!prepared.final_submit_proof_present);
+
+        assert!(matches!(
+            start_irreversible_submission_authorized(
+                &pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &cloud.proof,
+                &capacity,
+                None,
+                &fixture.worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            managed_final_submit_boundary_state(
+                &pool,
+                &cloud.application.id,
+                &cloud.run_id,
+            ),
+            prepared
+        );
+
+        let wrong_worker_id = "wrong-managed-worker-final-submit";
+        assert!(matches!(
+            start_irreversible_submission_authorized(
+                &pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &cloud.proof,
+                &capacity,
+                Some(&fixture.managed_cloud),
+                wrong_worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            managed_final_submit_boundary_state(
+                &pool,
+                &cloud.application.id,
+                &cloud.run_id,
+            ),
+            prepared
+        );
+
+        let started = start_irreversible_submission_authorized(
+            &pool,
+            "acct-jobs",
+            &cloud.application.id,
+            &cloud.run_id,
+            &cloud.lease_token,
+            cloud.lease_fence,
+            &cloud.proof,
+            &capacity,
+            Some(&fixture.managed_cloud),
+            &fixture.worker_id,
+        )
+        .expect("exact managed authority starts the irreversible effect");
+        assert_eq!(started.record.phase, "click_started");
+        assert_eq!(
+            started
+                .managed_cloud
+                .as_ref()
+                .expect("managed fresh effect authority")
+                .managed_cloud_worker_id,
+            fixture.worker_id
+        );
+        let click_started = managed_final_submit_boundary_state(
+            &pool,
+            &cloud.application.id,
+            &cloud.run_id,
+        );
+        assert_eq!(click_started.lease_phase, "click_started");
+        assert_eq!(click_started.certification_phase, "consumed");
+        assert_eq!(click_started.certification_fence, 1);
+        assert!(click_started.phase_b_request_sha256.is_some());
+        assert_eq!(click_started.canary_reservation_count, 1);
+        assert_eq!(click_started.capacity_count, 1);
+        assert_eq!(click_started.managed_receipt_count, 1);
+        assert!(click_started.final_submit_proof_present);
+
+        assert!(matches!(
+            start_irreversible_submission_authorized(
+                &pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &cloud.proof,
+                &capacity,
+                None,
+                &fixture.worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            managed_final_submit_boundary_state(
+                &pool,
+                &cloud.application.id,
+                &cloud.run_id,
+            ),
+            click_started
+        );
+
+        assert!(matches!(
+            start_irreversible_submission_authorized(
+                &pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &cloud.proof,
+                &capacity,
+                Some(&fixture.managed_cloud),
+                wrong_worker_id,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(
+            managed_final_submit_boundary_state(
+                &pool,
+                &cloud.application.id,
+                &cloud.run_id,
+            ),
+            click_started
+        );
+
+        let replay = start_irreversible_submission_authorized(
+            &pool,
+            "acct-jobs",
+            &cloud.application.id,
+            &cloud.run_id,
+            &cloud.lease_token,
+            cloud.lease_fence,
+            &cloud.proof,
+            &capacity,
+            Some(&fixture.managed_cloud),
+            &fixture.worker_id,
+        )
+        .expect("exact managed authority replays the stored irreversible effect");
+        assert_eq!(replay, started);
+        assert_eq!(
+            managed_final_submit_boundary_state(
+                &pool,
+                &cloud.application.id,
+                &cloud.run_id,
+            ),
+            click_started
         );
     }
 
@@ -19468,8 +21960,8 @@ mod tests {
     #[test]
     fn jobs_export_includes_durable_data_but_omits_ephemeral_secrets() {
         let pool = test_pool();
-        let profile = default_profile("jobs@example.com");
-        save_profile(&pool, "acct-jobs", &profile).unwrap();
+        let (profile, preferences) =
+            execution_policy_fixture(&pool, "acct-jobs", "jobs@example.com", "track-default");
         let posting = upsert_posting(
             &pool,
             "acct-jobs",
@@ -19479,7 +21971,7 @@ mod tests {
                 now_ms(),
             ),
             &profile,
-            &JobPreferences::default(),
+            &preferences,
         )
         .unwrap();
         let (application, resume) =
@@ -19570,14 +22062,29 @@ mod tests {
             .unwrap();
         assert_eq!(export.resume_versions.len(), 1);
         assert_eq!(export.workspace.application_evidence.len(), 1);
+        assert_eq!(export.canonical_track_policy_ledger.revisions.len(), 1);
+        assert_eq!(
+            export.canonical_track_policy_ledger.review_receipts.len(),
+            1
+        );
+        assert_eq!(export.canonical_track_policy_ledger.heads.len(), 1);
+        assert!(export.canonical_track_policy_ledger.revisions[0]
+            .canonical_policy_json
+            .contains("New York, NY"));
         assert!(export.workspace.browser_sessions[0].takeover_url.is_none());
         let serialized = serde_json::to_string(&export).unwrap();
+        assert!(!serialized.contains(ENCRYPTED_PAYLOAD_PREFIX));
         assert!(!serialized.contains("secret-capability"));
         assert!(!serialized.contains("export-ticket-secret"));
         assert!(!serialized.contains("must-not-export"));
 
         let refs = crate::db::account_data::artifact_object_refs(&pool, "acct-jobs").unwrap();
-        assert_eq!(refs.len(), 4);
+        assert_eq!(refs.len(), 5);
+        assert!(refs.iter().any(|reference| {
+            reference.object_key == "accounts/acct-jobs/jobs/fixture-source-resume.pdf"
+                && reference.content_type.as_deref() == Some("application/pdf")
+                && reference.size_bytes == Some(1_024)
+        }));
         assert!(refs.iter().any(|reference| reference.object_key
             == "accounts/acct-jobs/jobs/export/resume.pdf"
             && reference.size_bytes == Some(42)));
@@ -20630,14 +23137,12 @@ mod tests {
         let pool = test_pool();
         let (mut application, run_id, browser_profile_id) =
             execution_lease_fixture(&pool, "answer-cloud");
-        application.receipt.as_object_mut().unwrap().insert(
-            "approved_execution".to_string(),
-            json!({"schema_version": 2, "checksum": "approved-cloud-checksum"}),
-        );
-        application =
-            replace_application_receipt(&pool, "acct-jobs", &application.id, application.receipt)
-                .unwrap()
-                .unwrap();
+        let approved_checksum = application
+            .receipt
+            .pointer("/approved_execution/checksum")
+            .and_then(Value::as_str)
+            .expect("fixture approved execution checksum")
+            .to_string();
         let lease = claim_execution_lease(
             &pool,
             "acct-jobs",
@@ -20648,7 +23153,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(lease.phase, "prepared");
-        update_attempt_reservation_status(&pool, "acct-jobs", &application.id, "running").unwrap();
+        assert!(update_attempt_reservation_status(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            "running",
+        )
+        .unwrap());
+        assert_eq!(
+            list_attempt_reservations(&pool, "acct-jobs").unwrap()[0].status,
+            "running"
+        );
         application = update_application(&pool, "acct-jobs", &application.id, "running", None)
             .unwrap()
             .unwrap();
@@ -20695,7 +23210,7 @@ mod tests {
                 .receipt
                 .pointer("/packet_revision/invalidated_packet_checksum")
                 .and_then(Value::as_str),
-            Some("approved-cloud-checksum")
+            Some(approved_checksum.as_str())
         );
         assert_eq!(
             revision
@@ -20771,14 +23286,6 @@ mod tests {
         let pool = test_pool();
         let (mut application, run_id, ticket_hash, _) =
             local_run_authority_fixture(&pool, "answer-local");
-        application.receipt.as_object_mut().unwrap().insert(
-            "approved_execution".to_string(),
-            json!({"schema_version": 2, "checksum": "approved-local-checksum"}),
-        );
-        application =
-            replace_application_receipt(&pool, "acct-jobs", &application.id, application.receipt)
-                .unwrap()
-                .unwrap();
         assert!(claim_local_run_ticket(&pool, &run_id, &ticket_hash)
             .unwrap()
             .is_some());
@@ -20977,7 +23484,24 @@ mod tests {
     #[test]
     fn application_queue_hold_blocks_even_active_reservation_replay_until_release() {
         let pool = test_pool();
-        let (application, _, _) = execution_lease_fixture(&pool, "held-queue");
+        let (application, run_id, _) = execution_lease_fixture(&pool, "held-queue");
+        let application_before = serde_json::to_value(
+            get_application(&pool, "acct-jobs", &application.id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let reservations_before = list_attempt_reservations(&pool, "acct-jobs").unwrap();
+        let reserved_runner = reservations_before
+            .iter()
+            .find(|reservation| reservation.application_id == application.id)
+            .expect("held queue fixture has an active reservation")
+            .runner
+            .clone();
+        let browser_sessions_before =
+            serde_json::to_value(list_browser_sessions(&pool, "acct-jobs").unwrap()).unwrap();
+        let run_events_before =
+            serde_json::to_value(list_run_events(&pool, "acct-jobs", &run_id).unwrap()).unwrap();
         append_account_operational_hold(
             &pool,
             OperationalCapability::ApplicationQueue,
@@ -20987,23 +23511,44 @@ mod tests {
             None,
         );
 
-        let error =
-            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local").unwrap_err();
+        let error = reserve_application_attempt(
+            &pool,
+            "acct-jobs",
+            &application.id,
+            &reserved_runner,
+        )
+        .unwrap_err();
         assert!(matches!(
             error.downcast_ref::<OperationalHoldError>(),
             Some(OperationalHoldError::Held(_))
         ));
-        let runner: String = pool
-            .get()
+        let persistence_error =
+            update_application(&pool, "acct-jobs", &application.id, "queued", None).unwrap_err();
+        assert!(matches!(
+            persistence_error.downcast_ref::<OperationalHoldError>(),
+            Some(OperationalHoldError::Held(_))
+        ));
+        let stored_application = get_application(&pool, "acct-jobs", &application.id)
             .unwrap()
-            .query_row(
-                "SELECT runner FROM jobs_attempt_reservations
-                  WHERE account_id = 'acct-jobs' AND application_id = ?1",
-                params![application.id],
-                |row| row.get(0),
-            )
             .unwrap();
-        assert_eq!(runner, "unassigned");
+        assert_eq!(stored_application.state, "queued");
+        assert_eq!(stored_application.run_id.as_deref(), Some(run_id.as_str()));
+        assert_eq!(
+            serde_json::to_value(stored_application).unwrap(),
+            application_before
+        );
+        assert_eq!(
+            list_attempt_reservations(&pool, "acct-jobs").unwrap(),
+            reservations_before
+        );
+        assert_eq!(
+            serde_json::to_value(list_browser_sessions(&pool, "acct-jobs").unwrap()).unwrap(),
+            browser_sessions_before
+        );
+        assert_eq!(
+            serde_json::to_value(list_run_events(&pool, "acct-jobs", &run_id).unwrap()).unwrap(),
+            run_events_before
+        );
 
         append_account_operational_hold(
             &pool,
@@ -21014,10 +23559,15 @@ mod tests {
             Some("held-queue-1"),
         );
         assert_eq!(
-            reserve_application_attempt(&pool, "acct-jobs", &application.id, "local",)
-                .unwrap()
-                .runner,
-            "local"
+            reserve_application_attempt(
+                &pool,
+                "acct-jobs",
+                &application.id,
+                &reserved_runner,
+            )
+            .unwrap()
+            .runner,
+            reserved_runner
         );
     }
 
@@ -21189,6 +23739,357 @@ mod tests {
         };
         assert!(replay.replayed);
         assert_eq!(replay.response_json, first.response_json);
+    }
+
+    #[test]
+    fn fix_728_employer_domain_runner_claim_holds_leave_local_and_cloud_unmodified() {
+        let local_pool = test_pool();
+        let (local_application, local_run_id, local_ticket_hash, _) =
+            local_run_authority_fixture_unbound(&local_pool, "employer-domain-local-claim");
+        reserve_application_attempt(&local_pool, "acct-jobs", &local_application.id, "local")
+            .unwrap();
+        let descriptor = seed_test_local_browser_release_authority(&local_pool);
+        let local_domain = application_job_integrity_receipt(&local_application)
+            .unwrap()
+            .expect("local claim has signed job-integrity authority")
+            .canonical_employer_domain;
+        append_operational_hold_for_scope(
+            &local_pool,
+            OperationalCapability::RunnerClaim,
+            OperationalHoldScopeKind::EmployerDomain,
+            &local_domain,
+            "fix-728-local-domain-claim-held",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        let local_before = (
+            local_claim_state(&local_pool, &local_application.id, &local_run_id),
+            local_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_local_run_claim_replays WHERE run_id = ?1",
+                    params![local_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            local_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_application_ats_certification_bindings
+                      WHERE application_id = ?1 AND run_id = ?2",
+                    params![local_application.id, local_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &local_pool,
+                &local_run_id,
+                &local_ticket_hash,
+                &"7".repeat(64),
+                &descriptor,
+                "test-server",
+                |_, _| anyhow::bail!("held local claim must not mint a response"),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::DistributionUnavailable
+        ));
+        let local_after = (
+            local_claim_state(&local_pool, &local_application.id, &local_run_id),
+            local_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_local_run_claim_replays WHERE run_id = ?1",
+                    params![local_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            local_pool
+                .get()
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM jobs_application_ats_certification_bindings
+                      WHERE application_id = ?1 AND run_id = ?2",
+                    params![local_application.id, local_run_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        );
+        assert_eq!(local_after, local_before);
+
+        let cloud_pool = test_pool();
+        let (cloud_application, cloud_run_id, cloud_browser_profile_id) =
+            execution_lease_fixture(&cloud_pool, "employer-domain-cloud-claim");
+        let cloud_domain = application_job_integrity_receipt(&cloud_application)
+            .unwrap()
+            .expect("cloud claim has signed job-integrity authority")
+            .canonical_employer_domain;
+        let cloud_state = |pool: &DbPool| {
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT application.state, reservation.runner, reservation.status,
+                            session.status,
+                            (SELECT COUNT(*) FROM jobs_execution_leases
+                              WHERE application_id = application.id),
+                            (SELECT COUNT(*) FROM jobs_application_ats_certification_bindings
+                              WHERE application_id = application.id),
+                            (SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                              WHERE application_id = application.id)
+                       FROM jobs_applications application
+                       JOIN jobs_attempt_reservations reservation
+                         ON reservation.account_id = application.account_id
+                        AND reservation.application_id = application.id
+                       JOIN jobs_browser_sessions session
+                         ON session.account_id = application.account_id AND session.id = ?2
+                      WHERE application.account_id = 'acct-jobs' AND application.id = ?1",
+                    params![cloud_application.id, cloud_run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        append_operational_hold_for_scope(
+            &cloud_pool,
+            OperationalCapability::RunnerClaim,
+            OperationalHoldScopeKind::EmployerDomain,
+            &cloud_domain,
+            "fix-728-cloud-domain-claim-held",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        let cloud_before = cloud_state(&cloud_pool);
+        assert!(matches!(
+            claim_execution_lease(
+                &cloud_pool,
+                "acct-jobs",
+                &cloud_application.id,
+                &cloud_run_id,
+                &cloud_browser_profile_id,
+                "fix-728-held-cloud-worker",
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(cloud_state(&cloud_pool), cloud_before);
+
+        let spoof_pool = test_pool();
+        let (mut spoof_application, spoof_run_id, spoof_ticket_hash, _) =
+            local_run_authority_fixture_unbound(&spoof_pool, "employer-domain-active-spoof");
+        reserve_application_attempt(&spoof_pool, "acct-jobs", &spoof_application.id, "local")
+            .unwrap();
+        let spoof_descriptor = seed_test_local_browser_release_authority(&spoof_pool);
+        spoof_application.receipt["job_integrity"]["canonicalEmployerDomain"] =
+            json!("mutable-spoof.example");
+        let spoof_payload = to_json(&spoof_application, "spoofed local claim application").unwrap();
+        spoof_pool
+            .get()
+            .unwrap()
+            .execute(
+                "UPDATE jobs_applications SET application_json = ?2 WHERE id = ?1",
+                params![spoof_application.id, spoof_payload],
+            )
+            .unwrap();
+        let spoof_before = local_claim_state(&spoof_pool, &spoof_application.id, &spoof_run_id);
+        assert!(matches!(
+            claim_local_run_with_browser_release(
+                &spoof_pool,
+                &spoof_run_id,
+                &spoof_ticket_hash,
+                &"8".repeat(64),
+                &spoof_descriptor,
+                "test-server",
+                |_, _| anyhow::bail!("spoofed authority must not mint a response"),
+            )
+            .unwrap(),
+            BrowserLocalRunClaimDisposition::Rejected
+        ));
+        assert_eq!(
+            local_claim_state(&spoof_pool, &spoof_application.id, &spoof_run_id),
+            spoof_before
+        );
+    }
+
+    #[test]
+    fn fix_728_employer_domain_final_submit_holds_leave_local_and_cloud_unmodified() {
+        let local_pool = test_pool();
+        let (local_application, local_run_id, local_ticket_hash, local_proof) =
+            certified_local_intervention_fixture(&local_pool, "employer-domain-local-submit");
+        let local_domain = application_job_integrity_receipt(&local_application)
+            .unwrap()
+            .expect("local submit has signed job-integrity authority")
+            .canonical_employer_domain;
+        let mut local_capacity =
+            test_submission_evidence_capacity(&local_application.id, &local_run_id);
+        local_capacity.runner = "local".to_string();
+        append_operational_hold_for_scope(
+            &local_pool,
+            OperationalCapability::FinalSubmit,
+            OperationalHoldScopeKind::EmployerDomain,
+            &local_domain,
+            "fix-728-local-domain-submit-held",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        let local_before_application = serde_json::to_value(
+            get_application(&local_pool, "acct-jobs", &local_application.id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let local_boundary_state = |pool: &DbPool| {
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT ticket.status, reservation.status, binding.phase, binding.fence,
+                            binding.phase_b_request_sha256,
+                            (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations
+                              WHERE binding_id = binding.binding_id),
+                            (SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                              WHERE application_id = binding.application_id
+                                AND run_id = binding.run_id)
+                       FROM jobs_local_run_tickets ticket
+                       JOIN jobs_attempt_reservations reservation
+                         ON reservation.account_id = ticket.account_id
+                        AND reservation.application_id = ticket.application_id
+                       JOIN jobs_application_ats_certification_bindings binding
+                         ON binding.account_id = ticket.account_id
+                        AND binding.application_id = ticket.application_id
+                        AND binding.run_id = ticket.id
+                      WHERE ticket.id = ?1",
+                    params![local_run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let local_before = local_boundary_state(&local_pool);
+        assert!(!local_run_submit_authorized(
+            &local_pool,
+            &local_run_id,
+            &local_ticket_hash,
+            &local_proof,
+            &local_capacity,
+        )
+        .unwrap());
+        assert_eq!(local_boundary_state(&local_pool), local_before);
+        assert_eq!(
+            serde_json::to_value(
+                get_application(&local_pool, "acct-jobs", &local_application.id)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            local_before_application
+        );
+
+        let cloud_pool = test_pool();
+        let cloud = certified_cloud_execution_fixture(&cloud_pool, "employer-domain-cloud-submit");
+        let cloud_domain = application_job_integrity_receipt(&cloud.application)
+            .unwrap()
+            .expect("cloud submit has signed job-integrity authority")
+            .canonical_employer_domain;
+        let cloud_capacity =
+            test_submission_evidence_capacity(&cloud.application.id, &cloud.run_id);
+        append_operational_hold_for_scope(
+            &cloud_pool,
+            OperationalCapability::FinalSubmit,
+            OperationalHoldScopeKind::EmployerDomain,
+            &cloud_domain,
+            "fix-728-cloud-domain-submit-held",
+            OperationalHoldTransition::Held,
+            0,
+            None,
+        );
+        let cloud_before_application = serde_json::to_value(
+            get_application(&cloud_pool, "acct-jobs", &cloud.application.id)
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let cloud_boundary_state = |pool: &DbPool| {
+            pool.get()
+                .unwrap()
+                .query_row(
+                    "SELECT lease.phase, reservation.status, binding.phase, binding.fence,
+                            binding.phase_b_request_sha256,
+                            (SELECT COUNT(*) FROM jobs_ats_certification_canary_reservations
+                              WHERE binding_id = binding.binding_id),
+                            (SELECT COUNT(*) FROM jobs_submission_evidence_capacity
+                              WHERE application_id = binding.application_id
+                                AND run_id = binding.run_id)
+                       FROM jobs_execution_leases lease
+                       JOIN jobs_attempt_reservations reservation
+                         ON reservation.account_id = lease.account_id
+                        AND reservation.application_id = lease.application_id
+                       JOIN jobs_application_ats_certification_bindings binding
+                         ON binding.account_id = lease.account_id
+                        AND binding.application_id = lease.application_id
+                        AND binding.run_id = lease.run_id
+                      WHERE lease.run_id = ?1",
+                    params![cloud.run_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?,
+                            row.get::<_, i64>(6)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let cloud_before = cloud_boundary_state(&cloud_pool);
+        assert!(matches!(
+            start_irreversible_submission(
+                &cloud_pool,
+                "acct-jobs",
+                &cloud.application.id,
+                &cloud.run_id,
+                &cloud.lease_token,
+                cloud.lease_fence,
+                &cloud.proof,
+                &cloud_capacity,
+            ),
+            Err(ExecutionLeaseError::Conflict)
+        ));
+        assert_eq!(cloud_boundary_state(&cloud_pool), cloud_before);
+        assert_eq!(
+            serde_json::to_value(
+                get_application(&cloud_pool, "acct-jobs", &cloud.application.id)
+                    .unwrap()
+                    .unwrap()
+            )
+            .unwrap(),
+            cloud_before_application
+        );
     }
 
     #[test]

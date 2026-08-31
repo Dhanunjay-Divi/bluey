@@ -7,6 +7,101 @@ under `docs/release/`.
 
 ### Added
 
+- Added the Phase 620A1 Bluey Jobs business-messaging no-egress kernel for original,
+  deterministic owner-command planning across WhatsApp Business Platform and Apple Messages for
+  Business. A strict synthetic-only TypeScript simulator and non-default Rust verifier share
+  canonical command, plan, operation, receipt, and SHA-256 vectors; enforce universal `STOP`,
+  step-up-only chat approval, exact Jobs/source/integrity read-set binding, provider-specific truth
+  ceilings, and terminal post-request ambiguity; and report zero network, credential, provider,
+  browser, process, Jobs-mutation, or external-write attempts. Static CI containment prevents any
+  production module, route, worker, binary, Docker image, or managed release from referencing the
+  simulator. No provider account, credential, callback, database schema, UI, application,
+  employer/recruiter message, personal WhatsApp/iMessage session, production flag, deployment, or
+  external effect was added or enabled.
+- Added Phase 614B Bluey Jobs signed job-integrity authority and the FIX-725 through FIX-766
+  hardening set. Exact Phase 614 original-source and ATS authority now compose with independently
+  signed employer-identity and job-risk attestations under disjoint delegated roles, strict
+  Ed25519 verification, monotonic trust/revocation/head transitions, database-time freshness, and
+  paired SQLite/PostgreSQL migrations. Preparation, approval, reservation, running, local/cloud
+  runner claim, managed/unmanaged FinalSubmit, public projections, exports, and immutable receipts
+  recheck the current composed authority under canonical lock order. Production-positive tests now
+  traverse the real source → ATS → integrity lifecycle with exact local/cloud runner binding; the
+  integration-only support target is explicit, default-off, rejected by release builds, and
+  excluded from production Docker/release commands by a static CI guard. Added design-only Phase
+  620A and 620B–F plans for consent-bound WhatsApp/Apple business messaging, mailbox draft control,
+  scoped agents/MCP, C2C planning, and LinkedIn drafting/publishing. The plans are clean-room,
+  simulator-first, and keep every OAuth, ingestion, draft, send, submit, post, reconciliation,
+  source-verification, discovery, runner, and customer effect flag at `0`. No competitor private
+  session, proprietary code/UI, provider write, application, message, email, post, deployment,
+  production flag, or customer cohort was used or enabled.
+- Added Phase 614 Bluey Jobs original-source verification authority: an exact managed workflow
+  entrypoint and private worker API; paired SQLite/PostgreSQL fenced assignments, database-time
+  heartbeats, immutable observations/receipts/transitions, replay quarantine, and a monotonic
+  current head; anonymous bounded protocols for Greenhouse, Lever, Ashby, SmartRecruiters, and
+  Workday with duplicate-key pre-scan, fatal UTF-8, exact-octet/header evidence, strict JSON
+  media/encoding and recognized-field semantics, and conflict-aware alias handling; receipt-derived
+  posting projection; transactional queue/final-effect rechecks; and a
+  versioned managed-release v2 contract that preserves Phase 611 v1 rejection. PostgreSQL
+  application save/queue and final-effect paths now share canonical lock order, while verifier
+  lease, heartbeat, first
+  terminal publication, and changed-byte quarantine resolve immutable identity before taking
+  `H -> M -> D -> assignment`. Exact terminal replay remains read-only. The verifier scheduler uses
+  one bounded 32-candidate normal scan window, a separate eight-row hold-recheck budget, and
+  persisted cross-call hold backoff or typed supersession. Managed heartbeat expiry and grant
+  revocation retain their typed unavailable classification through SQLite/PostgreSQL assignment
+  rechecks; other registry failures remain storage/integrity errors. Mutable discovery fields or provider
+  presence cannot self-mint employer/scam/source authority. The product therefore remains
+  Review-first pending Phase 614B Signed Job Integrity Authority for independent employer/risk
+  clearance. The Jobs operational-readiness regression now covers original-source verification as
+  the eighth concrete capability and asserts its inherited global hold and absence of a native
+  blocker. The application state-machine regression also preserves its original
+  `awaiting_review`/`review_first` values when queueing lacks the required `approved_execution`
+  snapshot, without weakening transactional queue authority. Managed-cloud claim and final Submit
+  now make the combined `H -> exclusive M -> ATS -> fleet` prelock their first protected operation;
+  unmanaged paths retain `H -> shared M -> ATS`, and both acquire account `D` afterward. Certified
+  ATS fixtures use the honest `provider_verified_original_source` scope, while historical
+  source/category regressions assert Review-first preparation without minting queue authority.
+  Execution-lease/local-run intervention fixtures likewise retain real approved-execution
+  checksums and use test-only preapproved queue state for diagnostic reachability; their remaining
+  entitlement/match-threshold denials stay non-green and do not fabricate Phase 614B authority.
+  Reservation/running transitions remain `H -> M -> D` with source/discovery rechecks; their
+  independent ATS/integrity composition is explicitly parked for Phase 614B.
+  Direct/global discovery, source
+  verification in every current activation, and all production/provider-write flags remain false
+  or `0`; no live/authenticated provider action, application, message, deployment, customer cohort,
+  production flag read-back, or release claim is made.
+- Added the frozen Phase 613 Bluey Jobs role, skill, and typed-geography registry plus a paired
+  SQLite/PostgreSQL ten-table Career Track policy authority. Global taxonomy/canonicalizer
+  activations, policy-relevant account inputs, Track semantics, encrypted policy revisions and
+  review receipts, and compare-and-swap head transitions are generation-bound so taxonomy,
+  identity, resume, preference, or Track `A -> B -> A` drift cannot revive an old approval.
+  Queueing, Auto-submit, final execution, public-ATS category/continuation handling, and portal
+  readiness now require positive current authority. Stable client Track IDs, transaction-bound plan
+  limits, and retryable post-write curated enrollment prevent duplicate or falsely failed Track
+  creation. All production flags and external effects remain parked.
+- Added a read-only Bluey Jobs Career Command Center as the new portal home, composing current
+  server workspace truth into setup readiness, rolling 24-hour matches, human interventions,
+  discovery-source health, evidence-backed outcomes, Gmail/Outlook/calendar connection state,
+  explicit LinkedIn unavailability, plan usage, managed-runner availability, and prioritized
+  navigation-only next actions. The original responsive surface preserves five mobile tabs,
+  retains preview query state, distinguishes prepared/sent/submitted/ambiguous states, and adds no
+  provider command or server mutation. Setup readiness distinguishes authoritative, actionable,
+  reported-only, and optional state; resume/legacy Track references stay fail-closed, mailbox
+  correlation is excluded from required readiness, stale source health is shared with Matches,
+  and Today's focus respects active Tracks plus latest pass/restore feedback without claiming
+  eligibility. Added the Phase 612B GiraffyReach second-pass record,
+  including one explicitly synthetic resume parse and preparation test that stopped at a `Saved`
+  tracker item without OAuth, missing-skill injection, external communication, applied status, or
+  employer submission. Round 613 canonical role/skill/location and Career Track enforcement
+  remains mandatory; no release flag, deployment, credential, or production authority changed.
+- Added the Phase 612 GiraffyReach clean-room product/source audit and Bluey Jobs implementation
+  authority. The audit separates public and normal authenticated observations from marketing
+  claims and unknowns; documents direct-employer, curated, recruiter-email, Dice, and LinkedIn
+  source cohorts; verifies current production versus Phase 611 source-gated capability; identifies
+  the unmerged role/skill/location authority defects as launch-blocking; and defines an independent
+  source control plane, evidence/canonicalization contracts, market/resume/C2C/agent product plan,
+  successor batches, measurements, and acceptance gates. No account setting, provider, source,
+  application code, release flag, deployment, or production state changed.
 - Added disabled-by-default Bluey Jobs managed-cloud launch authority for the browser-delivered,
   no-install Background runner. The authority requires one canonical signed release to bind the
   exact Jobs API, workflows, runner, and portal artifacts; schema, protocol, configuration,
@@ -207,6 +302,36 @@ under `docs/release/`.
 
 ### Fixed
 
+- Raised the combined Linux Jobs CI lane's closed timeout from 45 to 90 minutes after the exact
+  PR-head run passed every preceding gate but was cancelled with 89 of 108 integration tests green
+  and zero failures. The pre-install Jobs CI self-test now rejects any drift from the bounded
+  90-minute contract; test commands, release authority, feature flags, and production behavior are
+  unchanged. The replacement exact-tip hosted run completed every gate in 48 minutes 25 seconds,
+  including all 108 integration tests and both simulator-verifier steps.
+- Closed Phase 613 review defects FIX-694 through FIX-711: monotonic taxonomy/account/Track replay
+  and execution fences; fail-closed canonical classification; typed public-ATS evidence; portal
+  mutation/read-back ordering; retry-safe Track writes; PostgreSQL Auto-submit revocation,
+  Track-head, managed-migration, safe-integer CHECK, and resume-publication/deletion ordering;
+  complete owner export; durable review reasons; exact resume replay; transport-stable evidence;
+  semantic preservation of arbitrary Career Fact value keys; bounded public-ATS cursor-v2 ordered
+  prefix/overlap/total validation with exact post-filter dedupe/cross-list history; and referentially
+  complete public many-match previews.
+- Reconciled the final Phase 613 local evidence: PostgreSQL 17.10 plus pgvector 0.8.3 passed 13/13;
+  Rust passed 1,401 library and 1,517/1,517 all-target tests after clean fmt/check/Clippy; all five
+  Jobs workspaces passed typecheck and production build, while portal passed 349/349 across 28
+  files and built 2,299 modules with only the existing size advisory;
+  automation passed 680 with one existing conditional skip, including public ATS 39/39; aggregate
+  Jobs Vitest passed 1,847 with that skip across 144 passing files and one skipped file; schema
+  parity remained 81 tables/74 indexes; privacy passed across 2,622 tracked and 2,347 text paths;
+  provenance passed at
+  663 lock entries, 631 unique package versions, one audited override, and 14 pinned repositories;
+  and native-storage, Browser-release, managed-release, and account-deletion guards passed 14/14,
+  10/10, 16/16, and 3/3 respectively. Local preview QA passed, but read-only deployed preview QA
+  still exposed a stale recursive `/matches/matches` route and pre-fix unknown-company
+  presentation. Release status therefore remains conditional yellow pending
+  exact-tip CI, Docker/Linux image/native smoke, current deployed-bundle read-back, hosted
+  migration/network/canary/rollback/deployment evidence, and production flag read-back. Release
+  configuration remains `0`; no live flag read-back is claimed.
 - Corrected the Unix daemon IPC capability replacement test to model one boot-scoped atomic
   replacement instead of an artificial stream of 100 rewrites, and added deterministic proof that
   four consecutive zero-link opens exhaust the existing bounded retry policy and fail closed.
