@@ -1,4 +1,5 @@
 
+#[allow(clippy::result_large_err)]
 pub async fn complete(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -7,7 +8,15 @@ pub async fn complete(
     >,
     Json(req): Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, (StatusCode, Json<ApiError>)> {
-    match tokio::spawn(complete_inner(state, account, req, trace_id)).await {
+    match tokio::spawn(complete_inner(
+        state,
+        account,
+        req,
+        trace_id,
+        ManagedSystemAuthority::ExternalClientContract,
+    ))
+    .await
+    {
         Ok(result) => result.map(Json),
         Err(error) => {
             tracing::error!(error = %error, "detached managed completion task failed");
@@ -30,6 +39,7 @@ pub async fn complete(
 /// The worker owns the provider stream, billing, usage recording, and
 /// idempotency caching, so dropping the HTTP response body cannot cancel
 /// settlement. A terminal `billing` event carries the final `CompleteResponse`.
+#[allow(clippy::result_large_err)]
 pub async fn complete_stream(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
@@ -54,6 +64,7 @@ pub async fn complete_stream(
     }
 }
 
+#[allow(clippy::result_large_err)]
 async fn complete_stream_inner(
     state: AppState,
     account: Account,
@@ -75,8 +86,11 @@ async fn complete_stream_inner(
             }),
         ));
     }
-    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(&req)
-        .map_err(InternalDisclosureBlocked::into_api_error)?;
+    let trusted_envelope = TrustedInternalEnvelope::validate_direct_request(
+        &req,
+        ManagedSystemAuthority::ExternalClientContract,
+    )
+    .map_err(InternalDisclosureBlocked::into_api_error)?;
 
     validate_complete_images(&req.image_data_urls)
         .map_err(|error| image_validation_error(error.error, error.reason.unwrap_or_default()))?;
@@ -2135,11 +2149,19 @@ async fn complete_stream_inner(
     Ok(router_sse(detach_router_stream(Box::pin(event_stream))))
 }
 
+#[allow(clippy::result_large_err)]
 pub(crate) async fn complete_for_account(
     state: AppState,
     account: Account,
     req: CompleteRequest,
     trace_id: String,
 ) -> Result<CompleteResponse, (StatusCode, Json<ApiError>)> {
-    complete_inner(state, account, req, trace_id).await
+    complete_inner(
+        state,
+        account,
+        req,
+        trace_id,
+        ManagedSystemAuthority::TrustedServerSystem,
+    )
+    .await
 }

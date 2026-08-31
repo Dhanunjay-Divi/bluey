@@ -42,6 +42,12 @@ pub enum Error {
     #[error("trial ended; first $30 reload required")]
     TrialEnded,
 
+    /// The managed router rejected an internal-prompt disclosure attempt.
+    /// This variant carries no server-controlled text, so desktop surfaces can
+    /// react to the reason without exposing an arbitrary response body.
+    #[error("internal_disclosure_blocked")]
+    InternalDisclosureBlocked,
+
     /// Other server errors (5xx, malformed responses, etc.).
     /// Codex Stage 9d (S8.4 round-2 nit): body intentionally NOT
     /// surfaced to consumers — production error bodies can leak

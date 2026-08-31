@@ -572,6 +572,9 @@ impl CloudClient {
             other => {
                 let retry_after_secs = retry_after_header(&resp);
                 let body = resp.text().await.unwrap_or_default();
+                if other == StatusCode::BAD_REQUEST && is_internal_disclosure_blocked(&body) {
+                    return Err(Error::InternalDisclosureBlocked);
+                }
                 if other == StatusCode::SERVICE_UNAVAILABLE {
                     if let Some(error) = capacity_busy_error(&body, retry_after_secs) {
                         return Err(error);
@@ -711,6 +714,13 @@ fn capacity_busy_error(body: &str, header_retry_after_secs: Option<u64>) -> Opti
             reason
         },
     })
+}
+
+fn is_internal_disclosure_blocked(body: &str) -> bool {
+    serde_json::from_str::<ApiErrorBody>(body)
+        .ok()
+        .and_then(|body| body.reason)
+        .is_some_and(|reason| reason == "internal_disclosure_blocked")
 }
 
 fn is_capacity_busy_reason(reason: &str) -> bool {
@@ -1220,6 +1230,72 @@ mod tests {
             }
             other => panic!("expected InsufficientBalance, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn parse_or_err_maps_only_known_disclosure_reason_to_typed_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "request blocked",
+                "reason": "internal_disclosure_blocked"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/router/other"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "arbitrary server detail",
+                "reason": "unknown_reason"
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let typed: Result<serde_json::Value> = client
+            .auth_post("/router/complete", &serde_json::json!({}))
+            .await;
+        assert!(matches!(typed, Err(Error::InternalDisclosureBlocked)));
+
+        let bounded: Result<serde_json::Value> = client
+            .auth_post("/router/other", &serde_json::json!({}))
+            .await;
+        assert!(matches!(bounded, Err(Error::Server { status: 400 })));
+    }
+
+    #[tokio::test]
+    async fn stream_or_err_preserves_typed_disclosure_reason() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/router/complete/stream"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "request blocked",
+                "reason": "internal_disclosure_blocked"
+            })))
+            .mount(&server)
+            .await;
+        let client = client_for(server.uri());
+        client
+            .save_tokens(Tokens {
+                access: "a".into(),
+                refresh: "r".into(),
+                email: "e@example.com".into(),
+            })
+            .unwrap();
+
+        let result = client
+            .auth_post_stream("/router/complete/stream", &serde_json::json!({}))
+            .await;
+
+        assert!(matches!(result, Err(Error::InternalDisclosureBlocked)));
     }
 
     #[test]

@@ -860,6 +860,9 @@ fn map_err(e: CloudError) -> LlmError {
             retry_after_secs,
             reason,
         },
+        CloudError::InternalDisclosureBlocked => {
+            LlmError::Provider("internal_disclosure_blocked".to_string())
+        }
         CloudError::Server { status } => LlmError::Provider(format!("server error: {status}")),
         other => LlmError::Provider(other.to_string()),
     }
@@ -1247,6 +1250,16 @@ mod tests {
                 assert_eq!(reason, "provider_key_cooling_down");
             }
             other => panic!("expected CapacityBusy, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maps_disclosure_block_to_bounded_reason_without_server_body() {
+        let mapped = map_err(CloudError::InternalDisclosureBlocked);
+
+        match mapped {
+            LlmError::Provider(reason) => assert_eq!(reason, "internal_disclosure_blocked"),
+            other => panic!("expected Provider, got {other:?}"),
         }
     }
 }

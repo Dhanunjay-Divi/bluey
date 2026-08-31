@@ -227,7 +227,7 @@ private func normalizePrivateInstructionText(_ text: String) -> String {
     return output.trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
-private enum BlueyTheme {
+enum BlueyTheme {
     static let cyan = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 1.0)
     static let cyanSoft = NSColor(red: 0.35, green: 0.82, blue: 1.0, alpha: 0.14)
     static let panel = NSColor(red: 0.025, green: 0.029, blue: 0.036, alpha: 0.95)
@@ -255,24 +255,25 @@ private enum BlueyTheme {
     }
 }
 
-private enum BlueyLightTheme {
-    static let accent = NSColor(red: 0.000, green: 0.385, blue: 0.600, alpha: 1.0)
-    static let accentBorder = NSColor(red: 0.000, green: 0.465, blue: 0.700, alpha: 1.0)
-    static let accentSoft = NSColor(red: 0.690, green: 0.885, blue: 0.965, alpha: 1.0)
-    static let panel = NSColor(red: 0.565, green: 0.610, blue: 0.638, alpha: 1.0)
-    static let content = NSColor(red: 0.720, green: 0.748, blue: 0.765, alpha: 1.0)
-    static let contentHigh = NSColor(red: 0.790, green: 0.810, blue: 0.822, alpha: 1.0)
-    static let contentLow = NSColor(red: 0.632, green: 0.678, blue: 0.708, alpha: 1.0)
-    static let bar = NSColor(red: 0.405, green: 0.455, blue: 0.488, alpha: 1.0)
-    static let barChrome = NSColor(red: 0.625, green: 0.672, blue: 0.700, alpha: 1.0)
-    static let chrome = NSColor(red: 0.618, green: 0.662, blue: 0.688, alpha: 1.0)
-    static let chromeGuard = NSColor(red: 0.390, green: 0.448, blue: 0.486, alpha: 1.0)
-    static let surface = NSColor(red: 0.812, green: 0.832, blue: 0.842, alpha: 1.0)
-    static let surfaceRaised = NSColor(red: 0.875, green: 0.890, blue: 0.898, alpha: 1.0)
-    static let text = NSColor(red: 0.050, green: 0.064, blue: 0.078, alpha: 1.0)
-    static let textDim = NSColor(red: 0.205, green: 0.262, blue: 0.305, alpha: 1.0)
-    static let border = NSColor(red: 0.030, green: 0.055, blue: 0.075, alpha: 0.34)
-    static let shadow = NSColor.black.withAlphaComponent(0.28)
+enum BlueyLightTheme {
+    static let accent = NSColor(red: 0.000, green: 0.310, blue: 0.525, alpha: 1.0)
+    static let accentBorder = NSColor(red: 0.000, green: 0.390, blue: 0.635, alpha: 1.0)
+    static let accentSoft = NSColor(red: 0.720, green: 0.895, blue: 0.970, alpha: 1.0)
+    static let panel = NSColor(red: 0.890, green: 0.915, blue: 0.930, alpha: 1.0)
+    static let content = NSColor(red: 0.940, green: 0.952, blue: 0.960, alpha: 1.0)
+    static let contentHigh = NSColor(red: 0.978, green: 0.983, blue: 0.987, alpha: 1.0)
+    static let contentLow = NSColor(red: 0.858, green: 0.885, blue: 0.902, alpha: 1.0)
+    static let bar = NSColor(red: 0.820, green: 0.852, blue: 0.872, alpha: 1.0)
+    static let barChrome = NSColor(red: 0.930, green: 0.945, blue: 0.954, alpha: 1.0)
+    static let chrome = NSColor(red: 0.895, green: 0.920, blue: 0.935, alpha: 1.0)
+    static let chromeGuard = NSColor(red: 0.760, green: 0.805, blue: 0.832, alpha: 1.0)
+    static let surface = NSColor(red: 0.952, green: 0.962, blue: 0.969, alpha: 1.0)
+    static let surfaceRaised = NSColor(red: 0.990, green: 0.993, blue: 0.995, alpha: 1.0)
+    static let text = NSColor(red: 0.018, green: 0.030, blue: 0.044, alpha: 1.0)
+    static let textDim = NSColor(red: 0.125, green: 0.165, blue: 0.205, alpha: 1.0)
+    static let success = NSColor(red: 0.000, green: 0.350, blue: 0.145, alpha: 1.0)
+    static let border = NSColor(red: 0.020, green: 0.045, blue: 0.065, alpha: 0.30)
+    static let shadow = NSColor.black.withAlphaComponent(0.24)
 }
 
 private enum BalanceVisualTone: Equatable {
@@ -306,6 +307,14 @@ private func establishesSignedInChrome(
     to next: OverlayAccountUIState
 ) -> Bool {
     current != .signedIn && next == .signedIn
+}
+
+private func shouldPresentPostSignInShortcutCoachmark(
+    from current: OverlayAccountUIState,
+    to next: OverlayAccountUIState,
+    alreadyShown: Bool
+) -> Bool {
+    current == .signedOut && next == .signedIn && !alreadyShown
 }
 
 private func parsedBalanceCents(from label: String) -> Int? {
@@ -389,7 +398,7 @@ private func blueyLightMaterialAlpha(_ base: CGFloat, opacity: CGFloat, floor: C
 private enum OverlayPlacementStore {
     private static let pillFrameKey = "bluey.overlay.pill.frame.v2"
     private static let expandedFrameKey = "bluey.overlay.expanded.frame.v2"
-    private static let firstExpandedShortcutHelpKey = "bluey.overlay.firstExpandedShortcutHelpShown.v1"
+    private static let shortcutCoachmarkKey = "bluey.overlay.shortcutCoachmarkShown.v2"
 
     static func loadPillFrame(in visibleFrame: NSRect) -> NSRect? {
         loadFrame(key: pillFrameKey).map { clampedPillFrame($0, in: visibleFrame) }
@@ -403,13 +412,12 @@ private enum OverlayPlacementStore {
         UserDefaults.standard.removeObject(forKey: pillFrameKey)
     }
 
-    static func consumeFirstExpandedShortcutHelp() -> Bool {
-        let defaults = UserDefaults.standard
-        guard !defaults.bool(forKey: firstExpandedShortcutHelpKey) else {
-            return false
-        }
-        defaults.set(true, forKey: firstExpandedShortcutHelpKey)
-        return true
+    static var hasShownShortcutCoachmark: Bool {
+        UserDefaults.standard.bool(forKey: shortcutCoachmarkKey)
+    }
+
+    static func markShortcutCoachmarkShown() {
+        UserDefaults.standard.set(true, forKey: shortcutCoachmarkKey)
     }
 
     static func loadExpandedFrame(in visibleFrame: NSRect) -> NSRect? {
@@ -741,7 +749,7 @@ private enum ExpandedPanelMetrics {
 }
 
 private enum PillMetrics {
-    static let size = NSSize(width: 158, height: 32)
+    static let size = NSSize(width: 112, height: 30)
 
     static func centeredFrame(in visibleFrame: NSRect) -> NSRect {
         NSRect(
@@ -841,6 +849,13 @@ private enum BlueyBrandAsset {
   </g>
 </svg>
 """#
+
+    static let lightWordmarkSvg = wordmarkSvg
+        .replacingOccurrences(of: "#f8fdff", with: "#071b2a")
+        .replacingOccurrences(of: "#bdefff", with: "#005879")
+        .replacingOccurrences(of: "#63d8ff", with: "#00779f")
+        .replacingOccurrences(of: "#4f8dff", with: "#174f9a")
+        .replacingOccurrences(of: "flood-opacity=\".55\"", with: "flood-opacity=\".12\"")
 
     static func image(from svg: String) -> NSImage? {
         NSImage(data: Data(svg.utf8))
@@ -3004,18 +3019,25 @@ private enum PillRunState: Equatable {
         }
     }
 
-    var symbolName: String {
+    var actionGlyph: String {
         switch self {
-        case .ready:
-            return "play.fill"
+        case .ready, .paused, .failed:
+            return "▶"
         case .connecting:
-            return "bolt.horizontal.fill"
+            return "■"
         case .listening:
-            return "pause.fill"
-        case .paused:
-            return "play.fill"
-        case .failed:
-            return "exclamationmark"
+            return "Ⅱ"
+        }
+    }
+
+    var actionAccessibilityLabel: String {
+        switch self {
+        case .connecting:
+            return "Cancel connecting"
+        case .listening:
+            return "Pause listening"
+        case .ready, .paused, .failed:
+            return "Start listening"
         }
     }
 
@@ -3102,8 +3124,6 @@ private final class PillView: NSView {
     }
     var onClick: (() -> Void)?
     var onRunToggle: (() -> Void)?
-    var onAsk: (() -> Void)?
-    var onEnd: (() -> Void)?
     var onMoved: ((NSRect) -> Void)?
     private var runState: PillRunState = .ready
     private var healthState: PillHealthState = .unknown
@@ -3116,9 +3136,7 @@ private final class PillView: NSView {
     private let wordmarkView = BlueyWordmarkView()
     private let dotView = NSView()
     private let controlRail = NSView()
-    private let styleButton = NSButton(title: "", target: nil, action: nil)
     private let runButton = NSButton(title: "", target: nil, action: nil)
-    private let endButton = NSButton(title: "", target: nil, action: nil)
     private var backgroundOpacity: CGFloat = 0.94
 
     override init(frame frameRect: NSRect) {
@@ -3156,22 +3174,12 @@ private final class PillView: NSView {
         controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.085)).cgColor
         addSubview(controlRail)
 
-        configureMiniButton(styleButton, symbol: "text.cursor", fallback: "?", tint: BlueyTheme.cyan)
         configureRunButton()
-        configureMiniButton(endButton, symbol: "power", fallback: "×", tint: BlueyTheme.textDim)
 
-        styleButton.toolTip = "Ask a question"
         runButton.toolTip = "Start or pause listening"
-        endButton.toolTip = "Turn Bluey off"
-        styleButton.target = self
-        styleButton.action = #selector(styleClicked)
         runButton.target = self
         runButton.action = #selector(runClicked)
-        endButton.target = self
-        endButton.action = #selector(endClicked)
-        controlRail.addSubview(styleButton)
         controlRail.addSubview(runButton)
-        controlRail.addSubview(endButton)
         updateRunStateDisplay()
     }
     required init?(coder: NSCoder) { fatalError() }
@@ -3183,11 +3191,9 @@ private final class PillView: NSView {
         guard bounds.contains(point), !isHidden, alphaValue > 0.01 else { return nil }
         let railPoint = convert(point, to: controlRail)
         if controlRail.bounds.contains(railPoint) {
-            for button in [styleButton, runButton, endButton].reversed() {
-                let buttonPoint = controlRail.convert(railPoint, to: button)
-                if button.bounds.contains(buttonPoint), !button.isHidden, button.alphaValue > 0.01 {
-                    return button
-                }
+            let buttonPoint = controlRail.convert(railPoint, to: runButton)
+            if runButton.bounds.contains(buttonPoint), runButton.alphaValue > 0.01 {
+                return runButton
             }
         }
         return self
@@ -3197,26 +3203,24 @@ private final class PillView: NSView {
         super.layout()
         layer?.cornerRadius = bounds.height / 2
 
-        let logoSide: CGFloat = 25
-        logoMark.frame = NSRect(x: 5, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
+        let logoSide: CGFloat = 23
+        logoMark.frame = NSRect(x: 4, y: (bounds.height - logoSide) / 2, width: logoSide, height: logoSide)
 
-        let railWidth: CGFloat = 65
+        let railWidth: CGFloat = 22
         controlRail.frame = NSRect(
             x: bounds.width - railWidth - 5,
-            y: (bounds.height - 24) / 2,
+            y: (bounds.height - 22) / 2,
             width: railWidth,
-            height: 24)
-        controlRail.layer?.cornerRadius = 12
+            height: 22)
+        controlRail.layer?.cornerRadius = 11
 
-        let buttonSide: CGFloat = 20
-        styleButton.frame = NSRect(x: 3, y: 2, width: buttonSide, height: buttonSide)
-        runButton.frame = NSRect(x: 23.5, y: 2, width: buttonSide, height: buttonSide)
-        endButton.frame = NSRect(x: 42, y: 2, width: buttonSide, height: buttonSide)
+        runButton.frame = controlRail.bounds
+        runButton.layer?.cornerRadius = 11
 
-        wordmarkView.frame = NSRect(x: 36, y: (bounds.height - 18) / 2 + 1, width: 50, height: 18)
-        let dotSize: CGFloat = 7
-        let dotX = min(wordmarkView.frame.maxX + 2, controlRail.frame.minX - dotSize - 7)
-        dotView.frame = NSRect(x: dotX, y: bounds.midY + 4.5, width: dotSize, height: dotSize)
+        wordmarkView.frame = NSRect(x: 31, y: (bounds.height - 15) / 2 + 1, width: 39, height: 15)
+        let dotSize: CGFloat = 6
+        let dotX = min(wordmarkView.frame.maxX + 2, controlRail.frame.minX - dotSize - 4)
+        dotView.frame = NSRect(x: dotX, y: bounds.midY + 3.5, width: dotSize, height: dotSize)
         dotView.layer?.cornerRadius = dotSize / 2
     }
 
@@ -3266,6 +3270,9 @@ private final class PillView: NSView {
 
     private func updateRunStateDisplay() {
         configureRunButton()
+        runButton.setAccessibilityLabel(runState.actionAccessibilityLabel)
+        runButton.setAccessibilityHelp("\(runState.actionAccessibilityLabel) with Bluey")
+        runButton.setAccessibilityValue(runState.accessibilityLabel)
         runButton.layer?.backgroundColor = runState.symbolColor.withAlphaComponent(
             materialAlpha(runState == .listening ? 0.18 : 0.07)).cgColor
         runButton.layer?.borderColor = runState.symbolColor.withAlphaComponent(materialAlpha(0.25)).cgColor
@@ -3332,12 +3339,18 @@ private final class PillView: NSView {
     }
 
     private func configureRunButton() {
-        configureMiniButton(runButton, symbol: "", fallback: runState == .listening ? "Ⅱ" : "▶", tint: runState.symbolColor)
+        configureMiniButton(
+            runButton,
+            symbol: "",
+            fallback: runState.actionGlyph,
+            tint: runState.symbolColor)
         runButton.image = nil
         runButton.attributedTitle = NSAttributedString(
-            string: runState == .listening ? "Ⅱ" : "▶",
+            string: runState.actionGlyph,
             attributes: [
-                .font: NSFont.systemFont(ofSize: runState == .listening ? 11.5 : 10.0, weight: .heavy),
+                .font: NSFont.systemFont(
+                    ofSize: runState == .listening ? 11.5 : 10.0,
+                    weight: .heavy),
                 .foregroundColor: runState.symbolColor,
             ])
         runButton.alignment = .center
@@ -3355,17 +3368,11 @@ private final class PillView: NSView {
         backgroundOpacity = min(max(CGFloat(opacity), minimumOverlayBackgroundOpacity), 1.0)
         controlRail.layer?.backgroundColor = NSColor.white.withAlphaComponent(materialAlpha(0.040)).cgColor
         controlRail.layer?.borderColor = NSColor.white.withAlphaComponent(materialAlpha(0.085)).cgColor
-        configureMiniButton(styleButton, symbol: "text.cursor", fallback: "?", tint: BlueyTheme.cyan)
-        configureMiniButton(endButton, symbol: "power", fallback: "×", tint: BlueyTheme.textDim)
         updateRunStateDisplay()
         needsDisplay = true
     }
 
     @objc private func runClicked() { onRunToggle?() }
-
-    @objc private func styleClicked() { onAsk?() }
-
-    @objc private func endClicked() { onEnd?() }
 
     override func draw(_ dirtyRect: NSRect) {
         let outer = bounds.insetBy(dx: 0.85, dy: 0.85)
@@ -4695,9 +4702,9 @@ private final class FeedView: NSView {
         stack.layer?.backgroundColor = BlueyTheme.cyan.withAlphaComponent(0.13).cgColor
         stack.layer?.borderWidth = 1
         stack.layer?.borderColor = BlueyTheme.cyan.withAlphaComponent(0.38).cgColor
-        stack.toolTip = "Use this code on the Bluey account page to connect this device"
+        stack.toolTip = "Use this fallback code only if the browser did not carry it automatically"
 
-        let label = NSTextField(labelWithString: "Connect code")
+        let label = NSTextField(labelWithString: "Fallback code")
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
         label.textColor = dimTextColor
@@ -5923,6 +5930,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     let closeConfirmBody: NSTextField
     let closeConfirmCancelButton: NSButton
     let closeConfirmTurnOffButton: NSButton
+    let shortcutCoachmark: ShortcutCoachmarkView
 
     var onClose: (() -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
@@ -6122,6 +6130,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmBody = NSTextField(wrappingLabelWithString: "This closes Bluey completely. To start again, run: bluey on")
         closeConfirmCancelButton = NSButton(title: "Cancel", target: nil, action: nil)
         closeConfirmTurnOffButton = NSButton(title: "Turn Off", target: nil, action: nil)
+        shortcutCoachmark = ShortcutCoachmarkView(frame: .zero)
 
         super.init(frame: frameRect)
 
@@ -6263,6 +6272,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmBody,
             closeConfirmCancelButton,
             closeConfirmTurnOffButton,
+            shortcutCoachmark,
         ] {
             view.translatesAutoresizingMaskIntoConstraints = false
         }
@@ -6364,6 +6374,16 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmPanel.addSubview(closeConfirmBody)
         closeConfirmPanel.addSubview(closeConfirmCancelButton)
         closeConfirmPanel.addSubview(closeConfirmTurnOffButton)
+        shortcutCoachmark.translatesAutoresizingMaskIntoConstraints = true
+        shortcutCoachmark.isHidden = true
+        shortcutCoachmark.onShowShortcuts = { [weak self] in
+            self?.dismissShortcutCoachmark()
+            self?.showShortcutHelpOverlay(source: "coachmark")
+        }
+        shortcutCoachmark.onDismiss = { [weak self] in
+            self?.dismissShortcutCoachmark()
+        }
+        addSubview(shortcutCoachmark)
         keyboardFocusRing.translatesAutoresizingMaskIntoConstraints = true
         addSubview(keyboardFocusRing)
         // Keep the fixed chrome rows above transparent scroll/canvas surfaces
@@ -6451,8 +6471,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             drawerCloseButton.topAnchor.constraint(equalTo: sessionDrawer.topAnchor, constant: 10),
             drawerCloseButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -10),
-            drawerCloseButton.widthAnchor.constraint(equalToConstant: 30),
-            drawerCloseButton.heightAnchor.constraint(equalToConstant: 30),
+            drawerCloseButton.widthAnchor.constraint(equalToConstant: 34),
+            drawerCloseButton.heightAnchor.constraint(equalToConstant: 34),
 
             drawerSubtitleLabel.topAnchor.constraint(equalTo: drawerTitleLabel.bottomAnchor, constant: 4),
             drawerSubtitleLabel.leadingAnchor.constraint(equalTo: drawerTitleLabel.leadingAnchor),
@@ -6461,12 +6481,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             sessionSearchField.topAnchor.constraint(equalTo: drawerSubtitleLabel.bottomAnchor, constant: 10),
             sessionSearchField.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
             sessionSearchField.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            sessionSearchField.heightAnchor.constraint(equalToConstant: 30),
+            sessionSearchField.heightAnchor.constraint(equalToConstant: 34),
 
             latestSessionButton.topAnchor.constraint(equalTo: sessionSearchField.bottomAnchor, constant: 10),
             latestSessionButton.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 12),
             latestSessionButton.trailingAnchor.constraint(equalTo: sessionDrawer.trailingAnchor, constant: -12),
-            latestSessionButton.heightAnchor.constraint(equalToConstant: 32),
+            latestSessionButton.heightAnchor.constraint(equalToConstant: 36),
 
             sessionScroll.topAnchor.constraint(equalTo: latestSessionButton.bottomAnchor, constant: 10),
             sessionScroll.leadingAnchor.constraint(equalTo: sessionDrawer.leadingAnchor, constant: 8),
@@ -6624,8 +6644,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeConfirmCancelButton.topAnchor.constraint(equalTo: closeConfirmBody.bottomAnchor, constant: 18),
             closeConfirmCancelLeading,
             closeConfirmCancelButton.bottomAnchor.constraint(equalTo: closeConfirmPanel.bottomAnchor, constant: -18),
-            closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 150),
-            closeConfirmCancelButton.heightAnchor.constraint(equalToConstant: 34),
+            closeConfirmCancelButton.widthAnchor.constraint(equalToConstant: 160),
+            closeConfirmCancelButton.heightAnchor.constraint(equalToConstant: 40),
 
             closeConfirmTurnOffButton.topAnchor.constraint(equalTo: closeConfirmCancelButton.topAnchor),
             closeConfirmTurnOffButton.leadingAnchor.constraint(equalTo: closeConfirmCancelButton.trailingAnchor, constant: 12),
@@ -6868,6 +6888,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         lightThemeEnabled ? BlueyLightTheme.accentSoft : BlueyTheme.cyan
     }
 
+    private var themedSuccessColor: NSColor {
+        lightThemeEnabled ? BlueyLightTheme.success : BlueyTheme.green
+    }
+
     private func refreshBackgroundChrome() {
         layer?.backgroundColor = NSColor.clear.cgColor
         layer?.borderColor = (lightThemeEnabled
@@ -6880,6 +6904,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             : BlueyTheme.cyan.withAlphaComponent(0.18)).cgColor
         headerBar.layer?.shadowOpacity = lightThemeEnabled ? 0.12 : 0.18
         headerChrome.layer?.backgroundColor = themedHeaderChromeColor.cgColor
+        headerWordmark.image = BlueyBrandAsset.image(from: lightThemeEnabled
+            ? BlueyBrandAsset.lightWordmarkSvg
+            : BlueyBrandAsset.wordmarkSvg)
         modelMenu.layer?.backgroundColor = themedSurfaceColor.cgColor
         modelMenu.layer?.borderColor = (lightThemeEnabled
             ? BlueyLightTheme.border
@@ -6890,6 +6917,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateThemeButtonChrome()
         updateShortcutsButtonChrome()
         statusLabel.textColor = themedDimTextColor
+        if routeBadge.stringValue.localizedCaseInsensitiveContains("ready") {
+            routeBadge.textColor = themedSuccessColor
+        }
         updateBalanceLabelTone()
         transcriptStateLabel.textColor = transcriptStateLabel.stringValue == "LIVE" ? BlueyTheme.green : themedDimTextColor
         transcriptLabel.textColor = themedTextColor
@@ -6922,22 +6952,33 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ? BlueyLightTheme.border
             : BlueyTheme.hairline).cgColor
         transcriptLabel.attributedStringValue = attributedTranscriptStripText(transcriptLabel.stringValue)
-        sessionDrawer.layer?.backgroundColor = NSColor(
-            red: lightThemeEnabled ? 0.750 : 0.035,
-            green: lightThemeEnabled ? 0.790 : 0.040,
-            blue: lightThemeEnabled ? 0.812 : 0.050,
-            alpha: lightThemeEnabled ? lightMaterialAlpha(0.88, floor: 0.18) : materialAlpha(0.98)
-        ).cgColor
+        sessionDrawer.layer?.backgroundColor = (lightThemeEnabled
+            ? BlueyLightTheme.contentHigh.withAlphaComponent(
+                lightMaterialAlpha(0.995, floor: 0.34))
+            : NSColor(red: 0.035, green: 0.040, blue: 0.050, alpha: materialAlpha(0.98)))
+            .cgColor
         sessionDrawer.layer?.borderColor = (lightThemeEnabled
-            ? BlueyLightTheme.border
+            ? BlueyLightTheme.accentBorder.withAlphaComponent(0.46)
             : BlueyTheme.hairline).cgColor
+        sessionDrawer.layer?.shadowColor = NSColor.black.cgColor
+        sessionDrawer.layer?.shadowOpacity = lightThemeEnabled ? 0.18 : 0.26
+        sessionDrawer.layer?.shadowRadius = lightThemeEnabled ? 24 : 18
         drawerTitleLabel.textColor = themedTextColor
         drawerSubtitleLabel.textColor = themedDimTextColor
+        sessionScroll.scrollerKnobStyle = lightThemeEnabled ? .dark : .light
         refreshSessionSearchChrome()
-        answerStylePanel.layer?.backgroundColor = BlueyTheme.panelDeep
-            .withAlphaComponent(materialAlpha(0.97))
+        answerStyleOverlay.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(lightThemeEnabled ? 0.24 : 0.44)
             .cgColor
-        answerStyleLabel.textColor = lightThemeEnabled ? BlueyLightTheme.text : NSColor.white.withAlphaComponent(0.96)
+        answerStylePanel.layer?.backgroundColor = (lightThemeEnabled
+            ? BlueyLightTheme.contentHigh.withAlphaComponent(
+                lightMaterialAlpha(0.995, floor: 0.34))
+            : BlueyTheme.panelDeep.withAlphaComponent(materialAlpha(0.97)))
+            .cgColor
+        answerStylePanel.layer?.borderColor = themedAccentBorderColor
+            .withAlphaComponent(lightThemeEnabled ? 0.58 : 0.30)
+            .cgColor
+        answerStyleLabel.textColor = themedTextColor
         refreshAnswerStyleInputChrome()
         composerBar.layer?.backgroundColor = themedComposerColor.cgColor
         composerBar.layer?.borderColor = (lightThemeEnabled
@@ -6957,9 +6998,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             focusedBackground: composerSurfaceFocusFill)
         opacityControl.layer?.backgroundColor = NSColor.clear.cgColor
         opacityControl.layer?.borderColor = NSColor.clear.cgColor
-        closeConfirmPanel.layer?.backgroundColor = BlueyTheme.panelDeep
-            .withAlphaComponent(materialAlpha(0.97))
-            .cgColor
+        refreshConfirmationChrome()
+        shortcutCoachmark.applyTheme(light: lightThemeEnabled)
         refreshKeyboardFocusRingStyle()
         feed.setLightTheme(lightThemeEnabled, opacity: backgroundOpacity)
         canvasPane.applyBackgroundOpacity(backgroundOpacity)
@@ -6992,9 +7032,26 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             ])
     }
 
+    private func refreshConfirmationChrome() {
+        closeConfirmOverlay.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(lightThemeEnabled ? 0.26 : 0.52)
+            .cgColor
+        closeConfirmPanel.layer?.backgroundColor = (lightThemeEnabled
+            ? BlueyLightTheme.contentHigh.withAlphaComponent(0.995)
+            : BlueyTheme.panelDeep.withAlphaComponent(0.99))
+            .cgColor
+        closeConfirmPanel.layer?.borderColor = themedAccentBorderColor
+            .withAlphaComponent(lightThemeEnabled ? 0.64 : 0.30)
+            .cgColor
+        closeConfirmPanel.layer?.shadowOpacity = lightThemeEnabled ? 0.24 : 0.34
+        closeConfirmPanel.layer?.shadowRadius = lightThemeEnabled ? 26 : 22
+        closeConfirmTitle.textColor = themedTextColor
+        closeConfirmBody.textColor = themedDimTextColor
+    }
+
     override func draw(_ dirtyRect: NSRect) {
         let outer = bounds.insetBy(dx: 0.75, dy: 0.75)
-        let radius = windowFullSize ? 0 : ExpandedPanelMetrics.cornerRadius
+        let radius = ExpandedPanelMetrics.cornerRadius
         if lightThemeEnabled {
             drawBlueyLightPanel(in: outer, radius: radius, opacity: backgroundOpacity)
         } else {
@@ -7583,7 +7640,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             closeButton,
         ])
 
-        var controls: [NSView] = headerControls
+        var controls: [NSView] = []
+
+        if !shortcutCoachmark.isHidden {
+            controls.append(contentsOf: controlsInView(shortcutCoachmark))
+        }
+
+        controls.append(contentsOf: headerControls)
 
         if !sessionDrawer.isHidden {
             controls.append(contentsOf: controlsInView(sessionDrawer))
@@ -8571,6 +8634,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
                 || view is NSSlider
                 || view is OpacityScrubberView
                 || view is CanvasDividerView
+                || view is ShortcutCoachmarkView
             {
                 return true
             }
@@ -8867,8 +8931,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let composerHeight = composerBarHeightConstraint?.constant ?? ChromeMetrics.composerBaseHeight
         let attachmentHeight = attachmentStripHeightConstraint?.constant ?? 0
         let transcriptHeight: CGFloat = ChromeMetrics.transcriptStripHeight
-        let horizontalInset: CGFloat = windowFullSize ? 0 : 8
-        let bottomInset: CGFloat = windowFullSize ? 0 : 8
+        let horizontalInset: CGFloat = 8
+        let bottomInset: CGFloat = 8
         let chromeGap: CGFloat = 5
         let workspaceGap: CGFloat = 6
 
@@ -8912,6 +8976,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
         raiseFixedChromeToFront()
         layoutHeaderChromeControls()
+        layoutShortcutCoachmark()
         headerBar.isHidden = false
         headerChrome.isHidden = false
         headerBar.alphaValue = 1
@@ -8951,6 +9016,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         updateSessionDrawerGeometry(layoutWidth: layoutWidth, layoutHeight: layoutHeight)
         answerStyleOverlay.layer?.zPosition = 4_200
         closeConfirmOverlay.layer?.zPosition = 4_300
+        shortcutCoachmark.layer?.zPosition = 4_500
         keyboardFocusRing.layer?.zPosition = 4_900
         toastView.layer?.zPosition = 4_100
         transcriptStrip.layer?.zPosition = 3_000
@@ -8991,12 +9057,38 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             let topSibling = subviews.last { $0 !== headerBar }
             addSubview(headerBar, positioned: .above, relativeTo: topSibling)
         }
-        for overlay in [sessionDrawer, answerStyleOverlay, closeConfirmOverlay, toastView] {
+        for overlay in [sessionDrawer, answerStyleOverlay, closeConfirmOverlay, toastView, shortcutCoachmark] {
             if overlay.superview === self, !overlay.isHidden {
                 let topSibling = subviews.last { $0 !== overlay }
                 addSubview(overlay, positioned: .above, relativeTo: topSibling)
             }
         }
+        if keyboardFocusRing.superview === self, !keyboardFocusRing.isHidden {
+            let topSibling = subviews.last { $0 !== keyboardFocusRing }
+            addSubview(keyboardFocusRing, positioned: .above, relativeTo: topSibling)
+        }
+    }
+
+    private func layoutShortcutCoachmark() {
+        guard !shortcutCoachmark.isHidden else { return }
+        let target = shortcutsButton.convert(shortcutsButton.bounds, to: self)
+        guard target.width > 0, target.height > 0 else { return }
+        let width = min(350, max(310, bounds.width - 36))
+        let height: CGFloat = 148
+        let horizontalInset: CGFloat = 18
+        let preferredX = target.midX - width + 64
+        let originX = min(
+            max(horizontalInset, preferredX),
+            max(horizontalInset, bounds.width - width - horizontalInset))
+        let top = headerBar.frame.minY - 4
+        shortcutCoachmark.frame = NSRect(
+            x: originX,
+            y: max(18, top - height),
+            width: width,
+            height: height)
+        shortcutCoachmark.arrowCenterX = target.midX - originX
+        shortcutCoachmark.needsLayout = true
+        shortcutCoachmark.layoutSubtreeIfNeeded()
     }
 
     private func layoutHeaderChromeControls() {
@@ -9279,6 +9371,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionDrawer.layer?.shadowRadius = 18
         sessionDrawer.layer?.shadowOffset = NSSize(width: 0, height: -8)
         sessionDrawer.layer?.zPosition = 1_500
+        sessionDrawer.setAccessibilityElement(true)
+        sessionDrawer.setAccessibilityRole(.group)
+        sessionDrawer.setAccessibilityLabel("Recording history")
 
         answerStyleOverlay.isHidden = true
         answerStyleOverlay.wantsLayer = true
@@ -9295,14 +9390,14 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         answerStylePanel.layer?.shadowRadius = 20
         answerStylePanel.layer?.shadowOffset = .zero
 
-        drawerTitleLabel.font = NSFont.systemFont(ofSize: 14, weight: .bold)
+        drawerTitleLabel.font = NSFont.systemFont(ofSize: 15, weight: .bold)
         drawerTitleLabel.textColor = BlueyTheme.text
-        drawerSubtitleLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .medium)
+        drawerSubtitleLabel.font = NSFont.systemFont(ofSize: 11, weight: .medium)
         drawerSubtitleLabel.textColor = BlueyTheme.textDim
         drawerSubtitleLabel.lineBreakMode = .byWordWrapping
         drawerSubtitleLabel.maximumNumberOfLines = 2
         sessionSearchField.placeholderString = "Search title or session ID"
-        sessionSearchField.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
+        sessionSearchField.font = NSFont.systemFont(ofSize: 12, weight: .medium)
         sessionSearchField.isBezeled = false
         sessionSearchField.drawsBackground = true
         sessionSearchField.focusRingType = .none
@@ -9311,6 +9406,11 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         sessionSearchField.layer?.cornerRadius = 10
         sessionSearchField.layer?.borderWidth = 1
         sessionSearchField.layer?.masksToBounds = true
+        sessionSearchField.setAccessibilityLabel("Search recording history")
+        sessionSearchField.setAccessibilityHelp(
+            "Search by recording title, date, or session identifier.")
+        drawerCloseButton.setAccessibilityLabel("Close recording history")
+        latestSessionButton.setAccessibilityLabel("Continue latest recording")
         refreshSessionSearchChrome()
 
         sessionStack.orientation = .vertical
@@ -9463,11 +9563,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmBody.isEditable = false
         closeConfirmBody.isSelectable = false
         closeConfirmBody.allowsEditingTextAttributes = false
+        closeConfirmPanel.setAccessibilityElement(true)
+        closeConfirmPanel.setAccessibilityRole(.group)
+        closeConfirmPanel.setAccessibilityLabel("Bluey confirmation")
+        closeConfirmCancelButton.setAccessibilityLabel("Cancel")
+        closeConfirmTurnOffButton.setAccessibilityLabel("Turn Bluey off")
 
         styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
         styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
         closeConfirmCancelButton.toolTip = "Keep Bluey running"
         closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
+        refreshConfirmationChrome()
     }
 
     private func configureTooltips() {
@@ -9485,7 +9591,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         shortcutsButton.toolTip = "Show controls and shortcuts"
         moveHandleButton.toolTip = "Drag to move Bluey while click-through is on"
         balanceLabel.toolTip = "Remaining Bluey credits"
-        fullSizeButton.toolTip = windowFullSize ? "Restore compact Bluey" : "Fill this screen"
+        fullSizeButton.toolTip = windowFullSize
+            ? "Restore compact Bluey"
+            : "Open a focused Bluey workspace"
         interactionModeButton.toolTip = passThroughMode
             ? "Click-through on: controls click normally, the blue move handle drags Bluey, and blank space clicks the app behind it."
             : "Interactive on: blank Bluey space moves/resizes the panel, and the whole panel receives clicks."
@@ -9686,12 +9794,25 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     @objc private func themeClicked() {
         lightThemeEnabled.toggle()
         UserDefaults.standard.set(lightThemeEnabled, forKey: overlayLightThemeDefaultsKey)
+        emitLifecycle(
+            "theme_changed",
+            status: lightThemeEnabled ? "light" : "dark",
+            detail: "source=header")
         refreshBackgroundChrome()
+        if !closeConfirmOverlay.isHidden,
+           closeConfirmTitle.stringValue == "Controls and shortcuts" {
+            configureCloseConfirmForShortcutList()
+        }
+        if !sessionDrawer.isHidden {
+            renderSessionRows(log: false)
+        }
         configureTooltips()
         needsDisplay = true
     }
 
     @objc private func shortcutsClicked() {
+        OverlayPlacementStore.markShortcutCoachmarkShown()
+        dismissShortcutCoachmark()
         pendingDeleteSessionId = nil
         configureCloseConfirmForShortcutList()
         presentConfirmationOverlay()
@@ -9699,10 +9820,55 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showShortcutHelpOverlay(source: String) {
+        OverlayPlacementStore.markShortcutCoachmarkShown()
+        dismissShortcutCoachmark()
         pendingDeleteSessionId = nil
         configureCloseConfirmForShortcutList()
         presentConfirmationOverlay()
         emitLifecycle("shortcuts_overlay_opened", detail: "source=\(source) platform=macos")
+    }
+
+    @discardableResult
+    func showShortcutCoachmark(source: String) -> Bool {
+        guard accountUIState == .signedIn,
+              shortcutCoachmark.isHidden,
+              closeConfirmOverlay.isHidden,
+              answerStyleOverlay.isHidden,
+              sessionDrawer.isHidden,
+              !(window?.firstResponder is NSTextView)
+        else { return false }
+        shortcutCoachmark.applyTheme(light: lightThemeEnabled)
+        shortcutCoachmark.isHidden = false
+        shortcutCoachmark.alphaValue = 0
+        layoutShortcutCoachmark()
+        raiseFixedChromeToFront()
+        clearKeyboardControlFocus()
+        setKeyboardFocusedControl(shortcutCoachmark.showButton)
+        window?.makeFirstResponder(shortcutCoachmark.showButton)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.16
+            self.shortcutCoachmark.animator().alphaValue = 1
+        }
+        emitLifecycle(
+            "shortcuts_coachmark_shown",
+            detail: "source=\(source) platform=macos")
+        return true
+    }
+
+    private func dismissShortcutCoachmark() {
+        guard !shortcutCoachmark.isHidden else { return }
+        if keyboardFocusedControl === shortcutCoachmark.showButton
+            || keyboardFocusedControl === shortcutCoachmark.dismissButton {
+            clearKeyboardControlFocus()
+        }
+        shortcutCoachmark.isHidden = true
+        shortcutCoachmark.alphaValue = 1
+        if window?.firstResponder === shortcutCoachmark.showButton
+            || window?.firstResponder === shortcutCoachmark.dismissButton
+            || window?.firstResponder === shortcutCoachmark {
+            window?.makeFirstResponder(nil)
+        }
+        emitLifecycle("shortcuts_coachmark_dismissed", detail: "platform=macos")
     }
 
     @objc private func closeClicked() {
@@ -9725,6 +9891,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         configureCloseConfirmBodyStandard()
         closeConfirmTitle.stringValue = "Turn Bluey off?"
         closeConfirmBody.stringValue = "This closes Bluey completely. To start again, run: bluey on"
+        closeConfirmPanel.setAccessibilityLabel("Turn Bluey off")
+        closeConfirmBody.setAccessibilityLabel(
+            "This closes Bluey completely. To start again, run bluey on.")
         closeConfirmCancelButton.title = "Cancel"
         closeConfirmCancelButton.target = self
         closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
@@ -9734,6 +9903,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmTurnOffButton.target = self
         closeConfirmTurnOffButton.action = #selector(confirmTurnOffClicked)
         closeConfirmTurnOffButton.toolTip = "Turn Bluey off. Run bluey on to start again."
+        closeConfirmCancelButton.setAccessibilityLabel("Cancel")
+        closeConfirmTurnOffButton.setAccessibilityLabel("Turn Bluey off")
         styleControlButton(closeConfirmTurnOffButton, symbol: "power", accent: true)
         presentConfirmationOverlay()
     }
@@ -9744,19 +9915,36 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let titleColor = lightThemeEnabled ? BlueyLightTheme.text : BlueyTheme.text
         let actionColor = lightThemeEnabled ? BlueyLightTheme.text : NSColor.white.withAlphaComponent(0.94)
         let mutedColor = lightThemeEnabled ? BlueyLightTheme.textDim : BlueyTheme.textDim
-        let titleFont = NSFont.systemFont(ofSize: 12.8, weight: .bold)
-        let noteFont = NSFont.systemFont(ofSize: 11.6, weight: .medium)
-        let keyFont = NSFont.monospacedSystemFont(ofSize: 11.6, weight: .semibold)
-        let actionFont = NSFont.systemFont(ofSize: 11.6, weight: .semibold)
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.alignment = .left
-        paragraph.lineSpacing = 2.5
+        let titleFont = NSFont.systemFont(ofSize: 13.2, weight: .bold)
+        let noteFont = NSFont.systemFont(ofSize: 11.4, weight: .medium)
+        let keyFont = NSFont.monospacedSystemFont(ofSize: 11.4, weight: .semibold)
+        let actionFont = NSFont.systemFont(ofSize: 11.4, weight: .semibold)
+        let bodyParagraph = NSMutableParagraphStyle()
+        bodyParagraph.alignment = .left
+        bodyParagraph.lineSpacing = 1
+        bodyParagraph.lineBreakMode = .byWordWrapping
+        let shortcutParagraph = NSMutableParagraphStyle()
+        shortcutParagraph.setParagraphStyle(bodyParagraph)
+        shortcutParagraph.tabStops = [
+            NSTextTab(textAlignment: .left, location: 132, options: [:]),
+        ]
+        let pairParagraph = NSMutableParagraphStyle()
+        pairParagraph.setParagraphStyle(bodyParagraph)
+        pairParagraph.tabStops = [
+            NSTextTab(textAlignment: .left, location: 70, options: [:]),
+            NSTextTab(textAlignment: .left, location: 194, options: [:]),
+            NSTextTab(textAlignment: .left, location: 272, options: [:]),
+        ]
 
-        func attributes(font: NSFont, color: NSColor) -> [NSAttributedString.Key: Any] {
+        func attributes(
+            font: NSFont,
+            color: NSColor,
+            paragraph: NSParagraphStyle? = nil
+        ) -> [NSAttributedString.Key: Any] {
             [
                 .font: font,
                 .foregroundColor: color,
-                .paragraphStyle: paragraph,
+                .paragraphStyle: paragraph ?? bodyParagraph,
             ]
         }
 
@@ -9767,31 +9955,45 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         }
 
         func appendShortcut(_ shortcut: String, _ action: String) {
-            let paddedShortcut = shortcut.padding(toLength: 17, withPad: " ", startingAt: 0)
             result.append(NSAttributedString(
-                string: paddedShortcut,
-                attributes: attributes(font: keyFont, color: keyColor)))
+                string: shortcut,
+                attributes: attributes(
+                    font: keyFont,
+                    color: keyColor,
+                    paragraph: shortcutParagraph)))
             result.append(NSAttributedString(
-                string: action + "\n",
-                attributes: attributes(font: actionFont, color: actionColor)))
+                string: "\t" + action + "\n",
+                attributes: attributes(
+                    font: actionFont,
+                    color: actionColor,
+                    paragraph: shortcutParagraph)))
         }
 
         func appendPair(_ leftKey: String, _ leftAction: String, _ rightKey: String, _ rightAction: String) {
-            let first = leftKey.padding(toLength: 7, withPad: " ", startingAt: 0)
-            let middle = leftAction.padding(toLength: 19, withPad: " ", startingAt: 0)
-            let second = rightKey.padding(toLength: 7, withPad: " ", startingAt: 0)
             result.append(NSAttributedString(
-                string: first,
-                attributes: attributes(font: keyFont, color: keyColor)))
+                string: leftKey,
+                attributes: attributes(
+                    font: keyFont,
+                    color: keyColor,
+                    paragraph: pairParagraph)))
             result.append(NSAttributedString(
-                string: middle,
-                attributes: attributes(font: actionFont, color: actionColor)))
+                string: "\t" + leftAction,
+                attributes: attributes(
+                    font: actionFont,
+                    color: actionColor,
+                    paragraph: pairParagraph)))
             result.append(NSAttributedString(
-                string: second,
-                attributes: attributes(font: keyFont, color: keyColor)))
+                string: "\t" + rightKey,
+                attributes: attributes(
+                    font: keyFont,
+                    color: keyColor,
+                    paragraph: pairParagraph)))
             result.append(NSAttributedString(
-                string: rightAction + "\n",
-                attributes: attributes(font: actionFont, color: actionColor)))
+                string: "\t" + rightAction + "\n",
+                attributes: attributes(
+                    font: actionFont,
+                    color: actionColor,
+                    paragraph: pairParagraph)))
         }
 
         let globalShortcuts = [
@@ -9813,9 +10015,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         appendLine(passThroughMode
             ? "Blank Bluey space clicks behind it. Wheel/trackpad scrolls Bluey panes."
             : "Blank Bluey space drags the window. Tab selects Bluey controls; Enter opens the selected control.")
-        appendLine()
         appendLine("Inside Bluey when click-through is off:", font: noteFont, color: titleColor)
-        appendLine()
         appendPair("Enter", "Answer", "Esc", "Close panel")
         appendPair("Tab", "Next control", "Shift+Tab", "Previous control")
         appendPair("Opt+Down", "Scroll down", "Opt+Up", "Scroll up")
@@ -9823,10 +10023,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         appendLine("Mouse wheel scrolls the answer, canvas, or history under the pointer.")
         appendLine("With click-through on, blank clicks pass through; Bluey feed, canvas, and history still scroll.")
         appendLine("Opacity selected: arrow keys adjust it.")
-        appendLine()
         appendLine("Global shortcuts work in both modes:")
         globalShortcuts.forEach { appendShortcut($0.0, $0.1) }
-        appendLine()
         appendLine("Ask focused: type normally. Enter answers. Shift+Enter adds a new line.")
         return result
     }
@@ -9841,31 +10039,38 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         closeConfirmBody.maximumNumberOfLines = 3
         closeConfirmTurnOffButton.isHidden = false
         closeConfirmTurnOffButton.isEnabled = true
+        refreshConfirmationChrome()
     }
 
     private func configureCloseConfirmForShortcutList() {
         clearKeyboardControlFocus()
         closeConfirmTitle.stringValue = "Controls and shortcuts"
-        closeConfirmPanelWidthConstraint?.constant = 470
+        closeConfirmPanelWidthConstraint?.constant = min(680, max(470, bounds.width - 48))
         closeConfirmCancelLeadingConstraint?.isActive = false
         closeConfirmCancelCenterXConstraint?.isActive = true
         closeConfirmBody.attributedStringValue = macShortcutHelpText
         closeConfirmBody.isEditable = false
         closeConfirmBody.isSelectable = false
         closeConfirmBody.alignment = .left
-        closeConfirmBody.maximumNumberOfLines = 20
+        closeConfirmBody.maximumNumberOfLines = 0
+        closeConfirmBody.lineBreakMode = .byWordWrapping
+        closeConfirmPanel.setAccessibilityLabel("Controls and shortcuts")
+        closeConfirmBody.setAccessibilityLabel(macShortcutHelpText.string)
 
         closeConfirmCancelButton.title = "Done"
         closeConfirmCancelButton.target = self
         closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
         closeConfirmCancelButton.toolTip = "Close controls and shortcuts"
+        closeConfirmCancelButton.setAccessibilityLabel("Close controls and shortcuts")
         styleControlButton(closeConfirmCancelButton, symbol: "checkmark", accent: true)
 
         closeConfirmTurnOffButton.isHidden = true
         closeConfirmTurnOffButton.isEnabled = false
+        refreshConfirmationChrome()
     }
 
     private func presentConfirmationOverlay() {
+        dismissShortcutCoachmark()
         dismissAnswerStyleEditor(animated: false)
         closeConfirmOverlay.isHidden = false
         closeConfirmOverlay.alphaValue = 0
@@ -10056,6 +10261,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
     @discardableResult
     private func dismissActiveOverlay() -> Bool {
+        if !shortcutCoachmark.isHidden {
+            dismissShortcutCoachmark()
+            return true
+        }
         if !closeConfirmOverlay.isHidden {
             dismissCloseConfirm(animated: true)
             return true
@@ -10994,6 +11203,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
     }
 
     func showSignedOutLogin(url: URL?) {
+        dismissShortcutCoachmark()
         accountUIState = .signedOut
         signedOutGateActive = true
         setHeaderSubtitle("Local ready")
@@ -11800,9 +12010,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             view.removeFromSuperview()
         }
         let label = NSTextField(wrappingLabelWithString: message)
-        label.font = NSFont.systemFont(ofSize: 11.5, weight: .medium)
-        label.textColor = BlueyTheme.textDim
+        label.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+        label.textColor = themedDimTextColor
         label.alignment = .center
+        label.setAccessibilityLabel(message)
         label.translatesAutoresizingMaskIntoConstraints = false
         sessionStack.addArrangedSubview(label)
         label.widthAnchor.constraint(equalTo: sessionStack.widthAnchor, constant: -20).isActive = true
@@ -11815,12 +12026,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let bottomClearance = (composerBarHeightConstraint?.constant ?? ChromeMetrics.composerBaseHeight)
             + ChromeMetrics.transcriptStripHeight
             + 44
-        let availableWidth = max(260, layoutWidth - sideInset * 2)
+        let availableWidth = max(300, layoutWidth - sideInset * 2)
         let availableHeight = max(190, layoutHeight - headerClearance - bottomClearance)
         let renderedRows = sessionItems.isEmpty ? 1 : max(filteredSessionItems().count, 1)
         let visibleRows = CGFloat(min(renderedRows, 6))
         let desiredHeight = 142 + visibleRows * 58
-        let drawerWidth = min(380, max(310, min(availableWidth, layoutWidth * 0.36)))
+        let drawerWidth = min(availableWidth, min(420, max(350, layoutWidth * 0.42)))
         let drawerHeight = min(availableHeight, max(220, desiredHeight))
 
         sessionDrawerTopConstraint?.constant = headerClearance
@@ -13215,7 +13426,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         styleHeaderIconButton(fullSizeButton, symbol: symbol, fallback: fallback)
         fullSizeButton.toolTip = windowFullSize
             ? "Restore compact Bluey"
-            : "Fill this screen"
+            : "Open a focused Bluey workspace"
     }
 
     private func updateThemeButtonChrome() {
@@ -13279,15 +13490,12 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let visibleScreen = window.screen?.visibleFrame
             ?? NSScreen.main?.visibleFrame
             ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let fullScreen = window.screen?.frame
-            ?? NSScreen.main?.frame
-            ?? visibleScreen
-        let maxWidth = fullScreen.width
-        let maxHeight = fullScreen.height
+        let maxWidth = ExpandedPanelMetrics.fittingMaximumWidth(for: visibleScreen)
+        let maxHeight = ExpandedPanelMetrics.fittingMaximumHeight(for: visibleScreen)
         if let overlayWindow = window as? OverlayWindow {
-            overlayWindow.fillsVisibleFrame = true
+            overlayWindow.fillsVisibleFrame = false
             overlayWindow.preserveProgrammaticFrameHeight = false
-            overlayWindow.contentCornerRadius = 0
+            overlayWindow.contentCornerRadius = ExpandedPanelMetrics.cornerRadius
             overlayWindow.minimumFrameWidth = min(360, maxWidth)
             overlayWindow.maximumFrameWidth = maxWidth
             overlayWindow.minimumFrameHeight = min(360, maxHeight)
@@ -13298,7 +13506,10 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         window.maxSize = NSSize(width: maxWidth, height: maxHeight)
         window.contentMaxSize = window.maxSize
 
-        let frame = fullScreen
+        let frame = ExpandedPanelMetrics.focusFrame(
+            in: visibleScreen,
+            preferredWidth: ExpandedPanelMetrics.maxFocusWidth,
+            preferredHeight: ExpandedPanelMetrics.focusHeight)
         updateCanvasWidth()
         NSAnimationContext.runAnimationGroup { context in
             context.duration = 0.16
@@ -14609,14 +14820,24 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
         row.wantsLayer = true
-        row.layer?.backgroundColor = session.isActive
-            ? BlueyTheme.cyanSoft.cgColor
-            : NSColor.white.withAlphaComponent(0.035).cgColor
+        let selectedFill = lightThemeEnabled
+            ? BlueyLightTheme.accentSoft.withAlphaComponent(
+                lightMaterialAlpha(0.94, floor: 0.34))
+            : BlueyTheme.cyanSoft
+        let restingFill = lightThemeEnabled
+            ? BlueyLightTheme.surfaceRaised.withAlphaComponent(
+                lightMaterialAlpha(0.98, floor: 0.34))
+            : NSColor.white.withAlphaComponent(0.035)
+        row.layer?.backgroundColor = (session.isActive ? selectedFill : restingFill).cgColor
         row.layer?.cornerRadius = 12
         row.layer?.borderWidth = 1
         row.layer?.borderColor = session.isActive
-            ? BlueyTheme.cyan.withAlphaComponent(0.34).cgColor
-            : BlueyTheme.hairline.cgColor
+            ? themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.72 : 0.34).cgColor
+            : (lightThemeEnabled ? BlueyLightTheme.border : BlueyTheme.hairline).cgColor
+        row.setAccessibilityElement(true)
+        row.setAccessibilityRole(.group)
+        row.setAccessibilityLabel(
+            session.isActive ? "Current recording, \(session.title)" : "Recording, \(session.title)")
 
         if editingSessionId == session.id {
             return configureRenameRow(row, session: session)
@@ -14626,11 +14847,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         openButton.translatesAutoresizingMaskIntoConstraints = false
         openButton.isBordered = false
         openButton.tag = sessionIndex(session.id)
+        openButton.setAccessibilityLabel("Open \(session.title)")
+        openButton.setAccessibilityHelp("Open this saved recording in Bluey.")
 
         let title = NSTextField(labelWithString: session.title)
         title.translatesAutoresizingMaskIntoConstraints = false
         title.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        title.textColor = BlueyTheme.text
+        title.textColor = themedTextColor
         title.lineBreakMode = .byTruncatingTail
 
         let code = shortSessionCode(session.id)
@@ -14640,7 +14863,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let subtitle = NSTextField(labelWithString: subtitleText)
         subtitle.translatesAutoresizingMaskIntoConstraints = false
         subtitle.font = NSFont.systemFont(ofSize: 9.5, weight: .medium)
-        subtitle.textColor = BlueyTheme.textDim
+        subtitle.textColor = themedDimTextColor
         subtitle.lineBreakMode = .byTruncatingTail
         row.toolTip = "Session \(session.id)"
 
@@ -14650,8 +14873,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         rename.translatesAutoresizingMaskIntoConstraints = false
         rename.isBordered = false
         rename.tag = sessionIndex(session.id)
-        rename.contentTintColor = BlueyTheme.cyan
+        rename.contentTintColor = themedAccentColor
         rename.toolTip = "Rename recording"
+        rename.setAccessibilityLabel("Rename \(session.title)")
         if let image = symbolImage("pencil") {
             image.isTemplate = true
             rename.image = image
@@ -14668,6 +14892,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         delete.tag = sessionIndex(session.id)
         delete.contentTintColor = BlueyTheme.warning
         delete.toolTip = "Delete recording"
+        delete.setAccessibilityLabel("Delete \(session.title)")
         if let image = symbolImage("trash") {
             image.isTemplate = true
             delete.image = image
@@ -14685,7 +14910,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         row.addSubview(rename)
         row.addSubview(delete)
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 52),
+            row.heightAnchor.constraint(equalToConstant: 60),
 
             openButton.topAnchor.constraint(equalTo: row.topAnchor),
             openButton.leadingAnchor.constraint(equalTo: row.leadingAnchor),
@@ -14693,7 +14918,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             openButton.trailingAnchor.constraint(equalTo: rename.leadingAnchor),
 
             title.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
-            title.topAnchor.constraint(equalTo: row.topAnchor, constant: 8),
+            title.topAnchor.constraint(equalTo: row.topAnchor, constant: 10),
             title.trailingAnchor.constraint(equalTo: contextBadge.leadingAnchor, constant: -6),
 
             contextBadge.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
@@ -14706,13 +14931,13 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
             subtitle.trailingAnchor.constraint(equalTo: rename.leadingAnchor, constant: -6),
 
             rename.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            rename.widthAnchor.constraint(equalToConstant: 28),
-            rename.heightAnchor.constraint(equalToConstant: 28),
+            rename.widthAnchor.constraint(equalToConstant: 32),
+            rename.heightAnchor.constraint(equalToConstant: 32),
 
             delete.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
             delete.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            delete.widthAnchor.constraint(equalToConstant: 28),
-            delete.heightAnchor.constraint(equalToConstant: 28),
+            delete.widthAnchor.constraint(equalToConstant: 32),
+            delete.heightAnchor.constraint(equalToConstant: 32),
 
             rename.trailingAnchor.constraint(equalTo: delete.leadingAnchor, constant: -2),
         ])
@@ -14725,20 +14950,27 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         let label = NSTextField(labelWithString: count > 0 ? "\(count) \(imageCount > 0 ? "items" : "docs")" : "")
         label.translatesAutoresizingMaskIntoConstraints = false
         label.font = NSFont.systemFont(ofSize: 9.5, weight: .bold)
-        label.textColor = imageCount > 0 ? BlueyTheme.cyan : BlueyTheme.text
+        label.textColor = imageCount > 0 ? themedAccentColor : themedTextColor
         label.alignment = .center
         label.lineBreakMode = .byTruncatingTail
         label.maximumNumberOfLines = 1
         label.isHidden = count == 0
         label.wantsLayer = true
         label.layer?.cornerRadius = 10
-        label.layer?.backgroundColor = (imageCount > 0 ? BlueyTheme.cyan : NSColor.white)
-            .withAlphaComponent(imageCount > 0 ? 0.12 : 0.055)
+        label.layer?.backgroundColor = (imageCount > 0
+            ? themedAccentFillColor.withAlphaComponent(lightThemeEnabled ? 0.74 : 0.12)
+            : (lightThemeEnabled
+                ? BlueyLightTheme.surface.withAlphaComponent(
+                    lightMaterialAlpha(0.90, floor: 0.28))
+                : NSColor.white.withAlphaComponent(0.055)))
             .cgColor
         label.layer?.borderWidth = count > 0 ? 1 : 0
-        label.layer?.borderColor = (imageCount > 0 ? BlueyTheme.cyan : BlueyTheme.hairline)
-            .withAlphaComponent(imageCount > 0 ? 0.34 : 1.0)
+        label.layer?.borderColor = (imageCount > 0
+            ? themedAccentBorderColor.withAlphaComponent(lightThemeEnabled ? 0.56 : 0.34)
+            : (lightThemeEnabled ? BlueyLightTheme.border : BlueyTheme.hairline))
             .cgColor
+        label.setAccessibilityLabel(
+            count > 0 ? "\(count) attached context item\(count == 1 ? "" : "s")" : "")
         label.toolTip = count > 0
             ? "\(count) attached context item\(count == 1 ? "" : "s") in this recording"
             : nil
@@ -14751,10 +14983,17 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         field.translatesAutoresizingMaskIntoConstraints = false
         field.stringValue = session.title
         field.font = NSFont.systemFont(ofSize: 11.5, weight: .semibold)
-        field.textColor = BlueyTheme.text
+        field.textColor = themedTextColor
         field.isBezeled = false
-        field.drawsBackground = false
+        field.drawsBackground = true
         field.focusRingType = .none
+        field.backgroundColor = lightThemeEnabled
+            ? BlueyLightTheme.surfaceRaised
+            : NSColor.white.withAlphaComponent(0.055)
+        field.wantsLayer = true
+        field.layer?.cornerRadius = 8
+        field.layer?.borderWidth = 2
+        field.layer?.borderColor = themedAccentBorderColor.withAlphaComponent(0.90).cgColor
         field.target = self
         field.action = #selector(saveInlineRenameClicked(_:))
         field.tag = sessionIndex(session.id)
@@ -14764,8 +15003,9 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         save.translatesAutoresizingMaskIntoConstraints = false
         save.isBordered = false
         save.tag = sessionIndex(session.id)
-        save.contentTintColor = BlueyTheme.cyan
+        save.contentTintColor = themedAccentColor
         save.toolTip = "Save recording name"
+        save.setAccessibilityLabel("Save recording name")
         if let image = symbolImage("checkmark") {
             image.isTemplate = true
             save.image = image
@@ -14779,7 +15019,7 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         row.addSubview(field)
         row.addSubview(save)
         NSLayoutConstraint.activate([
-            row.heightAnchor.constraint(equalToConstant: 44),
+            row.heightAnchor.constraint(equalToConstant: 52),
             field.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 10),
             field.centerYAnchor.constraint(equalTo: row.centerYAnchor),
             field.trailingAnchor.constraint(equalTo: save.leadingAnchor, constant: -6),
@@ -14787,8 +15027,8 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
 
             save.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -6),
             save.centerYAnchor.constraint(equalTo: row.centerYAnchor),
-            save.widthAnchor.constraint(equalToConstant: 28),
-            save.heightAnchor.constraint(equalToConstant: 28),
+            save.widthAnchor.constraint(equalToConstant: 32),
+            save.heightAnchor.constraint(equalToConstant: 32),
         ])
         DispatchQueue.main.async { [weak self, weak field] in
             guard self?.editingSessionId == session.id else { return }
@@ -14827,15 +15067,20 @@ private final class ExpandedPanelView: NSView, NSTextFieldDelegate {
         configureCloseConfirmBodyStandard()
         closeConfirmTitle.stringValue = "Delete recording?"
         closeConfirmBody.stringValue = "Remove \"\(session.title)\" from this device. This cannot be undone."
+        closeConfirmPanel.setAccessibilityLabel("Delete recording")
+        closeConfirmBody.setAccessibilityLabel(
+            "Remove \(session.title) from this device. This cannot be undone.")
         closeConfirmCancelButton.title = "Cancel"
         closeConfirmCancelButton.target = self
         closeConfirmCancelButton.action = #selector(cancelCloseConfirmClicked)
         closeConfirmCancelButton.toolTip = "Keep this recording"
+        closeConfirmCancelButton.setAccessibilityLabel("Cancel deletion")
         styleControlButton(closeConfirmCancelButton, symbol: "xmark", accent: false)
         closeConfirmTurnOffButton.title = "Delete"
         closeConfirmTurnOffButton.target = self
         closeConfirmTurnOffButton.action = #selector(confirmDeleteSessionClicked)
         closeConfirmTurnOffButton.toolTip = "Delete this saved recording"
+        closeConfirmTurnOffButton.setAccessibilityLabel("Delete \(session.title)")
         styleControlButton(closeConfirmTurnOffButton, symbol: "trash", accent: true)
         presentConfirmationOverlay()
     }
@@ -15773,8 +16018,6 @@ private final class OverlayApp {
         pillView.applyBackgroundOpacity(overlayOpacity)
         pillView.onClick = { [weak self] in self?.expand(showFirstRunShortcuts: true) }
         pillView.onRunToggle = { [weak self] in self?.toggleListeningFromPill() }
-        pillView.onAsk = { [weak self] in self?.expandAndFocusQuestion() }
-        pillView.onEnd = { [weak self] in self?.expandAndConfirmTurnOff() }
         pillView.onMoved = { [weak self] frame in self?.rememberPillFrame(frame) }
 
         if captureVisibleForDebug {
@@ -16507,8 +16750,7 @@ private final class OverlayApp {
         emitSimple("shown")
         emitLifecycle("expanded")
         if showFirstRunShortcuts,
-           expandedView?.isSignedOutGateActive != true,
-           OverlayPlacementStore.consumeFirstExpandedShortcutHelp() {
+           expandedView?.isSignedOutGateActive != true {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
                 guard
                     let self,
@@ -16516,9 +16758,20 @@ private final class OverlayApp {
                     self.expandedWindow?.isVisible == true,
                     self.expandedView?.isSignedOutGateActive != true
                 else { return }
-                self.expandedView?.showShortcutHelpOverlay(source: "first_expand")
+                self.presentShortcutCoachmarkIfNeeded(source: "first_expand")
             }
         }
+    }
+
+    private func presentShortcutCoachmarkIfNeeded(source: String) {
+        guard !OverlayPlacementStore.hasShownShortcutCoachmark,
+              expandedModeActive,
+              expandedWindow?.isVisible == true,
+              let expandedView,
+              expandedView.isSignedOutGateActive != true,
+              expandedView.showShortcutCoachmark(source: source)
+        else { return }
+        OverlayPlacementStore.markShortcutCoachmarkShown()
     }
 
     private func ensureExpandedWindow() {
@@ -16707,10 +16960,23 @@ private final class OverlayApp {
             let previousAccountUIState = accountUIState
             let nextAccountUIState = resolvedAccountUIState(authoritativeSignedIn: signedIn)
             accountUIState = nextAccountUIState
+            if previousAccountUIState != nextAccountUIState {
+                emitLifecycle(
+                    "auth_state_changed",
+                    status: signedIn ? "signed_in" : "signed_out")
+            }
             if signedIn {
                 let establishesSignedIn = establishesSignedInChrome(
                     from: previousAccountUIState,
                     to: nextAccountUIState)
+                let wasVisibleSignedOutGate = expandedModeActive
+                    && expandedWindow?.isVisible == true
+                    && expandedView?.isSignedOutGateActive == true
+                let shouldPresentShortcutCoachmark = shouldPresentPostSignInShortcutCoachmark(
+                    from: previousAccountUIState,
+                    to: nextAccountUIState,
+                    alreadyShown: OverlayPlacementStore.hasShownShortcutCoachmark)
+                    && wasVisibleSignedOutGate
                 let shouldCollapseAfterUnlock = establishesSignedIn
                     && expandedView?.isSignedOutGateActive == true
                 if establishesSignedIn {
@@ -16718,7 +16984,11 @@ private final class OverlayApp {
                     expandedView?.refreshAudioRouteBadge(for: currentRunState)
                 }
                 pillView?.setHealthState(.ready)
-                if shouldCollapseAfterUnlock {
+                if shouldPresentShortcutCoachmark {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
+                        self?.presentShortcutCoachmarkIfNeeded(source: "sign_in")
+                    }
+                } else if shouldCollapseAfterUnlock {
                     collapse()
                 }
             } else {
@@ -17034,6 +17304,7 @@ private func blueyTrustedRemoteInputEventTapCallback(
 
 #if BLUEY_AUTH_UI_POLICY_TESTS
 private func runAuthUIPolicyTests() {
+    precondition(PillMetrics.size == NSSize(width: 112, height: 30))
     precondition(!allowsAuthenticatedChromeUpdates(for: .unknown))
     precondition(!allowsAuthenticatedChromeUpdates(for: .signedOut))
     precondition(allowsAuthenticatedChromeUpdates(for: .signedIn))
@@ -17046,6 +17317,23 @@ private func runAuthUIPolicyTests() {
     precondition(establishesSignedInChrome(from: .signedOut, to: .signedIn))
     precondition(!establishesSignedInChrome(from: .signedIn, to: .signedIn))
     precondition(!establishesSignedInChrome(from: .signedOut, to: .signedOut))
+
+    precondition(shouldPresentPostSignInShortcutCoachmark(
+        from: .signedOut,
+        to: .signedIn,
+        alreadyShown: false))
+    precondition(!shouldPresentPostSignInShortcutCoachmark(
+        from: .unknown,
+        to: .signedIn,
+        alreadyShown: false))
+    precondition(!shouldPresentPostSignInShortcutCoachmark(
+        from: .signedOut,
+        to: .signedIn,
+        alreadyShown: true))
+    precondition(!shouldPresentPostSignInShortcutCoachmark(
+        from: .signedOut,
+        to: .signedOut,
+        alreadyShown: false))
 
     var state = resolvedAccountUIState(authoritativeSignedIn: true)
     precondition(allowsAuthenticatedChromeUpdates(for: state))

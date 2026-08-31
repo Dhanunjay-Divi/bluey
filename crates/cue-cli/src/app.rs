@@ -1856,12 +1856,13 @@ async fn browser_login(
     let login_url = device_login_url(&flow.verification_uri, &flow.user_code);
 
     println!("Opening Bluey sign-in...");
-    println!("Code: {}", flow.user_code);
-    println!("Approve this code only in the Bluey account you want this desktop to use.");
+    println!("The browser link already includes this desktop's secure connection code.");
+    println!("Fallback code: {}", flow.user_code);
+    println!("Approve only the Bluey app you started on this desktop.");
     println!("{login_url}");
     let _ = open_browser(&login_url);
     println!("Waiting for browser approval...");
-    println!("After signing in, click Connect desktop on the Bluey page. This terminal will finish automatically.");
+    println!("Sign in, then click Connect this Bluey once. No code re-entry is normally needed.");
 
     let auth = tokio::time::timeout(Duration::from_secs(DEVICE_LOGIN_TIMEOUT_SECS), async {
         await_browser_device_login(&flow, &client)
@@ -1869,7 +1870,10 @@ async fn browser_login(
             .map_err(anyhow::Error::from)
     })
     .await
-    .context("login timed out after 10 minutes. Re-run `bluey login`, then click Connect desktop in the browser.")??;
+    .context(
+        "login timed out after 10 minutes. Re-run `bluey login`, then click Connect this Bluey \
+         in the browser.",
+    )??;
 
     let mut account = AccountConfig::local();
     account.provider = "bluey".to_string();
@@ -2013,7 +2017,10 @@ async fn await_browser_device_login(
             cue_cloud_client::DeviceFlowState::LoggedIn(auth) => return Ok(auth),
             cue_cloud_client::DeviceFlowState::Pending => {
                 if Instant::now() >= next_hint {
-                    println!("Still waiting. In the browser, click Connect desktop to approve this terminal.");
+                    println!(
+                        "Still waiting. In the browser, click Connect this Bluey to approve this \
+                         desktop."
+                    );
                     next_hint += Duration::from_secs(20);
                 }
                 sleep(interval).await;
