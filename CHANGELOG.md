@@ -316,6 +316,11 @@ under `docs/release/`.
 
 ### Fixed
 
+- Corrected the hosted Jobs runner plan-matrix fixture to establish and read back verified,
+  durable public-beta admission before testing Free/Pro/Cloud and application-integrity
+  boundaries. The regression now proves it crossed the valid outer beta gate before the
+  preexisting signed job-integrity fence; production middleware, runtime authority, flags, and
+  cohort state are unchanged.
 - Raised the combined Linux Jobs CI lane's closed timeout from 45 to 90 minutes after the exact
   PR-head run passed every preceding gate but was cancelled with 89 of 108 integration tests green
   and zero failures. The pre-install Jobs CI self-test now rejects any drift from the bounded
