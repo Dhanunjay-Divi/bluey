@@ -62,7 +62,7 @@ describe("career command center", () => {
       runner_availability: {
         ...previewWorkspace.runner_availability,
         cloud: {
-          status: "invited_beta",
+          status: "limited_beta",
           available: false,
           plan_included: true,
           distribution_enabled: false,
@@ -79,7 +79,7 @@ describe("career command center", () => {
     expect(html).toContain("24");
     expect(html).toContain("of 100 packets used");
     expect(html).toContain("Managed cloud runner");
-    expect(html).toContain("Invited Beta");
+    expect(html).toContain("Limited Beta");
     expect(html).toContain("Background automation is not enabled for this account.");
     expect(html).toContain("Use Review first while access is unavailable.");
     expect(html).toContain("Auto-submit is unavailable while the managed runner is disabled.");

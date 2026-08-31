@@ -55,11 +55,107 @@ let refreshAccessTokenPromise: Promise<string> | null = null;
 
 export class ApiError extends Error {
   status: number;
+  payload: unknown;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, payload: unknown = null) {
     super(message);
     this.status = status;
+    this.payload = payload;
   }
+}
+
+export type JobsBetaAccessState = "admitted" | "not_admitted" | "suspended";
+export type JobsBetaAccessReason =
+  | "admitted"
+  | "verification_required"
+  | "not_open"
+  | "window_closed"
+  | "capacity_reached"
+  | "denied"
+  | "suspended"
+  | "unavailable";
+
+export type JobsBetaAccess =
+  | { schemaVersion: 1; access: "admitted"; reason: "admitted" }
+  | {
+      schemaVersion: 1;
+      access: "not_admitted";
+      reason: Exclude<JobsBetaAccessReason, "admitted" | "suspended">;
+    }
+  | { schemaVersion: 1; access: "suspended"; reason: "suspended" };
+
+export interface JobsPortalLoadResult {
+  betaAccess: JobsBetaAccess;
+  workspace: JobsWorkspace | null;
+  account: AccountSummary | null;
+}
+
+const BETA_ACCESS_STATES = new Set<JobsBetaAccessState>([
+  "admitted",
+  "not_admitted",
+  "suspended",
+]);
+const BETA_ACCESS_REASONS = new Set<JobsBetaAccessReason>([
+  "admitted",
+  "verification_required",
+  "not_open",
+  "window_closed",
+  "capacity_reached",
+  "denied",
+  "suspended",
+  "unavailable",
+]);
+const NOT_ADMITTED_REASONS = new Set<JobsBetaAccessReason>([
+  "verification_required",
+  "not_open",
+  "window_closed",
+  "capacity_reached",
+  "denied",
+  "unavailable",
+]);
+
+function invalidBetaAccess(): never {
+  throw new ApiError(
+    0,
+    "Bluey Jobs could not safely confirm public-beta access.",
+  );
+}
+
+export function parseJobsBetaAccess(payload: unknown): JobsBetaAccess {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload))
+    invalidBetaAccess();
+  const record = payload as Record<string, unknown>;
+  const keys = Object.keys(record).sort();
+  if (
+    keys.length !== 3 ||
+    keys[0] !== "access" ||
+    keys[1] !== "reason" ||
+    keys[2] !== "schemaVersion"
+  ) {
+    invalidBetaAccess();
+  }
+  if (record.schemaVersion !== 1) invalidBetaAccess();
+  if (
+    typeof record.access !== "string" ||
+    !BETA_ACCESS_STATES.has(record.access as JobsBetaAccessState)
+  ) {
+    invalidBetaAccess();
+  }
+  if (
+    typeof record.reason !== "string" ||
+    !BETA_ACCESS_REASONS.has(record.reason as JobsBetaAccessReason)
+  ) {
+    invalidBetaAccess();
+  }
+
+  const access = record.access as JobsBetaAccessState;
+  const reason = record.reason as JobsBetaAccessReason;
+  const consistent =
+    (access === "admitted" && reason === "admitted") ||
+    (access === "suspended" && reason === "suspended") ||
+    (access === "not_admitted" && NOT_ADMITTED_REASONS.has(reason));
+  if (!consistent) invalidBetaAccess();
+  return { schemaVersion: 1, access, reason } as JobsBetaAccess;
 }
 
 export interface InterviewPrepCompletionResponse {
@@ -106,19 +202,25 @@ function refreshToken(): string {
   return "";
 }
 
-function persistTokens(payload: { access_token: string; refresh_token?: string }): void {
+function persistTokens(payload: {
+  access_token: string;
+  refresh_token?: string;
+}): void {
   const persistent = localStorage.getItem(AUTH_PERSISTENCE_KEY) !== "session";
   const store = persistent ? localStorage : sessionStorage;
   const other = persistent ? sessionStorage : localStorage;
   other.removeItem(ACCESS_TOKEN_KEY);
   other.removeItem(REFRESH_TOKEN_KEY);
   store.setItem(ACCESS_TOKEN_KEY, payload.access_token);
-  if (payload.refresh_token) store.setItem(REFRESH_TOKEN_KEY, payload.refresh_token);
+  if (payload.refresh_token)
+    store.setItem(REFRESH_TOKEN_KEY, payload.refresh_token);
 }
 
 function timeoutFor(init: RequestInit): number {
   const method = String(init.method || "GET").toUpperCase();
-  return method === "GET" || method === "HEAD" ? READ_TIMEOUT_MS : WRITE_TIMEOUT_MS;
+  return method === "GET" || method === "HEAD"
+    ? READ_TIMEOUT_MS
+    : WRITE_TIMEOUT_MS;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -149,19 +251,29 @@ async function refreshAccessToken(): Promise<string> {
     if (!token) return "";
     let response: Response;
     try {
-      response = await fetchWithTimeout("/auth/refresh", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: token }),
-      }, AUTH_TIMEOUT_MS);
+      response = await fetchWithTimeout(
+        "/auth/refresh",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: token }),
+        },
+        AUTH_TIMEOUT_MS,
+      );
     } catch (error) {
       if (isAbortError(error)) return "";
       throw error;
     }
     if (!response.ok) return "";
-    const payload = (await response.json()) as { access_token?: string; refresh_token?: string };
+    const payload = (await response.json()) as {
+      access_token?: string;
+      refresh_token?: string;
+    };
     if (!payload.access_token) return "";
-    persistTokens({ access_token: payload.access_token, refresh_token: payload.refresh_token });
+    persistTokens({
+      access_token: payload.access_token,
+      refresh_token: payload.refresh_token,
+    });
     return payload.access_token;
   })();
   try {
@@ -171,9 +283,14 @@ async function refreshAccessToken(): Promise<string> {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}, retried = false): Promise<T> {
+async function request<T>(
+  path: string,
+  init: RequestInit = {},
+  retried = false,
+): Promise<T> {
   const headers = new Headers(init.headers);
-  if (!(init.body instanceof FormData)) headers.set("Content-Type", "application/json");
+  if (!(init.body instanceof FormData))
+    headers.set("Content-Type", "application/json");
   const token = accessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
   let response: Response;
@@ -181,7 +298,10 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
     response = await fetchWithTimeout(path, { ...init, headers });
   } catch (error) {
     if (isAbortError(error)) {
-      throw new ApiError(0, "Bluey Jobs is taking longer than expected. Please try again.");
+      throw new ApiError(
+        0,
+        "Bluey Jobs is taking longer than expected. Please try again.",
+      );
     }
     throw error;
   }
@@ -205,7 +325,7 @@ async function request<T>(path: string, init: RequestInit = {}, retried = false)
         : typeof body === "object" && body && "message" in body
           ? String((body as { message: unknown }).message)
           : "Bluey Jobs could not finish that request.";
-    throw new ApiError(response.status, message);
+    throw new ApiError(response.status, message, body);
   }
   return body as T;
 }
@@ -244,11 +364,12 @@ function policyAuthorityFromWire(
   } = authority;
   return {
     ...rest,
-    applicationIdentityId: typeof applicationIdentityIdFromWire === "string"
-      ? applicationIdentityIdFromWire
-      : typeof existingApplicationIdentityId === "string"
-        ? existingApplicationIdentityId
-        : "",
+    applicationIdentityId:
+      typeof applicationIdentityIdFromWire === "string"
+        ? applicationIdentityIdFromWire
+        : typeof existingApplicationIdentityId === "string"
+          ? existingApplicationIdentityId
+          : "",
   };
 }
 
@@ -301,7 +422,10 @@ async function requestDownload(
     response = await fetchWithTimeout(path, { headers }, WRITE_TIMEOUT_MS);
   } catch (error) {
     if (isAbortError(error)) {
-      throw new ApiError(0, "Bluey could not finish the download in time. Please try again.");
+      throw new ApiError(
+        0,
+        "Bluey could not finish the download in time. Please try again.",
+      );
     }
     throw error;
   }
@@ -311,7 +435,10 @@ async function requestDownload(
   }
   if (!response.ok) {
     const text = await response.text();
-    throw new ApiError(response.status, text || "Bluey could not download that file.");
+    throw new ApiError(
+      response.status,
+      text || "Bluey could not download that file.",
+    );
   }
   const disposition = response.headers.get("content-disposition") || "";
   const match = disposition.match(/filename="([^"]+)"/i);
@@ -332,35 +459,60 @@ async function fileBase64(file: File): Promise<string> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   const chunks: string[] = [];
   for (let offset = 0; offset < bytes.length; offset += 32_768) {
-    chunks.push(String.fromCharCode(...bytes.subarray(offset, offset + 32_768)));
+    chunks.push(
+      String.fromCharCode(...bytes.subarray(offset, offset + 32_768)),
+    );
   }
   return btoa(chunks.join(""));
 }
 
 export const jobsApi = {
-  workspace: async () => workspaceFromWire(
-    await request<JobsWorkspace>("/api/jobs/workspace"),
-  ),
+  betaAccess: async () => {
+    try {
+      return parseJobsBetaAccess(
+        await request<unknown>("/api/jobs/beta-access", { cache: "no-store" }),
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 503) {
+        return parseJobsBetaAccess(error.payload);
+      }
+      throw error;
+    }
+  },
+  workspace: async () =>
+    workspaceFromWire(await request<JobsWorkspace>("/api/jobs/workspace")),
   account: () => request<AccountSummary>("/account/me"),
   completeOnboarding: async (
     profile: CareerProfile,
     preferences: JobPreferences,
     track: CareerTrack,
-  ) => workspaceFromWire(
-    await request<JobsWorkspace>("/api/jobs/onboarding/complete", {
-      method: "POST",
-      headers: await taxonomyWriteHeaders(),
-      body: JSON.stringify({ profile, preferences, track: trackToWire(track) }),
-    }),
-  ),
+  ) =>
+    workspaceFromWire(
+      await request<JobsWorkspace>("/api/jobs/onboarding/complete", {
+        method: "POST",
+        headers: await taxonomyWriteHeaders(),
+        body: JSON.stringify({
+          profile,
+          preferences,
+          track: trackToWire(track),
+        }),
+      }),
+    ),
   prepareInterview: (applicationId: string) =>
-    request<InterviewPrepCompletionResponse>(`/api/jobs/applications/${encodeURIComponent(applicationId)}/interview-prep`, {
-      method: "POST",
-      body: "{}",
-    }),
+    request<InterviewPrepCompletionResponse>(
+      `/api/jobs/applications/${encodeURIComponent(applicationId)}/interview-prep`,
+      {
+        method: "POST",
+        body: "{}",
+      },
+    ),
   saveProfile: (profile: CareerProfile) =>
-    request<CareerProfile>("/api/jobs/profile", { method: "PUT", body: JSON.stringify(profile) }),
-  resumeSource: () => request<ResumeSourceMetadata | null>("/api/jobs/resume-source"),
+    request<CareerProfile>("/api/jobs/profile", {
+      method: "PUT",
+      body: JSON.stringify(profile),
+    }),
+  resumeSource: () =>
+    request<ResumeSourceMetadata | null>("/api/jobs/resume-source"),
   uploadResumeSource: async (
     file: File,
     profile: CareerProfile,
@@ -388,39 +540,52 @@ export const jobsApi = {
       method: "PUT",
       body: JSON.stringify(preferences),
     }),
-  saveFact: (fact: CareerFact) => request<CareerFact>("/api/jobs/facts", {
-    method: "POST",
-    body: JSON.stringify({
-      id: fact.id,
-      category: fact.category,
-      label: fact.label,
-      value: fact.value,
+  saveFact: (fact: CareerFact) =>
+    request<CareerFact>("/api/jobs/facts", {
+      method: "POST",
+      body: JSON.stringify({
+        id: fact.id,
+        category: fact.category,
+        label: fact.label,
+        value: fact.value,
+      }),
     }),
-  }),
-  deleteFact: (id: string) => request<void>(`/api/jobs/facts/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  deleteFact: (id: string) =>
+    request<void>(`/api/jobs/facts/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
   saveTrack: async (track: CareerTrack) => {
     const creating = track.created_at_ms <= 0;
-    const saved = await request<CareerTrack>(creating ? "/api/jobs/tracks" : `/api/jobs/tracks/${encodeURIComponent(track.id)}`, {
-      method: creating ? "POST" : "PUT",
-      headers: await taxonomyWriteHeaders(),
-      body: JSON.stringify(trackToWire(track)),
-    });
+    const saved = await request<CareerTrack>(
+      creating
+        ? "/api/jobs/tracks"
+        : `/api/jobs/tracks/${encodeURIComponent(track.id)}`,
+      {
+        method: creating ? "POST" : "PUT",
+        headers: await taxonomyWriteHeaders(),
+        body: JSON.stringify(trackToWire(track)),
+      },
+    );
     return trackFromWire(saved);
   },
   deleteTrack: (id: string) =>
-    request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
   authorizeTrackAutoSubmit: (id: string) =>
     request<AutoSubmitAuthorization>(
       `/api/jobs/tracks/${encodeURIComponent(id)}/auto-submit`,
       { method: "POST" },
     ),
   revokeTrackAutoSubmit: (id: string) =>
-    request<void>(
-      `/api/jobs/tracks/${encodeURIComponent(id)}/auto-submit`,
-      { method: "DELETE" },
-    ),
+    request<void>(`/api/jobs/tracks/${encodeURIComponent(id)}/auto-submit`, {
+      method: "DELETE",
+    }),
   saveMatch: (job: UserJobInput) =>
-    request<JobPosting>("/api/jobs/matches", { method: "POST", body: JSON.stringify(job) }),
+    request<JobPosting>("/api/jobs/matches", {
+      method: "POST",
+      body: JSON.stringify(job),
+    }),
   searchDiscoveryCatalog: (query: string, trackId: string, provider = "all") =>
     request<DiscoverySourceCatalogResponse>(
       `/api/jobs/discovery/catalog?q=${encodeURIComponent(query)}&track_id=${encodeURIComponent(trackId)}&provider=${encodeURIComponent(provider)}`,
@@ -428,26 +593,42 @@ export const jobsApi = {
   connectDiscoverySource: (trackId: string, catalogEntryId: string) =>
     request<DiscoverySource>("/api/jobs/discovery/sources", {
       method: "POST",
-      body: JSON.stringify({ track_id: trackId, catalog_entry_id: catalogEntryId }),
+      body: JSON.stringify({
+        track_id: trackId,
+        catalog_entry_id: catalogEntryId,
+      }),
     }),
   prepareApplication: (jobId: string, mode: string, submissionMode: string) =>
     request<PrepareApplicationResponse>("/api/jobs/applications", {
       method: "POST",
-      body: JSON.stringify({ job_id: jobId, mode, submission_mode: submissionMode }),
+      body: JSON.stringify({
+        job_id: jobId,
+        mode,
+        submission_mode: submissionMode,
+      }),
     }),
   updateApplication: (id: string, state: string, submissionMode?: string) =>
-    request<JobApplication>(`/api/jobs/applications/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ state, submission_mode: submissionMode }),
-    }),
+    request<JobApplication>(
+      `/api/jobs/applications/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ state, submission_mode: submissionMode }),
+      },
+    ),
   commitPacket: (id: string) =>
-    request<PacketCommitResult>(`/api/jobs/applications/${encodeURIComponent(id)}/commit`, {
-      method: "POST",
-    }),
+    request<PacketCommitResult>(
+      `/api/jobs/applications/${encodeURIComponent(id)}/commit`,
+      {
+        method: "POST",
+      },
+    ),
   approveApplication: (id: string) =>
-    request<ApproveApplicationResponse>(`/api/jobs/applications/${encodeURIComponent(id)}/approve`, {
-      method: "POST",
-    }),
+    request<ApproveApplicationResponse>(
+      `/api/jobs/applications/${encodeURIComponent(id)}/approve`,
+      {
+        method: "POST",
+      },
+    ),
   reconcileSubmissionNotSubmitted: (id: string) =>
     request<JobApplication>(
       `/api/jobs/applications/${encodeURIComponent(id)}/reconcile-submission`,
@@ -457,12 +638,17 @@ export const jobsApi = {
       },
     ),
   queueApplicationRun: (id: string, runner: "local" | "cloud" = "cloud") =>
-    request<QueueApplicationRunResponse>(`/api/jobs/applications/${encodeURIComponent(id)}/runs`, {
-      method: "POST",
-      body: JSON.stringify({ runner }),
-    }),
+    request<QueueApplicationRunResponse>(
+      `/api/jobs/applications/${encodeURIComponent(id)}/runs`,
+      {
+        method: "POST",
+        body: JSON.stringify({ runner }),
+      },
+    ),
   applicationEvidence: (id: string) =>
-    request<ApplicationEvidence[]>(`/api/jobs/applications/${encodeURIComponent(id)}/evidence`),
+    request<ApplicationEvidence[]>(
+      `/api/jobs/applications/${encodeURIComponent(id)}/evidence`,
+    ),
   downloadApplicationEvidence: (
     applicationId: string,
     evidenceId: string,
@@ -473,24 +659,41 @@ export const jobsApi = {
       fallbackName,
     ),
   resumeVersion: (id: string) =>
-    request<ResumeVersion>(`/api/jobs/resume-versions/${encodeURIComponent(id)}`),
+    request<ResumeVersion>(
+      `/api/jobs/resume-versions/${encodeURIComponent(id)}`,
+    ),
   resolveIntervention: (
     id: string,
     status: string,
     action = "",
-    resolution?: { answer?: string; remember?: boolean; scope?: string; scope_id?: string },
+    resolution?: {
+      answer?: string;
+      remember?: boolean;
+      scope?: string;
+      scope_id?: string;
+    },
   ) =>
-    request<InterventionResolutionResult>(`/api/jobs/interventions/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      body: JSON.stringify({ status, action, ...resolution }),
-    }),
+    request<InterventionResolutionResult>(
+      `/api/jobs/interventions/${encodeURIComponent(id)}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ status, action, ...resolution }),
+      },
+    ),
   saveAnswerMemory: (answer: AnswerMemory) =>
-    request<AnswerMemory>(answer.id ? `/api/jobs/answers/${encodeURIComponent(answer.id)}` : "/api/jobs/answers", {
-      method: answer.id ? "PUT" : "POST",
-      body: JSON.stringify(answer),
-    }),
+    request<AnswerMemory>(
+      answer.id
+        ? `/api/jobs/answers/${encodeURIComponent(answer.id)}`
+        : "/api/jobs/answers",
+      {
+        method: answer.id ? "PUT" : "POST",
+        body: JSON.stringify(answer),
+      },
+    ),
   deleteAnswerMemory: (id: string) =>
-    request<void>(`/api/jobs/answers/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    request<void>(`/api/jobs/answers/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
   saveCandidateEvent: (event: CandidateEventInput) =>
     request<CandidateEvent>("/api/jobs/candidate-events", {
       method: "POST",
@@ -507,21 +710,33 @@ export const jobsApi = {
       body: JSON.stringify(identity),
     }),
   updateApplicationIdentity: (identity: ApplicationIdentity) =>
-    request<ApplicationIdentity>(`/api/jobs/application-identities/${encodeURIComponent(identity.id)}`, {
-      method: "PUT",
-      body: JSON.stringify(identity),
-    }),
+    request<ApplicationIdentity>(
+      `/api/jobs/application-identities/${encodeURIComponent(identity.id)}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(identity),
+      },
+    ),
   verifyApplicationIdentity: (id: string, code: string) =>
-    request<ApplicationIdentity>(`/api/jobs/application-identities/${encodeURIComponent(id)}/verify`, {
-      method: "POST",
-      body: JSON.stringify({ code }),
-    }),
+    request<ApplicationIdentity>(
+      `/api/jobs/application-identities/${encodeURIComponent(id)}/verify`,
+      {
+        method: "POST",
+        body: JSON.stringify({ code }),
+      },
+    ),
   resendApplicationIdentity: (id: string) =>
-    request<ApplicationIdentity>(`/api/jobs/application-identities/${encodeURIComponent(id)}/resend`, {
-      method: "POST",
-    }),
+    request<ApplicationIdentity>(
+      `/api/jobs/application-identities/${encodeURIComponent(id)}/resend`,
+      {
+        method: "POST",
+      },
+    ),
   deleteApplicationIdentity: (id: string) =>
-    request<void>(`/api/jobs/application-identities/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    request<void>(
+      `/api/jobs/application-identities/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
   mailboxOAuthProviders: async () => {
     const payload = await request<unknown>("/api/jobs/mailbox-oauth/config");
     return decodeMailboxProviderAvailability(payload);
@@ -543,19 +758,28 @@ export const jobsApi = {
     return decodeMailboxOAuthStart(payload);
   },
   mailboxSyncState: (id: string) =>
-    request<MailboxSyncState>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync-state`),
+    request<MailboxSyncState>(
+      `/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync-state`,
+    ),
   syncMailbox: (id: string) =>
-    request<MailboxSyncState>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync`, {
-      method: "POST",
-    }),
+    request<MailboxSyncState>(
+      `/api/jobs/mailbox-connections/${encodeURIComponent(id)}/sync`,
+      {
+        method: "POST",
+      },
+    ),
   mailboxMessages: (connectionId?: string, status?: string, limit = 50) => {
     const params = new URLSearchParams({ limit: String(limit) });
     if (connectionId) params.set("connection_id", connectionId);
     if (status) params.set("status", status);
-    return request<MailboxMessage[]>(`/api/jobs/mailbox-messages?${params.toString()}`);
+    return request<MailboxMessage[]>(
+      `/api/jobs/mailbox-messages?${params.toString()}`,
+    );
   },
   communicationActions: async (applicationId?: string, limit = 100) => {
-    const params = new URLSearchParams({ limit: String(Math.min(Math.max(limit, 1), 100)) });
+    const params = new URLSearchParams({
+      limit: String(Math.min(Math.max(limit, 1), 100)),
+    });
     if (applicationId) params.set("application_id", applicationId);
     const payload = await request<unknown>(
       `/api/jobs/communication-actions?${params.toString()}`,
@@ -571,7 +795,10 @@ export const jobsApi = {
     return decodeCommunicationActionDetail(payload);
   },
   approveCommunicationAction: async (
-    action: Pick<CommunicationActionSummary, "id" | "action_revision" | "payload_sha256">,
+    action: Pick<
+      CommunicationActionSummary,
+      "id" | "action_revision" | "payload_sha256"
+    >,
   ) => {
     const payload = await request<unknown>(
       `/api/jobs/communication-actions/${encodeURIComponent(action.id)}/approve`,
@@ -587,7 +814,10 @@ export const jobsApi = {
     return decodeCommunicationActionDetail(payload);
   },
   cancelCommunicationAction: async (
-    action: Pick<CommunicationActionSummary, "id" | "action_revision" | "payload_sha256">,
+    action: Pick<
+      CommunicationActionSummary,
+      "id" | "action_revision" | "payload_sha256"
+    >,
   ) => {
     const payload = await request<unknown>(
       `/api/jobs/communication-actions/${encodeURIComponent(action.id)}/cancel`,
@@ -603,8 +833,42 @@ export const jobsApi = {
     return decodeCommunicationActionDetail(payload);
   },
   deleteMailboxConnection: (id: string) =>
-    request<void>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    request<void>(`/api/jobs/mailbox-connections/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
 };
+
+export async function loadJobsPortal(): Promise<JobsPortalLoadResult> {
+  const betaAccess = await jobsApi.betaAccess();
+  if (betaAccess.access !== "admitted") {
+    return { betaAccess, workspace: null, account: null };
+  }
+  const [workspace, account] = await Promise.all([
+    jobsApi.workspace(),
+    jobsApi.account(),
+  ]);
+  return { betaAccess, workspace, account };
+}
+
+export function signOutOfBluey(): void {
+  const token = accessToken();
+  const refresh = refreshToken();
+  localStorage.removeItem(ACCESS_TOKEN_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  sessionStorage.removeItem(ACCESS_TOKEN_KEY);
+  sessionStorage.removeItem(REFRESH_TOKEN_KEY);
+  if (token) {
+    void fetch("/auth/logout", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ refresh_token: refresh || null }),
+    }).catch(() => undefined);
+  }
+  window.location.href = "/";
+}
 
 export function loginUrl(): string {
   return `/login?next=${encodeURIComponent("/jobs")}`;

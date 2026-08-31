@@ -204,6 +204,7 @@ jobs:
         run: |
           set -euo pipefail
           npm ci --prefix candidate-source/jobs
+          npm audit --prefix candidate-source/jobs --audit-level=moderate
           npm run --prefix candidate-source/jobs build --workspace @bluey/jobs-automation
           npm run --prefix candidate-source/jobs/browser build
           npm run --prefix candidate-source/jobs/browser prepare:chromium -- \
@@ -284,12 +285,14 @@ jobs:
           prepared_archive="$RUNNER_TEMP/bluey-browser-prepared/bluey-browser-prepared-${{ matrix.target }}.tar"
           test -f "$prepared_archive"
           npm ci --prefix trusted-release-tools/jobs
+          npm audit --prefix trusted-release-tools/jobs --audit-level=moderate
           extracted_jobs="$(node trusted-release-tools/jobs/scripts/browser-release-ci-gate.mjs extract-prepared \
             --archive "$prepared_archive" \
             --out-parent "$RUNNER_TEMP")"
           test -d "$extracted_jobs"
           SOURCE="$extracted_jobs" DESTINATION="$GITHUB_WORKSPACE/candidate-source/jobs" node -e "const fs=require('node:fs'),path=require('node:path');for(const item of ['automation/dist','browser/dist','browser/browser-bundle']){const from=path.join(process.env.SOURCE,item),to=path.join(process.env.DESTINATION,item);fs.rmSync(to,{recursive:true,force:true});fs.mkdirSync(path.dirname(to),{recursive:true});fs.cpSync(from,to,{recursive:true,errorOnExist:true,force:false})}"
           npm ci --ignore-scripts --prefix candidate-source/jobs
+          npm audit --prefix candidate-source/jobs --audit-level=moderate
           npm run --prefix trusted-release-tools/jobs build --workspace @bluey/jobs-automation
           npm run --prefix trusted-release-tools/jobs/browser build
           node --input-type=module -e "const contract=await import('./trusted-release-tools/jobs/browser/scripts/release-package-contract.mjs');await contract.validatePreparedPackagingTree('./candidate-source/jobs/browser');await contract.validatePreparedSourceAgainstTrusted('./candidate-source/jobs/browser','./trusted-release-tools/jobs/browser')"

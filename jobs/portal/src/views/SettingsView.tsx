@@ -452,7 +452,7 @@ export function SettingsView({
         <div className="plan-grid">
           <Plan name="Free" price="$0" details="1 agent · 5 reviewed application kits · 2 application emails" active={workspace.entitlement.plan === "free"} />
           <Plan name="Pro" price="$29" details="3 agents · 50 application kits · 10 application emails · web review and job-site handoff" active={workspace.entitlement.plan === "pro"} />
-          <Plan name="Cloud" price="$49" details="5 agents · 100 application kits · 25 application emails · invited cloud automation beta" active={workspace.entitlement.plan === "cloud"} />
+          <Plan name="Cloud" price="$49" details="5 agents · 100 application kits · 25 application emails · limited public cloud automation" active={workspace.entitlement.plan === "cloud"} />
         </div>
         <p className="plan-footnote">
           Application emails are included. Connected inboxes start with read-only employer-update

@@ -2,7 +2,7 @@ import type { RunnerAvailability, RunnerChannelAvailability } from "../types";
 
 export const lockedRunnerAvailability: RunnerAvailability = {
   local: {
-    status: "invited_beta",
+    status: "limited_beta",
     available: false,
     plan_included: false,
     distribution_enabled: false,
@@ -10,7 +10,7 @@ export const lockedRunnerAvailability: RunnerAvailability = {
     next_action: "Review the application kit and continue on the original job site.",
   },
   cloud: {
-    status: "invited_beta",
+    status: "limited_beta",
     available: false,
     plan_included: false,
     distribution_enabled: false,
@@ -31,12 +31,12 @@ export function runnerAvailabilityOrLocked(
 export const runnerLandingCopy = {
   flowTitle: "Review before cloud automation starts",
   flowBody:
-    "Approve the exact application kit first. Cloud automation is opening gradually to invited beta accounts; Review first and job-site handoff stay available to everyone.",
-  plansTitle: "Start free. Request cloud automation beta access.",
+    "Public-beta admission opens the Jobs workspace, not cloud automation. A separately authorized Career Track and an available runner are both required before any cloud action can start.",
+  plansTitle: "Start free. Join the limited public beta.",
   proSummary: "Tailored applications in the web portal",
   proDetails: "3 Career Tracks · 50 application kits · web review and job-site handoff",
-  cloudSummary: "Cloud automation for invited beta accounts",
-  cloudDetails: "5 Career Tracks · 100 application kits · invited cloud automation beta",
+  cloudSummary: "Cloud automation in the limited public beta",
+  cloudDetails: "5 Career Tracks · 100 application kits · limited public cloud automation",
   accessNote:
     "Cloud automation appears only after it is enabled for your account. Every plan keeps the exact resume and answers used for each application.",
 } as const;
@@ -75,7 +75,7 @@ export function cloudRunnerAccessCopy(access: RunnerChannelAvailability): Runner
     };
   }
   return {
-    badge: "Invited beta",
+    badge: "Limited public beta",
     description: access.reason,
     points: [
       access.next_action,

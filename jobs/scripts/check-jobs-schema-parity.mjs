@@ -102,6 +102,9 @@ export const JOBS_PARITY_TABLES = [
   "jobs_local_run_resume_actions",
   "jobs_operational_hold_events",
   "jobs_operational_hold_heads",
+  "jobs_public_beta_cohorts",
+  "jobs_public_beta_enrollments",
+  "jobs_public_beta_overrides",
   "jobs_runner_legacy_inventory_authorities",
   "jobs_runner_account_subjects",
   "jobs_runner_purge_enforcements",
@@ -126,6 +129,21 @@ export const JOBS_PARITY_TABLES = [
 ];
 
 const REQUIRED_INDEX_SIGNATURES = new Map([
+  ["jobs_public_beta_cohorts", []],
+  [
+    "jobs_public_beta_enrollments",
+    [
+      "idx_jobs_public_beta_enrollments_account on jobs_public_beta_enrollments (account_id, cohort_id)",
+      "idx_jobs_public_beta_enrollments_source on jobs_public_beta_enrollments (cohort_id, source, admitted_at_ms desc)",
+    ].sort(),
+  ],
+  [
+    "jobs_public_beta_overrides",
+    [
+      "idx_jobs_public_beta_overrides_account on jobs_public_beta_overrides (account_id, cohort_id)",
+      "idx_jobs_public_beta_overrides_active on jobs_public_beta_overrides (cohort_id, denied, updated_at_ms desc) where denied = 1",
+    ].sort(),
+  ],
   [
     "jobs_job_integrity_attestations",
     [
@@ -3301,6 +3319,58 @@ export function checkPhase614BMigrationRegistration(runnerSource) {
   return issues;
 }
 
+export function checkPhase621MigrationRegistration(runnerSource) {
+  const issues = [];
+  const sqliteDeclaration =
+    /const\s+SQLITE_JOBS_PUBLIC_BETA_ACCESS\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/sqlite\/server-runtime\/060_jobs_public_beta_access\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(sqliteDeclaration)].length !== 1) {
+    issues.push(
+      "server SQLite migration runner must include 060_jobs_public_beta_access.sql exactly once",
+    );
+  }
+  const sqliteMigrations = extractRustArrayBody(runnerSource, "MIGRATIONS");
+  if (
+    !sqliteMigrations ||
+    (
+      sqliteMigrations.match(/\bSQLITE_JOBS_PUBLIC_BETA_ACCESS\b/g) ?? []
+    ).length !== 1
+  ) {
+    issues.push(
+      "server SQLite migration runner must register 060_jobs_public_beta_access.sql exactly once",
+    );
+  }
+
+  const postgresIdDeclaration =
+    /pub\s+const\s+JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID\s*:\s*&str\s*=\s*"038_jobs_public_beta_access\.sql"\s*;/g;
+  if ([...runnerSource.matchAll(postgresIdDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must declare 038_jobs_public_beta_access.sql exactly once",
+    );
+  }
+  const postgresDeclaration =
+    /const\s+POSTGRES_JOBS_PUBLIC_BETA_ACCESS\s*:\s*&str\s*=\s*include_str!\(\s*"\.\.\/\.\.\/\.\.\/infra\/postgres\/server-runtime\/038_jobs_public_beta_access\.sql"\s*\)\s*;/g;
+  if ([...runnerSource.matchAll(postgresDeclaration)].length !== 1) {
+    issues.push(
+      "server Postgres migration runner must include 038_jobs_public_beta_access.sql exactly once",
+    );
+  }
+  const postgresMigrations = extractRustArrayBody(
+    runnerSource,
+    "POSTGRES_POST_JOBS_MIGRATIONS",
+  );
+  const postgresRegistration =
+    /\(\s*JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID\s*,\s*POSTGRES_JOBS_PUBLIC_BETA_ACCESS\s*,?\s*\)/g;
+  if (
+    !postgresMigrations ||
+    [...postgresMigrations.matchAll(postgresRegistration)].length !== 1
+  ) {
+    issues.push(
+      "server Postgres migration runner must register 038_jobs_public_beta_access.sql exactly once",
+    );
+  }
+  return issues;
+}
+
 function main() {
   const repoRoot = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -3415,6 +3485,14 @@ function main() {
     repoRoot,
     "infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql",
   );
+  const sqlitePublicBetaAccessPath = path.join(
+    repoRoot,
+    "infra/sqlite/server-runtime/060_jobs_public_beta_access.sql",
+  );
+  const postgresPublicBetaAccessPath = path.join(
+    repoRoot,
+    "infra/postgres/server-runtime/038_jobs_public_beta_access.sql",
+  );
   const sqliteSource = [
     sqlitePath,
     sqliteCommunicationPath,
@@ -3430,6 +3508,7 @@ function main() {
     sqliteCanonicalTaxonomyAuthorityPath,
     sqliteOriginalSourceVerificationAuthorityPath,
     sqliteSignedJobIntegrityAuthorityPath,
+    sqlitePublicBetaAccessPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -3448,6 +3527,7 @@ function main() {
     postgresCanonicalTaxonomyAuthorityPath,
     postgresOriginalSourceVerificationAuthorityPath,
     postgresSignedJobIntegrityAuthorityPath,
+    postgresPublicBetaAccessPath,
   ]
     .map((sourcePath) => fs.readFileSync(sourcePath, "utf8"))
     .join("\n");
@@ -3456,6 +3536,7 @@ function main() {
     ...checkPhase613MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase614MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
     ...checkPhase614BMigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
+    ...checkPhase621MigrationRegistration(fs.readFileSync(sqlitePath, "utf8")),
   );
 
   const includePath =

@@ -1142,6 +1142,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
 .center-screen > svg { color: var(--accent); }
 .center-screen h1 { color: var(--text); font-size: 24px; }
 
+.public-beta-gate { min-height: 100vh; display: flex; flex-direction: column; background: var(--bg); }
+.public-beta-main { width: min(100% - 32px, 720px); margin: 0 auto; padding: 56px 0; display: grid; place-items: center; flex: 1; }
+.public-beta-card { width: 100%; padding: 48px 44px 30px; display: grid; justify-items: center; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); box-shadow: var(--shadow); text-align: center; }
+.public-beta-icon { width: 58px; height: 58px; margin-bottom: 22px; display: grid; place-items: center; border: 1px solid var(--border-strong); border-radius: 50%; background: var(--accent-soft); color: var(--accent); }
+.public-beta-icon.amber { border-color: color-mix(in srgb, var(--amber) 45%, var(--border)); background: var(--amber-soft); color: var(--amber); }
+.public-beta-icon.red { border-color: color-mix(in srgb, var(--red) 45%, var(--border)); background: var(--red-soft); color: var(--red); }
+.public-beta-card h1 { margin-top: 9px; color: var(--text); font-size: clamp(27px, 5vw, 36px); line-height: 1.12; }
+.public-beta-detail { max-width: 570px; margin-top: 14px; color: var(--text-soft); font-size: 14px; line-height: 1.6; }
+.public-beta-actions { margin-top: 25px; display: flex; justify-content: center; flex-wrap: wrap; gap: 9px; }
+.public-beta-note { width: 100%; margin-top: 30px; padding-top: 18px; border-top: 1px solid var(--border); color: var(--muted); font-size: 10px; line-height: 1.55; }
+.public-beta-footer { width: 100%; }
+
 @media (max-width: 1200px) {
   .app-header { grid-template-columns: minmax(150px, 1fr) auto; }
   .desktop-nav { display: none; }
@@ -1390,6 +1402,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, textarea:focus-visib
   .entry-plan-action > span { flex: 1 1 calc(100% - 30px); }
   .entry-plan-action .button { margin-left: 28px; }
   .entry-footer { padding: 0 16px; }
+  .public-beta-main { width: calc(100% - 20px); padding: 28px 0; }
+  .public-beta-card { padding: 34px 18px 24px; }
+  .public-beta-detail { font-size: 13px; }
+  .public-beta-actions { width: 100%; flex-direction: column; }
+  .public-beta-actions .button { width: 100%; }
+  .public-beta-footer { display: grid; }
   .search-status-band { min-width: 0; padding: 12px; grid-template-columns: 36px minmax(0, 1fr); gap: 10px; }
   .search-status-icon { width: 34px; height: 34px; }
   .search-status-copy { min-width: 0; }

@@ -65,5 +65,17 @@ Backup/off-host object storage contract:
 - `AWS_SECRET_ACCESS_KEY`
 - `AWS_DEFAULT_REGION=auto`
 
+These backup values belong only in root:root mode-0600
+`/etc/bluey-api/bluey-storage.env` with a prefix-scoped list/head/get/put key.
+They must not be loaded by `bluey-api.service`; application object storage uses
+separate `BLUEY_OBJECT_*` credentials. The host key has no delete, lifecycle,
+bucket-lock, or administrative permission.
+
+The production storage profile also fixes
+`BLUEY_PREFLIGHT_REQUIRE_RESTORE_DEADMAN_PROVIDER=1`. Phase 622 intentionally
+fails that release gate until a separate reviewed external control-plane
+provider can create, monitor, expire, clean up, and close restore-target leases
+without depending on the Bluey host. A local marker is never sufficient.
+
 Do not put Redis, Postgres, pgvector, object-store credentials, or provider keys
 on customer desktops. Those are server-side concerns only.

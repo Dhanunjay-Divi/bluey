@@ -182,6 +182,19 @@ async fn process_dispatch(
         finish_no_side_effect(pool, access, "dispatch_release_gate_closed", false)?;
         return Ok(());
     }
+    let request = match provider_request(pool, lease) {
+        Ok(request) => request,
+        Err(reason_code) => {
+            finish_no_side_effect(pool, access, reason_code, false)?;
+            return Ok(());
+        }
+    };
+
+    let request_started = jobs::mark_communication_action_request_started(pool, &access)
+        .map_err(|_| "request_start_evidence_failed")?;
+    if request_started.is_none() {
+        return Ok(());
+    }
     let credential = match prepare_credential(pool, client, lease, CredentialUse::Dispatch).await {
         Ok(credential) => credential,
         Err(failure) => {
@@ -196,16 +209,6 @@ async fn process_dispatch(
             return Ok(());
         }
     };
-    let request = match provider_request(pool, lease) {
-        Ok(request) => request,
-        Err(reason_code) => {
-            finish_no_side_effect(pool, access, reason_code, false)?;
-            return Ok(());
-        }
-    };
-
-    jobs::mark_communication_action_request_started(pool, &access)
-        .map_err(|_| "request_start_evidence_failed")?;
     let result =
         dispatch_before_lease_deadline(lease.action.lease_expires_at_ms, jobs::now_ms(), || {
             providers::dispatch(client, endpoints, &credential.access_token, &request)
@@ -313,7 +316,7 @@ fn finish_no_side_effect(
         },
     )
     .map(|_| ())
-    .map_err(|_| "pre_request_completion_evidence_failed")
+    .map_err(|_| "no_side_effect_completion_evidence_failed")
 }
 
 async fn run_reconciliation_cycle(
@@ -877,6 +880,40 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), "dispatch_lease_deadline_expired");
         assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn request_start_authority_loss_returns_before_credential_refresh_or_provider_dispatch() {
+        let source = include_str!("mod.rs");
+        let dispatch = source
+            .split("async fn process_dispatch(")
+            .nth(1)
+            .expect("communication dispatch implementation")
+            .split("async fn process_reconciliation(")
+            .next()
+            .expect("bounded communication dispatch implementation");
+        let provider_request = dispatch
+            .find("let request = match provider_request")
+            .expect("local provider request construction");
+        let request_start = dispatch
+            .find("mark_communication_action_request_started")
+            .expect("durable request-start boundary");
+        let authority_loss = dispatch
+            .find("if request_started.is_none()")
+            .expect("request-start authority-loss branch");
+        let credential_preparation = dispatch
+            .find("prepare_credential(pool, client, lease, CredentialUse::Dispatch)")
+            .expect("credential preparation boundary");
+        let provider_dispatch = dispatch
+            .find("providers::dispatch")
+            .expect("provider dispatch boundary");
+        assert!(
+            provider_request < request_start
+                && request_start < authority_loss
+                && authority_loss < credential_preparation
+                && credential_preparation < provider_dispatch
+        );
+        assert!(dispatch[authority_loss..credential_preparation].contains("return Ok(())"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -1,6 +1,7 @@
 //! Redacted operations audit events for exports, deletes, and owner support.
 
 use anyhow::Result;
+use postgres::GenericClient;
 use rusqlite::params;
 
 use crate::db::DbPool;
@@ -42,27 +43,46 @@ pub fn recent_events(pool: &DbPool, limit: i64) -> Result<Vec<OpsAuditEvent>> {
 
 fn record_event_sqlite(pool: &DbPool, input: OpsAuditEventInput) -> Result<()> {
     let conn = pool.get()?;
+    record_event_sqlite_client(&conn, &input)
+}
+
+fn record_event_postgres(pool: &DbPool, input: OpsAuditEventInput) -> Result<()> {
+    let mut conn = pool.get_pg()?;
+    record_event_postgres_client(&mut **conn, &input)
+}
+
+/// Insert an operations event using the caller's SQLite transaction.
+///
+/// This is intentionally transaction-local so privileged mutations cannot
+/// commit without their corresponding redacted audit record.
+pub fn record_event_sqlite_client(
+    conn: &rusqlite::Connection,
+    input: &OpsAuditEventInput,
+) -> Result<()> {
     conn.execute(
         "INSERT INTO ops_audit_events
             (id, account_id_hash, actor_account_id_hash, event_type, status, metadata_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             uuid::Uuid::new_v4().to_string(),
-            input.account_id_hash,
-            input.actor_account_id_hash,
-            input.event_type,
-            input.status,
+            input.account_id_hash.as_deref(),
+            input.actor_account_id_hash.as_deref(),
+            &input.event_type,
+            &input.status,
             input.metadata_json.to_string()
         ],
     )?;
     Ok(())
 }
 
-fn record_event_postgres(pool: &DbPool, input: OpsAuditEventInput) -> Result<()> {
-    let mut conn = pool.get_pg()?;
+/// Insert an operations event using the caller's PostgreSQL transaction.
+pub fn record_event_postgres_client(
+    client: &mut impl GenericClient,
+    input: &OpsAuditEventInput,
+) -> Result<()> {
     let id = uuid::Uuid::new_v4().to_string();
     let metadata_json = input.metadata_json.to_string();
-    conn.execute(
+    client.execute(
         "INSERT INTO ops_audit_events
             (id, account_id_hash, actor_account_id_hash, event_type, status, metadata_json)
          VALUES ($1, $2, $3, $4, $5, $6)",

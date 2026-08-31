@@ -115,9 +115,7 @@ fn current_authority_posting_representations(
     selection: PostingRepresentationSelection<'_>,
 ) -> Result<WorkspaceRepresentation> {
     for _ in 0..3 {
-        match current_authority_posting_representations_once(
-            pool, account_id, email, selection,
-        ) {
+        match current_authority_posting_representations_once(pool, account_id, email, selection) {
             Err(error) if error.is::<PostingRepresentationSnapshotChanged>() => continue,
             result => return result,
         }
@@ -395,9 +393,7 @@ fn load_posting_representation_inputs_postgres(
             "SELECT preferences_json FROM jobs_preferences WHERE account_id=$1",
             &[&account_id],
         )?
-        .map(|row| {
-            parse_json::<JobPreferences>(row.get(0), "Jobs representation preferences")
-        })
+        .map(|row| parse_json::<JobPreferences>(row.get(0), "Jobs representation preferences"))
         .transpose()?
         .unwrap_or_default(),
     );
@@ -411,8 +407,7 @@ fn load_posting_representation_inputs_postgres(
     for row in track_rows {
         let id: String = row.get(0);
         let active = row.get::<_, i32>(2) != 0;
-        let mut track: CareerTrack =
-            parse_json(row.get(1), "Jobs representation Career Track")?;
+        let mut track: CareerTrack = parse_json(row.get(1), "Jobs representation Career Track")?;
         track.id = id;
         let activation_drift = track.active != active;
         track.active = active;
@@ -596,10 +591,9 @@ fn represent_posting_page_postgres(
     let discovery = load_discovery_authorities_postgres(tx, account_id, &postings)?;
     let mut represented = Vec::with_capacity(postings.len());
     for posting in postings {
-        let projection =
-            resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms(
-                tx, account_id, &posting, db_time_ms,
-            )?;
+        let projection = resolve_composed_job_integrity_projection_postgres_tx_after_prelock_at_ms(
+            tx, account_id, &posting, db_time_ms,
+        )?;
         let (mut projected, mut eligibility) = representation_before_ats(
             &posting,
             &projection,
@@ -982,7 +976,7 @@ pub fn account_export(
     account_id: &str,
     email: &str,
 ) -> Result<Option<JobsAccountExport>> {
-    let exists = crate::db::run_blocking_db(|| match pool {
+    let has_profile = crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => pool
             .get()?
             .query_row(
@@ -1000,17 +994,23 @@ pub fn account_export(
             .map(|row| row.get::<_, bool>(0))
             .context("check Jobs export data"),
     })?;
-    if !exists {
+    let public_beta = crate::db::jobs_beta_access::public_beta_account_export(pool, account_id)?;
+    if !has_profile && public_beta.is_empty() {
         return Ok(None);
     }
 
-    let _ = ensure_primary_application_identity(pool, account_id, email)?;
-    let representation =
-        export_current_authority_posting_representations(pool, account_id, email)?;
-    let mut workspace = build_workspace(pool, account_id, email, representation)?;
-    for session in &mut workspace.browser_sessions {
-        session.takeover_url = None;
-    }
+    let workspace = if has_profile {
+        let _ = ensure_primary_application_identity(pool, account_id, email)?;
+        let representation =
+            export_current_authority_posting_representations(pool, account_id, email)?;
+        let mut workspace = build_workspace(pool, account_id, email, representation)?;
+        for session in &mut workspace.browser_sessions {
+            session.takeover_url = None;
+        }
+        Some(workspace)
+    } else {
+        None
+    };
     Ok(Some(JobsAccountExport {
         workspace,
         canonical_track_policy_ledger: export_canonical_track_policy_ledger(pool, account_id)?,
@@ -1021,6 +1021,8 @@ pub fn account_export(
         communication_actions: export_communication_actions(pool, account_id)?,
         communication_evidence: export_communication_evidence(pool, account_id)?,
         communication_reconciliations: export_communication_reconciliations(pool, account_id)?,
+        public_beta_enrollments: public_beta.enrollments,
+        public_beta_overrides: public_beta.overrides,
     }))
 }
 
@@ -1088,7 +1090,9 @@ mod workspace_representation_tests {
                 ],
             );
             assert_eq!(
-                representation.matches("representation_db_now_postgres").count(),
+                representation
+                    .matches("representation_db_now_postgres")
+                    .count(),
                 1,
                 "representation must use one PostgreSQL database time"
             );
@@ -1312,13 +1316,8 @@ mod workspace_representation_tests {
             signal_codes: Vec::new(),
             authority: None,
         };
-        let composed = compose_job_integrity_projection(
-            &raw,
-            original_source,
-            None,
-            mismatch,
-            false,
-        );
+        let composed =
+            compose_job_integrity_projection(&raw, original_source, None, mismatch, false);
         let mut projected = raw;
         projected.discovery_evidence = composed.discovery_evidence;
         let mut hard_failures = Vec::new();
@@ -1410,9 +1409,9 @@ mod workspace_representation_tests {
         .expect("build authoritative workspace")
         .matches;
         let response = workspace_matches
-        .into_iter()
-        .find(|posting| posting.id == relational_id)
-        .expect("workspace posting");
+            .into_iter()
+            .find(|posting| posting.id == relational_id)
+            .expect("workspace posting");
 
         let listed = list_current_posting_representations(
             &pool,
@@ -1590,31 +1589,31 @@ mod workspace_representation_tests {
         let exported = account_export(&pool, "acct-representation-bound", "bound@example.com")
             .expect("export oversized account")
             .expect("oversized account export");
+        let workspace = exported
+            .workspace
+            .as_ref()
+            .expect("profile workspace export");
         assert_eq!(
-            exported.workspace.matches.len(),
+            workspace.matches.len(),
             CURRENT_AUTHORITY_REPRESENTATION_MAX_POSTINGS + 1
         );
-        assert!(exported
-            .workspace
+        assert!(workspace
             .matches
             .windows(2)
             .all(|pair| pair[0].id < pair[1].id));
-        assert!(!exported
-            .workspace
+        assert!(!workspace
             .matches
             .iter()
             .any(|posting| posting.id == "other-tenant-posting"));
-        assert!(exported
-            .workspace
+        assert!(workspace
             .matches
             .iter()
             .any(|posting| posting.id == "bounded-posting-0499"));
-        assert!(!exported
-            .workspace
+        assert!(!workspace
             .matches
             .iter()
             .any(|posting| posting.id == "zzzz-mutated-embedded-id"));
-        for posting in &exported.workspace.matches {
+        for posting in &workspace.matches {
             assert_eq!(
                 posting.discovery_evidence.employer_verification_status,
                 "unknown"
@@ -1627,8 +1626,7 @@ mod workspace_representation_tests {
             assert!(!eligibility.can_queue_local);
             assert!(!eligibility.can_queue_cloud);
         }
-        let denied = exported
-            .workspace
+        let denied = workspace
             .matches
             .iter()
             .find(|posting| posting.id == "bounded-posting-0250")
@@ -1715,10 +1713,8 @@ mod workspace_representation_tests {
             )?;
             let mut aba_connection = pool.get_pg()?;
             let mut aba_tx = aba_connection.transaction()?;
-            let before_aba = posting_representation_mutable_inputs_sha256_postgres(
-                &mut aba_tx,
-                &account_id,
-            )?;
+            let before_aba =
+                posting_representation_mutable_inputs_sha256_postgres(&mut aba_tx, &account_id)?;
             pool.get_pg()?.execute(
                 "UPDATE jobs_attempt_reservations
                     SET status='running',updated_at_ms=2
@@ -1731,10 +1727,8 @@ mod workspace_representation_tests {
                   WHERE account_id=$1 AND id=$2",
                 &[&account_id, &reservation_id],
             )?;
-            let after_aba = posting_representation_mutable_inputs_sha256_postgres(
-                &mut aba_tx,
-                &account_id,
-            )?;
+            let after_aba =
+                posting_representation_mutable_inputs_sha256_postgres(&mut aba_tx, &account_id)?;
             assert_ne!(
                 before_aba, after_aba,
                 "PostgreSQL xmin must expose an exact-value ABA rewrite"
@@ -1768,15 +1762,17 @@ mod workspace_representation_tests {
                   WHERE account_id=$1 AND id=$2",
                 &[&account_id, &posting.id, &corrupted_json],
             )?;
-            let exported = account_export(&pool, &account_id, &email)?
-                .expect("PostgreSQL account export");
-            assert!(exported
+            let exported =
+                account_export(&pool, &account_id, &email)?.expect("PostgreSQL account export");
+            let workspace = exported
                 .workspace
+                .as_ref()
+                .expect("PostgreSQL profile workspace export");
+            assert!(workspace
                 .matches
                 .iter()
                 .any(|candidate| candidate.id == posting.id));
-            assert!(!exported
-                .workspace
+            assert!(!workspace
                 .matches
                 .iter()
                 .any(|candidate| candidate.id == "zzzz-mutated-pg-embedded-id"));

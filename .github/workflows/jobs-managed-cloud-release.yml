@@ -95,6 +95,11 @@ jobs:
           MIGRATION_SET_SHA256=$(sha256sum release/contracts/migration-contract.json | cut -d' ' -f1)
           PROTOCOL_SET_SHA256=$(sha256sum release/contracts/protocol-contract.json | cut -d' ' -f1)
           docker buildx create --driver docker-container --use
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE/jobs:/workspace:ro" \
+            --workdir /workspace \
+            "$NODE_IMAGE" \
+            sh -euc 'node -e "const [major,minor]=process.versions.node.split(\".\").map(Number);if(major<22||(major===22&&minor<13))process.exit(1)" && npm audit --audit-level=moderate'
           docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
             --build-arg "BLUEY_JOBS_BUILD_ID=$RELEASE_ID-jobs-api" \
             --build-arg "BLUEY_JOBS_CONFIG_SCHEMA_SHA256=$CONFIG_SCHEMA_SHA256" \

@@ -78,9 +78,11 @@ browsers, scale each queue independently:
 ## Beta flag
 
 Release builds return 404 for Jobs APIs unless
-`BLUEY_JOBS_BETA_ENABLED=1`. Local debug builds remain enabled for development.
-The static portal may be deployed before the API flag is enabled without
-exposing customer data or automation endpoints.
+`BLUEY_JOBS_BETA_ENABLED=1`. The flag is the master kill switch; production
+customer routes also require a durable admission in the bounded public cohort.
+The additive cohort migration starts at `draft` with cap `0`. The static portal
+may be deployed before the master flag is enabled without exposing customer
+data or automation endpoints.
 
 ## Operational completion gates
 

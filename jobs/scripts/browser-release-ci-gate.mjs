@@ -1940,9 +1940,11 @@ export function validateWorkflowContract(workflowSource) {
     "path: trusted-release-tools",
     "npm ci --ignore-scripts --prefix jobs",
     "npm ci --prefix candidate-source/jobs",
+    "npm audit --prefix candidate-source/jobs --audit-level=moderate",
     "npm run --prefix candidate-source/jobs/browser build",
     "npm run --prefix candidate-source/jobs/browser prepare:chromium",
     "npm ci --prefix trusted-release-tools/jobs",
+    "npm audit --prefix trusted-release-tools/jobs --audit-level=moderate",
     "npm run --prefix trusted-release-tools/jobs/browser build",
     "trusted-release-tools/jobs/browser/scripts/package-release.mjs",
     "validatePreparedPackagingTree('./candidate-source/jobs/browser')",
@@ -2100,11 +2102,22 @@ export function validateWorkflowContract(workflowSource) {
   const preparationJob = workflowSource.match(
     /^  prepare-candidate:\n([\s\S]*?)(?=^  candidate-targets:)/m,
   )?.[1];
+  const preparationDependencies = preparationJob?.indexOf(
+    "npm ci --prefix candidate-source/jobs",
+  ) ?? -1;
+  const preparationAudit = preparationJob?.indexOf(
+    "npm audit --prefix candidate-source/jobs --audit-level=moderate",
+  ) ?? -1;
+  const preparationBuild = preparationJob?.indexOf(
+    "npm run --prefix candidate-source/jobs build --workspace @bluey/jobs-automation",
+  ) ?? -1;
   if (
     !preparationJob ||
     preparationJob.includes("${{ secrets.") ||
     preparationJob.includes("bluey-browser-release-signing") ||
-    !preparationJob.includes("npm ci --prefix candidate-source/jobs") ||
+    preparationDependencies < 0 ||
+    preparationAudit <= preparationDependencies ||
+    preparationBuild <= preparationAudit ||
     !preparationJob.includes(
       "npm run --prefix candidate-source/jobs/browser build",
     ) ||
@@ -2147,11 +2160,17 @@ export function validateWorkflowContract(workflowSource) {
   const trustedDependencies = candidateJob.indexOf(
     "npm ci --prefix trusted-release-tools/jobs",
   );
+  const trustedDependencyAudit = candidateJob.indexOf(
+    "npm audit --prefix trusted-release-tools/jobs --audit-level=moderate",
+  );
   const safeExtraction = candidateJob.indexOf(
     "browser-release-ci-gate.mjs extract-prepared",
   );
   const candidateDependencies = candidateJob.indexOf(
     "npm ci --ignore-scripts --prefix candidate-source/jobs",
+  );
+  const candidateDependencyAudit = candidateJob.indexOf(
+    "npm audit --prefix candidate-source/jobs --audit-level=moderate",
   );
   const packageStep = candidateJob.indexOf(
     "- name: Package with trusted tooling and step-scoped signing authority",
@@ -2167,9 +2186,11 @@ export function validateWorkflowContract(workflowSource) {
     preparedDownload <= trustedCheckout ||
     trustedInstall <= preparedDownload ||
     trustedDependencies <= trustedInstall ||
-    safeExtraction <= trustedDependencies ||
+    trustedDependencyAudit <= trustedDependencies ||
+    safeExtraction <= trustedDependencyAudit ||
     candidateDependencies <= safeExtraction ||
-    packageStep <= trustedInstall ||
+    candidateDependencyAudit <= candidateDependencies ||
+    packageStep <= candidateDependencyAudit ||
     sealStep <= packageStep ||
     nativeMacStep <= sealStep ||
     candidateJob.slice(0, packageStep).includes("${{ secrets.") ||

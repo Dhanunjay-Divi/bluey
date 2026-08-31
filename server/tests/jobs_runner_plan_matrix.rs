@@ -15,6 +15,9 @@ use bluey_server::{
     db::{
         accounts::Account,
         jobs::{self, JobApplication, JobDiscoveryEvidence, JobPosting, JobPreferences},
+        jobs_beta_access::{
+            self, PublicBetaAccessReason, PublicBetaCohortState, PublicBetaCohortUpdate,
+        },
         open_pool, run_migrations, DbPool,
     },
 };
@@ -386,6 +389,41 @@ fn assign_browser_release_channel(pool: &DbPool, account_id: &str) {
     .expect("assign matrix Browser release channel");
 }
 
+fn open_public_beta_for_test(pool: &DbPool) {
+    let audit_actor = Account::create(
+        pool,
+        "jobs-runner-plan-matrix-beta-admin@example.com",
+        "unused-test-password-hash",
+    )
+    .expect("create matrix public-beta audit actor");
+    assert_eq!(
+        Account::mark_email_verified(pool, &audit_actor.id)
+            .expect("verify matrix public-beta audit actor"),
+        1
+    );
+    Account::set_admin(pool, &audit_actor.id, true)
+        .expect("authorize matrix public-beta audit actor");
+
+    let cohort = jobs_beta_access::get_public_beta_cohort(pool)
+        .expect("load default matrix public-beta cohort");
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let opened = jobs_beta_access::update_public_beta_cohort_audited(
+        pool,
+        PublicBetaCohortUpdate {
+            expected_revision: cohort.revision,
+            state: PublicBetaCohortState::Open,
+            opens_at_ms: Some(now_ms - 60_000),
+            closes_at_ms: Some(now_ms + 60 * 60 * 1_000),
+            hard_cap: 16,
+        },
+        &audit_actor.id,
+    )
+    .expect("open bounded matrix public-beta cohort");
+    assert_eq!(opened.state, PublicBetaCohortState::Open);
+    assert_eq!(opened.hard_cap, 16);
+    assert_eq!(opened.assigned_count, 0);
+}
+
 impl TestContext {
     fn boot() -> Self {
         let db_path = std::env::temp_dir().join(format!(
@@ -394,6 +432,7 @@ impl TestContext {
         ));
         let pool = open_pool(&db_path).expect("open matrix database");
         run_migrations(&pool).expect("run matrix migrations");
+        open_public_beta_for_test(&pool);
         let config = Config {
             port: 0,
             db_path: db_path.clone(),
@@ -426,6 +465,28 @@ impl TestContext {
         let email = format!("jobs-runner-{label}-{}@example.com", uuid::Uuid::new_v4());
         let account = Account::create(&self.pool, &email, "unused-test-password-hash")
             .expect("create matrix account");
+        assert_eq!(
+            Account::mark_email_verified(&self.pool, &account.id)
+                .expect("verify matrix account for public-beta admission"),
+            1
+        );
+        let admission = jobs_beta_access::evaluate_or_enroll_public_beta(&self.pool, &account.id)
+            .expect("admit matrix account to the open public-beta cohort");
+        assert_eq!(admission.reason, PublicBetaAccessReason::Admitted);
+        let admission_row: (String, i64, i64) = self
+            .pool
+            .get()
+            .expect("open matrix database")
+            .query_row(
+                "SELECT e.source, a.email_verified_at IS NOT NULL, a.is_temporary
+                   FROM jobs_public_beta_enrollments e
+                   JOIN accounts a ON a.id = e.account_id
+                  WHERE e.account_id = ?1",
+                rusqlite::params![account.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("load durable matrix public-beta enrollment");
+        assert_eq!(admission_row, ("public_window".to_string(), 1, 0));
         jobs::set_entitlement_plan(&self.pool, &account.id, plan).expect("set matrix entitlement");
         let token = jwt::issue(TEST_SECRET, &account.id, TokenKind::Access)
             .expect("issue matrix access token");
@@ -621,7 +682,7 @@ fn jobs_api_handlers_have_no_direct_workflow_gateway_boundary() {
 
 #[tokio::test]
 #[serial]
-async fn free_pro_cloud_entitlements_remain_observable_but_review_first_blocks_effects() {
+async fn free_pro_cloud_entitlements_remain_observable_while_effects_fail_closed() {
     let _env = EnvGuard::capture(&[
         "BLUEY_JOBS_BETA_ENABLED",
         "BLUEY_JOBS_DATA_KEY",
@@ -677,13 +738,24 @@ async fn free_pro_cloud_entitlements_remain_observable_but_review_first_blocks_e
         assert_eq!(entitlement.cloud_browser, expected_cloud);
     }
 
-    // Review-first is a hard boundary even for the fully entitled Cloud plan.
+    // An awaiting-review application remains effect-free even for the fully entitled Cloud plan.
+    // The current signed job-integrity authority intentionally denies before the later queue-state
+    // check, so this assertion does not claim to exercise that unreachable branch.
     let review = ctx.account("review-boundary", "cloud");
     let awaiting_review = ctx.prepare(&review.account, "review-boundary");
-    let (local_status, _) = ctx.queue(&awaiting_review, &review.token, "local").await;
-    let (cloud_status, _) = ctx.queue(&awaiting_review, &review.token, "cloud").await;
+    let (local_status, local_body) = ctx.queue(&awaiting_review, &review.token, "local").await;
+    let (cloud_status, cloud_body) = ctx.queue(&awaiting_review, &review.token, "cloud").await;
     assert_eq!(local_status, StatusCode::CONFLICT);
     assert_eq!(cloud_status, StatusCode::CONFLICT);
+    for body in [local_body, cloud_body] {
+        assert_eq!(
+            body.as_str(),
+            Some(
+                "current signed job-integrity authority does not permit application approval \
+                 (original_source_verification_inactive)"
+            )
+        );
+    }
     assert_eq!(
         jobs::get_entitlement(&ctx.pool, &review.account.id)
             .expect("read review entitlement")

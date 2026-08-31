@@ -11,7 +11,7 @@ pub struct OperationalHoldMetric {
     pub active_count: i64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MetricsSnapshot {
     pub accounts: i64,
     pub balance_sum: i64,
@@ -23,12 +23,46 @@ pub struct MetricsSnapshot {
     pub credit_batches: i64,
     pub usage_24h: i64,
     pub webhook_processed: i64,
+    pub jobs_public_beta_state: &'static str,
+    pub jobs_public_beta_hard_cap: i64,
+    pub jobs_public_beta_assigned: i64,
+    pub jobs_public_beta_live_enrollments: i64,
+    pub jobs_public_beta_public_enrollments: i64,
+    pub jobs_public_beta_admin_enrollments: i64,
+    pub jobs_public_beta_active_denials: i64,
     /// Active operational holds grouped only by closed, low-cardinality
     /// capability and scope-kind dimensions. Scope identifiers and reasons
     /// never cross this read-model boundary.
     pub operational_holds: Vec<OperationalHoldMetric>,
     pub paused_discovery_sources: i64,
     pub open_ats_circuits: i64,
+}
+
+impl Default for MetricsSnapshot {
+    fn default() -> Self {
+        Self {
+            accounts: 0,
+            balance_sum: 0,
+            trial_active: 0,
+            request_idempotency_total: 0,
+            request_idempotency_complete: 0,
+            request_idempotency_in_progress: 0,
+            mark_complete_failed: 0,
+            credit_batches: 0,
+            usage_24h: 0,
+            webhook_processed: 0,
+            jobs_public_beta_state: "draft",
+            jobs_public_beta_hard_cap: 0,
+            jobs_public_beta_assigned: 0,
+            jobs_public_beta_live_enrollments: 0,
+            jobs_public_beta_public_enrollments: 0,
+            jobs_public_beta_admin_enrollments: 0,
+            jobs_public_beta_active_denials: 0,
+            operational_holds: Vec::new(),
+            paused_discovery_sources: 0,
+            open_ats_circuits: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,6 +73,13 @@ pub struct JobsReadinessSnapshot {
 }
 
 pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
+    let public_beta = crate::db::jobs_beta_access::public_beta_aggregate_snapshot(pool)?;
+    let public_beta_state = match public_beta.state {
+        crate::db::jobs_beta_access::PublicBetaCohortState::Draft => "draft",
+        crate::db::jobs_beta_access::PublicBetaCohortState::Open => "open",
+        crate::db::jobs_beta_access::PublicBetaCohortState::ClosedToNew => "closed_to_new",
+        crate::db::jobs_beta_access::PublicBetaCohortState::Suspended => "suspended",
+    };
     crate::db::run_blocking_db(|| match pool {
         DbPool::Sqlite(_) => {
             let conn = pool.get()?;
@@ -79,6 +120,13 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                     &conn,
                     "SELECT COUNT(*) FROM stripe_webhook_events WHERE processed_at IS NOT NULL",
                 )?,
+                jobs_public_beta_state: public_beta_state,
+                jobs_public_beta_hard_cap: public_beta.hard_cap,
+                jobs_public_beta_assigned: public_beta.assigned_count,
+                jobs_public_beta_live_enrollments: public_beta.live_enrollment_count,
+                jobs_public_beta_public_enrollments: public_beta.public_enrollment_count,
+                jobs_public_beta_admin_enrollments: public_beta.admin_enrollment_count,
+                jobs_public_beta_active_denials: public_beta.active_denial_count,
                 operational_holds: operational_hold_metrics_sqlite(&conn)?,
                 paused_discovery_sources: paused_discovery_sources_sqlite(&conn)?,
                 open_ats_circuits: open_ats_circuits_sqlite(&conn)?,
@@ -126,6 +174,13 @@ pub fn snapshot(pool: &DbPool) -> Result<MetricsSnapshot> {
                     &mut conn,
                     "SELECT COUNT(*)::bigint FROM stripe_webhook_events WHERE processed_at IS NOT NULL",
                 )?,
+                jobs_public_beta_state: public_beta_state,
+                jobs_public_beta_hard_cap: public_beta.hard_cap,
+                jobs_public_beta_assigned: public_beta.assigned_count,
+                jobs_public_beta_live_enrollments: public_beta.live_enrollment_count,
+                jobs_public_beta_public_enrollments: public_beta.public_enrollment_count,
+                jobs_public_beta_admin_enrollments: public_beta.admin_enrollment_count,
+                jobs_public_beta_active_denials: public_beta.active_denial_count,
                 operational_holds: operational_hold_metrics_pg(&mut conn)?,
                 paused_discovery_sources: paused_discovery_sources_pg(&mut conn)?,
                 open_ats_circuits: open_ats_circuits_pg(&mut conn)?,

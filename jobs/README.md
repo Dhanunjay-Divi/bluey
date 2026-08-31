@@ -45,8 +45,11 @@ Unknown required fields and verification challenges preserve the browser and
 pause the workflow for up to 24 hours; resolving the Intervention Inbox resumes
 the same application.
 
-The release Jobs API is dark unless `BLUEY_JOBS_BETA_ENABLED=1`. Run the
-standalone service with:
+The release Jobs API is dark unless `BLUEY_JOBS_BETA_ENABLED=1`. In production,
+that master switch is necessary but not sufficient: an authenticated verified
+account must also hold a durable admission in the bounded public cohort. The
+cohort migration seeds `draft` with cap `0`, so deployment cannot open customer
+access by accident. Run the standalone service for local development with:
 
 ```bash
 cd server

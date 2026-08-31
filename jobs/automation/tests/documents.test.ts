@@ -418,8 +418,9 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 async function extractPdfText(path: string): Promise<string> {
-  const pdf = await getDocument({ data: new Uint8Array(await readFile(path)) }).promise;
+  const loadingTask = getDocument({ data: new Uint8Array(await readFile(path)) });
   try {
+    const pdf = await loadingTask.promise;
     const pages: string[] = [];
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
       const content = await (await pdf.getPage(pageNumber)).getTextContent();
@@ -427,7 +428,7 @@ async function extractPdfText(path: string): Promise<string> {
     }
     return pages.join("\n").replace(/\s+/gu, " ").trim();
   } finally {
-    await pdf.destroy();
+    await loadingTask.destroy();
   }
 }
 

@@ -7,6 +7,20 @@ under `docs/release/`.
 
 ### Added
 
+- Added a durable, public, first-come Bluey Jobs cohort with an atomic hard cap,
+  sticky admissions, revisioned administrative suspension and denial,
+  privacy-safe aggregate telemetry, and a fail-closed master kill switch. The
+  migration defaults to `draft` with cap `0`; this change does not itself open
+  production access or enable any model, Browser, workflow, mailbox,
+  communication, or provider-write effect.
+- Prepared the bounded Bluey Jobs V1 public-autonomy composition: admitted
+  accounts retain the existing independent Career Track, signed worker,
+  managed runner, final-submit, mailbox, and reviewed communication
+  authorities, while current public-beta denial, suspension, deletion, and the
+  master switch are rechecked before every new employer-facing effect. Exact
+  already-started replay and lookup-only reconciliation remain available. This
+  source preparation does not deploy the portal, open the cohort, or enable an
+  external-write flag.
 - Added the Phase 620A1 Bluey Jobs business-messaging no-egress kernel for original,
   deterministic owner-command planning across WhatsApp Business Platform and Apple Messages for
   Business. A strict synthetic-only TypeScript simulator and non-default Rust verifier share
@@ -302,12 +316,77 @@ under `docs/release/`.
 
 ### Fixed
 
+- Corrected the hosted Jobs runner plan-matrix fixture to establish and read back verified,
+  durable public-beta admission before testing Free/Pro/Cloud and application-integrity
+  boundaries. The regression now proves it crossed the valid outer beta gate before the
+  preexisting signed job-integrity fence; production middleware, runtime authority, flags, and
+  cohort state are unchanged.
 - Raised the combined Linux Jobs CI lane's closed timeout from 45 to 90 minutes after the exact
   PR-head run passed every preceding gate but was cancelled with 89 of 108 integration tests green
   and zero failures. The pre-install Jobs CI self-test now rejects any drift from the bounded
   90-minute contract; test commands, release authority, feature flags, and production behavior are
   unchanged. The replacement exact-tip hosted run completed every gate in 48 minutes 25 seconds,
   including all 108 integration tests and both simulator-verifier steps.
+- Removed the Bluey Jobs dependency-security release blocker by upgrading both résumé PDF
+  extractors to patched PDF.js 6.2.108, retaining text-only parsing with loading-task cleanup,
+  and refreshing vulnerable DOMPurify, PostCSS/Nano ID, brace-expansion, JS-YAML, and Undici
+  resolutions. Jobs pull requests and release checks now fail on any known moderate-or-higher
+  dependency advisory; no provider, application, mailbox, deployment, flag, or cohort effect was
+  enabled.
+- Closed the Phase 621/622 acceptance-review findings: deletion-pending
+  accounts cannot enroll, receive an administrator grant, or acquire a new
+  override; audit actors must be current real administrators; all beta
+  responses and portal status reads are private and non-storable; beta-only
+  enrollment and denial data is included in account export without creating a
+  profile; migration-array registration and live-versus-assigned metric
+  invariants are structurally guarded; and queued application/communication
+  work rechecks current beta authority before a new external effect. No raw
+  account, resume, application, message, provider, or credential content was
+  added to logs or metrics.
+- Preserved byte-identical local-submit recovery for both review-first schema-3
+  and ATS-certified schema-4 proofs after beta or runner distribution closes.
+  Exact replay now returns the original database-owned authorization timestamp;
+  fresh submission authority remains fail-closed.
+- Aligned the Jobs operations-route regression tests with the hardened
+  `private, no-store, max-age=0` and `Vary: Authorization` response contract;
+  production routing and cache policy are unchanged.
+- Aligned legacy runner-volume and account-deletion fixtures with the new
+  public-beta effect fence: the exact runner test now creates a durable
+  verified admission, while deletion tests accept the earlier fail-closed
+  denial and retain their no-mutation proofs. Production effect behavior is
+  unchanged.
+- Replaced the local Browser distribution claim's eight-position helper
+  interface with one typed claim request, keeping replay and authorization
+  behavior unchanged while restoring the strict warning-free source gate.
+- Corrected Linux storage descriptor attestation to dereference only already-open `/dev/fd`
+  handles while trusted paths remain non-following; the portable regression now proves stable
+  environment/lock positives and exact substitution rejection reasons across GNU and BSD `stat`.
+- Extended the same follow-only descriptor attestation to the cloud release preflight and made its
+  portable fixture reject any `/dev/fd` identity check that omits explicit dereferencing.
+- Corrected the Phase 621 local-runner authority integration fixture so it sends a schema-valid
+  unauthorized claim and proves the distinct master-off 404 and distribution-paused 503
+  boundaries instead of stopping at JSON extraction with 422.
+- Closed the Phase 621 public-beta administration audit bypass: production cohort, grant, and
+  override mutations now require an actor-backed audit context, while unaudited setup helpers are
+  private to unit tests and source guarded. The configured-PostgreSQL forced-audit-failure fixture
+  now uses transactionally installed, unique, actor-scoped trigger/function names and panic-safe,
+  absence-verified cleanup.
+- Replaced count-only host backup retention and silent once-daily disk checks
+  with locked, staged backup pairs; exact offsite read-back proof; bounded,
+  proof-aware count/capacity retention; legacy proof bootstrap; self-cleaning
+  locked log archives; durable component-sized disk status; and 70%/16 GB
+  early warning before the unchanged 80%/8 GB release stop line. Production's
+  15-minute guard now also warns on a 120-minute backup and fails at 180 minutes
+  or on missing checksum/offsite-proof metadata without repeatedly hashing the
+  full dump. Hard per-snapshot/archive bounds, root-trusted storage paths,
+  backup and log-archive run dead-men, inode checks, reason-aware alerts,
+  root-only operations credentials, class-prefixed R2 lifecycle keys, and a
+  release-preflight guard prevent the same migration/capacity failure from
+  silently recurring. The storage installer also prepares root-owned restore
+  lease/lock directories, while production preflight deliberately remains
+  blocked until a separately reviewed external provider can create, monitor,
+  expire, and close restore-target cleanup registrations independent of the
+  Bluey host; a locally consumed marker cannot satisfy that gate.
 - Closed Phase 613 review defects FIX-694 through FIX-711: monotonic taxonomy/account/Track replay
   and execution fences; fail-closed canonical classification; typed public-ATS evidence; portal
   mutation/read-back ordering; retry-safe Track writes; PostgreSQL Auto-submit revocation,

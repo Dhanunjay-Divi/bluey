@@ -598,7 +598,7 @@ export interface JobsEntitlement {
   additional_inbox_cents: number;
 }
 
-export type RunnerAvailabilityStatus = "available" | "invited_beta" | "upgrade_required";
+export type RunnerAvailabilityStatus = "available" | "limited_beta" | "upgrade_required";
 
 export type LocalBrowserReleaseChannel = "internal" | "beta" | "stable";
 export type LocalBrowserReleasePlatform = "macos" | "windows";

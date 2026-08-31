@@ -344,7 +344,8 @@ async fn private_no_store(request: Request, next: Next) -> Response {
 }
 
 pub(crate) async fn private_admin_no_store(request: Request, next: Next) -> Response {
-    let private_admin_response = request.uri().path().starts_with("/admin/");
+    let path = request.uri().path();
+    let private_admin_response = path.starts_with("/admin/") || path == "/api/jobs/beta-access";
     let mut response = next.run(request).await;
     if private_admin_response {
         set_private_headers(&mut response);
@@ -355,11 +356,14 @@ pub(crate) async fn private_admin_no_store(request: Request, next: Next) -> Resp
 fn set_private_headers(response: &mut Response) {
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("private, no-store"),
+        HeaderValue::from_static("private, no-store, max-age=0"),
     );
     response
         .headers_mut()
         .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Authorization"));
 }
 
 #[cfg(test)]
@@ -655,8 +659,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(append.status(), StatusCode::CREATED);
-        assert_eq!(append.headers()[header::CACHE_CONTROL], "private, no-store");
+        assert_eq!(
+            append.headers()[header::CACHE_CONTROL],
+            "private, no-store, max-age=0"
+        );
         assert_eq!(append.headers()[header::PRAGMA], "no-cache");
+        assert_eq!(append.headers()[header::VARY], "Authorization");
         let append_body = axum::body::to_bytes(append.into_body(), 64 * 1024)
             .await
             .unwrap();
@@ -811,7 +819,7 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
                 assert_eq!(
                     response.headers().get(header::CACHE_CONTROL),
-                    Some(&HeaderValue::from_static("private, no-store")),
+                    Some(&HeaderValue::from_static("private, no-store, max-age=0",)),
                     "{path}"
                 );
                 assert_eq!(
@@ -832,7 +840,7 @@ mod tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
             assert_eq!(
                 response.headers().get(header::CACHE_CONTROL),
-                Some(&HeaderValue::from_static("private, no-store"))
+                Some(&HeaderValue::from_static("private, no-store, max-age=0",))
             );
             assert_eq!(
                 response.headers().get(header::PRAGMA),
@@ -881,7 +889,7 @@ mod tests {
             assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
             assert_eq!(
                 forbidden.headers()[header::CACHE_CONTROL],
-                "private, no-store"
+                "private, no-store, max-age=0"
             );
 
             let allowed = router
@@ -912,7 +920,7 @@ mod tests {
             );
             assert_eq!(
                 unsupported_media_type.headers()[header::CACHE_CONTROL],
-                "private, no-store"
+                "private, no-store, max-age=0"
             );
             assert_eq!(unsupported_media_type.headers()[header::PRAGMA], "no-cache");
 
@@ -934,7 +942,7 @@ mod tests {
             assert_eq!(payload_too_large.status(), StatusCode::PAYLOAD_TOO_LARGE);
             assert_eq!(
                 payload_too_large.headers()[header::CACHE_CONTROL],
-                "private, no-store"
+                "private, no-store, max-age=0"
             );
             assert_eq!(payload_too_large.headers()[header::PRAGMA], "no-cache");
 
@@ -965,7 +973,7 @@ mod tests {
             assert_eq!(unknown_field.status(), StatusCode::UNPROCESSABLE_ENTITY);
             assert_eq!(
                 unknown_field.headers()[header::CACHE_CONTROL],
-                "private, no-store"
+                "private, no-store, max-age=0"
             );
         }
 
@@ -1001,7 +1009,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(fenced.status(), StatusCode::CONFLICT);
-            assert_eq!(fenced.headers()[header::CACHE_CONTROL], "private, no-store");
+            assert_eq!(
+                fenced.headers()[header::CACHE_CONTROL],
+                "private, no-store, max-age=0"
+            );
         }
 
         let event_count = pool

@@ -12212,6 +12212,43 @@ pub(super) mod runner_volume_purge_tests {
                 )
                 .expect("fence test account");
         }
+
+        fn admit_public_beta_effect_fixture(&self, account_id: &str) {
+            let mut conn = self.pool.get().expect("open public beta fixture connection");
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .expect("begin public beta fixture transaction");
+            assert_eq!(
+                tx.execute(
+                    "UPDATE accounts
+                        SET email_verified_at = '2026-08-30T00:00:00Z'
+                      WHERE id = ?1",
+                    params![account_id],
+                )
+                .expect("verify public beta fixture account"),
+                1
+            );
+            assert_eq!(
+                tx.execute(
+                    "UPDATE jobs_public_beta_cohorts
+                        SET state = 'closed_to_new', hard_cap = 1, assigned_count = 1,
+                            revision = revision + 1, updated_at_ms = 1
+                      WHERE id = 'public-v1' AND assigned_count = 0",
+                    [],
+                )
+                .expect("open durable public beta effect fixture"),
+                1
+            );
+            tx.execute(
+                "INSERT INTO jobs_public_beta_enrollments (
+                    cohort_id, account_id, source, admitted_at_ms
+                 ) VALUES ('public-v1', ?1, 'admin', 1)",
+                params![account_id],
+            )
+            .expect("admit durable public beta effect fixture");
+            tx.commit()
+                .expect("commit durable public beta effect fixture");
+        }
     }
 
     impl Drop for TestDatabase {
@@ -14941,6 +14978,7 @@ pub(super) mod runner_volume_purge_tests {
     #[test]
     fn runner_volume_execution_lease_claim_is_atomic_with_residency_binding() {
         let success = TestDatabase::new(&["acct-claim-success"]);
+        success.admit_public_beta_effect_fixture("acct-claim-success");
         let (application_id, run_id, browser_profile_id) = runner_execution_lease_fixture(
             &success.pool,
             "acct-claim-success",
@@ -15150,6 +15188,7 @@ pub(super) mod runner_volume_purge_tests {
         ));
 
         let failure = TestDatabase::new(&["acct-claim-failure"]);
+        failure.admit_public_beta_effect_fixture("acct-claim-failure");
         let (application_id, run_id, browser_profile_id) = runner_execution_lease_fixture(
             &failure.pool,
             "acct-claim-failure",

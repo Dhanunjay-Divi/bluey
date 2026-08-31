@@ -27,6 +27,7 @@ pub mod devices;
 pub mod diagnostic_logs;
 pub mod idempotency;
 pub mod jobs;
+pub mod jobs_beta_access;
 pub mod jobs_generation;
 pub mod jobs_generation_allowance;
 pub mod jobs_provider_cost_holds;
@@ -375,6 +376,8 @@ const SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY: &str = include_str!(
 const SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
     "../../../infra/sqlite/server-runtime/058_jobs_signed_job_integrity_authority.sql"
 );
+const SQLITE_JOBS_PUBLIC_BETA_ACCESS: &str =
+    include_str!("../../../infra/sqlite/server-runtime/060_jobs_public_beta_access.sql");
 
 const MIGRATIONS: &[&str] = &[
     // 0001 — accounts: identity + auth + balance
@@ -1727,6 +1730,9 @@ const MIGRATIONS: &[&str] = &[
     SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
     // 0058 - dual-role signed employer-identity and job-risk authority.
     SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+    // 0060 - durable, dark-by-default public first-come cohort authority.
+    // 0059 remains reserved for the separate business-messaging authority.
+    SQLITE_JOBS_PUBLIC_BETA_ACCESS,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1738,12 +1744,15 @@ pub fn run_migrations(pool: &DbPool) -> Result<()> {
 
 fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     let mut conn = pool.get().context("get conn")?;
-    let (signed_job_integrity_migration, preceding_migrations) = MIGRATIONS
-        .split_last()
+    let signed_job_integrity_index = MIGRATIONS
+        .iter()
+        .position(|migration| *migration == SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY)
         .context("SQLite signed job-integrity migration is missing")?;
-    if *signed_job_integrity_migration != SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY {
-        anyhow::bail!("SQLite signed job-integrity migration must remain the migration head")
-    }
+    let (preceding_migrations, signed_and_following_migrations) =
+        MIGRATIONS.split_at(signed_job_integrity_index);
+    let (signed_job_integrity_migration, following_migrations) = signed_and_following_migrations
+        .split_first()
+        .context("SQLite signed job-integrity migration is missing")?;
     for (i, sql) in preceding_migrations.iter().enumerate() {
         conn.execute_batch(sql)
             .with_context(|| format!("migration {} failed", i + 1))?;
@@ -2672,10 +2681,18 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         .context("widen SQLite operational-hold capability authority")?;
     // Migration 058 rebuilds one immutable table to widen a CHECK constraint. SQLite reparses
     // every trigger during that table swap, including replay-era triggers that refer to columns
-    // installed by the compatibility helpers above. Keep 058 as the logical migration head while
-    // executing it only after those columns and trigger refreshes are present.
+    // installed by the compatibility helpers above. Execute it only after those columns and
+    // trigger refreshes are present, then continue with later additive migrations.
     execute_sqlite_signed_job_integrity_migration(&mut conn, signed_job_integrity_migration)
-        .with_context(|| format!("migration {} failed", MIGRATIONS.len()))?;
+        .with_context(|| format!("migration {} failed", signed_job_integrity_index + 1))?;
+    for (offset, sql) in following_migrations.iter().enumerate() {
+        conn.execute_batch(sql).with_context(|| {
+            format!(
+                "migration {} failed",
+                signed_job_integrity_index + offset + 2
+            )
+        })?;
+    }
     tracing::info!(
         backend = pool.backend_name(),
         count = MIGRATIONS.len(),
@@ -2843,6 +2860,9 @@ pub const JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID: &str =
 const POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY: &str = include_str!(
     "../../../infra/postgres/server-runtime/036_jobs_signed_job_integrity_authority.sql"
 );
+pub const JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID: &str = "038_jobs_public_beta_access.sql";
+const POSTGRES_JOBS_PUBLIC_BETA_ACCESS: &str =
+    include_str!("../../../infra/postgres/server-runtime/038_jobs_public_beta_access.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2975,6 +2995,10 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
         POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+    ),
+    (
+        JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID,
+        POSTGRES_JOBS_PUBLIC_BETA_ACCESS,
     ),
 ];
 
@@ -6093,7 +6117,8 @@ mod postgres_migration_tests {
         JOBS_CANONICAL_TAXONOMY_AUTHORITY_MIGRATION_ID,
         JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY_MIGRATION_ID, JOBS_OPERATIONAL_HOLDS_MIGRATION_ID,
         JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY_MIGRATION_ID,
-        JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID, JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
+        JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID, JOBS_RUNNER_VOLUME_PURGE_MIGRATION_ID,
+        JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID,
         JOBS_SUBMISSION_EVIDENCE_RESERVATIONS_MIGRATION_ID,
         JOBS_WORKFLOW_CLEANUP_AUTHORITY_MIGRATION_ID, JOBS_WORKFLOW_COMMANDS_MIGRATION_ID,
         MIGRATIONS, POSTGRES_ACCOUNT_DELETION_INTENTS, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
@@ -6101,7 +6126,7 @@ mod postgres_migration_tests {
         POSTGRES_JOBS_BROWSER_RELEASE_AUTHORITY, POSTGRES_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
         POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_MANAGED_CLOUD_RELEASE_AUTHORITY,
         POSTGRES_JOBS_OPERATIONAL_HOLDS, POSTGRES_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY,
-        POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
+        POSTGRES_JOBS_PUBLIC_BETA_ACCESS, POSTGRES_JOBS_RUNNER_VOLUME_PURGE, POSTGRES_JOBS_SCHEMA,
         POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
         POSTGRES_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, POSTGRES_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
         POSTGRES_JOBS_WORKFLOW_COMMANDS, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
@@ -6109,9 +6134,10 @@ mod postgres_migration_tests {
         SQLITE_JOBS_ATS_CERTIFICATION_AUTHORITY, SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
         SQLITE_JOBS_BROWSER_RELEASE_AUTHORITY, SQLITE_JOBS_CANONICAL_TAXONOMY_AUTHORITY,
         SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX, SQLITE_JOBS_OPERATIONAL_HOLDS,
-        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, SQLITE_JOBS_RUNNER_VOLUME_PURGE,
-        SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY, SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS,
-        SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY, SQLITE_JOBS_WORKFLOW_COMMANDS,
+        SQLITE_JOBS_ORIGINAL_SOURCE_VERIFICATION_AUTHORITY, SQLITE_JOBS_PUBLIC_BETA_ACCESS,
+        SQLITE_JOBS_RUNNER_VOLUME_PURGE, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY,
+        SQLITE_JOBS_SUBMISSION_EVIDENCE_RESERVATIONS, SQLITE_JOBS_WORKFLOW_CLEANUP_AUTHORITY,
+        SQLITE_JOBS_WORKFLOW_COMMANDS,
     };
 
     #[test]
@@ -6532,16 +6558,14 @@ mod postgres_migration_tests {
     }
 
     #[test]
-    fn signed_job_integrity_authority_is_paired_unseeded_and_current_head() {
+    fn signed_job_integrity_authority_is_paired_and_unseeded() {
         let (version, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
-            .last()
-            .expect("signed job-integrity authority must be the PostgreSQL head");
+            .iter()
+            .find(|(version, _)| *version == JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID)
+            .expect("signed job-integrity authority must be embedded");
         assert_eq!(*version, JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY_MIGRATION_ID);
         assert_eq!(*postgres_sql, POSTGRES_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY);
-        assert_eq!(
-            MIGRATIONS.last().copied(),
-            Some(SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY)
-        );
+        assert!(MIGRATIONS.contains(&SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY));
         for schema in [*postgres_sql, SQLITE_JOBS_SIGNED_JOB_INTEGRITY_AUTHORITY] {
             assert_eq!(
                 schema
@@ -6590,6 +6614,45 @@ mod postgres_migration_tests {
             }
             assert!(!schema.contains("INSERT INTO jobs_job_integrity_attestations"));
             assert!(!schema.contains("INSERT INTO jobs_job_integrity_revocations"));
+        }
+    }
+
+    #[test]
+    fn public_beta_authority_is_paired_dark_and_runtime_ledgered() {
+        let (_, postgres_sql) = POSTGRES_POST_JOBS_MIGRATIONS
+            .iter()
+            .find(|(version, _)| *version == JOBS_PUBLIC_BETA_ACCESS_MIGRATION_ID)
+            .expect("public beta authority must exist before Jobs routes are served");
+        assert_eq!(*postgres_sql, POSTGRES_JOBS_PUBLIC_BETA_ACCESS);
+        assert_eq!(
+            MIGRATIONS.last().copied(),
+            Some(SQLITE_JOBS_PUBLIC_BETA_ACCESS)
+        );
+
+        for table in [
+            "jobs_public_beta_cohorts",
+            "jobs_public_beta_enrollments",
+            "jobs_public_beta_overrides",
+        ] {
+            assert!(postgres_sql.contains(table), "PostgreSQL missing {table}");
+            assert!(
+                SQLITE_JOBS_PUBLIC_BETA_ACCESS.contains(table),
+                "SQLite missing {table}"
+            );
+        }
+        for required in [
+            "'public-v1', 'draft', NULL, NULL, 0, 0, 1",
+            "CHECK(hard_cap >= 0 AND hard_cap <= 10000)",
+            "CHECK(assigned_count >= 0 AND assigned_count <= hard_cap)",
+        ] {
+            assert!(
+                postgres_sql.contains(required),
+                "PostgreSQL missing {required}"
+            );
+            assert!(
+                SQLITE_JOBS_PUBLIC_BETA_ACCESS.contains(required),
+                "SQLite missing {required}"
+            );
         }
     }
 

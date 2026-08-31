@@ -17,6 +17,7 @@ import {
   WalletCards,
 } from "lucide-react";
 import type { AccountSummary, JobsWorkspace } from "../types";
+import { signOutOfBluey } from "../api";
 import { initials, money } from "../lib/format";
 import blueyIcon from "../../../../web/assets/bluey-logo.svg";
 import blueyWordmark from "../../../../web/assets/bluey-wordmark.svg";
@@ -84,23 +85,6 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
     };
   }, [profileOpen]);
 
-  const signOut = async () => {
-    const token = localStorage.getItem("bluey_access_token") || sessionStorage.getItem("bluey_access_token") || "";
-    const refresh = localStorage.getItem("bluey_refresh_token") || sessionStorage.getItem("bluey_refresh_token") || "";
-    localStorage.removeItem("bluey_access_token");
-    localStorage.removeItem("bluey_refresh_token");
-    sessionStorage.removeItem("bluey_access_token");
-    sessionStorage.removeItem("bluey_refresh_token");
-    if (token) {
-      void fetch("/auth/logout", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: refresh || null }),
-      });
-    }
-    window.location.href = "/";
-  };
-
   return (
     <div className="jobs-shell">
       <a className="jobs-skip-link" href="#jobs-main">Skip to Jobs content</a>
@@ -162,7 +146,7 @@ export function AppShell({ children, account, workspace, onRefresh, preview, pre
                   {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
                   Use {theme === "dark" ? "light" : "dark"} theme
                 </button>
-                <button role="menuitem" onClick={signOut}><LogOut size={16} />Sign out</button>
+                <button role="menuitem" onClick={signOutOfBluey}><LogOut size={16} />Sign out</button>
               </div>
             )}
           </div>

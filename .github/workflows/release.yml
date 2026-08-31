@@ -131,6 +131,7 @@ jobs:
       - name: Test, typecheck, and build Jobs
         run: |
           npm ci --prefix jobs --no-audit --no-fund
+          npm audit --prefix jobs --audit-level=moderate
           npm test --prefix jobs
           npm run typecheck --prefix jobs
           npm run build --prefix jobs
