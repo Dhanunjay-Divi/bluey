@@ -1228,6 +1228,8 @@ fn short_capacity_wait_secs(retry_after_secs: u64) -> Option<u64> {
     (wait_secs <= max_secs).then_some(wait_secs)
 }
 
+// Axum handler errors intentionally carry the complete bounded JSON error envelope.
+#[allow(clippy::result_large_err)]
 async fn check_account_llm_or_short_wait(
     state: &AppState,
     account_id: &str,

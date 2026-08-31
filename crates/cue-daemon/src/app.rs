@@ -7448,8 +7448,10 @@ fn pcm16_i16le_stats(raw: &[u8]) -> Pcm16AudioStats {
     let mut peak = 0_i32;
     let mut nonzero = 0_usize;
     let mut sum_squares = 0_f64;
-    for chunk in raw[..sample_bytes].chunks_exact(2) {
-        let sample = i16::from_le_bytes([chunk[0], chunk[1]]) as i32;
+    let (sample_pairs, remainder) = raw[..sample_bytes].as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for chunk in sample_pairs {
+        let sample = i16::from_le_bytes(*chunk) as i32;
         let magnitude = sample.abs();
         if magnitude > 0 {
             nonzero = nonzero.saturating_add(1);
@@ -12940,16 +12942,15 @@ fn compact_managed_answer_context(context: &[AnswerContext]) -> Vec<AnswerContex
         &desired_metadata_bytes,
         MANAGED_ANSWER_CONTEXT_MAX_TOTAL_METADATA_BYTES,
     );
-    let mut metadata_budgets = metadata_budgets.chunks_exact(2);
+    let (metadata_budget_pairs, remainder) = metadata_budgets.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    let mut metadata_budgets = metadata_budget_pairs.iter();
     let mut compacted = retained
         .iter()
         .map(|item| {
             let [title_budget, source_budget] = metadata_budgets
                 .next()
-                .expect("each managed context item has two metadata budgets")
-            else {
-                unreachable!("managed context metadata budgets are paired")
-            };
+                .expect("each managed context item has two metadata budgets");
             let mut compacted = (*item).clone();
             compacted.title = item
                 .title

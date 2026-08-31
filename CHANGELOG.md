@@ -326,6 +326,19 @@ under `docs/release/`.
   exact-tip CI, Docker/Linux image/native smoke, current deployed-bundle read-back, hosted
   migration/network/canary/rollback/deployment evidence, and production flag read-back. Release
   configuration remains `0`; no live flag read-back is claimed.
+- Corrected the Unix daemon IPC capability replacement test to model one boot-scoped atomic
+  replacement instead of an artificial stream of 100 rewrites, and added deterministic proof that
+  four consecutive zero-link opens exhaust the existing bounded retry policy and fail closed.
+  Production owner, mode, file-type, symlink, hard-link, zero-link, and retry behavior is unchanged.
+- Normalized the pinned Playwright Noble base's regular `/usr/bin/node` into the existing
+  `/usr/local/bin/node` managed-runtime authority before measurement, then removed the source path
+  and package-manager tools from both NodeSource and `/usr/local` layouts. CI and release image
+  identity now bind to the pull-request head SHA with a non-PR fallback instead of attesting a
+  synthetic merge SHA. The prior 256-file error masked this later fail-closed path mismatch; no
+  measurement root, release flag, or hosted authority was relaxed.
+- Completed Rust 1.98 compatibility across the initial proven eleven-file backport plus two
+  fixed-width chunk sites exposed by the exact Phase 611 rerun in the daemon application, without
+  importing unrelated Phase 623 work or changing runtime behavior.
 - Raised the closed managed-cloud runtime-measurement file bound from 256 to 512 across candidate
   construction, embedded runtime verification, and server release-evidence validation. The pinned
   Playwright Chromium headless-shell tree alone exceeds the old bound, so managed-runner image
