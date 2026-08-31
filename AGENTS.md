@@ -69,12 +69,32 @@ Cue is a cross-platform AI meeting copilot built with Tauri 2 (Rust backend + Re
   runs every `all` and direct command from the physical repository root. It
   cleans an owned root after success, failure, HUP, INT, or TERM, but once
   marker establishment begins a missing or malformed marker retains the root
-  and makes cleanup fail explicitly. SIGKILL and host crashes are recovered
-  only by a later marker-bound stale-run pass; uncertain process inspection is
-  treated as active.
-- Never point the test run parent at a repository, Git worktree, Downloads
-  sibling, broad temporary root, or `/Volumes`. It must be a private
-  current-user directory under local `/tmp`; existing directories are never
+  and makes cleanup fail explicitly. A later invocation refuses to start a new
+  command while owned run metadata is missing or malformed, or when deletion
+  of an eligible stale root fails. Marker numbers are canonical bounded
+  decimals; the run name binds the exact creation epoch and launcher PID; and
+  starting/running state binds zero/nonzero command-group identity. Recovery
+  snapshots and revalidates the root and marker device, inode, modification
+  time, canonical fields, age, owner PID, and process group immediately before
+  deletion. The post-`mkdir` root identity is immutable; each marker transition
+  pre-binds its temp identity and is committed only after atomic rename and
+  post-rename verification. Eligible stale and current roots are atomically
+  moved into a private same-parent quarantine and deleted from that verified
+  directory with a same-filesystem fence. Any ambiguity retains a quarantine
+  that blocks the next command. SIGKILL and host crashes are recovered only by a later
+  marker-bound stale-run pass; uncertain process inspection is treated as
+  active. HUP, INT, and TERM are forwarded with the system kill utility to the
+  isolated command process group before bounded escalation. The wrapper resets
+  those signals and enters its private process group before publishing its
+  ready handshake; the launcher defers delivery until PID/PGID and running
+  marker authority are exact, and opens the command gate only afterward.
+  Current cleanup must also match the root and marker identities and all nine
+  fields captured by the latest marker write; substitution retains evidence.
+- Never point the test run parent at exact or ancestral Git metadata, a
+  registered worktree, Downloads sibling, broad temporary root, or `/Volumes`.
+  It must be a private current-user directory under local `/tmp`; Git/worktree
+  checks precede mutation, worktree discovery preserves producer status and is
+  time/byte-bounded before shell buffering, and existing directories are never
   chmodded by the launcher.
 
 ## Review Discipline

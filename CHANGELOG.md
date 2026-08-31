@@ -376,10 +376,38 @@ under `docs/release/`.
   through root ownership; and once marker establishment begins, a missing or malformed marker
   retains the root and fails cleanup explicitly. Verified exact-root cleanup preserves
   nonzero/signal status and fails a successful command when deletion fails; the next-launch reaper
-  skips live groups, process-inspection ambiguity, and linked or invalid markers. Fake-command
-  self-tests and a Jobs CI guard cover parent rejection, mkdir-window signals, caller CWD,
+  skips live groups and process-inspection ambiguity, preserves linked candidates, and blocks on
+  linked or invalid owned marker metadata. Fake-command self-tests and a Jobs CI guard cover
+  parent rejection, mkdir-window signals, caller CWD,
   descendants, stale recovery, marker corruption, and cleanup failure. No SSD, existing repository
-  target, database, production service, or release flag is touched.
+  target, database, production service, or release flag is touched. A fresh audit additionally
+  made process-group forwarding portable across macOS Bash 3.2 and Linux, proves child receipt of
+  HUP/INT/TERM, blocks new commands when owned retained metadata is unknown or eligible stale-root
+  deletion fails, and moved the microphone-setting SQLite test into a collision-safe temporary
+  directory controlled by the launcher. A second safety audit now rejects non-canonical or
+  overflow marker numbers, cross-binds run-name epoch/PID and state/process-group identity, requires
+  both marker and root filesystem age, and revalidates exact field/device/inode/mtime plus fresh
+  age/process authority immediately before deletion; behavioral and guard-negative fixtures cover
+  future, copied-young, identity-drift, and byte-equivalent marker-inode swap cases. The command
+  wrapper now resets signals and enters its private group before publishing a private ready
+  handshake; the launcher defers signals until it verifies PID/PGID identity and records the
+  running marker, then delivers the deferred signal before opening the command gate. Bounded
+  group/PID polling and KILL escalation prevent a pre-gate signal from hanging on `wait`, while
+  zombie children are reaped. Deterministic pre-gate HUP/INT/TERM probes and all nine marker-field
+  guard mutations preserve these boundaries. A final safety correction binds normal current-run
+  cleanup to the root device/inode, latest marker device/inode/mtime, and all nine captured fields;
+  byte-equivalent marker replacement, same-inode field rewrite, and whole-root substitution now
+  retain evidence with status 74. Exact Git directory/file/link parents and registered-worktree
+  overlap are rejected before mutation, while bounded status-checked worktree enumeration and
+  negative guard fixtures prevent command failure or process substitution from authorizing a run.
+  The latest correction makes the post-`mkdir` root identity immutable; pre-binds marker temp
+  inode/mtime across atomic rename; caps and times out worktree discovery before shell buffering;
+  and atomically quarantines both stale and current roots before any anchored same-filesystem
+  deletion. Original-path absence and moved root/marker authority are checked twice, including
+  after a deterministic final-delete substitution boundary. Any ambiguity retains a quarantine
+  that blocks the next command. Current/stale transition and final-delete fixtures plus independent
+  guard mutations cover every identity, field, producer-status, byte/time bound, ordering fence,
+  and quarantine call site.
 - Corrected the hosted Jobs runner plan-matrix fixture to establish and read back verified,
   durable public-beta admission before testing Free/Pro/Cloud and application-integrity
   boundaries. The regression now proves it crossed the valid outer beta gate before the

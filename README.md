@@ -134,14 +134,40 @@ successful command into an error without hiding an existing failure or signal
 status. Both modes execute from the physical repository root even when invoked
 elsewhere. Before marker establishment, an early owned root is safely cleaned;
 after establishment, a missing or malformed marker retains the root and reports
-cleanup failure for audit. An uncatchable SIGKILL or host crash is handled
-conservatively only on a later launcher invocation, and uncertain process
-inspection is treated as active. A zombie-only process group is treated as
-inactive because it cannot execute or retain files; the self-test creates that
-state deterministically to prevent intermittent cleanup failures. The launcher
-rejects repositories, worktrees, Downloads siblings, broad temporary roots,
-and `/Volumes`, and never chmods an existing parent. Verify the safety contract
-without compiling Rust:
+cleanup failure for audit. The next invocation blocks before starting a command
+when an owned retained root has missing or malformed metadata or when verified
+stale-root deletion fails, and reports only bounded exact-root recovery
+guidance. Marker numbers use bounded canonical decimals; the generated name
+must exactly repeat the marker epoch and owner PID; starting/running state must
+match zero/nonzero command-group identity; and both validation passes bind the
+root and marker device, inode, modification time, fields, age, owner, and group.
+A normal current-run cleanup also requires the root and latest marker identity
+and all nine fields captured when the launcher wrote them. Byte-identical
+marker replacement, same-inode authority rewrites, and whole-root substitution
+therefore retain evidence and fail explicitly instead of authorizing deletion.
+The root identity is assigned only once after `mkdir`; each marker transition
+pre-binds its temp identity and must survive atomic rename plus post-rename
+verification. Eligible current and stale roots are atomically moved into a
+private same-parent quarantine, validated again, and deleted only from the
+verified quarantined directory with a same-filesystem fence. Any uncertainty
+retains that quarantine and blocks the next large command.
+A newly created root cannot claim an old marker to bypass the grace period. An
+uncatchable SIGKILL or host crash is handled conservatively only on a later
+launcher invocation, and uncertain process inspection is treated as active. A
+zombie-only process group is treated as inactive because it cannot execute or
+retain files. HUP, INT, and TERM use a portable system process-group signal and
+bounded escalation; the self-test proves the command actually receives each
+signal. Before the command gate, the wrapper resets signals, creates its private
+group, and publishes a private ready handshake; the launcher verifies exact
+PID/PGID and running-marker authority before delivering any deferred signal and
+only then opens the gate. Pre-gate probes prove exact signal status, no user
+command start, wrapper exit, and exact-root cleanup. The launcher rejects exact
+or ancestral Git metadata, registered worktree overlap, Downloads siblings,
+broad temporary roots, and `/Volumes` before creating the run parent, and never
+chmods an existing parent. Worktree discovery failure or output above 1 MiB
+also fails closed; producer status is preserved and the stream is time/byte
+bounded before shell buffering.
+Verify the safety contract without compiling Rust:
 
 ```bash
 scripts/run-bluey-tests.sh --self-test

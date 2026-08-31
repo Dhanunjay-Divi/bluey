@@ -26,6 +26,69 @@ const repoRoot = path.resolve(
 
 const JOBS_CI_TIMEOUT_MINUTES = 90;
 const ISOLATED_TEST_LAUNCHER = "scripts/run-bluey-tests.sh";
+const MIC_DEVICE_SELECTION_TEST =
+  "crates/cue-daemon/tests/mic_device_selection.rs";
+const MARKER_FIELD_COMPARISONS = [
+  ["magic", '"$marker_magic" == "$1"'],
+  ["run_root", '"$marker_run_root" == "$2"'],
+  ["run_name", '"$marker_run_name" == "$3"'],
+  ["owner_uid", '"$marker_owner_uid" == "$4"'],
+  ["owner_pid", '"$marker_owner_pid" == "$5"'],
+  ["process_group_id", '"$marker_process_group_id" == "$6"'],
+  ["launcher_group_id", '"$marker_launcher_group_id" == "$7"'],
+  ["created_epoch", '"$marker_created_epoch" == "$8"'],
+  ["state", '"$marker_state" == "$9"'],
+];
+const CURRENT_MARKER_SNAPSHOT_BINDINGS = [
+  ["magic", 'current_marker_magic="$marker_magic"'],
+  ["run_root", 'current_marker_run_root="$marker_run_root"'],
+  ["run_name", 'current_marker_run_name="$marker_run_name"'],
+  ["owner_uid", 'current_marker_owner_uid="$marker_owner_uid"'],
+  ["owner_pid", 'current_marker_owner_pid="$marker_owner_pid"'],
+  [
+    "process_group_id",
+    'current_marker_process_group_id="$marker_process_group_id"',
+  ],
+  [
+    "launcher_group_id",
+    'current_marker_launcher_group_id="$marker_launcher_group_id"',
+  ],
+  ["created_epoch", 'current_marker_created_epoch="$marker_created_epoch"'],
+  ["state", 'current_marker_state="$marker_state"'],
+];
+const CURRENT_MARKER_REVALIDATION_ARGUMENTS = [
+  ["magic", '"$current_marker_magic"'],
+  ["run_root", '"$current_marker_run_root"'],
+  ["run_name", '"$current_marker_run_name"'],
+  ["owner_uid", '"$current_marker_owner_uid"'],
+  ["owner_pid", '"$current_marker_owner_pid"'],
+  ["process_group_id", '"$current_marker_process_group_id"'],
+  ["launcher_group_id", '"$current_marker_launcher_group_id"'],
+  ["created_epoch", '"$current_marker_created_epoch"'],
+  ["state", '"$current_marker_state"'],
+];
+const EXPECTED_MARKER_REVALIDATION_ARGUMENTS = [
+  ["magic", '"$expected_magic"'],
+  ["run_root", '"$expected_run_root"'],
+  ["run_name", '"$expected_run_name"'],
+  ["owner_uid", '"$expected_owner_uid"'],
+  ["owner_pid", '"$expected_owner_pid"'],
+  ["process_group_id", '"$expected_process_group_id"'],
+  ["launcher_group_id", '"$expected_launcher_group_id"'],
+  ["created_epoch", '"$expected_created_epoch"'],
+  ["state", '"$expected_state"'],
+];
+
+function replaceOccurrence(source, needle, replacement, occurrence) {
+  let start = 0;
+  let index = -1;
+  for (let count = 0; count < occurrence; count += 1) {
+    index = source.indexOf(needle, start);
+    if (index < 0) return source;
+    start = index + needle.length;
+  }
+  return source.slice(0, index) + replacement + source.slice(index + needle.length);
+}
 
 const managedReleasePermissionContracts = new Map([
   ["CANDIDATE-BUILD", ["actions: read", "contents: read"]],
@@ -1158,27 +1221,95 @@ function validateIsolatedTestDiskAuthority(workflow, launcher) {
     "trap 'on_signal INT 130' INT",
     "trap 'on_signal TERM 143' TERM",
     "install_deferred_signal_traps",
+    'readonly COMMAND_READY_POLL_ATTEMPTS=500',
+    'readonly STOP_POLL_ATTEMPTS=50',
     "run_root_created=1",
     "dispatch_deferred_signal",
     'marker_established=1\n  write_marker starting 0',
     'if [[ "$marker_established" -eq 1 ]]; then',
     'readonly STALE_GRACE_SECONDS=60',
+    'readonly MAX_CANONICAL_DECIMAL_DIGITS=15',
+    'readonly WORKTREE_LIST_MAX_BYTES=1048576',
+    'readonly WORKTREE_LIST_CAPTURE_BYTES=1048578',
+    'readonly WORKTREE_LIST_TIMEOUT_SECONDS=10',
+    "set -o pipefail",
+    "is_canonical_decimal() {",
+    'is_canonical_decimal "$marker_created_epoch"',
+    '[[ "$run_epoch" == "$marker_created_epoch" && "$run_pid" == "$marker_owner_pid" ]]',
+    '[[ "$marker_process_group_id" == "0" ]] || return 1',
+    'is_canonical_decimal_gt_one "$marker_process_group_id"',
     "run parent must not contain dot segments",
     "run parent must stay under local /tmp",
     "existing run parent must already have mode 0700",
+    'validate_no_git_ancestor "$desired"',
+    'validate_no_known_worktree_overlap "$desired"',
+    '[[ ! -e "$probe/.git" && ! -L "$probe/.git" ]] || return 1',
+    'local producer_status=0 LC_ALL=C sentinel=$\'\\034\'',
+    'alarm $timeout;',
+    'git -C "$repo_root" worktree list --porcelain 2>/dev/null',
+    'producer_status=$?',
+    'exit "$producer_status"',
+    '} | /usr/bin/head -c "$WORKTREE_LIST_CAPTURE_BYTES")" || return 1',
+    '[[ "$listing" == *"$sentinel" ]] || return 1',
+    'listing="${listing%"$sentinel"}"',
+    '[[ "${#listing}" -le "$WORKTREE_LIST_MAX_BYTES" ]] || return 1',
     "run parent must not overlap any registered Git worktree",
     "/usr/bin/perl -MPOSIX=setsid",
-    'kill -s "$signal_name" "-$process_group_id"',
+    "-MFcntl=O_WRONLY,O_CREAT,O_EXCL",
+    '$SIG{HUP} = "DEFAULT";',
+    '$SIG{INT} = "DEFAULT";',
+    '$SIG{TERM} = "DEFAULT";',
+    "exit 125 if setsid() == -1;",
+    "O_WRONLY | O_CREAT | O_EXCL, 0600",
+    'ready="$run_root/.command-ready"',
+    '[[ "$ready_pid" == "$command_pid" ]]',
+    '[[ "$observed_group_id" == "$command_pid" ]]',
+    '[[ "$observed_group_id" == "$command_pid" ]] && break',
+    '/bin/kill -s "$signal_name" -- "-$process_group_id"',
+    '/bin/kill -s KILL -- "-$process_group_id"',
+    '/bin/kill -s KILL -- "$command_pid"',
+    'pid_can_execute "$command_pid" && return 1',
     'group_is_active "$marker_process_group_id"',
     'output="$(ps -eo pgid=,stat= 2>/dev/null)"',
     '[[ "$observed_pgid" == "$pgid" && "$observed_state" != Z* ]]',
     '[[ "$status" -eq 0 ]] || return 0',
     '[[ -d "$candidate" && ! -L "$candidate" && -O "$candidate" ]] || continue',
     '[[ -f "$marker" && ! -L "$marker" && -O "$marker" ]] || return 1',
-    'read_marker "$candidate/$MARKER_NAME" || continue',
+    'if ! read_marker "$marker"; then',
+    "stale-run recovery blocked by missing or malformed owned metadata",
+    "eligible stale-run deletion failed for exact root",
+    "No test command was started.",
+    "readonly STALE_RECOVERY_FAILURE_STATUS=75",
+    "reap_stale_runs ||",
+    'read_path_identity "$candidate"',
+    'accepted_root_device_inode="$observed_path_device_inode"',
+    'accepted_marker_device_inode="$observed_path_device_inode"',
+    'run_parent_device_inode="$observed_path_device_inode"',
+    'current_root_device_inode="$observed_path_device_inode"',
+    'current_marker_device_inode="$observed_path_device_inode"',
+    'current_marker_modified_epoch="$observed_path_modified_epoch"',
+    "create_delete_quarantine",
+    "remove_empty_delete_quarantine",
+    "verify_quarantined_payload",
+    "delete_quarantined_payload",
+    "quarantine_and_delete_root",
+    "/usr/bin/perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)'",
+    'if [[ -e "$source" || -L "$source" ]]',
+    'Darwin) /usr/bin/find -x . -depth -mindepth 1 -delete ;;',
+    'Linux) /usr/bin/find . -xdev -depth -mindepth 1 -delete ;;',
+    'hook="${BLUEY_TEST_INJECT_AFTER_QUARANTINE_VERIFY_HOOK:-}"',
+    "set -o noclobber",
+    'next_device_inode="$observed_path_device_inode"',
+    'next_modified_epoch="$observed_path_modified_epoch"',
+    'hook="${BLUEY_TEST_INJECT_AFTER_MARKER_RENAME_HOOK:-}"',
+    "quarantined run-root identity changed",
+    "final quarantined authority changed",
+    "quarantine deletion failed",
+    "marker_fields_match",
+    'second_now="$(date +%s)"',
+    "stale-run path identity changed during recovery",
+    "stale-run age eligibility changed during recovery",
     'pid_is_active "$marker_owner_pid" && continue',
-    'if ! rm -rf -- "$physical"',
-    '[[ -e "$physical" || -L "$physical" ]]',
     "command passed but cleanup failed",
     "cleanup failed; preserving command status",
     "exit 125 unless chdir $repo_root;",
@@ -1196,15 +1327,59 @@ function validateIsolatedTestDiskAuthority(workflow, launcher) {
     "reaper touched an active process group",
     "inactive marker-valid stale root survived",
     "reaper followed a candidate symlink",
-    "reaper followed a marker symlink",
+    "reaper followed a retained marker symlink",
     "unsafe parent was mutated before rejection",
     "post-mkdir signal run root survived",
+    "for signal_spec in HUP:129 INT:130 TERM:143; do",
+    "child did not receive $signal_name",
     "all mapping did not run from repository root",
     "direct command did not run from repository root",
     "reaper treated ps failure as inactive",
     "zombie-only process group blocked cleanup",
     "marker-missing cleanup did not fail closed",
     "marker-corrupt cleanup did not fail closed",
+    "stale deletion failure started child command or lost evidence",
+    "retained marker did not block a new command",
+    "linked retained marker did not block a new command",
+    "future-dated marker did not block before child start",
+    "for marker_case in",
+    "overflow leading-zero epoch-drift pid-drift starting-group running-zero",
+    "$marker_case marker authority did not block before child start",
+    "young root with stale marker did not block before child start",
+    "same-field marker inode replacement did not block before child start",
+    "same-field marker inode replacement missed path-identity authority",
+    "for current_identity_case in marker-inode marker-fields root-swap; do",
+    "current $current_identity_case cleanup did not fail closed",
+    "current root substitution removed the original command data",
+    "current root substitution lacked retention guidance",
+    "current marker inode replacement lacked retention guidance",
+    "current marker field rewrite lacked retention guidance",
+    "pre-running-marker root substitution gained command authority",
+    "pre-running-marker root substitution deleted retained evidence",
+    "pre-running-marker root substitution lacked retention guidance",
+    "post-rename marker substitution gained command authority",
+    "post-rename marker substitution deleted retained evidence",
+    "post-rename marker substitution lacked retention guidance",
+    "pre-delete root substitution did not fail closed",
+    "pre-delete root substitution removed original or substitute data",
+    "pre-delete root substitution lacked quarantine guidance",
+    "final-delete current substitution did not fail closed",
+    "final-delete current substitution removed retained evidence",
+    "final-delete current substitution lacked quarantine guidance",
+    "retained quarantine did not block the next command",
+    "final-delete stale substitution did not block the next command",
+    "final-delete stale substitution removed retained evidence",
+    "final-delete stale substitution lacked quarantine guidance",
+    "for exact_git_kind in directory file symlink; do",
+    "existing exact Git $exact_git_kind parent was accepted",
+    "worktree enumeration failure did not block the command",
+    "worktree enumeration failure created a test root",
+    "oversized worktree enumeration did not block the command",
+    "oversized worktree enumeration created a test root",
+    "pre-gate $pre_gate_signal status was not preserved",
+    "pre-gate $pre_gate_signal started the user command or lacked handshake proof",
+    "pre-gate $pre_gate_signal wrapper survived",
+    "pre-gate $pre_gate_signal exact run root survived",
     "cleanup failure did not fail a successful command",
     "cleanup failure hid child status",
     "cleanup failure hid signal status",
@@ -1213,6 +1388,339 @@ function validateIsolatedTestDiskAuthority(workflow, launcher) {
     if (!launcher.includes(requiredScenario)) {
       issues.push(`${ISOLATED_TEST_LAUNCHER} is missing scenario: ${requiredScenario}`);
     }
+  }
+
+  for (const [field, comparison] of MARKER_FIELD_COMPARISONS) {
+    if (!launcher.includes(comparison)) {
+      issues.push(`marker reread is missing exact field comparison: ${field}`);
+    }
+  }
+
+  for (const [field, binding] of CURRENT_MARKER_SNAPSHOT_BINDINGS) {
+    if (occurrences(launcher, binding) !== 1) {
+      issues.push(`current marker snapshot is missing exact field binding: ${field}`);
+    }
+  }
+
+  for (const [field, argument] of CURRENT_MARKER_REVALIDATION_ARGUMENTS) {
+    if (occurrences(launcher, argument) !== 2) {
+      issues.push(`current marker cleanup is missing exact field revalidation: ${field}`);
+    }
+  }
+
+  for (const [field, argument] of EXPECTED_MARKER_REVALIDATION_ARGUMENTS) {
+    if (occurrences(launcher, argument) !== 5) {
+      issues.push(`quarantined marker is missing exact field revalidation: ${field}`);
+    }
+  }
+
+  if (
+    occurrences(
+      launcher,
+      'current_root_device_inode="$observed_path_device_inode"',
+    ) !== 1 ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" == "$current_root_device_inode"',
+    ) !== 3 ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" != "$current_root_device_inode"',
+    ) !== 2 ||
+    occurrences(
+      launcher,
+      '"$first_marker_device_inode" != "$current_marker_device_inode"',
+    ) !== 1 ||
+    occurrences(
+      launcher,
+      '"$first_marker_modified_epoch" != "$current_marker_modified_epoch"',
+    ) !== 1 ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" != "$current_marker_device_inode"',
+    ) !== 1 ||
+    occurrences(
+      launcher,
+      '"$observed_path_modified_epoch" != "$current_marker_modified_epoch"',
+    ) !== 1
+  ) {
+    issues.push(
+      "current cleanup must bind established root, marker device/inode/mtime, and fields",
+    );
+  }
+
+  const writeMarkerStart = launcher.indexOf("write_marker() {");
+  const stopProcessGroupStart = launcher.indexOf(
+    "stop_process_group() {",
+    writeMarkerStart,
+  );
+  const writeMarkerAuthority =
+    writeMarkerStart >= 0 && stopProcessGroupStart > writeMarkerStart
+      ? launcher.slice(writeMarkerStart, stopProcessGroupStart)
+      : "";
+  const markerTempBindIndex = writeMarkerAuthority.indexOf(
+    'next_device_inode="$observed_path_device_inode"',
+  );
+  const markerTempMtimeBindIndex = writeMarkerAuthority.indexOf(
+    'next_modified_epoch="$observed_path_modified_epoch"',
+  );
+  const markerRenameIndex = writeMarkerAuthority.indexOf(
+    "/usr/bin/perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)'",
+  );
+  const markerTransitionHookIndex = writeMarkerAuthority.indexOf(
+    'hook="${BLUEY_TEST_INJECT_AFTER_MARKER_RENAME_HOOK:-}"',
+  );
+  const markerIdentityIndex = writeMarkerAuthority.indexOf(
+    '"$observed_path_device_inode" == "$next_device_inode"',
+  );
+  const markerSnapshotIndex = writeMarkerAuthority.indexOf(
+    'current_marker_device_inode="$observed_path_device_inode"',
+  );
+  if (
+    markerTempBindIndex < 0 ||
+    markerTempMtimeBindIndex < markerTempBindIndex ||
+    markerRenameIndex < markerTempMtimeBindIndex ||
+    markerTransitionHookIndex < markerRenameIndex ||
+    markerIdentityIndex < markerTransitionHookIndex ||
+    markerSnapshotIndex < markerIdentityIndex ||
+    occurrences(
+      writeMarkerAuthority,
+      '"$observed_path_device_inode" == "$current_root_device_inode"',
+    ) !== 3 ||
+    occurrences(
+      writeMarkerAuthority,
+      '"$observed_path_device_inode" == "$next_device_inode"',
+    ) !== 1 ||
+    occurrences(
+      writeMarkerAuthority,
+      '"$observed_path_modified_epoch" == "$next_modified_epoch"',
+    ) !== 1 ||
+    writeMarkerAuthority.includes(
+      'current_root_device_inode="$observed_path_device_inode"',
+    )
+  ) {
+    issues.push(
+      "marker transition must preserve immutable root and pre-rename marker identity",
+    );
+  }
+
+  if (
+    occurrences(
+      launcher,
+      '"$first_marker_device_inode" != "$expected_marker_device_inode"',
+    ) !== 1 ||
+    occurrences(
+      launcher,
+      '"$first_marker_modified_epoch" != "$expected_marker_modified_epoch"',
+    ) !== 1 ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" == "$expected_marker_device_inode"',
+    ) !== 2 ||
+    occurrences(
+      launcher,
+      '"$observed_path_modified_epoch" == "$expected_marker_modified_epoch"',
+    ) !== 2
+  ) {
+    issues.push(
+      "quarantined cleanup must bind the moved marker device/inode/mtime and fields",
+    );
+  }
+
+  if (
+    occurrences(launcher, 'validate_no_git_ancestor "$desired"') !== 1 ||
+    launcher.includes('validate_no_git_ancestor "$parent_physical"') ||
+    occurrences(launcher, "set -o pipefail") !== 1 ||
+    !launcher.includes('alarm $timeout;') ||
+    !launcher.includes('producer_status=$?') ||
+    !launcher.includes('exit "$producer_status"') ||
+    !launcher.includes(
+      '} | /usr/bin/head -c "$WORKTREE_LIST_CAPTURE_BYTES")" || return 1',
+    ) ||
+    !launcher.includes('[[ "$listing" == *"$sentinel" ]] || return 1') ||
+    !launcher.includes('listing="${listing%"$sentinel"}"') ||
+    !launcher.includes('[[ "${#listing}" -le "$WORKTREE_LIST_MAX_BYTES" ]] || return 1') ||
+    launcher.includes(
+      'listing="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)"',
+    ) ||
+    launcher.includes(
+      '< <(git -C "$repo_root" worktree list --porcelain)',
+    )
+  ) {
+    issues.push(
+      "exact requested parent Git ancestry and producer-status-checked worktree enumeration must fail closed",
+    );
+  }
+
+  const worktreeProducerIndex = launcher.indexOf(
+    'git -C "$repo_root" worktree list --porcelain 2>/dev/null',
+  );
+  const worktreeCapIndex = launcher.indexOf(
+    '} | /usr/bin/head -c "$WORKTREE_LIST_CAPTURE_BYTES")" || return 1',
+  );
+  const worktreeSentinelIndex = launcher.indexOf(
+    '[[ "$listing" == *"$sentinel" ]] || return 1',
+  );
+  const worktreeLengthIndex = launcher.indexOf(
+    '[[ "${#listing}" -le "$WORKTREE_LIST_MAX_BYTES" ]] || return 1',
+  );
+  const worktreeParseIndex = launcher.indexOf(
+    'while IFS= read -r line; do',
+    worktreeLengthIndex,
+  );
+  if (
+    worktreeProducerIndex < 0 ||
+    worktreeCapIndex < worktreeProducerIndex ||
+    worktreeSentinelIndex < worktreeCapIndex ||
+    worktreeLengthIndex < worktreeSentinelIndex ||
+    worktreeParseIndex < worktreeLengthIndex
+  ) {
+    issues.push(
+      "worktree discovery must preserve producer status before bounded parsing",
+    );
+  }
+
+  const quarantineStart = launcher.indexOf("quarantine_and_delete_root() {");
+  const reaperStart = launcher.indexOf("reap_stale_runs() {", quarantineStart);
+  const reaperEnd = launcher.indexOf('\nrun_root=""', reaperStart);
+  const quarantineAuthority =
+    quarantineStart >= 0 && reaperStart > quarantineStart
+      ? launcher.slice(quarantineStart, reaperStart)
+      : "";
+  const reaperAuthority =
+    reaperStart >= 0 && reaperEnd > reaperStart
+      ? launcher.slice(reaperStart, reaperEnd)
+      : "";
+  const quarantineRenameIndex = quarantineAuthority.indexOf(
+    "/usr/bin/perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)'",
+  );
+  const sourceAbsenceIndex = quarantineAuthority.indexOf(
+    'if [[ -e "$source" || -L "$source" ]]',
+  );
+  const firstQuarantineVerifyIndex = quarantineAuthority.indexOf(
+    "! verify_quarantined_payload \\",
+  );
+  const finalHookIndex = quarantineAuthority.indexOf(
+    'hook="${BLUEY_TEST_INJECT_AFTER_QUARANTINE_VERIFY_HOOK:-}"',
+  );
+  const secondQuarantineVerifyIndex = quarantineAuthority.indexOf(
+    "if ! verify_quarantined_payload \\",
+    finalHookIndex,
+  );
+  const quarantineDeleteIndex = quarantineAuthority.indexOf(
+    "if ! delete_quarantined_payload \\",
+  );
+  if (
+    occurrences(launcher, "quarantine_and_delete_root() {") !== 1 ||
+    occurrences(launcher, "quarantine_and_delete_root \\") !== 2 ||
+    occurrences(launcher, "verify_quarantined_payload() {") !== 1 ||
+    occurrences(launcher, "delete_quarantined_payload() {") !== 1 ||
+    quarantineRenameIndex < 0 ||
+    sourceAbsenceIndex < quarantineRenameIndex ||
+    firstQuarantineVerifyIndex < sourceAbsenceIndex ||
+    finalHookIndex < firstQuarantineVerifyIndex ||
+    secondQuarantineVerifyIndex < finalHookIndex ||
+    quarantineDeleteIndex < secondQuarantineVerifyIndex ||
+    !quarantineAuthority.includes(
+      '"$observed_path_device_inode" == "$expected_root_device_inode"',
+    ) ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" == "$expected_root_device_inode"',
+    ) !== 5 ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" == "$run_parent_device_inode"',
+    ) !== 3 ||
+    occurrences(
+      launcher,
+      '"$observed_path_device_inode" == "$delete_quarantine_device_inode"',
+    ) !== 3 ||
+    launcher.includes('rm -rf -- "$run_root"') ||
+    launcher.includes('rm -rf -- "$candidate"') ||
+    launcher.includes('rm -rf -- "$physical"') ||
+    launcher.includes('rm -rf -- "$moved_root"')
+  ) {
+    issues.push(
+      "current and stale deletion must use one atomic quarantine authority",
+    );
+  }
+
+  const exactGitParentIndex = launcher.indexOf(
+    'validate_no_git_ancestor "$desired"',
+  );
+  const exactWorktreeIndex = launcher.indexOf(
+    'validate_no_known_worktree_overlap "$desired"',
+  );
+  const parentMutationIndex = launcher.indexOf(
+    'if [[ -e "$desired" || -L "$desired" ]]; then',
+  );
+  if (
+    exactGitParentIndex < 0 ||
+    exactWorktreeIndex < exactGitParentIndex ||
+    parentMutationIndex < exactWorktreeIndex
+  ) {
+    issues.push(
+      "exact Git and registered-worktree rejection must precede run-parent mutation",
+    );
+  }
+
+  const wrapperResetIndex = launcher.indexOf('$SIG{HUP} = "DEFAULT";');
+  const wrapperSetsidIndex = launcher.indexOf("exit 125 if setsid() == -1;");
+  const wrapperReadyIndex = launcher.indexOf("sysopen(my $handle, $ready");
+  const wrapperGateWaitIndex = launcher.indexOf("while (!-e $gate)");
+  const wrapperSpawnIndex = launcher.indexOf("/usr/bin/perl -MPOSIX=setsid");
+  const preSpawnDeferredIndex = launcher.lastIndexOf(
+    "install_deferred_signal_traps",
+    wrapperSpawnIndex,
+  );
+  const readyPidIndex = launcher.indexOf(
+    '[[ "$ready_pid" == "$command_pid" ]]',
+    wrapperSpawnIndex,
+  );
+  const pgidIndex = launcher.indexOf(
+    '[[ "$observed_group_id" == "$command_pid" ]]',
+    wrapperSpawnIndex,
+  );
+  const runningMarkerIndex = launcher.indexOf(
+    'write_marker running "$process_group_id"',
+    wrapperSpawnIndex,
+  );
+  const deferredDispatchIndex = launcher.indexOf(
+    "dispatch_deferred_signal",
+    runningMarkerIndex,
+  );
+  const openGateIndex = launcher.indexOf(
+    "printf 'start\\n' > \"$gate\"",
+    deferredDispatchIndex,
+  );
+  if (
+    wrapperResetIndex < wrapperSpawnIndex ||
+    wrapperSetsidIndex < wrapperResetIndex ||
+    wrapperReadyIndex < wrapperSetsidIndex ||
+    wrapperGateWaitIndex < wrapperReadyIndex ||
+    preSpawnDeferredIndex < 0 ||
+    !launcher.includes(
+      'ready="$run_root/.command-ready"\n  install_deferred_signal_traps\n  /usr/bin/perl',
+    ) ||
+    readyPidIndex < wrapperSpawnIndex ||
+    pgidIndex < readyPidIndex ||
+    runningMarkerIndex < pgidIndex ||
+    deferredDispatchIndex < runningMarkerIndex ||
+    !launcher.includes(
+      "  dispatch_deferred_signal\n  printf 'start\\n' > \"$gate\"",
+    ) ||
+    openGateIndex < deferredDispatchIndex
+  ) {
+    issues.push(
+      "private wrapper handshake and deferred pre-gate signal order must remain exact",
+    );
+  }
+
+  if (
+    occurrences(launcher, "for signal_spec in HUP:129 INT:130 TERM:143; do") !== 2
+  ) {
+    issues.push("pre-gate and running child receipt tests must cover HUP, INT, and TERM");
   }
 
   const trapIndex = launcher.indexOf("trap on_exit EXIT");
@@ -1236,6 +1744,116 @@ function validateIsolatedTestDiskAuthority(workflow, launcher) {
     issues.push("mkdir ownership window must defer signals until the root is owned");
   }
 
+  if (
+    !/if ! quarantine_and_delete_root \\\n[\s\S]{0,1000}return 1/.test(reaperAuthority) ||
+    !/if ! read_marker "\$marker"; then[\s\S]{0,500}return 1/.test(
+      launcher,
+    )
+  ) {
+    issues.push("stale-run deletion and unknown metadata must block a new command");
+  }
+
+  if (
+    !/is_canonical_decimal\(\) \{[\s\S]{0,300}\^\[1-9\]\[0-9\]\*\$[\s\S]{0,200}MAX_CANONICAL_DECIMAL_DIGITS/.test(
+      launcher,
+    )
+  ) {
+    issues.push("marker arithmetic must use canonical bounded decimals");
+  }
+
+  if (
+    !launcher.includes(
+      '[[ "$run_epoch" == "$marker_created_epoch" && "$run_pid" == "$marker_owner_pid" ]]',
+    )
+  ) {
+    issues.push("marker run name must bind its exact epoch and owner PID");
+  }
+
+  if (
+    !launcher.includes(
+      '[[ "$marker_process_group_id" == "0" ]] || return 1',
+    ) ||
+    !/else\s+is_canonical_decimal_gt_one "\$marker_process_group_id" \|\| return 1/.test(
+      launcher,
+    )
+  ) {
+    issues.push("marker state must bind its process-group identity");
+  }
+
+  const ageRevalidations = launcher.match(
+    /validate_stale_candidate_age \\\n\s+"\$(?:now|second_now)"/g,
+  ) ?? [];
+  const initialAgeRevalidations = launcher.match(
+    /validate_stale_candidate_age \\\n\s+"\$now"/g,
+  ) ?? [];
+  const finalAgeRevalidations = launcher.match(
+    /validate_stale_candidate_age \\\n\s+"\$second_now"/g,
+  ) ?? [];
+  const ownerRevalidations = launcher.match(
+    /pid_is_active "\$marker_owner_pid" && continue/g,
+  ) ?? [];
+  const groupRevalidations = launcher.match(
+    /\[\[ "\$marker_state" == "running" \]\] && group_is_active "\$marker_process_group_id"/g,
+  ) ?? [];
+  if (
+    ageRevalidations.length !== 2 ||
+    initialAgeRevalidations.length !== 1 ||
+    finalAgeRevalidations.length !== 1 ||
+    ownerRevalidations.length !== 2 ||
+    groupRevalidations.length !== 2
+  ) {
+    issues.push("stale deletion must rerun full age, owner, and group eligibility");
+  }
+
+  if (
+    !launcher.includes(
+      'if [[ "$marker_created_epoch" -gt "$now" || "$root_modified" -gt "$now" ||',
+    ) ||
+    !launcher.includes(
+      'if [[ "$root_age" -lt "$STALE_GRACE_SECONDS" ||',
+    ) ||
+    !launcher.includes(
+      '"$marker_age" -lt "$STALE_GRACE_SECONDS" ]];',
+    )
+  ) {
+    issues.push("stale age must reject future metadata and young copied roots");
+  }
+
+  if (
+    !launcher.includes("marker_fields_match") ||
+    !launcher.includes(
+      '"$second_root_device_inode" != "$accepted_root_device_inode"',
+    ) ||
+    !launcher.includes(
+      '"$second_marker_device_inode" != "$accepted_marker_device_inode"',
+    ) ||
+    !launcher.includes(
+      '"$second_root_modified_epoch" != "$accepted_root_modified_epoch"',
+    ) ||
+    !launcher.includes(
+      '"$second_marker_modified_epoch" != "$accepted_marker_modified_epoch"',
+    )
+  ) {
+    issues.push("stale deletion must retain exact field, device, inode, and mtime identity");
+  }
+
+  return issues;
+}
+
+function validateMicDeviceTempAuthority(source) {
+  const issues = [];
+  for (const required of [
+    "tempfile::Builder::new()",
+    '.prefix("bluey-mic-device-")',
+    ".tempdir_in(std::env::temp_dir())",
+  ]) {
+    if (!source.includes(required)) {
+      issues.push(`${MIC_DEVICE_SELECTION_TEST} is missing: ${required}`);
+    }
+  }
+  if (/['"]\/tmp\/cue_test_mic_device_/.test(source)) {
+    issues.push(`${MIC_DEVICE_SELECTION_TEST} must not hardcode a shared /tmp database`);
+  }
   return issues;
 }
 
@@ -1248,10 +1866,15 @@ function testIsolatedTestDiskAuthorityGuard() {
     path.join(repoRoot, ISOLATED_TEST_LAUNCHER),
     "utf8",
   );
+  const micDeviceTest = fs.readFileSync(
+    path.join(repoRoot, MIC_DEVICE_SELECTION_TEST),
+    "utf8",
+  );
   assert.deepEqual(
     validateIsolatedTestDiskAuthority(workflow, launcher),
     [],
   );
+  assert.deepEqual(validateMicDeviceTempAuthority(micDeviceTest), []);
 
   const unwiredWorkflow = workflow.replace(
     `        run: bash ${ISOLATED_TEST_LAUNCHER} --self-test`,
@@ -1330,6 +1953,648 @@ function testIsolatedTestDiskAuthorityGuard() {
     "Jobs CI guard must reject process inspection that treats ps errors as inactive",
   );
 
+  const builtinGroupSignal = launcher.replace(
+    '/bin/kill -s "$signal_name" -- "-$process_group_id"',
+    'kill -s "$signal_name" "-$process_group_id"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, builtinGroupSignal).some((issue) =>
+      issue.includes("/bin/kill"),
+    ),
+    "Jobs CI guard must reject non-portable builtin process-group signaling",
+  );
+
+  const incompleteSignalReceipt = launcher.replace(
+    "for signal_spec in HUP:129 INT:130 TERM:143; do",
+    "for signal_spec in TERM:143; do",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, incompleteSignalReceipt).some((issue) =>
+      issue.includes("receipt tests must cover HUP, INT, and TERM"),
+    ),
+    "Jobs CI guard must require child receipt tests for HUP, INT, and TERM",
+  );
+
+  const ignoredStaleDeletionFailure = replaceOccurrence(
+    launcher,
+    "    if ! quarantine_and_delete_root \\",
+    "    if false && ! quarantine_and_delete_root \\",
+    1,
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, ignoredStaleDeletionFailure).some(
+      (issue) => issue.includes("stale-run deletion"),
+    ),
+    "Jobs CI guard must reject proceeding after stale deletion failure",
+  );
+
+  const ignoredUnknownMetadata = launcher.replace(
+    /if ! read_marker "\$marker"; then([\s\S]{0,500}?)return 1/,
+    'if ! read_marker "$marker"; then$1continue',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, ignoredUnknownMetadata).some(
+      (issue) => issue.includes("unknown metadata"),
+    ),
+    "Jobs CI guard must reject proceeding past missing retained-run metadata",
+  );
+
+  const unboundedMarkerDecimal = launcher.replace(
+    '[[ "${#value}" -le "$MAX_CANONICAL_DECIMAL_DIGITS" ]]',
+    "return 0",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unboundedMarkerDecimal).some(
+      (issue) => issue.includes("canonical bounded decimals"),
+    ),
+    "Jobs CI guard must reject unbounded or non-canonical marker arithmetic",
+  );
+
+  const uncoupledRunName = launcher.replace(
+    '[[ "$run_epoch" == "$marker_created_epoch" && "$run_pid" == "$marker_owner_pid" ]]',
+    '[[ -n "$run_nonce" ]]',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, uncoupledRunName).some((issue) =>
+      issue.includes("exact epoch and owner PID"),
+    ),
+    "Jobs CI guard must reject loss of run-name epoch/PID binding",
+  );
+
+  const uncoupledMarkerState = launcher.replace(
+    '[[ "$marker_process_group_id" == "0" ]] || return 1',
+    ": # starting state accepted with any process group",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, uncoupledMarkerState).some((issue) =>
+      issue.includes("state must bind"),
+    ),
+    "Jobs CI guard must reject loss of marker state/process-group binding",
+  );
+
+  const trustedYoungCopiedRoot = launcher.replace(
+    '"$marker_age" -lt "$STALE_GRACE_SECONDS" ]];',
+    '"$marker_age" -lt "0" ]];',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, trustedYoungCopiedRoot).some((issue) =>
+      issue.includes("young copied roots"),
+    ),
+    "Jobs CI guard must reject deletion authority from an old marker in a young root",
+  );
+
+  const acceptedFutureMarker = launcher.replace(
+    'if [[ "$marker_created_epoch" -gt "$now" || "$root_modified" -gt "$now" ||',
+    'if [[ "$marker_created_epoch" -lt "0" || "$root_modified" -gt "$now" ||',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, acceptedFutureMarker).some((issue) =>
+      issue.includes("future metadata"),
+    ),
+    "Jobs CI guard must reject loss of future-dated marker blocking",
+  );
+
+  const skippedFinalAgeRevalidation = launcher.replace(
+    '      "$second_now" "$second_root_modified_epoch" "$second_marker_modified_epoch"',
+    '      "$now" "$second_root_modified_epoch" "$second_marker_modified_epoch"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, skippedFinalAgeRevalidation).some(
+      (issue) => issue.includes("rerun full age"),
+    ),
+    "Jobs CI guard must reject loss of fresh second age validation",
+  );
+
+  const ignoredMarkerIdentitySwap = launcher.replace(
+    '"$second_marker_device_inode" != "$accepted_marker_device_inode"',
+    '"$second_marker_device_inode" != "$second_marker_device_inode"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, ignoredMarkerIdentitySwap).some(
+      (issue) => issue.includes("device, inode, and mtime identity"),
+    ),
+    "Jobs CI guard must reject loss of same-field marker inode binding",
+  );
+
+  for (const [field, comparison] of MARKER_FIELD_COMPARISONS) {
+    const ignoredField = launcher.replace(comparison, '"ignored" == "ignored"');
+    assert(
+      validateIsolatedTestDiskAuthority(workflow, ignoredField).some((issue) =>
+        issue.includes(`exact field comparison: ${field}`),
+      ),
+      `Jobs CI guard must reject loss of the ${field} reread comparison`,
+    );
+  }
+
+  const unboundCurrentRootSnapshot = launcher
+    .split('current_root_device_inode="$observed_path_device_inode"')
+    .join('current_root_device_inode="unbound"');
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unboundCurrentRootSnapshot).some(
+      (issue) => issue.includes("current cleanup must bind established root"),
+    ),
+    "Jobs CI guard must reject loss of the current run-root identity snapshot",
+  );
+
+  const incompleteCurrentIdentityCoverage = launcher.replace(
+    "for current_identity_case in marker-inode marker-fields root-swap; do",
+    "for current_identity_case in marker-inode; do",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(
+      workflow,
+      incompleteCurrentIdentityCoverage,
+    ).some((issue) => issue.includes("marker-inode marker-fields root-swap")),
+    "Jobs CI guard must run all current root/marker substitution fixtures",
+  );
+
+  for (const [comparison, replacement, count] of [
+    [
+      '"$observed_path_device_inode" == "$current_root_device_inode"',
+      '"$observed_path_device_inode" == "$observed_path_device_inode"',
+      3,
+    ],
+    [
+      '"$observed_path_device_inode" != "$current_root_device_inode"',
+      '"$observed_path_device_inode" != "$observed_path_device_inode"',
+      2,
+    ],
+  ]) {
+    for (let occurrence = 1; occurrence <= count; occurrence += 1) {
+      const skippedCurrentRootRevalidation = replaceOccurrence(
+        launcher,
+        comparison,
+        replacement,
+        occurrence,
+      );
+      assert(
+        validateIsolatedTestDiskAuthority(
+          workflow,
+          skippedCurrentRootRevalidation,
+        ).some((issue) => issue.includes("current cleanup must bind established root")),
+        `Jobs CI guard must reject loss of current run-root revalidation ${occurrence}`,
+      );
+    }
+  }
+
+  const skippedCurrentMarkerIdentity = launcher.replace(
+    '"$first_marker_device_inode" != "$current_marker_device_inode"',
+    '"$first_marker_device_inode" != "$first_marker_device_inode"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, skippedCurrentMarkerIdentity).some(
+      (issue) => issue.includes("current cleanup must bind established root"),
+    ),
+    "Jobs CI guard must reject loss of current marker device/inode revalidation",
+  );
+
+  const skippedCurrentMarkerMtime = launcher.replace(
+    '"$first_marker_modified_epoch" != "$current_marker_modified_epoch"',
+    '"$first_marker_modified_epoch" != "$first_marker_modified_epoch"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, skippedCurrentMarkerMtime).some(
+      (issue) => issue.includes("current cleanup must bind established root"),
+    ),
+    "Jobs CI guard must reject loss of current marker mtime revalidation",
+  );
+
+  for (const [comparison, replacement] of [
+    [
+      '"$observed_path_device_inode" != "$current_marker_device_inode"',
+      '"$observed_path_device_inode" != "$observed_path_device_inode"',
+    ],
+    [
+      '"$observed_path_modified_epoch" != "$current_marker_modified_epoch"',
+      '"$observed_path_modified_epoch" != "$observed_path_modified_epoch"',
+    ],
+  ]) {
+    const skippedFinalCurrentMarkerIdentity = launcher.replace(
+      comparison,
+      replacement,
+    );
+    assert(
+      validateIsolatedTestDiskAuthority(
+        workflow,
+        skippedFinalCurrentMarkerIdentity,
+      ).some((issue) => issue.includes("current cleanup must bind established root")),
+      "Jobs CI guard must reject loss of final current-marker revalidation",
+    );
+  }
+
+  for (const [binding, replacement] of [
+    [
+      'next_device_inode="$observed_path_device_inode"',
+      'next_device_inode="unbound"',
+    ],
+    [
+      'next_modified_epoch="$observed_path_modified_epoch"',
+      'next_modified_epoch="unbound"',
+    ],
+  ]) {
+    const skippedMarkerTransitionBinding = launcher.replace(binding, replacement);
+    assert(
+      validateIsolatedTestDiskAuthority(
+        workflow,
+        skippedMarkerTransitionBinding,
+      ).some((issue) => issue.includes("marker transition")),
+      "Jobs CI guard must reject loss of marker-transition identity binding",
+    );
+  }
+
+  const nonAtomicMarkerTransition = replaceOccurrence(
+    launcher,
+    "/usr/bin/perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)'",
+    '/bin/mv -f -- "$next" "$marker_path"',
+    2,
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, nonAtomicMarkerTransition).some(
+      (issue) => issue.includes("marker transition"),
+    ),
+    "Jobs CI guard must reject loss of atomic marker transition rename",
+  );
+
+  for (const [comparison, replacement] of [
+    [
+      '"$observed_path_device_inode" == "$next_device_inode"',
+      '"$observed_path_device_inode" == "$observed_path_device_inode"',
+    ],
+    [
+      '"$observed_path_modified_epoch" == "$next_modified_epoch"',
+      '"$observed_path_modified_epoch" == "$observed_path_modified_epoch"',
+    ],
+  ]) {
+    const ignoredMarkerTransitionIdentity = launcher.replace(
+      comparison,
+      replacement,
+    );
+    assert(
+      validateIsolatedTestDiskAuthority(
+        workflow,
+        ignoredMarkerTransitionIdentity,
+      ).some((issue) => issue.includes("marker transition")),
+      "Jobs CI guard must reject loss of pre-rename marker identity",
+    );
+  }
+
+  const missingMarkerTransitionHook = launcher.replace(
+    'hook="${BLUEY_TEST_INJECT_AFTER_MARKER_RENAME_HOOK:-}"',
+    'hook=""',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, missingMarkerTransitionHook).some(
+      (issue) => issue.includes("marker transition"),
+    ),
+    "Jobs CI guard must preserve the deterministic marker-transition fixture",
+  );
+
+  for (const [field, binding] of CURRENT_MARKER_SNAPSHOT_BINDINGS) {
+    const ignoredBinding = launcher.replace(binding, `current_marker_${field}="ignored"`);
+    assert(
+      validateIsolatedTestDiskAuthority(workflow, ignoredBinding).some((issue) =>
+        issue.includes(`exact field binding: ${field}`),
+      ),
+      `Jobs CI guard must reject loss of the current ${field} marker snapshot`,
+    );
+  }
+
+  for (const [field, argument] of CURRENT_MARKER_REVALIDATION_ARGUMENTS) {
+    for (let occurrence = 1; occurrence <= 2; occurrence += 1) {
+      const ignoredArgument = replaceOccurrence(
+        launcher,
+        argument,
+        '"ignored"',
+        occurrence,
+      );
+      assert(
+        validateIsolatedTestDiskAuthority(workflow, ignoredArgument).some((issue) =>
+          issue.includes(`exact field revalidation: ${field}`),
+        ),
+        `Jobs CI guard must reject current ${field} revalidation ${occurrence}`,
+      );
+    }
+  }
+
+  for (const [field, argument] of EXPECTED_MARKER_REVALIDATION_ARGUMENTS) {
+    for (let occurrence = 1; occurrence <= 5; occurrence += 1) {
+      const ignoredArgument = replaceOccurrence(
+        launcher,
+        argument,
+        '"ignored"',
+        occurrence,
+      );
+      assert(
+        validateIsolatedTestDiskAuthority(workflow, ignoredArgument).some((issue) =>
+          issue.includes(`exact field revalidation: ${field}`),
+        ),
+        `Jobs CI guard must reject quarantined ${field} revalidation ${occurrence}`,
+      );
+    }
+  }
+
+  for (let occurrence = 1; occurrence <= 2; occurrence += 1) {
+    const skippedQuarantineCall = replaceOccurrence(
+      launcher,
+      "quarantine_and_delete_root \\",
+      "unsafe_delete_root \\",
+      occurrence,
+    );
+    assert(
+      validateIsolatedTestDiskAuthority(workflow, skippedQuarantineCall).some(
+        (issue) => issue.includes("atomic quarantine authority"),
+      ),
+      `Jobs CI guard must require quarantine call ${occurrence}`,
+    );
+  }
+
+  const nonAtomicQuarantineRename = replaceOccurrence(
+    launcher,
+    "/usr/bin/perl -e 'exit(rename($ARGV[0], $ARGV[1]) ? 0 : 1)'",
+    '/bin/cp -R "$source" "$moved_root"',
+    1,
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, nonAtomicQuarantineRename).some(
+      (issue) => issue.includes("atomic quarantine authority"),
+    ),
+    "Jobs CI guard must reject copy-based quarantine transitions",
+  );
+
+  const skippedSourceAbsence = launcher.replace(
+    'if [[ -e "$source" || -L "$source" ]]',
+    "if false",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, skippedSourceAbsence).some(
+      (issue) => issue.includes("atomic quarantine authority"),
+    ),
+    "Jobs CI guard must require original-source absence after quarantine rename",
+  );
+
+  for (let occurrence = 1; occurrence <= 2; occurrence += 1) {
+    const skippedQuarantineVerification = replaceOccurrence(
+      launcher,
+      "verify_quarantined_payload \\",
+      "unsafe_verify_quarantined_payload \\",
+      occurrence,
+    );
+    assert(
+      validateIsolatedTestDiskAuthority(
+        workflow,
+        skippedQuarantineVerification,
+      ).some((issue) => issue.includes("atomic quarantine authority")),
+      `Jobs CI guard must require quarantine verification ${occurrence}`,
+    );
+  }
+
+  const skippedAnchoredDelete = launcher.replace(
+    "delete_quarantined_payload \\",
+    "unsafe_delete_quarantined_payload \\",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, skippedAnchoredDelete).some(
+      (issue) => issue.includes("atomic quarantine authority"),
+    ),
+    "Jobs CI guard must require anchored quarantined deletion",
+  );
+
+  const missingFinalDeleteHook = launcher.replace(
+    'hook="${BLUEY_TEST_INJECT_AFTER_QUARANTINE_VERIFY_HOOK:-}"',
+    'hook=""',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, missingFinalDeleteHook).some(
+      (issue) => issue.includes("atomic quarantine authority"),
+    ),
+    "Jobs CI guard must preserve the final-delete substitution fixture",
+  );
+
+  for (const [comparison, replacement, count] of [
+    [
+      '"$observed_path_device_inode" == "$expected_root_device_inode"',
+      '"$observed_path_device_inode" == "$observed_path_device_inode"',
+      5,
+    ],
+    [
+      '"$observed_path_device_inode" == "$run_parent_device_inode"',
+      '"$observed_path_device_inode" == "$observed_path_device_inode"',
+      3,
+    ],
+    [
+      '"$observed_path_device_inode" == "$delete_quarantine_device_inode"',
+      '"$observed_path_device_inode" == "$observed_path_device_inode"',
+      3,
+    ],
+  ]) {
+    for (let occurrence = 1; occurrence <= count; occurrence += 1) {
+      const ignoredQuarantineIdentity = replaceOccurrence(
+        launcher,
+        comparison,
+        replacement,
+        occurrence,
+      );
+      assert(
+        validateIsolatedTestDiskAuthority(
+          workflow,
+          ignoredQuarantineIdentity,
+        ).some((issue) => issue.includes("atomic quarantine authority")),
+        `Jobs CI guard must reject quarantine identity loss ${occurrence}`,
+      );
+    }
+  }
+
+  for (const [comparison, replacement, count] of [
+    [
+      '"$first_marker_device_inode" != "$expected_marker_device_inode"',
+      '"$first_marker_device_inode" != "$first_marker_device_inode"',
+      1,
+    ],
+    [
+      '"$first_marker_modified_epoch" != "$expected_marker_modified_epoch"',
+      '"$first_marker_modified_epoch" != "$first_marker_modified_epoch"',
+      1,
+    ],
+    [
+      '"$observed_path_device_inode" == "$expected_marker_device_inode"',
+      '"$observed_path_device_inode" == "$observed_path_device_inode"',
+      2,
+    ],
+    [
+      '"$observed_path_modified_epoch" == "$expected_marker_modified_epoch"',
+      '"$observed_path_modified_epoch" == "$observed_path_modified_epoch"',
+      2,
+    ],
+  ]) {
+    for (let occurrence = 1; occurrence <= count; occurrence += 1) {
+      const ignoredQuarantinedMarkerIdentity = replaceOccurrence(
+        launcher,
+        comparison,
+        replacement,
+        occurrence,
+      );
+      assert(
+        validateIsolatedTestDiskAuthority(
+          workflow,
+          ignoredQuarantinedMarkerIdentity,
+        ).some((issue) => issue.includes("quarantined cleanup")),
+        `Jobs CI guard must reject quarantined marker identity loss ${occurrence}`,
+      );
+    }
+  }
+
+  const ancestorCheckOnParentOnly = launcher.replace(
+    'validate_no_git_ancestor "$desired"',
+    'validate_no_git_ancestor "$parent_physical"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, ancestorCheckOnParentOnly).some(
+      (issue) => issue.includes("exact requested parent Git ancestry"),
+    ),
+    "Jobs CI guard must reject checking only the requested parent's ancestor",
+  );
+
+  const incompleteExactGitCoverage = launcher.replace(
+    "for exact_git_kind in directory file symlink; do",
+    "for exact_git_kind in directory file; do",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, incompleteExactGitCoverage).some(
+      (issue) => issue.includes("directory file symlink"),
+    ),
+    "Jobs CI guard must run exact Git directory, file, and symlink fixtures",
+  );
+
+  const lateExactParentChecks = launcher.replace(
+    'validate_no_git_ancestor "$desired"',
+    'if [[ -e "$desired" || -L "$desired" ]]; then\n  fi\n  ' +
+      'validate_no_git_ancestor "$desired"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, lateExactParentChecks).some(
+      (issue) => issue.includes("precede run-parent mutation"),
+    ),
+    "Jobs CI guard must reject exact Git checks moved after parent mutation",
+  );
+
+  const uncheckedWorktreeEnumeration = launcher.replace(
+    '    exit "$producer_status"',
+    "    exit 0",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, uncheckedWorktreeEnumeration).some(
+      (issue) => issue.includes("producer-status-checked worktree enumeration"),
+    ),
+    "Jobs CI guard must reject treating worktree enumeration failure as success",
+  );
+
+  const processSubstitutionWorktreeEnumeration = launcher.replace(
+    'done <<< "$listing"',
+    'done < <(git -C "$repo_root" worktree list --porcelain)',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(
+      workflow,
+      processSubstitutionWorktreeEnumeration,
+    ).some((issue) => issue.includes("status-checked worktree enumeration")),
+    "Jobs CI guard must reject process substitution that discards Git status",
+  );
+
+  const unboundedWorktreeEnumeration = launcher.replace(
+    '[[ "${#listing}" -le "$WORKTREE_LIST_MAX_BYTES" ]] || return 1',
+    ': # worktree enumeration response accepted without a bound',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unboundedWorktreeEnumeration).some(
+      (issue) => issue.includes("worktree enumeration"),
+    ),
+    "Jobs CI guard must reject an unbounded worktree enumeration response",
+  );
+
+  for (const [needle, replacement, label] of [
+    ["set -o pipefail", ": # pipeline status ignored", "pipeline status"],
+    ["      alarm $timeout;", "      alarm 0;", "producer timeout"],
+    [
+      '} | /usr/bin/head -c "$WORKTREE_LIST_CAPTURE_BYTES")" || return 1',
+      '})" || return 1',
+      "producer byte cap",
+    ],
+    [
+      '[[ "$listing" == *"$sentinel" ]] || return 1',
+      ": # producer completion sentinel ignored",
+      "producer completion sentinel",
+    ],
+    [
+      'listing="${listing%"$sentinel"}"',
+      ": # completion sentinel retained",
+      "sentinel removal",
+    ],
+  ]) {
+    const unsafeWorktreeEnumeration = launcher.replace(needle, replacement);
+    assert(
+      validateIsolatedTestDiskAuthority(
+        workflow,
+        unsafeWorktreeEnumeration,
+      ).some((issue) => issue.includes("worktree enumeration")),
+      `Jobs CI guard must reject loss of ${label}`,
+    );
+  }
+
+  const gateBeforeSetsid = launcher.replace(
+    "exit 125 if setsid() == -1;",
+    ": # private process-group setup removed",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, gateBeforeSetsid).some((issue) =>
+      issue.includes("private wrapper handshake"),
+    ),
+    "Jobs CI guard must reject a wrapper that can wait before private group setup",
+  );
+
+  const undeferredWrapperSpawn = launcher.replace(
+    'ready="$run_root/.command-ready"\n  install_deferred_signal_traps\n  /usr/bin/perl',
+    'ready="$run_root/.command-ready"\n  /usr/bin/perl',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, undeferredWrapperSpawn).some((issue) =>
+      issue.includes("private wrapper handshake"),
+    ),
+    "Jobs CI guard must reject an undeferred wrapper-spawn window",
+  );
+
+  const unboundWrapperGroup = launcher.replace(
+    '[[ "$observed_group_id" == "$command_pid" ]] && break',
+    '[[ -n "$observed_group_id" ]] && break',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unboundWrapperGroup).some((issue) =>
+      issue.includes("observed_group_id"),
+    ),
+    "Jobs CI guard must require exact wrapper PID/process-group equality",
+  );
+
+  const gateBeforeDeferredDispatch = launcher.replace(
+    "dispatch_deferred_signal\n  printf 'start\\n' > \"$gate\"",
+    "printf 'start\\n' > \"$gate\"\n  dispatch_deferred_signal",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, gateBeforeDeferredDispatch).some((issue) =>
+      issue.includes("private wrapper handshake"),
+    ),
+    "Jobs CI guard must reject opening the user-command gate before deferred delivery",
+  );
+
+  const unboundedPidStop = launcher.replace(
+    'pid_can_execute "$command_pid" && return 1',
+    ": # wait even while the child can still execute",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unboundedPidStop).some((issue) =>
+      issue.includes("pid_can_execute"),
+    ),
+    "Jobs CI guard must reject an unbounded PID fallback wait",
+  );
+
   const callerCwdCommand = launcher.replace(
     "exit 125 unless chdir $repo_root;",
     ": # caller working directory retained",
@@ -1339,6 +2604,22 @@ function testIsolatedTestDiskAuthorityGuard() {
       issue.includes("chdir"),
     ),
     "Jobs CI guard must reject commands that retain the caller working directory",
+  );
+
+  const sharedMicDatabase = micDeviceTest
+    .replace(
+      ".tempdir_in(std::env::temp_dir())",
+      '.tempdir_in("/tmp")',
+    )
+    .replace(
+      'let db_path = temp_dir.path().join("mic-device.sqlite");',
+      'let db_path = "/tmp/cue_test_mic_device_shared.db";',
+    );
+  assert(
+    validateMicDeviceTempAuthority(sharedMicDatabase).some((issue) =>
+      issue.includes("shared /tmp database"),
+    ),
+    "Jobs CI guard must reject a shared hardcoded microphone-test database",
   );
 }
 
