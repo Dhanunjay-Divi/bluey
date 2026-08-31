@@ -38,26 +38,43 @@ if [ -t 1 ]; then
     DIM="$(tput dim 2>/dev/null || true)"
     GREEN="$(tput setaf 2 2>/dev/null || true)"
     RED="$(tput setaf 1 2>/dev/null || true)"
-    YELLOW="$(tput setaf 3 2>/dev/null || true)"
     BLUE="$(tput setaf 4 2>/dev/null || true)"
     RESET="$(tput sgr0 2>/dev/null || true)"
 else
-    BOLD="" DIM="" GREEN="" RED="" YELLOW="" BLUE="" RESET=""
+    BOLD="" DIM="" GREEN="" RED="" BLUE="" RESET=""
 fi
 
 step()  { printf "\n%s── %s ──%s\n" "$BLUE$BOLD" "$1" "$RESET"; }
 ok()    { printf "%s✅ %s%s\n" "$GREEN" "$1" "$RESET"; }
-warn()  { printf "%s⚠  %s%s\n" "$YELLOW" "$1" "$RESET"; }
 fail()  { printf "%s❌ %s%s\n" "$RED" "$1" "$RESET" >&2; exit 1; }
 
 # ── Find workspace root ─────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -z "${BLUEY_TEST_WORKSPACE_ROOT:-}" \
+    || ! -f "$BLUEY_TEST_WORKSPACE_ROOT/.bluey-test-workspace" ]]; then
+    exec bash "$WORKSPACE/scripts/run-bluey-tests.sh" -- \
+        bash "$WORKSPACE/scripts/observability-acceptance-smoke.sh" "$@"
+fi
 cd "$WORKSPACE"
 
 # ── Working directory ───────────────────────────────────────────────────
-WORK="$(mktemp -d -t bluey-obs-smoke)"
-trap 'rm -rf "$WORK" 2>/dev/null; jobs -p | xargs -r kill 2>/dev/null' EXIT
+WORK="$(mktemp -d "$TMPDIR/bluey-obs-smoke.XXXXXX")"
+cleanup() {
+    local pid
+    local pids=()
+    while IFS= read -r pid; do
+        [ -n "$pid" ] && pids+=("$pid")
+    done < <(jobs -p)
+    for pid in "${pids[@]}"; do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    rm -rf "$WORK" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 LOG_DIR="$WORK/logs"
 mkdir -p "$LOG_DIR"
@@ -72,19 +89,27 @@ echo "  logs     : $LOG_DIR"
 echo "  expected git tip:"
 git -P log --oneline -1 || true
 
-# ── Build (release) the server binary ───────────────────────────────────
-step "Build bluey-server (debug — fast iteration)"
+# ── Build the exact local smoke binaries ────────────────────────────────
+step "Build bluey-server, bluey-daemon, and bluey CLI (debug)"
 ( cd "$WORKSPACE/server" && cargo build --bin bluey-server 2>&1 | tail -3 )
-SERVER_BIN="$WORKSPACE/server/target/debug/bluey-server"
+( cd "$WORKSPACE" && cargo build -p cue-daemon --bin bluey-daemon 2>&1 | tail -3 )
+( cd "$WORKSPACE" && cargo build -p cue-cli --bin bluey 2>&1 | tail -3 )
+SERVER_BIN="$CARGO_TARGET_DIR/debug/bluey-server"
+DAEMON_BIN="$CARGO_TARGET_DIR/debug/bluey-daemon"
+BLUEY_BIN="$CARGO_TARGET_DIR/debug/bluey"
 [ -x "$SERVER_BIN" ] || fail "bluey-server binary not built"
+[ -x "$DAEMON_BIN" ] || fail "bluey-daemon binary not built"
+[ -x "$BLUEY_BIN" ] || fail "bluey CLI binary not built"
 ok "server binary at $SERVER_BIN"
+ok "daemon and CLI binaries are task-owned under $CARGO_TARGET_DIR"
 
 # ── Stub config: env-only, no real stripe / smtp / providers ────────────
 step "Stub config + env vars"
-export BLUEY_PORT=18000
+export BLUEY_API_HOST=127.0.0.1
+export BLUEY_PORT="$((18000 + ($$ % 1000)))"
 export BLUEY_DB_PATH="$WORK/bluey.sqlite"
 export BLUEY_JWT_SECRET="$(openssl rand -hex 64 2>/dev/null || head -c 32 /dev/urandom | xxd -p -c 32)"
-export BLUEY_PUBLIC_URL="http://127.0.0.1:18000"
+export BLUEY_PUBLIC_URL="http://127.0.0.1:$BLUEY_PORT"
 export RUST_LOG="info,bluey_server=debug,tower_http=info"
 # Disable ANSI colors so grep can read field values cleanly.
 export NO_COLOR=1
@@ -115,11 +140,11 @@ ok "dashboard command layer emits WithTrace before daemon IPC"
 
 # ── Send a request that the request-id middleware should handle ─────────
 step "Send request with caller-supplied trace_id and request_id"
-TRACE_ID="trace-smoke-$(date +%s)-$$"
-REQUEST_ID="req-smoke-$(date +%s)-$$"
+TRACE_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+REQUEST_ID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
 
 curl -sS -D "$CURL_HEADERS" -o "$CURL_OUT" \
-    -X GET "http://127.0.0.1:18000/health" \
+    -X GET "http://127.0.0.1:$BLUEY_PORT/health" \
     -H "X-Bluey-Trace-Id: $TRACE_ID" \
     -H "X-Bluey-Request-Id: $REQUEST_ID" \
     || fail "curl to /health failed"
@@ -170,7 +195,7 @@ ok "lifecycle lines present"
 # ── Assertion 4: server fails-open when client omits ids ───────────────
 step "Verify server mints fresh ids when client omits them"
 curl -sS -D "$CURL_HEADERS" -o "$CURL_OUT" \
-    -X GET "http://127.0.0.1:18000/health" \
+    -X GET "http://127.0.0.1:$BLUEY_PORT/health" \
     || fail "second curl to /health failed"
 
 MINTED_TRACE="$(grep -i 'x-bluey-trace-id:' "$CURL_HEADERS" | head -1 | awk '{print $2}' | tr -d '\r')"
@@ -198,58 +223,66 @@ ok "server mints fresh trace_id ($MINTED_TRACE) and request_id ($MINTED_REQUEST)
 # ── Assertion 6: daemon honors BLUEY_TRACE_ID env (Phase 5) ─────────────
 step "Verify daemon honors BLUEY_TRACE_ID env on IPC dispatch (Phase 5)"
 
-DAEMON_BIN="$WORKSPACE/target/release/bluey-daemon"
-if [ ! -x "$DAEMON_BIN" ]; then
-    DAEMON_BIN="$WORKSPACE/target/debug/bluey-daemon"
+DAEMON_LOG_DIR="$WORK/daemon-logs"
+DAEMON_STDERR="$WORK/daemon.stderr"
+mkdir -p "$DAEMON_LOG_DIR"
+KNOWN_TRACE="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+DAEMON_PORT="$((59000 + ($$ % 5000)))"
+DAEMON_ADDR="127.0.0.1:$DAEMON_PORT"
+
+RUST_LOG=debug BLUEY_LOG_DIR="$DAEMON_LOG_DIR" BLUEY_TRACE_ID="$KNOWN_TRACE" \
+    "$DAEMON_BIN" --addr "$DAEMON_ADDR" --no-overlay >/dev/null 2>"$DAEMON_STDERR" &
+DAEMON_PID=$!
+
+DAEMON_READY=0
+for _ in {1..50}; do
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+        break
+    fi
+    if BLUEY_DAEMON_ADDR="$DAEMON_ADDR" BLUEY_TRACE_ID="$KNOWN_TRACE" \
+        "$BLUEY_BIN" status >/dev/null 2>&1; then
+        DAEMON_READY=1
+        break
+    fi
+    sleep 0.1
+done
+if [ "$DAEMON_READY" -ne 1 ]; then
+    echo "--- daemon stderr tail ---"
+    tail -20 "$DAEMON_STDERR" 2>/dev/null || true
+    fail "daemon did not become ready for the Phase 5 trace assertion"
 fi
 
-if [ ! -x "$DAEMON_BIN" ]; then
-    warn "bluey-daemon binary not found; skipping Phase 5 daemon assertion"
-    warn "build with: cargo build -p cue-daemon --bin bluey-daemon"
-else
-    DAEMON_LOG_DIR="$WORK/daemon-logs"
-    mkdir -p "$DAEMON_LOG_DIR"
-    KNOWN_TRACE="phase5-acceptance-trace-$$"
+sleep 1
+DAEMON_LOG_FILE="$(find "$DAEMON_LOG_DIR" -maxdepth 1 -type f -name 'daemon-log.*.log' -print | head -1)"
+if [ -z "$DAEMON_LOG_FILE" ] || [ ! -f "$DAEMON_LOG_FILE" ]; then
+    fail "daemon log file was not produced for the Phase 5 trace assertion"
+fi
+if ! grep "\"trace_id\":\"$KNOWN_TRACE\"" "$DAEMON_LOG_FILE" \
+    | grep -q "daemon ipc request received"; then
+    echo "--- daemon log tail ---"
+    tail -20 "$DAEMON_LOG_FILE"
+    fail "daemon log missing trace_id=$KNOWN_TRACE (Phase 5 env-pass-through broken)"
+fi
+ok "daemon JSON log contains trace_id=$KNOWN_TRACE on authenticated IPC dispatch"
 
-    # Kill any leftover daemon on the IPC port.
-    if command -v pkill >/dev/null 2>&1; then
-        pkill -9 bluey-daemon 2>/dev/null || true
-    fi
-    sleep 1
-
-    RUST_LOG=debug BLUEY_LOG_DIR="$DAEMON_LOG_DIR" BLUEY_TRACE_ID="$KNOWN_TRACE" \
-        "$DAEMON_BIN" --no-overlay >/dev/null 2>&1 &
-    DAEMON_PID=$!
-    sleep 2
-
+BLUEY_DAEMON_ADDR="$DAEMON_ADDR" BLUEY_TRACE_ID="$KNOWN_TRACE" \
+    "$BLUEY_BIN" off >/dev/null 2>&1 \
+    || fail "daemon did not shut down cleanly after the Phase 5 assertion"
+DAEMON_EXITED=0
+for _ in {1..80}; do
     if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
-        warn "daemon failed to start; skipping Phase 5 daemon assertion"
-    else
-        # Send a status request via the daemon's IPC port.
-        if printf '%s\n' '{"type":"status"}' | nc -w 2 127.0.0.1 57321 >/dev/null 2>&1; then
-            sleep 1
-            # Send shutdown to flush logs cleanly.
-            printf '%s\n' '{"type":"shutdown"}' | nc -w 2 127.0.0.1 57321 >/dev/null 2>&1 || true
-            sleep 2
-
-            # Grep the daemon log for the env-supplied trace.
-            DAEMON_LOG_FILE="$(ls "$DAEMON_LOG_DIR"/daemon-log.*.log 2>/dev/null | head -1)"
-            if [ -z "$DAEMON_LOG_FILE" ] || [ ! -f "$DAEMON_LOG_FILE" ]; then
-                warn "daemon log file not produced; Phase 5 assertion skipped"
-            elif ! grep -q "\"trace_id\":\"$KNOWN_TRACE\"" "$DAEMON_LOG_FILE"; then
-                echo "--- daemon log tail ---"
-                tail -20 "$DAEMON_LOG_FILE"
-                fail "daemon log missing trace_id=$KNOWN_TRACE (Phase 5 env-pass-through broken)"
-            else
-                ok "daemon JSON log contains trace_id=$KNOWN_TRACE on IPC dispatch"
-            fi
-        else
-            warn "could not send IPC to daemon (nc failure); Phase 5 assertion skipped"
-        fi
-
-        kill -TERM "$DAEMON_PID" 2>/dev/null || true
-        wait "$DAEMON_PID" 2>/dev/null || true
+        DAEMON_EXITED=1
+        break
     fi
+    sleep 0.1
+done
+if [ "$DAEMON_EXITED" -ne 1 ]; then
+    fail "daemon remained alive after the authenticated shutdown assertion"
+fi
+DAEMON_EXIT_STATUS=0
+wait "$DAEMON_PID" || DAEMON_EXIT_STATUS=$?
+if [ "$DAEMON_EXIT_STATUS" -ne 0 ]; then
+    fail "daemon exited with status $DAEMON_EXIT_STATUS after authenticated shutdown"
 fi
 
 step "Verify Phase 3 overlay lifecycle + frontend error capture tests"

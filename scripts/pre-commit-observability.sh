@@ -45,8 +45,9 @@ if [ -n "$STAGED_RS" ]; then
     # keep the pre-commit fast. CI catches clippy regressions.
     if [ "${BLUEY_PRECOMMIT_CLIPPY:-}" = "1" ]; then
         echo "Running cargo clippy -D warnings..."
-        if ! cargo clippy --all-targets -- -D warnings >/dev/null 2>&1; then
-            echo "cargo clippy FAILED. Run 'cargo clippy --all-targets' to inspect."
+        if ! bash "$WORKSPACE/scripts/run-bluey-tests.sh" -- \
+            cargo clippy --all-targets -- -D warnings >/dev/null 2>&1; then
+            echo "cargo clippy FAILED. Run it through scripts/run-bluey-tests.sh to inspect."
             exit 1
         fi
         echo "✅ clippy clean"

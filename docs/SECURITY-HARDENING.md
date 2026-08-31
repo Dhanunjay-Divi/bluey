@@ -216,30 +216,33 @@ These are mandatory before inviting real paid users:
 ### Local private permissions
 
 ```bash
-cargo test -p cue-core app_paths::tests::ensure_uses_private_directory_permissions
-cargo test -p cue-daemon storage::security_tests::meeting_store_writes_private_files
-cargo test -p cue-daemon db::tests::file_database_is_created_private
+bash scripts/run-bluey-tests.sh -- cargo test -p cue-core \
+  app_paths::tests::ensure_uses_private_directory_permissions
+bash scripts/run-bluey-tests.sh -- cargo test -p cue-daemon \
+  storage::security_tests::meeting_store_writes_private_files
+bash scripts/run-bluey-tests.sh -- cargo test -p cue-daemon \
+  db::tests::file_database_is_created_private
 ```
 
 ### Overlay IPC validator
 
 ```bash
-cargo test -p cue-daemon --test overlay_production_path
+bash scripts/run-bluey-tests.sh -- cargo test -p cue-daemon --test overlay_production_path
 ```
 
 ### Managed STT auth path
 
 ```bash
-cd server
-cargo test stt::tests
+bash scripts/run-bluey-tests.sh -- cargo test --manifest-path server/Cargo.toml stt::tests
 ```
 
 ### Cloud sync/RAG auth path
 
 ```bash
-cd server
-cargo test sync_batch_round_trips_session_bundle_and_rag
-cargo test validate_rejects_empty_or_huge_batches
+bash scripts/run-bluey-tests.sh -- cargo test --manifest-path server/Cargo.toml \
+  sync_batch_round_trips_session_bundle_and_rag
+bash scripts/run-bluey-tests.sh -- cargo test --manifest-path server/Cargo.toml \
+  validate_rejects_empty_or_huge_batches
 ```
 
 ### Install checksum path

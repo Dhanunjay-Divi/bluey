@@ -32,7 +32,7 @@
 cargo fmt --check   # ✅ / ❌
 cargo clippy        # ✅ / ❌
 cargo build         # ✅ / ❌
-cargo test          # ✅ / ❌ (X passed, Y failed)
+bash scripts/run-bluey-tests.sh all  # ✅ / ❌ (X passed, Y failed; temp workspace cleaned)
 ```
 
 ## Overall Verdict

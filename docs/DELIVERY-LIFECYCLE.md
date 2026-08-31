@@ -32,7 +32,7 @@ The complete chain that runs locally on uno before any release:
 cargo fmt --all --check                                          # formatter check
 cargo clippy --all-targets -- -D warnings                        # lint with -D
 cargo build --all-targets --release                              # release build all crates
-cargo test --all-targets                                         # 392 cargo tests
+bash scripts/run-bluey-tests.sh all                              # isolated Rust tests; cleans on exit
 ( cd crates/cue-dashboard/ui && npm test && npm run build )      # 15 vitest + UI build
 swift build -c release --package-path native/macos/cue-overlay   # Swift overlay
 swift build -c release --package-path native/macos/cue-whisper   # Swift whisper
