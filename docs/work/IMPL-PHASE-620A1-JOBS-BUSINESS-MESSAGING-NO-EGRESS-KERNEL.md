@@ -3,8 +3,8 @@
 > **Codex preflight:** Loaded `$bluey-ops`, reconciled the Phase 614B handoff and Phase 620 plans
 > against the isolated worktree, and did not use the SSD archive.
 
-**Status:** local source implementation and verification complete; no production capability or
-external effect is authorized
+**Status:** source and exact-tip hosted verification complete; no production capability or external
+effect is authorized
 
 **Branch:** `feat/phase-620a-jobs-business-messaging-simulator`
 
@@ -108,6 +108,14 @@ No file under `docs/reviews/` changed. The meeting-owned checkout
 | Independent source/security review | Green; no remaining P0, P1, or P2 |
 | `git diff --check` | Green |
 
+The exact-tip replacement run after FIX-782 is
+[`33360874641`](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33360874641) at
+`680160b14e9113a49d778fe8ad3cf8c974a9da72`. Its combined Linux job completed in 48 minutes 25
+seconds: 1,968 Jobs JavaScript tests passed with one intentional skip, 955 selected server Jobs
+unit tests passed, all 108 server integration tests passed, all 14 Rust simulator verifier tests
+passed, and the managed-runner Docker/native smoke passed. The parallel Darwin native-runner job,
+exact-tip cross-platform CI, and observability workflow were also green.
+
 The full 1,590-test run supersedes an earlier interrupted aggregate and is the only aggregate
 represented as passing.
 
@@ -139,4 +147,5 @@ represented as passing.
 - [x] Production build, binary, Docker, and workflow containment are guarded.
 - [x] Privacy, schema, provenance, release-authority, and aggregate tests are green.
 - [x] Independent source/security rereview found no remaining P0–P2.
+- [x] Exact-tip hosted Jobs CI, cross-platform CI, and observability workflows are green.
 - [x] No external effect, production flag, deployment, or provider write occurred.

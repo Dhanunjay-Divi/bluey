@@ -11,7 +11,8 @@
 
 **Date:** 2026-08-30
 
-**Status:** 🟢 local source accepted; 🟡 messaging production/release capability intentionally absent
+**Status:** 🟢 source and exact-tip hosted evidence accepted; 🟡 messaging
+production/release capability intentionally absent
 
 ## Verdict
 
@@ -104,6 +105,13 @@ All corrections were rebuilt and independently rereviewed.
 | Browser/managed release authority | 10/10 and 17/17 |
 | Portal freshness/account deletion | Green and 3/3 |
 | Independent final review | No remaining P0–P2 |
+| Exact-tip hosted evidence | Green at `680160b14e9113a49d778fe8ad3cf8c974a9da72`: Jobs CI [`33360874641`](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33360874641), cross-platform CI [`33360874638`](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33360874638), observability [`33360874675`](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33360874675) |
+
+The replacement Jobs CI run completed under the closed 90-minute budget in 48 minutes 25 seconds.
+It passed 1,968 Jobs JavaScript tests with one intentional skip, 955 selected server Jobs unit
+tests, all 108 server integration tests, all 14 Rust simulator verifier tests, and the exact
+managed-runner Docker/native smoke. This converts the prior timeout-only conditional evidence into
+an exact-tip hosted pass without changing runtime behavior or authorizing production effects.
 
 ## Residual Limitations
 
