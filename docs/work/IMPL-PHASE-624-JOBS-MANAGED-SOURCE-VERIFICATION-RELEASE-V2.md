@@ -10,7 +10,7 @@ verification remain pending; no workflow dispatch, deployment, or flag change
 
 **Implementation commit:** `02648f09ceb1790ef34d21632baac00c06c37e17`
 
-**Integrated source tip:** `8858abe28d590b1f234481ace3abba24be076e04`
+**Integrated source tip:** `eccc70419fd53de7ee880c6413f8a9d0ba154668`
 
 **Branch:** `feat/phase-624-jobs-managed-source-verification-v2`
 
@@ -112,9 +112,9 @@ candidate image input; it is not candidate, registry, activation, or deployment 
 
 No Docker command, workflow dispatch, provider request, or production mutation was performed.
 
-The Phase 624 source commit was merged with the independently accepted Phase 622/FIX-784 tip. The
-merge preserved the final 20-test gate and independent guards; no release-v2 source conflict was
-resolved manually.
+The Phase 624 source commit was merged with the independently accepted Phase 622/FIX-784 tip and
+the latest Phase 620A parent evidence. The merges preserved the final 20-test gate and independent
+guards; no release-v2 source conflict was resolved manually.
 
 ## Deviations From Plan
 
