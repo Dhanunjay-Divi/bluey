@@ -55,6 +55,14 @@ bootstrap_trusted_parent_chain() {
 
 bootstrap_identity() { bootstrap_stat -c%i -f%i "$1"; }
 
+bootstrap_follow_identity() {
+    if stat -L -c%i -- "$1" >/dev/null 2>&1; then
+        stat -L -c%i -- "$1"
+    else
+        stat -L -f%i -- "$1"
+    fi
+}
+
 load_env_file() {
     local env_file="$1" before after
     if [ -e "$env_file" ] || [ -L "$env_file" ]; then
@@ -64,7 +72,7 @@ load_env_file() {
         }
         before="$(bootstrap_identity "$env_file")" || exit 1
         exec 9<"$env_file"
-        after="$(bootstrap_identity /dev/fd/9)" || exit 1
+        after="$(bootstrap_follow_identity /dev/fd/9)" || exit 1
         [ "$before" = "$after" ] || exit 1
         # shellcheck disable=SC1090
         . /dev/fd/9
@@ -80,7 +88,8 @@ if [ -n "${BLUEY_EXTRA_ENV_FILES:-}" ]; then
         load_env_file "$env_file"
     done
 fi
-unset -f bootstrap_stat bootstrap_trusted_file bootstrap_trusted_parent_chain bootstrap_identity
+unset -f bootstrap_stat bootstrap_trusted_file bootstrap_trusted_parent_chain bootstrap_identity \
+    bootstrap_follow_identity
 while IFS= read -r inherited_name; do
     case "$inherited_name" in
         *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*DATABASE_URL*|*DSN*|*WEBHOOK*|*CREDENTIAL*|*COOKIE*|*AUTH*)
@@ -159,6 +168,30 @@ path_mode() {
 
 path_dev_inode() {
     if stat -c '%d:%i' "$1" >/dev/null 2>&1; then stat -c '%d:%i' "$1"; else stat -f '%d:%i' "$1"; fi
+}
+
+path_follow_owner_uid() {
+    if stat -L -c%u -- "$1" >/dev/null 2>&1; then
+        stat -L -c%u -- "$1"
+    else
+        stat -L -f%u -- "$1"
+    fi
+}
+
+path_follow_mode() {
+    if stat -L -c%a -- "$1" >/dev/null 2>&1; then
+        stat -L -c%a -- "$1"
+    else
+        stat -L -f%Lp -- "$1"
+    fi
+}
+
+path_follow_dev_inode() {
+    if stat -L -c '%d:%i' -- "$1" >/dev/null 2>&1; then
+        stat -L -c '%d:%i' -- "$1"
+    else
+        stat -L -f '%d:%i' -- "$1"
+    fi
 }
 
 validate_trusted_existing_chain() {
@@ -294,11 +327,11 @@ lock_mode="$(path_mode "$INSTALL_LOCK_FILE")"
 printf '%s\n' "$lock_mode" | grep -Eq '^[0-7]+$' || die "installer lock mode changed invalidly"
 [ $((8#$lock_mode & 8#022)) -eq 0 ] || die "installer lock became group/world writable"
 path_lock_identity="$(path_dev_inode "$INSTALL_LOCK_FILE")" || die "cannot stat installer lock path"
-fd_lock_identity="$(path_dev_inode /dev/fd/8)" || die "cannot stat opened installer lock"
+fd_lock_identity="$(path_follow_dev_inode /dev/fd/8)" || die "cannot stat opened installer lock"
 [ "$path_lock_identity" = "$fd_lock_identity" ] || die "installer lock identity changed across open"
 [ -f /dev/fd/8 ] || die "opened installer lock is not regular"
-[ "$(path_owner_uid /dev/fd/8)" = 0 ] || die "opened installer lock is not root-owned"
-fd_lock_mode="$(path_mode /dev/fd/8)"
+[ "$(path_follow_owner_uid /dev/fd/8)" = 0 ] || die "opened installer lock is not root-owned"
+fd_lock_mode="$(path_follow_mode /dev/fd/8)"
 printf '%s\n' "$fd_lock_mode" | grep -Eq '^[0-7]+$' || die "opened installer lock mode is invalid"
 [ $((8#$fd_lock_mode & 8#022)) -eq 0 ] || die "opened installer lock is group/world writable"
 chmod 0600 "$INSTALL_LOCK_FILE"

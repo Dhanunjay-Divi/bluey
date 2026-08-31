@@ -62,6 +62,14 @@ bootstrap_trusted_parent_chain() {
 
 bootstrap_identity() { bootstrap_stat -c%i -f%i "$1"; }
 
+bootstrap_follow_identity() {
+    if stat -L -c%i -- "$1" >/dev/null 2>&1; then
+        stat -L -c%i -- "$1"
+    else
+        stat -L -f%i -- "$1"
+    fi
+}
+
 load_env_file() {
     local env_file="$1" path_identity fd_identity env_fd
     if [ -e "$env_file" ] || [ -L "$env_file" ]; then
@@ -72,7 +80,7 @@ load_env_file() {
         path_identity="$(bootstrap_identity "$env_file")" || exit 1
         exec 9<"$env_file"
         env_fd=9
-        fd_identity="$(bootstrap_identity "/dev/fd/$env_fd")" || exit 1
+        fd_identity="$(bootstrap_follow_identity "/dev/fd/$env_fd")" || exit 1
         [ "$path_identity" = "$fd_identity" ] || exit 1
         # shellcheck disable=SC1090
         . "/dev/fd/$env_fd"
@@ -90,7 +98,8 @@ if [ -n "${BLUEY_EXTRA_ENV_FILES:-}" ]; then
 else
     load_env_file /etc/bluey-api/bluey-postgres.env
 fi
-unset -f bootstrap_stat bootstrap_trusted_file bootstrap_trusted_parent_chain bootstrap_identity
+unset -f bootstrap_stat bootstrap_trusted_file bootstrap_trusted_parent_chain bootstrap_identity \
+    bootstrap_follow_identity
 
 ARCHIVE_ROOT="${BLUEY_LOG_ARCHIVE_LOCAL_DIR-/var/backups/bluey-api/logs}"
 WORK_ROOT="${BLUEY_LOG_ARCHIVE_WORK_DIR-/var/lib/bluey-ops/log-archive}"

@@ -485,19 +485,37 @@ if BLUEY_LOG_GUARD_INSTALL_LOCK_FILE="$installer_owned_lock" \
 fi
 
 # Deterministic post-open substitution tests use a non-root-only installer hook.
-# The stat shim changes only ownership/mode reporting and normalizes macOS
-# /dev/fd's pseudo-device ID; inode identity remains real.
+# The stat shim changes only ownership/mode reporting and normalizes /dev/fd's
+# device ID; the portable helpers preserve each platform's real mode/inode.
 LOCK_TEST_BIN="$TEST_ROOT/lock-test-bin"
 LOCK_TEST_ROOT="$(cd -P "$TEST_ROOT" && pwd -P)/lock-open"
 mkdir -p "$LOCK_TEST_BIN" "$LOCK_TEST_ROOT"
 cat > "$LOCK_TEST_BIN/stat" <<'SH'
 #!/usr/bin/env bash
 args="$*"; path="${!#}"
+case "$path" in
+  /dev/fd/*)
+    case " $args " in *" -L "*) ;; *) exit 64 ;; esac ;;
+esac
+native_mode() {
+  if /usr/bin/stat -L -c '%a' -- "$path" >/dev/null 2>&1; then
+    /usr/bin/stat -L -c '%a' -- "$path"
+  else
+    /usr/bin/stat -L -f '%Lp' -- "$path"
+  fi
+}
+native_inode() {
+  if /usr/bin/stat -L -c '%i' -- "$path" >/dev/null 2>&1; then
+    /usr/bin/stat -L -c '%i' -- "$path"
+  else
+    /usr/bin/stat -L -f '%i' -- "$path"
+  fi
+}
 case "$args" in
   *%u*) echo 0 ;;
   *%a*|*%Lp*)
-    if [ -f "$path" ]; then /usr/bin/stat -f '%Lp' "$path"; else echo 755; fi ;;
-  *%d:%i*) echo "1:$(/usr/bin/stat -f '%i' "$path")" ;;
+    if [ -f "$path" ]; then native_mode; else echo 755; fi ;;
+  *%d:%i*) echo "1:$(native_inode)" ;;
   *) /usr/bin/stat "$@" ;;
 esac
 SH
@@ -508,22 +526,30 @@ SH
 chmod 0755 "$LOCK_TEST_BIN/stat" "$LOCK_TEST_BIN/flock"
 
 run_lock_swap_test() {
-    local name="$1" hook="$2" lock
+    local name="$1" hook="$2" expected="$3" lock output
     lock="$LOCK_TEST_ROOT/$name/guard.lock"
+    output="$LOCK_TEST_ROOT/$name-output.log"
     mkdir -p "$(dirname "$lock")"; : > "$lock"; chmod 0600 "$lock"
     if PATH="$LOCK_TEST_BIN:$PATH" BLUEY_INSTALLER_ENABLE_TEST_HOOK=1 \
         BLUEY_LOG_GUARD_INSTALL_LOCK_FILE="$lock" \
         BLUEY_INSTALLER_LOCK_POST_OPEN_TEST_HOOK_COMMAND="$hook" \
-        "$ROOT/ops/install-bluey-log-guards.sh" --test-lock-open >/dev/null 2>&1; then
+        "$ROOT/ops/install-bluey-log-guards.sh" --test-lock-open >"$output" 2>&1; then
         fail "installer accepted post-open $name substitution"
     fi
+    grep -Fq "$expected" "$output" ||
+        fail "installer rejected post-open $name substitution for the wrong reason"
 }
 leaf_lock="$LOCK_TEST_ROOT/leaf/guard.lock"
-run_lock_swap_test leaf "mv '$leaf_lock' '${leaf_lock}.old'; : > '$leaf_lock'; chmod 0600 '$leaf_lock'"
+run_lock_swap_test leaf \
+    "mv '$leaf_lock' '${leaf_lock}.old'; : > '$leaf_lock'; chmod 0600 '$leaf_lock'" \
+    "installer lock identity changed across open"
 mode_lock="$LOCK_TEST_ROOT/mode/guard.lock"
-run_lock_swap_test mode "chmod 0666 '$mode_lock'"
+run_lock_swap_test mode "chmod 0666 '$mode_lock'" \
+    "installer lock became group/world writable"
 ancestor_lock="$LOCK_TEST_ROOT/ancestor/guard.lock"
-run_lock_swap_test ancestor "mv '$(dirname "$ancestor_lock")' '$(dirname "$ancestor_lock").old'; mkdir -p '$(dirname "$ancestor_lock")'; : > '$ancestor_lock'; chmod 0600 '$ancestor_lock'"
+run_lock_swap_test ancestor \
+    "mv '$(dirname "$ancestor_lock")' '$(dirname "$ancestor_lock").old'; mkdir -p '$(dirname "$ancestor_lock")'; : > '$ancestor_lock'; chmod 0600 '$ancestor_lock'" \
+    "installer lock identity changed across open"
 stable_lock="$LOCK_TEST_ROOT/stable/guard.lock"
 mkdir -p "$(dirname "$stable_lock")"; : > "$stable_lock"; chmod 0600 "$stable_lock"
 PATH="$LOCK_TEST_BIN:$PATH" BLUEY_INSTALLER_ENABLE_TEST_HOOK=1 \
@@ -578,6 +604,13 @@ for root_script in backup-bluey-db.sh archive-bluey-logs.sh \
     if BLUEY_STORAGE_ENV_FILE="$SYMLINK_ENV" \
         "$ROOT/ops/$root_script" --check-config >/dev/null 2>&1; then
         fail "$root_script followed a symlinked root env fragment"
+    fi
+done
+for root_script in backup-bluey-db.sh archive-bluey-logs.sh \
+    bluey-disk-guard.sh install-bluey-log-guards.sh; do
+    if ! PATH="$LOCK_TEST_BIN:$PATH" BLUEY_STORAGE_ENV_FILE="$TRUSTED_ENV_TARGET" \
+        "$ROOT/ops/$root_script" --check-config >/dev/null 2>&1; then
+        fail "$root_script rejected a stable descriptor-attested root env fragment"
     fi
 done
 

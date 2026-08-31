@@ -341,6 +341,9 @@ under `docs/release/`.
 - Replaced the local Browser distribution claim's eight-position helper
   interface with one typed claim request, keeping replay and authorization
   behavior unchanged while restoring the strict warning-free source gate.
+- Corrected Linux storage descriptor attestation to dereference only already-open `/dev/fd`
+  handles while trusted paths remain non-following; the portable regression now proves stable
+  environment/lock positives and exact substitution rejection reasons across GNU and BSD `stat`.
 - Corrected the Phase 621 local-runner authority integration fixture so it sends a schema-valid
   unauthorized claim and proves the distinct master-off 404 and distribution-paused 503
   boundaries instead of stopping at JSON extraction with 422.

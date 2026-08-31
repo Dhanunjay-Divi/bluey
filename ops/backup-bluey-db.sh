@@ -66,6 +66,14 @@ bootstrap_identity() {
     fi
 }
 
+bootstrap_follow_identity() {
+    if stat -L -c '%i' -- "$1" >/dev/null 2>&1; then
+        stat -L -c '%i' -- "$1"
+    else
+        stat -L -f '%i' -- "$1"
+    fi
+}
+
 load_env_file() {
     local env_file="$1" env_fd path_identity fd_identity
     if [ -e "$env_file" ] || [ -L "$env_file" ]; then
@@ -77,7 +85,7 @@ load_env_file() {
         path_identity="$(bootstrap_identity "$env_file")" || exit 1
         exec 9<"$env_file"
         env_fd=9
-        fd_identity="$(bootstrap_identity "/dev/fd/$env_fd")" || exit 1
+        fd_identity="$(bootstrap_follow_identity "/dev/fd/$env_fd")" || exit 1
         [ "$path_identity" = "$fd_identity" ] || {
             echo "backup failed: environment file changed while opening" >&2
             exit 1
@@ -98,7 +106,8 @@ if [ -n "${BLUEY_EXTRA_ENV_FILES:-}" ]; then
 else
     load_env_file /etc/bluey-api/bluey-postgres.env
 fi
-unset -f bootstrap_stat bootstrap_trusted_file bootstrap_trusted_parent_chain bootstrap_identity
+unset -f bootstrap_stat bootstrap_trusted_file bootstrap_trusted_parent_chain bootstrap_identity \
+    bootstrap_follow_identity
 
 DB_PATH="${BLUEY_DB_PATH-/opt/bluey-api/bluey.db}"
 BACKUP_DIR="${BLUEY_BACKUP_DIR-/var/backups/bluey-api}"
