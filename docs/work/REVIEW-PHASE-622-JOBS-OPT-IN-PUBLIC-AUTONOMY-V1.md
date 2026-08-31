@@ -4,11 +4,12 @@
 > 622, the Phase 611 managed-cloud authority, the Phase 621 public gate, and the current dark
 > production posture.
 
-**Commit range:** `3f90bc01210345df56f24a8e95a493895c9744ae..95bb966fd897db94599a0c7e2defe1fb02ea3912`
+**Commit range:**
+`3f90bc01210345df56f24a8e95a493895c9744ae..95696dd0ce204c06ed382ed73f52d46920501bfb`
 
-**Source commit:** `55d24e95234c1fcc2db22a912c739dfd5760eb66`
+**Aggregate source plus FIX-784:** `95696dd0ce204c06ed382ed73f52d46920501bfb`
 
-**Generated portal commit:** `95bb966fd897db94599a0c7e2defe1fb02ea3912`
+**Generated portal and dependency-security commit:** `b3d0c79cecc44ca45bf31e6fbe2838108bfabe3a`
 
 **Reviewer:** Independent aggregate security, local-run recovery, fixture, portal, and final
 source reviewers; consolidated by the primary implementation agent
@@ -52,7 +53,11 @@ until hosted runtime/provider/canary gates pass
 - Exact retry returns the original database-owned authorization timestamp and cannot create a
   second employer-facing effect.
 - FIX-778 groups distribution input into one typed request without changing replay or authorization
-  semantics and passes strict Clippy without a waiver.
+  semantics and passes strict Clippy without a waiver. FIX-779/780 preserve trusted-path
+  substitution resistance while making opened-descriptor identity portable across Linux/macOS;
+  FIX-781 closes all known dependency advisories and makes the audit a release gate; FIX-782 binds
+  the combined hosted lane to a reviewed finite 90-minute budget; FIX-784 establishes real public
+  beta admission in the stale plan-matrix fixture without weakening production middleware.
 
 ### Portal truth and release boundary
 
@@ -81,18 +86,21 @@ until hosted runtime/provider/canary gates pass
 ## Build & Test Verification
 
 ```text
-PASS  Jobs workspaces: 1,982 tests; one intentional no-egress simulator skip
+PASS  Jobs workspaces: 1,983 tests; one intentional no-egress simulator skip
 PASS  all five typechecks and production builds; portal digest
-      65be1e2ebda67b02fcd1c9340240bb0100aade36a2748c2266369898b3d65235
+      bf6ab3febf060cddc303be099cd01cc4c3d79d1c0a3a05d625b19e1d3f5d2042 (34 files)
+PASS  npm production/full audits: 252/673 dependencies; zero advisories
 PASS  final exact-state server library: 1,611/1,611 in 1,872.19 seconds
 PASS  final exact-state HTTP integration: 113/113 in 558.24 seconds
 PASS  server all-target check and strict all-target Clippy (`-D warnings`)
 PASS  repository formatting and diff checks
-PASS  schema 105/90; privacy 2,719/2,443; provenance 663/631/14
-PASS  Browser release 10/10; managed-cloud release 17/17; deletion 3/3
+PASS  schema 105/90; privacy 2,751/2,475; provenance 663/631/14
+PASS  Browser release 10/10; managed-cloud release 18/18; deletion 3/3
 PASS  messaging containment and CI guard self-tests
 PASS  native runner storage: fmt, strict Clippy, 14 tests, release build, Darwin N-API smoke
-PASS  independent aggregate, FIX-776/777, and FIX-778 reviews: no P0-P3 findings
+PASS  storage guard, cloud preflight, and restore drill; real PostgreSQL scenario executed
+PASS  FIX-784 focused test 1/1 and full test target 2/2; fmt and strict Clippy green
+PASS  independent aggregate and FIX-776 through FIX-784 reviews: no P0-P3 findings
 ```
 
 ## Overall Verdict

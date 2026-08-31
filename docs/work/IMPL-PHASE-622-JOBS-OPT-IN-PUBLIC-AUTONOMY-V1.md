@@ -3,10 +3,13 @@
 **Status:** local aggregate source candidate accepted; autonomous V1 and production release are
 not claimed
 
-**Source state:** source commit `55d24e95234c1fcc2db22a912c739dfd5760eb66`; deterministic
-generated portal commit `95bb966fd897db94599a0c7e2defe1fb02ea3912`; both based through
-storage predecessor `3f90bc01210345df56f24a8e95a493895c9744ae`. Integrated Phase 611
-compatibility and hosted verification remain required before release.
+**Source state:** aggregate source plus FIX-784
+`95696dd0ce204c06ed382ed73f52d46920501bfb`; prior aggregate integration
+`60fb5f3e0e9b27c034d7443c706c5a4cc7f28093`; dependency-security and deterministic portal
+correction `b3d0c79cecc44ca45bf31e6fbe2838108bfabe3a`; parent CI-budget authority
+`680160b14e9113a49d778fe8ad3cf8c974a9da72`; integrated through managed-cloud authority
+`66ad0fa87e9216d2190caeb742448df3c796cb3f`. Fresh exact-tip hosted verification remains required
+before release.
 
 ## Current Aggregate
 
@@ -73,19 +76,32 @@ an exact retry is byte-identical.
 - After FIX-778, the final exact-state rerun passed 1,611/1,611 server library tests in 1,872.19
   seconds and 113/113 HTTP integration journeys in 558.24 seconds. Server all-target check, strict
   all-target Clippy with warnings denied, repository formatting, and diff checks passed.
-- Final aggregate Jobs verification passed 1,982 tests with one intentional no-egress simulator
-  skip: automation 791, Browser 219, runner 308, workflows 300, and portal 364. All five workspaces
-  typechecked and built. A repeat portal build retained the exact 32-file directory digest
-  `65be1e2ebda67b02fcd1c9340240bb0100aade36a2748c2266369898b3d65235`; Vite emitted only its
+- Final aggregate Jobs verification passed 1,983 tests with one intentional no-egress simulator
+  skip: automation 792, Browser 219, runner 308, workflows 300, and portal 364. All five workspaces
+  typechecked and built. A repeat portal build retained the exact 34-file directory digest
+  `bf6ab3febf060cddc303be099cd01cc4c3d79d1c0a3a05d625b19e1d3f5d2042` from 34 files; Vite
+  emitted only its
   existing advisory for a chunk slightly above 500 kB.
+- FIX-781 upgraded both résumé PDF extractors and the affected transitive packages, preserved the
+  text-only parser boundary, and added mandatory moderate-or-higher audit gates to pull-request and
+  release workflows. Production audit covered 252 dependencies and the full graph covered 673;
+  both reported zero advisories.
 - Final schema, privacy, provenance, release, deletion, containment, and CI guards passed: 105
-  tables/90 indexes; 2,719 tracked paths/2,443 text files; 663 lock entries/631 package versions/14
-  pinned repositories; Browser release 10/10; managed-cloud release 17/17; and deletion 3/3.
+  tables/90 indexes; 2,751 tracked paths/2,475 text files; 663 lock entries/631 package versions/14
+  pinned repositories; Browser release 10/10; managed-cloud release 18/18; and deletion 3/3.
 - Native runner storage formatting, strict Clippy, 14 tests, release build, and the Darwin N-API
   smoke passed. Docker is unavailable on this host, so the exact managed-runner image build/smoke
   remains an exact-tip CI gate.
-- Independent aggregate security review and the FIX-776 through FIX-778 reviews reported no P0-P3
-  findings and returned GO for the bounded local source commit. Hosted launch remains NO-GO.
+- On the integrated V1 state, the complete production storage-guard suite, cloud-preflight suite,
+  and restore-drill suite passed; the restore run reported `real_postgres_scenario=executed`. This
+  re-proves the local scripts but does not substitute for host activation, remote alert delivery,
+  provider cleanup, or production rollback evidence.
+- Independent aggregate security review and the FIX-776 through FIX-784 reviews reported no P0-P3
+  findings and returned GO for the bounded local source commits. FIX-782 raises only the closed
+  hosted Jobs CI budget from 45 to 90 minutes after the previous run timed out at 89/108 integration
+  tests with zero failures. FIX-784 admits the stale runner-plan fixture through the real public
+  beta gate and preserves the preexisting signed-integrity/no-mutation fence without production
+  changes; exact-tip hosted completion remains mandatory. Hosted launch remains NO-GO.
 
 ## Aggregate Source Surface
 
@@ -102,6 +118,10 @@ an exact retry is byte-identical.
   closed during the aggregate security review. FIX-776 and FIX-777 record the bounded full-suite
   cache-contract and legacy-fixture corrections; neither changes production behavior. FIX-778
   records the typed local distribution-claim boundary that closes the strict Clippy source gate.
+  FIX-779 and FIX-780 correct Linux opened-descriptor attestation without weakening trusted-path
+  substitution checks. FIX-781 closes the dependency-security release gate, and FIX-782 binds the
+  hosted Jobs CI job to the reviewed 90-minute budget. FIX-784 corrects the stale public-beta
+  runner-plan test fixture without weakening runtime authority.
 - FIX-767 is a separate storage-resilience unit in the same working tree and is inventoried in its
   own record; shared `CHANGELOG.md` and `jobs/OPERATIONS.md` hunks must be staged deliberately.
 
