@@ -2,9 +2,12 @@
 
 **Status:** local source candidate accepted; production activation is not authorized
 
-**Source state:** source commit `55d24e95234c1fcc2db22a912c739dfd5760eb66`; deterministic
-generated portal commit `95bb966fd897db94599a0c7e2defe1fb02ea3912`; both based through
-storage predecessor `3f90bc01210345df56f24a8e95a493895c9744ae`.
+**Source state:** aggregate source plus FIX-784
+`95696dd0ce204c06ed382ed73f52d46920501bfb`; prior aggregate integration
+`60fb5f3e0e9b27c034d7443c706c5a4cc7f28093`; dependency-security and deterministic portal
+correction `b3d0c79cecc44ca45bf31e6fbe2838108bfabe3a`; parent CI-budget authority
+`680160b14e9113a49d778fe8ad3cf8c974a9da72`; integrated through managed-cloud authority
+`66ad0fa87e9216d2190caeb742448df3c796cb3f`. Fresh exact-tip hosted verification remains required.
 
 ## Implemented
 
@@ -64,23 +67,30 @@ Executed on 2026-08-30 against the current working tree:
 - after the security fixes, focused portal coverage passed 15 tests across the beta gate and API,
   strict portal typecheck passed, the CI guard self-test and 105-table/90-index schema parity
   passed, and `git diff --check` passed.
-- Final aggregate Jobs verification on 2026-08-31 passed 1,982 tests with one intentional
-  no-egress simulator skip: automation 791, Browser 219, runner 308, workflows 300, and portal 364.
+- Final aggregate Jobs verification on 2026-08-31 passed 1,983 tests with one intentional
+  no-egress simulator skip: automation 792, Browser 219, runner 308, workflows 300, and portal 364.
   All five workspaces typechecked and built; a repeat portal build produced the same closed
   `web/jobs` directory digest
-  `65be1e2ebda67b02fcd1c9340240bb0100aade36a2748c2266369898b3d65235` from 32 files.
+  `bf6ab3febf060cddc303be099cd01cc4c3d79d1c0a3a05d625b19e1d3f5d2042` from 34 files.
+- FIX-781 removed every known dependency advisory. Production audit covered 252 dependencies and
+  the full graph covered 673 dependencies, both with zero advisories; the portal retains a
+  text-only PDF.js 6 extraction boundary and all pull-request/release paths now fail on a known
+  moderate-or-higher advisory.
 - Final low-debug Rust verification passed 1,611/1,611 server library tests and 113/113 HTTP
   integration journeys. Server all-target check, strict all-target Clippy with warnings denied,
   repository formatting, and diff checks passed.
 - Final repository guards passed: 105 SQLite/PostgreSQL tables and 90 indexes; privacy scan of
-  2,719 tracked paths and 2,443 text files; 663 lock entries, 631 unique package versions, and 14
-  commit-pinned provenance repositories; Browser release 10/10; managed-cloud release 17/17;
+  2,751 tracked paths and 2,475 text files; 663 lock entries, 631 unique package versions, and 14
+  commit-pinned provenance repositories; Browser release 10/10; managed-cloud release 18/18;
   browser deletion 3/3; business-messaging containment; and CI guard self-tests.
 - Native runner storage formatting, strict Clippy, 14 tests, release build, and the Darwin N-API
   smoke passed. Docker is unavailable on this host, so the exact managed-runner image build/smoke
   remains an exact-tip CI gate.
-- Independent aggregate security review and the subsequent FIX-776 through FIX-778 reviews found
-  no P0-P3 findings and returned GO for the bounded local source commit. This is not a production
+- Independent aggregate security review and the subsequent FIX-776 through FIX-784 reviews found
+  no P0-P3 findings and returned GO for the bounded local source commits. FIX-782 corrects only the
+  demonstrably exhausted hosted CI budget. FIX-784 corrects the only PR #35 hosted failure by
+  establishing real beta admission in a stale integration fixture; it does not change production
+  middleware or authority. A fresh exact-tip green run remains required. This is not a production
   activation verdict.
 
 ## Files Created Or Modified

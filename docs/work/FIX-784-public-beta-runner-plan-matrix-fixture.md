@@ -85,6 +85,14 @@ scripts/check-bluey-ops-docs.sh
 git diff --check
 ```
 
+## Independent Rereview
+
+The narrowed correction was independently accepted with no P0-P3 findings. The reviewer verified
+the exact hosted 403/409 failure, audited bounded cohort setup, seven isolated enrollments under the
+16-account cap, exact application-integrity response, and retained application, session,
+reservation, workflow-command, and metering no-mutation assertions. Focused test 1/1, complete
+test target 2/2, formatting, strict Clippy, documentation guard, and diff checks passed.
+
 ## Known Limitations
 
 - This focused correction does not replace the required fresh exact-tip hosted Jobs run and full
