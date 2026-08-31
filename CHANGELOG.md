@@ -306,7 +306,8 @@ under `docs/release/`.
   PR-head run passed every preceding gate but was cancelled with 89 of 108 integration tests green
   and zero failures. The pre-install Jobs CI self-test now rejects any drift from the bounded
   90-minute contract; test commands, release authority, feature flags, and production behavior are
-  unchanged.
+  unchanged. The replacement exact-tip hosted run completed every gate in 48 minutes 25 seconds,
+  including all 108 integration tests and both simulator-verifier steps.
 - Closed Phase 613 review defects FIX-694 through FIX-711: monotonic taxonomy/account/Track replay
   and execution fences; fail-closed canonical classification; typed public-ATS evidence; portal
   mutation/read-back ordering; retry-safe Track writes; PostgreSQL Auto-submit revocation,
