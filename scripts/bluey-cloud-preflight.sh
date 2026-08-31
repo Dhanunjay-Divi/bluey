@@ -20,6 +20,14 @@ bootstrap_stat() {
   local gnu="$1" bsd="$2" path="$3"
   if stat "$gnu" -- "$path" >/dev/null 2>&1; then stat "$gnu" -- "$path"; else stat "$bsd" -- "$path"; fi
 }
+bootstrap_follow_identity() {
+  local path="$1"
+  if stat -L -c%i -- "$path" >/dev/null 2>&1; then
+    stat -L -c%i -- "$path"
+  else
+    stat -L -f%i -- "$path"
+  fi
+}
 trusted_env_chain() {
   local path="$1" current owner mode value
   current="$(cd -P -- "$(dirname "$path")" 2>/dev/null && pwd -P)" || return 1
@@ -47,7 +55,7 @@ load_trusted_env() {
   path_id="$(bootstrap_stat -c%i -f%i "$path")" || return 1
   exec 9<"$path"
   env_fd=9
-  fd_id="$(bootstrap_stat -c%i -f%i "/dev/fd/$env_fd")" || return 1
+  fd_id="$(bootstrap_follow_identity "/dev/fd/$env_fd")" || return 1
   [ "$path_id" = "$fd_id" ] || return 1
   # shellcheck disable=SC1090
   . "/dev/fd/$env_fd"
@@ -66,7 +74,7 @@ if [ "${#ENV_FILES[@]}" -gt 0 ]; then
     }
   done
 fi
-unset -f bootstrap_stat trusted_env_chain load_trusted_env
+unset -f bootstrap_stat bootstrap_follow_identity trusted_env_chain load_trusted_env
 
 primary_env_file="${ENV_FILES[0]:-}"
 

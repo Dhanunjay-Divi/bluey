@@ -344,6 +344,8 @@ under `docs/release/`.
 - Corrected Linux storage descriptor attestation to dereference only already-open `/dev/fd`
   handles while trusted paths remain non-following; the portable regression now proves stable
   environment/lock positives and exact substitution rejection reasons across GNU and BSD `stat`.
+- Extended the same follow-only descriptor attestation to the cloud release preflight and made its
+  portable fixture reject any `/dev/fd` identity check that omits explicit dereferencing.
 - Corrected the Phase 621 local-runner authority integration fixture so it sends a schema-valid
   unauthorized claim and proves the distinct master-off 404 and distribution-paused 503
   boundaries instead of stopping at JSON extraction with 422.

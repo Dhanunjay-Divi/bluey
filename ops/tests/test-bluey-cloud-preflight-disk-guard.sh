@@ -12,6 +12,19 @@ fail() {
 }
 
 mkdir -p "$TEST_ROOT/bin" "$TEST_ROOT/data"
+cat > "$TEST_ROOT/bin/stat" <<'SH'
+#!/usr/bin/env bash
+path="${!#}"
+case "$path" in
+    /dev/fd/*)
+        case " $* " in
+            *" -L "*) ;;
+            *) exit 64 ;;
+        esac
+        ;;
+esac
+exec /usr/bin/stat "$@"
+SH
 cat > "$TEST_ROOT/bin/aws" <<'SH'
 #!/usr/bin/env bash
 [ -n "${AWS_ACCESS_KEY_ID:-}" ] && [ -n "${AWS_SECRET_ACCESS_KEY:-}" ] || exit 90
@@ -28,7 +41,8 @@ cat > "$TEST_ROOT/disk-guard" <<'SH'
 printf '%s\n' "${1:-}" >> "${MOCK_DISK_GUARD_LOG:?}"
 exit "${MOCK_DISK_GUARD_EXIT:-0}"
 SH
-chmod +x "$TEST_ROOT/bin/aws" "$TEST_ROOT/bin/curl" "$TEST_ROOT/disk-guard"
+chmod +x "$TEST_ROOT/bin/stat" "$TEST_ROOT/bin/aws" "$TEST_ROOT/bin/curl" \
+    "$TEST_ROOT/disk-guard"
 
 ENV_FILE="$TEST_ROOT/preflight.env"
 cat > "$ENV_FILE" <<EOF
