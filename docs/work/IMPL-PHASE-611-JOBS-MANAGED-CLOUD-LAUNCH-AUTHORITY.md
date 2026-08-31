@@ -49,7 +49,7 @@
 
 ## Files Created / Modified
 
-Final branch-diff inventory: **80 paths** relative to Phase 610 base `89d6b820`, including this
+Final branch-diff inventory: **96 paths** relative to Phase 610 base `89d6b820`, including this
 implementation document and the Phase 611 review document. `M` means modified and `A` means added.
 
 | Status | File | Purpose |
@@ -58,11 +58,21 @@ implementation document and the Phase 611 review document. `M` means modified an
 | M | `.github/workflows/release.yml` | Prevent the ordinary release path from bypassing the managed-cloud gate |
 | A | `.github/workflows/jobs-managed-cloud-release.yml` | Define manual candidate, authorize, promote, and rollback stages over stored bytes |
 | M | `CHANGELOG.md` | Record the bounded Phase 611 source result and parked launch evidence |
+| M | `crates/cue-core/src/ipc_auth.rs` | Preserve Rust 1.98 compatibility and model the bounded boot-scoped capability replacement race without changing production validation |
+| M | `crates/cue-daemon/src/app.rs` | Complete Rust 1.98 fixed-width chunk handling exposed by the exact-head rerun |
+| M | `crates/cue-daemon/src/audio/framer.rs` | Preserve preallocated frame capacity after padded flush |
+| M | `crates/cue-daemon/src/audio/system_capture.rs` | Decode fixed PCM pairs through the Rust 1.98 array-chunk API |
+| M | `crates/cue-daemon/tests/system_audio_integration.rs` | Honor the declared integration deadline under parallel CI load |
+| M | `crates/cue-rag/src/store.rs` | Decode fixed embedding values through the Rust 1.98 array-chunk API |
 | A | `docs/rounds/ROUND-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Freeze the product, authority, recovery, release, and external-evidence contract |
 | A | `docs/work/FIX-690-jobs-managed-availability-dispatch-authority.md` | Record the loose availability/dispatch root cause and fix |
 | A | `docs/work/FIX-691-jobs-request-start-recovery-authority.md` | Record the recovery downgrade/new-effect root cause and fix |
 | A | `docs/work/FIX-692-jobs-managed-runner-release-effect-boundary.md` | Record the missing runner release-bound effect authority and fix |
 | A | `docs/work/FIX-693-jobs-managed-runner-measurement-bound.md` | Record the impossible runner measurement ceiling and cross-language bounded correction |
+| A | `docs/work/FIX-694-jobs-managed-runner-node-path.md` | Record the pinned Playwright path mismatch, normalized runtime, and exact-head binding |
+| A | `docs/work/FIX-695-rust-1-98-compatibility-backport.md` | Record the proven eleven-file rolling-toolchain compatibility backport |
+| A | `docs/work/FIX-696-rust-1-98-daemon-app-compatibility.md` | Record the two remaining daemon compatibility failures and correction |
+| A | `docs/work/FIX-697-ipc-capability-replacement-ci-flake.md` | Record the realistic one-replacement model and deterministic bounded-failure coverage for the IPC capability test |
 | A | `docs/work/IMPL-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Inventory implementation, validation state, deviations, and follow-ups |
 | A | `docs/work/REVIEW-PHASE-611-JOBS-MANAGED-CLOUD-LAUNCH-AUTHORITY.md` | Record independent review evidence, remaining external gates, and verdict |
 | A | `infra/postgres/server-runtime/033_jobs_managed_cloud_release_authority.sql` | Add PostgreSQL release, runtime, readiness, command, request-start, and execution authority |
@@ -118,6 +128,12 @@ implementation document and the Phase 611 review document. `M` means modified an
 | M | `server/src/api/jobs_runner_volumes.rs` | Bind managed volume proof to release A and runtime B identity |
 | M | `server/src/api/jobs_worker_auth.rs` | Authenticate exact runtime, reconciliation, lease, and effect-boundary paths |
 | M | `server/src/api/mod.rs` | Register the managed-cloud API authority module |
+| M | `server/src/api/router.rs` | Scope the intentional bounded Axum error-envelope Clippy allowance |
+| M | `server/src/api/router/completion.rs` | Scope the intentional completion error-envelope Clippy allowance |
+| M | `server/src/api/router/embeddings.rs` | Scope the intentional embedding error-envelope Clippy allowances |
+| M | `server/src/api/router/streaming_completion.rs` | Scope the intentional streaming error-envelope Clippy allowances |
+| M | `server/src/api/router/transcribe.rs` | Scope the intentional transcription error-envelope Clippy allowance |
+| M | `server/src/api/stt.rs` | Decode fixed PCM pairs through the Rust 1.98 array-chunk API |
 | M | `server/src/bin/bluey-jobs-api.rs` | Validate/start managed reporters and independent dispatch/recovery loops |
 | M | `server/src/db/jobs.rs` | Export and integrate managed release/execution authority |
 | M | `server/src/db/jobs/execution_leases.rs` | Bind managed execution-lease claim, authorization, irreversible-effect, runtime-correlation, and receipt-replay authority |
@@ -197,8 +213,11 @@ cargo test --manifest-path server/Cargo.toml --all-targets -- --test-threads=4
     jobs_runner_plan_matrix 2; usage schema 1
 ```
 
-The independent line-by-line review is green with no remaining P0/P1 finding, and the completed
-full all-target Rust rerun passed with zero failures.
+The final independent line-by-line source review found no residual P0/P1/P2 issue across FIX-693,
+FIX-694, and FIX-695, and the completed baseline full all-target Rust rerun passed with zero
+failures. Independent review also found no P0/P1/P2/P3 issue in FIX-696 or FIX-697; the final exact
+source-head CI run closes the resource-capable source verification while hosted launch evidence
+remains open.
 
 Post-correction local evidence at the branch tip on 2026-08-24:
 
@@ -216,10 +235,108 @@ git -P diff --check
   PASS
 ```
 
-The automation Vitest suite, Cargo check/Clippy/tests, and exact managed-runner Docker build/smoke
-were not rerun at the corrected tip: the local disk had 5.0 GiB free, below the 8 GiB release-work
-floor, no PortableSSD was mounted, and Docker was unavailable. A resource-capable successor must
-record exact-tip results; the baseline totals above must not be treated as proof for the correction.
+The first resource-capable pull-request rerun at head `f50103e8` used GitHub's synthetic merge
+commit `f552ac2a` and produced Actions run `33313140429`, job `99261666660`. It passed the managed
+release gate, 1,748 passed Jobs tests with one intentional skip, every Jobs typecheck/build, portal
+parity, native runner format, Clippy, tests, and release build, then failed at the managed-runner
+image measurement with:
+
+```text
+Runtime measurement root is missing: /usr/local/bin/node
+```
+
+That exact pinned Playwright Noble base installs the NodeSource package at `/usr/bin/node`.
+FIX-694 normalizes that regular file into the already-authoritative `/usr/local/bin/node` before
+measurement, removes the original after measurement, makes pull-request jobs check out and embed
+the same head SHA, and rejects symbolic links throughout every measured runtime root. Four sibling
+CI jobs also failed the new Rust 1.98
+Clippy surface; FIX-695 backports the proven eleven-file repair from `2f3910a1` without
+absorbing unrelated Phase 623 work. Local evidence after the final source correction:
+
+```text
+automation full test suite and typecheck
+  PASS: 660 tests; 1 intentional skip; TypeScript clean
+
+runner full test suite and typecheck
+  PASS: 308 tests; TypeScript clean
+
+managed-cloud release gate
+  PASS: 17 tests
+
+server Rust formatting
+  PASS
+
+git diff --check
+  PASS
+```
+
+The complete automation and runner test/typecheck gates are now green locally. Rust
+check/Clippy/tests plus the exact corrected managed-runner Docker build/native smoke remain
+required. Docker is unavailable locally, so a resource-capable CI rerun must record the image and
+native-addon result; the earlier successful stages cannot be inherited by either correction.
+
+The first combined exact-head run at `978ac4fe` passed native runner storage on Darwin, then exposed
+two additional Rust 1.98 constant-chunk diagnostics in `crates/cue-daemon/src/app.rs` across macOS,
+Ubuntu, Windows, and observability. FIX-696 applies only the two corresponding transformations
+already green at descendant head `83f15263`; Rust 1.98 workspace formatting, diff checks, and a repository-wide numeric
+`.chunks_exact(...)` scan pass locally. The final exact source-head run recorded below closes that
+combined CI requirement.
+
+Earlier exact-tip pull-request evidence at source head
+`032568c3698af10150752bb23cebf71268b614b6` on 2026-08-30 was green:
+
+- [Bluey Jobs CI / Privacy Gate run 33323257948](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948)
+  completed successfully. Its [Jobs gate job 99288862771](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862771)
+  passed 1,749 Jobs tests with one intentional skip (automation 660, browser 219, runner 308,
+  workflows 291, portal 271), 17 managed-cloud release-gate tests, all Jobs typechecks/builds,
+  native-storage format/Clippy/tests/release build, the exact managed-runner Docker build and
+  runtime measurement, and the native addon smoke. The server Jobs subset passed 729 unit tests
+  and 34 integration tests with zero failures. The companion
+  [Darwin native-storage job 99288862640](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257948/job/99288862640)
+  also passed.
+- [CI run 33323257936](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936)
+  completed successfully on [Ubuntu](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936/job/99288828817),
+  [Windows](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936/job/99288828935),
+  and [macOS](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257936/job/99288828944).
+- [Observability Policy run 33323257933](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933)
+  completed successfully. The [server test job](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33323257933/job/99288828813)
+  observed 1,464 passed tests across its reported binaries/suites (1,350 library, 1 bluey-server,
+  1 connectinfo, 1 context migration, 2 GDPR, 106 integration, 2 plan-matrix, 1 usage-schema), with
+  zero failures; observability policy, workspace tests, and the final aggregate check also passed.
+
+The later documentation-only head exposed an intermittent Ubuntu failure in a test that modeled
+100 continuous capability replacements even though production publishes one atomic replacement
+per daemon boot. FIX-697 changed only that test model and its deterministic bounded-failure
+coverage; the production retry constant, opener, link-count checks, and fail-closed behavior are
+unchanged.
+
+Final exact-tip pull-request evidence at source head
+`24b5f717f941c39d1ab72b34af50a5e3cac4d183` on 2026-08-30 is green:
+
+- [Bluey Jobs CI / Privacy Gate run 33326265497](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265497)
+  completed successfully. Its [Jobs gate job 99296815980](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265497/job/99296815980)
+  passed 1,749 Jobs tests including one intentional skip, 17 managed-cloud release-gate tests,
+  all Jobs typechecks/builds and privacy/contract gates, native-storage
+  format/Clippy/tests/release build, the exact managed-runner Docker build and runtime
+  measurement, and native-addon smoke. The server Jobs subset passed 729 unit tests and 34
+  integration tests. The companion [Darwin native-storage job 99296816093](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265497/job/99296816093)
+  also passed.
+- [CI run 33326265510](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510)
+  completed successfully on [Ubuntu job 99296815848](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510/job/99296815848),
+  [Windows job 99296815952](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510/job/99296815952),
+  and [macOS job 99296815972](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265510/job/99296815972).
+- [Observability Policy run 33326265494](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494)
+  completed successfully. The [server test job 99296815882](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99296815882)
+  observed 1,464 passed tests across its reported suites; the
+  [observability-policy job 99296815780](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99296815780),
+  [workspace job 99296815885](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99296815885),
+  and [aggregate job 99300208699](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33326265494/job/99300208699)
+  also passed.
+
+This closes the Phase 611 source and exact-tip CI gates only. It does not publish or read back a
+registry artifact, prove hosted PostgreSQL/Temporal/network behavior, attest a deployed image or
+read-only root filesystem, establish real runner capacity, admit a customer cohort, run an ATS
+canary, enable a flag, exercise a kill switch, or rehearse production rollback.
 
 Hosted container publication, immutable registry/static read-back, Temporal task-queue behavior,
 live runner capacity, runtime image-digest attestation, read-only-rootfs policy, customer cohort,
@@ -251,7 +368,7 @@ canary, and rollback are external-only gates and cannot be converted into local 
 
 ## Review Checklist (for reviewer)
 
-- [x] Final branch diff contains exactly 80 inventoried paths and the handoff worktree is clean
+- [x] Final branch diff contains exactly 96 inventoried paths
 - [x] Files match the Round 611 scope with no unrelated or `docs/reviews/` changes
 - [x] New-effect availability requires exact live release and role quorum with no debug bypass
 - [x] Idempotent replay precedes mutable admission checks and preserves original A
@@ -262,4 +379,4 @@ canary, and rollback are external-only gates and cannot be converted into local 
 - [x] All customer flags remain `0` and hosted evidence is not claimed from local source
 - [x] No TODO lacks a tracked follow-up
 - [x] Baseline `423fba5c` full all-target Rust rerun passes with zero failures
-- [ ] Corrected branch tip passes automation Vitest, Rust check/Clippy/tests, and exact managed-runner Docker/CI gates
+- [x] Final corrected source head `24b5f717f941c39d1ab72b34af50a5e3cac4d183` passes Jobs/privacy, Rust check/Clippy/tests, cross-platform CI, observability, and the exact managed-runner Docker/native-smoke gates

@@ -305,7 +305,9 @@ function currentMeasuredRuntimePaths(
     } catch {
       throw new Error("Managed-cloud measured runtime root is missing");
     }
-    if (metadata.isSymbolicLink()) return;
+    if (metadata.isSymbolicLink()) {
+      throw new Error("Managed-cloud measured runtime roots cannot contain symbolic links");
+    }
     if (metadata.isDirectory()) {
       const children = readdirSync(path, { withFileTypes: true })
         .sort((left, right) => compareUtf8(left.name, right.name));

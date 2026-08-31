@@ -33,9 +33,21 @@ describe("runner container storage boundary", () => {
     expect(dockerfile).toContain("! -name 'chromium_headless_shell-*'");
     expect(dockerfile).toContain("! -name 'ffmpeg-*'");
     expect(dockerfile).not.toContain("! -name 'chromium-*'");
+    expect(dockerfile).toContain('test "$(command -v node)" = /usr/bin/node');
+    expect(dockerfile).toContain(
+      "install -m 0555 /usr/bin/node /usr/local/bin/node",
+    );
+    expect(dockerfile).toContain("test -f /usr/local/bin/node");
+    expect(dockerfile).toContain("! test -L /usr/local/bin/node");
+    expect(dockerfile).toContain(
+      "/usr/local/bin/node /tmp/managed-cloud-release-gate.mjs runtime-measurement",
+    );
     expect(dockerfile).toContain(
       'CMD ["/usr/local/bin/node", "runner/dist/server.js"]',
     );
+    expect(dockerfile).toContain("rm -rf /usr/lib/node_modules");
+    expect(dockerfile).toContain("rm -f /usr/bin/corepack /usr/bin/npm /usr/bin/npx");
+    expect(dockerfile).toContain("/usr/bin/node /usr/bin/yarn /usr/bin/yarnpkg");
     expect(dockerfile).toMatch(/\nUSER pwuser\n/);
     expect(dockerfile).not.toContain("--no-sandbox");
     expect(dockerfile).not.toMatch(/\nUSER (?:0|root)\n/);
@@ -142,6 +154,19 @@ describe("runner container storage boundary", () => {
       );
       expect(source).toContain("jobs/scripts/native-runner-addon-smoke.mjs");
       expect(source).toContain("BLUEY_JOBS_RUNNER_NATIVE_SMOKE_ROOT");
+      expect(source).toContain(
+        "BLUEY_JOBS_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}",
+      );
+      expect(source).toContain(
+        "ref: ${{ github.event.pull_request.head.sha || github.sha }}",
+      );
+      expect(source).toContain(
+        '--build-arg "BLUEY_JOBS_SOURCE_COMMIT=$BLUEY_JOBS_SOURCE_COMMIT"',
+      );
+      expect(source).not.toContain(
+        '--build-arg "BLUEY_JOBS_SOURCE_COMMIT=$GITHUB_SHA"',
+      );
+      expect(source).toContain("--entrypoint /usr/local/bin/node");
     }
   });
 });

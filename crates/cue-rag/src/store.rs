@@ -872,8 +872,10 @@ fn blob_to_embedding(blob: &[u8], expected_dim: usize) -> Result<Vec<f32>> {
         blob.len()
     );
     let mut embedding = Vec::with_capacity(expected_dim);
-    for bytes in blob.chunks_exact(EMBEDDING_VALUE_BYTES) {
-        let value = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let (values, remainder) = blob.as_chunks::<EMBEDDING_VALUE_BYTES>();
+    debug_assert!(remainder.is_empty());
+    for bytes in values {
+        let value = f32::from_le_bytes(*bytes);
         anyhow::ensure!(
             value.is_finite(),
             "embedding blob contains a non-finite value"

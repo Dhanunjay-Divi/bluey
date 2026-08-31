@@ -191,6 +191,7 @@ pub struct TranscribeResponse {
     pub balance_cents_after: i64,
 }
 
+#[allow(clippy::result_large_err)]
 pub async fn transcribe(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,

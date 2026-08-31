@@ -67,10 +67,14 @@ COPY --from=build --chown=pwuser:pwuser /build/runner/package.json \
 COPY --from=build --chown=pwuser:pwuser /build/runner/dist ./runner/dist
 COPY scripts/managed-cloud-release-gate.mjs \
     /tmp/managed-cloud-release-gate.mjs
-RUN find /ms-playwright -mindepth 1 -maxdepth 1 \
+RUN test "$(command -v node)" = /usr/bin/node \
+    && install -m 0555 /usr/bin/node /usr/local/bin/node \
+    && test -f /usr/local/bin/node \
+    && ! test -L /usr/local/bin/node \
+    && find /ms-playwright -mindepth 1 -maxdepth 1 \
         ! -name 'chromium_headless_shell-*' \
         ! -name 'ffmpeg-*' -exec rm -rf '{}' + \
-    && node /tmp/managed-cloud-release-gate.mjs runtime-measurement \
+    && /usr/local/bin/node /tmp/managed-cloud-release-gate.mjs runtime-measurement \
         --root / \
         --component jobs-runner \
         --build-id "$BLUEY_JOBS_BUILD_ID" \
@@ -80,9 +84,12 @@ RUN find /ms-playwright -mindepth 1 -maxdepth 1 \
         --roles managed_runner \
         --source-commit "$BLUEY_JOBS_SOURCE_COMMIT" \
         --out /app/.bluey/managed-cloud-runtime-measurement.json \
-    && rm -rf /usr/local/lib/node_modules /root/.npm /tmp/* \
-    && rm -f /usr/local/bin/corepack /usr/local/bin/npm /usr/local/bin/npx \
-        /usr/local/bin/yarn /usr/local/bin/yarnpkg /usr/local/bin/docker-entrypoint.sh \
+    && rm -rf /usr/lib/node_modules /usr/local/lib/node_modules /root/.npm /tmp/* \
+    && rm -f /usr/bin/corepack /usr/bin/npm /usr/bin/npx \
+        /usr/bin/node /usr/bin/yarn /usr/bin/yarnpkg \
+        /usr/local/bin/corepack /usr/local/bin/npm /usr/local/bin/npx \
+        /usr/local/bin/yarn /usr/local/bin/yarnpkg \
+        /usr/local/bin/docker-entrypoint.sh \
     && find /app -type d -exec chmod 0555 '{}' + \
     && find /app -type f -exec chmod 0444 '{}' + \
     && chmod 0555 /app/runner/dist/native/bluey_jobs_runner_native_storage.node \

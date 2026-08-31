@@ -935,8 +935,10 @@ fn decode_hex_32(value: &str) -> std::result::Result<[u8; IPC_BEARER_BYTES], Str
         return Err("daemon IPC bearer must contain exactly 32 bytes".to_string());
     }
     let mut output = [0_u8; IPC_BEARER_BYTES];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        output[index] = (decode_nibble(pair[0])? << 4) | decode_nibble(pair[1])?;
+    let bytes = value.as_bytes();
+    for (index, slot) in output.iter_mut().enumerate() {
+        let offset = index * 2;
+        *slot = (decode_nibble(bytes[offset])? << 4) | decode_nibble(bytes[offset + 1])?;
     }
     Ok(output)
 }
@@ -1195,7 +1197,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn capability_replacement_never_exposes_a_partial_record() {
+    fn capability_reader_fails_after_bounded_zero_link_replacements() {
+        let paths = test_paths("ipc-capability-bounded-replace");
+        paths.ensure().expect("paths");
+        let first = IpcCapabilityRecord::generate().expect("first");
+        let second = IpcCapabilityRecord::generate().expect("second");
+        publish_ipc_capability(&paths, &first).expect("publish first");
+
+        let path = ipc_capability_path(&paths);
+        let mut open_count = 0;
+        let error = open_private_capability_file_with(&path, |attempt| {
+            open_count += 1;
+            let replacement = if attempt % 2 == 0 { &second } else { &first };
+            publish_ipc_capability(&paths, replacement).expect("replace after every open");
+        })
+        .expect_err("four zero-link opens must fail closed");
+
+        assert_eq!(open_count, IPC_CAPABILITY_REPLACEMENT_RETRIES + 1);
+        assert!(format!("{error:#}").contains("failed nlink validation"));
+
+        let current = load_ipc_capability(&paths).expect("load final replacement");
+        assert_eq!(current.boot_id, first.boot_id);
+        assert!(remove_ipc_capability_if_current(&paths, first.boot_id).unwrap());
+        let _ = fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_boot_scoped_capability_replacement_never_exposes_a_partial_record() {
         let paths = test_paths("ipc-capability-race");
         paths.ensure().expect("paths");
         let first = IpcCapabilityRecord::generate().expect("first");
@@ -1216,14 +1245,13 @@ mod tests {
         });
 
         barrier.wait();
-        for index in 0..100 {
-            let capability = if index % 2 == 0 { &second } else { &first };
-            publish_ipc_capability(&paths, capability).expect("atomic replacement");
-        }
+        publish_ipc_capability(&paths, &second).expect("one boot-scoped atomic replacement");
         reader.join().expect("reader");
 
-        let current = load_ipc_capability(&paths).unwrap();
-        assert!(remove_ipc_capability_if_current(&paths, current.boot_id).unwrap());
+        let current = load_ipc_capability(&paths).expect("load final second record");
+        assert_eq!(current.boot_id, second.boot_id);
+        assert!(current.bearer.constant_time_eq(&second.bearer));
+        assert!(remove_ipc_capability_if_current(&paths, second.boot_id).unwrap());
         let _ = fs::remove_dir_all(paths.runtime_dir.parent().unwrap());
     }
 }
