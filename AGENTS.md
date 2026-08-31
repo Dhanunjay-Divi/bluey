@@ -60,6 +60,22 @@ Cue is a cross-platform AI meeting copilot built with Tauri 2 (Rust backend + Re
 - Integration tests for IPC commands and daemon workflows.
 - CI must pass before PR merge: fmt, clippy, build, test.
 - Test names describe behavior: `test_chunker_splits_at_sentence_boundary`.
+- Run local Bluey Rust tests through `scripts/run-bluey-tests.sh all`, or use
+  `scripts/run-bluey-tests.sh -- <command>` for a focused test/check command.
+  The launcher isolates Cargo output, primary SQLite, temporary, data, config,
+  runtime, and log paths; forces SQLite; removes inherited PostgreSQL URLs; and
+  supervises the complete command process group.
+- Run `scripts/run-bluey-tests.sh --self-test` before handoff. The launcher
+  runs every `all` and direct command from the physical repository root. It
+  cleans an owned root after success, failure, HUP, INT, or TERM, but once
+  marker establishment begins a missing or malformed marker retains the root
+  and makes cleanup fail explicitly. SIGKILL and host crashes are recovered
+  only by a later marker-bound stale-run pass; uncertain process inspection is
+  treated as active.
+- Never point the test run parent at a repository, Git worktree, Downloads
+  sibling, broad temporary root, or `/Volumes`. It must be a private
+  current-user directory under local `/tmp`; existing directories are never
+  chmodded by the launcher.
 
 ## Review Discipline
 

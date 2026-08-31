@@ -25,6 +25,7 @@ const repoRoot = path.resolve(
 );
 
 const JOBS_CI_TIMEOUT_MINUTES = 90;
+const ISOLATED_TEST_LAUNCHER = "scripts/run-bluey-tests.sh";
 
 function runnerVolumeParitySchema(integerType) {
   const migrationPath =
@@ -312,6 +313,222 @@ function testJobsCiTimeBudgetGuard() {
       issue.includes(`exactly ${JOBS_CI_TIMEOUT_MINUTES} minutes`),
     ),
     "Jobs CI guard must reject a regression to the exhausted 45-minute budget",
+  );
+}
+
+function validateIsolatedTestDiskAuthority(workflow, launcher) {
+  const issues = [];
+  const occurrences = (value, needle) => value.split(needle).length - 1;
+  const selfTestCommand = `bash ${ISOLATED_TEST_LAUNCHER} --self-test`;
+
+  if (occurrences(workflow, selfTestCommand) !== 1) {
+    issues.push(
+      `Jobs CI must run ${ISOLATED_TEST_LAUNCHER} --self-test exactly once`,
+    );
+  }
+
+  for (const required of [
+    'export CARGO_TARGET_DIR="$run_root/cargo-target"',
+    'export TMPDIR="$run_root/tmp"',
+    'export TMP="$run_root/tmp"',
+    'export TEMP="$run_root/tmp"',
+    'export SQLITE_TMPDIR="$run_root/tmp"',
+    'export BLUEY_DB_PATH="$run_root/data/bluey-test.sqlite"',
+    "export BLUEY_SERVER_DB_BACKEND=sqlite",
+    "unset BLUEY_DATABASE_URL BLUEY_TEST_POSTGRES_URL",
+    'export BLUEY_LOG_DIR="$run_root/logs"',
+    'export CUE_LOG_DIR="$BLUEY_LOG_DIR"',
+    "export CARGO_INCREMENTAL=0",
+    "export CARGO_PROFILE_DEV_INCREMENTAL=false",
+    "export CARGO_PROFILE_TEST_INCREMENTAL=false",
+    "export CARGO_PROFILE_DEV_DEBUG=0",
+    "export CARGO_PROFILE_TEST_DEBUG=0",
+    "trap on_exit EXIT",
+    "trap 'on_signal HUP 129' HUP",
+    "trap 'on_signal INT 130' INT",
+    "trap 'on_signal TERM 143' TERM",
+    "install_deferred_signal_traps",
+    "run_root_created=1",
+    "dispatch_deferred_signal",
+    'marker_established=1\n  write_marker starting 0',
+    'if [[ "$marker_established" -eq 1 ]]; then',
+    'readonly STALE_GRACE_SECONDS=60',
+    "run parent must not contain dot segments",
+    "run parent must stay under local /tmp",
+    "existing run parent must already have mode 0700",
+    "run parent must not overlap any registered Git worktree",
+    "/usr/bin/perl -MPOSIX=setsid",
+    'kill -s "$signal_name" "-$process_group_id"',
+    'group_is_active "$marker_process_group_id"',
+    'output="$(ps -eo pgid=,stat= 2>/dev/null)"',
+    '[[ "$observed_pgid" == "$pgid" && "$observed_state" != Z* ]]',
+    '[[ "$status" -eq 0 ]] || return 0',
+    '[[ -d "$candidate" && ! -L "$candidate" && -O "$candidate" ]] || continue',
+    '[[ -f "$marker" && ! -L "$marker" && -O "$marker" ]] || return 1',
+    'read_marker "$candidate/$MARKER_NAME" || continue',
+    'pid_is_active "$marker_owner_pid" && continue',
+    'if ! rm -rf -- "$physical"',
+    '[[ -e "$physical" || -L "$physical" ]]',
+    "command passed but cleanup failed",
+    "cleanup failed; preserving command status",
+    "exit 125 unless chdir $repo_root;",
+    'if [[ "${1:-}" == "--self-test" ]]',
+    'if [[ "${1:-}" == "all" ]]',
+  ]) {
+    if (!launcher.includes(required)) {
+      issues.push(`${ISOLATED_TEST_LAUNCHER} is missing authority: ${required}`);
+    }
+  }
+
+  for (const requiredScenario of [
+    "poisoned-environment isolation failed",
+    "ordinary descendant survived",
+    "reaper touched an active process group",
+    "inactive marker-valid stale root survived",
+    "reaper followed a candidate symlink",
+    "reaper followed a marker symlink",
+    "unsafe parent was mutated before rejection",
+    "post-mkdir signal run root survived",
+    "all mapping did not run from repository root",
+    "direct command did not run from repository root",
+    "reaper treated ps failure as inactive",
+    "zombie-only process group blocked cleanup",
+    "marker-missing cleanup did not fail closed",
+    "marker-corrupt cleanup did not fail closed",
+    "cleanup failure did not fail a successful command",
+    "cleanup failure hid child status",
+    "cleanup failure hid signal status",
+    "test run residue remains",
+  ]) {
+    if (!launcher.includes(requiredScenario)) {
+      issues.push(`${ISOLATED_TEST_LAUNCHER} is missing scenario: ${requiredScenario}`);
+    }
+  }
+
+  const trapIndex = launcher.indexOf("trap on_exit EXIT");
+  const deferredMkdirIndex = launcher.indexOf(
+    'install_deferred_signal_traps\n    if mkdir -m 0700 -- "$run_root"',
+  );
+  const postMkdirHookIndex = launcher.indexOf(
+    "BLUEY_TEST_INJECT_AFTER_RUN_ROOT_MKDIR",
+    deferredMkdirIndex,
+  );
+  const ownedIndex = launcher.indexOf("run_root_created=1", deferredMkdirIndex);
+  const dispatchIndex = launcher.indexOf("dispatch_deferred_signal", ownedIndex);
+  if (
+    trapIndex < 0 ||
+    deferredMkdirIndex < 0 ||
+    postMkdirHookIndex < deferredMkdirIndex ||
+    postMkdirHookIndex > ownedIndex ||
+    ownedIndex < deferredMkdirIndex ||
+    dispatchIndex < ownedIndex
+  ) {
+    issues.push("mkdir ownership window must defer signals until the root is owned");
+  }
+
+  return issues;
+}
+
+function testIsolatedTestDiskAuthorityGuard() {
+  const workflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/jobs-ci.yml"),
+    "utf8",
+  );
+  const launcher = fs.readFileSync(
+    path.join(repoRoot, ISOLATED_TEST_LAUNCHER),
+    "utf8",
+  );
+  assert.deepEqual(
+    validateIsolatedTestDiskAuthority(workflow, launcher),
+    [],
+  );
+
+  const unwiredWorkflow = workflow.replace(
+    `        run: bash ${ISOLATED_TEST_LAUNCHER} --self-test`,
+    "        run: true",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(unwiredWorkflow, launcher).some((issue) =>
+      issue.includes("exactly once"),
+    ),
+    "Jobs CI guard must reject removal of the isolated launcher self-test",
+  );
+
+  const sharedCargoTarget = launcher.replace(
+    'export CARGO_TARGET_DIR="$run_root/cargo-target"',
+    'export CARGO_TARGET_DIR="$repo_root/target"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, sharedCargoTarget).some((issue) =>
+      issue.includes("CARGO_TARGET_DIR"),
+    ),
+    "Jobs CI guard must reject loss of Cargo target isolation",
+  );
+
+  const poisonedDatabase = launcher.replace(
+    "unset BLUEY_DATABASE_URL BLUEY_TEST_POSTGRES_URL",
+    ": # inherited database URLs retained",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, poisonedDatabase).some(
+      (issue) => issue.includes("BLUEY_DATABASE_URL"),
+    ),
+    "Jobs CI guard must reject inherited database authority",
+  );
+
+  const unsafeSymlinkReaper = launcher.replace(
+    '[[ -d "$candidate" && ! -L "$candidate" && -O "$candidate" ]] || continue',
+    '[[ -d "$candidate" && -O "$candidate" ]] || continue',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unsafeSymlinkReaper).some(
+      (issue) => issue.includes('! -L "$candidate"'),
+    ),
+    "Jobs CI guard must reject loss of stale-run symlink safety",
+  );
+
+  const unsafeMkdirWindow = launcher.replace(
+    'install_deferred_signal_traps\n    if mkdir -m 0700 -- "$run_root"',
+    'if mkdir -m 0700 -- "$run_root"',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unsafeMkdirWindow).some((issue) =>
+      issue.includes("mkdir ownership window"),
+    ),
+    "Jobs CI guard must reject an unprotected mkdir ownership window",
+  );
+
+  const unsafeMarkerCleanup = launcher.replace(
+    'if [[ "$marker_established" -eq 1 ]]; then',
+    "if false; then",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unsafeMarkerCleanup).some((issue) =>
+      issue.includes("marker_established"),
+    ),
+    "Jobs CI guard must reject cleanup that ignores an established marker",
+  );
+
+  const unsafeProcessInspection = launcher.replace(
+    '[[ "$status" -eq 0 ]] || return 0',
+    '[[ "$status" -eq 1 ]] && return 1',
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, unsafeProcessInspection).some((issue) =>
+      issue.includes("status"),
+    ),
+    "Jobs CI guard must reject process inspection that treats ps errors as inactive",
+  );
+
+  const callerCwdCommand = launcher.replace(
+    "exit 125 unless chdir $repo_root;",
+    ": # caller working directory retained",
+  );
+  assert(
+    validateIsolatedTestDiskAuthority(workflow, callerCwdCommand).some((issue) =>
+      issue.includes("chdir"),
+    ),
+    "Jobs CI guard must reject commands that retain the caller working directory",
   );
 }
 
@@ -1735,6 +1952,7 @@ testPortalBundleFreshnessWorkflowGuard();
 testDependencySecurityWorkflowGuard();
 testBuiltPortalPublicBetaTruth();
 testJobsCiTimeBudgetGuard();
+testIsolatedTestDiskAuthorityGuard();
 testIntegrationTestSupportContainmentGuard();
 testPublicBetaAdminMutationAuditBoundary();
 checkBusinessMessagingSimulatorContainment();
@@ -1744,6 +1962,6 @@ testProvenance();
 
 console.log(
   "Jobs CI guard self-tests passed (privacy, portal bundle freshness, dependency security, " +
-  "time budget, schema parity, integration and business-messaging simulator containment, " +
-  "lock inventory, and provenance).",
+  "time budget, isolated test-disk authority, schema parity, integration and " +
+  "business-messaging simulator containment, lock inventory, and provenance).",
 );

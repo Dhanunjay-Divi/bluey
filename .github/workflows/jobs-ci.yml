@@ -53,6 +53,9 @@ jobs:
       - name: Self-test Jobs CI guards
         run: node jobs/scripts/ci-guards-self-test.mjs
 
+      - name: Self-test isolated test launcher
+        run: bash scripts/run-bluey-tests.sh --self-test
+
       - name: Reject committed private data and secrets
         run: node jobs/scripts/privacy-gate.mjs
 
