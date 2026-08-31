@@ -50,7 +50,8 @@ was removed or relaxed.
 - A non-integer, lower, or unreviewed higher timeout fails closed rather than silently changing the
   resource contract.
 - The 90-minute ceiling remains bounded, so a real hang still terminates the hosted job.
-- The cancelled run is not represented as passing; a fresh exact-tip hosted run remains required.
+- The cancelled run is not represented as passing; the succeeding exact-tip run is recorded
+  separately below.
 
 ## How to Test
 
@@ -61,12 +62,29 @@ go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
 git diff --check
 ```
 
-After push, require a fresh exact-tip Jobs CI run to complete all 108 integration tests and both
-business-messaging simulator verifier steps before changing the release verdict.
+## Exact-tip Hosted Evidence
+
+Commit `680160b14e9113a49d778fe8ad3cf8c974a9da72` completed the replacement Jobs CI run
+[`33360874641`](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33360874641) under the
+closed 90-minute budget. The combined Linux job
+[`99391834778`](https://github.com/Dhanunjay-Divi/bluey/actions/runs/33360874641/job/99391834778)
+finished in 48 minutes 25 seconds with every step green, including:
+
+- 1,968 Jobs JavaScript tests passed and one intentionally skipped;
+- 955 selected server Jobs unit tests passed with zero failures;
+- all 108 server integration tests passed in 469.50 seconds;
+- all 14 Rust business-messaging simulator verifier tests passed after strict Clippy;
+- the managed-runner Docker build/native-addon smoke passed; and
+- privacy, schema, provenance, portal freshness, account-deletion, typecheck, build, and
+  containment gates passed.
+
+The parallel Darwin native-runner job also passed. The exact-tip CI, server, and observability
+workflows were green; no timeout, test failure, production write, deployment, or flag change
+occurred.
 
 ## Known Limitations
 
-- The source guard proves the workflow budget contract, not hosted completion. PR #34 remains
-  blocked until the fresh exact-tip Jobs CI run is green.
+- The exact-tip hosted run proves the current workload fits the 90-minute contract, but future
+  mandatory gate growth still requires measurement rather than assuming permanent headroom.
 - Further mandatory gate growth may justify splitting the combined job in a separately reviewed
   phase. This fix does not hide such growth behind an unbounded timeout.

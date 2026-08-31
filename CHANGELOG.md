@@ -325,7 +325,8 @@ under `docs/release/`.
   PR-head run passed every preceding gate but was cancelled with 89 of 108 integration tests green
   and zero failures. The pre-install Jobs CI self-test now rejects any drift from the bounded
   90-minute contract; test commands, release authority, feature flags, and production behavior are
-  unchanged.
+  unchanged. The replacement exact-tip hosted run completed every gate in 48 minutes 25 seconds,
+  including all 108 integration tests and both simulator-verifier steps.
 - Removed the Bluey Jobs dependency-security release blocker by upgrading both résumé PDF
   extractors to patched PDF.js 6.2.108, retaining text-only parsing with loading-task cleanup,
   and refreshing vulnerable DOMPurify, PostCSS/Nano ID, brace-expansion, JS-YAML, and Undici
