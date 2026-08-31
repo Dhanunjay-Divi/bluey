@@ -3,7 +3,9 @@
 > **Codex preflight:** Load `$bluey-ops` and reconcile the review against Round 624, FIX-783, the
 > implementation record, the final branch diff, and the retained Phase 614/614B authority.
 
-**Commit range:** `b3d0c79c..working tree`
+**Commit range:** `b3d0c79c..8858abe28d590b1f234481ace3abba24be076e04`
+
+**Implementation commit:** `02648f09ceb1790ef34d21632baac00c06c37e17`
 
 **Reviewer:** Independent line-by-line review and correction rereview complete
 

@@ -3,10 +3,14 @@
 > **Codex preflight:** Loaded `$bluey-ops`, its release guidance, the designated worktree handoff,
 > and the current Phase 611, 614/614B, 621, and 622 authority records. The SSD archive was not used.
 
-**Status:** Bounded local source accepted; no commit, push, workflow dispatch, deployment, or flag
-change
+**Status:** Bounded local source accepted and integrated with FIX-784; push and exact-tip hosted
+verification remain pending; no workflow dispatch, deployment, or flag change
 
 **Base commit:** `b3d0c79c`
+
+**Implementation commit:** `02648f09ceb1790ef34d21632baac00c06c37e17`
+
+**Integrated source tip:** `8858abe28d590b1f234481ace3abba24be076e04`
 
 **Branch:** `feat/phase-624-jobs-managed-source-verification-v2`
 
@@ -107,6 +111,10 @@ from Docker Official Image tag metadata updated 2026-08-25. This resolves the pr
 candidate image input; it is not candidate, registry, activation, or deployment evidence.
 
 No Docker command, workflow dispatch, provider request, or production mutation was performed.
+
+The Phase 624 source commit was merged with the independently accepted Phase 622/FIX-784 tip. The
+merge preserved the final 20-test gate and independent guards; no release-v2 source conflict was
+resolved manually.
 
 ## Deviations From Plan
 
