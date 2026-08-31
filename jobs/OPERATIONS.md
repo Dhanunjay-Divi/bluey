@@ -862,25 +862,36 @@ Before enabling production archival:
    archive retry counts remain healthy before increasing throughput.
 
 ```sql
-SELECT c.id, c.canonical_key, c.updated_at_ms
-FROM jobs_global_candidates c
-WHERE c.availability_status = 'expired'
-  AND c.archive_state = 'hot'
-  AND c.updated_at_ms < (
-      EXTRACT(EPOCH FROM NOW() - INTERVAL '30 days') * 1000
-  )::BIGINT
-  AND NOT EXISTS (
-      SELECT 1
-      FROM jobs_global_candidate_memberships m
-      WHERE m.candidate_id = c.id
-        AND m.expired_at_ms IS NULL
+WITH archive_clock AS (
+    SELECT
+        (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT AS now_ms,
+        (EXTRACT(EPOCH FROM clock_timestamp() - INTERVAL '30 days') * 1000)::BIGINT
+            AS stale_before_ms
+)
+SELECT candidate.id, candidate.canonical_key, candidate.updated_at_ms
+FROM jobs_global_candidates candidate
+CROSS JOIN archive_clock
+WHERE candidate.availability_status = 'expired'
+  AND candidate.updated_at_ms <= archive_clock.stale_before_ms
+  AND (
+      (candidate.archive_state IN ('hot', 'retry')
+       AND candidate.archive_next_attempt_at_ms <= archive_clock.now_ms)
+      OR
+      (candidate.archive_state = 'archiving'
+       AND COALESCE(candidate.archive_lease_expires_at_ms, 0) <= archive_clock.now_ms)
   )
   AND NOT EXISTS (
       SELECT 1
-      FROM jobs_global_candidate_materializations m
-      WHERE m.candidate_id = c.id
+      FROM jobs_global_candidate_memberships membership
+      WHERE membership.candidate_id = candidate.id
+        AND membership.availability_status <> 'expired'
   )
-ORDER BY c.updated_at_ms
+  AND NOT EXISTS (
+      SELECT 1
+      FROM jobs_global_candidate_materializations materialization
+      WHERE materialization.candidate_id = candidate.id
+  )
+ORDER BY candidate.updated_at_ms, candidate.id
 LIMIT 100;
 ```
 
@@ -893,11 +904,12 @@ FROM jobs_global_candidates
 GROUP BY archive_state
 ORDER BY archive_state;
 
-SELECT id, archive_attempt_count, archive_next_attempt_at_ms
+SELECT id, archive_state, archive_attempt_count,
+       archive_next_attempt_at_ms, archive_lease_expires_at_ms
 FROM jobs_global_candidates
-WHERE archive_state = 'hot'
-  AND archive_attempt_count > 0
-ORDER BY archive_next_attempt_at_ms
+WHERE archive_state IN ('retry', 'archiving')
+   OR archive_attempt_count > 0
+ORDER BY archive_next_attempt_at_ms, id
 LIMIT 100;
 ```
 

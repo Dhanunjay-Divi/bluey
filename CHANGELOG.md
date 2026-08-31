@@ -349,6 +349,22 @@ under `docs/release/`.
   private to unit tests and source guarded. The configured-PostgreSQL forced-audit-failure fixture
   now uses transactionally installed, unique, actor-scoped trigger/function names and panic-safe,
   absence-verified cleanup.
+- Replaced count-only host backup retention and silent once-daily disk checks
+  with locked, staged backup pairs; exact offsite read-back proof; bounded,
+  proof-aware count/capacity retention; legacy proof bootstrap; self-cleaning
+  locked log archives; durable component-sized disk status; and 70%/16 GB
+  early warning before the unchanged 80%/8 GB release stop line. Production's
+  15-minute guard now also warns on a 120-minute backup and fails at 180 minutes
+  or on missing checksum/offsite-proof metadata without repeatedly hashing the
+  full dump. Hard per-snapshot/archive bounds, root-trusted storage paths,
+  backup and log-archive run dead-men, inode checks, reason-aware alerts,
+  root-only operations credentials, class-prefixed R2 lifecycle keys, and a
+  release-preflight guard prevent the same migration/capacity failure from
+  silently recurring. The storage installer also prepares root-owned restore
+  lease/lock directories, while production preflight deliberately remains
+  blocked until a separately reviewed external provider can create, monitor,
+  expire, and close restore-target cleanup registrations independent of the
+  Bluey host; a locally consumed marker cannot satisfy that gate.
 - Closed Phase 613 review defects FIX-694 through FIX-711: monotonic taxonomy/account/Track replay
   and execution fences; fail-closed canonical classification; typed public-ATS evidence; portal
   mutation/read-back ordering; retry-safe Track writes; PostgreSQL Auto-submit revocation,
