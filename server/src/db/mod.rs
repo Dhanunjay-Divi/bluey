@@ -38,6 +38,7 @@ pub mod refresh_tokens;
 pub mod signup_otps;
 pub mod stripe_auto_reload;
 pub mod stt_accounting;
+pub mod support_diagnostics;
 pub mod sync;
 pub mod trial_abuse;
 pub mod usage;
@@ -297,7 +298,8 @@ const MIGRATIONS: &[&str] = &[
         auto_topup_amount_cents     INTEGER NOT NULL DEFAULT 1500,     -- $15
         stripe_customer_id          TEXT,
         stripe_payment_method_id    TEXT,
-        is_admin                    INTEGER NOT NULL DEFAULT 0
+        is_admin                    INTEGER NOT NULL DEFAULT 0,
+        deletion_pending_at_ms      INTEGER
     );
     CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(email);
     "#,
@@ -573,6 +575,9 @@ const MIGRATIONS: &[&str] = &[
         child_id           TEXT NOT NULL,
         session_id         TEXT NOT NULL,
         deleted_at_ms      INTEGER NOT NULL,
+        source_kind        TEXT,
+        source_id          TEXT,
+        chunk_index        INTEGER,
         PRIMARY KEY (account_id, child_kind, child_id)
     );
     CREATE INDEX IF NOT EXISTS idx_cloud_child_tombstones_session
@@ -1589,6 +1594,55 @@ const MIGRATIONS: &[&str] = &[
     // 0040 - Track-scoped, revisioned user authority for unattended
     // application submission.
     SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+    // 0041 - append-only support-diagnostics consent receipts. A desktop
+    // preference is not upload authority: the server derives current consent
+    // from the newest account-scoped receipt and preserves revocation proof.
+    r#"
+    CREATE TABLE IF NOT EXISTS support_diagnostic_consent_events (
+        receipt_id        TEXT PRIMARY KEY,
+        account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        revision          INTEGER NOT NULL CHECK(revision > 0),
+        action            TEXT NOT NULL CHECK(action IN ('granted', 'revoked')),
+        policy_version    TEXT NOT NULL,
+        content_policy    TEXT NOT NULL CHECK(content_policy = 'metadata_only'),
+        recorded_at_ms    INTEGER NOT NULL,
+        UNIQUE(account_id, revision)
+    );
+    CREATE INDEX IF NOT EXISTS idx_support_diagnostic_consent_current
+        ON support_diagnostic_consent_events(account_id, revision DESC);
+    "#,
+    // 0042 - durable per-session support-diagnostic deletion tombstones.
+    r#"
+    CREATE TABLE IF NOT EXISTS support_diagnostic_session_tombstones (
+        account_id        TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+        session_id        TEXT NOT NULL,
+        deleted_at_ms     INTEGER NOT NULL,
+        PRIMARY KEY(account_id, session_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_support_diagnostic_session_tombstones_deleted
+        ON support_diagnostic_session_tombstones(account_id, deleted_at_ms);
+    "#,
+    // 0043 - bounded opaque account-deletion reconciliation receipts. These
+    // deliberately have no account FK so a response-lost hard delete can be
+    // confirmed without retaining customer identity or reviving auth.
+    r#"
+    CREATE TABLE IF NOT EXISTS account_deletion_receipts (
+        operation_id       TEXT PRIMARY KEY,
+        account_binding    TEXT NOT NULL,
+        capability_hash    TEXT NOT NULL,
+        state              TEXT NOT NULL CHECK(state IN ('prepared', 'pending', 'deleted')),
+        created_at_ms      INTEGER NOT NULL,
+        updated_at_ms      INTEGER NOT NULL,
+        completed_at_ms    INTEGER,
+        expires_at_ms      INTEGER NOT NULL,
+        CHECK(expires_at_ms > created_at_ms),
+        CHECK((state = 'deleted') = (completed_at_ms IS NOT NULL))
+    );
+    CREATE INDEX IF NOT EXISTS idx_account_deletion_receipts_expiry
+        ON account_deletion_receipts(expires_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_account_deletion_receipts_account
+        ON account_deletion_receipts(account_binding, updated_at_ms DESC);
+    "#,
 ];
 
 pub fn run_migrations(pool: &DbPool) -> Result<()> {
@@ -1864,6 +1918,12 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
     )?;
     ensure_column(&conn, "accounts", "billing_restriction_reason", "TEXT")?;
     ensure_column(&conn, "accounts", "billing_restricted_at", "DATETIME")?;
+    ensure_column(&conn, "accounts", "deletion_pending_at_ms", "INTEGER")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_accounts_deletion_pending
+             ON accounts(deletion_pending_at_ms)
+             WHERE deletion_pending_at_ms IS NOT NULL;",
+    )?;
     ensure_column(
         &conn,
         "accounts",
@@ -1952,6 +2012,9 @@ fn run_sqlite_migrations(pool: &DbPool) -> Result<()> {
         "updated_at_ms",
         "INTEGER NOT NULL DEFAULT 0",
     )?;
+    ensure_column(&conn, "cloud_child_tombstones", "source_kind", "TEXT")?;
+    ensure_column(&conn, "cloud_child_tombstones", "source_id", "TEXT")?;
+    ensure_column(&conn, "cloud_child_tombstones", "chunk_index", "INTEGER")?;
     conn.execute(
         "UPDATE cloud_context_artifacts
          SET updated_at_ms = created_at_ms
@@ -2024,6 +2087,14 @@ const POSTGRES_JOBS_GLOBAL_CANDIDATE_ARCHIVE: &str =
     include_str!("../../../infra/postgres/server-runtime/017_jobs_global_candidate_archive.sql");
 const POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS: &str =
     include_str!("../../../infra/postgres/server-runtime/018_jobs_auto_submit_authorizations.sql");
+const POSTGRES_SUPPORT_DIAGNOSTIC_CONSENT: &str =
+    include_str!("../../../infra/postgres/server-runtime/019_support_diagnostic_consent.sql");
+const POSTGRES_ACCOUNT_DELETION_FENCES: &str =
+    include_str!("../../../infra/postgres/server-runtime/020_account_deletion_fences.sql");
+const POSTGRES_CLOUD_CHILD_TOMBSTONE_PROVENANCE: &str =
+    include_str!("../../../infra/postgres/server-runtime/021_cloud_child_tombstone_provenance.sql");
+const POSTGRES_ACCOUNT_DELETION_RECEIPTS: &str =
+    include_str!("../../../infra/postgres/server-runtime/022_account_deletion_receipts.sql");
 const POSTGRES_MIGRATIONS: &[(&str, &str)] = &[
     ("001_server_runtime_compat.sql", POSTGRES_RUNTIME_SCHEMA),
     ("002_usage_reservations.sql", POSTGRES_USAGE_RESERVATIONS),
@@ -2084,6 +2155,22 @@ const POSTGRES_POST_JOBS_MIGRATIONS: &[(&str, &str)] = &[
     (
         "018_jobs_auto_submit_authorizations.sql",
         POSTGRES_JOBS_AUTO_SUBMIT_AUTHORIZATIONS,
+    ),
+    (
+        "019_support_diagnostic_consent.sql",
+        POSTGRES_SUPPORT_DIAGNOSTIC_CONSENT,
+    ),
+    (
+        "020_account_deletion_fences.sql",
+        POSTGRES_ACCOUNT_DELETION_FENCES,
+    ),
+    (
+        "021_cloud_child_tombstone_provenance.sql",
+        POSTGRES_CLOUD_CHILD_TOMBSTONE_PROVENANCE,
+    ),
+    (
+        "022_account_deletion_receipts.sql",
+        POSTGRES_ACCOUNT_DELETION_RECEIPTS,
     ),
 ];
 
@@ -2507,8 +2594,10 @@ mod sqlite_migration_replay_tests {
 #[cfg(test)]
 mod postgres_migration_tests {
     use super::{
-        POSTGRES_CONTEXT_ARTIFACT_REVISIONS, POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX,
-        POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS, POSTGRES_POST_JOBS_MIGRATIONS,
+        POSTGRES_ACCOUNT_DELETION_FENCES, POSTGRES_ACCOUNT_DELETION_RECEIPTS,
+        POSTGRES_CLOUD_CHILD_TOMBSTONE_PROVENANCE, POSTGRES_CONTEXT_ARTIFACT_REVISIONS,
+        POSTGRES_JOBS_GLOBAL_CANDIDATE_INDEX, POSTGRES_JOBS_SCHEMA, POSTGRES_MIGRATIONS,
+        POSTGRES_POST_JOBS_MIGRATIONS, POSTGRES_SUPPORT_DIAGNOSTIC_CONSENT,
         SQLITE_JOBS_AUTO_SUBMIT_AUTHORIZATIONS, SQLITE_JOBS_GLOBAL_CANDIDATE_INDEX,
     };
 
@@ -2682,5 +2771,68 @@ mod postgres_migration_tests {
                 "SQLite migration missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn support_diagnostic_consent_is_append_only_and_account_revisioned() {
+        for required in [
+            "CREATE TABLE IF NOT EXISTS support_diagnostic_consent_events",
+            "CHECK(action IN ('granted', 'revoked'))",
+            "CHECK(content_policy = 'metadata_only')",
+            "UNIQUE(account_id, revision)",
+        ] {
+            assert!(
+                POSTGRES_SUPPORT_DIAGNOSTIC_CONSENT.contains(required),
+                "missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_and_support_deletion_fences_have_postgres_parity() {
+        for required in [
+            "ADD COLUMN IF NOT EXISTS deletion_pending_at_ms BIGINT",
+            "CREATE TABLE IF NOT EXISTS support_diagnostic_session_tombstones",
+            "PRIMARY KEY (account_id, session_id)",
+            "REFERENCES accounts(id) ON DELETE CASCADE",
+        ] {
+            assert!(
+                POSTGRES_ACCOUNT_DELETION_FENCES.contains(required),
+                "missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloud_child_tombstones_preserve_rag_source_provenance() {
+        for required in [
+            "ADD COLUMN IF NOT EXISTS source_kind TEXT",
+            "ADD COLUMN IF NOT EXISTS source_id TEXT",
+            "ADD COLUMN IF NOT EXISTS chunk_index BIGINT",
+        ] {
+            assert!(
+                POSTGRES_CLOUD_CHILD_TOMBSTONE_PROVENANCE.contains(required),
+                "missing {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn account_deletion_receipts_are_opaque_bounded_and_not_account_cascaded() {
+        for required in [
+            "CREATE TABLE IF NOT EXISTS account_deletion_receipts",
+            "operation_id       TEXT PRIMARY KEY",
+            "account_binding    TEXT NOT NULL",
+            "capability_hash    TEXT NOT NULL",
+            "expires_at_ms      BIGINT NOT NULL",
+            "CHECK ((state = 'deleted') = (completed_at_ms IS NOT NULL))",
+        ] {
+            assert!(
+                POSTGRES_ACCOUNT_DELETION_RECEIPTS.contains(required),
+                "missing {required}"
+            );
+        }
+        assert!(!POSTGRES_ACCOUNT_DELETION_RECEIPTS.contains("REFERENCES accounts"));
+        assert!(!POSTGRES_ACCOUNT_DELETION_RECEIPTS.contains("account_id"));
     }
 }

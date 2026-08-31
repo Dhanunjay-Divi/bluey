@@ -151,6 +151,22 @@ pub enum LlmError {
 }
 
 impl LlmError {
+    /// Closed, content-free category suitable for diagnostics and logs.
+    ///
+    /// Provider error strings can contain response bodies, request URLs, local
+    /// paths, or other user-controlled text. Keep those strings available for
+    /// local recovery decisions, but never attach them to telemetry or logs.
+    pub fn diagnostic_category(&self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Quota(_) => "quota",
+            Self::Network(_) => "network",
+            Self::Provider(_) => "provider",
+            Self::CapacityBusy { .. } => "capacity",
+            Self::Billing(_) => "billing",
+        }
+    }
+
     pub fn should_failover(&self) -> bool {
         matches!(self, Self::Auth | Self::Quota(_))
     }
@@ -187,5 +203,38 @@ pub trait LlmProvider: Send + Sync {
 
     fn supports_streaming(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod error_privacy_tests {
+    use super::LlmError;
+
+    #[test]
+    fn diagnostic_categories_never_include_provider_payloads() {
+        let secret = "private transcript Bearer sk-secret https://example.test?q=secret /Users/me";
+        let errors = [
+            LlmError::Auth,
+            LlmError::Quota(secret.to_string()),
+            LlmError::Network(secret.to_string()),
+            LlmError::Provider(secret.to_string()),
+            LlmError::CapacityBusy {
+                retry_after_secs: 2,
+                reason: secret.to_string(),
+            },
+            LlmError::Billing(secret.to_string()),
+        ];
+
+        for error in errors {
+            let category = error.diagnostic_category();
+            assert!(
+                matches!(
+                    category,
+                    "auth" | "quota" | "network" | "provider" | "capacity" | "billing"
+                ),
+                "unexpected diagnostic category: {category}"
+            );
+            assert!(!category.contains(secret));
+        }
     }
 }

@@ -103,6 +103,7 @@ pub fn run() {
             commands::complete_onboarding,
             commands::get_data_controls,
             commands::set_cloud_sync_enabled,
+            commands::set_support_diagnostics_upload_enabled,
             commands::get_context_watch_settings,
             commands::update_context_watch_settings,
             commands::get_meeting_detection_settings,
@@ -471,9 +472,18 @@ fn local_dashboard_route(parsed: &url::Url) -> Option<&'static str> {
     }
 }
 
+fn signed_out_account_generation(account: &cue_core::AccountConfig) -> Option<u64> {
+    (account.provider.trim().eq_ignore_ascii_case("local")
+        && account.cloud_account_id.is_none()
+        && account.user_id.trim() == "local-user"
+        && !account.token_configured()
+        && account.refresh_token.is_none())
+    .then_some(account.credential_generation)
+}
+
 #[cfg(test)]
 mod deep_link_route_tests {
-    use super::local_dashboard_route;
+    use super::{local_dashboard_route, signed_out_account_generation};
 
     #[test]
     fn accepts_only_the_fixed_local_settings_route() {
@@ -496,6 +506,22 @@ mod deep_link_route_tests {
             let parsed = url::Url::parse(rejected).expect("valid test URL");
             assert_eq!(local_dashboard_route(&parsed), None, "{rejected}");
         }
+    }
+
+    #[test]
+    fn linked_account_commit_requires_the_daemon_signed_out_profile() {
+        let mut signed_out = cue_core::AccountConfig::local();
+        signed_out.credential_generation = 7;
+        assert_eq!(signed_out_account_generation(&signed_out), Some(7));
+
+        let mut external_login = signed_out;
+        external_login.provider = "bluey".to_string();
+        external_login.cloud_account_id = Some("account-b".to_string());
+        external_login.user_id = "b@example.com".to_string();
+        external_login.access_token = Some("access-b".to_string());
+        external_login.refresh_token = Some("refresh-b".to_string());
+        external_login.credential_generation = 8;
+        assert_eq!(signed_out_account_generation(&external_login), None);
     }
 }
 
@@ -550,6 +576,14 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
         return;
     };
 
+    let owner_guard = match commands::capture_dashboard_owner_guard(&app) {
+        Ok(owner_guard) => owner_guard,
+        Err(error) => {
+            tracing::warn!(%error, "account owner unavailable before link exchange");
+            return;
+        }
+    };
+
     let trace_id = cue_core::new_trace_id();
     let client = match dashboard_cloud_client_with_trace(&trace_id) {
         Ok(c) => c,
@@ -582,13 +616,37 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
             // Account replacement is a hard visibility boundary. Ask the
             // daemon to stop audio and clear its active meeting/context before
             // installing the new identity.
-            if let Err(error) = commands::begin_dashboard_owner_change(&app) {
+            if let Err(error) = owner_guard.begin_transition_if_current(&app) {
                 tracing::warn!(%error, "failed to suspend dashboard owner before account switch");
+                return;
             }
-            if let Err(error) =
-                commands::daemon_ipc(cue_core::ipc::DaemonRequest::CloudLogout).await
-            {
-                tracing::warn!(%error, "daemon cleanup failed before dashboard account switch");
+            let cleanup = commands::daemon_ipc(cue_core::ipc::DaemonRequest::CloudLogoutBound {
+                fence: owner_guard.mutation_fence(None, None),
+            })
+            .await;
+            let cleanup_complete = matches!(
+                cleanup,
+                Ok(cue_core::ipc::DaemonResponse::CloudStatus { .. })
+                    | Ok(cue_core::ipc::DaemonResponse::Ok)
+            );
+            if !cleanup_complete {
+                tracing::warn!(
+                    error_category = "daemon_account_switch_cleanup_failed",
+                    "daemon cleanup failed before dashboard account switch"
+                );
+                let _ = commands::refresh_dashboard_owner_after_account_change(&app);
+                let _ = app.emit(
+                    "deep_link_login",
+                    DeepLinkLoginResult {
+                        success: false,
+                        email: Some(resp.account.email),
+                        error: Some(
+                            "Bluey could not safely switch accounts on this computer. Try again."
+                                .to_string(),
+                        ),
+                    },
+                );
+                return;
             }
 
             let paths = match cue_core::app_paths::AppPaths::discover() {
@@ -606,10 +664,39 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
                     return;
                 }
             };
-            let mut account = cue_core::load_account(&paths)
-                .ok()
-                .flatten()
-                .unwrap_or_else(cue_core::AccountConfig::local);
+            let mut account = match cue_core::load_account(&paths) {
+                Ok(Some(account)) if signed_out_account_generation(&account).is_some() => account,
+                Ok(None) => cue_core::AccountConfig::local(),
+                Ok(Some(_)) => {
+                    let _ = commands::refresh_dashboard_owner_after_account_change(&app);
+                    let _ = app.emit(
+                        "deep_link_login",
+                        DeepLinkLoginResult {
+                            success: false,
+                            email: Some(resp.account.email),
+                            error: Some(
+                                "Another account signed in while this sign-in was finishing."
+                                    .to_string(),
+                            ),
+                        },
+                    );
+                    return;
+                }
+                Err(e) => {
+                    let _ = commands::refresh_dashboard_owner_after_account_change(&app);
+                    let _ = app.emit(
+                        "deep_link_login",
+                        DeepLinkLoginResult {
+                            success: false,
+                            email: Some(resp.account.email),
+                            error: Some(format!("account store: {e}")),
+                        },
+                    );
+                    return;
+                }
+            };
+            let signed_out_generation = signed_out_account_generation(&account)
+                .expect("signed-out account generation was checked above");
             account.provider = "bluey".to_string();
             account.cloud_account_id = Some(resp.account.id.clone());
             account.user_id = resp.account.email.clone();
@@ -620,15 +707,26 @@ async fn handle_deep_link_url(url: String, app: tauri::AppHandle) {
             account.access_token = Some(resp.access_token);
             account.refresh_token = Some(resp.refresh_token);
 
-            if let Err(e) = cue_cloud_client::save_account_profile_and_tokens(&paths, &account) {
-                tracing::warn!(error = %e, "save_tokens failed");
+            let account_saved = cue_cloud_client::save_account_profile_and_tokens_if_generation(
+                &paths,
+                signed_out_generation,
+                &account,
+            );
+            if !matches!(account_saved, Ok(true)) {
+                tracing::warn!(
+                    error_category = "stale_deep_link_account_commit",
+                    "deep-link account commit was rejected"
+                );
                 let _ = commands::refresh_dashboard_owner_after_account_change(&app);
                 let _ = app.emit(
                     "deep_link_login",
                     DeepLinkLoginResult {
                         success: false,
                         email: Some(resp.account.email),
-                        error: Some(format!("account store: {e}")),
+                        error: Some(
+                            "The account changed while sign-in was finishing. Try again."
+                                .to_string(),
+                        ),
                     },
                 );
                 return;

@@ -399,6 +399,52 @@ pub struct SessionAuditBundleResponse {
     pub expires_at_ms: i64,
 }
 
+pub const SUPPORT_DIAGNOSTIC_POLICY_VERSION: &str = "2026-08-30";
+pub const SUPPORT_DIAGNOSTIC_CONTENT_POLICY: &str = "metadata_only";
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SupportDiagnosticConsentRequest {
+    pub enabled: bool,
+    pub policy_version: &'static str,
+    pub content_policy: &'static str,
+}
+
+impl SupportDiagnosticConsentRequest {
+    pub fn current(enabled: bool) -> Self {
+        Self {
+            enabled,
+            policy_version: SUPPORT_DIAGNOSTIC_POLICY_VERSION,
+            content_policy: SUPPORT_DIAGNOSTIC_CONTENT_POLICY,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SupportDiagnosticConsentReceipt {
+    pub receipt_id: String,
+    pub enabled: bool,
+    pub policy_version: String,
+    pub content_policy: String,
+    pub revision: i64,
+    pub recorded_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SupportDiagnosticConsentStatus {
+    pub enabled: bool,
+    pub policy_version: String,
+    pub content_policy: String,
+    pub current_receipt: Option<SupportDiagnosticConsentReceipt>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SupportDiagnosticDeleteResponse {
+    pub scope: String,
+    pub session_id: Option<String>,
+    pub scheduled_objects: usize,
+    pub server_time_ms: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudSessionSummary {
     pub session_id: String,
@@ -412,6 +458,12 @@ pub struct CloudSessionSummary {
     pub transcript_count: i64,
     pub response_count: i64,
     pub context_count: i64,
+    #[serde(default)]
+    pub rag_count: i64,
+    #[serde(default)]
+    pub child_tombstone_count: i64,
+    #[serde(default)]
+    pub child_tombstone_updated_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +478,25 @@ pub struct SessionListResponse {
     pub sessions: Vec<CloudSessionSummary>,
     #[serde(default)]
     pub deleted_sessions: Vec<CloudDeletedSession>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CloudChildTombstone {
+    /// One of `transcript`, `response`, `context`, or `rag`. Attached files
+    /// are represented by their `context` artifact record.
+    pub child_kind: String,
+    pub child_id: String,
+    pub session_id: String,
+    pub deleted_at_ms: i64,
+    /// RAG-only provenance used to remove the correct derived local memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_index: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -434,6 +505,19 @@ pub struct CloudSessionBundle {
     pub transcript_segments: Vec<SyncTranscriptSegment>,
     pub cue_responses: Vec<SyncCueResponseRecord>,
     pub context_artifacts: Vec<SyncContextArtifactRecord>,
+    /// Live session-scoped RAG records and payload-free deletion markers.
+    ///
+    /// Older servers did not include this collection, so absence must remain
+    /// equivalent to an empty collection during a rolling upgrade.
+    #[serde(default)]
+    pub rag_chunks: Vec<SyncRagChunkRecord>,
+    /// Payload-free deletion markers retained after child rows are purged.
+    ///
+    /// Older servers did not include this collection. New clients therefore
+    /// treat an absent field as empty while newer servers can safely coexist
+    /// with clients that ignore unknown response fields.
+    #[serde(default)]
+    pub child_tombstones: Vec<CloudChildTombstone>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -462,6 +546,89 @@ pub struct RagMatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RagQueryResponse {
     pub matches: Vec<RagMatch>,
+}
+
+// ─── Account deletion reconciliation ───────────────────────────────────
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountDeletionCapability {
+    pub operation_id: String,
+    pub recovery_token: String,
+}
+
+impl AccountDeletionCapability {
+    pub fn new() -> Self {
+        Self {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            recovery_token: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+impl Default for AccountDeletionCapability {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeleteAccountRequest<'a> {
+    pub confirm_text: &'static str,
+    pub accept_data_loss: bool,
+    pub accept_credit_loss: bool,
+    pub operation_id: &'a str,
+    pub recovery_token: &'a str,
+}
+
+impl<'a> DeleteAccountRequest<'a> {
+    pub fn confirmed(capability: &'a AccountDeletionCapability) -> Self {
+        Self {
+            confirm_text: "DELETE",
+            accept_data_loss: true,
+            accept_credit_loss: true,
+            operation_id: &capability.operation_id,
+            recovery_token: &capability.recovery_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountDeletionStatusRequest<'a> {
+    pub operation_id: &'a str,
+    pub recovery_token: &'a str,
+}
+
+impl<'a> From<&'a AccountDeletionCapability> for AccountDeletionStatusRequest<'a> {
+    fn from(capability: &'a AccountDeletionCapability) -> Self {
+        Self {
+            operation_id: &capability.operation_id,
+            recovery_token: &capability.recovery_token,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountDeletionAck {
+    pub deleted: bool,
+    #[serde(default)]
+    pub deleted_at: String,
+    #[serde(default)]
+    pub deletion_pending: bool,
+    #[serde(default)]
+    pub retry_after_ms: Option<i64>,
+    #[serde(default)]
+    pub object_count_deleted: usize,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AccountDeletionStatus {
+    pub deleted: bool,
+    pub deletion_pending: bool,
+    #[serde(default)]
+    pub deleted_at: String,
+    pub expires_at_ms: i64,
 }
 
 // ─── STT authorization ─────────────────────────────────────────────────
@@ -568,4 +735,44 @@ pub struct MarkupPercent {
     pub medium: u32,
     pub deep: u32,
     pub vision: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CloudSessionBundle;
+
+    #[test]
+    fn legacy_cloud_bundle_defaults_rag_and_child_tombstones() {
+        let bundle: CloudSessionBundle = serde_json::from_value(serde_json::json!({
+            "session": {
+                "session_id": "session-1",
+                "title": "Legacy bundle",
+                "status": "archived",
+                "created_at_ms": 1,
+                "updated_at_ms": 2
+            },
+            "transcript_segments": [],
+            "cue_responses": [],
+            "context_artifacts": []
+        }))
+        .expect("legacy cloud bundle remains readable");
+
+        assert!(bundle.rag_chunks.is_empty());
+        assert!(bundle.child_tombstones.is_empty());
+    }
+
+    #[test]
+    fn legacy_rag_tombstone_defaults_missing_source_provenance() {
+        let marker: super::CloudChildTombstone = serde_json::from_value(serde_json::json!({
+            "child_kind": "rag",
+            "child_id": "chunk-1",
+            "session_id": "session-1",
+            "deleted_at_ms": 2
+        }))
+        .expect("legacy RAG tombstone remains readable");
+
+        assert!(marker.source_kind.is_none());
+        assert!(marker.source_id.is_none());
+        assert!(marker.chunk_index.is_none());
+    }
 }

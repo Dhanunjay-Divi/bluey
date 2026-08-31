@@ -21,13 +21,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     api::{jobs_import, jobs_resume_generation, AppState},
     auth::AuthedAccount,
-    db::jobs::{
-        self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
-        AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
-        CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
-        JobEligibilityDecision, JobPosting, JobPreferences, JobsEntitlement, JobsIntegration,
-        JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
-        RunnerChannelAvailability,
+    db::{
+        jobs::{
+            self, normalize_candidate_employment_type, normalize_candidate_engagement_type,
+            AnswerMemory, ApplicationEvidence, ApplicationIdentity, BrowserSession, CandidateEvent,
+            CareerFact, CareerProfile, CareerTrack, Intervention, JobApplication,
+            JobEligibilityDecision, JobPosting, JobPreferences, JobsEntitlement, JobsIntegration,
+            JobsWorkspace, PacketCommitResult, ResumeVersion, RunEvent, RunnerAvailability,
+            RunnerChannelAvailability,
+        },
+        object_uploads::{self, NewObjectUpload, ObjectKind, StorageScope, UploadControlError},
+        DbPool,
     },
     object_storage::{sha256_hex, ObjectStorage},
 };
@@ -4178,6 +4182,7 @@ async fn persist_submission_receipt(
         );
     let uploaded = upload_receipt_evidence(
         &storage,
+        &state.pool,
         account_id,
         application_id,
         &mut receipt,
@@ -4192,10 +4197,17 @@ async fn persist_submission_receipt(
         &receipt,
         &uploaded.verified,
     ) {
-        cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
+        cleanup_uploaded_objects(&storage, &state.pool, account_id, &uploaded.created_keys).await;
         return Err(error);
     }
-    let provider = required_receipt_string(&receipt, "adapter")?;
+    let provider = match required_receipt_string(&receipt, "adapter") {
+        Ok(provider) => provider,
+        Err(error) => {
+            cleanup_uploaded_objects(&storage, &state.pool, account_id, &uploaded.created_keys)
+                .await;
+            return Err(error);
+        }
+    };
     let evidence = match submission_evidence_records(
         application_id,
         &receipt_id,
@@ -4211,7 +4223,8 @@ async fn persist_submission_receipt(
     ) {
         Ok(evidence) => evidence,
         Err(error) => {
-            cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
+            cleanup_uploaded_objects(&storage, &state.pool, account_id, &uploaded.created_keys)
+                .await;
             return Err(error);
         }
     };
@@ -4230,11 +4243,13 @@ async fn persist_submission_receipt(
     match finalized {
         Ok(jobs::SubmissionFinalizeResult::Committed(application)) => Ok(application),
         Ok(jobs::SubmissionFinalizeResult::Replayed(application)) => {
-            cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
+            cleanup_uploaded_objects(&storage, &state.pool, account_id, &uploaded.created_keys)
+                .await;
             Ok(application)
         }
         Err(error) => {
-            cleanup_uploaded_objects(&storage, &uploaded.created_keys).await;
+            cleanup_uploaded_objects(&storage, &state.pool, account_id, &uploaded.created_keys)
+                .await;
             Err(submission_domain_error(error))
         }
     }
@@ -4536,6 +4551,7 @@ fn valid_png(bytes: &[u8]) -> bool {
 
 async fn upload_receipt_evidence(
     storage: &ObjectStorage,
+    pool: &DbPool,
     account_id: &str,
     application_id: &str,
     receipt: &mut Value,
@@ -4551,31 +4567,70 @@ async fn upload_receipt_evidence(
             &object.sha256[..20]
         );
         let storage_key = storage.artifact_key(account_id, &artifact_id);
-        if let Err(error) = storage
+        let reservation = match object_uploads::reserve_account_object_put(
+            pool,
+            &NewObjectUpload {
+                account_id: account_id.to_string(),
+                object_kind: ObjectKind::Artifact,
+                logical_id: artifact_id,
+                session_id: None,
+                storage_scope: StorageScope::Artifact,
+                object_key: storage_key.clone(),
+                size_bytes: i64::try_from(object.bytes.len()).unwrap_or(i64::MAX),
+                sha256: object.sha256.clone(),
+                content_type: object.media_type.to_string(),
+                expires_at_ms: i64::MAX,
+                metadata_json: json!({"source": "jobs_submission_receipt"}),
+                now_ms: jobs::now_ms(),
+                limits: storage.upload_limits(),
+            },
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                cleanup_uploaded_objects(storage, pool, account_id, &created_keys).await;
+                return Err(receipt_object_upload_error(error));
+            }
+        };
+        created_keys.push(storage_key.clone());
+        if storage
             .put(
                 &storage_key,
                 bytes::Bytes::from(object.bytes),
                 object.media_type,
             )
             .await
+            .is_err()
         {
-            cleanup_uploaded_objects(storage, &created_keys).await;
-            return Err(evidence_storage_error(error));
+            let _ = object_uploads::record_put_failure(
+                pool,
+                &reservation.upload.id,
+                "receipt object PUT failed",
+                jobs::now_ms(),
+            );
+            cleanup_uploaded_objects(storage, pool, account_id, &created_keys).await;
+            return Err(evidence_storage_error());
         }
-        created_keys.push(storage_key.clone());
         let stored = match storage.get(&storage_key).await {
             Ok(stored) => stored,
-            Err(error) => {
-                cleanup_uploaded_objects(storage, &created_keys).await;
-                return Err(evidence_storage_error(error));
+            Err(_) => {
+                cleanup_uploaded_objects(storage, pool, account_id, &created_keys).await;
+                return Err(evidence_storage_error());
             }
         };
         if sha256_hex(&stored.bytes) != object.sha256 {
-            cleanup_uploaded_objects(storage, &created_keys).await;
+            cleanup_uploaded_objects(storage, pool, account_id, &created_keys).await;
             return Err((
                 StatusCode::BAD_GATEWAY,
                 "Stored application evidence failed checksum verification.".to_string(),
             ));
+        }
+        if let Err(error) = object_uploads::finalize_account_object_put(
+            pool,
+            &reservation.upload.id,
+            jobs::now_ms(),
+        ) {
+            cleanup_uploaded_objects(storage, pool, account_id, &created_keys).await;
+            return Err(receipt_object_upload_error(error));
         }
         replace_receipt_storage_key(receipt, &object.original_key, &storage_key);
         verified.insert(storage_key, object.sha256);
@@ -4589,18 +4644,50 @@ async fn upload_receipt_evidence(
     })
 }
 
-async fn cleanup_uploaded_objects(storage: &ObjectStorage, created_keys: &[String]) {
+async fn cleanup_uploaded_objects(
+    storage: &ObjectStorage,
+    pool: &DbPool,
+    account_id: &str,
+    created_keys: &[String],
+) {
     for key in created_keys.iter().rev() {
-        let _ = storage.delete(key).await;
+        let now_ms = jobs::now_ms();
+        if storage.delete(key).await.is_ok() {
+            if object_uploads::confirm_account_object_deleted(pool, account_id, key, now_ms)
+                .is_err()
+            {
+                tracing::warn!(
+                    error_category = "receipt_cleanup_commit",
+                    "failed to commit application evidence cleanup"
+                );
+            }
+        } else if object_uploads::schedule_account_object_cleanup(pool, account_id, key, now_ms)
+            .is_err()
+        {
+            tracing::warn!(
+                error_category = "receipt_cleanup_schedule",
+                "failed to schedule application evidence cleanup"
+            );
+        }
     }
 }
 
-fn evidence_storage_error(_error: anyhow::Error) -> ApiError {
+fn evidence_storage_error() -> ApiError {
     tracing::error!("Bluey Jobs evidence storage request failed");
     (
         StatusCode::BAD_GATEWAY,
         "Bluey Jobs could not store submission evidence. Please try again.".to_string(),
     )
+}
+
+fn receipt_object_upload_error(error: anyhow::Error) -> ApiError {
+    if error.downcast_ref::<UploadControlError>() == Some(&UploadControlError::UploadGone) {
+        return (
+            StatusCode::GONE,
+            "This account is being deleted, so Bluey did not retain the evidence.".to_string(),
+        );
+    }
+    evidence_storage_error()
 }
 
 fn replace_receipt_storage_key(receipt: &mut Value, original_key: &str, storage_key: &str) {

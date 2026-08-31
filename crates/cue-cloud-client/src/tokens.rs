@@ -20,11 +20,136 @@ const KEY_EMAIL: &str = "account_email";
 const DEFAULT_BLUEY_API_URL: &str = "https://bluey.sh";
 const ACCOUNT_WRITE_MAX_ATTEMPTS: usize = 8;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Tokens {
     pub access: String,
     pub refresh: String,
     pub email: String,
+}
+
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Tokens")
+            .field("access", &"<redacted>")
+            .field("refresh", &"<redacted>")
+            .field("email", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Non-secret identity and profile metadata for one exact credential snapshot.
+///
+/// Tokens and token-derived fingerprints are intentionally excluded. Callers
+/// may use this value in in-process authority events, but must not log the
+/// account owner or device identifier.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialAuthority {
+    owner_account_id: String,
+    credential_generation: u64,
+    api_url: String,
+    device_id: Option<String>,
+}
+
+impl CredentialAuthority {
+    pub fn owner_account_id(&self) -> &str {
+        &self.owner_account_id
+    }
+
+    pub fn credential_generation(&self) -> u64 {
+        self.credential_generation
+    }
+
+    pub fn api_url(&self) -> &str {
+        &self.api_url
+    }
+
+    pub fn device_id(&self) -> Option<&str> {
+        self.device_id.as_deref()
+    }
+
+    pub(crate) fn same_profile_scope(&self, other: &Self) -> bool {
+        self.owner_account_id == other.owner_account_id
+            && normalize_api_url(&self.api_url) == normalize_api_url(&other.api_url)
+            && self.device_id == other.device_id
+    }
+}
+
+impl std::fmt::Debug for CredentialAuthority {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialAuthority")
+            .field("owner_account_id", &"<redacted>")
+            .field("credential_generation", &self.credential_generation)
+            .field("api_url", &"<redacted>")
+            .field("device_id", &self.device_id.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// One exact credential snapshot captured atomically by a token store.
+///
+/// The secret token pair is private and the custom Debug implementation never
+/// exposes it. `CloudClient` uses the exact pair only for compare-and-clear and
+/// compare-and-swap operations.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CredentialSnapshot {
+    authority: CredentialAuthority,
+    tokens: Tokens,
+}
+
+impl CredentialSnapshot {
+    pub fn authority(&self) -> &CredentialAuthority {
+        &self.authority
+    }
+
+    pub(crate) fn tokens(&self) -> &Tokens {
+        &self.tokens
+    }
+
+    fn generic(tokens: Tokens, credential_generation: u64) -> Result<Self> {
+        validate_tokens(&tokens)?;
+        Ok(Self {
+            authority: CredentialAuthority {
+                owner_account_id: tokens.email.trim().to_string(),
+                credential_generation,
+                api_url: String::new(),
+                device_id: None,
+            },
+            tokens,
+        })
+    }
+
+    fn from_account(account: &cue_core::AccountConfig, tokens: Tokens) -> Result<Self> {
+        validate_profile_tokens(account, &tokens)?;
+        let owner_account_id = account
+            .owner_account_id_with_token_state(true)
+            .ok_or_else(|| {
+                Error::TokenStore(
+                    "signed-in account profile has no stable owner identity".to_string(),
+                )
+            })?
+            .to_string();
+        Ok(Self {
+            authority: CredentialAuthority {
+                owner_account_id,
+                credential_generation: account.credential_generation,
+                api_url: account.api_url.trim().to_string(),
+                device_id: normalized_device_id(&account.device_id),
+            },
+            tokens,
+        })
+    }
+}
+
+impl std::fmt::Debug for CredentialSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialSnapshot")
+            .field("authority", &self.authority)
+            .field("tokens", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Trait so tests can inject an in-memory store; production uses the
@@ -32,11 +157,37 @@ pub struct Tokens {
 pub trait TokenStore: Send + Sync {
     fn save(&self, tokens: &Tokens) -> Result<()>;
     fn load(&self) -> Result<Option<Tokens>>;
+
+    /// Load credentials and their non-secret profile authority as one store
+    /// snapshot. Profile-backed stores override this method so owner,
+    /// generation, API origin, and device are captured from the same record.
+    fn load_snapshot(&self) -> Result<Option<CredentialSnapshot>> {
+        self.load()?
+            .map(|tokens| CredentialSnapshot::generic(tokens, 0))
+            .transpose()
+    }
+
+    /// Force-clear credentials for an explicit user-authorized logout or
+    /// account replacement. Background work must use `clear_if_current`.
     fn clear(&self) -> Result<()>;
+
+    /// Clear only when the persistent store still contains the exact
+    /// credential and profile snapshot the caller captured. Returns false
+    /// after account replacement, same-account refresh, or a profile/device
+    /// generation change.
+    fn clear_if_current(&self, expected: &CredentialSnapshot) -> Result<bool>;
 
     /// Replace the exact credential snapshot a refresh started with. Returns
     /// false when logout, login, or another refresh changed that snapshot.
     fn compare_and_swap(&self, expected: &Tokens, replacement: &Tokens) -> Result<bool>;
+
+    /// Authority-safe refresh boundary for background clients. Token-only
+    /// compare-and-swap remains for explicit compatibility callers.
+    fn compare_and_swap_snapshot(
+        &self,
+        expected: &CredentialSnapshot,
+        replacement: &Tokens,
+    ) -> Result<bool>;
 }
 
 /// Account-config-backed store for terminal installs where the OS keychain can
@@ -120,6 +271,16 @@ impl TokenStore for AccountFileStore {
         Ok(Some(tokens))
     }
 
+    fn load_snapshot(&self) -> Result<Option<CredentialSnapshot>> {
+        let Some(account) = self.load_account()? else {
+            return Ok(None);
+        };
+        let Some(tokens) = tokens_from_account(&account) else {
+            return Ok(None);
+        };
+        CredentialSnapshot::from_account(&account, tokens).map(Some)
+    }
+
     fn clear(&self) -> Result<()> {
         for _ in 0..ACCOUNT_WRITE_MAX_ATTEMPTS {
             let Some(mut account) = self.load_account()? else {
@@ -130,6 +291,27 @@ impl TokenStore for AccountFileStore {
             account.refresh_token = None;
             if self.save_account_if_generation(expected_generation, &account)? {
                 return Ok(());
+            }
+        }
+        Err(account_write_contention_error())
+    }
+
+    fn clear_if_current(&self, expected: &CredentialSnapshot) -> Result<bool> {
+        for _ in 0..ACCOUNT_WRITE_MAX_ATTEMPTS {
+            let Some(mut account) = self.load_account()? else {
+                return Ok(false);
+            };
+            let Some(tokens) = tokens_from_account(&account) else {
+                return Ok(false);
+            };
+            if CredentialSnapshot::from_account(&account, tokens)? != *expected {
+                return Ok(false);
+            }
+            let expected_generation = account.credential_generation;
+            account.access_token = None;
+            account.refresh_token = None;
+            if self.save_account_if_generation(expected_generation, &account)? {
+                return Ok(true);
             }
         }
         Err(account_write_contention_error())
@@ -153,6 +335,31 @@ impl TokenStore for AccountFileStore {
         }
         let replacement_account = account_for_tokens(Some(account), replacement);
         self.save_account_if_generation(expected_generation, &replacement_account)
+    }
+
+    fn compare_and_swap_snapshot(
+        &self,
+        expected: &CredentialSnapshot,
+        replacement: &Tokens,
+    ) -> Result<bool> {
+        validate_tokens(replacement)?;
+        if expected.tokens.email.trim() != replacement.email.trim() {
+            return Err(Error::TokenStore(
+                "refusing to refresh credentials into a different account identity".to_string(),
+            ));
+        }
+        let Some(account) = self.load_account()? else {
+            return Ok(false);
+        };
+        let Some(tokens) = tokens_from_account(&account) else {
+            return Ok(false);
+        };
+        if CredentialSnapshot::from_account(&account, tokens)? != *expected {
+            return Ok(false);
+        }
+        let generation = account.credential_generation;
+        let replacement_account = account_for_tokens(Some(account), replacement);
+        self.save_account_if_generation(generation, &replacement_account)
     }
 }
 
@@ -198,15 +405,19 @@ impl TokenStore for SecureAccountStore {
     }
 
     fn load(&self) -> Result<Option<Tokens>> {
+        Ok(self.load_snapshot()?.map(|snapshot| snapshot.tokens))
+    }
+
+    fn load_snapshot(&self) -> Result<Option<CredentialSnapshot>> {
         if !os_secure_store_enabled() || plaintext_token_fallback_enabled() {
-            if let Some(tokens) = self.account_file.load()? {
-                return Ok(Some(tokens));
+            if let Some(snapshot) = self.account_file.load_snapshot()? {
+                return Ok(Some(snapshot));
             }
             if legacy_keyring_fallback_enabled() {
                 match self.keyring.load() {
                     Ok(Some(tokens)) => {
                         self.account_file.save(&tokens)?;
-                        return Ok(Some(tokens));
+                        return self.account_file.load_snapshot();
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -223,27 +434,41 @@ impl TokenStore for SecureAccountStore {
         let profile = self.account_file.load_account()?;
         let keyring_error = match self.keyring.load() {
             Ok(Some(tokens)) => {
-                if let Some(profile) = profile.as_ref() {
-                    validate_profile_tokens(profile, &tokens)?;
+                let profile = if let Some(profile) = profile {
+                    profile
                 } else {
                     self.account_file.save_profile_without_tokens(&tokens)?;
-                }
-                return Ok(Some(tokens));
+                    self.account_file.load_account()?.ok_or_else(|| {
+                        Error::TokenStore(
+                            "secure account profile disappeared during migration".to_string(),
+                        )
+                    })?
+                };
+                return CredentialSnapshot::from_account(&profile, tokens).map(Some);
             }
             Ok(None) => None,
             Err(error) => Some(error),
         };
 
-        let Some(tokens) = self.account_file.load()? else {
+        let Some(file_snapshot) = self.account_file.load_snapshot()? else {
             if let Some(error) = keyring_error {
                 tracing::debug!(error = %error, "secure token storage unavailable and no legacy account-file tokens exist");
             }
             return Ok(None);
         };
+        let tokens = file_snapshot.tokens.clone();
         match self.keyring.save(&tokens) {
             Ok(()) => {
-                self.account_file.clear()?;
-                Ok(Some(tokens))
+                if !self.account_file.clear_if_current(&file_snapshot)? {
+                    let _ = self.keyring.clear_tokens_if_current(&tokens);
+                    return Ok(None);
+                }
+                let profile = self.account_file.load_account()?.ok_or_else(|| {
+                    Error::TokenStore(
+                        "account profile disappeared during secure-store migration".to_string(),
+                    )
+                })?;
+                CredentialSnapshot::from_account(&profile, tokens).map(Some)
             }
             Err(error) => Err(Error::TokenStore(format!(
                 "found legacy plaintext account tokens but could not migrate them to secure storage: {error}"
@@ -257,6 +482,37 @@ impl TokenStore for SecureAccountStore {
             return self.keyring.clear().and(file_result);
         }
         file_result
+    }
+
+    fn clear_if_current(&self, expected: &CredentialSnapshot) -> Result<bool> {
+        if !os_secure_store_enabled() || plaintext_token_fallback_enabled() {
+            return self.account_file.clear_if_current(expected);
+        }
+
+        if self.load_snapshot()?.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        let Some(profile_before) = self.account_file.load_account()? else {
+            return Ok(false);
+        };
+        let expected_generation = profile_before.credential_generation;
+        if !self.keyring.clear_tokens_if_current(expected.tokens())? {
+            return Ok(false);
+        }
+
+        let Some(mut profile_after) = self.account_file.load_account()? else {
+            return Ok(false);
+        };
+        if profile_after.credential_generation != expected_generation
+            || profile_after.owner_account_id_with_token_state(true)
+                != profile_before.owner_account_id_with_token_state(true)
+        {
+            return Ok(false);
+        }
+        profile_after.access_token = None;
+        profile_after.refresh_token = None;
+        self.account_file
+            .save_account_if_generation(expected_generation, &profile_after)
     }
 
     fn compare_and_swap(&self, expected: &Tokens, replacement: &Tokens) -> Result<bool> {
@@ -274,16 +530,79 @@ impl TokenStore for SecureAccountStore {
         }
 
         let Some(profile_after) = self.account_file.load_account()? else {
-            self.keyring.clear_if_current(replacement)?;
+            let _ = self.keyring.compare_and_swap(replacement, expected);
             return Ok(false);
         };
         let unchanged = profile_after.credential_generation == generation
             && profile_after.owner_account_id_with_token_state(true)
                 == profile_before.owner_account_id_with_token_state(true);
         if !unchanged {
-            self.keyring.clear_if_current(replacement)?;
+            let _ = self.keyring.compare_and_swap(replacement, expected);
+            return Ok(false);
         }
-        Ok(unchanged)
+        if !self
+            .account_file
+            .save_account_if_generation(generation, &profile_after)?
+        {
+            let _ = self.keyring.compare_and_swap(replacement, expected);
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn compare_and_swap_snapshot(
+        &self,
+        expected: &CredentialSnapshot,
+        replacement: &Tokens,
+    ) -> Result<bool> {
+        if !os_secure_store_enabled() || plaintext_token_fallback_enabled() {
+            return self
+                .account_file
+                .compare_and_swap_snapshot(expected, replacement);
+        }
+        validate_tokens(replacement)?;
+        if expected.tokens.email.trim() != replacement.email.trim() {
+            return Err(Error::TokenStore(
+                "refusing to refresh credentials into a different account identity".to_string(),
+            ));
+        }
+        if self.load_snapshot()?.as_ref() != Some(expected) {
+            return Ok(false);
+        }
+        let Some(profile_before) = self.account_file.load_account()? else {
+            return Ok(false);
+        };
+        let generation = profile_before.credential_generation;
+        if !self
+            .keyring
+            .compare_and_swap(expected.tokens(), replacement)?
+        {
+            return Ok(false);
+        }
+        let Some(profile_after) = self.account_file.load_account()? else {
+            let _ = self
+                .keyring
+                .compare_and_swap(replacement, expected.tokens());
+            return Ok(false);
+        };
+        let profile_authority =
+            CredentialSnapshot::from_account(&profile_after, expected.tokens().clone())?;
+        if profile_authority.authority != expected.authority {
+            let _ = self
+                .keyring
+                .compare_and_swap(replacement, expected.tokens());
+            return Ok(false);
+        }
+        if !self
+            .account_file
+            .save_account_if_generation(generation, &profile_after)?
+        {
+            let _ = self
+                .keyring
+                .compare_and_swap(replacement, expected.tokens());
+            return Ok(false);
+        }
+        Ok(true)
     }
 }
 
@@ -309,6 +628,21 @@ pub fn save_account_profile_and_tokens(
     paths: &cue_core::app_paths::AppPaths,
     account: &cue_core::AccountConfig,
 ) -> Result<()> {
+    // The normal customer configuration keeps tokens in the owner-only account
+    // profile. Publish an explicitly-authorized replacement in one atomic
+    // generation write; a clear -> profile -> token sequence would expose
+    // signed-out/intermediate identities to concurrent daemon work.
+    if !os_secure_store_enabled() || plaintext_token_fallback_enabled() {
+        if let Some(tokens) = tokens_from_account(account) {
+            validate_profile_tokens(account, &tokens)?;
+        }
+        return cue_core::save_account(paths, account)
+            .map_err(|error| Error::TokenStore(error.to_string()));
+    }
+
+    // Opt-in OS credential storage spans two persistence systems. Clear first
+    // and fail closed if either publication step fails; this path is never
+    // entered by default and does not add a new credential-store prompt.
     let store = SecureAccountStore::new(paths.clone());
     store.clear()?;
     save_account_profile_without_tokens(paths, account)?;
@@ -316,6 +650,25 @@ pub fn save_account_profile_and_tokens(
         store.save(&tokens)?;
     }
     Ok(())
+}
+
+/// Atomically install a linked account only when the local account profile is
+/// still the exact generation observed after daemon sign-out. This is the
+/// deep-link account-switch commit boundary: another CLI/daemon login wins
+/// instead of being overwritten by a stale browser response.
+pub fn save_account_profile_and_tokens_if_generation(
+    paths: &cue_core::app_paths::AppPaths,
+    expected_generation: u64,
+    account: &cue_core::AccountConfig,
+) -> Result<bool> {
+    if os_secure_store_enabled() && !plaintext_token_fallback_enabled() {
+        return Err(Error::TokenStore(
+            "atomic account replacement is unavailable with the opt-in OS credential store"
+                .to_string(),
+        ));
+    }
+    cue_core::config::save_account_if_generation(paths, expected_generation, account)
+        .map_err(|error| Error::TokenStore(error.to_string()))
 }
 
 pub fn owner_account_id(paths: &cue_core::app_paths::AppPaths) -> Result<Option<String>> {
@@ -458,6 +811,15 @@ fn account_write_contention_error() -> Error {
     )
 }
 
+fn normalized_device_id(device_id: &str) -> Option<String> {
+    let device_id = device_id.trim();
+    (!device_id.is_empty() && device_id != "local-device").then(|| device_id.to_string())
+}
+
+fn normalize_api_url(api_url: &str) -> String {
+    api_url.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
 #[cfg(test)]
 fn plaintext_token_fallback_enabled() -> bool {
     true
@@ -488,6 +850,7 @@ fn default_account_api_url() -> String {
 #[derive(Default)]
 pub struct KeyringStore {
     operation_lock_path: Option<PathBuf>,
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl KeyringStore {
@@ -498,6 +861,7 @@ impl KeyringStore {
     fn with_account_file(account_file: &Path) -> Self {
         Self {
             operation_lock_path: Some(keyring_lock_path(account_file)),
+            generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -560,7 +924,7 @@ impl KeyringStore {
         }
     }
 
-    fn clear_if_current(&self, expected: &Tokens) -> Result<bool> {
+    fn clear_tokens_if_current(&self, expected: &Tokens) -> Result<bool> {
         let _guard = self.operation_lock()?;
         if Self::load_unlocked()?.as_ref() != Some(expected) {
             return Ok(false);
@@ -644,7 +1008,10 @@ fn keyring_lock_path(account_file: &Path) -> PathBuf {
 impl TokenStore for KeyringStore {
     fn save(&self, tokens: &Tokens) -> Result<()> {
         let _guard = self.operation_lock()?;
-        Self::save_unlocked(tokens)
+        Self::save_unlocked(tokens)?;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
     }
 
     fn load(&self) -> Result<Option<Tokens>> {
@@ -652,9 +1019,35 @@ impl TokenStore for KeyringStore {
         Self::load_unlocked()
     }
 
+    fn load_snapshot(&self) -> Result<Option<CredentialSnapshot>> {
+        let _guard = self.operation_lock()?;
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        Self::load_unlocked()?
+            .map(|tokens| CredentialSnapshot::generic(tokens, generation))
+            .transpose()
+    }
+
     fn clear(&self) -> Result<()> {
         let _guard = self.operation_lock()?;
-        Self::clear_unlocked()
+        Self::clear_unlocked()?;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn clear_if_current(&self, expected: &CredentialSnapshot) -> Result<bool> {
+        let _guard = self.operation_lock()?;
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let Some(tokens) = Self::load_unlocked()? else {
+            return Ok(false);
+        };
+        if CredentialSnapshot::generic(tokens, generation)? != *expected {
+            return Ok(false);
+        }
+        Self::clear_unlocked()?;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(true)
     }
 
     fn compare_and_swap(&self, expected: &Tokens, replacement: &Tokens) -> Result<bool> {
@@ -670,6 +1063,33 @@ impl TokenStore for KeyringStore {
             return Ok(false);
         }
         Self::save_unlocked(replacement)?;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(true)
+    }
+
+    fn compare_and_swap_snapshot(
+        &self,
+        expected: &CredentialSnapshot,
+        replacement: &Tokens,
+    ) -> Result<bool> {
+        validate_tokens(replacement)?;
+        if expected.tokens.email.trim() != replacement.email.trim() {
+            return Err(Error::TokenStore(
+                "refusing to refresh credentials into a different account identity".to_string(),
+            ));
+        }
+        let _guard = self.operation_lock()?;
+        let generation = self.generation.load(std::sync::atomic::Ordering::Acquire);
+        let Some(tokens) = Self::load_unlocked()? else {
+            return Ok(false);
+        };
+        if CredentialSnapshot::generic(tokens, generation)? != *expected {
+            return Ok(false);
+        }
+        Self::save_unlocked(replacement)?;
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(true)
     }
 }
@@ -677,7 +1097,13 @@ impl TokenStore for KeyringStore {
 /// In-memory implementation for tests + headless CI.
 #[derive(Default)]
 pub struct MemoryStore {
-    inner: std::sync::Mutex<Option<Tokens>>,
+    inner: std::sync::Mutex<MemoryCredentials>,
+}
+
+#[derive(Default)]
+struct MemoryCredentials {
+    generation: u64,
+    tokens: Option<Tokens>,
 }
 
 impl MemoryStore {
@@ -689,15 +1115,42 @@ impl MemoryStore {
 impl TokenStore for MemoryStore {
     fn save(&self, tokens: &Tokens) -> Result<()> {
         validate_tokens(tokens)?;
-        *self.inner.lock().unwrap() = Some(tokens.clone());
+        let mut current = self.inner.lock().unwrap();
+        current.generation = current.generation.wrapping_add(1);
+        current.tokens = Some(tokens.clone());
         Ok(())
     }
     fn load(&self) -> Result<Option<Tokens>> {
-        Ok(self.inner.lock().unwrap().clone())
+        Ok(self.inner.lock().unwrap().tokens.clone())
     }
+
+    fn load_snapshot(&self) -> Result<Option<CredentialSnapshot>> {
+        let current = self.inner.lock().unwrap();
+        current
+            .tokens
+            .clone()
+            .map(|tokens| CredentialSnapshot::generic(tokens, current.generation))
+            .transpose()
+    }
+
     fn clear(&self) -> Result<()> {
-        *self.inner.lock().unwrap() = None;
+        let mut current = self.inner.lock().unwrap();
+        current.generation = current.generation.wrapping_add(1);
+        current.tokens = None;
         Ok(())
+    }
+
+    fn clear_if_current(&self, expected: &CredentialSnapshot) -> Result<bool> {
+        let mut current = self.inner.lock().unwrap();
+        let Some(tokens) = current.tokens.clone() else {
+            return Ok(false);
+        };
+        if CredentialSnapshot::generic(tokens, current.generation)? != *expected {
+            return Ok(false);
+        }
+        current.generation = current.generation.wrapping_add(1);
+        current.tokens = None;
+        Ok(true)
     }
 
     fn compare_and_swap(&self, expected: &Tokens, replacement: &Tokens) -> Result<bool> {
@@ -709,10 +1162,34 @@ impl TokenStore for MemoryStore {
             ));
         }
         let mut current = self.inner.lock().unwrap();
-        if current.as_ref() != Some(expected) {
+        if current.tokens.as_ref() != Some(expected) {
             return Ok(false);
         }
-        *current = Some(replacement.clone());
+        current.generation = current.generation.wrapping_add(1);
+        current.tokens = Some(replacement.clone());
+        Ok(true)
+    }
+
+    fn compare_and_swap_snapshot(
+        &self,
+        expected: &CredentialSnapshot,
+        replacement: &Tokens,
+    ) -> Result<bool> {
+        validate_tokens(replacement)?;
+        if expected.tokens.email.trim() != replacement.email.trim() {
+            return Err(Error::TokenStore(
+                "refusing to refresh credentials into a different account identity".to_string(),
+            ));
+        }
+        let mut current = self.inner.lock().unwrap();
+        let Some(tokens) = current.tokens.clone() else {
+            return Ok(false);
+        };
+        if CredentialSnapshot::generic(tokens, current.generation)? != *expected {
+            return Ok(false);
+        }
+        current.generation = current.generation.wrapping_add(1);
+        current.tokens = Some(replacement.clone());
         Ok(true)
     }
 }
@@ -755,6 +1232,186 @@ mod tests {
         assert_eq!(loaded.email, "e@example.com");
         store.clear().unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn memory_store_conditional_clear_never_removes_replacement_or_refresh() {
+        let store = MemoryStore::new();
+        let account_a1 = Tokens {
+            access: "access-a1".into(),
+            refresh: "refresh-a1".into(),
+            email: "a@example.com".into(),
+        };
+        let account_a2 = Tokens {
+            access: "access-a2".into(),
+            refresh: "refresh-a2".into(),
+            email: "a@example.com".into(),
+        };
+        let account_b = Tokens {
+            access: "access-b".into(),
+            refresh: "refresh-b".into(),
+            email: "b@example.com".into(),
+        };
+
+        store.save(&account_a1).unwrap();
+        let snapshot_a1 = store.load_snapshot().unwrap().unwrap();
+        store.save(&account_a2).unwrap();
+        let snapshot_a2 = store.load_snapshot().unwrap().unwrap();
+        assert!(!store.clear_if_current(&snapshot_a1).unwrap());
+        assert_eq!(store.load().unwrap(), Some(account_a2.clone()));
+
+        store.save(&account_b).unwrap();
+        let snapshot_b = store.load_snapshot().unwrap().unwrap();
+        assert!(!store.clear_if_current(&snapshot_a2).unwrap());
+        assert_eq!(store.load().unwrap(), Some(account_b.clone()));
+        assert!(store.clear_if_current(&snapshot_b).unwrap());
+        assert_eq!(store.load().unwrap(), None);
+    }
+
+    #[test]
+    fn account_file_conditional_clear_is_exact_across_account_and_refresh_changes() {
+        let paths = test_paths("account-file-conditional-clear");
+        let store = AccountFileStore::new(paths.clone());
+        let account_a1 = Tokens {
+            access: "access-a1".into(),
+            refresh: "refresh-a1".into(),
+            email: "a@example.com".into(),
+        };
+        let account_a2 = Tokens {
+            access: "access-a2".into(),
+            refresh: "refresh-a2".into(),
+            email: "a@example.com".into(),
+        };
+        let account_b = Tokens {
+            access: "access-b".into(),
+            refresh: "refresh-b".into(),
+            email: "b@example.com".into(),
+        };
+
+        store.save(&account_a1).unwrap();
+        let first = store.load_snapshot().unwrap().unwrap();
+        assert_eq!(first.authority().owner_account_id(), "a@example.com");
+        store.save(&account_a2).unwrap();
+        let refreshed = store.load_snapshot().unwrap().unwrap();
+        assert!(
+            refreshed.authority().credential_generation()
+                > first.authority().credential_generation()
+        );
+        assert!(!store.clear_if_current(&first).unwrap());
+        assert_eq!(store.load().unwrap(), Some(account_a2.clone()));
+
+        store.save(&account_b).unwrap();
+        let snapshot_b = store.load_snapshot().unwrap().unwrap();
+        assert!(!store.clear_if_current(&refreshed).unwrap());
+        assert_eq!(store.load().unwrap(), Some(account_b.clone()));
+        assert!(store.clear_if_current(&snapshot_b).unwrap());
+        assert_eq!(store.load().unwrap(), None);
+        let _ = std::fs::remove_dir_all(paths.config_dir);
+    }
+
+    #[test]
+    fn same_tokens_cannot_cross_a_profile_device_generation_change() {
+        let paths = test_paths("same-token-profile-change");
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.api_url = "https://bluey.sh".to_string();
+        account.cloud_account_id = Some("account-a".to_string());
+        account.user_id = "a@example.com".to_string();
+        account.device_id = "device-a".to_string();
+        account.access_token = Some("access-a".to_string());
+        account.refresh_token = Some("refresh-a".to_string());
+        cue_core::save_account(&paths, &account).unwrap();
+
+        let store = AccountFileStore::new(paths.clone());
+        let stale = store.load_snapshot().unwrap().unwrap();
+        let mut changed = cue_core::load_account(&paths).unwrap().unwrap();
+        changed.device_id = "device-b".to_string();
+        cue_core::save_account(&paths, &changed).unwrap();
+
+        assert!(!store.clear_if_current(&stale).unwrap());
+        assert!(!store
+            .compare_and_swap_snapshot(
+                &stale,
+                &Tokens {
+                    access: "late-access".to_string(),
+                    refresh: "late-refresh".to_string(),
+                    email: "a@example.com".to_string(),
+                },
+            )
+            .unwrap());
+        let current = store.load_snapshot().unwrap().unwrap();
+        assert_eq!(current.authority().device_id(), Some("device-b"));
+        assert_eq!(current.tokens().access, "access-a");
+        let _ = std::fs::remove_dir_all(paths.config_dir);
+    }
+
+    #[test]
+    fn secure_account_store_conditional_clear_uses_default_account_authority() {
+        let paths = test_paths("secure-conditional-clear");
+        let store = SecureAccountStore::new(paths.clone());
+        let account_a1 = Tokens {
+            access: "access-a1".into(),
+            refresh: "refresh-a1".into(),
+            email: "a@example.com".into(),
+        };
+        let account_a2 = Tokens {
+            access: "access-a2".into(),
+            refresh: "refresh-a2".into(),
+            email: "a@example.com".into(),
+        };
+        let account_b = Tokens {
+            access: "access-b".into(),
+            refresh: "refresh-b".into(),
+            email: "b@example.com".into(),
+        };
+
+        store.save(&account_a1).unwrap();
+        let snapshot_a1 = store.load_snapshot().unwrap().unwrap();
+        store.save(&account_a2).unwrap();
+        let snapshot_a2 = store.load_snapshot().unwrap().unwrap();
+        assert!(!store.clear_if_current(&snapshot_a1).unwrap());
+        store.save(&account_b).unwrap();
+        let snapshot_b = store.load_snapshot().unwrap().unwrap();
+        assert!(!store.clear_if_current(&snapshot_a2).unwrap());
+        assert_eq!(store.load().unwrap(), Some(account_b.clone()));
+        assert!(store.clear_if_current(&snapshot_b).unwrap());
+        assert_eq!(store.load().unwrap(), None);
+        let _ = std::fs::remove_dir_all(paths.config_dir);
+    }
+
+    #[test]
+    fn default_account_profile_replacement_is_one_atomic_generation_write() {
+        let paths = test_paths("atomic-profile-and-token-save");
+        let mut account = cue_core::AccountConfig::local();
+        account.provider = "bluey".to_string();
+        account.api_url = "https://bluey.sh".to_string();
+        account.cloud_account_id = Some("account-a".to_string());
+        account.user_id = "a@example.com".to_string();
+        account.device_id = "device-a".to_string();
+        account.access_token = Some("access-a".to_string());
+        account.refresh_token = Some("refresh-a".to_string());
+
+        save_account_profile_and_tokens(&paths, &account).unwrap();
+        let stored = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(stored.credential_generation, 1);
+        assert_eq!(stored.cloud_account_id.as_deref(), Some("account-a"));
+        assert_eq!(stored.access_token.as_deref(), Some("access-a"));
+        assert_eq!(stored.refresh_token.as_deref(), Some("refresh-a"));
+        let _ = std::fs::remove_dir_all(paths.config_dir);
+    }
+
+    #[test]
+    fn credential_debug_output_never_contains_identity_or_tokens() {
+        let tokens = Tokens {
+            access: "secret-access".into(),
+            refresh: "secret-refresh".into(),
+            email: "private@example.com".into(),
+        };
+        let snapshot = CredentialSnapshot::generic(tokens.clone(), 7).unwrap();
+        let debug = format!("{tokens:?} {snapshot:?}");
+        for secret in ["secret-access", "secret-refresh", "private@example.com"] {
+            assert!(!debug.contains(secret));
+        }
     }
 
     #[test]
@@ -861,6 +1518,42 @@ mod tests {
             owner_account_id(&paths).unwrap().as_deref(),
             Some("b@example.com")
         );
+        let _ = std::fs::remove_dir_all(paths.config_dir);
+    }
+
+    #[test]
+    fn atomic_link_commit_never_overwrites_a_newer_external_login() {
+        let paths = test_paths("atomic-link-account-switch");
+        cue_core::save_account(&paths, &cue_core::AccountConfig::local()).unwrap();
+        let signed_out_generation = cue_core::load_account(&paths)
+            .unwrap()
+            .unwrap()
+            .credential_generation;
+
+        let mut account_b = cue_core::AccountConfig::local();
+        account_b.provider = "bluey".to_string();
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        cue_core::save_account(&paths, &account_b).unwrap();
+
+        let mut stale_account_a = account_b.clone();
+        stale_account_a.cloud_account_id = Some("account-a".to_string());
+        stale_account_a.user_id = "a@example.com".to_string();
+        stale_account_a.access_token = Some("access-a".to_string());
+        stale_account_a.refresh_token = Some("refresh-a".to_string());
+        assert!(!save_account_profile_and_tokens_if_generation(
+            &paths,
+            signed_out_generation,
+            &stale_account_a,
+        )
+        .unwrap());
+
+        let current = cue_core::load_account(&paths).unwrap().unwrap();
+        assert_eq!(current.cloud_account_id.as_deref(), Some("account-b"));
+        assert_eq!(current.user_id, "b@example.com");
+        assert_eq!(current.access_token.as_deref(), Some("access-b"));
         let _ = std::fs::remove_dir_all(paths.config_dir);
     }
 

@@ -12,7 +12,7 @@ bluey.sh, www.bluey.sh {
     @bluey_ai_crawler header_regexp User-Agent (?i)(GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-User|Claude-SearchBot|anthropic-ai|PerplexityBot|Perplexity-User|Google-Extended|CCBot|Bytespider|Applebot-Extended|meta-externalagent|Amazonbot)
     @bluey_scrape_canary path /.well-known/bluey-integrity-{$BLUEY_SCRAPE_CANARY_TOKEN:disabled}
     @bluey_jobs_api path /api/jobs/*
-    @bluey_api path /health /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete
+    @bluey_api path /health /auth/* /billing/* /pricing/* /router/* /stt/* /sync/* /rag/* /usage/* /account/me /account/usage /account/billing /account/devices /account/devices/* /account/export /account/delete /account/delete/status
     @bluey_install path /install.sh /install.ps1 /latest.json /latest.json.sig /releases/*
     @bluey_assets path /assets/*
     @bluey_jobs_assets path /jobs/assets/*

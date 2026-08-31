@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useNavigate } from "react-router-dom";
 import {
   Activity,
@@ -104,6 +105,26 @@ export function Context() {
       })
       .catch((nextError) => setError(String(nextError)))
       .finally(() => setLoading(false));
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = listen("dashboard_owner_changed", () => {
+      invoke<DataControls>("get_data_controls")
+        .then((nextControls) => {
+          if (!disposed) setControls(nextControls);
+        })
+        .catch((nextError) => {
+          if (!disposed) {
+            setControls(null);
+            setError(String(nextError));
+          }
+        });
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
   }, []);
 
   useEffect(() => {

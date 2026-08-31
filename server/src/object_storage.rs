@@ -351,6 +351,34 @@ async fn run_cleanup_pass(pool: &DbPool, scope: StorageScope, storage: &ObjectSt
                             storage_scope = scope.as_str(),
                             "object cleanup worker could not complete metadata"
                         );
+                    } else if crate::db::account_data::account_deletion_is_pending(
+                        pool,
+                        &job.account_id,
+                    )
+                    .unwrap_or(false)
+                    {
+                        match crate::db::account_data::complete_account_deletion(
+                            pool,
+                            &job.account_id,
+                        ) {
+                            Ok(crate::db::account_data::AccountDeletionCompletion::Deleted) => {
+                                tracing::info!(
+                                    account_id_hash = %cue_core::account_id_hash_prefix(&job.account_id),
+                                    "account deletion completed after durable object cleanup"
+                                );
+                            }
+                            Ok(
+                                crate::db::account_data::AccountDeletionCompletion::Pending
+                                | crate::db::account_data::AccountDeletionCompletion::NotFound,
+                            ) => {}
+                            Err(_) => {
+                                tracing::warn!(
+                                    account_id_hash = %cue_core::account_id_hash_prefix(&job.account_id),
+                                    error_category = "account_delete_finalize",
+                                    "account deletion finalizer will retry after object cleanup"
+                                );
+                            }
+                        }
                     }
                 }
                 Err(error) => {

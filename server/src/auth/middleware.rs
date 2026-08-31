@@ -34,6 +34,12 @@ pub async fn require_auth(
     if account.is_temporary_expired() {
         return Err(StatusCode::UNAUTHORIZED);
     }
+    let deletion_pending =
+        crate::db::account_data::account_deletion_is_pending(&state.pool, &account.id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    if deletion_pending && req.uri().path() != "/account/delete" {
+        return Err(StatusCode::GONE);
+    }
     req.extensions_mut().insert(AuthedAccount(account));
     Ok(next.run(req).await)
 }

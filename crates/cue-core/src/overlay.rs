@@ -113,6 +113,17 @@ pub enum MeetingBannerAction {
     Settings,
 }
 
+/// Native rendering milestone requested for an answer-card update.
+///
+/// These phases describe actual visible paint acknowledgements, not receipt of
+/// an IPC message. Progress/status text must not request `FirstText`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnswerRenderAckPhase {
+    FirstText,
+    Final,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OverlayCommand {
@@ -191,6 +202,9 @@ pub enum OverlayCommand {
     },
     UpdateCard {
         id: uuid::Uuid,
+        /// Ephemeral UUID shared by one user ask and its answer render path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction_id: Option<uuid::Uuid>,
         body: String,
         #[serde(default)]
         done: bool,
@@ -206,6 +220,10 @@ pub enum OverlayCommand {
         cost_label: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact: Option<CueCardArtifact>,
+        /// Rendering milestone the native overlay should acknowledge only
+        /// after this update is visibly painted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        render_ack: Option<AnswerRenderAckPhase>,
     },
     Shutdown,
 }
@@ -225,6 +243,15 @@ pub enum OverlayEvent {
     },
     AskRequested {
         question: String,
+        /// UUID minted once by the native UI for this user interaction.
+        /// Legacy overlays omit it and the daemon supplies a fallback.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        interaction_id: Option<uuid::Uuid>,
+        /// Native wall-clock timestamp captured when the user action was
+        /// accepted. It contains no user content and lets the daemon measure
+        /// native dispatch/queue latency. Legacy overlays omit it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initiated_at_unix_ms: Option<u64>,
         #[serde(default)]
         provider: Option<String>,
         #[serde(default)]
@@ -292,6 +319,15 @@ pub enum OverlayEvent {
     CloseRequested,
     CardRendered {
         id: uuid::Uuid,
+    },
+    /// Confirms that a requested answer milestone reached the visible native
+    /// surface. This remains separate from the legacy generic `CardRendered`
+    /// event so existing card-installation semantics do not change.
+    AnswerRenderAcknowledged {
+        id: uuid::Uuid,
+        interaction_id: uuid::Uuid,
+        phase: AnswerRenderAckPhase,
+        sequence: u64,
     },
     Error {
         message: String,
@@ -550,25 +586,77 @@ mod tests {
         let id = uuid::Uuid::nil();
         let command = OverlayCommand::UpdateCard {
             id,
+            interaction_id: Some(id),
             body: "Recovered answer".to_string(),
             done: false,
             sequence: 7,
             snapshot: true,
             cost_label: None,
             artifact: None,
+            render_ack: Some(AnswerRenderAckPhase::FirstText),
         };
 
         let json = serde_json::to_string(&command).expect("serialize update card");
         assert!(json.contains(r#""sequence":7"#));
         assert!(json.contains(r#""snapshot":true"#));
+        assert!(json.contains(r#""interaction_id":"00000000-0000-0000-0000-000000000000""#));
+        assert!(json.contains(r#""render_ack":"first_text""#));
         let decoded: OverlayCommand = serde_json::from_str(&json).expect("deserialize update card");
         assert!(matches!(
             decoded,
             OverlayCommand::UpdateCard {
                 sequence: 7,
                 snapshot: true,
+                interaction_id: Some(interaction_id),
+                render_ack: Some(AnswerRenderAckPhase::FirstText),
+                ..
+            } if interaction_id == id
+        ));
+    }
+
+    #[test]
+    fn legacy_update_card_defaults_interaction_fields_to_none() {
+        let command: OverlayCommand = serde_json::from_str(
+            r#"{"type":"update_card","id":"00000000-0000-0000-0000-000000000000","body":"Legacy","done":false}"#,
+        )
+        .expect("deserialize legacy update card");
+
+        assert!(matches!(
+            command,
+            OverlayCommand::UpdateCard {
+                interaction_id: None,
+                render_ack: None,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn answer_render_acknowledgement_round_trips() {
+        let interaction_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("valid interaction id");
+        let event = OverlayEvent::AnswerRenderAcknowledged {
+            id: uuid::Uuid::nil(),
+            interaction_id,
+            phase: AnswerRenderAckPhase::Final,
+            sequence: 9,
+        };
+
+        let json = serde_json::to_string(&event).expect("serialize render acknowledgement");
+        assert_eq!(
+            json,
+            r#"{"type":"answer_render_acknowledged","id":"00000000-0000-0000-0000-000000000000","interaction_id":"550e8400-e29b-41d4-a716-446655440000","phase":"final","sequence":9}"#
+        );
+        let decoded: OverlayEvent =
+            serde_json::from_str(&json).expect("deserialize render acknowledgement");
+        assert!(matches!(
+            decoded,
+            OverlayEvent::AnswerRenderAcknowledged {
+                interaction_id: decoded_id,
+                phase: AnswerRenderAckPhase::Final,
+                sequence: 9,
+                ..
+            } if decoded_id == interaction_id
         ));
     }
 
@@ -639,7 +727,42 @@ mod tests {
         assert!(matches!(
             event,
             OverlayEvent::AskRequested {
+                interaction_id: None,
                 answer_current_transcript: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ask_event_preserves_interaction_id() {
+        let interaction_id = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("valid interaction id");
+        let event: OverlayEvent = serde_json::from_str(
+            r#"{"type":"ask_requested","question":"answer this","interaction_id":"550e8400-e29b-41d4-a716-446655440000"}"#,
+        )
+        .expect("deserialize interaction ask event");
+
+        assert!(matches!(
+            event,
+            OverlayEvent::AskRequested {
+                interaction_id: Some(decoded_id),
+                ..
+            } if decoded_id == interaction_id
+        ));
+    }
+
+    #[test]
+    fn ask_event_preserves_native_initiation_timestamp() {
+        let event: OverlayEvent = serde_json::from_str(
+            r#"{"type":"ask_requested","question":"answer this","initiated_at_unix_ms":1750000000123}"#,
+        )
+        .expect("deserialize timestamped ask event");
+
+        assert!(matches!(
+            event,
+            OverlayEvent::AskRequested {
+                initiated_at_unix_ms: Some(1_750_000_000_123),
                 ..
             }
         ));

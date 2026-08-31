@@ -492,6 +492,17 @@ fn auth_response_with_label(
     refresh_label: Option<&str>,
     refresh_device_id: Option<&str>,
 ) -> Result<AuthResponse, (StatusCode, Json<ApiError>)> {
+    if account_data::account_deletion_is_pending(&state.pool, &account.id).map_err(|_| {
+        err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "authentication unavailable",
+        )
+    })? {
+        return Err(err(
+            StatusCode::GONE,
+            "account deletion is already in progress",
+        ));
+    }
     let access = auth::jwt::issue(
         &state.config.jwt_secret,
         &account.id,

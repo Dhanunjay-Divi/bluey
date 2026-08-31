@@ -70,13 +70,14 @@ pub use meeting::{
     MeetingRecap, MeetingRecord, MemoryHit, Speaker, TranscriptSegment,
 };
 pub use observability::{
-    account_id_hash_prefix, new_request_id, new_trace_id, platform, sanitize_observability_id,
-    short_observability_ref, trace_id_from_env, ObserveFields, BLUEY_REQUEST_ID_HEADER,
-    BLUEY_TRACE_ID_ENV, BLUEY_TRACE_ID_HEADER,
+    account_id_hash_prefix, new_interaction_id, new_request_id, new_trace_id, platform,
+    sanitize_interaction_id, sanitize_observability_id, short_observability_ref, trace_id_from_env,
+    ObserveFields, BLUEY_INTERACTION_ID_HEADER, BLUEY_REQUEST_ID_HEADER, BLUEY_TRACE_ID_ENV,
+    BLUEY_TRACE_ID_HEADER,
 };
 pub use overlay::{
-    MeetingBannerAction, MeetingCandidate, MeetingEvidence, OverlayCommand, OverlayContextItem,
-    OverlayEvent, OverlayPosition, OverlaySessionItem,
+    AnswerRenderAckPhase, MeetingBannerAction, MeetingCandidate, MeetingEvidence, OverlayCommand,
+    OverlayContextItem, OverlayEvent, OverlayPosition, OverlaySessionItem,
 };
 pub use state::{DaemonState, MeetingState};
 pub use windows_capture::{
@@ -95,6 +96,7 @@ macro_rules! observe {
             platform = %fields.platform,
             trace_id = %fields.trace_id_value(),
             request_id = %fields.request_id_value(),
+            interaction_id = %fields.interaction_id_value(),
             session_id = %fields.session_id_value(),
             account_id_hash = %fields.account_id_hash_value(),
             status = %fields.status_value(),

@@ -14,18 +14,20 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use anyhow::{Context, Result};
 use cue_cloud_client::{
-    CloudClient, CloudSessionBundle, SessionAuditBundleResponse, SyncBatchRequest,
-    SyncBatchResponse, SyncContextArtifactRecord, SyncCounts, SyncCueResponseRecord,
-    SyncRagChunkRecord, SyncSessionRecord, SyncTranscriptSegment,
+    CloudChildTombstone, CloudClient, CloudSessionBundle, CloudSessionSummary,
+    SessionAuditBundleResponse, SyncBatchRequest, SyncBatchResponse, SyncContextArtifactRecord,
+    SyncCounts, SyncCueResponseRecord, SyncRagChunkRecord, SyncSessionRecord,
+    SyncTranscriptSegment,
 };
 use cue_core::{
-    short_session_code, AnswerContextRole, CardArtifactType, ContextArtifact, ContextKind,
-    ContextProcessingStatus, ConversationMemory, ConversationTurn, CueCardArtifact,
+    app_paths::AppPaths, short_session_code, AnswerContextRole, CardArtifactType, ContextArtifact,
+    ContextKind, ContextProcessingStatus, ConversationMemory, ConversationTurn, CueCardArtifact,
     MeetingDiagnostics, MeetingRecord, Speaker, TranscriptSegment,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -50,17 +52,28 @@ const SESSION_AUDIT_DIR: &str = "session-audit";
 const SESSION_AUDIT_EVENTS_DIR: &str = "session-audit-events";
 const SESSION_AUDIT_UPLOADED_DIR: &str = "session-audit-uploaded";
 const SUPPORT_DIAGNOSTIC_UPLOAD_ENV: &str = "BLUEY_SUPPORT_DIAGNOSTIC_UPLOAD";
+const MAX_SUPPORT_DIAGNOSTIC_BUNDLES_PER_SYNC: usize = 8;
+const MAX_SUPPORT_DIAGNOSTIC_DIR_SCAN: usize = 512;
 const CLOUD_SYNC_STATE_DIR: &str = "cloud-sync-state";
 const CLOUD_DELETE_OUTBOX_DIR: &str = "cloud-delete-outbox";
-const CLOUD_SYNC_STATE_SCHEMA_VERSION: u32 = 1;
+const CLOUD_RESTORED_CONTEXT_DIR: &str = "cloud-restored-context";
+const CLOUD_RESTORED_OBJECTS_DIR: &str = "cloud-restored-objects";
+const CLOUD_HYDRATION_CURSOR_DIR: &str = "cloud-hydration-cursor";
+const CLOUD_SYNC_STATE_SCHEMA_VERSION: u32 = 2;
+const CLOUD_HYDRATION_CURSOR_SCHEMA_VERSION: u32 = 1;
+const MAX_CLOUD_HYDRATION_PAGES_PER_RUN: usize = 8;
 const CLOUD_DELETE_OUTBOX_SCHEMA_VERSION: u32 = 2;
 const LEGACY_CLOUD_DELETE_OUTBOX_SCHEMA_VERSION: u32 = 1;
+const CLOUD_DELETE_RETRY_BASE_MS: i64 = 5_000;
+const CLOUD_DELETE_RETRY_MAX_MS: i64 = 60 * 60 * 1_000;
 const CLOUD_CONVERSATION_MEMORY_SCHEMA_VERSION: u32 = 1;
 const MAX_CLOUD_CONVERSATION_MEMORY_EPOCHS: usize = 8;
 const MAX_CLOUD_CONVERSATION_MEMORY_EPOCH_CHARS: usize = 12_000;
 const MAX_CLOUD_CONVERSATION_MEMORY_TIMESTAMP_CHARS: usize = 128;
 
-#[derive(Debug, Clone)]
+type OperationGuard<'a> = dyn Fn() -> Result<()> + Sync + 'a;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyncedObjectMetadata {
     object_key: String,
     size_bytes: u64,
@@ -72,7 +85,10 @@ struct SyncedObjectMetadata {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CloudSyncState {
     schema_version: u32,
+    owner_account_id: String,
     remote_session_id: String,
+    #[serde(default)]
+    remote_summary: Option<CloudSessionFingerprint>,
     #[serde(default = "empty_metadata")]
     session_metadata: Value,
     #[serde(default)]
@@ -87,9 +103,67 @@ struct CloudSyncState {
     synced_response_records: BTreeMap<String, CloudResponseState>,
     #[serde(default)]
     rag_chunks: BTreeMap<String, CloudRagState>,
+    #[serde(default)]
+    attachment_transfers: BTreeMap<String, CloudAttachmentTransferState>,
+    #[serde(default)]
+    child_tombstones: BTreeMap<String, CloudChildTombstone>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CloudSessionFingerprint {
+    title: String,
+    status: String,
+    updated_at_ms: i64,
+    last_active_at_ms: Option<i64>,
+    answer_style: Option<String>,
+    transcript_count: i64,
+    response_count: i64,
+    context_count: i64,
+    rag_count: i64,
+    child_tombstone_count: i64,
+    child_tombstone_updated_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudHydrationCursorState {
+    schema_version: u32,
+    owner_account_id: String,
+    cursor: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CloudAttachmentTransferStatus {
+    Synced,
+    UploadRetry,
+    DownloadRetry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CloudAttachmentTransferState {
+    record_id: String,
+    status: CloudAttachmentTransferStatus,
+    attempt_count: u32,
+    updated_at_ms: i64,
+    #[serde(default)]
+    last_error_category: Option<String>,
+    #[serde(default)]
+    object: Option<SyncedObjectMetadata>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AttachmentUploadSummary {
+    uploaded: HashMap<Uuid, SyncedObjectMetadata>,
+    retry_count: usize,
+}
+
+enum ArtifactObjectSource {
+    NotApplicable,
+    Available(PathBuf),
+    Missing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PendingCloudSessionDelete {
     schema_version: u32,
     local_session_id: Uuid,
@@ -100,6 +174,12 @@ struct PendingCloudSessionDelete {
     state: CloudSessionDeleteState,
     #[serde(default)]
     committed_at_ms: Option<i64>,
+    #[serde(default)]
+    attempt_count: u32,
+    #[serde(default)]
+    next_retry_at_ms: i64,
+    #[serde(default)]
+    last_error_category: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +199,13 @@ impl Default for AuditEventLogState {
             bytes: 0,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuditEventLogFingerprint {
+    modified_at_ms: i64,
+    bytes: u64,
+    last_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,19 +288,10 @@ struct SessionAuditBundle {
     bundle_id: String,
     session_id: String,
     session_code: String,
-    account_id: Option<String>,
-    device_id: Option<String>,
     generated_at_ms: i64,
+    content_policy: String,
     manifest: Value,
     events: Vec<Value>,
-    questions: Vec<Value>,
-    responses: Vec<Value>,
-    transcript: Vec<Value>,
-    context: Vec<Value>,
-    screen: Vec<Value>,
-    artifacts: Vec<Value>,
-    costs: Vec<Value>,
-    attachments: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +299,7 @@ struct BuiltAuditBundle {
     bundle: SessionAuditBundle,
     bytes: Vec<u8>,
     local_dir: PathBuf,
+    event_log_fingerprint: Option<AuditEventLogFingerprint>,
 }
 
 #[derive(Debug, Clone)]
@@ -230,25 +309,110 @@ pub struct LocalSyncSummary {
     pub server_time_ms: Option<i64>,
 }
 
-pub fn append_session_audit_event(
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct SessionAuditScope {
+    pub session_id: Uuid,
+    pub owner_account_id: Option<String>,
+}
+
+impl SessionAuditScope {
+    pub(crate) fn from_meeting(meeting: &MeetingRecord) -> Self {
+        Self {
+            session_id: meeting.id,
+            owner_account_id: meeting.owner_account_id.clone(),
+        }
+    }
+}
+
+/// Phase 624 diagnostic records deliberately omit raw account and device
+/// identifiers. The authenticated support endpoint associates an upload with
+/// its owner; the local diagnostic payload does not need a second identity
+/// copy.
+pub(crate) fn append_privacy_safe_diagnostic_events_for_scope(
     data_dir: &Path,
-    meeting: &MeetingRecord,
-    kind: &str,
-    payload: Value,
+    scope: &SessionAuditScope,
+    events: &[(String, Value)],
 ) -> Result<()> {
+    append_session_audit_events_for_scope_inner(data_dir, scope, events)
+}
+
+fn append_session_audit_events_for_scope_inner(
+    data_dir: &Path,
+    scope: &SessionAuditScope,
+    events: &[(String, Value)],
+) -> Result<()> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    if events.len() as u64 > MAX_AUDIT_EVENT_RECORDS {
+        anyhow::bail!("local audit batch exceeds the bounded record count");
+    }
     let _append_guard = audit_event_append_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let session_id = meeting.id.to_string();
-    let session_code = short_session_code(meeting.id);
-    let device_id = std::env::var("BLUEY_DEVICE_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let event_dir = session_audit_event_dir(data_dir, meeting.id);
+    let event_dir = session_audit_event_dir(data_dir, scope);
     cue_core::app_paths::create_private_dir(&event_dir)?;
     let event_path = event_dir.join("events.jsonl");
     let mut event_state = load_audit_event_log_state(&event_path)?;
-    let sequence = event_state.last_sequence.saturating_add(1);
+    let mut encoded_events = Vec::with_capacity(events.len());
+    let mut incoming_bytes = 0_u64;
+    for (offset, (kind, payload)) in events.iter().enumerate() {
+        let sequence = event_state
+            .last_sequence
+            .saturating_add(offset as u64)
+            .saturating_add(1);
+        let encoded = encode_session_audit_event(scope, sequence, kind, payload.clone())?;
+        incoming_bytes = incoming_bytes.saturating_add(encoded.len() as u64);
+        encoded_events.push(encoded);
+    }
+    if incoming_bytes > MAX_AUDIT_EVENT_LOG_BYTES {
+        anyhow::bail!("local audit batch exceeds the bounded event log size");
+    }
+    let incoming_records = encoded_events.len() as u64;
+    if event_state.record_count.saturating_add(incoming_records) > MAX_AUDIT_EVENT_RECORDS
+        || event_state.bytes.saturating_add(incoming_bytes) > MAX_AUDIT_EVENT_LOG_BYTES
+    {
+        event_state = compact_audit_event_log(&event_path, incoming_bytes, incoming_records)?;
+    }
+
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&event_path)
+        .with_context(|| format!("open {}", event_path.display()))?;
+    for encoded in &encoded_events {
+        file.write_all(encoded)
+            .with_context(|| format!("write {}", event_path.display()))?;
+    }
+    file.sync_data()
+        .with_context(|| format!("sync {}", event_path.display()))?;
+    drop(file);
+    event_state.last_sequence = event_state.last_sequence.saturating_add(incoming_records);
+    event_state.record_count = event_state.record_count.saturating_add(incoming_records);
+    event_state.bytes = event_state.bytes.saturating_add(incoming_bytes);
+    write_audit_event_log_state(&event_path, &event_state)?;
+    if audit_append_should_prune(incoming_bytes) {
+        // Global retention cannot depend on cloud sync, which is opt-in. The
+        // first append in each process performs a recovery scan, then scans are
+        // amortized by durable bytes appended so UI event throughput stays O(1)
+        // in the steady state while total local storage remains capped.
+        prune_local_audit_storage(data_dir);
+    }
+    Ok(())
+}
+
+fn encode_session_audit_event(
+    scope: &SessionAuditScope,
+    sequence: u64,
+    kind: &str,
+    payload: Value,
+) -> Result<Vec<u8>> {
+    let session_code = short_session_code(scope.session_id);
     let event_id = format!(
         "{session_code}-ui-{sequence:08}-{}",
         Uuid::new_v4().simple()
@@ -256,15 +420,13 @@ pub fn append_session_audit_event(
     let mut record = json!({
         "schema_version": AUDIT_SCHEMA_VERSION,
         "event_id": event_id,
-        "session_id": session_id,
+        "session_id": scope.session_id.to_string(),
         "session_code": session_code,
-        "account_id": meeting.owner_account_id.as_deref(),
-        "device_id": device_id.as_deref(),
         "sequence": sequence,
         "kind": kind,
         "created_at_ms": current_epoch_ms(),
         "source": "desktop_ui",
-        "payload": metadata_only_audit_payload(payload),
+        "payload": support_diagnostic_payload(payload),
     });
     let mut encoded = serde_json::to_vec(&record).context("serialize local audit event")?;
     if encoded.len().saturating_add(1) > MAX_AUDIT_EVENT_RECORD_BYTES {
@@ -279,40 +441,7 @@ pub fn append_session_audit_event(
     if encoded.len() > MAX_AUDIT_EVENT_RECORD_BYTES {
         anyhow::bail!("local audit event exceeds the bounded record size");
     }
-    let incoming_bytes = encoded.len() as u64;
-    if event_state.record_count.saturating_add(1) > MAX_AUDIT_EVENT_RECORDS
-        || event_state.bytes.saturating_add(incoming_bytes) > MAX_AUDIT_EVENT_LOG_BYTES
-    {
-        event_state = compact_audit_event_log(&event_path, incoming_bytes)?;
-    }
-
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(&event_path)
-        .with_context(|| format!("open {}", event_path.display()))?;
-    file.write_all(&encoded)
-        .with_context(|| format!("write {}", event_path.display()))?;
-    file.sync_data()
-        .with_context(|| format!("sync {}", event_path.display()))?;
-    drop(file);
-    event_state.last_sequence = sequence;
-    event_state.record_count = event_state.record_count.saturating_add(1);
-    event_state.bytes = event_state.bytes.saturating_add(incoming_bytes);
-    write_audit_event_log_state(&event_path, &event_state)?;
-    if audit_append_should_prune(incoming_bytes) {
-        // Global retention cannot depend on cloud sync, which is opt-in. The
-        // first append in each process performs a recovery scan, then scans are
-        // amortized by durable bytes appended so UI event throughput stays O(1)
-        // in the steady state while total local storage remains capped.
-        prune_local_audit_storage(data_dir);
-    }
-    Ok(())
+    Ok(encoded)
 }
 
 fn audit_append_should_prune(incoming_bytes: u64) -> bool {
@@ -337,112 +466,6 @@ fn audit_append_should_prune(incoming_bytes: u64) -> bool {
 /// product session sync already owns questions, answers, transcripts, and
 /// attachments; duplicating those values into diagnostics creates a second,
 /// harder-to-govern copy of private customer content.
-fn metadata_only_audit_payload(payload: Value) -> Value {
-    let Value::Object(payload) = payload else {
-        return json!({
-            "content_policy": "metadata_only",
-            "payload_redacted": true,
-        });
-    };
-
-    let mut metadata = Map::new();
-    let mut redacted_fields = Vec::new();
-    for (key, value) in payload {
-        if audit_metadata_key_is_safe(&key) {
-            metadata.insert(key, value);
-            continue;
-        }
-
-        redacted_fields.push(key.clone());
-        match value {
-            Value::String(value) => {
-                metadata.insert(
-                    format!("{key}_chars"),
-                    Value::from(value.chars().count() as u64),
-                );
-            }
-            Value::Array(values) => {
-                metadata.insert(format!("{key}_count"), Value::from(values.len() as u64));
-            }
-            Value::Object(values) => {
-                metadata.insert(
-                    format!("{key}_field_count"),
-                    Value::from(values.len() as u64),
-                );
-            }
-            Value::Null | Value::Bool(_) | Value::Number(_) => {}
-        }
-    }
-    metadata.insert(
-        "content_policy".into(),
-        Value::String("metadata_only".into()),
-    );
-    if !redacted_fields.is_empty() {
-        metadata.insert("payload_redacted".into(), Value::Bool(true));
-        metadata.insert(
-            "redacted_fields".into(),
-            Value::Array(redacted_fields.into_iter().map(Value::String).collect()),
-        );
-    }
-    Value::Object(metadata)
-}
-
-fn audit_metadata_key_is_safe(key: &str) -> bool {
-    matches!(
-        key,
-        "schema_version"
-            | "sequence"
-            | "generation"
-            | "provider"
-            | "model"
-            | "route"
-            | "route_primary"
-            | "task_type"
-            | "question_intent"
-            | "artifact_type"
-            | "answer_context_role"
-            | "processing_status"
-            | "speaker"
-            | "status"
-            | "state"
-            | "kind"
-            | "source"
-            | "error_category"
-            | "reason_code"
-            | "http_status"
-            | "stream"
-            | "streaming"
-            | "is_final"
-            | "retryable"
-            | "terminal"
-            | "success"
-            | "context_was_empty"
-            | "cost_cents"
-            | "balance_cents_after"
-            | "input_tokens"
-            | "output_tokens"
-            | "artifact_confidence"
-            | "audio_chunk_storage"
-            | "content_policy"
-            | "listen_runs"
-            | "stt_parse_errors"
-            | "stt_provider_errors"
-            | "audio_start_errors"
-            | "audio_source_errors"
-            | "last_stt_provider"
-            | "last_error_kind"
-    ) || key.ends_with("_id")
-        || key.ends_with("_ids")
-        || key.ends_with("_count")
-        || key.ends_with("_chars")
-        || key.ends_with("_bytes")
-        || key.ends_with("_ms")
-        || key.ends_with("_pct")
-        || key.starts_with("is_")
-        || key.starts_with("has_")
-        || key.starts_with("had_")
-}
-
 impl LocalSyncSummary {
     fn empty() -> Self {
         Self {
@@ -482,11 +505,22 @@ pub struct CloudHydrationSummary {
     pub restored_sessions: usize,
     pub skipped_sessions: usize,
     pub purged_deleted_sessions: usize,
+    pub purged_session_ids: Vec<Uuid>,
+    pub reconciled_session_ids: Vec<Uuid>,
+    pub attachment_retry_count: usize,
+    pub local_cleanup_retry_count: usize,
+    pub continuation_pending: bool,
 }
 
 impl CloudHydrationSummary {
     pub fn total_sessions(&self) -> usize {
         self.restored_sessions + self.skipped_sessions + self.purged_deleted_sessions
+    }
+
+    fn record_purged_session_id(&mut self, seen_session_ids: &mut HashSet<Uuid>, session_id: Uuid) {
+        if seen_session_ids.insert(session_id) {
+            self.purged_session_ids.push(session_id);
+        }
     }
 }
 
@@ -495,77 +529,246 @@ pub async fn sync_local_meetings(
     data_dir: &Path,
     client: &CloudClient,
     owner_account_id: Option<&str>,
+    operation_is_active: &OperationGuard<'_>,
 ) -> Result<LocalSyncSummary> {
-    reconcile_prepared_cloud_session_deletes(data_dir, store, owner_account_id)
+    operation_is_active()?;
+    let owner_account_id = required_owner_account_id(owner_account_id)?;
+    reconcile_prepared_cloud_session_deletes(data_dir, store, Some(owner_account_id))
         .context("reconcile interrupted local session deletions")?;
-    flush_pending_cloud_session_deletes(data_dir, client, owner_account_id).await;
+    flush_pending_cloud_session_deletes(
+        data_dir,
+        client,
+        Some(owner_account_id),
+        operation_is_active,
+    )
+    .await?;
+    let cloud_delete_retry_pending =
+        has_committed_cloud_session_delete(data_dir, owner_account_id)?;
+    operation_is_active()?;
     let meetings = store
         .all_meetings()
         .context("failed to load local sessions")?
         .into_iter()
-        .filter(|meeting| meeting_belongs_to_owner(meeting, owner_account_id))
+        .filter(|meeting| meeting_belongs_to_owner(meeting, Some(owner_account_id)))
         .collect::<Vec<_>>();
     if meetings.is_empty() {
+        if cloud_delete_retry_pending {
+            anyhow::bail!("cloud session deletion remains queued for retry");
+        }
         return Ok(LocalSyncSummary::empty());
     }
 
-    let response_map = load_local_responses(data_dir, &meetings);
-    let sync_states = load_cloud_sync_states(data_dir, &meetings);
+    let response_map = load_local_responses(data_dir, owner_account_id, &meetings);
+    let mut sync_states = load_cloud_sync_states(data_dir, owner_account_id, &meetings);
     for parent_batch in build_object_parent_batches(&meetings, &response_map, &sync_states) {
+        operation_is_active()?;
         client
             .sync_batch(&parent_batch)
             .await
             .context("reserve cloud parent sessions before object upload")?;
+        operation_is_active()?;
     }
-    let uploaded_objects = upload_context_objects(data_dir, &meetings, &sync_states, client).await;
-    let batches =
-        build_sync_batches_with_states(&meetings, &response_map, &uploaded_objects, &sync_states);
+    let uploaded_objects = upload_context_objects(
+        data_dir,
+        owner_account_id,
+        &meetings,
+        &response_map,
+        &mut sync_states,
+        client,
+        operation_is_active,
+    )
+    .await?;
+    let batches = build_sync_batches_with_states(
+        &meetings,
+        &response_map,
+        &uploaded_objects.uploaded,
+        &sync_states,
+    );
     if batches.is_empty() {
+        if uploaded_objects.retry_count > 0 {
+            anyhow::bail!(
+                "cloud attachment sync remains incomplete; {} object(s) require retry",
+                uploaded_objects.retry_count
+            );
+        }
+        if cloud_delete_retry_pending {
+            anyhow::bail!("cloud session deletion remains queued for retry");
+        }
         return Ok(LocalSyncSummary::empty());
     }
     let uploaded_child_states = uploaded_child_states_by_session(&batches);
 
     let mut summary = LocalSyncSummary::empty();
     for batch in batches {
+        operation_is_active()?;
         let response = client
             .sync_batch(&batch)
             .await
             .context("cloud sync batch")?;
+        operation_is_active()?;
         summary.add_response(response);
     }
     for meeting in &meetings {
+        operation_is_active()?;
         let responses = response_map.get(&meeting.id.to_string()).map(Vec::as_slice);
         let previous = sync_states.get(&meeting.id);
         let wire_session_id = wire_session_id(meeting, previous);
         let state = cloud_sync_state_after_upload(
             meeting,
             responses,
-            &uploaded_objects,
+            &uploaded_objects.uploaded,
             previous,
             uploaded_child_states.get(&wire_session_id),
+            owner_account_id,
         );
-        write_cloud_sync_state(data_dir, meeting.id, &state)?;
+        write_cloud_sync_state(data_dir, owner_account_id, meeting.id, &state)?;
     }
-    if support_diagnostic_upload_enabled() {
-        sync_session_audit_bundles(data_dir, &meetings, &response_map, client, owner_account_id)
-            .await;
-    } else {
-        // Diagnostic bundles are a separate support-data surface. Ordinary
-        // session sync must never imply consent to upload them.
-        prune_local_audit_storage(data_dir);
+    if uploaded_objects.retry_count > 0 {
+        anyhow::bail!(
+            "cloud attachment sync remains incomplete; {} object(s) require retry",
+            uploaded_objects.retry_count
+        );
+    }
+    if cloud_delete_retry_pending {
+        anyhow::bail!("cloud session deletion remains queued for retry");
     }
     Ok(summary)
 }
 
-fn support_diagnostic_upload_enabled() -> bool {
-    std::env::var(SUPPORT_DIAGNOSTIC_UPLOAD_ENV)
-        .map(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
+fn support_diagnostic_upload_enabled(explicit_user_consent: bool) -> bool {
+    explicit_user_consent
+        && std::env::var(SUPPORT_DIAGNOSTIC_UPLOAD_ENV)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(true)
+}
+
+/// Upload metadata-only support diagnostics independently of product session
+/// sync. The explicit persisted user-consent bit is mandatory; an operator env
+/// value may disable this path but cannot enable it on the user's behalf.
+pub async fn sync_support_diagnostic_bundles(
+    store: &MeetingStore,
+    paths: &AppPaths,
+    client: &CloudClient,
+    owner_account_id: Option<&str>,
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<usize> {
+    let owner_account_id = required_owner_account_id(owner_account_id)?;
+    let consent_is_active = || {
+        if operation_is_active().is_err() {
+            return false;
+        }
+        cue_core::load_settings(paths)
+            .map(|settings| {
+                support_diagnostic_upload_enabled(
+                    settings.support_diagnostics_upload_allowed_for_account(Some(owner_account_id)),
+                )
+            })
+            .unwrap_or(false)
+    };
+    if !consent_is_active() {
+        prune_local_audit_storage(&paths.data_dir);
+        return Ok(0);
+    }
+    let _guard = support_diagnostic_sync_lock().lock().await;
+    let store = store.clone();
+    let data_dir = paths.data_dir.clone();
+    let worker_owner_account_id = owner_account_id.to_string();
+    let meetings = tokio::task::spawn_blocking(move || -> Result<Vec<MeetingRecord>> {
+        let mut meetings = Vec::new();
+        for session_id in
+            pending_support_diagnostic_session_ids(&data_dir, &worker_owner_account_id)?
+        {
+            let Some(meeting) = store.load_by_id(session_id)? else {
+                continue;
+            };
+            if meeting_belongs_to_owner(&meeting, Some(&worker_owner_account_id)) {
+                meetings.push(meeting);
+            }
+        }
+        Ok(meetings)
+    })
+    .await
+    .context("join support diagnostic session lookup")??;
+    if meetings.is_empty() {
+        return Ok(0);
+    }
+    if !consent_is_active() {
+        return Ok(0);
+    }
+    operation_is_active()?;
+    let server_consent = client
+        .get_support_diagnostic_consent()
+        .await
+        .map_err(|_| anyhow::anyhow!("support diagnostic server consent check deferred"))?;
+    operation_is_active()?;
+    let server_revision = server_consent
+        .current_receipt
+        .as_ref()
+        .map(|receipt| receipt.revision)
+        .filter(|revision| *revision > 0);
+    if let Some(server_revision) = server_revision {
+        crate::diagnostics::align_support_diagnostic_server_revision(
+            &paths.data_dir,
+            owner_account_id,
+            server_revision,
+        )?;
+    }
+    if server_revision.is_none()
+        || !server_consent.enabled
+        || server_consent.policy_version != cue_cloud_client::SUPPORT_DIAGNOSTIC_POLICY_VERSION
+        || server_consent.content_policy != cue_cloud_client::SUPPORT_DIAGNOSTIC_CONTENT_POLICY
+    {
+        crate::diagnostics::fence_support_diagnostics_for_owner(&paths.data_dir, owner_account_id)?;
+        let _ = cue_core::update_settings(paths, |settings| {
+            settings.support_diagnostics_upload_enabled = false;
+            settings.support_diagnostics_upload_consent_granted = false;
+        });
+        return Ok(0);
+    }
+    sync_session_audit_bundles(&paths.data_dir, &meetings, client, consent_is_active).await
+}
+
+fn support_diagnostic_sync_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
+fn pending_support_diagnostic_session_ids(
+    data_dir: &Path,
+    owner_account_id: &str,
+) -> Result<Vec<Uuid>> {
+    let root = data_dir
+        .join(SESSION_AUDIT_EVENTS_DIR)
+        .join(account_scope_key(owner_account_id)?);
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(Vec::new());
+    };
+    let mut pending = entries
+        .take(MAX_SUPPORT_DIAGNOSTIC_DIR_SCAN)
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let session_id = entry
+                .file_name()
+                .to_str()
+                .and_then(|value| Uuid::parse_str(value).ok())?;
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            Some((modified, session_id))
         })
-        .unwrap_or(false)
+        .collect::<Vec<_>>();
+    pending.sort_by_key(|(modified, _)| *modified);
+    Ok(pending
+        .into_iter()
+        .take(MAX_SUPPORT_DIAGNOSTIC_BUNDLES_PER_SYNC)
+        .map(|(_, session_id)| session_id)
+        .collect())
 }
 
 pub fn prepare_cloud_session_delete(
@@ -573,7 +776,7 @@ pub fn prepare_cloud_session_delete(
     local_session_id: Uuid,
     owner_account_id: &str,
 ) -> Result<CloudSessionDeleteDisposition> {
-    let remote_session_id = load_cloud_sync_state(data_dir, local_session_id)
+    let remote_session_id = load_cloud_sync_state(data_dir, owner_account_id, local_session_id)
         .map(|state| state.remote_session_id)
         // A server may have accepted the idempotent session write immediately
         // before a crash prevented the provenance sidecar from being written.
@@ -587,6 +790,9 @@ pub fn prepare_cloud_session_delete(
         queued_at_ms: current_epoch_ms(),
         state: CloudSessionDeleteState::Prepared,
         committed_at_ms: None,
+        attempt_count: 0,
+        next_retry_at_ms: 0,
+        last_error_category: None,
     };
     write_pending_cloud_delete(data_dir, &pending)?;
     Ok(CloudSessionDeleteDisposition::Queued)
@@ -597,7 +803,7 @@ pub fn commit_prepared_cloud_session_delete(
     local_session_id: Uuid,
     owner_account_id: &str,
 ) -> Result<CloudSessionDeleteDisposition> {
-    let path = cloud_delete_outbox_path(data_dir, local_session_id);
+    let path = cloud_delete_outbox_path(data_dir, owner_account_id, local_session_id)?;
     let mut pending = read_cloud_delete_intent(&path)?.with_context(|| {
         format!("prepared cloud deletion for session {local_session_id} missing")
     })?;
@@ -607,6 +813,9 @@ pub fn commit_prepared_cloud_session_delete(
     }
     pending.state = CloudSessionDeleteState::Committed;
     pending.committed_at_ms = Some(current_epoch_ms());
+    pending.attempt_count = 0;
+    pending.next_retry_at_ms = 0;
+    pending.last_error_category = None;
     write_pending_cloud_delete(data_dir, &pending)?;
     Ok(CloudSessionDeleteDisposition::Queued)
 }
@@ -639,7 +848,8 @@ fn reconcile_prepared_cloud_session_deletes_locked(
     else {
         return Ok(());
     };
-    let dir = data_dir.join(CLOUD_DELETE_OUTBOX_DIR);
+    migrate_legacy_cloud_delete_intents(data_dir, owner_account_id)?;
+    let dir = cloud_delete_outbox_dir(data_dir, owner_account_id)?;
     let Ok(entries) = fs::read_dir(&dir) else {
         return Ok(());
     };
@@ -666,6 +876,9 @@ fn reconcile_prepared_cloud_session_deletes_locked(
 
         pending.state = CloudSessionDeleteState::Committed;
         pending.committed_at_ms = Some(current_epoch_ms());
+        pending.attempt_count = 0;
+        pending.next_retry_at_ms = 0;
+        pending.last_error_category = None;
         write_pending_cloud_delete(data_dir, &pending)?;
     }
     Ok(())
@@ -705,7 +918,7 @@ fn abort_prepared_cloud_session_delete_with<F>(
 where
     F: FnOnce(&Path) -> std::io::Result<()>,
 {
-    let path = cloud_delete_outbox_path(data_dir, local_session_id);
+    let path = cloud_delete_outbox_path(data_dir, owner_account_id, local_session_id)?;
     let Some(pending) = read_cloud_delete_intent(&path)? else {
         return Ok(());
     };
@@ -727,9 +940,16 @@ pub async fn flush_queued_cloud_session_delete(
     local_session_id: Uuid,
     client: &CloudClient,
     owner_account_id: &str,
-) -> CloudSessionDeleteDisposition {
-    flush_queued_cloud_session_delete_with(data_dir, local_session_id, client, owner_account_id)
-        .await
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<CloudSessionDeleteDisposition> {
+    flush_queued_cloud_session_delete_with(
+        data_dir,
+        local_session_id,
+        client,
+        owner_account_id,
+        operation_is_active,
+    )
+    .await
 }
 
 #[async_trait::async_trait]
@@ -757,35 +977,45 @@ async fn flush_queued_cloud_session_delete_with<C>(
     local_session_id: Uuid,
     client: &C,
     owner_account_id: &str,
-) -> CloudSessionDeleteDisposition
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<CloudSessionDeleteDisposition>
 where
     C: CloudSessionDeleteClient + Sync + ?Sized,
 {
-    let path = cloud_delete_outbox_path(data_dir, local_session_id);
-    let Some(pending) = read_cloud_delete_intent(&path).ok().flatten() else {
-        return CloudSessionDeleteDisposition::NotPreviouslyUploaded;
+    let path = cloud_delete_outbox_path(data_dir, owner_account_id, local_session_id)?;
+    let Some(mut pending) = read_cloud_delete_intent(&path).ok().flatten() else {
+        return Ok(CloudSessionDeleteDisposition::NotPreviouslyUploaded);
     };
     if validate_cloud_delete_intent(&pending, local_session_id, owner_account_id).is_err() {
-        return CloudSessionDeleteDisposition::NotPreviouslyUploaded;
+        return Ok(CloudSessionDeleteDisposition::NotPreviouslyUploaded);
     }
     if pending.state != CloudSessionDeleteState::Committed {
-        return CloudSessionDeleteDisposition::Queued;
+        return Ok(CloudSessionDeleteDisposition::Queued);
     }
+    if pending.next_retry_at_ms > current_epoch_ms() {
+        return Ok(CloudSessionDeleteDisposition::Queued);
+    }
+    operation_is_active()?;
     match client
         .delete_cloud_session(&pending.remote_session_id)
         .await
     {
         Ok(_) => {
-            remove_cloud_delete_provenance(data_dir, local_session_id);
-            CloudSessionDeleteDisposition::Confirmed
+            operation_is_active()?;
+            remove_cloud_delete_provenance(data_dir, owner_account_id, local_session_id)?;
+            Ok(CloudSessionDeleteDisposition::Confirmed)
         }
         Err(error) => {
+            operation_is_active()?;
+            let error_category = cloud_delete_error_category(&error);
+            schedule_cloud_delete_retry(data_dir, &mut pending, error_category)?;
             warn!(
-                session_id = %local_session_id,
-                error_category = %cloud_delete_error_category(&error),
+                session_hash = %cloud_log_identifier_hash(local_session_id.as_bytes()),
+                error_category,
+                attempt_count = pending.attempt_count,
                 "cloud session deletion remains queued"
             );
-            CloudSessionDeleteDisposition::Queued
+            Ok(CloudSessionDeleteDisposition::Queued)
         }
     }
 }
@@ -794,33 +1024,43 @@ pub async fn flush_pending_cloud_session_deletes(
     data_dir: &Path,
     client: &CloudClient,
     owner_account_id: Option<&str>,
-) {
-    flush_pending_cloud_session_deletes_with(data_dir, client, owner_account_id).await;
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<()> {
+    flush_pending_cloud_session_deletes_with(
+        data_dir,
+        client,
+        owner_account_id,
+        operation_is_active,
+    )
+    .await
 }
 
 async fn flush_pending_cloud_session_deletes_with<C>(
     data_dir: &Path,
     client: &C,
     owner_account_id: Option<&str>,
-) where
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<()>
+where
     C: CloudSessionDeleteClient + Sync + ?Sized,
 {
     let Some(owner_account_id) = owner_account_id
         .map(str::trim)
         .filter(|owner| !owner.is_empty())
     else {
-        return;
+        return Ok(());
     };
-    let dir = data_dir.join(CLOUD_DELETE_OUTBOX_DIR);
+    migrate_legacy_cloud_delete_intents(data_dir, owner_account_id)?;
+    let dir = cloud_delete_outbox_dir(data_dir, owner_account_id)?;
     let Ok(entries) = fs::read_dir(&dir) else {
-        return;
+        return Ok(());
     };
     for entry in entries.flatten().take(256) {
         let path = entry.path();
         let Some(local_session_id) = cloud_delete_outbox_session_id(&path) else {
             continue;
         };
-        let Some(pending) = read_cloud_delete_intent(&path).ok().flatten() else {
+        let Some(mut pending) = read_cloud_delete_intent(&path).ok().flatten() else {
             continue;
         };
         if validate_cloud_delete_intent(&pending, local_session_id, owner_account_id).is_err()
@@ -828,22 +1068,32 @@ async fn flush_pending_cloud_session_deletes_with<C>(
         {
             continue;
         }
+        if pending.next_retry_at_ms > current_epoch_ms() {
+            continue;
+        }
+        operation_is_active()?;
         match client
             .delete_cloud_session(&pending.remote_session_id)
             .await
         {
             Ok(_) => {
-                remove_cloud_delete_provenance(data_dir, local_session_id);
+                operation_is_active()?;
+                remove_cloud_delete_provenance(data_dir, owner_account_id, local_session_id)?;
             }
             Err(error) => {
+                operation_is_active()?;
+                let error_category = cloud_delete_error_category(&error);
+                schedule_cloud_delete_retry(data_dir, &mut pending, error_category)?;
                 debug!(
-                    session_id = %local_session_id,
-                    error_category = %cloud_delete_error_category(&error),
+                    session_hash = %cloud_log_identifier_hash(local_session_id.as_bytes()),
+                    error_category,
+                    attempt_count = pending.attempt_count,
                     "pending cloud session deletion remains queued"
                 );
             }
         }
     }
+    Ok(())
 }
 
 fn cloud_delete_outbox_session_id(path: &Path) -> Option<Uuid> {
@@ -853,6 +1103,44 @@ fn cloud_delete_outbox_session_id(path: &Path) -> Option<Uuid> {
     path.file_stem()
         .and_then(|stem| stem.to_str())
         .and_then(|stem| Uuid::parse_str(stem).ok())
+}
+
+fn migrate_legacy_cloud_delete_intents(data_dir: &Path, owner_account_id: &str) -> Result<()> {
+    let legacy_root = data_dir.join(CLOUD_DELETE_OUTBOX_DIR);
+    let Ok(entries) = fs::read_dir(&legacy_root) else {
+        return Ok(());
+    };
+    for entry in entries.flatten().take(256) {
+        let legacy_path = entry.path();
+        if !legacy_path.is_file() {
+            continue;
+        }
+        let Some(session_id) = cloud_delete_outbox_session_id(&legacy_path) else {
+            continue;
+        };
+        let Some(pending) = read_cloud_delete_intent(&legacy_path)? else {
+            continue;
+        };
+        if validate_cloud_delete_intent(&pending, session_id, owner_account_id).is_err() {
+            continue;
+        }
+        let scoped_path = cloud_delete_outbox_path(data_dir, owner_account_id, session_id)?;
+        if let Some(existing) = read_cloud_delete_intent(&scoped_path)? {
+            if existing != pending {
+                continue;
+            }
+        } else {
+            write_pending_cloud_delete(data_dir, &pending)?;
+        }
+        match fs::remove_file(&legacy_path) {
+            Ok(()) => sync_deleted_private_file_parent(&legacy_path)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context("remove migrated legacy cloud deletion intent");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_cloud_delete_intent(path: &Path) -> Result<Option<PendingCloudSessionDelete>> {
@@ -867,6 +1155,46 @@ fn read_cloud_delete_intent(path: &Path) -> Result<Option<PendingCloudSessionDel
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse cloud deletion intent {}", path.display()))
         .map(Some)
+}
+
+fn cloud_session_has_committed_delete(
+    data_dir: &Path,
+    owner_account_id: &str,
+    local_session_id: Uuid,
+) -> Result<bool> {
+    let path = cloud_delete_outbox_path(data_dir, owner_account_id, local_session_id)?;
+    let Some(pending) = read_cloud_delete_intent(&path)? else {
+        return Ok(false);
+    };
+    validate_cloud_delete_intent(&pending, local_session_id, owner_account_id)?;
+    Ok(pending.state == CloudSessionDeleteState::Committed)
+}
+
+fn has_committed_cloud_session_delete(data_dir: &Path, owner_account_id: &str) -> Result<bool> {
+    let dir = cloud_delete_outbox_dir(data_dir, owner_account_id)?;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Ok(false);
+    };
+    for (index, entry) in entries.flatten().enumerate() {
+        if index >= 512 {
+            // A pathological outbox must not be reported as fully synced just
+            // because the bounded scan stopped before a committed record.
+            return Ok(true);
+        }
+        let path = entry.path();
+        let Some(local_session_id) = cloud_delete_outbox_session_id(&path) else {
+            continue;
+        };
+        let Some(pending) = read_cloud_delete_intent(&path)? else {
+            continue;
+        };
+        if validate_cloud_delete_intent(&pending, local_session_id, owner_account_id).is_ok()
+            && pending.state == CloudSessionDeleteState::Committed
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn validate_cloud_delete_intent(
@@ -905,101 +1233,301 @@ fn cloud_delete_error_category(error: &cue_cloud_client::Error) -> &'static str 
     }
 }
 
+fn cloud_delete_retry_delay_ms(local_session_id: Uuid, attempt_count: u32) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).min(16);
+    let base_cap = CLOUD_DELETE_RETRY_MAX_MS.saturating_mul(4) / 5;
+    let base = CLOUD_DELETE_RETRY_BASE_MS
+        .saturating_mul(1_i64.checked_shl(exponent).unwrap_or(i64::MAX))
+        .min(base_cap);
+    let mut hasher = Sha256::new();
+    hasher.update(b"bluey-cloud-delete-retry-v1\0");
+    hasher.update(local_session_id.as_bytes());
+    hasher.update(attempt_count.to_be_bytes());
+    let digest = hasher.finalize();
+    let jitter_bucket = u16::from_be_bytes([digest[0], digest[1]]) as i64;
+    let jitter = (base / 4).saturating_mul(jitter_bucket) / i64::from(u16::MAX);
+    base.saturating_add(jitter).min(CLOUD_DELETE_RETRY_MAX_MS)
+}
+
+fn schedule_cloud_delete_retry(
+    data_dir: &Path,
+    pending: &mut PendingCloudSessionDelete,
+    error_category: &str,
+) -> Result<()> {
+    pending.attempt_count = pending.attempt_count.saturating_add(1);
+    pending.next_retry_at_ms = current_epoch_ms().saturating_add(cloud_delete_retry_delay_ms(
+        pending.local_session_id,
+        pending.attempt_count,
+    ));
+    pending.last_error_category = Some(error_category.to_string());
+    write_pending_cloud_delete(data_dir, pending)
+}
+
 pub async fn hydrate_missing_cloud_meetings(
     store: &MeetingStore,
     data_dir: &Path,
     client: &CloudClient,
     owner_account_id: Option<&str>,
     limit: i64,
+    operation_is_active: &OperationGuard<'_>,
+    persistence_barrier: &AsyncMutex<()>,
 ) -> Result<CloudHydrationSummary> {
-    let response = client
-        .list_cloud_sessions(Some(limit.clamp(1, 200)))
-        .await
-        .context("list cloud sessions")?;
+    let owner_account_id = required_owner_account_id(owner_account_id)?;
+    reconcile_prepared_cloud_session_deletes(data_dir, store, Some(owner_account_id))
+        .context("reconcile interrupted local session deletions before hydration")?;
     let mut summary = CloudHydrationSummary::default();
-    for deleted in response.deleted_sessions {
-        let session_id = local_uuid_for_cloud_id("session", "account-session", &deleted.session_id);
-        let Some(local_meeting) = store.load_by_id(session_id)? else {
-            continue;
-        };
-        if !meeting_should_follow_cloud_delete(&local_meeting, owner_account_id) {
-            summary.skipped_sessions += 1;
-            continue;
-        }
-        remove_bluey_owned_context_files(data_dir, &local_meeting);
-        if store.delete(session_id)? {
-            let state_path = cloud_sync_state_path(data_dir, session_id);
-            if let Err(error) = fs::remove_file(&state_path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    debug!(
-                        path = %state_path.display(),
-                        error = %error,
-                        "cloud-delete cleanup could not remove sync state"
-                    );
-                }
-            }
-            summary.purged_deleted_sessions += 1;
-        }
+    let mut cursor = load_cloud_hydration_cursor(data_dir, owner_account_id);
+    let mut seen_cursors = HashSet::new();
+    if let Some(cursor) = cursor.as_ref() {
+        seen_cursors.insert(cursor.clone());
     }
-
-    if response.sessions.is_empty() {
-        return Ok(summary);
-    }
-
-    for session in response.sessions {
-        let session_id = local_uuid_for_cloud_id("session", "account-session", &session.session_id);
-        let existing = store.load_by_id(session_id)?;
-        if existing
-            .as_ref()
-            .is_some_and(|meeting| !meeting_belongs_to_owner(meeting, owner_account_id))
-        {
-            summary.skipped_sessions += 1;
-            continue;
-        }
-
-        let bundle = client
-            .load_cloud_session(&session.session_id)
+    let mut seen_purged_session_ids = HashSet::new();
+    let mut seen_reconciled_session_ids = HashSet::new();
+    let mut processed_pages = 0usize;
+    loop {
+        let attachment_retries_before_page = summary.attachment_retry_count;
+        let cleanup_retries_before_page = summary.local_cleanup_retry_count;
+        operation_is_active()?;
+        let response = client
+            .list_cloud_sessions_page(Some(limit.clamp(1, 200)), cursor.as_deref())
             .await
-            .with_context(|| format!("load cloud session {}", session.session_id))?;
-        if bundle.session.session_id != session.session_id {
-            anyhow::bail!(
-                "cloud session list/bundle identity mismatch: expected {}, got {}",
-                session.session_id,
-                bundle.session.session_id
-            );
-        }
-        let mut cloud_meeting = meeting_from_cloud_bundle(data_dir, Some(client), bundle).await?;
-        cloud_meeting.owner_account_id = owner_account_id.map(ToString::to_string);
-        if !meeting_has_syncable_content(&cloud_meeting, None) {
-            summary.skipped_sessions += 1;
-            continue;
-        }
+            .context("list cloud sessions")?;
+        operation_is_active()?;
+        let next_cursor = response.next_cursor.clone();
 
-        if let Some(existing) = existing {
-            let active = store
-                .load_active()?
-                .is_some_and(|meeting| meeting.id == existing.id);
-            let (meeting, changed) = reconcile_cloud_meeting(existing, cloud_meeting)?;
-            if !changed {
+        for deleted in response.deleted_sessions {
+            operation_is_active()?;
+            let session_id =
+                local_uuid_for_cloud_id("session", "account-session", &deleted.session_id);
+            // Surface every account-scoped server tombstone to the daemon even
+            // when its MeetingStore file is already absent. Other local views
+            // (the active in-memory session, projections, RAG, or diagnostics)
+            // may still need deterministic cleanup.
+            summary.record_purged_session_id(&mut seen_purged_session_ids, session_id);
+            if purge_cloud_session_local_state(data_dir, owner_account_id, session_id).is_err() {
+                summary.local_cleanup_retry_count =
+                    summary.local_cleanup_retry_count.saturating_add(1);
+                debug!("account-scoped cloud tombstone cache cleanup remains queued for retry");
+            }
+            let _persistence = persistence_barrier.lock().await;
+            operation_is_active()?;
+            let Some(local_meeting) = store.load_by_id(session_id)? else {
+                continue;
+            };
+            if !meeting_should_follow_cloud_delete(&local_meeting, Some(owner_account_id)) {
                 summary.skipped_sessions += 1;
                 continue;
             }
-            if active {
-                store.save_active(&meeting)?;
-            } else {
-                store.save_archived(&meeting)?;
+            operation_is_active()?;
+            remove_bluey_owned_context_files(data_dir, &local_meeting);
+            if store.delete(session_id)? {
+                summary.purged_deleted_sessions += 1;
             }
-        } else {
-            store.save_archived(&cloud_meeting)?;
         }
-        summary.restored_sessions += 1;
+
+        for session in response.sessions {
+            operation_is_active()?;
+            let session_id =
+                local_uuid_for_cloud_id("session", "account-session", &session.session_id);
+            if cloud_session_has_committed_delete(data_dir, owner_account_id, session_id)? {
+                summary.skipped_sessions += 1;
+                continue;
+            }
+            let existing = store.load_by_id(session_id)?;
+            if existing
+                .as_ref()
+                .is_some_and(|meeting| !meeting_belongs_to_owner(meeting, Some(owner_account_id)))
+            {
+                summary.skipped_sessions += 1;
+                continue;
+            }
+            if existing.is_some()
+                && cloud_session_summary_is_current(
+                    data_dir,
+                    owner_account_id,
+                    session_id,
+                    &session,
+                )
+            {
+                summary.skipped_sessions += 1;
+                continue;
+            }
+
+            operation_is_active()?;
+            let bundle = client
+                .load_cloud_session(&session.session_id)
+                .await
+                .with_context(|| format!("load cloud session {}", session.session_id))?;
+            operation_is_active()?;
+            if bundle.session.session_id != session.session_id {
+                anyhow::bail!(
+                    "cloud session list/bundle identity mismatch: expected {}, got {}",
+                    session.session_id,
+                    bundle.session.session_id
+                );
+            }
+            let (mut cloud_meeting, attachment_retry_count, child_tombstones) =
+                meeting_from_cloud_bundle(
+                    data_dir,
+                    Some(client),
+                    owner_account_id,
+                    bundle,
+                    operation_is_active,
+                )
+                .await?;
+            operation_is_active()?;
+            cloud_meeting.owner_account_id = Some(owner_account_id.to_string());
+            summary.attachment_retry_count = summary
+                .attachment_retry_count
+                .saturating_add(attachment_retry_count);
+            if !child_tombstones.is_empty() && seen_reconciled_session_ids.insert(session_id) {
+                summary.reconciled_session_ids.push(session_id);
+            }
+            // Re-read and publish the local mutation under the same barrier as
+            // live STT, final answers, sign-out, and account deletion. The
+            // earlier copy was only an optimization hint; it cannot authorize
+            // a write after network I/O.
+            let _persistence = persistence_barrier.lock().await;
+            operation_is_active()?;
+            let existing = store.load_by_id(session_id)?;
+            if existing
+                .as_ref()
+                .is_some_and(|meeting| !meeting_belongs_to_owner(meeting, Some(owner_account_id)))
+            {
+                summary.skipped_sessions += 1;
+                continue;
+            }
+            if let Some(existing) = existing.as_ref() {
+                operation_is_active()?;
+                remove_cloud_tombstoned_context_files(
+                    data_dir,
+                    owner_account_id,
+                    existing,
+                    &child_tombstones,
+                );
+            }
+            purge_cloud_response_tombstones(
+                data_dir,
+                owner_account_id,
+                cloud_meeting.id,
+                &child_tombstones,
+            )?;
+            if !meeting_has_syncable_content(&cloud_meeting, None)
+                && (existing.is_none() || child_tombstones.is_empty())
+            {
+                mark_cloud_session_summary_current(
+                    data_dir,
+                    owner_account_id,
+                    session_id,
+                    &session,
+                )?;
+                summary.skipped_sessions += 1;
+                continue;
+            }
+
+            if let Some(existing) = existing {
+                let active = store
+                    .load_active()?
+                    .is_some_and(|meeting| meeting.id == existing.id);
+                let (meeting, changed) =
+                    reconcile_cloud_meeting(existing, cloud_meeting, &child_tombstones)?;
+                if !changed {
+                    mark_cloud_session_summary_current(
+                        data_dir,
+                        owner_account_id,
+                        session_id,
+                        &session,
+                    )?;
+                    summary.skipped_sessions += 1;
+                    continue;
+                }
+                operation_is_active()?;
+                if active {
+                    store.save_active(&meeting)?;
+                } else {
+                    store.save_archived(&meeting)?;
+                }
+            } else {
+                operation_is_active()?;
+                store.save_archived(&cloud_meeting)?;
+            }
+            mark_cloud_session_summary_current(data_dir, owner_account_id, session_id, &session)?;
+            summary.restored_sessions += 1;
+        }
+
+        if summary.attachment_retry_count > attachment_retries_before_page
+            || summary.local_cleanup_retry_count > cleanup_retries_before_page
+        {
+            // Do not checkpoint past a page whose attachment or local purge
+            // side effects are incomplete. The next bounded retry resumes this
+            // exact page, so a partial first page cannot hide behind a cursor
+            // while later pages make the account appear current.
+            break;
+        }
+        processed_pages = processed_pages.saturating_add(1);
+        if !advance_cloud_session_cursor(&mut cursor, &mut seen_cursors, next_cursor)? {
+            clear_cloud_hydration_cursor(data_dir, owner_account_id)?;
+            break;
+        }
+        write_cloud_hydration_cursor(
+            data_dir,
+            owner_account_id,
+            cursor
+                .as_deref()
+                .context("cloud hydration cursor missing")?,
+        )?;
+        if processed_pages >= MAX_CLOUD_HYDRATION_PAGES_PER_RUN {
+            summary.continuation_pending = true;
+            break;
+        }
     }
     Ok(summary)
+}
+
+/// Reapply the latest durable server child tombstones to a stale in-memory
+/// meeting immediately before it is saved. This closes the small window
+/// between hydration publishing deletion provenance and the runtime reloading
+/// its active MeetingRecord.
+pub(crate) fn reapply_cloud_child_tombstones_before_save(
+    data_dir: &Path,
+    owner_account_id: &str,
+    meeting: &mut MeetingRecord,
+) -> Result<usize> {
+    let owner_account_id = required_owner_account_id(Some(owner_account_id))?;
+    anyhow::ensure!(
+        meeting.owner_account_id.as_deref() == Some(owner_account_id),
+        "refusing to apply cloud tombstones across account owners"
+    );
+    let Some(state) =
+        load_cloud_sync_state_strict_if_present(data_dir, owner_account_id, meeting.id)?
+    else {
+        return Ok(0);
+    };
+    let before = serde_json::to_value(&*meeting)?;
+    let tombstones = state.child_tombstones.values().cloned().collect::<Vec<_>>();
+    apply_cloud_child_tombstones_to_meeting(meeting, &tombstones);
+    Ok(usize::from(before != serde_json::to_value(&*meeting)?))
+}
+
+fn advance_cloud_session_cursor(
+    cursor: &mut Option<String>,
+    seen_cursors: &mut HashSet<String>,
+    next_cursor: Option<String>,
+) -> Result<bool> {
+    let Some(next_cursor) = next_cursor else {
+        return Ok(false);
+    };
+    if !seen_cursors.insert(next_cursor.clone()) {
+        anyhow::bail!("cloud session pagination returned a repeated cursor");
+    }
+    *cursor = Some(next_cursor);
+    Ok(true)
 }
 
 fn reconcile_cloud_meeting(
     mut local: MeetingRecord,
     cloud: MeetingRecord,
+    child_tombstones: &[CloudChildTombstone],
 ) -> Result<(MeetingRecord, bool)> {
     if local.id != cloud.id {
         anyhow::bail!(
@@ -1019,6 +1547,8 @@ fn reconcile_cloud_meeting(
     if local.owner_account_id.is_none() && local_was_shell {
         local.owner_account_id = cloud.owner_account_id.clone();
     }
+
+    apply_cloud_child_tombstones_to_meeting(&mut local, child_tombstones);
 
     if local_was_shell || session_title_is_placeholder(&local.title) {
         local.title = cloud.title;
@@ -1118,6 +1648,87 @@ fn reconcile_cloud_meeting(
     }
     let changed = before != serde_json::to_value(&local)?;
     Ok((local, changed))
+}
+
+fn apply_cloud_child_tombstones_to_meeting(
+    meeting: &mut MeetingRecord,
+    child_tombstones: &[CloudChildTombstone],
+) {
+    let mut conversation_memory_deleted = false;
+    for tombstone in child_tombstones {
+        match tombstone.child_kind.as_str() {
+            "transcript" => {
+                let local_id = local_uuid_for_cloud_id(
+                    "transcript-segment",
+                    &tombstone.session_id,
+                    &tombstone.child_id,
+                );
+                meeting.transcript.retain(|segment| segment.id != local_id);
+            }
+            "response" => {
+                let local_id = local_turn_uuid(&tombstone.session_id, &tombstone.child_id);
+                meeting.conversation.retain(|turn| turn.id != local_id);
+            }
+            "context" => {
+                let local_id = local_uuid_for_cloud_id(
+                    "context-artifact",
+                    &tombstone.session_id,
+                    &tombstone.child_id,
+                );
+                meeting.context.retain(|artifact| artifact.id != local_id);
+                for turn in &mut meeting.conversation {
+                    turn.attachment_ids
+                        .retain(|attachment_id| *attachment_id != local_id);
+                }
+            }
+            "rag" => {
+                conversation_memory_deleted |=
+                    apply_cloud_rag_tombstone_to_meeting(meeting, tombstone);
+            }
+            _ => {}
+        }
+    }
+    if conversation_memory_deleted {
+        // Compacted epochs have no stable server-side identity beyond their
+        // positional chunk index. Clearing the derived memory projection is
+        // deliberately conservative and idempotent; deleting one remote
+        // memory chunk must never shift indexes and delete a different epoch
+        // during a later hydration pass.
+        meeting.conversation_memory = ConversationMemory::default();
+    }
+    meeting.normalize_conversation_bounds();
+}
+
+fn apply_cloud_rag_tombstone_to_meeting(
+    meeting: &mut MeetingRecord,
+    tombstone: &CloudChildTombstone,
+) -> bool {
+    let summary_id = format!("{}:summary:0", tombstone.session_id);
+    let instructions_id = format!("{}:instructions:0", tombstone.session_id);
+    if tombstone.source_kind.as_deref() == Some("summary") || tombstone.child_id == summary_id {
+        meeting.summary = None;
+        return false;
+    }
+    if tombstone.source_kind.as_deref() == Some("answer_instructions")
+        || tombstone.child_id == instructions_id
+    {
+        meeting.answer_instructions = None;
+        return false;
+    }
+    if tombstone.source_kind.as_deref() == Some("conversation_memory") {
+        return true;
+    }
+    let memory_prefix = format!("{}:conversation-memory:", tombstone.session_id);
+    tombstone.child_id.starts_with(&memory_prefix)
+}
+
+fn cloud_state_has_conversation_memory_tombstone(state: &CloudSyncState, session_id: &str) -> bool {
+    let memory_prefix = format!("{session_id}:conversation-memory:");
+    state.child_tombstones.values().any(|tombstone| {
+        tombstone.child_kind == "rag"
+            && (tombstone.source_kind.as_deref() == Some("conversation_memory")
+                || tombstone.child_id.starts_with(&memory_prefix))
+    })
 }
 
 fn merge_missing_context_fields(local: &mut ContextArtifact, cloud: ContextArtifact) {
@@ -1258,6 +1869,97 @@ fn remove_bluey_owned_context_files(data_dir: &Path, meeting: &MeetingRecord) {
     for artifact in &meeting.context {
         remove_bluey_owned_prepared_image(data_dir, artifact);
         remove_bluey_owned_markdown(data_dir, artifact);
+        if let Some(owner_account_id) = meeting.owner_account_id.as_deref() {
+            remove_bluey_owned_restored_context_files(
+                data_dir,
+                owner_account_id,
+                meeting.id,
+                artifact,
+            );
+        }
+    }
+}
+
+fn remove_cloud_tombstoned_context_files(
+    data_dir: &Path,
+    owner_account_id: &str,
+    meeting: &MeetingRecord,
+    child_tombstones: &[CloudChildTombstone],
+) {
+    let deleted_ids = child_tombstones
+        .iter()
+        .filter(|tombstone| tombstone.child_kind == "context")
+        .map(|tombstone| {
+            local_uuid_for_cloud_id(
+                "context-artifact",
+                &tombstone.session_id,
+                &tombstone.child_id,
+            )
+        })
+        .collect::<HashSet<_>>();
+    for artifact in meeting
+        .context
+        .iter()
+        .filter(|artifact| deleted_ids.contains(&artifact.id))
+    {
+        remove_bluey_owned_prepared_image(data_dir, artifact);
+        remove_bluey_owned_markdown(data_dir, artifact);
+        remove_bluey_owned_restored_context_files(data_dir, owner_account_id, meeting.id, artifact);
+    }
+}
+
+fn remove_bluey_owned_restored_context_files(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+    artifact: &ContextArtifact,
+) {
+    let object_path = PathBuf::from(&artifact.path);
+    let expected_prefix = format!("{}-", artifact.id);
+    if object_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(&expected_prefix))
+    {
+        if let Ok(allowed_dir) = account_scoped_restored_dir(
+            data_dir,
+            CLOUD_RESTORED_OBJECTS_DIR,
+            owner_account_id,
+            session_id,
+        ) {
+            remove_file_under_allowed_dir(
+                data_dir,
+                allowed_dir,
+                object_path,
+                artifact.id,
+                "restored object",
+            );
+        }
+    }
+
+    let Some(markdown_path) = artifact.markdown_path.as_deref() else {
+        return;
+    };
+    let preview_path = PathBuf::from(markdown_path);
+    let expected_preview_name = format!("{}.md", artifact.id);
+    if preview_path.file_name().and_then(|name| name.to_str())
+        != Some(expected_preview_name.as_str())
+    {
+        return;
+    }
+    if let Ok(allowed_dir) = account_scoped_restored_dir(
+        data_dir,
+        CLOUD_RESTORED_CONTEXT_DIR,
+        owner_account_id,
+        session_id,
+    ) {
+        remove_file_under_allowed_dir(
+            data_dir,
+            allowed_dir,
+            preview_path,
+            artifact.id,
+            "restored preview",
+        );
     }
 }
 
@@ -1302,7 +2004,7 @@ fn remove_file_under_allowed_dir(
     data_dir: &Path,
     allowed_dir: PathBuf,
     path: PathBuf,
-    artifact_id: Uuid,
+    _artifact_id: Uuid,
     kind: &'static str,
 ) {
     let path = if path.is_absolute() {
@@ -1319,21 +2021,15 @@ fn remove_file_under_allowed_dir(
         Err(_) => path,
     };
     if !candidate.starts_with(&allowed) {
-        warn!(
-            artifact_id = %artifact_id,
-            path = %candidate.display(),
-            allowed = %allowed.display(),
-            "skipping cloud-delete cleanup outside Bluey context directory"
-        );
+        debug!("skipping cloud-delete cleanup outside the scoped Bluey cache");
         return;
     }
     if let Err(error) = fs::remove_file(&candidate) {
         if error.kind() != std::io::ErrorKind::NotFound {
             warn!(
-                artifact_id = %artifact_id,
-                path = %candidate.display(),
+                error_kind = ?error.kind(),
                 kind,
-                "failed to remove Bluey-owned context cache file after cloud delete: {error}"
+                "failed to remove a Bluey-owned context cache file after cloud delete"
             );
         }
     }
@@ -1341,6 +2037,7 @@ fn remove_file_under_allowed_dir(
 
 fn load_local_responses(
     data_dir: &Path,
+    owner_account_id: &str,
     meetings: &[MeetingRecord],
 ) -> HashMap<String, Vec<crate::llm::CueResponse>> {
     let db_path = data_dir.join("sessions.db");
@@ -1351,15 +2048,14 @@ fn load_local_responses(
     let mut out = HashMap::new();
     for meeting in meetings {
         let session_id = meeting.id.to_string();
-        match db.list_cue_responses(&session_id, 500) {
-            Ok(mut responses) => {
-                responses.sort_by_key(|response| response.ts_ms);
+        match db.list_all_cue_responses_for_owner(owner_account_id, &session_id) {
+            Ok(responses) => {
                 out.insert(session_id, responses);
             }
             Err(error) => {
                 debug!(
-                    session_id = %session_id,
-                    error = %error,
+                    session_hash = %cloud_log_identifier_hash(session_id.as_bytes()),
+                    error_category = local_state_error_category(&error),
                     "cloud sync could not read local cue responses"
                 );
             }
@@ -1368,89 +2064,302 @@ fn load_local_responses(
     out
 }
 
+fn purge_cloud_response_tombstones(
+    data_dir: &Path,
+    owner_account_id: &str,
+    local_session_id: Uuid,
+    child_tombstones: &[CloudChildTombstone],
+) -> Result<()> {
+    let db_path = data_dir.join("sessions.db");
+    let db_path = db_path
+        .to_str()
+        .context("session database path is not valid UTF-8")?;
+    let db = Database::open(db_path)?;
+    let session_id = local_session_id.to_string();
+    for tombstone in child_tombstones
+        .iter()
+        .filter(|tombstone| tombstone.child_kind == "response")
+    {
+        db.delete_cue_response_for_owner(owner_account_id, &session_id, &tombstone.child_id)?;
+    }
+    Ok(())
+}
+
 async fn upload_context_objects(
     data_dir: &Path,
+    owner_account_id: &str,
     meetings: &[MeetingRecord],
-    sync_states: &HashMap<Uuid, CloudSyncState>,
+    response_map: &HashMap<String, Vec<crate::llm::CueResponse>>,
+    sync_states: &mut HashMap<Uuid, CloudSyncState>,
     client: &CloudClient,
-) -> HashMap<Uuid, SyncedObjectMetadata> {
-    let mut uploaded = HashMap::new();
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<AttachmentUploadSummary> {
+    let mut summary = AttachmentUploadSummary::default();
     let mut seen = HashSet::new();
     for meeting in meetings {
-        let sync_state = sync_states.get(&meeting.id);
+        let responses = response_map.get(&meeting.id.to_string()).map(Vec::as_slice);
         for artifact in &meeting.context {
-            if !seen.insert(artifact.id) {
+            if !seen.insert((meeting.id, artifact.id)) {
                 continue;
             }
-            let Some(path) = artifact_object_path(data_dir, artifact) else {
-                continue;
+            let path = match artifact_object_source(data_dir, artifact) {
+                ArtifactObjectSource::NotApplicable => continue,
+                ArtifactObjectSource::Available(path) => path,
+                ArtifactObjectSource::Missing => {
+                    let sync_state = sync_states.get(&meeting.id).cloned();
+                    let artifact_id =
+                        wire_context_artifact_id(meeting, artifact.id, sync_state.as_ref());
+                    record_attachment_transfer_retry(
+                        data_dir,
+                        owner_account_id,
+                        meeting,
+                        responses,
+                        sync_states,
+                        artifact.id,
+                        artifact_id,
+                        CloudAttachmentTransferStatus::UploadRetry,
+                        "local_file_unavailable",
+                    )?;
+                    summary.retry_count += 1;
+                    continue;
+                }
             };
-            let Ok(metadata) = tokio::fs::metadata(&path).await else {
-                continue;
+            let sync_state = sync_states.get(&meeting.id).cloned();
+            let artifact_id = wire_context_artifact_id(meeting, artifact.id, sync_state.as_ref());
+            let session_id = wire_session_id(meeting, sync_state.as_ref());
+            let metadata = match tokio::fs::metadata(&path).await {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    record_attachment_transfer_retry(
+                        data_dir,
+                        owner_account_id,
+                        meeting,
+                        responses,
+                        sync_states,
+                        artifact.id,
+                        artifact_id,
+                        CloudAttachmentTransferStatus::UploadRetry,
+                        "local_file_unavailable",
+                    )?;
+                    summary.retry_count += 1;
+                    continue;
+                }
             };
             if !metadata.is_file() {
+                record_attachment_transfer_retry(
+                    data_dir,
+                    owner_account_id,
+                    meeting,
+                    responses,
+                    sync_states,
+                    artifact.id,
+                    artifact_id,
+                    CloudAttachmentTransferStatus::UploadRetry,
+                    "local_path_not_file",
+                )?;
+                summary.retry_count += 1;
                 continue;
             }
             if metadata.len() > MAX_OBJECT_UPLOAD_BYTES {
-                debug!(
-                    artifact_id = %artifact.id,
-                    path = %path.display(),
-                    size_bytes = metadata.len(),
-                    "cloud object sync skipped oversized artifact"
-                );
+                record_attachment_transfer_retry(
+                    data_dir,
+                    owner_account_id,
+                    meeting,
+                    responses,
+                    sync_states,
+                    artifact.id,
+                    artifact_id,
+                    CloudAttachmentTransferStatus::UploadRetry,
+                    "object_too_large",
+                )?;
+                summary.retry_count += 1;
                 continue;
             }
             let content_type = content_type_for_path(&path);
-            let artifact_id = wire_context_artifact_id(meeting, artifact.id, sync_state);
-            let session_id = wire_session_id(meeting, sync_state);
             if Uuid::parse_str(&artifact_id).is_err() {
                 // The object endpoint is UUID-keyed. Legacy non-UUID record IDs
                 // still round-trip through JSON sync, but their unavailable
                 // object bytes are intentionally not attached to a new ID.
-                debug!(
-                    artifact_id = %artifact_id,
-                    "cloud object sync skipped legacy non-UUID artifact id"
-                );
+                record_attachment_transfer_retry(
+                    data_dir,
+                    owner_account_id,
+                    meeting,
+                    responses,
+                    sync_states,
+                    artifact.id,
+                    artifact_id,
+                    CloudAttachmentTransferStatus::UploadRetry,
+                    "unsupported_object_identifier",
+                )?;
+                summary.retry_count += 1;
                 continue;
             }
             match tokio::fs::read(&path).await {
-                Ok(bytes) => match client
-                    .upload_artifact_object(&artifact_id, &session_id, bytes, &content_type)
-                    .await
-                {
-                    Ok(response) => {
-                        uploaded.insert(
-                            artifact.id,
-                            SyncedObjectMetadata {
+                Ok(bytes) => {
+                    let local_sha256 = format!("{:x}", Sha256::digest(&bytes));
+                    if let Some(object) = sync_states
+                        .get(&meeting.id)
+                        .and_then(|state| state.attachment_transfers.get(&artifact.id.to_string()))
+                        .filter(|transfer| {
+                            transfer.status == CloudAttachmentTransferStatus::Synced
+                                && transfer.record_id == artifact_id
+                        })
+                        .and_then(|transfer| transfer.object.as_ref())
+                        .filter(|object| {
+                            object.sha256.eq_ignore_ascii_case(&local_sha256)
+                                && object.size_bytes == bytes.len() as u64
+                        })
+                        .cloned()
+                    {
+                        summary.uploaded.insert(artifact.id, object);
+                        continue;
+                    }
+                    operation_is_active()?;
+                    match client
+                        .upload_artifact_object(&artifact_id, &session_id, bytes, &content_type)
+                        .await
+                    {
+                        Ok(response) => {
+                            operation_is_active()?;
+                            let object = SyncedObjectMetadata {
                                 object_key: response.object_key,
                                 size_bytes: response.size_bytes,
                                 sha256: response.sha256,
                                 content_type: response.content_type,
                                 expires_at_ms: response.expires_at_ms,
-                            },
-                        );
+                            };
+                            if !object.sha256.eq_ignore_ascii_case(&local_sha256)
+                                || object.size_bytes != metadata.len()
+                            {
+                                record_attachment_transfer_retry(
+                                    data_dir,
+                                    owner_account_id,
+                                    meeting,
+                                    responses,
+                                    sync_states,
+                                    artifact.id,
+                                    artifact_id,
+                                    CloudAttachmentTransferStatus::UploadRetry,
+                                    "object_integrity_mismatch",
+                                )?;
+                                summary.retry_count += 1;
+                                continue;
+                            }
+                            record_attachment_transfer_success(
+                                data_dir,
+                                owner_account_id,
+                                meeting,
+                                responses,
+                                sync_states,
+                                artifact.id,
+                                artifact_id,
+                                object.clone(),
+                            )?;
+                            summary.uploaded.insert(artifact.id, object);
+                        }
+                        Err(_) => {
+                            record_attachment_transfer_retry(
+                                data_dir,
+                                owner_account_id,
+                                meeting,
+                                responses,
+                                sync_states,
+                                artifact.id,
+                                artifact_id,
+                                CloudAttachmentTransferStatus::UploadRetry,
+                                "object_upload_failed",
+                            )?;
+                            summary.retry_count += 1;
+                        }
                     }
-                    Err(error) => {
-                        warn!(
-                            artifact_id = %artifact.id,
-                            path = %path.display(),
-                            error = %error,
-                            "cloud object upload failed; continuing with text sync"
-                        );
-                    }
-                },
-                Err(error) => {
-                    debug!(
-                        artifact_id = %artifact.id,
-                        path = %path.display(),
-                        error = %error,
-                        "cloud object sync could not read artifact"
-                    );
+                }
+                Err(_) => {
+                    record_attachment_transfer_retry(
+                        data_dir,
+                        owner_account_id,
+                        meeting,
+                        responses,
+                        sync_states,
+                        artifact.id,
+                        artifact_id,
+                        CloudAttachmentTransferStatus::UploadRetry,
+                        "local_file_read_failed",
+                    )?;
+                    summary.retry_count += 1;
                 }
             }
         }
     }
-    uploaded
+    Ok(summary)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_attachment_transfer_retry(
+    data_dir: &Path,
+    owner_account_id: &str,
+    meeting: &MeetingRecord,
+    responses: Option<&[crate::llm::CueResponse]>,
+    sync_states: &mut HashMap<Uuid, CloudSyncState>,
+    local_artifact_id: Uuid,
+    record_id: String,
+    status: CloudAttachmentTransferStatus,
+    error_category: &str,
+) -> Result<()> {
+    let state = sync_states
+        .entry(meeting.id)
+        .or_insert_with(|| initial_cloud_sync_state(meeting, responses, owner_account_id));
+    validate_cloud_sync_state_owner(state, owner_account_id)?;
+    let previous_attempts = state
+        .attachment_transfers
+        .get(&local_artifact_id.to_string())
+        .map(|transfer| transfer.attempt_count)
+        .unwrap_or_default();
+    state.attachment_transfers.insert(
+        local_artifact_id.to_string(),
+        CloudAttachmentTransferState {
+            record_id,
+            status,
+            attempt_count: previous_attempts.saturating_add(1),
+            updated_at_ms: current_epoch_ms(),
+            last_error_category: Some(error_category.to_string()),
+            object: None,
+        },
+    );
+    write_cloud_sync_state(data_dir, owner_account_id, meeting.id, state)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_attachment_transfer_success(
+    data_dir: &Path,
+    owner_account_id: &str,
+    meeting: &MeetingRecord,
+    responses: Option<&[crate::llm::CueResponse]>,
+    sync_states: &mut HashMap<Uuid, CloudSyncState>,
+    local_artifact_id: Uuid,
+    record_id: String,
+    object: SyncedObjectMetadata,
+) -> Result<()> {
+    let state = sync_states
+        .entry(meeting.id)
+        .or_insert_with(|| initial_cloud_sync_state(meeting, responses, owner_account_id));
+    validate_cloud_sync_state_owner(state, owner_account_id)?;
+    let previous_attempts = state
+        .attachment_transfers
+        .get(&local_artifact_id.to_string())
+        .map(|transfer| transfer.attempt_count)
+        .unwrap_or_default();
+    state.attachment_transfers.insert(
+        local_artifact_id.to_string(),
+        CloudAttachmentTransferState {
+            record_id,
+            status: CloudAttachmentTransferStatus::Synced,
+            attempt_count: previous_attempts.saturating_add(1),
+            updated_at_ms: current_epoch_ms(),
+            last_error_category: None,
+            object: Some(object),
+        },
+    );
+    write_cloud_sync_state(data_dir, owner_account_id, meeting.id, state)
 }
 
 fn build_object_parent_batches(
@@ -1480,40 +2389,64 @@ fn build_object_parent_batches(
     batches
 }
 
-async fn sync_session_audit_bundles(
+async fn sync_session_audit_bundles<F>(
     data_dir: &Path,
     meetings: &[MeetingRecord],
-    response_map: &HashMap<String, Vec<crate::llm::CueResponse>>,
     client: &CloudClient,
-    owner_account_id: Option<&str>,
-) {
+    consent_is_active: F,
+) -> Result<usize>
+where
+    F: Fn() -> bool,
+{
     prune_local_audit_storage(data_dir);
+    let mut uploaded = 0usize;
     for meeting in meetings {
-        let session_id = meeting.id.to_string();
-        let responses = response_map.get(&session_id);
-        if !meeting_has_syncable_content(meeting, responses) {
+        if !consent_is_active() {
+            if let Some(owner_account_id) = meeting.owner_account_id.as_deref() {
+                crate::diagnostics::fence_support_diagnostics_for_owner(
+                    data_dir,
+                    owner_account_id,
+                )?;
+            }
+            break;
+        }
+        let scope = SessionAuditScope::from_meeting(meeting);
+        if !crate::diagnostics::support_diagnostic_scope_is_uploadable(data_dir, &scope) {
+            purge_session_audit_state(data_dir, meeting.owner_account_id.as_deref(), meeting.id)?;
             continue;
         }
-        let response_slice = responses.map(Vec::as_slice).unwrap_or(&[]);
-        let built = match build_local_session_audit_bundle(
-            data_dir,
-            meeting,
-            response_slice,
-            owner_account_id,
-        ) {
-            Ok(bundle) => bundle,
-            Err(error) => {
+        let session_id = meeting.id.to_string();
+        let build_data_dir = data_dir.to_path_buf();
+        let build_meeting = meeting.clone();
+        let mut built = match tokio::task::spawn_blocking(move || {
+            build_local_session_audit_bundle(&build_data_dir, &build_meeting)
+        })
+        .await
+        {
+            Ok(Ok(bundle)) => bundle,
+            Ok(Err(error)) => {
                 warn!(
-                    session_id = %meeting.id,
-                    error = %error,
-                    "session audit bundle build failed"
+                    session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                    error_category = local_state_error_category(&error),
+                    "support diagnostic bundle build failed"
+                );
+                continue;
+            }
+            Err(_) => {
+                warn!(
+                    session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                    "support diagnostic bundle worker did not complete"
                 );
                 continue;
             }
         };
+        if built.bundle.events.is_empty() {
+            let _ = fs::remove_dir_all(&built.local_dir);
+            continue;
+        }
         if built.bytes.len() > MAX_AUDIT_BUNDLE_BYTES {
             warn!(
-                session_id = %meeting.id,
+                session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
                 size_bytes = built.bytes.len(),
                 max_bytes = MAX_AUDIT_BUNDLE_BYTES,
                 "session audit bundle skipped because it is too large"
@@ -1523,515 +2456,519 @@ async fn sync_session_audit_bundles(
         if audit_upload_marker_matches(data_dir, meeting, &built.bundle.bundle_id) {
             if let Err(error) = fs::remove_dir_all(&built.local_dir) {
                 debug!(
-                    session_id = %meeting.id,
-                    path = %built.local_dir.display(),
-                    error = %error,
+                    session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                    error_kind = ?error.kind(),
                     "already uploaded session audit bundle could not be removed locally"
                 );
             }
+            if let Err(error) = remove_session_audit_event_log_if_unchanged(
+                data_dir,
+                meeting,
+                built.event_log_fingerprint,
+            ) {
+                debug!(
+                    session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                    error_category = local_state_error_category(&error),
+                    "already uploaded diagnostic event log could not be removed locally"
+                );
+            }
+            continue;
+        }
+        if !consent_is_active() {
+            if let Some(owner_account_id) = meeting.owner_account_id.as_deref() {
+                crate::diagnostics::fence_support_diagnostics_for_owner(
+                    data_dir,
+                    owner_account_id,
+                )?;
+            }
+            break;
+        }
+        if !crate::diagnostics::support_diagnostic_scope_is_uploadable(data_dir, &scope) {
+            purge_session_audit_state(data_dir, meeting.owner_account_id.as_deref(), meeting.id)?;
             continue;
         }
         match client
             .upload_session_audit_bundle(
                 &session_id,
                 &built.bundle.bundle_id,
-                built.bytes.clone(),
+                std::mem::take(&mut built.bytes),
                 AUDIT_BUNDLE_CONTENT_TYPE,
             )
             .await
         {
             Ok(response) => {
+                if !consent_is_active() {
+                    if let Some(owner_account_id) = meeting.owner_account_id.as_deref() {
+                        crate::diagnostics::fence_support_diagnostics_for_owner(
+                            data_dir,
+                            owner_account_id,
+                        )?;
+                    }
+                    return Ok(uploaded);
+                }
+                uploaded = uploaded.saturating_add(1);
                 if let Err(error) = write_audit_upload_marker(data_dir, meeting, &built, &response)
                 {
                     debug!(
-                        session_id = %meeting.id,
-                        error = %error,
+                        session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                        error_category = local_state_error_category(&error),
                         "session audit upload marker write failed"
                     );
                 }
                 if let Err(error) = fs::remove_dir_all(&built.local_dir) {
                     warn!(
-                        session_id = %meeting.id,
-                        path = %built.local_dir.display(),
-                        error = %error,
+                        session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                        error_kind = ?error.kind(),
                         "uploaded session audit bundle could not be removed locally"
                     );
                 }
-                if let Err(error) = remove_session_audit_event_log(data_dir, meeting.id) {
-                    debug!(
-                        session_id = %meeting.id,
-                        error = %error,
-                        "uploaded session audit event log could not be removed locally"
-                    );
+                match remove_session_audit_event_log_if_unchanged(
+                    data_dir,
+                    meeting,
+                    built.event_log_fingerprint,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => debug!(
+                        session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                        "new diagnostic events arrived during upload; preserving them for the next bundle"
+                    ),
+                    Err(error) => debug!(
+                        session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                        error_category = local_state_error_category(&error),
+                        "uploaded diagnostic event log could not be removed locally"
+                    ),
                 }
             }
             Err(error) => {
                 warn!(
-                    session_id = %meeting.id,
-                    bundle_id = %built.bundle.bundle_id,
-                    error = %error,
-                    "session audit bundle upload failed; local retry copy remains bounded"
+                    session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
+                    error_category = support_upload_error_category(&error),
+                    "support diagnostic upload deferred; local retry copy remains bounded"
                 );
+                return Err(anyhow::anyhow!("support diagnostic upload deferred"));
             }
         }
     }
     prune_local_audit_storage(data_dir);
+    Ok(uploaded)
+}
+
+fn support_upload_error_category(error: &cue_cloud_client::Error) -> &'static str {
+    match error {
+        cue_cloud_client::Error::Unauthorized => "unauthorized",
+        cue_cloud_client::Error::Server { status: 403 } => "forbidden",
+        cue_cloud_client::Error::Server { status: 404 } => "unavailable",
+        cue_cloud_client::Error::Server { status: 413 } => "too_large",
+        cue_cloud_client::Error::Server { status } if *status >= 500 => "server_unavailable",
+        cue_cloud_client::Error::Network(_) => "network",
+        _ => "rejected",
+    }
+}
+
+fn local_state_error_category(error: &anyhow::Error) -> &'static str {
+    match error
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+    {
+        Some(std::io::ErrorKind::NotFound) => "not_found",
+        Some(std::io::ErrorKind::PermissionDenied) => "permission_denied",
+        Some(std::io::ErrorKind::InvalidData) => "invalid_data",
+        Some(std::io::ErrorKind::WriteZero) => "write_failed",
+        Some(std::io::ErrorKind::UnexpectedEof) => "truncated",
+        Some(_) => "io",
+        None => "local_state",
+    }
 }
 
 fn build_local_session_audit_bundle(
     data_dir: &Path,
     meeting: &MeetingRecord,
-    responses: &[crate::llm::CueResponse],
-    account_id: Option<&str>,
 ) -> Result<BuiltAuditBundle> {
-    let audit_root = data_dir.join(SESSION_AUDIT_DIR);
-    let local_dir = audit_root.join(meeting.id.to_string());
-    let audio_dir = local_dir.join("audio");
+    let local_dir = session_audit_bundle_dir(data_dir, meeting);
     cue_core::app_paths::create_private_dir(&local_dir)?;
-    cue_core::app_paths::create_private_dir(&audio_dir)?;
 
-    let bundle = assemble_session_audit_bundle(data_dir, meeting, responses, account_id);
+    let (bundle, event_log_fingerprint) = assemble_session_audit_bundle(data_dir, meeting);
     let bytes = serde_json::to_vec_pretty(&bundle).context("serialize session audit bundle")?;
     write_json_file(&local_dir.join("manifest.json"), &bundle.manifest)?;
     write_jsonl_file(&local_dir.join("events.jsonl"), &bundle.events)?;
-    write_jsonl_file(&local_dir.join("questions.jsonl"), &bundle.questions)?;
-    write_jsonl_file(&local_dir.join("responses.jsonl"), &bundle.responses)?;
-    write_jsonl_file(&local_dir.join("transcript.jsonl"), &bundle.transcript)?;
-    write_jsonl_file(&local_dir.join("context.jsonl"), &bundle.context)?;
-    write_jsonl_file(&local_dir.join("screen.jsonl"), &bundle.screen)?;
-    write_jsonl_file(&local_dir.join("artifacts.jsonl"), &bundle.artifacts)?;
-    write_jsonl_file(&local_dir.join("costs.jsonl"), &bundle.costs)?;
-    write_jsonl_file(&local_dir.join("attachments.jsonl"), &bundle.attachments)?;
-    write_jsonl_file(
-        &audio_dir.join("audio.jsonl"),
-        &[json!({
-            "schema_version": AUDIT_SCHEMA_VERSION,
-            "session_id": meeting.id.to_string(),
-            "session_code": short_session_code(meeting.id),
-            "kind": "audio_capture_manifest",
-            "created_at_ms": current_epoch_ms(),
-            "audio_chunk_storage": "not_collected",
-            "content_policy": "metadata_only",
-        })],
-    )?;
     write_json_file(&local_dir.join("bundle.json"), &bundle)?;
 
     Ok(BuiltAuditBundle {
         bundle,
         bytes,
         local_dir,
+        event_log_fingerprint,
     })
 }
 
 fn assemble_session_audit_bundle(
     data_dir: &Path,
     meeting: &MeetingRecord,
-    responses: &[crate::llm::CueResponse],
-    account_id: Option<&str>,
-) -> SessionAuditBundle {
+) -> (SessionAuditBundle, Option<AuditEventLogFingerprint>) {
     let session_id = meeting.id.to_string();
     let session_code = short_session_code(meeting.id);
-    let generated_at_ms = current_epoch_ms();
-    let event_log_fingerprint = audit_event_log_fingerprint(data_dir, meeting.id);
-    let updated_at = updated_at_ms(meeting, Some(responses))
-        .max(
-            event_log_fingerprint
-                .map(|(modified_ms, _)| modified_ms)
-                .unwrap_or_default(),
-        )
-        .max(
-            responses
-                .iter()
-                .map(|response| response.ts_ms as i64)
-                .max()
-                .unwrap_or_default(),
-        );
+    let observed_at_ms = current_epoch_ms();
+    let (raw_events, event_log_fingerprint) =
+        read_session_audit_events_with_fingerprint(data_dir, meeting);
+    let updated_at = event_log_fingerprint
+        .map(|fingerprint| fingerprint.modified_at_ms)
+        .unwrap_or(observed_at_ms);
+    // Derive the bundle timestamp from the locked event-log snapshot. Retries
+    // of the same fingerprint must produce identical bytes and therefore the
+    // same server-side checksum/idempotency result.
+    let generated_at_ms = updated_at;
     let event_log_size = event_log_fingerprint
-        .map(|(_, size_bytes)| size_bytes)
+        .map(|fingerprint| fingerprint.bytes)
         .unwrap_or(0);
-    let bundle_id = format!("audit-{session_code}-{updated_at}-{event_log_size}");
-    let device_id = std::env::var("BLUEY_DEVICE_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-
-    let mut events = Vec::new();
-    let mut questions = Vec::new();
-    let mut response_records = Vec::new();
-    let mut transcript = Vec::new();
-    let mut context = Vec::new();
-    let mut screen = Vec::new();
-    let mut artifacts = Vec::new();
-    let mut costs = Vec::new();
-    let mut attachments = Vec::new();
-    let mut sequence = 0u64;
-    let mut seen_questions = HashSet::new();
-
-    push_audit_record(
-        &mut events,
-        &session_id,
-        &session_code,
-        account_id,
-        &device_id,
-        &mut sequence,
-        "session",
-        json!({
-            "started_at_ms": parse_ms(&meeting.started_at),
-            "ended_at_ms": meeting.ended_at.as_deref().map(parse_ms),
-            "updated_at_ms": updated_at,
-            "listen_runs": meeting.diagnostics.listen_runs,
-            "stt_parse_errors": meeting.diagnostics.stt_parse_errors,
-            "stt_provider_errors": meeting.diagnostics.stt_provider_errors,
-            "audio_start_errors": meeting.diagnostics.audio_start_errors,
-            "audio_source_errors": meeting.diagnostics.audio_source_errors,
-            "last_audio_session_id": meeting.diagnostics.last_audio_session_id,
-            "last_stt_provider": meeting.diagnostics.last_stt_provider,
-            "last_error_kind": meeting.diagnostics.last_error_kind,
-            "last_error_at_ms": meeting.diagnostics.last_error_at.as_deref().map(parse_ms),
-            "title_chars": meeting.title.chars().count(),
-            "summary_chars": meeting.summary.as_deref().map(|value| value.chars().count()),
-            "answer_style_chars": meeting.answer_instructions.as_deref().map(|value| value.chars().count()),
-        }),
+    let event_log_sequence = event_log_fingerprint
+        .map(|fingerprint| fingerprint.last_sequence)
+        .unwrap_or(0);
+    let retention_days = audit_local_retention_days();
+    let retention_max_bytes = audit_local_max_bytes();
+    let bundle_id = format!(
+        "diagnostic-{session_code}-{updated_at}-{event_log_size}-{event_log_sequence}-{retention_days}-{retention_max_bytes}"
     );
-
-    for segment in &meeting.transcript {
-        let payload = json!({
-            "segment_id": segment.id.to_string(),
-            "speaker": segment.speaker.to_string(),
-            "text": truncate_chars(&segment.text, MAX_TEXT_PREVIEW_CHARS),
-            "created_at_ms": parse_ms(&segment.created_at),
-            "is_final": segment.is_final,
-        });
-        push_audit_record(
-            &mut transcript,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "transcript_segment",
-            payload.clone(),
-        );
-        push_audit_record(
-            &mut events,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "transcript_segment",
-            json!({ "segment_id": segment.id.to_string(), "is_final": segment.is_final }),
-        );
-    }
-
-    for artifact in &meeting.context {
-        let payload = json!({
-            "artifact_id": artifact.id.to_string(),
-            "kind": artifact.kind.to_string(),
-            "title": artifact.title,
-            "note": artifact.note,
-            "path": artifact.path,
-            "size_bytes": artifact.size_bytes,
-            "text_preview": artifact.text_preview.as_deref().map(|text| truncate_chars(text, MAX_TEXT_PREVIEW_CHARS)),
-            "markdown_path": artifact.markdown_path,
-            "processing_status": artifact.processing_status.to_string(),
-            "processing_error": artifact.processing_error,
-            "answer_context_role": artifact.answer_context_role,
-            "created_at_ms": parse_ms(&artifact.created_at),
-        });
-        push_audit_record(
-            &mut context,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "context_artifact",
-            payload.clone(),
-        );
-        push_audit_record(
-            &mut attachments,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "attachment",
-            payload.clone(),
-        );
-        if matches!(artifact.kind, ContextKind::Image | ContextKind::Diagram)
-            || artifact.title.to_ascii_lowercase().contains("screen")
-        {
-            push_audit_record(
-                &mut screen,
-                &session_id,
-                &session_code,
-                account_id,
-                &device_id,
-                &mut sequence,
-                "screen_context",
-                payload.clone(),
-            );
-        }
-        push_audit_record(
-            &mut events,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "context_artifact",
-            json!({ "artifact_id": artifact.id.to_string(), "kind": artifact.kind.to_string() }),
-        );
-    }
-
-    for response in responses {
-        if let Some(question) = response
-            .source_text
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-        {
-            let key = format!("{}:{}", response.id, question.trim());
-            if seen_questions.insert(key) {
-                push_audit_record(
-                    &mut questions,
-                    &session_id,
-                    &session_code,
-                    account_id,
-                    &device_id,
-                    &mut sequence,
-                    "question",
-                    json!({
-                        "response_id": response.id,
-                        "text": truncate_chars(question, MAX_TEXT_PREVIEW_CHARS),
-                        "created_at_ms": response.ts_ms as i64,
-                        "source": "cue_response",
-                    }),
-                );
-            }
-        }
-        push_audit_record(
-            &mut response_records,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "response",
-            json!({
-                "response_id": response.id,
-                "kind": response.kind,
-                "text": truncate_chars(&response.text, MAX_RESPONSE_CHARS),
-                "created_at_ms": response.ts_ms as i64,
-                "provider": response.provider,
-                "model": response.model,
-                "cost_label": response.cost_label,
-                "artifact_type": response.artifact_type,
-                "artifact_confidence": response.artifact_confidence,
-            }),
-        );
-        push_response_cost_record(
-            &mut costs,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            response,
-        );
-        if response.artifact_type.is_some() || response.artifact_body.is_some() {
-            push_audit_record(
-                &mut artifacts,
-                &session_id,
-                &session_code,
-                account_id,
-                &device_id,
-                &mut sequence,
-                "response_artifact",
-                json!({
-                    "response_id": response.id,
-                    "artifact_type": response.artifact_type,
-                    "artifact_body": response.artifact_body.as_deref().map(|body| truncate_chars(body, MAX_RESPONSE_CHARS)),
-                    "artifact_confidence": response.artifact_confidence,
-                }),
-            );
-        }
-    }
-
-    for turn in &meeting.conversation {
-        let key = format!("turn:{}:{}", turn.id, turn.question.trim());
-        if !turn.question.trim().is_empty() && seen_questions.insert(key) {
-            push_audit_record(
-                &mut questions,
-                &session_id,
-                &session_code,
-                account_id,
-                &device_id,
-                &mut sequence,
-                "question",
-                json!({
-                    "turn_id": turn.id.to_string(),
-                    "text": truncate_chars(&turn.question, MAX_TEXT_PREVIEW_CHARS),
-                    "created_at_ms": parse_ms(&turn.created_at),
-                    "source": turn.source,
-                    "attachment_ids": turn.attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                }),
-            );
-        }
-        push_audit_record(
-            &mut response_records,
-            &session_id,
-            &session_code,
-            account_id,
-            &device_id,
-            &mut sequence,
-            "response",
-            json!({
-                "turn_id": turn.id.to_string(),
-                "text": truncate_chars(&turn.answer, MAX_RESPONSE_CHARS),
-                "created_at_ms": parse_ms(&turn.created_at),
-                "provider": turn.provider,
-                "source": turn.source,
-                "attachment_ids": turn.attachment_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
-                "artifact_type": turn.artifact.as_ref().map(|artifact| cloud_artifact_type_value(artifact.artifact_type)),
-            }),
-        );
-        if let Some(artifact) = &turn.artifact {
-            push_audit_record(
-                &mut artifacts,
-                &session_id,
-                &session_code,
-                account_id,
-                &device_id,
-                &mut sequence,
-                "turn_artifact",
-                json!({
-                    "turn_id": turn.id.to_string(),
-                    "artifact_type": cloud_artifact_type_value(artifact.artifact_type),
-                    "title": artifact.title,
-                    "body": truncate_chars(&artifact.body, MAX_RESPONSE_CHARS),
-                    "confidence": artifact.confidence,
-                }),
-            );
-        }
-    }
-
-    let raw_ui_events = read_session_audit_events(data_dir, meeting.id);
-    let raw_ui_event_count = raw_ui_events.len();
-    events.extend(raw_ui_events);
+    let events = raw_events
+        .into_iter()
+        .filter_map(privacy_safe_remote_audit_event)
+        .collect::<Vec<_>>();
 
     let manifest = json!({
         "schema_version": AUDIT_SCHEMA_VERSION,
         "bundle_id": bundle_id,
         "session_id": session_id,
         "session_code": session_code,
-        "account_id": account_id,
-        "device_id": device_id,
         "generated_at_ms": generated_at_ms,
         "updated_at_ms": updated_at,
+        "content_policy": "metadata_only",
         "record_counts": {
             "events": events.len(),
-            "questions": questions.len(),
-            "responses": response_records.len(),
-            "transcript": transcript.len(),
-            "context": context.len(),
-            "screen": screen.len(),
-            "artifacts": artifacts.len(),
-            "costs": costs.len(),
-            "attachments": attachments.len(),
-            "raw_ui_events": raw_ui_event_count,
         },
+        "excluded_content": [
+            "questions", "answers", "transcripts", "prompts", "audio", "screenshots",
+            "files", "paths", "urls", "clipboard", "tokens", "raw_errors"
+        ],
         "local_retention": {
             "uploaded_session_dirs_removed": true,
-            "failed_upload_dirs_retention_days": audit_local_retention_days(),
-            "failed_upload_root_max_bytes": audit_local_max_bytes(),
+            "failed_upload_dirs_retention_days": retention_days,
+            "failed_upload_root_max_bytes": retention_max_bytes,
         },
     });
 
-    SessionAuditBundle {
-        schema_version: AUDIT_SCHEMA_VERSION,
-        bundle_id,
-        session_id,
-        session_code,
-        account_id: account_id.map(ToString::to_string),
-        device_id,
-        generated_at_ms,
-        manifest,
-        events,
-        questions,
-        responses: response_records,
-        transcript,
-        context,
-        screen,
-        artifacts,
-        costs,
-        attachments,
-    }
+    (
+        SessionAuditBundle {
+            schema_version: AUDIT_SCHEMA_VERSION,
+            bundle_id,
+            session_id,
+            session_code,
+            generated_at_ms,
+            content_policy: "metadata_only".to_string(),
+            manifest,
+            events,
+        },
+        event_log_fingerprint,
+    )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn push_audit_record(
-    records: &mut Vec<Value>,
-    session_id: &str,
-    session_code: &str,
-    account_id: Option<&str>,
-    device_id: &Option<String>,
-    sequence: &mut u64,
-    kind: &str,
-    payload: Value,
-) {
-    *sequence += 1;
-    records.push(json!({
-        "schema_version": AUDIT_SCHEMA_VERSION,
-        "event_id": format!("{session_code}-{:08}", *sequence),
-        "session_id": session_id,
-        "session_code": session_code,
-        "account_id": account_id,
-        "device_id": device_id.as_deref(),
-        "sequence": *sequence,
-        "kind": kind,
-        "created_at_ms": current_epoch_ms(),
-        "source": "desktop_sync",
-        "payload": metadata_only_audit_payload(payload),
-    }));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_response_cost_record(
-    records: &mut Vec<Value>,
-    session_id: &str,
-    session_code: &str,
-    account_id: Option<&str>,
-    device_id: &Option<String>,
-    sequence: &mut u64,
-    response: &crate::llm::CueResponse,
-) {
-    if response.cost_cents.is_none()
-        && response.balance_cents_after.is_none()
-        && response.input_tokens.is_none()
-        && response.output_tokens.is_none()
+fn privacy_safe_remote_audit_event(value: Value) -> Option<Value> {
+    let Value::Object(mut record) = value else {
+        return None;
+    };
+    let sequence = record.remove("sequence").and_then(|value| value.as_u64())?;
+    let created_at_ms = record
+        .remove("created_at_ms")
+        .and_then(|value| value.as_u64())?;
+    let kind = record
+        .remove("kind")
+        .and_then(|value| {
+            value
+                .as_str()
+                .and_then(safe_support_label)
+                .map(str::to_string)
+        })
+        .filter(|kind| support_diagnostic_event_kind_is_known(kind))?;
+    let payload = support_diagnostic_payload(record.remove("payload").unwrap_or(Value::Null));
+    if payload.get("schema_version").and_then(Value::as_u64) != Some(2)
+        || payload.get("event_name").and_then(Value::as_str) != Some(kind.as_str())
+        || !payload
+            .get("component")
+            .and_then(Value::as_str)
+            .is_some_and(support_diagnostic_component_is_known)
+        || !payload
+            .get("outcome")
+            .and_then(Value::as_str)
+            .is_some_and(support_diagnostic_outcome_is_known)
+        || payload
+            .get("created_at_ms")
+            .and_then(Value::as_u64)
+            .is_none()
+        || payload
+            .get("monotonic_offset_ms")
+            .and_then(Value::as_u64)
+            .is_none()
     {
-        return;
+        return None;
     }
-    push_audit_record(
-        records,
-        session_id,
-        session_code,
-        account_id,
-        device_id,
-        sequence,
-        "cost",
-        json!({
-            "response_id": response.id,
-            "provider": response.provider,
-            "model": response.model,
-            "input_tokens": response.input_tokens,
-            "output_tokens": response.output_tokens,
-            "cost_cents": response.cost_cents,
-            "balance_cents_after": response.balance_cents_after,
-            "cost_label": response.cost_label,
-            "created_at_ms": response.ts_ms as i64,
-        }),
+    Some(json!({
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "sequence": sequence,
+        "kind": kind,
+        "created_at_ms": created_at_ms,
+        "source": "desktop_diagnostic",
+        "content_policy": "metadata_only",
+        "payload": payload,
+    }))
+}
+
+fn support_diagnostic_event_kind_is_known(kind: &str) -> bool {
+    matches!(
+        kind,
+        "overlay_user_action"
+            | "overlay_lifecycle"
+            | "answer_request_accepted"
+            | "answer_context_prepared"
+            | "answer_card_created"
+            | "answer_status_presented"
+            | "answer_replay_started"
+            | "answer_route_completed"
+            | "answer_first_text"
+            | "answer_completed"
+            | "answer_failed"
+            | "answer_slow_start"
+            | "native_first_text_rendered"
+            | "native_final_rendered"
+            | "transcript_settled"
+            | "transcript_buffer_consumed"
+            | "audio_start_requested"
+            | "audio_capture_ready"
+            | "audio_stop_requested"
+            | "audio_capture_stopped"
+            | "audio_first_chunk"
+            | "stt_connected"
+            | "stt_first_partial"
+            | "stt_first_final"
+            | "rag_query_completed"
+            | "model_attempt_started"
+            | "model_connected"
+            | "model_first_event"
+            | "model_first_text"
+            | "model_attempt_completed"
+            | "persistence_completed"
+            | "context_watch_observed"
+            | "diagnostic_events_dropped"
+    )
+}
+
+fn support_diagnostic_component_is_known(component: &str) -> bool {
+    matches!(
+        component,
+        "native_overlay" | "daemon" | "audio" | "stt" | "rag" | "model" | "persistence" | "support"
+    )
+}
+
+fn support_diagnostic_outcome_is_known(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        "started" | "succeeded" | "failed" | "timed_out" | "dropped"
+    )
+}
+
+fn support_diagnostic_payload(payload: Value) -> Value {
+    let Value::Object(payload) = payload else {
+        return json!({ "content_policy": "metadata_only" });
+    };
+    let mut safe = Map::new();
+    for (key, value) in payload {
+        let allowed = match key.as_str() {
+            "schema_version"
+            | "created_at_ms"
+            | "monotonic_offset_ms"
+            | "duration_ms"
+            | "queue_wait_ms"
+            | "queue_depth"
+            | "queue_high_water"
+            | "attempt"
+            | "generation"
+            | "sequence"
+            | "count"
+            | "bytes"
+            | "input_chars"
+            | "output_chars"
+            | "context_count"
+            | "document_count"
+            | "screenshot_count"
+            | "transcript_count"
+            | "memory_count"
+            | "source_count"
+            | "dropped_count"
+            | "coalesced_count" => value.is_number(),
+            "streaming" => value.is_boolean(),
+            "interaction_id" | "trace_id" | "request_id" | "audio_run_id" | "card_id" => value
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .is_some(),
+            "event_name" => value
+                .as_str()
+                .is_some_and(support_diagnostic_event_kind_is_known),
+            "component" => value
+                .as_str()
+                .is_some_and(support_diagnostic_component_is_known),
+            "outcome" => value
+                .as_str()
+                .is_some_and(support_diagnostic_outcome_is_known),
+            "provider" | "route" => value.as_str().is_some_and(support_provider_is_known),
+            "model" => value.as_str().is_some_and(support_model_family_is_known),
+            "action" => value.as_str().is_some_and(support_action_is_known),
+            "error_category" => value.as_str().is_some_and(support_error_category_is_known),
+            "question_intent" => value.as_str().is_some_and(support_question_intent_is_known),
+            "artifact_type" => value.as_str().is_some_and(support_artifact_type_is_known),
+            _ => false,
+        };
+        if allowed {
+            safe.insert(key, value);
+        }
+    }
+    safe.insert(
+        "content_policy".to_string(),
+        Value::String("metadata_only".to_string()),
     );
+    Value::Object(safe)
+}
+
+fn safe_support_label(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 48
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        }))
+    .then_some(value)
+}
+
+fn support_provider_is_known(value: &str) -> bool {
+    matches!(
+        value,
+        "anthropic"
+            | "assemblyai"
+            | "bluey_managed"
+            | "deepgram"
+            | "google"
+            | "groq"
+            | "local"
+            | "openai"
+            | "other"
+    )
+}
+
+fn support_model_family_is_known(value: &str) -> bool {
+    matches!(
+        value,
+        "bluey"
+            | "claude"
+            | "gemini"
+            | "gpt"
+            | "kimi"
+            | "llama"
+            | "mistral"
+            | "nova"
+            | "openai_reasoning"
+            | "other"
+            | "qwen"
+            | "whisper"
+    )
+}
+
+fn support_action_is_known(value: &str) -> bool {
+    matches!(
+        value,
+        "active_page_capture_requested"
+            | "analyze_screen_requested"
+            | "ask_answer_sent"
+            | "ask_answer_skipped"
+            | "ask_requested"
+            | "attach_files_requested"
+            | "attach_requested"
+            | "autosend_answer_sent"
+            | "autosend_answer_skipped"
+            | "capture_start_requested"
+            | "capture_stop_requested"
+            | "close_requested"
+            | "context_list_requested"
+            | "hidden"
+            | "instructions_requested"
+            | "instructions_updated"
+            | "meeting_banner_action"
+            | "opacity_updated"
+            | "paste_text_requested"
+            | "ready"
+            | "recap_requested"
+            | "recording_start_requested"
+            | "recording_stop_requested"
+            | "remove_context_requested"
+            | "session_continue_requested"
+            | "session_delete_requested"
+            | "session_drawer_opened"
+            | "session_drawer_sessions_rendered"
+            | "session_list_requested"
+            | "session_new_requested"
+            | "session_open_requested"
+            | "session_rename_requested"
+            | "shortcuts_coachmark_dismissed"
+            | "shortcuts_coachmark_shown"
+            | "shortcuts_overlay_opened"
+            | "shown"
+            | "sign_in_requested"
+            | "theme_changed"
+            | "transcript_buffer_consumed"
+            | "transcript_buffer_skip_consumed"
+            | "transcript_clear_requested"
+            | "transcript_context_cleared"
+    )
+}
+
+fn support_error_category_is_known(value: &str) -> bool {
+    matches!(
+        value,
+        "authentication"
+            | "billing"
+            | "cancelled"
+            | "capacity"
+            | "dropped"
+            | "failed"
+            | "internal"
+            | "network"
+            | "none"
+            | "ok"
+            | "rate_limit"
+            | "response_db_write_failed"
+            | "runtime_setup"
+            | "runtime_unavailable"
+            | "safety"
+            | "start_canceled"
+            | "timed_out"
+            | "timeout"
+            | "unknown"
+    )
+}
+
+fn support_question_intent_is_known(value: &str) -> bool {
+    matches!(
+        value,
+        "code_explanation"
+            | "code_or_debug"
+            | "explanation"
+            | "general"
+            | "quick_explanation"
+            | "short_query"
+            | "system_design"
+    )
+}
+
+fn support_artifact_type_is_known(value: &str) -> bool {
+    matches!(
+        value,
+        "code" | "document" | "none" | "screen" | "structured" | "system_design"
+    )
 }
 
 fn write_json_file<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -2052,10 +2989,33 @@ fn write_jsonl_file(path: &Path, records: &[Value]) -> Result<()> {
     Ok(())
 }
 
-fn session_audit_event_dir(data_dir: &Path, session_id: Uuid) -> PathBuf {
+fn session_audit_event_dir(data_dir: &Path, scope: &SessionAuditScope) -> PathBuf {
     data_dir
         .join(SESSION_AUDIT_EVENTS_DIR)
-        .join(session_id.to_string())
+        .join(local_audit_scope_key(scope.owner_account_id.as_deref()))
+        .join(scope.session_id.to_string())
+}
+
+#[cfg(test)]
+pub(crate) fn session_audit_event_log_path_for_test(
+    data_dir: &Path,
+    scope: &SessionAuditScope,
+) -> PathBuf {
+    session_audit_event_dir(data_dir, scope).join("events.jsonl")
+}
+
+fn session_audit_bundle_dir(data_dir: &Path, meeting: &MeetingRecord) -> PathBuf {
+    data_dir
+        .join(SESSION_AUDIT_DIR)
+        .join(local_audit_scope_key(meeting.owner_account_id.as_deref()))
+        .join(meeting.id.to_string())
+}
+
+fn session_audit_upload_marker_path(data_dir: &Path, meeting: &MeetingRecord) -> PathBuf {
+    data_dir
+        .join(SESSION_AUDIT_UPLOADED_DIR)
+        .join(local_audit_scope_key(meeting.owner_account_id.as_deref()))
+        .join(format!("{}.json", meeting.id))
 }
 
 fn audit_event_append_lock() -> &'static Mutex<()> {
@@ -2088,12 +3048,16 @@ fn load_audit_event_log_state(event_path: &Path) -> Result<AuditEventLogState> {
     // the durable JSONL append and its small sidecar update. Stream and
     // normalize the bounded tail once; the steady-state append path remains
     // O(1).
-    let state = compact_audit_event_log(event_path, 0)?;
+    let state = compact_audit_event_log(event_path, 0, 0)?;
     write_audit_event_log_state(event_path, &state)?;
     Ok(state)
 }
 
-fn compact_audit_event_log(event_path: &Path, reserved_bytes: u64) -> Result<AuditEventLogState> {
+fn compact_audit_event_log(
+    event_path: &Path,
+    reserved_bytes: u64,
+    reserved_records: u64,
+) -> Result<AuditEventLogState> {
     let mut retained = VecDeque::<Vec<u8>>::new();
     let mut retained_bytes = 0_u64;
     let mut last_sequence = 0_u64;
@@ -2122,7 +3086,7 @@ fn compact_audit_event_log(event_path: &Path, reserved_bytes: u64) -> Result<Aud
             }
             retained_bytes = retained_bytes.saturating_add(normalized_bytes);
             retained.push_back(normalized);
-            while retained.len() as u64 > MAX_AUDIT_EVENT_RECORDS.saturating_sub(1)
+            while retained.len() as u64 > MAX_AUDIT_EVENT_RECORDS.saturating_sub(reserved_records)
                 || retained_bytes.saturating_add(reserved_bytes) > MAX_AUDIT_EVENT_LOG_BYTES
             {
                 let Some(removed) = retained.pop_front() else {
@@ -2184,32 +3148,87 @@ fn write_audit_event_log_state(event_path: &Path, state: &AuditEventLogState) ->
     atomic_write_private_file(&audit_event_log_state_path(event_path), &bytes)
 }
 
-fn read_session_audit_events(data_dir: &Path, session_id: Uuid) -> Vec<Value> {
-    let event_path = session_audit_event_dir(data_dir, session_id).join("events.jsonl");
+#[cfg(test)]
+fn read_session_audit_events(data_dir: &Path, meeting: &MeetingRecord) -> Vec<Value> {
+    read_session_audit_events_with_fingerprint(data_dir, meeting).0
+}
+
+fn read_session_audit_events_with_fingerprint(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+) -> (Vec<Value>, Option<AuditEventLogFingerprint>) {
+    let scope = SessionAuditScope::from_meeting(meeting);
+    let event_path = session_audit_event_dir(data_dir, &scope).join("events.jsonl");
     let _append_guard = audit_event_append_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !event_path.exists() || load_audit_event_log_state(&event_path).is_err() {
-        return Vec::new();
+    if !event_path.exists() {
+        return (Vec::new(), None);
     }
-    let Ok(file) = fs::File::open(&event_path) else {
-        return Vec::new();
+    let Ok(state) = load_audit_event_log_state(&event_path) else {
+        return (Vec::new(), None);
     };
-    BufReader::new(file)
+    let Ok(file) = fs::File::open(&event_path) else {
+        return (Vec::new(), None);
+    };
+    let events = BufReader::new(file)
         .lines()
         .map_while(|line| line.ok())
         .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
-        .collect()
+        .collect();
+    let fingerprint = audit_event_log_fingerprint_from_state(&event_path, &state);
+    (events, fingerprint)
 }
 
-fn audit_event_log_fingerprint(data_dir: &Path, session_id: Uuid) -> Option<(i64, u64)> {
-    let event_path = session_audit_event_dir(data_dir, session_id).join("events.jsonl");
-    let metadata = fs::metadata(&event_path).ok()?;
-    Some((metadata_modified_ms(&metadata), metadata.len()))
+fn audit_event_log_fingerprint(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+) -> Option<AuditEventLogFingerprint> {
+    let scope = SessionAuditScope::from_meeting(meeting);
+    let event_path = session_audit_event_dir(data_dir, &scope).join("events.jsonl");
+    let state = load_audit_event_log_state(&event_path).ok()?;
+    audit_event_log_fingerprint_from_state(&event_path, &state)
 }
 
-fn remove_session_audit_event_log(data_dir: &Path, session_id: Uuid) -> Result<()> {
-    let event_dir = session_audit_event_dir(data_dir, session_id);
+fn audit_event_log_fingerprint_from_state(
+    event_path: &Path,
+    state: &AuditEventLogState,
+) -> Option<AuditEventLogFingerprint> {
+    let metadata = fs::metadata(event_path).ok()?;
+    Some(AuditEventLogFingerprint {
+        modified_at_ms: metadata_modified_ms(&metadata),
+        bytes: metadata.len(),
+        last_sequence: state.last_sequence,
+    })
+}
+
+#[cfg(test)]
+fn remove_session_audit_event_log(data_dir: &Path, meeting: &MeetingRecord) -> Result<()> {
+    let _append_guard = audit_event_append_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    remove_session_audit_event_log_unlocked(data_dir, meeting)
+}
+
+fn remove_session_audit_event_log_if_unchanged(
+    data_dir: &Path,
+    meeting: &MeetingRecord,
+    expected: Option<AuditEventLogFingerprint>,
+) -> Result<bool> {
+    let _append_guard = audit_event_append_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let current = audit_event_log_fingerprint(data_dir, meeting);
+    if current != expected {
+        return Ok(false);
+    }
+    remove_session_audit_event_log_unlocked(data_dir, meeting)?;
+    Ok(true)
+}
+
+fn remove_session_audit_event_log_unlocked(data_dir: &Path, meeting: &MeetingRecord) -> Result<()> {
+    let scope = SessionAuditScope::from_meeting(meeting);
+    let event_dir = session_audit_event_dir(data_dir, &scope);
     if event_dir.exists() {
         fs::remove_dir_all(&event_dir)
             .with_context(|| format!("remove {}", event_dir.display()))?;
@@ -2221,18 +3240,73 @@ fn remove_session_audit_event_log(data_dir: &Path, session_id: Uuid) -> Result<(
 ///
 /// Cloud-delete provenance is intentionally separate and remains durable
 /// until the server confirms the account-side tombstone.
-pub fn purge_session_audit_state(data_dir: &Path, session_id: Uuid) -> Result<()> {
+pub fn purge_session_audit_state(
+    data_dir: &Path,
+    owner_account_id: Option<&str>,
+    session_id: Uuid,
+) -> Result<()> {
+    let scope = SessionAuditScope {
+        session_id,
+        owner_account_id: owner_account_id.map(ToString::to_string),
+    };
     let local_bundle_dir = data_dir
         .join(SESSION_AUDIT_DIR)
+        .join(local_audit_scope_key(owner_account_id))
         .join(session_id.to_string());
-    let event_dir = session_audit_event_dir(data_dir, session_id);
+    let event_dir = session_audit_event_dir(data_dir, &scope);
     let upload_marker = data_dir
         .join(SESSION_AUDIT_UPLOADED_DIR)
+        .join(local_audit_scope_key(owner_account_id))
         .join(format!("{session_id}.json"));
 
     remove_audit_path_if_present(&local_bundle_dir, true)?;
     remove_audit_path_if_present(&event_dir, true)?;
     remove_audit_path_if_present(&upload_marker, false)?;
+    Ok(())
+}
+
+/// Remove all user-owned cloud-sync material for one account from this device.
+///
+/// The diagnostic consent epoch is advanced first and intentionally retained
+/// as a payload-free fence. That prevents already-queued pre-deletion events
+/// from recreating support-diagnostic content after the account purge.
+pub fn purge_cloud_account_local_state(data_dir: &Path, owner_account_id: &str) -> Result<()> {
+    let owner_account_id = required_owner_account_id(Some(owner_account_id))?;
+    let scope_key = account_scope_key(owner_account_id)?;
+    crate::diagnostics::fence_support_diagnostics_for_owner(data_dir, owner_account_id)?;
+
+    for root in [
+        CLOUD_SYNC_STATE_DIR,
+        CLOUD_DELETE_OUTBOX_DIR,
+        CLOUD_HYDRATION_CURSOR_DIR,
+        CLOUD_RESTORED_CONTEXT_DIR,
+        CLOUD_RESTORED_OBJECTS_DIR,
+        SESSION_AUDIT_DIR,
+        SESSION_AUDIT_EVENTS_DIR,
+        SESSION_AUDIT_UPLOADED_DIR,
+    ] {
+        remove_audit_path_if_present(&data_dir.join(root).join(&scope_key), true)?;
+    }
+    Ok(())
+}
+
+/// Remove account/session-scoped sync provenance and restored attachment
+/// caches after a server tombstone, even when the MeetingStore row is already
+/// absent. Diagnostic/RAG/database tombstones are applied by the daemon's
+/// owner-transition-fenced purge lifecycle.
+pub fn purge_cloud_session_local_state(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<()> {
+    let owner_account_id = required_owner_account_id(Some(owner_account_id))?;
+    remove_cloud_delete_provenance(data_dir, owner_account_id, session_id)?;
+    for root in [CLOUD_RESTORED_CONTEXT_DIR, CLOUD_RESTORED_OBJECTS_DIR] {
+        remove_audit_path_if_present(
+            &account_scoped_restored_dir(data_dir, root, owner_account_id, session_id)?,
+            true,
+        )?;
+    }
     Ok(())
 }
 
@@ -2250,9 +3324,7 @@ fn remove_audit_path_if_present(path: &Path, directory: bool) -> Result<()> {
 }
 
 fn audit_upload_marker_matches(data_dir: &Path, meeting: &MeetingRecord, bundle_id: &str) -> bool {
-    let marker_path = data_dir
-        .join(SESSION_AUDIT_UPLOADED_DIR)
-        .join(format!("{}.json", meeting.id));
+    let marker_path = session_audit_upload_marker_path(data_dir, meeting);
     let Ok(contents) = fs::read_to_string(marker_path) else {
         return false;
     };
@@ -2273,9 +3345,11 @@ fn write_audit_upload_marker(
     built: &BuiltAuditBundle,
     response: &SessionAuditBundleResponse,
 ) -> Result<()> {
-    let marker_dir = data_dir.join(SESSION_AUDIT_UPLOADED_DIR);
+    let marker_dir = data_dir
+        .join(SESSION_AUDIT_UPLOADED_DIR)
+        .join(local_audit_scope_key(meeting.owner_account_id.as_deref()));
     cue_core::app_paths::create_private_dir(&marker_dir)?;
-    let marker_path = marker_dir.join(format!("{}.json", meeting.id));
+    let marker_path = session_audit_upload_marker_path(data_dir, meeting);
     write_json_file(
         &marker_path,
         &json!({
@@ -2308,8 +3382,7 @@ fn prune_local_audit_root(audit_root: &Path) {
         if entry.modified_ms <= cutoff_ms {
             if let Err(error) = fs::remove_dir_all(&entry.path) {
                 warn!(
-                    path = %entry.path.display(),
-                    error = %error,
+                    error_kind = ?error.kind(),
                     "failed to prune expired local session audit directory"
                 );
             }
@@ -2329,8 +3402,7 @@ fn prune_local_audit_root(audit_root: &Path) {
         }
         if let Err(error) = fs::remove_dir_all(&entry.path) {
             warn!(
-                path = %entry.path.display(),
-                error = %error,
+                error_kind = ?error.kind(),
                 "failed to prune local session audit directory for size cap"
             );
             continue;
@@ -2350,25 +3422,46 @@ fn audit_session_dirs(root: &Path) -> Vec<AuditDirEntry> {
     let Ok(read_dir) = fs::read_dir(root) else {
         return Vec::new();
     };
-    read_dir
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.path();
-            if !path.is_dir() {
+    let mut sessions = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if name.starts_with('.') {
+            continue;
+        }
+        if Uuid::parse_str(name).is_ok() {
+            if let Some(entry) = audit_dir_entry(path) {
+                sessions.push(entry);
+            }
+            continue;
+        }
+        let Ok(scoped_entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        sessions.extend(scoped_entries.flatten().filter_map(|entry| {
+            let session_path = entry.path();
+            let session_name = session_path.file_name()?.to_str()?;
+            if !session_path.is_dir() || Uuid::parse_str(session_name).is_err() {
                 return None;
             }
-            let name = path.file_name().and_then(|value| value.to_str())?;
-            if name.starts_with('.') {
-                return None;
-            }
-            let metadata = fs::metadata(&path).ok()?;
-            Some(AuditDirEntry {
-                path,
-                modified_ms: metadata_modified_ms(&metadata),
-                size_bytes: dir_size_bytes(entry.path().as_path()),
-            })
-        })
-        .collect()
+            audit_dir_entry(session_path)
+        }));
+    }
+    sessions
+}
+
+fn audit_dir_entry(path: PathBuf) -> Option<AuditDirEntry> {
+    let metadata = fs::metadata(&path).ok()?;
+    Some(AuditDirEntry {
+        modified_ms: metadata_modified_ms(&metadata),
+        size_bytes: dir_size_bytes(&path),
+        path,
+    })
 }
 
 fn dir_size_bytes(path: &Path) -> u64 {
@@ -2420,6 +3513,17 @@ fn current_epoch_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn cloud_log_identifier_hash(identifier: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"bluey-cloud-log-identifier-v1\0");
+    hasher.update((identifier.len() as u64).to_be_bytes());
+    hasher.update(identifier);
+    format!("{:x}", hasher.finalize())
+        .chars()
+        .take(12)
+        .collect()
+}
+
 fn empty_metadata() -> Value {
     json!({})
 }
@@ -2437,6 +3541,28 @@ fn stable_entity_uuid(entity: &str, session_id: &str, source_id: &str) -> Uuid {
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     Uuid::from_bytes(bytes)
+}
+
+fn required_owner_account_id(owner_account_id: Option<&str>) -> Result<&str> {
+    owner_account_id
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("cloud sync requires an account owner"))
+}
+
+fn account_scope_key(owner_account_id: &str) -> Result<String> {
+    let owner_account_id = required_owner_account_id(Some(owner_account_id))?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"bluey-cloud-account-scope-v1\0");
+    hasher.update((owner_account_id.len() as u64).to_be_bytes());
+    hasher.update(owner_account_id.as_bytes());
+    Ok(format!("account-{:x}", hasher.finalize()))
+}
+
+fn local_audit_scope_key(owner_account_id: Option<&str>) -> String {
+    owner_account_id
+        .and_then(|owner| account_scope_key(owner).ok())
+        .unwrap_or_else(|| "local-unowned".to_string())
 }
 
 fn local_uuid_for_cloud_id(entity: &str, session_id: &str, source_id: &str) -> Uuid {
@@ -2465,110 +3591,264 @@ fn stable_wire_record_id(entity: &str, session_id: &str, source_id: &str) -> Str
     }
 }
 
-fn cloud_sync_state_path(data_dir: &Path, session_id: Uuid) -> PathBuf {
-    data_dir
+fn cloud_sync_state_dir(data_dir: &Path, owner_account_id: &str) -> Result<PathBuf> {
+    Ok(data_dir
         .join(CLOUD_SYNC_STATE_DIR)
-        .join(format!("{session_id}.json"))
+        .join(account_scope_key(owner_account_id)?))
 }
 
-fn cloud_sync_state_backup_path(data_dir: &Path, session_id: Uuid) -> PathBuf {
-    data_dir
-        .join(CLOUD_SYNC_STATE_DIR)
-        .join(format!("{session_id}.json.bak"))
+fn cloud_sync_state_path(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(cloud_sync_state_dir(data_dir, owner_account_id)?.join(format!("{session_id}.json")))
 }
 
-fn cloud_delete_outbox_path(data_dir: &Path, session_id: Uuid) -> PathBuf {
-    data_dir
+fn cloud_sync_state_backup_path(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(cloud_sync_state_dir(data_dir, owner_account_id)?.join(format!("{session_id}.json.bak")))
+}
+
+fn cloud_delete_outbox_dir(data_dir: &Path, owner_account_id: &str) -> Result<PathBuf> {
+    Ok(data_dir
         .join(CLOUD_DELETE_OUTBOX_DIR)
-        .join(format!("{session_id}.json"))
+        .join(account_scope_key(owner_account_id)?))
+}
+
+fn cloud_delete_outbox_path(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(cloud_delete_outbox_dir(data_dir, owner_account_id)?.join(format!("{session_id}.json")))
+}
+
+fn cloud_hydration_cursor_path(data_dir: &Path, owner_account_id: &str) -> Result<PathBuf> {
+    Ok(data_dir
+        .join(CLOUD_HYDRATION_CURSOR_DIR)
+        .join(account_scope_key(owner_account_id)?)
+        .join("cursor.json"))
+}
+
+fn load_cloud_hydration_cursor(data_dir: &Path, owner_account_id: &str) -> Option<String> {
+    let path = cloud_hydration_cursor_path(data_dir, owner_account_id).ok()?;
+    let state = fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<CloudHydrationCursorState>(&bytes).ok())?;
+    (state.schema_version == CLOUD_HYDRATION_CURSOR_SCHEMA_VERSION
+        && state.owner_account_id == owner_account_id
+        && !state.cursor.trim().is_empty())
+    .then_some(state.cursor)
+}
+
+fn write_cloud_hydration_cursor(
+    data_dir: &Path,
+    owner_account_id: &str,
+    cursor: &str,
+) -> Result<()> {
+    let cursor = cursor.trim();
+    anyhow::ensure!(!cursor.is_empty(), "cloud hydration cursor is empty");
+    let state = CloudHydrationCursorState {
+        schema_version: CLOUD_HYDRATION_CURSOR_SCHEMA_VERSION,
+        owner_account_id: owner_account_id.to_string(),
+        cursor: cursor.to_string(),
+    };
+    let bytes = serde_json::to_vec_pretty(&state).context("serialize cloud hydration cursor")?;
+    let path = cloud_hydration_cursor_path(data_dir, owner_account_id)?;
+    let parent = path
+        .parent()
+        .context("cloud hydration cursor has no parent")?;
+    cue_core::app_paths::create_private_dir(parent)?;
+    atomic_write_private_file(&path, &bytes)
+}
+
+fn clear_cloud_hydration_cursor(data_dir: &Path, owner_account_id: &str) -> Result<()> {
+    remove_audit_path_if_present(
+        &cloud_hydration_cursor_path(data_dir, owner_account_id)?,
+        false,
+    )
 }
 
 fn write_pending_cloud_delete(data_dir: &Path, pending: &PendingCloudSessionDelete) -> Result<()> {
-    let dir = data_dir.join(CLOUD_DELETE_OUTBOX_DIR);
+    let dir = cloud_delete_outbox_dir(data_dir, &pending.owner_account_id)?;
     cue_core::app_paths::create_private_dir(&dir)?;
     let bytes =
         serde_json::to_vec_pretty(pending).context("serialize pending cloud session deletion")?;
     atomic_write_private_file(
-        &cloud_delete_outbox_path(data_dir, pending.local_session_id),
+        &cloud_delete_outbox_path(
+            data_dir,
+            &pending.owner_account_id,
+            pending.local_session_id,
+        )?,
         &bytes,
     )
 }
 
-fn remove_cloud_delete_provenance(data_dir: &Path, session_id: Uuid) {
+fn remove_cloud_delete_provenance(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<()> {
     for path in [
-        cloud_delete_outbox_path(data_dir, session_id),
-        cloud_sync_state_path(data_dir, session_id),
-        cloud_sync_state_backup_path(data_dir, session_id),
+        cloud_delete_outbox_path(data_dir, owner_account_id, session_id)?,
+        cloud_sync_state_path(data_dir, owner_account_id, session_id)?,
+        cloud_sync_state_backup_path(data_dir, owner_account_id, session_id)?,
     ] {
-        if let Err(error) = fs::remove_file(&path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                debug!(
-                    path = %path.display(),
-                    error = %error,
-                    "could not remove completed cloud deletion provenance"
-                );
-            }
-        }
+        remove_audit_path_if_present(&path, false)?;
     }
+    Ok(())
 }
 
-fn load_cloud_sync_state(data_dir: &Path, session_id: Uuid) -> Option<CloudSyncState> {
-    let path = cloud_sync_state_path(data_dir, session_id);
-    if let Some(state) = read_valid_cloud_sync_state(&path) {
+fn load_cloud_sync_state(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Option<CloudSyncState> {
+    let path = cloud_sync_state_path(data_dir, owner_account_id, session_id).ok()?;
+    if let Some(state) = read_valid_cloud_sync_state(&path, owner_account_id) {
         return Some(state);
     }
 
-    let backup_path = cloud_sync_state_backup_path(data_dir, session_id);
-    let recovered = read_valid_cloud_sync_state(&backup_path);
+    let backup_path = cloud_sync_state_backup_path(data_dir, owner_account_id, session_id).ok()?;
+    let recovered = read_valid_cloud_sync_state(&backup_path, owner_account_id);
     if recovered.is_some() {
         warn!(
-            path = %path.display(),
-            backup_path = %backup_path.display(),
+            session_hash = %cloud_log_identifier_hash(session_id.as_bytes()),
             "recovered cloud sync deletion provenance from the last valid backup"
         );
     }
     recovered
 }
 
-fn read_valid_cloud_sync_state(path: &Path) -> Option<CloudSyncState> {
+fn load_cloud_sync_state_strict_if_present(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<Option<CloudSyncState>> {
+    let path = cloud_sync_state_path(data_dir, owner_account_id, session_id)?;
+    let backup_path = cloud_sync_state_backup_path(data_dir, owner_account_id, session_id)?;
+    let primary_exists = path.exists();
+    let backup_exists = backup_path.exists();
+    if !primary_exists && !backup_exists {
+        return Ok(None);
+    }
+    if let Some(state) = read_valid_cloud_sync_state(&path, owner_account_id)
+        .or_else(|| read_valid_cloud_sync_state(&backup_path, owner_account_id))
+    {
+        return Ok(Some(state));
+    }
+    anyhow::bail!("cloud deletion provenance is corrupt")
+}
+
+fn read_valid_cloud_sync_state(path: &Path, owner_account_id: &str) -> Option<CloudSyncState> {
     let bytes = fs::read(path).ok()?;
     match serde_json::from_slice::<CloudSyncState>(&bytes) {
-        Ok(state)
-            if state.schema_version == CLOUD_SYNC_STATE_SCHEMA_VERSION
-                && !state.remote_session_id.trim().is_empty() =>
-        {
+        Ok(state) if validate_cloud_sync_state_owner(&state, owner_account_id).is_ok() => {
             Some(state)
         }
         Ok(_) => None,
-        Err(error) => {
-            debug!(
-                path = %path.display(),
-                error = %error,
-                "cloud sync state could not be read"
-            );
+        Err(_) => {
+            debug!("cloud sync state could not be parsed");
             None
         }
     }
 }
 
+fn validate_cloud_sync_state_owner(state: &CloudSyncState, owner_account_id: &str) -> Result<()> {
+    let owner_account_id = required_owner_account_id(Some(owner_account_id))?;
+    if state.schema_version != CLOUD_SYNC_STATE_SCHEMA_VERSION {
+        anyhow::bail!("unsupported cloud sync state schema");
+    }
+    if state.owner_account_id != owner_account_id {
+        anyhow::bail!("cloud sync state account owner mismatch");
+    }
+    if state.remote_session_id.trim().is_empty() {
+        anyhow::bail!("cloud sync state remote session id is empty");
+    }
+    Ok(())
+}
+
+fn cloud_session_fingerprint(summary: &CloudSessionSummary) -> CloudSessionFingerprint {
+    CloudSessionFingerprint {
+        title: summary.title.clone(),
+        status: summary.status.clone(),
+        updated_at_ms: summary.updated_at_ms,
+        last_active_at_ms: summary.last_active_at_ms,
+        answer_style: summary.answer_style.clone(),
+        transcript_count: summary.transcript_count,
+        response_count: summary.response_count,
+        context_count: summary.context_count,
+        rag_count: summary.rag_count,
+        child_tombstone_count: summary.child_tombstone_count,
+        child_tombstone_updated_at_ms: summary.child_tombstone_updated_at_ms,
+    }
+}
+
+fn cloud_session_summary_is_current(
+    data_dir: &Path,
+    owner_account_id: &str,
+    local_session_id: Uuid,
+    summary: &CloudSessionSummary,
+) -> bool {
+    summary.child_tombstone_count == 0
+        && load_cloud_sync_state(data_dir, owner_account_id, local_session_id).is_some_and(
+            |state| {
+                state.remote_session_id == summary.session_id
+                    && state.remote_summary.as_ref() == Some(&cloud_session_fingerprint(summary))
+                    && state
+                        .attachment_transfers
+                        .values()
+                        .all(|transfer| transfer.status == CloudAttachmentTransferStatus::Synced)
+            },
+        )
+}
+
+fn mark_cloud_session_summary_current(
+    data_dir: &Path,
+    owner_account_id: &str,
+    local_session_id: Uuid,
+    summary: &CloudSessionSummary,
+) -> Result<()> {
+    let mut state = load_cloud_sync_state(data_dir, owner_account_id, local_session_id)
+        .context("cloud bundle sync state missing after hydration")?;
+    anyhow::ensure!(
+        state.remote_session_id == summary.session_id,
+        "cloud hydration summary session identity mismatch"
+    );
+    state.remote_summary = Some(cloud_session_fingerprint(summary));
+    write_cloud_sync_state(data_dir, owner_account_id, local_session_id, &state)
+}
+
 fn load_cloud_sync_states(
     data_dir: &Path,
+    owner_account_id: &str,
     meetings: &[MeetingRecord],
 ) -> HashMap<Uuid, CloudSyncState> {
     meetings
         .iter()
         .filter_map(|meeting| {
-            load_cloud_sync_state(data_dir, meeting.id).map(|state| (meeting.id, state))
+            load_cloud_sync_state(data_dir, owner_account_id, meeting.id)
+                .map(|state| (meeting.id, state))
         })
         .collect()
 }
 
-fn write_cloud_sync_state(data_dir: &Path, session_id: Uuid, state: &CloudSyncState) -> Result<()> {
-    let dir = data_dir.join(CLOUD_SYNC_STATE_DIR);
+fn write_cloud_sync_state(
+    data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
+    state: &CloudSyncState,
+) -> Result<()> {
+    validate_cloud_sync_state_owner(state, owner_account_id)?;
+    let dir = cloud_sync_state_dir(data_dir, owner_account_id)?;
     cue_core::app_paths::create_private_dir(&dir)?;
-    let path = cloud_sync_state_path(data_dir, session_id);
-    let backup_path = cloud_sync_state_backup_path(data_dir, session_id);
-    if read_valid_cloud_sync_state(&path).is_some() {
+    let path = cloud_sync_state_path(data_dir, owner_account_id, session_id)?;
+    let backup_path = cloud_sync_state_backup_path(data_dir, owner_account_id, session_id)?;
+    if read_valid_cloud_sync_state(&path, owner_account_id).is_some() {
         let current = fs::read(&path)
             .with_context(|| format!("read current cloud sync state {}", path.display()))?;
         atomic_write_private_file(&backup_path, &current)?;
@@ -2679,6 +3959,7 @@ fn cloud_sync_state_after_upload(
     uploaded_objects: &HashMap<Uuid, SyncedObjectMetadata>,
     previous: Option<&CloudSyncState>,
     uploaded_children: Option<&UploadedChildState>,
+    owner_account_id: &str,
 ) -> CloudSyncState {
     let session = session_record(meeting, responses, previous);
     let context_artifacts = meeting
@@ -2698,9 +3979,20 @@ fn cloud_sync_state_after_upload(
             )
         })
         .collect();
+    let current_context_ids = meeting
+        .context
+        .iter()
+        .map(|artifact| artifact.id.to_string())
+        .collect::<HashSet<_>>();
+    let mut attachment_transfers = previous
+        .map(|state| state.attachment_transfers.clone())
+        .unwrap_or_default();
+    attachment_transfers.retain(|local_id, _| current_context_ids.contains(local_id));
     CloudSyncState {
         schema_version: CLOUD_SYNC_STATE_SCHEMA_VERSION,
+        owner_account_id: owner_account_id.to_string(),
         remote_session_id: session.session_id,
+        remote_summary: None,
         session_metadata: session.metadata,
         transcript_segments: previous
             .map(|state| state.transcript_segments.clone())
@@ -2718,6 +4010,33 @@ fn cloud_sync_state_after_upload(
         rag_chunks: uploaded_children
             .map(|children| children.rag_chunks.clone())
             .unwrap_or_default(),
+        attachment_transfers,
+        child_tombstones: previous
+            .map(|state| state.child_tombstones.clone())
+            .unwrap_or_default(),
+    }
+}
+
+fn initial_cloud_sync_state(
+    meeting: &MeetingRecord,
+    responses: Option<&[crate::llm::CueResponse]>,
+    owner_account_id: &str,
+) -> CloudSyncState {
+    let session = session_record(meeting, responses, None);
+    CloudSyncState {
+        schema_version: CLOUD_SYNC_STATE_SCHEMA_VERSION,
+        owner_account_id: owner_account_id.to_string(),
+        remote_session_id: session.session_id,
+        remote_summary: None,
+        session_metadata: session.metadata,
+        transcript_segments: BTreeMap::new(),
+        context_artifacts: BTreeMap::new(),
+        responses: BTreeMap::new(),
+        synced_transcript_records: BTreeMap::new(),
+        synced_response_records: BTreeMap::new(),
+        rag_chunks: BTreeMap::new(),
+        attachment_transfers: BTreeMap::new(),
+        child_tombstones: BTreeMap::new(),
     }
 }
 
@@ -2940,23 +4259,36 @@ fn merge_metadata(mut preserved: Value, current: Value) -> Value {
     preserved
 }
 
-fn artifact_object_path(data_dir: &Path, artifact: &ContextArtifact) -> Option<PathBuf> {
-    let restored_preview_dir = data_dir.join("cloud-restored-context");
+fn artifact_object_source(data_dir: &Path, artifact: &ContextArtifact) -> ArtifactObjectSource {
+    let restored_preview_dir = data_dir.join(CLOUD_RESTORED_CONTEXT_DIR);
+    let restored_object_dir = data_dir.join(CLOUD_RESTORED_OBJECTS_DIR);
     let candidates = std::iter::once(Some(artifact.path.as_str()))
         .chain(std::iter::once(artifact.markdown_path.as_deref()));
+    let mut saw_local_candidate = false;
     for candidate in candidates.flatten() {
         if candidate.trim().is_empty() {
             continue;
         }
-        let path = PathBuf::from(candidate);
-        if path.starts_with(&restored_preview_dir) {
+        if candidate.starts_with("http://")
+            || candidate.starts_with("https://")
+            || candidate.starts_with("bluey://")
+        {
             continue;
         }
+        let path = PathBuf::from(candidate);
+        if path.starts_with(&restored_preview_dir) || path.starts_with(&restored_object_dir) {
+            continue;
+        }
+        saw_local_candidate = true;
         if path.is_file() {
-            return Some(path);
+            return ArtifactObjectSource::Available(path);
         }
     }
-    None
+    if saw_local_candidate {
+        ArtifactObjectSource::Missing
+    } else {
+        ArtifactObjectSource::NotApplicable
+    }
 }
 
 fn content_type_for_path(path: &Path) -> String {
@@ -3019,8 +4351,7 @@ fn build_sync_batches_with_states(
         });
         if !meeting_has_syncable_content(meeting, responses) && !has_pending_child_deletions {
             debug!(
-                session_id = %meeting.id,
-                title = %meeting.title,
+                session_hash = %cloud_log_identifier_hash(meeting.id.as_bytes()),
                 "cloud sync skipped empty local meeting shell"
             );
             continue;
@@ -3034,13 +4365,32 @@ fn build_sync_batches_with_states(
         let mut seen_response_ids = HashSet::new();
 
         for segment in &meeting.transcript {
+            let transcript_record = transcript_record(meeting, segment, sync_state);
+            if sync_state.is_some_and(|state| {
+                cloud_child_tombstone_dominates(
+                    &state.child_tombstones,
+                    "transcript",
+                    &transcript_record.segment_id,
+                    transcript_record.ts_ms,
+                )
+            }) {
+                continue;
+            }
             maybe_flush(&mut batches, &mut batch, &session);
-            batch
-                .transcript_segments
-                .push(transcript_record(meeting, segment, sync_state));
+            batch.transcript_segments.push(transcript_record);
 
             if segment.is_final {
                 if let Some(chunk) = transcript_rag_chunk(meeting, segment, sync_state) {
+                    if sync_state.is_some_and(|state| {
+                        cloud_child_tombstone_dominates(
+                            &state.child_tombstones,
+                            "rag",
+                            &chunk.chunk_id,
+                            chunk.updated_at_ms,
+                        )
+                    }) {
+                        continue;
+                    }
                     maybe_flush(&mut batches, &mut batch, &session);
                     batch.rag_chunks.push(chunk);
                 }
@@ -3048,14 +4398,32 @@ fn build_sync_batches_with_states(
         }
 
         for artifact in &meeting.context {
+            let context_record = context_record(meeting, artifact, uploaded_objects, sync_state);
+            if sync_state.is_some_and(|state| {
+                cloud_child_tombstone_dominates(
+                    &state.child_tombstones,
+                    "context",
+                    &context_record.artifact_id,
+                    context_record
+                        .updated_at_ms
+                        .max(context_record.created_at_ms),
+                )
+            }) {
+                continue;
+            }
             maybe_flush(&mut batches, &mut batch, &session);
-            batch.context_artifacts.push(context_record(
-                meeting,
-                artifact,
-                uploaded_objects,
-                sync_state,
-            ));
+            batch.context_artifacts.push(context_record);
             if let Some(chunk) = context_rag_chunk(meeting, artifact, sync_state) {
+                if sync_state.is_some_and(|state| {
+                    cloud_child_tombstone_dominates(
+                        &state.child_tombstones,
+                        "rag",
+                        &chunk.chunk_id,
+                        chunk.updated_at_ms,
+                    )
+                }) {
+                    continue;
+                }
                 maybe_flush(&mut batches, &mut batch, &session);
                 batch.rag_chunks.push(chunk);
             }
@@ -3111,8 +4479,7 @@ fn build_sync_batches_with_states(
         }
 
         if let Some(summary) = meeting.summary.as_deref().and_then(truncate_nonempty) {
-            maybe_flush(&mut batches, &mut batch, &session);
-            batch.rag_chunks.push(SyncRagChunkRecord {
+            let record = SyncRagChunkRecord {
                 chunk_id: format!("{session_id}:summary:0"),
                 session_id: Some(session_id.clone()),
                 source_kind: "summary".into(),
@@ -3126,36 +4493,52 @@ fn build_sync_batches_with_states(
                 updated_at_ms: updated_at_ms(meeting, responses.map(Vec::as_slice)),
                 deleted_at_ms: None,
                 metadata: json!({}),
-            });
+            };
+            if !sync_state.is_some_and(|state| {
+                cloud_child_tombstone_dominates(
+                    &state.child_tombstones,
+                    "rag",
+                    &record.chunk_id,
+                    record.updated_at_ms,
+                )
+            }) {
+                maybe_flush(&mut batches, &mut batch, &session);
+                batch.rag_chunks.push(record);
+            }
         }
 
-        for (index, epoch) in meeting.conversation_memory.epochs.iter().enumerate() {
-            let Some(text) = truncate_nonempty(&epoch.summary) else {
-                continue;
-            };
-            maybe_flush(&mut batches, &mut batch, &session);
-            batch.rag_chunks.push(SyncRagChunkRecord {
-                chunk_id: format!("{session_id}:conversation-memory:{index}"),
-                session_id: Some(session_id.clone()),
-                source_kind: "conversation_memory".into(),
-                source_id: session_id.clone(),
-                chunk_index: index as i64,
-                text,
-                embedding: None,
-                embedding_model: None,
-                token_count: None,
-                content_hash: None,
-                updated_at_ms: parse_ms(&epoch.last_created_at),
-                deleted_at_ms: None,
-                metadata: json!({
-                    "memory_revision": meeting.conversation_memory.revision,
-                    "epoch_revision": epoch.revision,
-                    "turn_count": epoch.turn_count,
-                    "first_turn_id": epoch.first_turn_id,
-                    "last_turn_id": epoch.last_turn_id,
-                    "derived": true,
-                }),
-            });
+        if !sync_state
+            .is_some_and(|state| cloud_state_has_conversation_memory_tombstone(state, &session_id))
+        {
+            for (index, epoch) in meeting.conversation_memory.epochs.iter().enumerate() {
+                let Some(text) = truncate_nonempty(&epoch.summary) else {
+                    continue;
+                };
+                let record = SyncRagChunkRecord {
+                    chunk_id: format!("{session_id}:conversation-memory:{index}"),
+                    session_id: Some(session_id.clone()),
+                    source_kind: "conversation_memory".into(),
+                    source_id: session_id.clone(),
+                    chunk_index: index as i64,
+                    text,
+                    embedding: None,
+                    embedding_model: None,
+                    token_count: None,
+                    content_hash: None,
+                    updated_at_ms: parse_ms(&epoch.last_created_at),
+                    deleted_at_ms: None,
+                    metadata: json!({
+                        "memory_revision": meeting.conversation_memory.revision,
+                        "epoch_revision": epoch.revision,
+                        "turn_count": epoch.turn_count,
+                        "first_turn_id": epoch.first_turn_id,
+                        "last_turn_id": epoch.last_turn_id,
+                        "derived": true,
+                    }),
+                };
+                maybe_flush(&mut batches, &mut batch, &session);
+                batch.rag_chunks.push(record);
+            }
         }
 
         if let Some(instructions) = meeting
@@ -3163,8 +4546,7 @@ fn build_sync_batches_with_states(
             .as_deref()
             .and_then(truncate_nonempty)
         {
-            maybe_flush(&mut batches, &mut batch, &session);
-            batch.rag_chunks.push(SyncRagChunkRecord {
+            let record = SyncRagChunkRecord {
                 chunk_id: format!("{session_id}:instructions:0"),
                 session_id: Some(session_id.clone()),
                 source_kind: "answer_instructions".into(),
@@ -3178,18 +4560,49 @@ fn build_sync_batches_with_states(
                 updated_at_ms: updated_at_ms(meeting, responses.map(Vec::as_slice)),
                 deleted_at_ms: None,
                 metadata: json!({}),
-            });
+            };
+            if !sync_state.is_some_and(|state| {
+                cloud_child_tombstone_dominates(
+                    &state.child_tombstones,
+                    "rag",
+                    &record.chunk_id,
+                    record.updated_at_ms,
+                )
+            }) {
+                maybe_flush(&mut batches, &mut batch, &session);
+                batch.rag_chunks.push(record);
+            }
         }
 
         if let Some(responses) = responses {
             for response in responses {
                 let response_record = cue_response_record(meeting, response, sync_state);
                 let response_id = response_record.response_id.clone();
+                if sync_state.is_some_and(|state| {
+                    cloud_child_tombstone_dominates(
+                        &state.child_tombstones,
+                        "response",
+                        &response_id,
+                        response_record.ts_ms,
+                    )
+                }) {
+                    continue;
+                }
                 seen_response_ids.insert(response_id.clone());
                 maybe_flush(&mut batches, &mut batch, &session);
                 batch.cue_responses.push(response_record);
                 if let Some(chunk) = response_rag_chunk(meeting, response, &response_id, sync_state)
                 {
+                    if sync_state.is_some_and(|state| {
+                        cloud_child_tombstone_dominates(
+                            &state.child_tombstones,
+                            "rag",
+                            &chunk.chunk_id,
+                            chunk.updated_at_ms,
+                        )
+                    }) {
+                        continue;
+                    }
                     maybe_flush(&mut batches, &mut batch, &session);
                     batch.rag_chunks.push(chunk);
                 }
@@ -3201,9 +4614,29 @@ fn build_sync_batches_with_states(
             if seen_response_ids.contains(&response_record.response_id) {
                 continue;
             }
+            if sync_state.is_some_and(|state| {
+                cloud_child_tombstone_dominates(
+                    &state.child_tombstones,
+                    "response",
+                    &response_record.response_id,
+                    response_record.ts_ms,
+                )
+            }) {
+                continue;
+            }
             maybe_flush(&mut batches, &mut batch, &session);
             batch.cue_responses.push(response_record);
             if let Some(chunk) = conversation_rag_chunk(meeting, turn, sync_state) {
+                if sync_state.is_some_and(|state| {
+                    cloud_child_tombstone_dominates(
+                        &state.child_tombstones,
+                        "rag",
+                        &chunk.chunk_id,
+                        chunk.updated_at_ms,
+                    )
+                }) {
+                    continue;
+                }
                 maybe_flush(&mut batches, &mut batch, &session);
                 batch.rag_chunks.push(chunk);
             }
@@ -3346,20 +4779,61 @@ fn meeting_has_syncable_content(
 async fn meeting_from_cloud_bundle(
     data_dir: &Path,
     client: Option<&CloudClient>,
+    owner_account_id: &str,
     bundle: CloudSessionBundle,
-) -> Result<MeetingRecord> {
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<(MeetingRecord, usize, Vec<CloudChildTombstone>)> {
+    operation_is_active()?;
     validate_cloud_bundle_parentage(&bundle)?;
     let CloudSessionBundle {
         session,
-        transcript_segments,
-        cue_responses,
-        context_artifacts,
+        mut transcript_segments,
+        mut cue_responses,
+        mut context_artifacts,
+        mut rag_chunks,
+        child_tombstones,
     } = bundle;
     let remote_session_id = session.session_id.clone();
     let id = local_uuid_for_cloud_id("session", "account-session", &remote_session_id);
+    let previous_state = load_cloud_sync_state(data_dir, owner_account_id, id);
+    let tombstones = newest_cloud_child_tombstones(
+        child_tombstones
+            .into_iter()
+            .chain(
+                previous_state
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|state| state.child_tombstones.values().cloned()),
+            )
+            .collect(),
+    );
+    transcript_segments.retain(|record| {
+        !cloud_child_tombstone_dominates(
+            &tombstones,
+            "transcript",
+            &record.segment_id,
+            record.ts_ms,
+        )
+    });
+    cue_responses.retain(|record| {
+        !cloud_child_tombstone_dominates(&tombstones, "response", &record.response_id, record.ts_ms)
+    });
+    context_artifacts.retain(|record| {
+        !cloud_child_tombstone_dominates(
+            &tombstones,
+            "context",
+            &record.artifact_id,
+            record.updated_at_ms.max(record.created_at_ms),
+        )
+    });
+    rag_chunks.retain(|record| {
+        !cloud_child_tombstone_dominates(&tombstones, "rag", &record.chunk_id, record.updated_at_ms)
+    });
     let mut sync_state = CloudSyncState {
         schema_version: CLOUD_SYNC_STATE_SCHEMA_VERSION,
+        owner_account_id: owner_account_id.to_string(),
         remote_session_id: remote_session_id.clone(),
+        remote_summary: None,
         session_metadata: session.metadata.clone(),
         transcript_segments: BTreeMap::new(),
         context_artifacts: BTreeMap::new(),
@@ -3367,6 +4841,11 @@ async fn meeting_from_cloud_bundle(
         synced_transcript_records: BTreeMap::new(),
         synced_response_records: BTreeMap::new(),
         rag_chunks: BTreeMap::new(),
+        attachment_transfers: previous_state
+            .as_ref()
+            .map(|state| state.attachment_transfers.clone())
+            .unwrap_or_default(),
+        child_tombstones: tombstones.clone(),
     };
 
     let mut transcript = Vec::new();
@@ -3404,7 +4883,9 @@ async fn meeting_from_cloud_bundle(
     }
 
     let mut context = Vec::new();
+    let mut attachment_retry_count = 0usize;
     for artifact in context_artifacts {
+        operation_is_active()?;
         let local_id = local_uuid_for_cloud_id(
             "context-artifact",
             &remote_session_id,
@@ -3420,7 +4901,33 @@ async fn meeting_from_cloud_bundle(
                 metadata: artifact.metadata.clone(),
             },
         );
-        context.push(context_artifact_from_cloud(data_dir, client, local_id, artifact).await?);
+        let (artifact, transfer) = context_artifact_from_cloud(
+            RestoredContextScope {
+                data_dir,
+                owner_account_id,
+                session_id: id,
+            },
+            client,
+            local_id,
+            artifact,
+            sync_state.attachment_transfers.get(&local_id.to_string()),
+            operation_is_active,
+        )
+        .await?;
+        if let Some(transfer) = transfer {
+            if transfer.status != CloudAttachmentTransferStatus::Synced {
+                attachment_retry_count = attachment_retry_count.saturating_add(1);
+            }
+            sync_state
+                .attachment_transfers
+                .insert(local_id.to_string(), transfer);
+            write_cloud_sync_state(data_dir, owner_account_id, id, &sync_state)?;
+        } else {
+            sync_state
+                .attachment_transfers
+                .remove(&local_id.to_string());
+        }
+        context.push(artifact);
     }
 
     let mut conversation = Vec::new();
@@ -3451,7 +4958,7 @@ async fn meeting_from_cloud_bundle(
 
     let live_answer_transcript_cursor = transcript.len();
     let conversation_memory = conversation_memory_from_session_metadata(&session.metadata);
-    let meeting = MeetingRecord {
+    let mut meeting = MeetingRecord {
         id,
         owner_account_id: None,
         title: session.title,
@@ -3479,9 +4986,39 @@ async fn meeting_from_cloud_bundle(
             .filter(|value| !value.trim().is_empty())
             .map(ToString::to_string),
     };
-    sync_state.rag_chunks = restored_rag_states(&meeting, &sync_state);
-    write_cloud_sync_state(data_dir, id, &sync_state)?;
-    Ok(meeting)
+    let tombstone_values = tombstones.values().cloned().collect::<Vec<_>>();
+    apply_cloud_child_tombstones_to_meeting(&mut meeting, &tombstone_values);
+    let live_context_ids = meeting
+        .context
+        .iter()
+        .map(|artifact| artifact.id.to_string())
+        .collect::<HashSet<_>>();
+    sync_state
+        .attachment_transfers
+        .retain(|local_id, _| live_context_ids.contains(local_id));
+    sync_state.rag_chunks = if rag_chunks.is_empty() {
+        restored_rag_states(&meeting, &sync_state)
+    } else {
+        rag_chunks
+            .into_iter()
+            .map(|record| {
+                let chunk_id = record.chunk_id.clone();
+                (
+                    chunk_id,
+                    CloudRagState {
+                        session_id: record.session_id,
+                        source_kind: record.source_kind,
+                        source_id: record.source_id,
+                        chunk_index: record.chunk_index,
+                        updated_at_ms: record.updated_at_ms,
+                    },
+                )
+            })
+            .collect()
+    };
+    operation_is_active()?;
+    write_cloud_sync_state(data_dir, owner_account_id, id, &sync_state)?;
+    Ok((meeting, attachment_retry_count, tombstone_values))
 }
 
 fn validate_cloud_bundle_parentage(bundle: &CloudSessionBundle) -> Result<()> {
@@ -3502,6 +5039,18 @@ fn validate_cloud_bundle_parentage(bundle: &CloudSessionBundle) -> Result<()> {
                 .iter()
                 .map(|record| record.session_id.as_str()),
         )
+        .chain(
+            bundle
+                .rag_chunks
+                .iter()
+                .filter_map(|record| record.session_id.as_deref()),
+        )
+        .chain(
+            bundle
+                .child_tombstones
+                .iter()
+                .map(|record| record.session_id.as_str()),
+        )
     {
         if child_session_id != session_id {
             anyhow::bail!(
@@ -3510,10 +5059,29 @@ fn validate_cloud_bundle_parentage(bundle: &CloudSessionBundle) -> Result<()> {
         }
     }
 
+    for tombstone in &bundle.child_tombstones {
+        if tombstone.child_id.trim().is_empty()
+            || tombstone.deleted_at_ms <= 0
+            || !matches!(
+                tombstone.child_kind.as_str(),
+                "transcript" | "response" | "context" | "rag"
+            )
+        {
+            anyhow::bail!("cloud session bundle contained an invalid child tombstone");
+        }
+    }
+
     let artifact_ids = bundle
         .context_artifacts
         .iter()
         .map(|record| record.artifact_id.as_str())
+        .chain(
+            bundle
+                .child_tombstones
+                .iter()
+                .filter(|tombstone| tombstone.child_kind == "context")
+                .map(|tombstone| tombstone.child_id.as_str()),
+        )
         .collect::<HashSet<_>>();
     for response in &bundle.cue_responses {
         let Some(value) = response.metadata.get("attachment_ids") else {
@@ -3544,58 +5112,163 @@ fn validate_cloud_bundle_parentage(bundle: &CloudSessionBundle) -> Result<()> {
             }
         }
     }
+    for tombstone in bundle
+        .child_tombstones
+        .iter()
+        .filter(|tombstone| tombstone.child_kind == "rag")
+    {
+        let provenance_fields = [
+            tombstone.source_kind.is_some(),
+            tombstone.source_id.is_some(),
+            tombstone.chunk_index.is_some(),
+        ];
+        let present = provenance_fields
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+        if present != 0 && present != provenance_fields.len() {
+            anyhow::bail!("cloud session bundle contained partial RAG tombstone provenance");
+        }
+    }
     Ok(())
 }
 
+fn cloud_child_tombstone_key(child_kind: &str, child_id: &str) -> String {
+    format!("{}:{child_id}", child_kind.trim().to_ascii_lowercase())
+}
+
+fn newest_cloud_child_tombstones(
+    child_tombstones: Vec<CloudChildTombstone>,
+) -> BTreeMap<String, CloudChildTombstone> {
+    let mut newest = BTreeMap::<String, CloudChildTombstone>::new();
+    for tombstone in child_tombstones {
+        let key = cloud_child_tombstone_key(&tombstone.child_kind, &tombstone.child_id);
+        let replace = newest
+            .get(&key)
+            .is_none_or(|current| tombstone.deleted_at_ms > current.deleted_at_ms);
+        if replace {
+            newest.insert(key, tombstone);
+        }
+    }
+    newest
+}
+
+fn cloud_child_tombstone_dominates(
+    tombstones: &BTreeMap<String, CloudChildTombstone>,
+    child_kind: &str,
+    child_id: &str,
+    updated_at_ms: i64,
+) -> bool {
+    tombstones
+        .get(&cloud_child_tombstone_key(child_kind, child_id))
+        .is_some_and(|tombstone| tombstone.deleted_at_ms >= updated_at_ms)
+}
+
+#[derive(Clone, Copy)]
+struct RestoredContextScope<'a> {
+    data_dir: &'a Path,
+    owner_account_id: &'a str,
+    session_id: Uuid,
+}
+
 async fn context_artifact_from_cloud(
-    data_dir: &Path,
+    scope: RestoredContextScope<'_>,
     client: Option<&CloudClient>,
     id: Uuid,
     record: SyncContextArtifactRecord,
-) -> Result<ContextArtifact> {
+    previous_transfer: Option<&CloudAttachmentTransferState>,
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<(ContextArtifact, Option<CloudAttachmentTransferState>)> {
     let kind = context_kind_from_cloud(&record.kind);
     let status = processing_status_from_metadata(&record.metadata, record.text_preview.as_deref());
-    let preview_path = write_restored_context_preview(data_dir, id, &record)?;
-    let object_path = match client {
-        Some(client) => download_restored_context_object(data_dir, client, id, &record)
-            .await
-            .unwrap_or_else(|| preview_path.clone()),
-        None => preview_path.clone(),
+    operation_is_active()?;
+    let expected_preview_path = account_scoped_restored_dir(
+        scope.data_dir,
+        CLOUD_RESTORED_CONTEXT_DIR,
+        scope.owner_account_id,
+        scope.session_id,
+    )?
+    .join(format!("{id}.md"));
+    let preview_result = write_restored_context_preview(
+        scope.data_dir,
+        scope.owner_account_id,
+        scope.session_id,
+        id,
+        &record,
+    );
+    let (preview_path, preview_retry) = match preview_result {
+        Ok(path) => (path, None),
+        Err(_) => (
+            expected_preview_path,
+            Some(attachment_transfer_retry_state(
+                record.artifact_id.clone(),
+                CloudAttachmentTransferStatus::DownloadRetry,
+                "preview_write_failed",
+                previous_transfer,
+            )),
+        ),
+    };
+    let (object_path, transfer) = match (preview_retry, client) {
+        (Some(retry), _) => (preview_path.clone(), Some(retry)),
+        (None, Some(client)) => match download_restored_context_object(
+            scope,
+            client,
+            id,
+            &record,
+            previous_transfer,
+            operation_is_active,
+        )
+        .await?
+        {
+            Some((path, transfer)) => (path, Some(transfer)),
+            None => (preview_path.clone(), None),
+        },
+        (None, None) => (preview_path.clone(), None),
     };
     let size_bytes = record
         .metadata
         .get("object_size_bytes")
         .or_else(|| record.metadata.get("size_bytes"))
         .and_then(|value| value.as_u64());
-    Ok(ContextArtifact {
-        id,
-        kind,
-        path: object_path.display().to_string(),
-        title: record.title,
-        // `source_uri` and object restoration status are transport metadata,
-        // not user-authored notes. The sidecar preserves the former exactly.
-        note: record.note,
-        size_bytes,
-        text_preview: record.text_preview,
-        markdown_path: Some(preview_path.display().to_string()),
-        processing_status: status,
-        processing_error: record
-            .metadata
-            .get("processing_error")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string),
-        answer_context_role: answer_context_role_from_metadata(&record.metadata),
-        created_at: record.created_at_ms.to_string(),
-        updated_at: record.updated_at_ms.max(record.created_at_ms).to_string(),
-    })
+    Ok((
+        ContextArtifact {
+            id,
+            kind,
+            path: object_path.display().to_string(),
+            title: record.title,
+            // `source_uri` and object restoration status are transport metadata,
+            // not user-authored notes. The sidecar preserves the former exactly.
+            note: record.note,
+            size_bytes,
+            text_preview: record.text_preview,
+            markdown_path: Some(preview_path.display().to_string()),
+            processing_status: status,
+            processing_error: record
+                .metadata
+                .get("processing_error")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string),
+            answer_context_role: answer_context_role_from_metadata(&record.metadata),
+            created_at: record.created_at_ms.to_string(),
+            updated_at: record.updated_at_ms.max(record.created_at_ms).to_string(),
+        },
+        transfer,
+    ))
 }
 
 fn write_restored_context_preview(
     data_dir: &Path,
+    owner_account_id: &str,
+    session_id: Uuid,
     id: Uuid,
     record: &SyncContextArtifactRecord,
 ) -> Result<std::path::PathBuf> {
-    let dir = data_dir.join("cloud-restored-context");
+    let dir = account_scoped_restored_dir(
+        data_dir,
+        CLOUD_RESTORED_CONTEXT_DIR,
+        owner_account_id,
+        session_id,
+    )?;
     cue_core::app_paths::create_private_dir(&dir)?;
     let path = dir.join(format!("{id}.md"));
     let mut body = format!(
@@ -3622,52 +5295,172 @@ fn write_restored_context_preview(
     } else {
         body.push_str("\nNo text preview was synced for this item.\n");
     }
-    fs::write(&path, body).with_context(|| format!("write {}", path.display()))?;
+    crate::storage::write_private_atomic_bytes(&path, body.as_bytes())
+        .context("write account-scoped restored context preview")?;
     Ok(path)
 }
 
 async fn download_restored_context_object(
-    data_dir: &Path,
+    scope: RestoredContextScope<'_>,
     client: &CloudClient,
     id: Uuid,
     record: &SyncContextArtifactRecord,
-) -> Option<PathBuf> {
-    record
+    previous_transfer: Option<&CloudAttachmentTransferState>,
+    operation_is_active: &OperationGuard<'_>,
+) -> Result<Option<(PathBuf, CloudAttachmentTransferState)>> {
+    let object_key = record
         .metadata
         .get("object_key")
         .and_then(|value| value.as_str())
-        .filter(|value| !value.trim().is_empty())?;
+        .filter(|value| !value.trim().is_empty());
+    if object_key.is_none() {
+        return Ok(None);
+    }
+    operation_is_active()?;
     let bytes = match client.download_artifact_object(&record.artifact_id).await {
         Ok(bytes) => bytes,
         Err(error) => {
-            debug!(
-                artifact_id = %record.artifact_id,
-                error = %error,
-                "cloud hydration could not download artifact object"
-            );
-            return None;
+            let _ = error;
+            return Ok(Some((
+                account_scoped_restored_dir(
+                    scope.data_dir,
+                    CLOUD_RESTORED_CONTEXT_DIR,
+                    scope.owner_account_id,
+                    scope.session_id,
+                )?
+                .join(format!("{id}.md")),
+                attachment_transfer_retry_state(
+                    record.artifact_id.clone(),
+                    CloudAttachmentTransferStatus::DownloadRetry,
+                    "object_download_failed",
+                    previous_transfer,
+                ),
+            )));
         }
     };
-    let dir = data_dir.join("cloud-restored-objects");
-    if let Err(error) = cue_core::app_paths::create_private_dir(&dir) {
-        debug!(
-            dir = %dir.display(),
-            error = %error,
-            "cloud hydration could not create restored object directory"
-        );
-        return None;
+    operation_is_active()?;
+    let preview_path = account_scoped_restored_dir(
+        scope.data_dir,
+        CLOUD_RESTORED_CONTEXT_DIR,
+        scope.owner_account_id,
+        scope.session_id,
+    )?
+    .join(format!("{id}.md"));
+    let local_sha256 = format!("{:x}", Sha256::digest(&bytes));
+    let expected_size = record
+        .metadata
+        .get("object_size_bytes")
+        .and_then(Value::as_u64);
+    let expected_sha256 = record
+        .metadata
+        .get("object_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty());
+    if bytes.len() as u64 > MAX_OBJECT_UPLOAD_BYTES
+        || expected_size.is_some_and(|expected| expected != bytes.len() as u64)
+        || expected_sha256.is_some_and(|expected| !expected.eq_ignore_ascii_case(&local_sha256))
+    {
+        return Ok(Some((
+            preview_path,
+            attachment_transfer_retry_state(
+                record.artifact_id.clone(),
+                CloudAttachmentTransferStatus::DownloadRetry,
+                "object_integrity_mismatch",
+                previous_transfer,
+            ),
+        )));
+    }
+    let dir = account_scoped_restored_dir(
+        scope.data_dir,
+        CLOUD_RESTORED_OBJECTS_DIR,
+        scope.owner_account_id,
+        scope.session_id,
+    )?;
+    if cue_core::app_paths::create_private_dir(&dir).is_err() {
+        return Ok(Some((
+            preview_path,
+            attachment_transfer_retry_state(
+                record.artifact_id.clone(),
+                CloudAttachmentTransferStatus::DownloadRetry,
+                "object_directory_unavailable",
+                previous_transfer,
+            ),
+        )));
     }
     let filename = restored_object_filename(id, record);
     let path = dir.join(filename);
-    if let Err(error) = fs::write(&path, bytes) {
-        debug!(
-            path = %path.display(),
-            error = %error,
-            "cloud hydration could not write restored object"
-        );
-        return None;
+    if crate::storage::write_private_atomic_bytes(&path, &bytes).is_err() {
+        return Ok(Some((
+            preview_path,
+            attachment_transfer_retry_state(
+                record.artifact_id.clone(),
+                CloudAttachmentTransferStatus::DownloadRetry,
+                "object_write_failed",
+                previous_transfer,
+            ),
+        )));
     }
-    Some(path)
+    let object = SyncedObjectMetadata {
+        object_key: object_key.unwrap_or_default().to_string(),
+        size_bytes: bytes.len() as u64,
+        sha256: local_sha256,
+        content_type: record
+            .metadata
+            .get("object_content_type")
+            .and_then(Value::as_str)
+            .unwrap_or("application/octet-stream")
+            .to_string(),
+        expires_at_ms: record
+            .metadata
+            .get("object_expires_at_ms")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    };
+    Ok(Some((
+        path,
+        CloudAttachmentTransferState {
+            record_id: record.artifact_id.clone(),
+            status: CloudAttachmentTransferStatus::Synced,
+            attempt_count: previous_transfer
+                .map(|transfer| transfer.attempt_count)
+                .unwrap_or_default()
+                .saturating_add(1),
+            updated_at_ms: current_epoch_ms(),
+            last_error_category: None,
+            object: Some(object),
+        },
+    )))
+}
+
+fn account_scoped_restored_dir(
+    data_dir: &Path,
+    root: &str,
+    owner_account_id: &str,
+    session_id: Uuid,
+) -> Result<PathBuf> {
+    Ok(data_dir
+        .join(root)
+        .join(account_scope_key(owner_account_id)?)
+        .join(session_id.to_string()))
+}
+
+fn attachment_transfer_retry_state(
+    record_id: String,
+    status: CloudAttachmentTransferStatus,
+    error_category: &str,
+    previous_transfer: Option<&CloudAttachmentTransferState>,
+) -> CloudAttachmentTransferState {
+    CloudAttachmentTransferState {
+        record_id,
+        status,
+        attempt_count: previous_transfer
+            .map(|transfer| transfer.attempt_count)
+            .unwrap_or_default()
+            .saturating_add(1),
+        updated_at_ms: current_epoch_ms(),
+        last_error_category: Some(error_category.to_string()),
+        object: None,
+    }
 }
 
 fn restored_object_filename(id: Uuid, record: &SyncContextArtifactRecord) -> String {
@@ -3895,6 +5688,30 @@ fn session_record(
     state: Option<&CloudSyncState>,
 ) -> SyncSessionRecord {
     let updated_at_ms = updated_at_ms(meeting, responses);
+    let session_id = wire_session_id(meeting, state);
+    let summary_chunk_id = format!("{session_id}:summary:0");
+    let instructions_chunk_id = format!("{session_id}:instructions:0");
+    let summary = state
+        .filter(|state| {
+            state
+                .child_tombstones
+                .contains_key(&cloud_child_tombstone_key("rag", &summary_chunk_id))
+        })
+        .map(|_| None)
+        .unwrap_or(meeting.summary.as_deref());
+    let answer_instructions = state
+        .filter(|state| {
+            state
+                .child_tombstones
+                .contains_key(&cloud_child_tombstone_key("rag", &instructions_chunk_id))
+        })
+        .map(|_| None)
+        .unwrap_or(meeting.answer_instructions.as_deref());
+    let mut conversation_memory = meeting.conversation_memory.clone();
+    if state.is_some_and(|state| cloud_state_has_conversation_memory_tombstone(state, &session_id))
+    {
+        conversation_memory = ConversationMemory::default();
+    }
     let metadata = merge_metadata(
         state
             .map(|state| state.session_metadata.clone())
@@ -3902,10 +5719,10 @@ fn session_record(
         json!({
             "session_code": short_session_code(meeting.id),
             "sync_revision": session_content_revision(meeting, responses, state),
-            "summary": meeting.summary.as_deref(),
+            "summary": summary,
             "conversation_memory": {
                 "schema_version": CLOUD_CONVERSATION_MEMORY_SCHEMA_VERSION,
-                "state": &meeting.conversation_memory,
+                "state": &conversation_memory,
             },
             "action_items": meeting.action_items.len(),
             "decisions": meeting.decisions.len(),
@@ -3929,7 +5746,7 @@ fn session_record(
         }),
     );
     SyncSessionRecord {
-        session_id: wire_session_id(meeting, state),
+        session_id,
         title: meeting.title.clone(),
         status: if meeting.ended_at.is_some() {
             "archived".into()
@@ -3939,7 +5756,7 @@ fn session_record(
         created_at_ms: parse_ms(&meeting.started_at),
         updated_at_ms,
         last_active_at_ms: Some(updated_at_ms),
-        answer_style: meeting.answer_instructions.clone(),
+        answer_style: answer_instructions.map(ToString::to_string),
         metadata,
         deleted_at_ms: None,
     }
@@ -4450,6 +6267,25 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FailingCloudDeleteClient {
+        attempted_remote_session_ids: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CloudSessionDeleteClient for FailingCloudDeleteClient {
+        async fn delete_cloud_session(
+            &self,
+            remote_session_id: &str,
+        ) -> std::result::Result<(), cue_cloud_client::Error> {
+            self.attempted_remote_session_ids
+                .lock()
+                .unwrap()
+                .push(remote_session_id.to_string());
+            Err(cue_cloud_client::Error::Server { status: 503 })
+        }
+    }
+
     fn test_meeting_store(root: &Path) -> MeetingStore {
         let paths = AppPaths {
             data_dir: root.to_path_buf(),
@@ -4463,10 +6299,15 @@ mod tests {
         MeetingStore::new(&paths).unwrap()
     }
 
-    fn empty_cloud_sync_state(remote_session_id: impl Into<String>) -> CloudSyncState {
+    fn empty_cloud_sync_state(
+        owner_account_id: impl Into<String>,
+        remote_session_id: impl Into<String>,
+    ) -> CloudSyncState {
         CloudSyncState {
             schema_version: CLOUD_SYNC_STATE_SCHEMA_VERSION,
+            owner_account_id: owner_account_id.into(),
             remote_session_id: remote_session_id.into(),
+            remote_summary: None,
             session_metadata: json!({}),
             transcript_segments: BTreeMap::new(),
             context_artifacts: BTreeMap::new(),
@@ -4474,7 +6315,55 @@ mod tests {
             synced_transcript_records: BTreeMap::new(),
             synced_response_records: BTreeMap::new(),
             rag_chunks: BTreeMap::new(),
+            attachment_transfers: BTreeMap::new(),
+            child_tombstones: BTreeMap::new(),
         }
+    }
+
+    fn child_tombstone(
+        kind: &str,
+        child_id: impl Into<String>,
+        session_id: Uuid,
+    ) -> CloudChildTombstone {
+        CloudChildTombstone {
+            child_kind: kind.to_string(),
+            child_id: child_id.into(),
+            session_id: session_id.to_string(),
+            deleted_at_ms: i64::MAX - 1,
+            source_kind: None,
+            source_id: None,
+            chunk_index: None,
+        }
+    }
+
+    #[test]
+    fn cloud_log_identifier_hash_is_stable_and_never_contains_the_identifier() {
+        let identifier = b"018f38e0-6f61-74a1-9000-private-session";
+        let hash = cloud_log_identifier_hash(identifier);
+        let raw_identifier = String::from_utf8_lossy(identifier);
+
+        assert_eq!(hash.len(), 12);
+        assert_eq!(hash, cloud_log_identifier_hash(identifier));
+        assert_ne!(hash, cloud_log_identifier_hash(b"another-session"));
+        assert!(!hash.contains(raw_identifier.as_ref()));
+        assert!(!raw_identifier.contains(&hash));
+        assert!(!hash.contains("private"));
+    }
+
+    #[test]
+    fn hydration_summary_tracks_unique_tombstoned_session_ids_separately_from_counts() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        let mut summary = CloudHydrationSummary::default();
+        let mut seen_session_ids = HashSet::new();
+
+        summary.record_purged_session_id(&mut seen_session_ids, first);
+        summary.record_purged_session_id(&mut seen_session_ids, first);
+        summary.record_purged_session_id(&mut seen_session_ids, second);
+        summary.purged_deleted_sessions = 1;
+
+        assert_eq!(summary.purged_session_ids, vec![first, second]);
+        assert_eq!(summary.total_sessions(), 1);
     }
 
     #[test]
@@ -4516,12 +6405,19 @@ mod tests {
     fn session_delete_purges_all_local_audit_surfaces() {
         let root = std::env::temp_dir().join(format!("bluey-audit-delete-{}", Uuid::new_v4()));
         let session_id = Uuid::new_v4();
-        let bundle_dir = root.join(SESSION_AUDIT_DIR).join(session_id.to_string());
+        let owner = "acct-audit-delete";
+        let scope_key = account_scope_key(owner).unwrap();
+        let bundle_dir = root
+            .join(SESSION_AUDIT_DIR)
+            .join(&scope_key)
+            .join(session_id.to_string());
         let event_dir = root
             .join(SESSION_AUDIT_EVENTS_DIR)
+            .join(&scope_key)
             .join(session_id.to_string());
         let marker = root
             .join(SESSION_AUDIT_UPLOADED_DIR)
+            .join(scope_key)
             .join(format!("{session_id}.json"));
         fs::create_dir_all(&bundle_dir).unwrap();
         fs::create_dir_all(&event_dir).unwrap();
@@ -4530,13 +6426,298 @@ mod tests {
         fs::write(event_dir.join("events.jsonl"), b"{}\n").unwrap();
         fs::write(&marker, b"{}").unwrap();
 
-        purge_session_audit_state(&root, session_id).unwrap();
+        purge_session_audit_state(&root, Some(owner), session_id).unwrap();
         assert!(!bundle_dir.exists());
         assert!(!event_dir.exists());
         assert!(!marker.exists());
         // Repeated deletion is idempotent.
-        purge_session_audit_state(&root, session_id).unwrap();
+        purge_session_audit_state(&root, Some(owner), session_id).unwrap();
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn audit_purge_preserves_same_session_id_for_other_account() {
+        let root = std::env::temp_dir().join(format!("bluey-audit-owner-{}", Uuid::new_v4()));
+        let session_id = Uuid::new_v4();
+        let scope_a = SessionAuditScope {
+            session_id,
+            owner_account_id: Some("acct-audit-a".into()),
+        };
+        let scope_b = SessionAuditScope {
+            session_id,
+            owner_account_id: Some("acct-audit-b".into()),
+        };
+        append_privacy_safe_diagnostic_events_for_scope(
+            &root,
+            &scope_a,
+            &[("owner_a".into(), json!({"count": 1}))],
+        )
+        .unwrap();
+        append_privacy_safe_diagnostic_events_for_scope(
+            &root,
+            &scope_b,
+            &[("owner_b".into(), json!({"count": 1}))],
+        )
+        .unwrap();
+        let path_a = session_audit_event_dir(&root, &scope_a);
+        let path_b = session_audit_event_dir(&root, &scope_b);
+        assert_ne!(path_a, path_b);
+
+        purge_session_audit_state(&root, Some("acct-audit-a"), session_id).unwrap();
+        assert!(!path_a.exists());
+        assert!(path_b.join("events.jsonl").is_file());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cloud_state_outbox_and_restored_paths_are_account_scoped() {
+        let root = std::env::temp_dir().join(format!("bluey-account-scope-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let session_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let owner_a = "acct-scope-a";
+        let owner_b = "acct-scope-b";
+        let state_a = empty_cloud_sync_state(owner_a, "remote-a");
+        let state_b = empty_cloud_sync_state(owner_b, "remote-b");
+        write_cloud_sync_state(&root, owner_a, session_id, &state_a).unwrap();
+        write_cloud_sync_state(&root, owner_b, session_id, &state_b).unwrap();
+
+        assert_eq!(
+            load_cloud_sync_state(&root, owner_a, session_id)
+                .unwrap()
+                .remote_session_id,
+            "remote-a"
+        );
+        assert_eq!(
+            load_cloud_sync_state(&root, owner_b, session_id)
+                .unwrap()
+                .remote_session_id,
+            "remote-b"
+        );
+        let state_path_a = cloud_sync_state_path(&root, owner_a, session_id).unwrap();
+        let state_path_b = cloud_sync_state_path(&root, owner_b, session_id).unwrap();
+        assert_ne!(state_path_a, state_path_b);
+        assert!(!state_path_a.to_string_lossy().contains(owner_a));
+        assert!(!state_path_b.to_string_lossy().contains(owner_b));
+
+        prepare_cloud_session_delete(&root, session_id, owner_a).unwrap();
+        prepare_cloud_session_delete(&root, session_id, owner_b).unwrap();
+        assert_ne!(
+            cloud_delete_outbox_path(&root, owner_a, session_id).unwrap(),
+            cloud_delete_outbox_path(&root, owner_b, session_id).unwrap()
+        );
+
+        let record = SyncContextArtifactRecord {
+            artifact_id: artifact_id.to_string(),
+            session_id: session_id.to_string(),
+            kind: "document".into(),
+            title: "Notes.txt".into(),
+            note: None,
+            source_uri: None,
+            content_hash: None,
+            text_preview: Some("private preview".into()),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            deleted_at_ms: None,
+            metadata: json!({}),
+        };
+        let restored_a =
+            write_restored_context_preview(&root, owner_a, session_id, artifact_id, &record)
+                .unwrap();
+        let restored_b =
+            write_restored_context_preview(&root, owner_b, session_id, artifact_id, &record)
+                .unwrap();
+        assert_ne!(restored_a, restored_b);
+        assert!(!restored_a.to_string_lossy().contains(owner_a));
+        assert!(!restored_b.to_string_lossy().contains(owner_b));
+        purge_cloud_session_local_state(&root, owner_a, session_id).unwrap();
+        assert!(load_cloud_sync_state(&root, owner_a, session_id).is_none());
+        assert!(load_cloud_sync_state(&root, owner_b, session_id).is_some());
+        assert!(!restored_a.exists());
+        assert!(restored_b.exists());
+        assert!(!cloud_delete_outbox_path(&root, owner_a, session_id)
+            .unwrap()
+            .exists());
+        assert!(cloud_delete_outbox_path(&root, owner_b, session_id)
+            .unwrap()
+            .exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn account_purge_removes_only_the_selected_cloud_scope() {
+        let root = std::env::temp_dir().join(format!("bluey-account-purge-{}", Uuid::new_v4()));
+        let session_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let owner_a = "acct-purge-a";
+        let owner_b = "acct-purge-b";
+        for owner in [owner_a, owner_b] {
+            write_cloud_sync_state(
+                &root,
+                owner,
+                session_id,
+                &empty_cloud_sync_state(owner, session_id.to_string()),
+            )
+            .unwrap();
+            prepare_cloud_session_delete(&root, session_id, owner).unwrap();
+            write_cloud_hydration_cursor(&root, owner, "opaque-cursor").unwrap();
+            let record = SyncContextArtifactRecord {
+                artifact_id: artifact_id.to_string(),
+                session_id: session_id.to_string(),
+                kind: "document".into(),
+                title: "Private.txt".into(),
+                note: None,
+                source_uri: None,
+                content_hash: None,
+                text_preview: Some("private preview".into()),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                deleted_at_ms: None,
+                metadata: json!({}),
+            };
+            write_restored_context_preview(&root, owner, session_id, artifact_id, &record).unwrap();
+            let scope = SessionAuditScope {
+                session_id,
+                owner_account_id: Some(owner.to_string()),
+            };
+            append_privacy_safe_diagnostic_events_for_scope(
+                &root,
+                &scope,
+                &[("scope_test".into(), json!({"count": 1}))],
+            )
+            .unwrap();
+        }
+
+        purge_cloud_account_local_state(&root, owner_a).unwrap();
+
+        assert!(load_cloud_sync_state(&root, owner_a, session_id).is_none());
+        assert!(load_cloud_hydration_cursor(&root, owner_a).is_none());
+        assert!(!cloud_delete_outbox_path(&root, owner_a, session_id)
+            .unwrap()
+            .exists());
+        assert!(load_cloud_sync_state(&root, owner_b, session_id).is_some());
+        assert_eq!(
+            load_cloud_hydration_cursor(&root, owner_b).as_deref(),
+            Some("opaque-cursor")
+        );
+        assert!(cloud_delete_outbox_path(&root, owner_b, session_id)
+            .unwrap()
+            .exists());
+        assert!(session_audit_event_dir(
+            &root,
+            &SessionAuditScope {
+                session_id,
+                owner_account_id: Some(owner_b.to_string()),
+            }
+        )
+        .exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn changed_only_fingerprint_includes_rag_and_child_deletions() {
+        let root =
+            std::env::temp_dir().join(format!("bluey-summary-fingerprint-{}", Uuid::new_v4()));
+        let owner = "acct-summary";
+        let session_id = Uuid::new_v4();
+        let mut state = empty_cloud_sync_state(owner, session_id.to_string());
+        let mut summary = CloudSessionSummary {
+            session_id: session_id.to_string(),
+            title: "Session".into(),
+            status: "ended".into(),
+            updated_at_ms: 100,
+            last_active_at_ms: None,
+            answer_style: None,
+            transcript_count: 2,
+            response_count: 1,
+            context_count: 1,
+            rag_count: 4,
+            child_tombstone_count: 0,
+            child_tombstone_updated_at_ms: None,
+        };
+        state.remote_summary = Some(cloud_session_fingerprint(&summary));
+        write_cloud_sync_state(&root, owner, session_id, &state).unwrap();
+        assert!(cloud_session_summary_is_current(
+            &root, owner, session_id, &summary
+        ));
+
+        summary.child_tombstone_count = 1;
+        summary.child_tombstone_updated_at_ms = Some(110);
+        assert!(!cloud_session_summary_is_current(
+            &root, owner, session_id, &summary
+        ));
+        summary.child_tombstone_count = 0;
+        summary.child_tombstone_updated_at_ms = None;
+        summary.rag_count -= 1;
+        assert!(!cloud_session_summary_is_current(
+            &root, owner, session_id, &summary
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_unscoped_cloud_sync_state_fails_closed() {
+        let root = std::env::temp_dir().join(format!("bluey-legacy-state-{}", Uuid::new_v4()));
+        let session_id = Uuid::new_v4();
+        let legacy_dir = root.join(CLOUD_SYNC_STATE_DIR);
+        fs::create_dir_all(&legacy_dir).unwrap();
+        fs::write(
+            legacy_dir.join(format!("{session_id}.json")),
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "remote_session_id": "legacy-remote",
+                "session_metadata": {},
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(load_cloud_sync_state(&root, "acct-current", session_id).is_none());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_retry_is_durable_and_owner_scoped() {
+        let root = std::env::temp_dir().join(format!("bluey-object-retry-{}", Uuid::new_v4()));
+        let owner = "acct-object-retry";
+        let mut meeting = MeetingRecord::new(Some("Attachment retry".into()));
+        meeting.owner_account_id = Some(owner.to_string());
+        let artifact = ContextArtifact::new(
+            ContextKind::Document,
+            root.join("missing.pdf").to_string_lossy().to_string(),
+            "Missing.pdf",
+            None,
+            Some(10),
+        );
+        let artifact_id = artifact.id;
+        meeting.context.push(artifact);
+        let mut states = HashMap::new();
+
+        record_attachment_transfer_retry(
+            &root,
+            owner,
+            &meeting,
+            None,
+            &mut states,
+            artifact_id,
+            artifact_id.to_string(),
+            CloudAttachmentTransferStatus::UploadRetry,
+            "local_file_unavailable",
+        )
+        .unwrap();
+
+        let persisted = load_cloud_sync_state(&root, owner, meeting.id).unwrap();
+        let transfer = persisted
+            .attachment_transfers
+            .get(&artifact_id.to_string())
+            .unwrap();
+        assert_eq!(transfer.status, CloudAttachmentTransferStatus::UploadRetry);
+        assert_eq!(
+            transfer.last_error_category.as_deref(),
+            Some("local_file_unavailable")
+        );
+        assert!(load_cloud_sync_state(&root, "acct-other", meeting.id).is_none());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4547,13 +6728,16 @@ mod tests {
         let session_id = Uuid::new_v4();
         let disposition = prepare_cloud_session_delete(&root, session_id, "acct-local").unwrap();
         assert_eq!(disposition, CloudSessionDeleteDisposition::Queued);
-        let queued: PendingCloudSessionDelete =
-            serde_json::from_slice(&fs::read(cloud_delete_outbox_path(&root, session_id)).unwrap())
-                .unwrap();
+        let queued: PendingCloudSessionDelete = serde_json::from_slice(
+            &fs::read(cloud_delete_outbox_path(&root, "acct-local", session_id).unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(queued.remote_session_id, session_id.to_string());
         assert_eq!(queued.state, CloudSessionDeleteState::Prepared);
         abort_prepared_cloud_session_delete(&root, session_id, "acct-local").unwrap();
-        assert!(!cloud_delete_outbox_path(&root, session_id).exists());
+        assert!(!cloud_delete_outbox_path(&root, "acct-local", session_id)
+            .unwrap()
+            .exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4564,21 +6748,25 @@ mod tests {
         let session_id = Uuid::new_v4();
         write_cloud_sync_state(
             &root,
+            "acct-1",
             session_id,
-            &empty_cloud_sync_state("remote-session-1"),
+            &empty_cloud_sync_state("acct-1", "remote-session-1"),
         )
         .unwrap();
 
         let disposition = prepare_cloud_session_delete(&root, session_id, "acct-1").unwrap();
         assert_eq!(disposition, CloudSessionDeleteDisposition::Queued);
-        let queued: PendingCloudSessionDelete =
-            serde_json::from_slice(&fs::read(cloud_delete_outbox_path(&root, session_id)).unwrap())
-                .unwrap();
+        let queued: PendingCloudSessionDelete = serde_json::from_slice(
+            &fs::read(cloud_delete_outbox_path(&root, "acct-1", session_id).unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(queued.local_session_id, session_id);
         assert_eq!(queued.remote_session_id, "remote-session-1");
         assert_eq!(queued.owner_account_id, "acct-1");
         assert_eq!(queued.state, CloudSessionDeleteState::Prepared);
-        assert!(cloud_sync_state_path(&root, session_id).exists());
+        assert!(cloud_sync_state_path(&root, "acct-1", session_id)
+            .unwrap()
+            .exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4595,7 +6783,44 @@ mod tests {
         let pending: PendingCloudSessionDelete = serde_json::from_value(legacy).unwrap();
         assert_eq!(pending.state, CloudSessionDeleteState::Committed);
         assert!(pending.committed_at_ms.is_none());
+        assert_eq!(pending.attempt_count, 0);
+        assert_eq!(pending.next_retry_at_ms, 0);
+        assert!(pending.last_error_category.is_none());
         validate_cloud_delete_intent(&pending, session_id, "acct-legacy").unwrap();
+    }
+
+    #[test]
+    fn legacy_delete_outbox_migrates_only_for_its_recorded_owner() {
+        let root = std::env::temp_dir().join(format!("bluey-legacy-outbox-{}", Uuid::new_v4()));
+        let legacy_root = root.join(CLOUD_DELETE_OUTBOX_DIR);
+        fs::create_dir_all(&legacy_root).unwrap();
+        let session_id = Uuid::new_v4();
+        let pending = PendingCloudSessionDelete {
+            schema_version: CLOUD_DELETE_OUTBOX_SCHEMA_VERSION,
+            local_session_id: session_id,
+            remote_session_id: "remote-legacy".into(),
+            owner_account_id: "acct-legacy-owner".into(),
+            queued_at_ms: 42,
+            state: CloudSessionDeleteState::Committed,
+            committed_at_ms: Some(43),
+            attempt_count: 0,
+            next_retry_at_ms: 0,
+            last_error_category: None,
+        };
+        let legacy_path = legacy_root.join(format!("{session_id}.json"));
+        fs::write(&legacy_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+
+        migrate_legacy_cloud_delete_intents(&root, "acct-other").unwrap();
+        assert!(legacy_path.exists());
+        assert!(!cloud_delete_outbox_path(&root, "acct-other", session_id)
+            .unwrap()
+            .exists());
+
+        migrate_legacy_cloud_delete_intents(&root, "acct-legacy-owner").unwrap();
+        assert!(!legacy_path.exists());
+        let scoped = cloud_delete_outbox_path(&root, "acct-legacy-owner", session_id).unwrap();
+        assert_eq!(read_cloud_delete_intent(&scoped).unwrap(), Some(pending));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]
@@ -4624,11 +6849,15 @@ mod tests {
         // delete/rollback. The durable record is still prepared, so neither
         // cleanup failure nor any background flusher can promote it.
         let client = RecordingCloudDeleteClient::default();
-        flush_pending_cloud_session_deletes_with(&root, &client, Some("acct-rollback")).await;
+        flush_pending_cloud_session_deletes_with(&root, &client, Some("acct-rollback"), &|| Ok(()))
+            .await
+            .unwrap();
         assert!(client.deleted_remote_session_ids.lock().unwrap().is_empty());
-        let pending = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("prepared intent remains durable");
+        let pending = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-rollback", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("prepared intent remains durable");
         assert_eq!(pending.state, CloudSessionDeleteState::Prepared);
         assert!(store.load_by_id(session_id).unwrap().is_some());
         let _ = fs::remove_dir_all(root);
@@ -4647,7 +6876,11 @@ mod tests {
         reconcile_prepared_cloud_session_deletes(&root, &store, Some("acct-reconcile")).unwrap();
 
         assert!(store.load_by_id(session_id).unwrap().is_some());
-        assert!(!cloud_delete_outbox_path(&root, session_id).exists());
+        assert!(
+            !cloud_delete_outbox_path(&root, "acct-reconcile", session_id)
+                .unwrap()
+                .exists()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4661,27 +6894,36 @@ mod tests {
         store.save_archived(&meeting).unwrap();
         write_cloud_sync_state(
             &root,
+            "acct-recover",
             session_id,
-            &empty_cloud_sync_state("remote-recover-1"),
+            &empty_cloud_sync_state("acct-recover", "remote-recover-1"),
         )
         .unwrap();
         prepare_cloud_session_delete(&root, session_id, "acct-recover").unwrap();
         assert!(store.delete(session_id).unwrap());
 
         reconcile_prepared_cloud_session_deletes(&root, &store, Some("acct-recover")).unwrap();
-        let recovered = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("reconciled delete intent");
+        let recovered = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-recover", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("reconciled delete intent");
         assert_eq!(recovered.state, CloudSessionDeleteState::Committed);
 
         let client = RecordingCloudDeleteClient::default();
-        flush_pending_cloud_session_deletes_with(&root, &client, Some("acct-recover")).await;
-        flush_pending_cloud_session_deletes_with(&root, &client, Some("acct-recover")).await;
+        flush_pending_cloud_session_deletes_with(&root, &client, Some("acct-recover"), &|| Ok(()))
+            .await
+            .unwrap();
+        flush_pending_cloud_session_deletes_with(&root, &client, Some("acct-recover"), &|| Ok(()))
+            .await
+            .unwrap();
         assert_eq!(
             *client.deleted_remote_session_ids.lock().unwrap(),
             vec!["remote-recover-1".to_string()]
         );
-        assert!(!cloud_delete_outbox_path(&root, session_id).exists());
+        assert!(!cloud_delete_outbox_path(&root, "acct-recover", session_id)
+            .unwrap()
+            .exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4694,9 +6936,11 @@ mod tests {
 
         reconcile_prepared_cloud_session_deletes(&root, &store, Some("acct-other")).unwrap();
 
-        let pending = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("other-account prepared intent remains");
+        let pending = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-original", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("other-account prepared intent remains");
         assert_eq!(pending.state, CloudSessionDeleteState::Prepared);
         let _ = fs::remove_dir_all(root);
     }
@@ -4710,17 +6954,21 @@ mod tests {
 
         // A signed-out startup cannot safely assign the intent to an account.
         reconcile_prepared_cloud_session_deletes(&root, &store, None).unwrap();
-        let prepared = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("signed-out startup leaves the intent inert");
+        let prepared = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-login", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("signed-out startup leaves the intent inert");
         assert_eq!(prepared.state, CloudSessionDeleteState::Prepared);
 
         // The post-login reconciliation path can now prove both ownership and
         // the absence of the canonical local record.
         reconcile_prepared_cloud_session_deletes(&root, &store, Some("acct-login")).unwrap();
-        let committed = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("post-login reconciliation promotes the intent");
+        let committed = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-login", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("post-login reconciliation promotes the intent");
         assert_eq!(committed.state, CloudSessionDeleteState::Committed);
         let _ = fs::remove_dir_all(root);
     }
@@ -4754,9 +7002,11 @@ mod tests {
         assert!(done_rx
             .recv_timeout(std::time::Duration::from_millis(50))
             .is_err());
-        let pending = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("in-flight intent remains prepared");
+        let pending = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-transaction", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("in-flight intent remains prepared");
         assert_eq!(pending.state, CloudSessionDeleteState::Prepared);
 
         drop(transaction);
@@ -4764,7 +7014,11 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("reconciliation completes after local transaction");
         worker.join().unwrap();
-        assert!(!cloud_delete_outbox_path(&root, session_id).exists());
+        assert!(
+            !cloud_delete_outbox_path(&root, "acct-transaction", session_id)
+                .unwrap()
+                .exists()
+        );
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4778,31 +7032,90 @@ mod tests {
         store.save_archived(&meeting).unwrap();
         write_cloud_sync_state(
             &root,
+            "acct-commit",
             session_id,
-            &empty_cloud_sync_state("remote-delete-1"),
+            &empty_cloud_sync_state("acct-commit", "remote-delete-1"),
         )
         .unwrap();
         prepare_cloud_session_delete(&root, session_id, "acct-commit").unwrap();
         assert!(store.delete(session_id).unwrap());
         commit_prepared_cloud_session_delete(&root, session_id, "acct-commit").unwrap();
-        let committed = read_cloud_delete_intent(&cloud_delete_outbox_path(&root, session_id))
-            .unwrap()
-            .expect("committed intent");
+        let committed = read_cloud_delete_intent(
+            &cloud_delete_outbox_path(&root, "acct-commit", session_id).unwrap(),
+        )
+        .unwrap()
+        .expect("committed intent");
         assert_eq!(committed.state, CloudSessionDeleteState::Committed);
         assert!(committed.committed_at_ms.is_some());
+        assert!(cloud_session_has_committed_delete(&root, "acct-commit", session_id).unwrap());
 
         let client = RecordingCloudDeleteClient::default();
         assert_eq!(
-            flush_queued_cloud_session_delete_with(&root, session_id, &client, "acct-commit",)
-                .await,
+            flush_queued_cloud_session_delete_with(
+                &root,
+                session_id,
+                &client,
+                "acct-commit",
+                &|| Ok(()),
+            )
+            .await
+            .unwrap(),
             CloudSessionDeleteDisposition::Confirmed
         );
         assert_eq!(
             *client.deleted_remote_session_ids.lock().unwrap(),
             vec!["remote-delete-1".to_string()]
         );
-        assert!(!cloud_delete_outbox_path(&root, session_id).exists());
-        assert!(!cloud_sync_state_path(&root, session_id).exists());
+        assert!(!cloud_delete_outbox_path(&root, "acct-commit", session_id)
+            .unwrap()
+            .exists());
+        assert!(!cloud_sync_state_path(&root, "acct-commit", session_id)
+            .unwrap()
+            .exists());
+        assert!(!cloud_session_has_committed_delete(&root, "acct-commit", session_id).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn failed_cloud_delete_persists_backoff_and_skips_immediate_retry() {
+        let root = std::env::temp_dir().join(format!("bluey-delete-backoff-{}", Uuid::new_v4()));
+        let session_id = Uuid::new_v4();
+        prepare_cloud_session_delete(&root, session_id, "acct-backoff").unwrap();
+        commit_prepared_cloud_session_delete(&root, session_id, "acct-backoff").unwrap();
+        let client = FailingCloudDeleteClient::default();
+
+        assert_eq!(
+            flush_queued_cloud_session_delete_with(
+                &root,
+                session_id,
+                &client,
+                "acct-backoff",
+                &|| Ok(()),
+            )
+            .await
+            .unwrap(),
+            CloudSessionDeleteDisposition::Queued
+        );
+        let path = cloud_delete_outbox_path(&root, "acct-backoff", session_id).unwrap();
+        let pending = read_cloud_delete_intent(&path).unwrap().unwrap();
+        assert_eq!(pending.attempt_count, 1);
+        assert!(pending.next_retry_at_ms > current_epoch_ms());
+        assert_eq!(pending.last_error_category.as_deref(), Some("server"));
+        assert!(has_committed_cloud_session_delete(&root, "acct-backoff").unwrap());
+
+        assert_eq!(
+            flush_queued_cloud_session_delete_with(
+                &root,
+                session_id,
+                &client,
+                "acct-backoff",
+                &|| Ok(()),
+            )
+            .await
+            .unwrap(),
+            CloudSessionDeleteDisposition::Queued
+        );
+        assert_eq!(client.attempted_remote_session_ids.lock().unwrap().len(), 1);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -4963,7 +7276,14 @@ mod tests {
                 .with_text_preview("private page text that must be removed");
         let artifact_id = artifact.id;
         meeting.context.push(artifact);
-        let state = cloud_sync_state_after_upload(&meeting, None, &HashMap::new(), None, None);
+        let state = cloud_sync_state_after_upload(
+            &meeting,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            "acct-context-delete",
+        );
         meeting.context.clear();
         let states = HashMap::from([(meeting.id, state)]);
 
@@ -5005,14 +7325,27 @@ mod tests {
         .with_text_preview("private content that must still be deleted");
         let artifact_id = artifact.id;
         meeting.context.push(artifact);
-        let state = cloud_sync_state_after_upload(&meeting, None, &HashMap::new(), None, None);
+        let state = cloud_sync_state_after_upload(
+            &meeting,
+            None,
+            &HashMap::new(),
+            None,
+            None,
+            "acct-cloud-state",
+        );
 
-        write_cloud_sync_state(&root, meeting.id, &state).expect("initial sync state");
-        write_cloud_sync_state(&root, meeting.id, &state).expect("state with backup");
-        fs::write(cloud_sync_state_path(&root, meeting.id), b"{interrupted")
-            .expect("simulate interrupted legacy write");
+        write_cloud_sync_state(&root, "acct-cloud-state", meeting.id, &state)
+            .expect("initial sync state");
+        write_cloud_sync_state(&root, "acct-cloud-state", meeting.id, &state)
+            .expect("state with backup");
+        fs::write(
+            cloud_sync_state_path(&root, "acct-cloud-state", meeting.id).unwrap(),
+            b"{interrupted",
+        )
+        .expect("simulate interrupted legacy write");
 
-        let recovered = load_cloud_sync_state(&root, meeting.id).expect("last valid state backup");
+        let recovered = load_cloud_sync_state(&root, "acct-cloud-state", meeting.id)
+            .expect("last valid state backup");
         assert_eq!(recovered.remote_session_id, state.remote_session_id);
         meeting.context.clear();
         let states = HashMap::from([(meeting.id, recovered)]);
@@ -5092,11 +7425,18 @@ mod tests {
                 .iter()
                 .flat_map(|batch| batch.context_artifacts.clone())
                 .collect(),
+            rag_chunks: batches
+                .iter()
+                .flat_map(|batch| batch.rag_chunks.clone())
+                .collect(),
+            child_tombstones: Vec::new(),
         };
 
-        let restored = meeting_from_cloud_bundle(&root, None, bundle)
-            .await
-            .expect("restore meeting");
+        let (restored, attachment_retries, _) =
+            meeting_from_cloud_bundle(&root, None, "acct-memory-roundtrip", bundle, &|| Ok(()))
+                .await
+                .expect("restore meeting");
+        assert_eq!(attachment_retries, 0);
         assert_eq!(restored.conversation_memory, original_memory);
 
         let uploaded_again = build_sync_batches(&[restored], &HashMap::new(), &HashMap::new());
@@ -5156,6 +7496,114 @@ mod tests {
     }
 
     #[test]
+    fn cloud_sync_keeps_more_than_500_responses_until_explicit_removal() {
+        let root = std::env::temp_dir().join(format!(
+            "bluey-cloud-complete-response-history-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).expect("temp dir");
+        let owner = "acct-long-chat";
+        let mut meeting = MeetingRecord::new(Some("Long chat".into()));
+        meeting.owner_account_id = Some(owner.to_string());
+        let session_id = meeting.id.to_string();
+        let db_path = root.join("sessions.db");
+        let db = Database::open(db_path.to_str().expect("utf-8 db path")).expect("open db");
+        db.ensure_session_record_for_owner(Some(owner), meeting.id, &meeting.title, 1, 1)
+            .expect("ensure session");
+
+        let mut local_response_ids = Vec::new();
+        for index in 0..501 {
+            let response_id = format!("turn-{}", Uuid::new_v4());
+            let question = format!("Question {index}");
+            let answer = format!("Answer {index}");
+            db.insert_cue_response(crate::db::NewCueResponse {
+                id: &response_id,
+                session_id: &session_id,
+                kind: "answer",
+                text: &answer,
+                source_text: Some(&question),
+                ts_ms: index + 1,
+                cost_cents: None,
+                balance_cents_after: None,
+                provider: Some("test"),
+                model: Some("test"),
+                input_tokens: None,
+                output_tokens: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+            })
+            .expect("insert response");
+            local_response_ids.push(response_id);
+        }
+
+        let complete_responses = db
+            .list_all_cue_responses(&session_id)
+            .expect("load complete response history");
+        assert_eq!(complete_responses.len(), 501);
+        let initial_response_map =
+            HashMap::from([(session_id.clone(), complete_responses.clone())]);
+        let initial_batches =
+            build_sync_batches(&[meeting.clone()], &initial_response_map, &HashMap::new());
+        let initial_children = uploaded_child_states_by_session(&initial_batches);
+        let initial_state = cloud_sync_state_after_upload(
+            &meeting,
+            Some(complete_responses.as_slice()),
+            &HashMap::new(),
+            None,
+            initial_children.get(&session_id),
+            owner,
+        );
+        assert_eq!(initial_state.synced_response_records.len(), 501);
+        drop(db);
+
+        let loaded_response_map =
+            load_local_responses(&root, owner, std::slice::from_ref(&meeting));
+        assert_eq!(loaded_response_map[&session_id].len(), 501);
+        let sync_states = HashMap::from([(meeting.id, initial_state.clone())]);
+        let unchanged_batches = build_sync_batches_with_states(
+            std::slice::from_ref(&meeting),
+            &loaded_response_map,
+            &HashMap::new(),
+            &sync_states,
+        );
+        let response_tombstones = unchanged_batches
+            .iter()
+            .flat_map(|batch| &batch.cue_responses)
+            .filter(|record| record.deleted_at_ms.is_some())
+            .count();
+        assert_eq!(response_tombstones, 0);
+
+        let oldest_wire_response_id = initial_batches
+            .iter()
+            .flat_map(|batch| &batch.cue_responses)
+            .find(|record| record.source_text.as_deref() == Some("Question 0"))
+            .map(|record| record.response_id.clone())
+            .expect("oldest uploaded response");
+        let mut explicitly_removed_map = loaded_response_map;
+        explicitly_removed_map
+            .get_mut(&session_id)
+            .expect("session response history")
+            .retain(|response| response.id != local_response_ids[0]);
+        let deletion_batches = build_sync_batches_with_states(
+            std::slice::from_ref(&meeting),
+            &explicitly_removed_map,
+            &HashMap::new(),
+            &sync_states,
+        );
+        let response_tombstones = deletion_batches
+            .iter()
+            .flat_map(|batch| &batch.cue_responses)
+            .filter(|record| record.deleted_at_ms.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(response_tombstones.len(), 1);
+        assert_eq!(response_tombstones[0].response_id, oldest_wire_response_id);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn session_audit_bundle_writes_reviewable_shape_and_marker() {
         let root = std::env::temp_dir().join(format!("bluey-audit-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("audit test root");
@@ -5208,28 +7656,45 @@ mod tests {
         response.artifact_body = Some("class LRUCache: pass".into());
         response.artifact_confidence = Some(0.94);
 
-        let built =
-            build_local_session_audit_bundle(&root, &meeting, &[response], Some("acct_audit"))
-                .expect("audit bundle");
+        append_privacy_safe_diagnostic_events_for_scope(
+            &root,
+            &SessionAuditScope::from_meeting(&meeting),
+            &[(
+                "answer_completed".to_string(),
+                json!({
+                    "schema_version": 2,
+                    "event_name": "answer_completed",
+                    "component": "daemon",
+                    "outcome": "succeeded",
+                    "created_at_ms": current_epoch_ms(),
+                    "monotonic_offset_ms": 0,
+                    "duration_ms": 120,
+                    "output_chars": response.text.chars().count(),
+                    "private_probe": response.text,
+                }),
+            )],
+        )
+        .expect("append diagnostic event");
+        let built = build_local_session_audit_bundle(&root, &meeting).expect("audit bundle");
 
         assert!(built.local_dir.join("manifest.json").is_file());
         assert!(built.local_dir.join("events.jsonl").is_file());
-        assert!(built.local_dir.join("questions.jsonl").is_file());
-        assert!(built.local_dir.join("responses.jsonl").is_file());
-        assert!(built.local_dir.join("transcript.jsonl").is_file());
-        assert!(built.local_dir.join("context.jsonl").is_file());
-        assert!(built.local_dir.join("screen.jsonl").is_file());
-        assert!(built.local_dir.join("artifacts.jsonl").is_file());
-        assert!(built.local_dir.join("costs.jsonl").is_file());
-        assert!(built.local_dir.join("attachments.jsonl").is_file());
-        assert!(built.local_dir.join("audio/audio.jsonl").is_file());
-        assert!(!built.bundle.questions.is_empty());
-        assert!(!built.bundle.responses.is_empty());
-        assert!(!built.bundle.transcript.is_empty());
-        assert!(!built.bundle.context.is_empty());
-        assert!(!built.bundle.screen.is_empty());
-        assert!(!built.bundle.artifacts.is_empty());
-        assert!(!built.bundle.costs.is_empty());
+        assert!(built.local_dir.join("bundle.json").is_file());
+        assert!(!built.local_dir.join("questions.jsonl").exists());
+        assert!(!built.local_dir.join("responses.jsonl").exists());
+        assert!(!built.local_dir.join("transcript.jsonl").exists());
+        assert!(!built.local_dir.join("context.jsonl").exists());
+        assert!(!built.local_dir.join("screen.jsonl").exists());
+        assert!(!built.local_dir.join("artifacts.jsonl").exists());
+        assert!(!built.local_dir.join("costs.jsonl").exists());
+        assert!(!built.local_dir.join("attachments.jsonl").exists());
+        assert!(!built.local_dir.join("audio").exists());
+        assert_eq!(built.bundle.content_policy, "metadata_only");
+        assert_eq!(built.bundle.events.len(), 1);
+        let retried = build_local_session_audit_bundle(&root, &meeting)
+            .expect("retry audit bundle from unchanged event log");
+        assert_eq!(built.bundle.bundle_id, retried.bundle.bundle_id);
+        assert_eq!(built.bytes, retried.bytes);
         let serialized = String::from_utf8(built.bytes.clone()).expect("audit bundle utf-8");
         for private_value in [
             "Explain LRU cache",
@@ -5270,86 +7735,101 @@ mod tests {
     }
 
     #[test]
-    fn session_audit_bundle_includes_metadata_only_ui_events() {
+    fn session_audit_bundle_excludes_legacy_untyped_ui_events() {
         let root = std::env::temp_dir().join(format!("bluey-audit-events-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).expect("audit test root");
 
         let mut meeting = MeetingRecord::new(Some("Visible glitch".into()));
         meeting.owner_account_id = Some("acct_events".into());
-        append_session_audit_event(
+        append_privacy_safe_diagnostic_events_for_scope(
             &root,
-            &meeting,
-            "ui_answer_status",
-            json!({ "message": "Reading screen context" }),
+            &SessionAuditScope::from_meeting(&meeting),
+            &[(
+                "ui_answer_status".to_string(),
+                json!({ "message": "Reading screen context" }),
+            )],
         )
         .expect("append status");
-        append_session_audit_event(
+        append_privacy_safe_diagnostic_events_for_scope(
             &root,
-            &meeting,
-            "ui_answer_error",
-            json!({ "visible_message": "Bluey could not complete that answer yet." }),
+            &SessionAuditScope::from_meeting(&meeting),
+            &[(
+                "ui_answer_error".to_string(),
+                json!({ "visible_message": "Bluey could not complete that answer yet." }),
+            )],
         )
         .expect("append error");
 
-        let event_dir = session_audit_event_dir(&root, meeting.id);
+        let event_dir = session_audit_event_dir(&root, &SessionAuditScope::from_meeting(&meeting));
         assert!(event_dir.join("events.jsonl").is_file());
 
-        let response = crate::llm::CueResponse::new(
-            "answer",
-            "Partial answer before the visible error.".into(),
-            &meeting.id.to_string(),
-            Some("Why did it fail?".into()),
-        );
-        let built =
-            build_local_session_audit_bundle(&root, &meeting, &[response], Some("acct_events"))
-                .expect("audit bundle");
+        let built = build_local_session_audit_bundle(&root, &meeting).expect("audit bundle");
 
-        let raw_ui_events = built
-            .bundle
-            .events
-            .iter()
-            .filter(|event| {
-                event
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .is_some_and(|source| source == "desktop_ui")
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(raw_ui_events.len(), 2);
-        assert!(built.bundle.events.iter().any(|event| {
-            event.get("kind").and_then(Value::as_str) == Some("ui_answer_error")
-                && event
-                    .get("payload")
-                    .and_then(|payload| payload.get("visible_message_chars"))
-                    .and_then(Value::as_u64)
-                    .is_some_and(|chars| chars > 0)
-        }));
+        assert!(built.bundle.events.is_empty());
         let serialized = String::from_utf8(built.bytes.clone()).expect("audit bundle utf-8");
         assert!(!serialized.contains("Reading screen context"));
         assert!(!serialized.contains("Bluey could not complete that answer yet."));
-        assert!(!serialized.contains("Partial answer before the visible error."));
-        assert!(!serialized.contains("Why did it fail?"));
         assert_eq!(
             built
                 .bundle
                 .manifest
                 .get("record_counts")
-                .and_then(|counts| counts.get("raw_ui_events"))
+                .and_then(|counts| counts.get("events"))
                 .and_then(Value::as_u64),
-            Some(2)
+            Some(0)
         );
 
-        remove_session_audit_event_log(&root, meeting.id).expect("remove event log");
+        remove_session_audit_event_log(&root, &meeting).expect("remove event log");
         assert!(!event_dir.exists());
 
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
+    fn support_diagnostic_payload_rejects_secret_shaped_labels() {
+        let payload = support_diagnostic_payload(json!({
+            "schema_version": 2,
+            "event_name": "answer_completed",
+            "component": "daemon",
+            "outcome": "succeeded",
+            "created_at_ms": 1,
+            "monotonic_offset_ms": 2,
+            "provider": "private_account_name",
+            "model": "gpt-secret-customer-name",
+            "action": "private_secret_123",
+            "error_category": "customer_email",
+            "question_intent": "general",
+            "artifact_type": "code"
+        }));
+
+        assert_eq!(payload["question_intent"], "general");
+        assert_eq!(payload["artifact_type"], "code");
+        for rejected in ["provider", "model", "action", "error_category"] {
+            assert!(payload.get(rejected).is_none(), "unexpected {rejected}");
+        }
+    }
+
+    #[test]
+    fn cloud_session_cursor_stops_on_completion_and_rejects_cycles() {
+        let mut cursor = None;
+        let mut seen = HashSet::new();
+        assert!(
+            advance_cloud_session_cursor(&mut cursor, &mut seen, Some("page-two".to_string()))
+                .unwrap()
+        );
+        assert_eq!(cursor.as_deref(), Some("page-two"));
+        let error =
+            advance_cloud_session_cursor(&mut cursor, &mut seen, Some("page-two".to_string()))
+                .expect_err("a repeated server cursor must fail closed");
+        assert!(error.to_string().contains("repeated cursor"));
+        assert!(!advance_cloud_session_cursor(&mut cursor, &mut seen, None).unwrap());
+    }
+
+    #[test]
     fn local_audit_event_log_is_bounded_without_cloud_sync() {
         let root = std::env::temp_dir().join(format!("bluey-audit-cap-{}", Uuid::new_v4()));
         let meeting = MeetingRecord::new(Some("Bounded diagnostics".into()));
-        let event_dir = session_audit_event_dir(&root, meeting.id);
+        let event_dir = session_audit_event_dir(&root, &SessionAuditScope::from_meeting(&meeting));
         std::fs::create_dir_all(&event_dir).unwrap();
         let event_path = event_dir.join("events.jsonl");
         let mut oversized_history = Vec::new();
@@ -5367,16 +7847,18 @@ mod tests {
         }
         std::fs::write(&event_path, oversized_history).unwrap();
 
-        append_session_audit_event(
+        append_privacy_safe_diagnostic_events_for_scope(
             &root,
-            &meeting,
-            "bounded",
-            json!({ "provider": "x".repeat(MAX_AUDIT_EVENT_RECORD_BYTES * 2) }),
+            &SessionAuditScope::from_meeting(&meeting),
+            &[(
+                "bounded".to_string(),
+                json!({ "provider": "x".repeat(MAX_AUDIT_EVENT_RECORD_BYTES * 2) }),
+            )],
         )
         .unwrap();
 
         let metadata = std::fs::metadata(&event_path).unwrap();
-        let events = read_session_audit_events(&root, meeting.id);
+        let events = read_session_audit_events(&root, &meeting);
         assert!(metadata.len() <= MAX_AUDIT_EVENT_LOG_BYTES);
         assert!(events.len() as u64 <= MAX_AUDIT_EVENT_RECORDS);
         assert_eq!(
@@ -5386,9 +7868,10 @@ mod tests {
         assert_eq!(
             events
                 .last()
-                .and_then(|event| event["payload"]["reason_code"].as_str()),
-            Some("record_size_cap")
+                .and_then(|event| event["payload"]["content_policy"].as_str()),
+            Some("metadata_only")
         );
+        assert!(events.last().unwrap()["payload"].get("provider").is_none());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -5397,7 +7880,7 @@ mod tests {
     fn audit_compaction_discards_oversized_legacy_lines_without_unbounded_reads() {
         let root = std::env::temp_dir().join(format!("bluey-audit-line-{}", Uuid::new_v4()));
         let meeting = MeetingRecord::new(Some("Bounded migration".into()));
-        let event_dir = session_audit_event_dir(&root, meeting.id);
+        let event_dir = session_audit_event_dir(&root, &SessionAuditScope::from_meeting(&meeting));
         std::fs::create_dir_all(&event_dir).unwrap();
         let event_path = event_dir.join("events.jsonl");
         let mut history = vec![b'x'; MAX_AUDIT_EVENT_RECORD_BYTES * 4];
@@ -5414,9 +7897,14 @@ mod tests {
         history.push(b'\n');
         std::fs::write(&event_path, history).unwrap();
 
-        append_session_audit_event(&root, &meeting, "next", json!({ "success": true })).unwrap();
+        append_privacy_safe_diagnostic_events_for_scope(
+            &root,
+            &SessionAuditScope::from_meeting(&meeting),
+            &[("next".to_string(), json!({ "success": true }))],
+        )
+        .unwrap();
 
-        let events = read_session_audit_events(&root, meeting.id);
+        let events = read_session_audit_events(&root, &meeting);
         assert_eq!(events.len(), 2);
         assert_eq!(events[0]["sequence"], 41);
         assert_eq!(events[1]["sequence"], 42);
@@ -5479,7 +7967,7 @@ mod tests {
         }
 
         let (reconciled, changed) =
-            reconcile_cloud_meeting(local, cloud).expect("reconcile conversation");
+            reconcile_cloud_meeting(local, cloud, &[]).expect("reconcile conversation");
         assert!(changed);
         assert_eq!(reconciled.conversation.len(), 64);
         assert_eq!(reconciled.conversation[0].created_at, "74");
@@ -5502,7 +7990,222 @@ mod tests {
         local.owner_account_id = Some("acct-a".into());
         let mut cloud = local.clone();
         cloud.owner_account_id = Some("acct-b".into());
-        assert!(reconcile_cloud_meeting(local, cloud).is_err());
+        assert!(reconcile_cloud_meeting(local, cloud, &[]).is_err());
+    }
+
+    #[test]
+    fn child_tombstones_remove_local_content_and_suppress_stale_upload() {
+        let owner = "acct-child-delete";
+        let mut meeting = MeetingRecord::new(Some("Deletion convergence".into()));
+        meeting.owner_account_id = Some(owner.to_string());
+        meeting.summary = Some("Deleted summary".into());
+        meeting.answer_instructions = Some("Deleted instructions".into());
+        let mut segment = TranscriptSegment::new(Speaker::User, "Deleted transcript", true);
+        segment.created_at = "1".into();
+        let segment_id = segment.id;
+        meeting.transcript.push(segment);
+        let mut context = ContextArtifact::new(
+            ContextKind::Document,
+            "/tmp/deleted.pdf",
+            "Deleted.pdf",
+            None,
+            Some(10),
+        );
+        context.updated_at = "1".into();
+        let context_id = context.id;
+        meeting.context.push(context);
+        for index in 0..98 {
+            meeting.push_conversation_turn(ConversationTurn::new(
+                format!("Memory question {index}"),
+                format!("Memory answer {index}"),
+                None,
+                Some("test".into()),
+            ));
+        }
+        assert!(!meeting.conversation_memory.epochs.is_empty());
+        let mut deleted_turn = ConversationTurn::new(
+            "Deleted question",
+            "Deleted answer",
+            None,
+            Some("test".into()),
+        )
+        .with_attachment_ids(vec![context_id]);
+        deleted_turn.created_at = "1".into();
+        let deleted_turn_id = deleted_turn.id;
+        meeting.conversation.push(deleted_turn);
+
+        let session_id = meeting.id;
+        let response_id = format!("turn-{deleted_turn_id}");
+        let summary_id = format!("{session_id}:summary:0");
+        let instructions_id = format!("{session_id}:instructions:0");
+        let memory_id = format!("{session_id}:conversation-memory:0");
+        let mut memory_tombstone = child_tombstone("rag", &memory_id, session_id);
+        memory_tombstone.source_kind = Some("conversation_memory".into());
+        memory_tombstone.source_id = Some(session_id.to_string());
+        memory_tombstone.chunk_index = Some(0);
+        let tombstones = vec![
+            child_tombstone("transcript", segment_id.to_string(), session_id),
+            child_tombstone("context", context_id.to_string(), session_id),
+            child_tombstone("response", &response_id, session_id),
+            child_tombstone("rag", &summary_id, session_id),
+            child_tombstone("rag", &instructions_id, session_id),
+            memory_tombstone,
+        ];
+
+        let mut reconciled = meeting.clone();
+        apply_cloud_child_tombstones_to_meeting(&mut reconciled, &tombstones);
+        assert!(reconciled
+            .transcript
+            .iter()
+            .all(|segment| segment.id != segment_id));
+        assert!(reconciled
+            .context
+            .iter()
+            .all(|artifact| artifact.id != context_id));
+        assert!(reconciled
+            .conversation
+            .iter()
+            .all(|turn| turn.id != deleted_turn_id));
+        assert!(reconciled.summary.is_none());
+        assert!(reconciled.answer_instructions.is_none());
+        assert!(reconciled.conversation_memory.is_empty());
+        apply_cloud_child_tombstones_to_meeting(&mut reconciled, &tombstones);
+        assert!(reconciled.conversation_memory.is_empty());
+
+        let mut state = empty_cloud_sync_state(owner, session_id.to_string());
+        state.child_tombstones = newest_cloud_child_tombstones(tombstones);
+        let states = HashMap::from([(session_id, state)]);
+        let batches =
+            build_sync_batches_with_states(&[meeting], &HashMap::new(), &HashMap::new(), &states);
+        assert!(batches.iter().all(|batch| {
+            batch
+                .transcript_segments
+                .iter()
+                .all(|record| record.segment_id != segment_id.to_string())
+                && batch
+                    .context_artifacts
+                    .iter()
+                    .all(|record| record.artifact_id != context_id.to_string())
+                && batch
+                    .cue_responses
+                    .iter()
+                    .all(|record| record.response_id != response_id)
+                && batch.rag_chunks.iter().all(|record| {
+                    record.chunk_id != summary_id
+                        && record.chunk_id != instructions_id
+                        && record.source_kind != "conversation_memory"
+                })
+        }));
+        let session = &batches[0].sessions[0];
+        assert!(session.answer_style.is_none());
+        assert!(session.metadata["summary"].is_null());
+        assert_eq!(
+            session.metadata["conversation_memory"]["state"],
+            serde_json::to_value(ConversationMemory::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn stale_live_save_reapplies_durable_child_tombstone_before_persistence() {
+        let root = std::env::temp_dir().join(format!(
+            "bluey-cloud-tombstone-save-race-{}",
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let owner = "acct-race";
+        let mut stale_runtime = MeetingRecord::new(Some("Live session".into()));
+        stale_runtime.owner_account_id = Some(owner.to_string());
+        let deleted_turn = ConversationTurn::new(
+            "deleted question",
+            "deleted answer",
+            None,
+            Some("test".into()),
+        );
+        let deleted_turn_id = deleted_turn.id;
+        stale_runtime.conversation.push(deleted_turn);
+
+        // Hydration publishes deletion provenance before it acquires the
+        // local persistence barrier. A live writer that retained this older
+        // runtime copy must observe that provenance before saving.
+        let response_id = format!("turn-{deleted_turn_id}");
+        let tombstone = child_tombstone("response", &response_id, stale_runtime.id);
+        let mut state = empty_cloud_sync_state(owner, stale_runtime.id.to_string());
+        state.child_tombstones = newest_cloud_child_tombstones(vec![tombstone]);
+        write_cloud_sync_state(&root, owner, stale_runtime.id, &state).unwrap();
+
+        let changed =
+            reapply_cloud_child_tombstones_before_save(&root, owner, &mut stale_runtime).unwrap();
+        assert_eq!(changed, 1);
+        assert!(stale_runtime
+            .conversation
+            .iter()
+            .all(|turn| turn.id != deleted_turn_id));
+        stale_runtime.conversation.push(ConversationTurn::new(
+            "new live question",
+            "new live answer",
+            None,
+            Some("test".into()),
+        ));
+        let store = test_meeting_store(&root);
+        store.save_active(&stale_runtime).unwrap();
+        let persisted = store.load_active().unwrap().unwrap();
+        assert!(persisted
+            .conversation
+            .iter()
+            .all(|turn| turn.id != deleted_turn_id));
+        assert_eq!(persisted.conversation.len(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bundle_allows_attachment_reference_to_context_tombstone() {
+        let session_id = Uuid::new_v4();
+        let artifact_id = Uuid::new_v4();
+        let response_id = format!("turn-{}", Uuid::new_v4());
+        let bundle = CloudSessionBundle {
+            session: SyncSessionRecord {
+                session_id: session_id.to_string(),
+                title: "Deleted attachment".into(),
+                status: "archived".into(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                last_active_at_ms: Some(2),
+                answer_style: None,
+                metadata: json!({}),
+                deleted_at_ms: None,
+            },
+            transcript_segments: Vec::new(),
+            cue_responses: vec![SyncCueResponseRecord {
+                response_id,
+                session_id: session_id.to_string(),
+                kind: "answer".into(),
+                text: "Answer".into(),
+                source_text: Some("Question".into()),
+                ts_ms: 1,
+                provider: None,
+                model: None,
+                lane: None,
+                task_type: None,
+                cost_cents: None,
+                balance_cents_after: None,
+                cost_label: None,
+                artifact_type: None,
+                artifact_body: None,
+                artifact_confidence: None,
+                deleted_at_ms: None,
+                metadata: json!({ "attachment_ids": [artifact_id.to_string()] }),
+            }],
+            context_artifacts: Vec::new(),
+            rag_chunks: Vec::new(),
+            child_tombstones: vec![child_tombstone(
+                "context",
+                artifact_id.to_string(),
+                session_id,
+            )],
+        };
+
+        validate_cloud_bundle_parentage(&bundle).unwrap();
     }
 
     #[test]
@@ -5601,13 +8304,47 @@ mod tests {
         doc.id = doc_id;
 
         let mut meeting = MeetingRecord::new(Some("Cleanup".into()));
+        meeting.owner_account_id = Some("acct-cleanup".into());
+        let restored_id = Uuid::new_v4();
+        let restored_preview_dir = account_scoped_restored_dir(
+            &root,
+            CLOUD_RESTORED_CONTEXT_DIR,
+            "acct-cleanup",
+            meeting.id,
+        )
+        .unwrap();
+        let restored_object_dir = account_scoped_restored_dir(
+            &root,
+            CLOUD_RESTORED_OBJECTS_DIR,
+            "acct-cleanup",
+            meeting.id,
+        )
+        .unwrap();
+        std::fs::create_dir_all(&restored_preview_dir).unwrap();
+        std::fs::create_dir_all(&restored_object_dir).unwrap();
+        let restored_preview = restored_preview_dir.join(format!("{restored_id}.md"));
+        let restored_object = restored_object_dir.join(format!("{restored_id}-Resume.pdf"));
+        std::fs::write(&restored_preview, b"private preview").unwrap();
+        std::fs::write(&restored_object, b"private object").unwrap();
+        let mut restored = ContextArtifact::new(
+            ContextKind::Document,
+            restored_object.to_string_lossy(),
+            "Resume.pdf",
+            None,
+            Some(14),
+        )
+        .with_markdown_path(restored_preview.to_string_lossy());
+        restored.id = restored_id;
         meeting.context.push(image);
         meeting.context.push(doc);
+        meeting.context.push(restored);
 
         remove_bluey_owned_context_files(&root, &meeting);
 
         assert!(!image_path.exists());
         assert!(!markdown_path.exists());
+        assert!(!restored_preview.exists());
+        assert!(!restored_object.exists());
         assert!(original_path.exists());
 
         let _ = std::fs::remove_dir_all(root);
@@ -5684,11 +8421,15 @@ mod tests {
                     "answer_context_role": "candidate_resume"
                 }),
             }],
+            rag_chunks: Vec::new(),
+            child_tombstones: Vec::new(),
         };
 
-        let meeting = meeting_from_cloud_bundle(&root, None, bundle)
-            .await
-            .expect("restore meeting");
+        let (meeting, attachment_retries, _) =
+            meeting_from_cloud_bundle(&root, None, "acct-restored-session", bundle, &|| Ok(()))
+                .await
+                .expect("restore meeting");
+        assert_eq!(attachment_retries, 0);
         assert_eq!(meeting.id, session_id);
         assert_eq!(meeting.title, "Restored interview");
         assert_eq!(meeting.transcript.len(), 1);

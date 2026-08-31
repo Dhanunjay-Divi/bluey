@@ -47,7 +47,11 @@ impl LlmProvider for LlmRouter {
                     return Ok(resp);
                 }
                 Err(e) if e.should_failover() => {
-                    warn!(provider = provider.name(), error = %e, "failover");
+                    warn!(
+                        provider = provider.name(),
+                        error_category = e.diagnostic_category(),
+                        "failover"
+                    );
                     last_err = Some(e);
                     continue;
                 }
@@ -74,7 +78,11 @@ impl LlmProvider for LlmRouter {
                     return Ok(stream);
                 }
                 Err(e) if e.should_failover() => {
-                    warn!(provider = provider.name(), error = %e, "stream failover");
+                    warn!(
+                        provider = provider.name(),
+                        error_category = e.diagnostic_category(),
+                        "stream failover"
+                    );
                     last_err = Some(e);
                     continue;
                 }

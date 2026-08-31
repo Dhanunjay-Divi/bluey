@@ -36,6 +36,29 @@ const MAX_HELPER_EVENT_BYTES: usize = 64 * 1024;
 const HELPER_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 static NEXT_AGREEMENT_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Closed, actionable category for local-helper failures. Never format the
+/// associated string because it may contain a path or operating-system detail.
+pub(super) const fn whisper_error_category(error: &WhisperError) -> &'static str {
+    match error {
+        WhisperError::BinaryNotFound(_) => "local_helper_missing",
+        WhisperError::SpawnFailed(_) => "local_helper_spawn",
+        WhisperError::ParseError(_) => "local_helper_protocol",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InvalidHelperEventDiagnostic {
+    error_category: &'static str,
+    event_bytes: usize,
+}
+
+fn invalid_helper_event_diagnostic(line: &str) -> InvalidHelperEventDiagnostic {
+    InvalidHelperEventDiagnostic {
+        error_category: "invalid_event",
+        event_bytes: line.len(),
+    }
+}
+
 #[cfg(unix)]
 const WHISPER_CHILD_ENV_ALLOWLIST: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL"];
 #[cfg(windows)]
@@ -193,7 +216,10 @@ async fn run_helper_loop(
     let mut child = match spawn_helper(&binary) {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to spawn whisper helper: {e}");
+            error!(
+                error_category = whisper_error_category(&e),
+                "failed to spawn local transcription helper"
+            );
             let _ = event_tx.try_send(Err(SttError::Provider(e.to_string())));
             return;
         }
@@ -257,10 +283,11 @@ async fn run_helper_loop(
                         break;
                     }
                 }
-                Err(e) => {
+                Err(_) => {
+                    let diagnostic = invalid_helper_event_diagnostic(&line);
                     debug!(
-                        event_bytes = line.len(),
-                        error = %e,
+                        event_bytes = diagnostic.event_bytes,
+                        error_category = diagnostic.error_category,
                         "Ignoring unparseable local transcription event"
                     );
                 }
@@ -771,5 +798,33 @@ mod tests {
                 "unexpected child environment variable: {name}"
             );
         }
+    }
+
+    #[test]
+    fn local_helper_trace_diagnostics_never_format_private_details() {
+        const SENTINEL: &str =
+            "PRIVATE_TRANSCRIPT token=helper-secret https://secret.invalid/private/path";
+        let errors = [
+            WhisperError::BinaryNotFound(SENTINEL.into()),
+            WhisperError::SpawnFailed(SENTINEL.into()),
+            WhisperError::ParseError(SENTINEL.into()),
+        ];
+        for error in errors {
+            let category = whisper_error_category(&error);
+            assert!(matches!(
+                category,
+                "local_helper_missing" | "local_helper_spawn" | "local_helper_protocol"
+            ));
+            assert!(!category.contains(SENTINEL));
+            assert!(!category.contains("helper-secret"));
+        }
+
+        let diagnostic = invalid_helper_event_diagnostic(SENTINEL);
+        let debug = format!("{diagnostic:?}");
+        assert_eq!(diagnostic.error_category, "invalid_event");
+        assert_eq!(diagnostic.event_bytes, SENTINEL.len());
+        assert!(!debug.contains(SENTINEL));
+        assert!(!debug.contains("helper-secret"));
+        assert!(!debug.contains("secret.invalid"));
     }
 }

@@ -26,10 +26,9 @@
 //! ### Auth
 //!
 //! The API key is read from [`DeepgramConfig::api_key`]. It is stored as a
-//! plain `String`, but NEVER printed: logging helpers use `mask_api_key`
-//! so only the last 4 characters ever appear. The one place the key
-//! leaves this module is the `Authorization` header value passed to
-//! `tokio_tungstenite::connect_async`.
+//! plain `String`, but never included in configuration `Debug` output or
+//! stream diagnostics. The one place the key leaves this module is the
+//! `Authorization` header value passed to `tokio_tungstenite::connect_async`.
 //!
 //! ### Error classification
 //!
@@ -87,7 +86,7 @@ enum StreamControl {
 }
 
 /// Configuration for the provider.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeepgramConfig {
     pub api_key: String,
     /// Which Deepgram model to request. Defaults to `nova-3`.
@@ -115,6 +114,25 @@ pub struct DeepgramConfig {
     pub base_url: Option<String>,
 }
 
+impl std::fmt::Debug for DeepgramConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DeepgramConfig")
+            .field("api_key", &"[REDACTED]")
+            .field("model", &self.model)
+            .field("interim_results", &self.interim_results)
+            .field("language", &self.language)
+            .field("punctuate", &self.punctuate)
+            .field("smart_format", &self.smart_format)
+            .field("endpointing_ms", &self.endpointing_ms)
+            .field("utterance_end_ms", &self.utterance_end_ms)
+            .field("vad_events", &self.vad_events)
+            .field("diarize", &self.diarize)
+            .field("base_url", &self.base_url.as_ref().map(|_| "[configured]"))
+            .finish()
+    }
+}
+
 impl Default for DeepgramConfig {
     fn default() -> Self {
         Self {
@@ -140,7 +158,7 @@ pub fn build_url(deepgram: &DeepgramConfig, stt: &SttConfig) -> Result<url::Url,
     let default_url = obfstr::obfstr!("wss://api.deepgram.com").to_string();
     let base = deepgram.base_url.as_deref().unwrap_or(&default_url);
     let mut u = url::Url::parse(&format!("{base}/v1/listen"))
-        .map_err(|e| SttError::Protocol(format!("invalid base url: {e}")))?;
+        .map_err(|_| SttError::Protocol("invalid provider endpoint".into()))?;
     {
         let mut q = u.query_pairs_mut();
         q.append_pair("model", &deepgram.model);
@@ -181,25 +199,11 @@ pub fn build_url(deepgram: &DeepgramConfig, stt: &SttConfig) -> Result<url::Url,
     Ok(u)
 }
 
-/// Return a safe-to-log form of the API key: never more than the last 4
-/// characters, never the head of the secret.
-pub fn mask_api_key(key: &str) -> String {
-    // Character-based (not byte-based): safe for any UTF-8 key. Emits
-    // `****` when the key is 4 or fewer chars, otherwise `****<last 4>`.
-    let mut last4: Vec<char> = key.chars().rev().take(4).collect();
-    if last4.len() < 4 || key.chars().count() <= 4 {
-        return "****".to_string();
-    }
-    last4.reverse();
-    let tail: String = last4.into_iter().collect();
-    format!("****{tail}")
-}
-
 // ========== JSON frame shape (Deepgram response) ==========
 
 /// The subset of Deepgram's response frame shape we actually use. Fields
 /// outside this struct are ignored via serde's default-on-missing behavior.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct DgFrame {
     #[serde(rename = "type", default)]
     pub ty: Option<String>,
@@ -209,13 +213,42 @@ pub struct DgFrame {
     pub channel: Option<DgChannel>,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for DgFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let frame_type = match self.ty.as_deref() {
+            Some("Results") => "results",
+            Some("Metadata") => "metadata",
+            Some("UtteranceEnd") => "utterance_end",
+            Some("SpeechStarted") => "speech_started",
+            Some("Error") => "error",
+            Some(_) => "other",
+            None => "missing",
+        };
+        formatter
+            .debug_struct("DgFrame")
+            .field("frame_type", &frame_type)
+            .field("is_final", &self.is_final)
+            .field("channel", &self.channel)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 pub struct DgChannel {
     #[serde(default)]
     pub alternatives: Vec<DgAlternative>,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for DgChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DgChannel")
+            .field("alternatives", &self.alternatives)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 pub struct DgAlternative {
     #[serde(default)]
     pub transcript: String,
@@ -225,7 +258,18 @@ pub struct DgAlternative {
     pub words: Vec<DgWord>,
 }
 
-#[derive(Debug, Deserialize)]
+impl std::fmt::Debug for DgAlternative {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DgAlternative")
+            .field("transcript_chars", &self.transcript.chars().count())
+            .field("confidence", &self.confidence)
+            .field("words", &self.words)
+            .finish()
+    }
+}
+
+#[derive(Deserialize)]
 pub struct DgWord {
     pub word: String,
     pub start: f32,
@@ -236,15 +280,28 @@ pub struct DgWord {
     pub speaker: Option<u32>,
 }
 
+impl std::fmt::Debug for DgWord {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DgWord")
+            .field("word_chars", &self.word.chars().count())
+            .field("start", &self.start)
+            .field("end", &self.end)
+            .field("confidence", &self.confidence)
+            .field("speaker", &self.speaker)
+            .finish()
+    }
+}
+
 /// Parse a raw Deepgram JSON payload into an `SttProvider` event list.
 /// Deepgram can emit 0, 1, or 2 events per frame (transcript + diarization).
 pub fn parse_frame(payload: &str, source: AudioSource) -> Result<Vec<TranscriptEvent>, SttError> {
     let value: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|e| SttError::Protocol(format!("invalid Deepgram JSON: {e}")))?;
+        .map_err(|_| SttError::Protocol("invalid provider JSON".into()))?;
     let frame_type = value.get("type").and_then(|ty| ty.as_str());
 
     if matches!(frame_type, Some("Error")) {
-        return Err(SttError::Provider(payload.to_string()));
+        return Err(SttError::Provider("remote provider error".into()));
     }
 
     // Deepgram also emits lifecycle/VAD frames such as SpeechStarted and
@@ -263,10 +320,10 @@ pub fn parse_frame(payload: &str, source: AudioSource) -> Result<Vec<TranscriptE
     }
     let channel: DgChannel = match serde_json::from_value(channel_value.clone()) {
         Ok(channel) => channel,
-        Err(error) => {
-            return Err(SttError::Protocol(format!(
-                "invalid Deepgram channel JSON: {error}"
-            )));
+        Err(_) => {
+            return Err(SttError::Protocol(
+                "invalid provider transcript frame".into(),
+            ));
         }
     };
     let is_final = value
@@ -337,16 +394,23 @@ pub fn map_ws_error(e: WsError) -> SttError {
     match e {
         WsError::Http(resp) => map_handshake_status(resp.status().as_u16()),
         WsError::HttpFormat(_) => SttError::Protocol("malformed HTTP".into()),
-        WsError::Io(io) => SttError::Network(io.to_string()),
+        WsError::Io(io) => SttError::Network(format!("I/O kind {:?}", io.kind())),
         WsError::Tls(_) => SttError::Network("TLS error".into()),
         WsError::ConnectionClosed | WsError::AlreadyClosed => {
             SttError::Network("connection closed".into())
         }
-        WsError::Protocol(p) => SttError::Protocol(p.to_string()),
+        WsError::Protocol(_) => SttError::Protocol("websocket protocol error".into()),
         WsError::Utf8 => SttError::Protocol("invalid UTF-8".into()),
         WsError::Url(_) => SttError::Protocol("invalid URL".into()),
-        _ => SttError::Network(format!("{e}")),
+        _ => SttError::Network("websocket transport error".into()),
     }
+}
+
+/// Closed STT error field shared by provider/factory tracing. Keeping this as
+/// one production helper prevents later call sites from formatting the
+/// provider-controlled detail carried inside `SttError`.
+pub(super) const fn stt_trace_error_category(error: &SttError) -> &'static str {
+    error.diagnostic_category()
 }
 
 // ========== Provider ==========
@@ -595,8 +659,7 @@ async fn run_supervisor(
                 if !e.is_retryable() {
                     tracing::error!(
                         provider = "deepgram_nova3",
-                        api_key = %mask_api_key(&cfg.api_key),
-                        error = ?e,
+                        error_category = stt_trace_error_category(&e),
                         "fatal stream error"
                     );
                     let _ = send_provider_event(&events_tx, Err(e), &state.dropped_partial_events);
@@ -607,8 +670,8 @@ async fn run_supervisor(
                 if attempt > MAX_RECONNECT_ATTEMPTS {
                     tracing::error!(
                         provider = "deepgram_nova3",
-                        api_key = %mask_api_key(&cfg.api_key),
                         attempts = attempt,
+                        error_category = stt_trace_error_category(&e),
                         "giving up after max reconnect attempts"
                     );
                     let _ = send_provider_event(&events_tx, Err(e), &state.dropped_partial_events);
@@ -618,10 +681,9 @@ async fn run_supervisor(
                 let delay = reconnect_delay(attempt - 1);
                 tracing::warn!(
                     provider = "deepgram_nova3",
-                    api_key = %mask_api_key(&cfg.api_key),
                     attempt,
                     delay_ms = delay.as_millis() as u64,
-                    error = ?e,
+                    error_category = stt_trace_error_category(&e),
                     "reconnecting"
                 );
                 tokio::time::sleep(delay).await;
@@ -706,13 +768,13 @@ async fn run_connection(
                                     }
                                 }
                             }
-                            Err(SttError::Provider(_)) => {
+                            Err(error @ SttError::Provider(_)) => {
                                 // Provider-level error in the JSON body.
                                 // Surface but keep the stream alive — the
                                 // next frame may recover.
                                 if send_provider_event(
                                     events_tx,
-                                    Err(SttError::Provider(text.to_string())),
+                                    Err(error),
                                     &state.dropped_partial_events,
                                 ).is_err() {
                                     return Ok(());
@@ -919,10 +981,55 @@ mod tests {
     }
 
     #[test]
-    fn mask_api_key_never_leaks_secret() {
-        assert_eq!(mask_api_key("dg_abcdefghij1234"), "****1234");
-        assert_eq!(mask_api_key("abc"), "****");
-        assert_eq!(mask_api_key(""), "****");
+    fn config_debug_redacts_key_and_endpoint() {
+        let cfg = DeepgramConfig {
+            api_key: "dg-secret-sentinel".into(),
+            base_url: Some("wss://user:token@secret.invalid/path".into()),
+            ..Default::default()
+        };
+        let debug = format!("{cfg:?}");
+        assert!(!debug.contains("dg-secret-sentinel"));
+        assert!(!debug.contains("secret.invalid"));
+        assert!(debug.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn provider_frame_debug_reports_shape_without_transcript_text() {
+        const SENTINEL: &str = "PRIVATE_TRANSCRIPT token=frame-secret";
+        let payload = serde_json::json!({
+            "type": SENTINEL,
+            "is_final": true,
+            "channel": {
+                "alternatives": [{
+                    "transcript": SENTINEL,
+                    "confidence": 0.9,
+                    "words": [{
+                        "word": SENTINEL,
+                        "start": 0.0,
+                        "end": 1.0,
+                    }],
+                }],
+            },
+        })
+        .to_string();
+        let frame: DgFrame = serde_json::from_str(&payload).unwrap();
+        let debug = format!("{frame:?}");
+        assert!(!debug.contains(SENTINEL));
+        assert!(!debug.contains("frame-secret"));
+        assert!(debug.contains("transcript_chars"));
+        assert!(debug.contains("word_chars"));
+    }
+
+    #[test]
+    fn production_trace_category_never_formats_provider_detail() {
+        const SENTINEL: &str =
+            "PRIVATE_TRANSCRIPT token=trace-secret https://secret.invalid/private/path";
+        let error = SttError::Provider(SENTINEL.into());
+        let trace_field = stt_trace_error_category(&error);
+        assert_eq!(trace_field, "provider");
+        assert!(!trace_field.contains(SENTINEL));
+        assert!(!trace_field.contains("trace-secret"));
+        assert!(!trace_field.contains("secret.invalid"));
     }
 
     #[test]
@@ -1029,15 +1136,35 @@ mod tests {
 
     #[test]
     fn parse_frame_error_type_surfaces_provider_error() {
-        let payload = r#"{"type":"Error","description":"bad"}"#;
-        let err = parse_frame(payload, AudioSource::Microphone).unwrap_err();
-        assert!(matches!(err, SttError::Provider(_)));
+        const SENTINEL: &str = "PRIVATE_TRANSCRIPT token=dg-secret https://secret.invalid";
+        let payload = serde_json::json!({
+            "type": "Error",
+            "description": SENTINEL,
+            "transcript": SENTINEL,
+        })
+        .to_string();
+        let err = parse_frame(&payload, AudioSource::Microphone).unwrap_err();
+        assert_eq!(err.diagnostic_category(), "provider");
+        let SttError::Provider(detail) = &err else {
+            panic!("expected provider error");
+        };
+        assert!(!detail.contains(SENTINEL));
+        assert!(!err.to_string().contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
     }
 
     #[test]
     fn parse_frame_malformed_json_is_protocol_error() {
-        let err = parse_frame("not json", AudioSource::Microphone).unwrap_err();
-        assert!(matches!(err, SttError::Protocol(_)));
+        const SENTINEL: &str = "PRIVATE_TRANSCRIPT token=parse-secret";
+        let payload = format!("not json {SENTINEL}");
+        let err = parse_frame(&payload, AudioSource::Microphone).unwrap_err();
+        let SttError::Protocol(detail) = &err else {
+            panic!("expected protocol error");
+        };
+        assert!(!detail.contains(SENTINEL));
+        assert_eq!(err.diagnostic_category(), "protocol");
+        assert!(!err.to_string().contains(SENTINEL));
+        assert!(!format!("{err:?}").contains(SENTINEL));
     }
 
     #[test]

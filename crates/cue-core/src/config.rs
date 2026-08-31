@@ -83,6 +83,30 @@ pub struct CueSettings {
     pub cloud_sync_enabled: bool,
     #[serde(default)]
     pub cloud_sync_consent_granted: bool,
+    /// Account that explicitly granted saved-session sync on this device.
+    /// Legacy unscoped consent fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloud_sync_consent_account_id: Option<String>,
+    /// Optional metadata-only support diagnostics upload. Local bounded
+    /// diagnostics remain available when this is off.
+    #[serde(default)]
+    pub support_diagnostics_upload_enabled: bool,
+    /// Persisted, explicit user consent for sending metadata-only support
+    /// diagnostics to Bluey's authenticated support storage.
+    #[serde(default)]
+    pub support_diagnostics_upload_consent_granted: bool,
+    /// Account that explicitly granted metadata-only diagnostic upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_diagnostics_upload_consent_account_id: Option<String>,
+    /// Durable local outbox bit for a server-side revocation/cleanup request.
+    /// Disabling diagnostics sets this before any network call so uploads stop
+    /// immediately even when the computer is offline.
+    #[serde(default)]
+    pub support_diagnostics_server_revocation_pending: bool,
+    /// Account whose server-side diagnostic consent and objects must be
+    /// revoked. A retry may run only while this exact account is signed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub support_diagnostics_server_revocation_account_id: Option<String>,
     pub retention_days: u32,
     pub updated_at: String,
 
@@ -170,6 +194,12 @@ impl Default for CueSettings {
             audio_microphone_enabled: true,
             cloud_sync_enabled: false,
             cloud_sync_consent_granted: false,
+            cloud_sync_consent_account_id: None,
+            support_diagnostics_upload_enabled: false,
+            support_diagnostics_upload_consent_granted: false,
+            support_diagnostics_upload_consent_account_id: None,
+            support_diagnostics_server_revocation_pending: false,
+            support_diagnostics_server_revocation_account_id: None,
             retention_days: 30,
             updated_at: clock::now_epoch_ms_string(),
             auto_disguise_prompted: false,
@@ -187,13 +217,93 @@ impl CueSettings {
     ///
     /// Callers must require both switches. The operational switch cannot be
     /// used as a substitute for the user's explicit cloud-processing consent.
-    pub fn cloud_sync_allowed(&self) -> bool {
-        self.cloud_sync_enabled && self.cloud_sync_consent_granted
+    fn cloud_sync_allowed(&self) -> bool {
+        self.cloud_sync_enabled
+            && self.cloud_sync_consent_granted
+            && persisted_account_scope(self.cloud_sync_consent_account_id.as_deref()).is_some()
+    }
+
+    /// Whether the current account owns this device's saved-session consent.
+    pub fn cloud_sync_allowed_for_account(&self, account_id: Option<&str>) -> bool {
+        self.cloud_sync_allowed()
+            && account_scopes_match(self.cloud_sync_consent_account_id.as_deref(), account_id)
+    }
+
+    pub fn cloud_sync_consent_scoped_to(&self, account_id: Option<&str>) -> bool {
+        account_scopes_match(self.cloud_sync_consent_account_id.as_deref(), account_id)
+    }
+
+    /// Whether metadata-only support diagnostics may leave the device.
+    /// Operational deployment flags remain an additional server/operator kill
+    /// switch and can never substitute for this persisted user consent.
+    fn support_diagnostics_upload_allowed(&self) -> bool {
+        self.support_diagnostics_upload_enabled
+            && self.support_diagnostics_upload_consent_granted
+            && persisted_account_scope(
+                self.support_diagnostics_upload_consent_account_id
+                    .as_deref(),
+            )
+            .is_some()
+            && !self.support_diagnostics_server_revocation_pending
+    }
+
+    pub fn support_diagnostics_upload_allowed_for_account(&self, account_id: Option<&str>) -> bool {
+        self.support_diagnostics_upload_allowed()
+            && account_scopes_match(
+                self.support_diagnostics_upload_consent_account_id
+                    .as_deref(),
+                account_id,
+            )
+    }
+
+    pub fn support_diagnostics_consent_scoped_to(&self, account_id: Option<&str>) -> bool {
+        account_scopes_match(
+            self.support_diagnostics_upload_consent_account_id
+                .as_deref(),
+            account_id,
+        )
+    }
+
+    pub fn support_diagnostics_revocation_pending_for_account(
+        &self,
+        account_id: Option<&str>,
+    ) -> bool {
+        self.support_diagnostics_server_revocation_pending
+            && account_scopes_match(
+                self.support_diagnostics_server_revocation_account_id
+                    .as_deref(),
+                account_id,
+            )
+    }
+
+    pub fn support_diagnostics_revocation_waits_for_other_account(
+        &self,
+        account_id: Option<&str>,
+    ) -> bool {
+        self.support_diagnostics_server_revocation_pending
+            && !self.support_diagnostics_revocation_pending_for_account(account_id)
     }
 
     fn enforce_consent(&mut self) {
+        normalize_persisted_account_scope(&mut self.cloud_sync_consent_account_id);
+        normalize_persisted_account_scope(&mut self.support_diagnostics_upload_consent_account_id);
+        normalize_persisted_account_scope(
+            &mut self.support_diagnostics_server_revocation_account_id,
+        );
+        if self.cloud_sync_consent_account_id.is_none() {
+            self.cloud_sync_consent_granted = false;
+        }
         if !self.cloud_sync_allowed() {
             self.cloud_sync_enabled = false;
+        }
+        if self.support_diagnostics_upload_consent_account_id.is_none() {
+            self.support_diagnostics_upload_consent_granted = false;
+        }
+        if !self.support_diagnostics_server_revocation_pending {
+            self.support_diagnostics_server_revocation_account_id = None;
+        }
+        if !self.support_diagnostics_upload_allowed() {
+            self.support_diagnostics_upload_enabled = false;
         }
     }
 
@@ -205,6 +315,20 @@ impl CueSettings {
         normalize_exclusion_list(&mut self.meeting_detection_ignored_apps);
         self.updated_at = clock::now_epoch_ms_string();
     }
+}
+
+fn persisted_account_scope(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn account_scopes_match(stored: Option<&str>, current: Option<&str>) -> bool {
+    persisted_account_scope(stored)
+        .zip(persisted_account_scope(current))
+        .is_some_and(|(stored, current)| stored == current)
+}
+
+fn normalize_persisted_account_scope(value: &mut Option<String>) {
+    *value = persisted_account_scope(value.as_deref()).map(ToString::to_string);
 }
 
 const fn default_context_watch_semantic_first() -> bool {
@@ -593,6 +717,16 @@ mod tests {
 
         assert!(!settings.cloud_sync_enabled);
         assert!(!settings.cloud_sync_consent_granted);
+        assert!(settings.cloud_sync_consent_account_id.is_none());
+        assert!(!settings.support_diagnostics_upload_enabled);
+        assert!(!settings.support_diagnostics_upload_consent_granted);
+        assert!(settings
+            .support_diagnostics_upload_consent_account_id
+            .is_none());
+        assert!(!settings.support_diagnostics_server_revocation_pending);
+        assert!(settings
+            .support_diagnostics_server_revocation_account_id
+            .is_none());
         assert_eq!(settings.disguise_mode, "none");
         assert!(settings.context_watch.semantic_first);
         assert!(!settings.context_watch.screenshot_fallback);
@@ -666,6 +800,16 @@ mod tests {
         assert!(!settings.cloud_sync_enabled);
         assert!(!settings.cloud_sync_consent_granted);
         assert!(!settings.cloud_sync_allowed());
+
+        let mut unscoped = CueSettings {
+            cloud_sync_enabled: true,
+            cloud_sync_consent_granted: true,
+            ..CueSettings::default()
+        };
+        unscoped.enforce_consent();
+        assert!(!unscoped.cloud_sync_enabled);
+        assert!(!unscoped.cloud_sync_consent_granted);
+        assert!(!unscoped.cloud_sync_allowed_for_account(Some("account-a")));
     }
 
     #[test]
@@ -673,6 +817,7 @@ mod tests {
         let mut settings = CueSettings {
             cloud_sync_enabled: true,
             cloud_sync_consent_granted: true,
+            cloud_sync_consent_account_id: Some("account-a".to_string()),
             ..CueSettings::default()
         };
 
@@ -681,6 +826,42 @@ mod tests {
         assert!(settings.cloud_sync_enabled);
         assert!(settings.cloud_sync_consent_granted);
         assert!(settings.cloud_sync_allowed());
+        assert!(settings.cloud_sync_allowed_for_account(Some("account-a")));
+        assert!(!settings.cloud_sync_allowed_for_account(Some("account-b")));
+        assert!(!settings.cloud_sync_allowed_for_account(None));
+    }
+
+    #[test]
+    fn support_diagnostic_upload_requires_persisted_explicit_consent() {
+        let mut legacy_enabled = serde_json::to_value(CueSettings::default()).unwrap();
+        legacy_enabled["support_diagnostics_upload_enabled"] = serde_json::Value::Bool(true);
+        legacy_enabled
+            .as_object_mut()
+            .unwrap()
+            .remove("support_diagnostics_upload_consent_granted");
+        let mut legacy: CueSettings = serde_json::from_value(legacy_enabled).unwrap();
+        legacy.touch();
+        assert!(!legacy.support_diagnostics_upload_allowed());
+        assert!(!legacy.support_diagnostics_upload_enabled);
+
+        let mut opted_in = CueSettings {
+            support_diagnostics_upload_enabled: true,
+            support_diagnostics_upload_consent_granted: true,
+            support_diagnostics_upload_consent_account_id: Some("account-a".to_string()),
+            ..CueSettings::default()
+        };
+        opted_in.touch();
+        assert!(opted_in.support_diagnostics_upload_allowed());
+        assert!(opted_in.support_diagnostics_upload_allowed_for_account(Some("account-a")));
+        assert!(!opted_in.support_diagnostics_upload_allowed_for_account(Some("account-b")));
+
+        opted_in.support_diagnostics_server_revocation_pending = true;
+        opted_in.support_diagnostics_server_revocation_account_id = Some("account-a".to_string());
+        opted_in.touch();
+        assert!(!opted_in.support_diagnostics_upload_allowed());
+        assert!(!opted_in.support_diagnostics_upload_enabled);
+        assert!(opted_in.support_diagnostics_revocation_pending_for_account(Some("account-a")));
+        assert!(opted_in.support_diagnostics_revocation_waits_for_other_account(Some("account-b")));
     }
 
     #[test]
@@ -700,6 +881,7 @@ mod tests {
                 update_settings(&paths, |settings| {
                     settings.cloud_sync_consent_granted = true;
                     settings.cloud_sync_enabled = true;
+                    settings.cloud_sync_consent_account_id = Some("account-a".to_string());
                 })
                 .unwrap();
             })
@@ -741,6 +923,7 @@ mod tests {
         let settings = load_settings(&paths).unwrap();
         assert!(settings.cloud_sync_enabled);
         assert!(settings.cloud_sync_consent_granted);
+        assert!(settings.cloud_sync_allowed_for_account(Some("account-a")));
         assert_eq!(settings.context_watch.interval_secs, 24);
         assert_eq!(
             settings.context_watch.excluded_domains,

@@ -12,6 +12,11 @@ use uuid::Uuid;
 pub const BLUEY_TRACE_ID_HEADER: &str = "x-bluey-trace-id";
 /// Standard per-hop request header. Server echoes this header on response.
 pub const BLUEY_REQUEST_ID_HEADER: &str = "x-bluey-request-id";
+/// Per-user-interaction correlation header propagated across answer hops.
+///
+/// Unlike trace and request ids, interaction ids are always UUIDs minted at
+/// the UI boundary and must never be derived from user content.
+pub const BLUEY_INTERACTION_ID_HEADER: &str = "x-bluey-interaction-id";
 /// Environment fallback used by CLI-launched flows before Phase 5's explicit
 /// Tauri/IPC trace propagation lands.
 pub const BLUEY_TRACE_ID_ENV: &str = "BLUEY_TRACE_ID";
@@ -24,6 +29,7 @@ pub struct ObserveFields {
     pub platform: String,
     pub trace_id: Option<String>,
     pub request_id: Option<String>,
+    pub interaction_id: Option<String>,
     pub session_id: Option<String>,
     pub account_id_hash: Option<String>,
     pub status: Option<String>,
@@ -42,6 +48,7 @@ impl ObserveFields {
             platform: platform(),
             trace_id: None,
             request_id: None,
+            interaction_id: None,
             session_id: None,
             account_id_hash: None,
             status: None,
@@ -60,6 +67,11 @@ impl ObserveFields {
 
     pub fn request_id(mut self, request_id: impl Into<String>) -> Self {
         self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub fn interaction_id(mut self, interaction_id: impl Into<String>) -> Self {
+        self.interaction_id = sanitize_interaction_id(&interaction_id.into());
         self
     }
 
@@ -111,6 +123,10 @@ impl ObserveFields {
         self.request_id.as_deref().unwrap_or("")
     }
 
+    pub fn interaction_id_value(&self) -> &str {
+        self.interaction_id.as_deref().unwrap_or("")
+    }
+
     pub fn session_id_value(&self) -> &str {
         self.session_id.as_deref().unwrap_or("")
     }
@@ -144,10 +160,14 @@ pub fn new_request_id() -> String {
     Uuid::new_v4().to_string()
 }
 
+pub fn new_interaction_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
 pub fn trace_id_from_env() -> Option<String> {
     std::env::var(BLUEY_TRACE_ID_ENV)
         .ok()
-        .and_then(|value| sanitize_observability_id(&value))
+        .and_then(|value| sanitize_interaction_id(&value))
 }
 
 pub fn sanitize_observability_id(value: &str) -> Option<String> {
@@ -163,6 +183,16 @@ pub fn sanitize_observability_id(value: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Validate a privacy-safe interaction id and return its canonical UUID form.
+///
+/// Interaction ids intentionally use a stricter contract than request and
+/// trace ids so free-form values cannot become a cross-system logging field.
+pub fn sanitize_interaction_id(value: &str) -> Option<String> {
+    Uuid::parse_str(value.trim())
+        .ok()
+        .map(|interaction_id| interaction_id.to_string())
 }
 
 /// Stable 8-character support reference for request/session ids.
@@ -247,6 +277,19 @@ mod tests {
     }
 
     #[test]
+    fn interaction_ids_are_uuid_only_and_canonical() {
+        let generated = new_interaction_id();
+        assert!(Uuid::parse_str(&generated).is_ok());
+        assert_eq!(
+            sanitize_interaction_id(" 550E8400-E29B-41D4-A716-446655440000 "),
+            Some("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+        assert_eq!(sanitize_interaction_id("interaction-123"), None);
+        assert_eq!(sanitize_interaction_id("person@example.com"), None);
+        assert_eq!(sanitize_interaction_id("550e8400\ne29b"), None);
+    }
+
+    #[test]
     fn short_observability_ref_matches_session_screenshot_codes() {
         assert_eq!(
             short_observability_ref(Some("25594f6d-4cc7-4315-b99b-017b567851ae")),
@@ -277,6 +320,7 @@ mod tests {
         let fields = ObserveFields::new("cue-daemon")
             .trace_id("trace")
             .request_id("request")
+            .interaction_id("550e8400-e29b-41d4-a716-446655440000")
             .account_id("acct_123")
             .status("ok")
             .latency_ms(42)
@@ -285,6 +329,10 @@ mod tests {
         assert_eq!(fields.component, "cue-daemon");
         assert_eq!(fields.trace_id_value(), "trace");
         assert_eq!(fields.request_id_value(), "request");
+        assert_eq!(
+            fields.interaction_id_value(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
         assert_eq!(fields.status_value(), "ok");
         assert_eq!(fields.latency_ms, Some(42));
         assert_eq!(fields.provider_value(), "bluey-managed");
@@ -299,6 +347,7 @@ mod tests {
             ObserveFields::new("cue-core")
                 .trace_id("trace")
                 .request_id("request")
+                .interaction_id("550e8400-e29b-41d4-a716-446655440000")
                 .status("ok"),
             "observability smoke"
         );

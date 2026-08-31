@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify};
 use tracing::{debug, info, warn};
 
-use crate::db::rag_queue::RagIndexQueue;
+use crate::db::rag_queue::{RagIndexQueue, RagVectorDeleteJob};
 use crate::storage::MeetingStore;
 
 const MANAGED_EMBED_DIM: usize = cue_rag::embedder::OpenAiEmbedder::DIM;
@@ -27,11 +27,31 @@ const RAG_INDEX_IDLE_POLL: Duration = Duration::from_secs(30);
 struct ManagedBlueyEmbedder {
     client: cue_cloud_client::CloudClient,
     paths: AppPaths,
+    owner_account_id: String,
+    credential_generation: u64,
 }
 
 impl ManagedBlueyEmbedder {
-    fn new(client: cue_cloud_client::CloudClient, paths: AppPaths) -> Self {
-        Self { client, paths }
+    fn new(
+        client: cue_cloud_client::CloudClient,
+        paths: AppPaths,
+        owner_account_id: String,
+        credential_generation: u64,
+    ) -> Self {
+        Self {
+            client,
+            paths,
+            owner_account_id,
+            credential_generation,
+        }
+    }
+
+    fn ensure_current_and_consented(&self) -> std::result::Result<(), EmbeddingError> {
+        ensure_managed_embedding_context(
+            &self.paths,
+            &self.owner_account_id,
+            self.credential_generation,
+        )
     }
 }
 
@@ -60,7 +80,7 @@ impl EmbeddingProvider for ManagedBlueyEmbedder {
         &self,
         texts: &[String],
     ) -> std::result::Result<Vec<Vec<f32>>, EmbeddingError> {
-        ensure_managed_embedding_consent(&self.paths)?;
+        self.ensure_current_and_consented()?;
         let inputs = texts
             .iter()
             .map(|text| bounded_embed_input(text))
@@ -75,7 +95,7 @@ impl EmbeddingProvider for ManagedBlueyEmbedder {
         // Re-read persisted consent at the network boundary. This prevents a
         // coordinator/provider retained across a settings change from using
         // an earlier consent snapshot.
-        ensure_managed_embedding_consent(&self.paths)?;
+        self.ensure_current_and_consented()?;
         let response = match self
             .client
             .embed_batch(&cue_cloud_client::EmbedBatchRequest {
@@ -85,11 +105,14 @@ impl EmbeddingProvider for ManagedBlueyEmbedder {
             })
             .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                self.ensure_current_and_consented()?;
+                response
+            }
             Err(cue_cloud_client::Error::Server { status }) if status == 404 || status == 405 => {
                 let mut vectors = Vec::with_capacity(inputs.len());
                 for input in inputs {
-                    ensure_managed_embedding_consent(&self.paths)?;
+                    self.ensure_current_and_consented()?;
                     let response = self
                         .client
                         .embed(&cue_cloud_client::EmbedRequest {
@@ -99,6 +122,7 @@ impl EmbeddingProvider for ManagedBlueyEmbedder {
                         })
                         .await
                         .map_err(map_cloud_embed_error)?;
+                    self.ensure_current_and_consented()?;
                     vectors.push(response.vector);
                 }
                 return validate_managed_vectors(vectors, texts.len());
@@ -144,6 +168,7 @@ pub(crate) struct RagIndexCoordinator {
     worker_notify: Arc<Notify>,
     scope_epoch: Arc<AtomicU64>,
     scope_changed: Arc<Notify>,
+    tombstone_epoch: Arc<AtomicU64>,
     paths: AppPaths,
 }
 
@@ -159,6 +184,7 @@ impl RagIndexCoordinator {
             worker_notify: Arc::new(Notify::new()),
             scope_epoch: Arc::new(AtomicU64::new(0)),
             scope_changed: Arc::new(Notify::new()),
+            tombstone_epoch: Arc::new(AtomicU64::new(0)),
             paths: paths.clone(),
         };
         coordinator.ensure_worker();
@@ -166,13 +192,24 @@ impl RagIndexCoordinator {
     }
 
     pub(crate) fn refresh_from_paths(&self, paths: &AppPaths) -> bool {
-        let desired_scope = match current_rag_scope(paths) {
+        let mut desired_scope = match current_rag_scope(paths) {
             Ok(scope) => scope,
             Err(error) => {
-                warn!(error = %error, "failed to resolve current RAG account scope");
+                warn!(
+                    error_code = rag_runtime_error_code(&error),
+                    error_ref = %rag_error_ref(&error),
+                    "failed to resolve current RAG account scope"
+                );
                 None
             }
         };
+        if desired_scope.as_ref().is_some_and(|scope| {
+            self.queue
+                .account_is_tombstoned(scope.account_id())
+                .unwrap_or(true)
+        }) {
+            desired_scope = None;
+        }
         let existing_scope = match self.pipeline.read() {
             Ok(guard) => guard.as_ref().map(|pipeline| pipeline.scope().clone()),
             Err(_) => {
@@ -242,7 +279,7 @@ impl RagIndexCoordinator {
         };
         if !meeting_belongs_to_rag_scope(&meeting, rag.scope()) {
             warn!(
-                session_id = %meeting.id,
+                session_ref = %rag_session_ref(&meeting.id.to_string()),
                 "skipping RAG rebuild enqueue for a session outside the current owner scope"
             );
             return;
@@ -270,46 +307,123 @@ impl RagIndexCoordinator {
         };
         if !owner_account_matches_rag_scope(session_owner_account_id.as_deref(), &scope) {
             warn!(
-                session_id = %session_id,
+                session_ref = %rag_session_ref(&session_id),
                 "refusing RAG deletion outside the current owner scope"
             );
             return;
         }
-        if let Err(error) = self.queue.cancel_session(&scope, &session_id) {
+        if let Err(error) = self
+            .queue
+            .tombstone_session(&scope, &session_id, queue_now_ms())
+        {
             warn!(
-                session_id = %session_id,
+                session_ref = %rag_session_ref(&session_id),
                 error_code = rag_queue_error_code(&error),
-                "failed to cancel deleted session RAG queue metadata"
+                "failed to durably fence deleted session RAG state"
             );
+            return;
         }
+        self.tombstone_epoch.fetch_add(1, Ordering::AcqRel);
+        drop(pipeline);
+        self.ensure_worker();
+        self.worker_notify.notify_one();
+    }
 
-        if let Some(rag) = pipeline {
-            let session_lock = Arc::clone(&self.session_lock);
-            tokio::spawn(async move {
-                let _guard = session_lock.lock().await;
-                if rag.delete_session(&session_id).await.is_err() {
-                    warn!(
-                        session_id = %session_id,
-                        "failed to clear deleted session RAG index"
-                    );
-                }
-            });
-        } else {
-            let store_path = self.paths.data_dir.join("rag_vectors.db");
-            if !store_path.exists() {
-                return;
-            }
-            tokio::task::spawn_blocking(move || {
-                let result =
-                    cue_rag::VectorStore::delete_session_at_path(&store_path, &scope, &session_id);
-                if result.is_err() {
-                    warn!(
-                        session_id = %session_id,
-                        "failed to clear deleted session RAG index without an active embedder"
-                    );
-                }
-            });
+    /// Durably purge RAG state for an account-scoped cloud tombstone.
+    ///
+    /// Unlike the best-effort UI deletion path, this method waits for any
+    /// in-flight rebuild, permanently fences the queue entry, and confirms the
+    /// vector deletion before returning.
+    pub(crate) async fn purge_cloud_tombstoned_session_for_owner(
+        &self,
+        owner_account_id: &str,
+        session_id: uuid::Uuid,
+    ) -> Result<()> {
+        let owner_account_id = owner_account_id.trim();
+        if owner_account_id.is_empty() {
+            anyhow::bail!("cloud RAG deletion requires an account owner");
         }
+        let _guard = self.session_lock.lock().await;
+        let scope = deletion_scope_for_session_owner(&self.paths, Some(owner_account_id))
+            .ok_or_else(|| anyhow::anyhow!("cloud RAG deletion account scope is unavailable"))?;
+        if !owner_account_matches_rag_scope(Some(owner_account_id), &scope) {
+            anyhow::bail!("cloud RAG deletion account scope changed");
+        }
+        let session_id = session_id.to_string();
+        self.queue
+            .tombstone_session(&scope, &session_id, queue_now_ms())?;
+        self.tombstone_epoch.fetch_add(1, Ordering::AcqRel);
+        let Some(job) = self.queue.claim_vector_delete(
+            &scope,
+            &session_id,
+            self.worker_id.as_ref(),
+            queue_now_ms(),
+            RAG_INDEX_LEASE_TTL,
+        )?
+        else {
+            if self.queue.vector_delete_is_complete(&scope, &session_id)? {
+                return Ok(());
+            }
+            anyhow::bail!("cloud RAG deletion is already in progress");
+        };
+        match self.delete_vectors_for_job(&job).await {
+            Ok(()) => {
+                anyhow::ensure!(
+                    self.queue.complete_vector_delete(&job, queue_now_ms())?,
+                    "cloud RAG deletion completion lost its lease"
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.queue.fail_vector_delete(
+                    &job,
+                    rag_rebuild_error_code(&error),
+                    queue_now_ms(),
+                )?;
+                self.worker_notify.notify_one();
+                Err(error)
+            }
+        }
+    }
+
+    /// Permanently fence and delete every RAG row owned by one deleted
+    /// account, including workspaces and orphan queue/vector rows that are no
+    /// longer discoverable through MeetingStore or the session projection.
+    pub(crate) async fn purge_account_for_owner(&self, owner_account_id: &str) -> Result<usize> {
+        let owner_account_id = owner_account_id.trim();
+        if owner_account_id.is_empty() {
+            anyhow::bail!("RAG account deletion requires an account owner");
+        }
+        let _guard = self.session_lock.lock().await;
+        let removed_metadata = self.queue.purge_account(owner_account_id, queue_now_ms())?;
+        self.tombstone_epoch.fetch_add(1, Ordering::AcqRel);
+        self.scope_epoch.fetch_add(1, Ordering::AcqRel);
+        self.scope_changed.notify_waiters();
+        if let Ok(mut pipeline) = self.pipeline.write() {
+            if pipeline
+                .as_ref()
+                .is_some_and(|rag| rag.scope().account_id() == owner_account_id)
+            {
+                *pipeline = None;
+            }
+        }
+        let store_path = self.paths.data_dir.join("rag_vectors.db");
+        let owner = owner_account_id.to_string();
+        let deleted_vectors = tokio::task::spawn_blocking(move || {
+            cue_rag::VectorStore::delete_account_at_path(&store_path, &owner)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("RAG account deletion worker did not complete"))??;
+        let remaining = cue_rag::VectorStore::account_chunk_count_at_path(
+            &self.paths.data_dir.join("rag_vectors.db"),
+            owner_account_id,
+        )?;
+        anyhow::ensure!(remaining == 0, "RAG account vector purge was incomplete");
+        anyhow::ensure!(
+            self.queue.account_is_tombstoned(owner_account_id)?,
+            "RAG account query fence was not durable"
+        );
+        Ok(removed_metadata.saturating_add(deleted_vectors))
     }
 
     pub(crate) async fn query_current_and_global(
@@ -320,13 +434,30 @@ impl RagIndexCoordinator {
         global_limit: usize,
     ) -> Result<(Vec<cue_rag::RagHit>, Vec<cue_rag::RagHit>)> {
         let query_scope_epoch = self.scope_epoch.load(Ordering::Acquire);
+        let query_tombstone_epoch = self.tombstone_epoch.load(Ordering::Acquire);
         let Some(rag) = self.pipeline() else {
             return Ok((Vec::new(), Vec::new()));
         };
+        if self
+            .queue
+            .account_is_tombstoned(rag.scope().account_id())
+            .unwrap_or(true)
+        {
+            return Ok((Vec::new(), Vec::new()));
+        }
         if self.scope_epoch.load(Ordering::Acquire) != query_scope_epoch {
             return Ok((Vec::new(), Vec::new()));
         }
         let query_scope = rag.scope().clone();
+        let current_limit = if self
+            .queue
+            .is_tombstoned(&query_scope, current_session_id)
+            .unwrap_or(true)
+        {
+            0
+        } else {
+            current_limit
+        };
         let query = rag.query_current_and_global(
             query_text,
             current_limit,
@@ -334,7 +465,7 @@ impl RagIndexCoordinator {
             global_limit,
         );
         tokio::pin!(query);
-        let results = tokio::select! {
+        let (mut current, mut global) = tokio::select! {
             biased;
             _ = wait_for_scope_epoch_change(
                 Arc::clone(&self.scope_epoch),
@@ -351,13 +482,35 @@ impl RagIndexCoordinator {
             debug!("discarding RAG query results after account scope changed");
             return Ok((Vec::new(), Vec::new()));
         }
-        Ok(results)
+        if self
+            .queue
+            .account_is_tombstoned(query_scope.account_id())
+            .unwrap_or(true)
+        {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        remove_tombstoned_hits(&self.queue, &query_scope, &mut current);
+        remove_tombstoned_hits(&self.queue, &query_scope, &mut global);
+        let observed_tombstone_epoch = self.tombstone_epoch.load(Ordering::Acquire);
+        if observed_tombstone_epoch != query_tombstone_epoch {
+            remove_tombstoned_hits(&self.queue, &query_scope, &mut current);
+            remove_tombstoned_hits(&self.queue, &query_scope, &mut global);
+            if self.tombstone_epoch.load(Ordering::Acquire) != observed_tombstone_epoch {
+                return Ok((Vec::new(), Vec::new()));
+            }
+        }
+        Ok((current, global))
     }
 
     fn pipeline(&self) -> Option<Arc<crate::db::rag::RagPipeline>> {
         self.refresh_from_paths(&self.paths);
         match self.pipeline.read() {
-            Ok(guard) => guard.clone(),
+            Ok(guard) => guard.clone().filter(|pipeline| {
+                !self
+                    .queue
+                    .account_is_tombstoned(pipeline.scope().account_id())
+                    .unwrap_or(true)
+            }),
             Err(_) => {
                 warn!("failed to acquire RAG pipeline lock");
                 None
@@ -378,15 +531,15 @@ impl RagIndexCoordinator {
                 self.enqueue_meeting_rebuild(&meeting, rag.scope(), reason);
             }
             Ok(Some(_)) => warn!(
-                session_id,
+                session_ref = %rag_session_ref(session_id),
                 reason, "skipping RAG enqueue for a session outside the current owner scope"
             ),
             Ok(None) => debug!(
-                session_id,
+                session_ref = %rag_session_ref(session_id),
                 reason, "skipping RAG enqueue for deleted session"
             ),
             Err(error) => warn!(
-                session_id,
+                session_ref = %rag_session_ref(session_id),
                 reason,
                 error_code = meeting_load_error_code(&error),
                 "failed to load session before RAG enqueue"
@@ -404,7 +557,7 @@ impl RagIndexCoordinator {
             Ok(revision) => revision,
             Err(error) => {
                 warn!(
-                    session_id = %meeting.id,
+                    session_ref = %rag_session_ref(&meeting.id.to_string()),
                     reason,
                     error_code = rag_queue_error_code(&error),
                     "failed to compute RAG session revision"
@@ -419,7 +572,7 @@ impl RagIndexCoordinator {
             Ok(changed) => {
                 if changed {
                     debug!(
-                        session_id = %meeting.id,
+                        session_ref = %rag_session_ref(&meeting.id.to_string()),
                         reason,
                         revision = %short_revision(&revision),
                         "queued durable RAG session rebuild"
@@ -429,7 +582,7 @@ impl RagIndexCoordinator {
                 self.worker_notify.notify_one();
             }
             Err(error) => warn!(
-                session_id = %meeting.id,
+                session_ref = %rag_session_ref(&meeting.id.to_string()),
                 reason,
                 error_code = rag_queue_error_code(&error),
                 "failed to queue durable RAG session rebuild"
@@ -473,6 +626,9 @@ impl RagIndexCoordinator {
     }
 
     async fn process_next_job(&self) -> Result<bool> {
+        if self.process_next_vector_delete().await? {
+            return Ok(true);
+        }
         let claimed_scope_epoch = self.scope_epoch.load(Ordering::Acquire);
         let Some(rag) = self.pipeline() else {
             return Ok(false);
@@ -507,8 +663,10 @@ impl RagIndexCoordinator {
         let meeting = match self.store.load_by_id(session_uuid) {
             Ok(Some(meeting)) => meeting,
             Ok(None) => {
-                let _ = rag.delete_session(&job.session_id).await;
-                self.queue.cancel_session(rag.scope(), &job.session_id)?;
+                self.queue
+                    .tombstone_session(rag.scope(), &job.session_id, queue_now_ms())?;
+                self.tombstone_epoch.fetch_add(1, Ordering::AcqRel);
+                self.worker_notify.notify_one();
                 return Ok(true);
             }
             Err(_) => {
@@ -547,7 +705,7 @@ impl RagIndexCoordinator {
                 self.queue
                     .fail(&job, "scope_changed", true, queue_now_ms())?;
                 debug!(
-                    session_id = %job.session_id,
+                    session_ref = %rag_session_ref(&job.session_id),
                     "cancelled RAG rebuild after account scope changed"
                 );
                 return Ok(true);
@@ -558,7 +716,7 @@ impl RagIndexCoordinator {
             let error_code = rag_rebuild_error_code(&error);
             self.queue.fail(&job, error_code, true, queue_now_ms())?;
             warn!(
-                session_id = %job.session_id,
+                session_ref = %rag_session_ref(&job.session_id),
                 revision = %short_revision(&job.claimed_revision),
                 attempt = job.attempts,
                 error_code,
@@ -588,8 +746,10 @@ impl RagIndexCoordinator {
                 return Ok(true);
             }
             Ok(None) => {
-                let _ = rag.delete_session(&job.session_id).await;
-                self.queue.cancel_session(rag.scope(), &job.session_id)?;
+                self.queue
+                    .tombstone_session(rag.scope(), &job.session_id, queue_now_ms())?;
+                self.tombstone_epoch.fetch_add(1, Ordering::AcqRel);
+                self.worker_notify.notify_one();
                 return Ok(true);
             }
             Err(_) => {
@@ -600,13 +760,81 @@ impl RagIndexCoordinator {
         }
         self.queue.complete(&job, queue_now_ms())?;
         info!(
-            session_id = %job.session_id,
+            session_ref = %rag_session_ref(&job.session_id),
             revision = %short_revision(&job.claimed_revision),
             attempt = job.attempts,
             "durable RAG session rebuild completed"
         );
         Ok(true)
     }
+
+    async fn process_next_vector_delete(&self) -> Result<bool> {
+        let Some(job) = self.queue.claim_next_vector_delete(
+            self.worker_id.as_ref(),
+            queue_now_ms(),
+            RAG_INDEX_LEASE_TTL,
+        )?
+        else {
+            return Ok(false);
+        };
+        let _guard = self.session_lock.lock().await;
+        match self.delete_vectors_for_job(&job).await {
+            Ok(()) => {
+                anyhow::ensure!(
+                    self.queue.complete_vector_delete(&job, queue_now_ms())?,
+                    "RAG vector deletion completion lost its lease"
+                );
+                info!(
+                    session_ref = %rag_session_ref(&job.session_id),
+                    attempt = job.attempts,
+                    "durable RAG vector deletion completed"
+                );
+            }
+            Err(error) => {
+                let error_code = rag_rebuild_error_code(&error);
+                self.queue
+                    .fail_vector_delete(&job, error_code, queue_now_ms())?;
+                warn!(
+                    session_ref = %rag_session_ref(&job.session_id),
+                    attempt = job.attempts,
+                    error_code,
+                    "durable RAG vector deletion failed and will retry"
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    async fn delete_vectors_for_job(&self, job: &RagVectorDeleteJob) -> Result<()> {
+        let workspace = (!job.workspace_id.is_empty()).then_some(job.workspace_id.as_str());
+        let scope = RagScope::new(&job.account_id, workspace)?;
+        if let Some(rag) = self
+            .pipeline()
+            .filter(|pipeline| pipeline.scope() == &scope)
+        {
+            rag.delete_session(&job.session_id).await?;
+            return Ok(());
+        }
+        let store_path = self.paths.data_dir.join("rag_vectors.db");
+        if !store_path.exists() {
+            return Ok(());
+        }
+        let session_id = job.session_id.clone();
+        tokio::task::spawn_blocking(move || {
+            cue_rag::VectorStore::delete_session_at_path(&store_path, &scope, &session_id)
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("RAG vector deletion worker did not complete"))??;
+        Ok(())
+    }
+}
+
+fn remove_tombstoned_hits(
+    queue: &RagIndexQueue,
+    scope: &RagScope,
+    hits: &mut Vec<cue_rag::RagHit>,
+) {
+    hits.retain(|hit| !queue.is_tombstoned(scope, &hit.session_id).unwrap_or(true));
 }
 
 fn meeting_belongs_to_rag_scope(meeting: &MeetingRecord, scope: &RagScope) -> bool {
@@ -639,17 +867,38 @@ async fn rebuild_meeting_rag_index(
     let rebuild =
         index_meeting_rag_generation(Arc::clone(&rag), meeting, &staging_session_id).await;
     if let Err(error) = rebuild {
-        let _ = rag.delete_session(&staging_session_id).await;
-        return Err(error);
+        return cleanup_failed_staging(&rag, &staging_session_id, error).await;
     }
     if let Err(error) = rag
         .replace_session_from_staging(&session_id, &staging_session_id)
         .await
     {
-        let _ = rag.delete_session(&staging_session_id).await;
-        return Err(error);
+        return cleanup_failed_staging(&rag, &staging_session_id, error).await;
     }
     Ok(())
+}
+
+async fn cleanup_failed_staging(
+    rag: &crate::db::rag::RagPipeline,
+    staging_session_id: &str,
+    original_error: anyhow::Error,
+) -> Result<()> {
+    combine_rebuild_and_cleanup_errors(
+        original_error,
+        rag.delete_session(staging_session_id).await.map(|_| ()),
+    )
+}
+
+fn combine_rebuild_and_cleanup_errors(
+    original_error: anyhow::Error,
+    cleanup: Result<()>,
+) -> Result<()> {
+    cleanup.map_err(|cleanup| {
+        anyhow::anyhow!(
+            "RAG rebuild failed ({original_error:#}); staging cleanup also failed ({cleanup:#})"
+        )
+    })?;
+    Err(original_error)
 }
 
 async fn index_meeting_rag_generation(
@@ -752,6 +1001,44 @@ fn short_revision(revision: &str) -> &str {
     revision.get(..12).unwrap_or(revision)
 }
 
+fn rag_session_ref(session_id: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bluey-rag-session-log-ref-v1\0");
+    digest.update((session_id.len() as u64).to_be_bytes());
+    digest.update(session_id.as_bytes());
+    hex::encode(&digest.finalize()[..8])
+}
+
+fn rag_error_ref(error: &anyhow::Error) -> String {
+    let raw = format!("{error:#}");
+    let mut digest = Sha256::new();
+    digest.update(b"bluey-rag-error-log-ref-v1\0");
+    digest.update((raw.len() as u64).to_be_bytes());
+    digest.update(raw.as_bytes());
+    hex::encode(&digest.finalize()[..8])
+}
+
+fn rag_runtime_error_code(error: &anyhow::Error) -> &'static str {
+    let lower = format!("{error:#}").to_ascii_lowercase();
+    if lower.contains("permission") || lower.contains("access denied") {
+        "permission"
+    } else if lower.contains("consent") {
+        "consent"
+    } else if lower.contains("account") || lower.contains("owner") {
+        "account_scope"
+    } else if lower.contains("sqlite")
+        || lower.contains("database")
+        || lower.contains("storage")
+        || lower.contains("file")
+    {
+        "storage"
+    } else if lower.contains("network") || lower.contains("connect") {
+        "network"
+    } else {
+        "internal"
+    }
+}
+
 fn rag_rebuild_error_code(error: &anyhow::Error) -> &'static str {
     let lower = format!("{error:#}").to_ascii_lowercase();
     if lower.contains("embedding") {
@@ -806,7 +1093,8 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
         }
         Err(error) => {
             warn!(
-                error = %error,
+                error_code = rag_runtime_error_code(&error),
+                error_ref = %rag_error_ref(&error),
                 "RAG indexing deferred locally because persisted cloud consent could not be read"
             );
             return None;
@@ -819,7 +1107,11 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
             return None;
         }
         Err(error) => {
-            warn!("RAG account scope unavailable: {error:#}");
+            warn!(
+                error_code = rag_runtime_error_code(&error),
+                error_ref = %rag_error_ref(&error),
+                "RAG account scope unavailable"
+            );
             return None;
         }
     };
@@ -830,7 +1122,11 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
             Ok(Some(embedder)) => embedder,
             Ok(None) => return None,
             Err(error) => {
-                warn!("managed RAG embedder unavailable: {error:#}");
+                warn!(
+                    error_code = rag_runtime_error_code(&error),
+                    error_ref = %rag_error_ref(&error),
+                    "managed RAG embedder unavailable"
+                );
                 return None;
             }
         }
@@ -845,8 +1141,12 @@ fn init_rag_pipeline(paths: &AppPaths) -> Option<Arc<crate::db::rag::RagPipeline
             info!("RAG pipeline initialized");
             Some(Arc::new(pipeline))
         }
-        Err(e) => {
-            warn!("RAG pipeline init failed: {e:#}");
+        Err(error) => {
+            warn!(
+                error_code = rag_runtime_error_code(&error),
+                error_ref = %rag_error_ref(&error),
+                "RAG pipeline init failed"
+            );
             None
         }
     }
@@ -889,22 +1189,34 @@ fn deletion_scope_for_session_owner(
 }
 
 fn managed_account_scope(paths: &AppPaths) -> anyhow::Result<Option<RagScope>> {
+    let Some(snapshot) = managed_account_snapshot(paths)? else {
+        return Ok(None);
+    };
+    Ok(Some(rag_scope_for_account(&snapshot.account)?))
+}
+
+struct ManagedAccountSnapshot {
+    account: cue_core::AccountConfig,
+    owner_account_id: String,
+}
+
+fn managed_account_snapshot(paths: &AppPaths) -> anyhow::Result<Option<ManagedAccountSnapshot>> {
     let Some(account) = load_account(paths)? else {
         return Ok(None);
     };
     if account.provider.trim() != "bluey" {
         return Ok(None);
     }
-    let Some(tokens) = cue_cloud_client::SecureAccountStore::new(paths.clone()).load()? else {
+    let Some(owner_account_id) = account.owner_account_id().map(ToString::to_string) else {
         return Ok(None);
     };
-    let account_user_id = account.user_id.trim();
-    let token_user_id = tokens.email.trim();
-    anyhow::ensure!(
-        account_user_id.is_empty() || token_user_id.is_empty() || account_user_id == token_user_id,
-        "RAG account profile does not match stored credentials"
-    );
-    Ok(Some(rag_scope_for_account(&account)?))
+    if crate::app::account_deletion_is_pending_for(paths, &owner_account_id)? {
+        return Ok(None);
+    }
+    Ok(Some(ManagedAccountSnapshot {
+        account,
+        owner_account_id,
+    }))
 }
 
 fn rag_scope_for_account(account: &cue_core::AccountConfig) -> anyhow::Result<RagScope> {
@@ -927,53 +1239,84 @@ fn local_rag_scope() -> RagScope {
 }
 
 fn managed_embedder(paths: &AppPaths) -> anyhow::Result<Option<Arc<dyn EmbeddingProvider>>> {
-    if !cloud_embedding_consent_active(paths)? {
-        return Ok(None);
-    }
-    let Some(account) = load_account(paths)? else {
+    let Some(snapshot) = managed_account_snapshot(paths)? else {
         return Ok(None);
     };
-    if account.provider.trim() != "bluey" || managed_account_scope(paths)?.is_none() {
+    if !load_settings(paths)?.cloud_sync_allowed_for_account(Some(&snapshot.owner_account_id)) {
         return Ok(None);
     }
-
-    let base_url = std::env::var("BLUEY_CLOUD_API_URL")
-        .or_else(|_| std::env::var("CUE_CLOUD_API_URL"))
-        .unwrap_or_else(|_| account.api_url.clone());
+    let access = snapshot
+        .account
+        .access_token
+        .clone()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("managed RAG account credentials are unavailable"))?;
+    let store = cue_cloud_client::tokens::MemoryStore::new();
+    store.save(&cue_cloud_client::Tokens {
+        access,
+        refresh: snapshot.account.refresh_token.clone().unwrap_or_default(),
+        email: snapshot.account.user_id.clone(),
+    })?;
     let config = cue_cloud_client::client::ClientConfig {
-        base_url,
+        base_url: snapshot.account.api_url.clone(),
         ..Default::default()
     };
-    let client = cue_cloud_client::CloudClient::new(
-        config,
-        Arc::new(cue_cloud_client::SecureAccountStore::new(paths.clone())),
-    )?;
-    if client.current_tokens().is_none() {
-        return Ok(None);
-    }
+    let client = cue_cloud_client::CloudClient::new(config, Arc::new(store))?;
     info!("RAG embeddings configured through Bluey managed router");
     Ok(Some(Arc::new(ManagedBlueyEmbedder::new(
         client,
         paths.clone(),
+        snapshot.owner_account_id,
+        snapshot.account.credential_generation,
     ))))
 }
 
 fn cloud_embedding_consent_active(paths: &AppPaths) -> anyhow::Result<bool> {
-    Ok(load_settings(paths)?.cloud_sync_allowed())
+    let owner_account_id =
+        managed_account_snapshot(paths)?.map(|snapshot| snapshot.owner_account_id);
+    Ok(load_settings(paths)?.cloud_sync_allowed_for_account(owner_account_id.as_deref()))
 }
 
-fn ensure_managed_embedding_consent(paths: &AppPaths) -> std::result::Result<(), EmbeddingError> {
-    match cloud_embedding_consent_active(paths) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(EmbeddingError::Request(
-            "managed embedding is disabled until cloud sync and cloud consent are enabled"
-                .to_string(),
-        )),
-        Err(_) => Err(EmbeddingError::Request(
+fn ensure_managed_embedding_context(
+    paths: &AppPaths,
+    expected_owner_account_id: &str,
+    expected_credential_generation: u64,
+) -> std::result::Result<(), EmbeddingError> {
+    let snapshot = managed_account_snapshot(paths)
+        .map_err(|_| {
+            EmbeddingError::Request(
+                "managed embedding is disabled because the account profile is unavailable"
+                    .to_string(),
+            )
+        })?
+        .ok_or_else(|| {
+            EmbeddingError::Request(
+                "managed embedding is disabled because the signed-in account changed".to_string(),
+            )
+        })?;
+    if snapshot.owner_account_id != expected_owner_account_id
+        || snapshot.account.credential_generation != expected_credential_generation
+    {
+        return Err(EmbeddingError::Request(
+            "managed embedding is disabled because the signed-in account changed".to_string(),
+        ));
+    }
+    let settings = load_settings(paths).map_err(|_| {
+        EmbeddingError::Request(
             "managed embedding is disabled because persisted cloud consent is unavailable"
                 .to_string(),
-        )),
+        )
+    })?;
+    if !settings.cloud_sync_allowed_for_account(Some(expected_owner_account_id)) {
+        return Err(EmbeddingError::Request(
+            concat!(
+                "managed embedding is disabled until cloud sync and cloud consent are enabled ",
+                "for this account"
+            )
+            .to_string(),
+        ));
     }
+    Ok(())
 }
 
 fn dev_openai_embedder() -> Option<Arc<dyn EmbeddingProvider>> {
@@ -1056,6 +1399,16 @@ fn dev_env_truthy(name: &str) -> bool {
 mod tests {
     use super::*;
     use cue_core::{save_account, save_settings, AccountConfig, CueSettings};
+
+    #[test]
+    fn rag_log_reference_is_stable_and_does_not_expose_session_id() {
+        let session_id = "private-session-id-550e8400-e29b-41d4-a716-446655440000";
+        let first = rag_session_ref(session_id);
+        assert_eq!(first, rag_session_ref(session_id));
+        assert_ne!(first, rag_session_ref("another-session"));
+        assert!(!first.contains(session_id));
+        assert_eq!(first.len(), 16);
+    }
     use std::sync::Mutex;
 
     static PLAINTEXT_TOKEN_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -1097,15 +1450,70 @@ mod tests {
     }
 
     fn save_cloud_consent(paths: &AppPaths, enabled: bool, consent_granted: bool) {
+        let account_id = load_account(paths)
+            .unwrap()
+            .and_then(|account| account.owner_account_id().map(ToString::to_string))
+            .unwrap_or_else(|| "test-account".to_string());
         save_settings(
             paths,
             &CueSettings {
                 cloud_sync_enabled: enabled,
                 cloud_sync_consent_granted: consent_granted,
+                cloud_sync_consent_account_id: Some(account_id),
                 ..CueSettings::default()
             },
         )
         .unwrap();
+    }
+
+    #[test]
+    fn query_filter_hides_tombstoned_vectors_before_physical_delete_finishes() {
+        let root =
+            std::env::temp_dir().join(format!("bluey-rag-query-fence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let queue = RagIndexQueue::open(root.join("queue.db")).unwrap();
+        let scope = RagScope::new("account-a", Some("workspace-a")).unwrap();
+        queue
+            .tombstone_session(&scope, "deleted-session", 100)
+            .unwrap();
+        let mut hits = vec![
+            cue_rag::RagHit {
+                session_id: "deleted-session".to_string(),
+                chunk_text: "must not be returned".to_string(),
+                score: 1.0,
+            },
+            cue_rag::RagHit {
+                session_id: "live-session".to_string(),
+                chunk_text: "safe result".to_string(),
+                score: 0.5,
+            },
+        ];
+
+        remove_tombstoned_hits(&queue, &scope, &mut hits);
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "live-session");
+        assert_eq!(
+            queue
+                .claim_next_vector_delete("worker", 101, Duration::from_secs(30))
+                .unwrap()
+                .unwrap()
+                .session_id,
+            "deleted-session"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rebuild_failure_reports_staging_cleanup_failure_instead_of_ignoring_it() {
+        let error = combine_rebuild_and_cleanup_errors(
+            anyhow::anyhow!("embedding failed"),
+            Err(anyhow::anyhow!("vector delete failed")),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("embedding failed"));
+        assert!(message.contains("vector delete failed"));
     }
 
     #[test]
@@ -1197,6 +1605,71 @@ mod tests {
     }
 
     #[test]
+    fn retained_managed_embedder_rejects_account_and_credential_changes() {
+        with_plaintext_token_fallback(|| {
+            let paths = test_paths();
+            let mut account_a = linked_account("account-a", "a@example.com", "workspace-a");
+            account_a.api_url = "http://127.0.0.1:9".to_string();
+            save_account(&paths, &account_a).unwrap();
+            save_cloud_consent(&paths, true, true);
+            let embedder = managed_embedder(&paths).unwrap().expect("managed embedder");
+
+            account_a.access_token = Some("rotated-access-a".to_string());
+            save_account(&paths, &account_a).unwrap();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let error = runtime
+                .block_on(embedder.embed("must not use a stale credential snapshot"))
+                .expect_err("credential rotation must invalidate the retained provider");
+            assert!(error.to_string().contains("account changed"));
+
+            let fresh = managed_embedder(&paths).unwrap().expect("fresh embedder");
+            save_account(
+                &paths,
+                &linked_account("account-b", "b@example.com", "workspace-b"),
+            )
+            .unwrap();
+            let error = runtime
+                .block_on(fresh.embed("must not cross account boundaries"))
+                .expect_err("account switch must invalidate the retained provider");
+            assert!(error.to_string().contains("account changed"));
+        });
+    }
+
+    #[test]
+    fn pending_account_deletion_disables_new_and_retained_managed_embeddings() {
+        with_plaintext_token_fallback(|| {
+            let paths = test_paths();
+            let account = linked_account("account-a", "a@example.com", "workspace-a");
+            save_account(&paths, &account).unwrap();
+            save_cloud_consent(&paths, true, true);
+            let retained = managed_embedder(&paths).unwrap().expect("managed embedder");
+
+            std::fs::create_dir_all(&paths.data_dir).unwrap();
+            std::fs::write(
+                paths.data_dir.join("pending-deleted-account-purge.json"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schema_version": 3,
+                    "owner_account_id": "account-a",
+                    "operation_id": "550e8400-e29b-41d4-a716-446655440901",
+                    "recovery_token": "550e8400-e29b-41d4-a716-446655440902",
+                    "requested_at_ms": 1,
+                    "state": "prepared"
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            assert!(managed_embedder(&paths).unwrap().is_none());
+            assert!(managed_account_scope(&paths).unwrap().is_none());
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let error = runtime
+                .block_on(retained.embed("must remain local during account deletion"))
+                .expect_err("pending deletion must invalidate a retained embedder");
+            assert!(error.to_string().contains("account changed"));
+        });
+    }
+
+    #[test]
     fn bounded_embed_input_trims_and_caps_text() {
         assert_eq!(bounded_embed_input("  hello  "), "hello");
         let long = "x".repeat(MAX_MANAGED_EMBED_INPUT_CHARS + 100);
@@ -1224,6 +1697,84 @@ mod tests {
             .await
             .expect("scope-change waiter should wake")
             .expect("scope-change waiter task should succeed");
+    }
+
+    #[tokio::test]
+    async fn account_purge_removes_orphan_queue_and_vector_rows_across_workspaces() {
+        let paths = test_paths();
+        paths.ensure().unwrap();
+        let meeting_store = MeetingStore::new(&paths).unwrap();
+        let coordinator = RagIndexCoordinator::from_paths(&paths, meeting_store).unwrap();
+        let owner_a_one = RagScope::new("account-a", Some("workspace-one")).unwrap();
+        let owner_a_two = RagScope::new("account-a", Some("workspace-two")).unwrap();
+        let owner_b = RagScope::new("account-b", Some("workspace-one")).unwrap();
+        let revision_a = "a".repeat(64);
+        let revision_b = "b".repeat(64);
+        coordinator
+            .queue
+            .enqueue(&owner_a_one, "known-session", &revision_a, 100)
+            .unwrap();
+        coordinator
+            .queue
+            .enqueue(&owner_a_two, "orphan-session", &revision_b, 100)
+            .unwrap();
+        coordinator
+            .queue
+            .enqueue(&owner_b, "other-session", &revision_a, 100)
+            .unwrap();
+
+        let vector_path = paths.data_dir.join("rag_vectors.db");
+        let vectors = cue_rag::VectorStore::open(&vector_path, 3).unwrap();
+        let chunk = cue_rag::Chunk {
+            text: "orphan private memory".to_string(),
+            start_char: 0,
+            end_char: 21,
+        };
+        vectors
+            .index(&owner_a_one, "known-session", &chunk, &[1.0, 0.0, 0.0])
+            .unwrap();
+        vectors
+            .index(&owner_a_two, "orphan-session", &chunk, &[0.0, 1.0, 0.0])
+            .unwrap();
+        vectors
+            .index(&owner_b, "other-session", &chunk, &[0.0, 0.0, 1.0])
+            .unwrap();
+        drop(vectors);
+
+        assert!(
+            coordinator
+                .purge_account_for_owner("account-a")
+                .await
+                .unwrap()
+                >= 4
+        );
+        assert!(coordinator
+            .queue
+            .account_is_tombstoned("account-a")
+            .unwrap());
+        assert_eq!(
+            coordinator
+                .queue
+                .account_metadata_row_count("account-a")
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            cue_rag::VectorStore::account_chunk_count_at_path(&vector_path, "account-a").unwrap(),
+            0
+        );
+        assert_eq!(
+            cue_rag::VectorStore::account_chunk_count_at_path(&vector_path, "account-b").unwrap(),
+            1
+        );
+        assert!(!coordinator
+            .queue
+            .enqueue(&owner_a_one, "late-session", &revision_a, 101)
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(&paths.data_dir);
+        let _ = std::fs::remove_dir_all(&paths.config_dir);
+        let _ = std::fs::remove_dir_all(&paths.runtime_dir);
     }
 
     #[test]
@@ -1274,6 +1825,9 @@ mod tests {
                 &linked_account("account-b", "b@example.com", "workspace-b"),
             )
             .unwrap();
+            assert!(coordinator.pipeline().is_none());
+
+            save_cloud_consent(&paths, true, true);
             let pipeline_b = coordinator.pipeline().expect("account B pipeline");
             assert_eq!(pipeline_b.scope().account_id(), "account-b");
             assert_eq!(pipeline_b.scope().workspace_id(), Some("workspace-b"));

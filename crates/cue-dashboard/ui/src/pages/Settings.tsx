@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useLocation } from "react-router-dom";
+import { listen } from "@tauri-apps/api/event";
 import { invoke } from "../lib/tauri";
 import { cloudSyncConsentCopy } from "../lib/cloudSyncConsent";
 import {
+  Activity,
   AudioLines,
   Check,
   Cloud,
@@ -210,7 +212,7 @@ function AccountCard() {
       await invoke("delete_account_now");
       window.location.href = "/";
     } catch (e) {
-      setAccountError(`Your account was not deleted: ${String(e)}`);
+      setAccountError(`Bluey could not finish account deletion: ${String(e)}`);
     } finally {
       setDeleteBusy(false);
     }
@@ -322,8 +324,10 @@ function AccountCard() {
                   className="mt-1 text-sm leading-relaxed text-zinc-400"
                 >
                   This permanently deletes {me.email}, synced sessions, files, transcripts,
-                  generated answers, usage history, and account records. Unused Bluey credits
-                  are lost when the account is deleted.
+                  generated answers, usage history, and account records. Bluey also removes this
+                  account's saved sessions, restored files, memory, and diagnostics from this
+                  computer before signing out. Unused Bluey credits are lost when the account is
+                  deleted.
                 </p>
               </div>
             </div>
@@ -334,7 +338,10 @@ function AccountCard() {
                   checked={acceptDataLoss}
                   onChange={(event) => setAcceptDataLoss(event.target.checked)}
                 />
-                <span>I understand this deletes account files, saved sessions, history, and data.</span>
+                <span>
+                  I understand this deletes account files, saved sessions, history, and local
+                  copies on this computer.
+                </span>
               </label>
               <label className="flex gap-2">
                 <input
@@ -387,7 +394,11 @@ function AccountCard() {
 }
 
 interface DataControls {
+  account_scope_available: boolean;
   cloud_sync_enabled: boolean;
+  support_diagnostics_upload_enabled: boolean;
+  support_diagnostics_server_cleanup_pending: boolean;
+  support_diagnostics_cleanup_waiting_for_another_account: boolean;
   raw_audio_retained: boolean;
   training_enabled: boolean;
 }
@@ -406,7 +417,7 @@ function DataControlsCard() {
   const [contextWatch, setContextWatch] = useState<ContextWatchControls | null>(null);
   const [excludedAppsDraft, setExcludedAppsDraft] = useState("");
   const [excludedDomainsDraft, setExcludedDomainsDraft] = useState("");
-  const [busy, setBusy] = useState<"cloud" | "context" | null>(null);
+  const [busy, setBusy] = useState<"cloud" | "diagnostics" | "context" | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -424,6 +435,28 @@ function DataControlsCard() {
       .catch((e) => setError(String(e)));
   }, []);
 
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = listen("dashboard_owner_changed", () => {
+      setMessage("");
+      setError("");
+      invoke<DataControls>("get_data_controls")
+        .then((nextControls) => {
+          if (!disposed) setControls(nextControls);
+        })
+        .catch((nextError) => {
+          if (!disposed) {
+            setControls(null);
+            setError(String(nextError));
+          }
+        });
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, []);
+
   async function updateCloudSync(enabled: boolean) {
     if (!controls || busy) return;
     setBusy("cloud");
@@ -432,6 +465,30 @@ function DataControlsCard() {
     try {
       const next = await invoke<DataControls>("set_cloud_sync_enabled", { enabled });
       setControls(next);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function updateSupportDiagnosticsUpload(enabled: boolean) {
+    if (!controls || busy) return;
+    setBusy("diagnostics");
+    setError("");
+    setMessage("");
+    try {
+      const next = await invoke<DataControls>("set_support_diagnostics_upload_enabled", {
+        enabled,
+      });
+      setControls(next);
+      setMessage(
+        enabled
+          ? "Metadata-only support diagnostics are enabled for this signed-in account."
+          : next.support_diagnostics_server_cleanup_pending
+            ? "Uploads stopped. Server cleanup will finish when this account reconnects."
+            : "Support diagnostic upload is off and uploaded diagnostics are queued for deletion.",
+      );
     } catch (e) {
       setError(String(e));
     } finally {
@@ -481,7 +538,9 @@ function DataControlsCard() {
           <span className="flex min-w-0 gap-3">
             <Cloud className="mt-0.5 h-4 w-4 shrink-0 text-blue-300" />
             <span>
-              <span className="block text-sm font-medium text-zinc-200">Cloud session sync</span>
+              <span className="block text-sm font-medium text-zinc-200">
+                Cloud session &amp; chat sync
+              </span>
               <span className="mt-1 block text-xs leading-5 text-zinc-500">
                 {cloudSyncConsentCopy.toggle}
               </span>
@@ -491,8 +550,45 @@ function DataControlsCard() {
             type="checkbox"
             className="mt-0.5 h-4 w-4 shrink-0 accent-blue-500"
             checked={controls?.cloud_sync_enabled ?? false}
-            disabled={!controls || busy !== null}
+            disabled={!controls?.account_scope_available || busy !== null}
             onChange={(event) => updateCloudSync(event.target.checked)}
+          />
+        </label>
+        <label className="flex cursor-pointer items-start justify-between gap-4 p-4">
+          <span className="flex min-w-0 gap-3">
+            <Activity className="mt-0.5 h-4 w-4 shrink-0 text-cyan-300" />
+            <span>
+              <span className="block text-sm font-medium text-zinc-200">
+                Share support diagnostics
+              </span>
+              <span className="mt-1 block text-xs leading-5 text-zinc-500">
+                Optional. Sends bounded timing, state, count, and failure-category events to
+                Bluey support. It never includes questions, answers, transcripts, prompts,
+                audio, screenshots, files, paths, URLs, clipboard data, tokens, or raw errors.
+              </span>
+              {controls?.support_diagnostics_server_cleanup_pending ? (
+                <span className="mt-1 block text-xs leading-5 text-amber-300">
+                  Upload is off. Server cleanup is waiting for this account to reconnect.
+                </span>
+              ) : null}
+              {controls?.support_diagnostics_cleanup_waiting_for_another_account ? (
+                <span className="mt-1 block text-xs leading-5 text-amber-300">
+                  Cleanup belongs to another or unverified account and will resume only when the
+                  original account signs in again.
+                </span>
+              ) : null}
+            </span>
+          </span>
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 shrink-0 accent-cyan-500"
+            checked={controls?.support_diagnostics_upload_enabled ?? false}
+            disabled={
+              !controls?.account_scope_available ||
+              (controls?.support_diagnostics_cleanup_waiting_for_another_account ?? false) ||
+              busy !== null
+            }
+            onChange={(event) => updateSupportDiagnosticsUpload(event.target.checked)}
           />
         </label>
         <div className="space-y-4 p-4">

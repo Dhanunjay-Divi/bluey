@@ -141,6 +141,60 @@ impl VectorStore {
         )?)
     }
 
+    /// Delete every vector and chunk owned by one account, across all
+    /// workspaces and sessions, without requiring an active embedder.
+    ///
+    /// Account deletion cannot derive its deletion set from MeetingStore:
+    /// interrupted imports and old workspace moves may leave valid owner rows
+    /// whose parent session is no longer present there. The owner column in
+    /// the vector database is the deletion authority for this sweep.
+    pub fn delete_account_at_path(path: &Path, account_id: &str) -> Result<usize> {
+        let scope = RagScope::new(account_id, None)?;
+        if !path.exists() {
+            return Ok(0);
+        }
+        let mut conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
+        if !table_has_column(&conn, "rag_chunks", "account_id")? {
+            // A pre-tenant index has no evidence tying rows to this owner.
+            // Leave those inaccessible legacy rows untouched rather than
+            // guessing across an account boundary.
+            return Ok(0);
+        }
+        let tx = conn.transaction()?;
+        let deleted = tx.execute(
+            "DELETE FROM rag_chunks WHERE account_id = ?1",
+            params![scope.account_id()],
+        )?;
+        let remaining: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM rag_chunks WHERE account_id = ?1",
+            params![scope.account_id()],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(remaining == 0, "RAG account deletion verification failed");
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// Count every chunk owned by one account without opening an embedding
+    /// model. Used only to verify durable owner-wide deletion.
+    pub fn account_chunk_count_at_path(path: &Path, account_id: &str) -> Result<usize> {
+        let scope = RagScope::new(account_id, None)?;
+        if !path.exists() {
+            return Ok(0);
+        }
+        let conn = Connection::open(path)?;
+        if !table_has_column(&conn, "rag_chunks", "account_id")? {
+            return Ok(0);
+        }
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rag_chunks WHERE account_id = ?1",
+            params![scope.account_id()],
+            |row| row.get(0),
+        )?;
+        usize::try_from(count).context("RAG account chunk count is outside usize")
+    }
+
     fn run_migrations(
         conn: &mut Connection,
         expected_model: &str,
@@ -1561,6 +1615,73 @@ mod tests {
         drop(store);
         let reopened = VectorStore::open(&path, 4).unwrap();
         assert_eq!(reopened.chunk_count(&account_a).unwrap(), 1);
+        drop(reopened);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn owner_wide_delete_spans_workspaces_and_preserves_other_accounts() {
+        let (base, path) = temp_database("delete-account");
+        let store = VectorStore::open(&path, 4).unwrap();
+        let owner_a_one = scope("account-a", Some("workspace-one"));
+        let owner_a_two = scope("account-a", Some("workspace-two"));
+        let owner_b = scope("account-b", Some("workspace-one"));
+        let embedding = fake_embedding(4, 0.25);
+        store
+            .index(
+                &owner_a_one,
+                "known-session",
+                &test_chunk("known owner A memory"),
+                &embedding,
+            )
+            .unwrap();
+        store
+            .index(
+                &owner_a_two,
+                "orphan-session",
+                &test_chunk("orphan owner A memory"),
+                &embedding,
+            )
+            .unwrap();
+        store
+            .index(
+                &owner_b,
+                "other-session",
+                &test_chunk("owner B memory"),
+                &embedding,
+            )
+            .unwrap();
+        drop(store);
+
+        assert_eq!(
+            VectorStore::account_chunk_count_at_path(&path, "account-a").unwrap(),
+            2
+        );
+        assert_eq!(
+            VectorStore::delete_account_at_path(&path, "account-a").unwrap(),
+            2
+        );
+        assert_eq!(
+            VectorStore::account_chunk_count_at_path(&path, "account-a").unwrap(),
+            0
+        );
+        assert_eq!(
+            VectorStore::account_chunk_count_at_path(&path, "account-b").unwrap(),
+            1
+        );
+
+        let reopened = VectorStore::open(&path, 4).unwrap();
+        assert!(reopened
+            .query(&owner_a_one, &embedding, 10, None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reopened
+                .query(&owner_b, &embedding, 10, None)
+                .unwrap()
+                .len(),
+            1
+        );
         drop(reopened);
         std::fs::remove_dir_all(base).unwrap();
     }

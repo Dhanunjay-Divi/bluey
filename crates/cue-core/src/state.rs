@@ -31,6 +31,8 @@ pub struct DaemonState {
     pub overlay_capture_excluded: Option<bool>,
     pub screen_capture_active: bool,
     pub screen_capture_interval_secs: Option<u64>,
+    #[serde(default)]
+    pub screen_capture_generation: u64,
 }
 
 impl DaemonState {
@@ -50,6 +52,7 @@ impl DaemonState {
             overlay_capture_excluded: None,
             screen_capture_active: false,
             screen_capture_interval_secs: None,
+            screen_capture_generation: 0,
         }
     }
 }

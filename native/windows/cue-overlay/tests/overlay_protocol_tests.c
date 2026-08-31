@@ -359,15 +359,39 @@ static void test_answer_current_transcript_ask_field(void) {
         "answer_current_transcript",
         &value,
         &value_len));
+
+    static const char correlated_ask[] =
+        "{\"type\":\"ask_requested\",\"question\":\"typed\","
+        "\"interaction_id\":\"550e8400-e29b-41d4-a716-446655440000\","
+        "\"initiated_at_unix_ms\":1750000000123}";
+    char interaction_id[40];
+    CHECK(json_extract_string(
+        correlated_ask,
+        sizeof(correlated_ask) - 1,
+        "interaction_id",
+        interaction_id,
+        sizeof(interaction_id)));
+    CHECK(strcmp(interaction_id, "550e8400-e29b-41d4-a716-446655440000") == 0);
+    CHECK(json_find_top_level_value(
+        correlated_ask,
+        sizeof(correlated_ask) - 1,
+        "initiated_at_unix_ms",
+        &value,
+        &value_len));
+    CHECK(value_len == strlen("1750000000123"));
+    CHECK(memcmp(value, "1750000000123", value_len) == 0);
 }
 
 static void test_fresh_state_answer_snapshot_contract(void) {
     static const char snapshot[] =
         "{\"type\":\"update_card\",\"id\":\"answer-42\","
+        "\"interaction_id\":\"550e8400-e29b-41d4-a716-446655440000\","
         "\"body\":\"Recovered answer\",\"done\":false,"
-        "\"sequence\":7,\"snapshot\":true}";
+        "\"sequence\":7,\"snapshot\":true,\"render_ack\":\"final\"}";
     char type[32];
     char id[80];
+    char interaction_id[40];
+    char render_ack[24];
     char *body = NULL;
     size_t body_len = 0;
     const char *snapshot_value = NULL;
@@ -379,6 +403,20 @@ static void test_fresh_state_answer_snapshot_contract(void) {
     CHECK(json_extract_string(
         snapshot, sizeof(snapshot) - 1, "id", id, sizeof(id)));
     CHECK(strcmp(id, "answer-42") == 0);
+    CHECK(json_extract_string(
+        snapshot,
+        sizeof(snapshot) - 1,
+        "interaction_id",
+        interaction_id,
+        sizeof(interaction_id)));
+    CHECK(strcmp(interaction_id, "550e8400-e29b-41d4-a716-446655440000") == 0);
+    CHECK(json_extract_string(
+        snapshot,
+        sizeof(snapshot) - 1,
+        "render_ack",
+        render_ack,
+        sizeof(render_ack)));
+    CHECK(strcmp(render_ack, "final") == 0);
     CHECK(json_extract_string_alloc(
         snapshot, sizeof(snapshot) - 1, "body", &body, &body_len));
     CHECK(body_len == strlen("Recovered answer"));
@@ -421,6 +459,142 @@ static void test_fresh_state_answer_snapshot_contract(void) {
     CHECK(recovery_mode == 0);
 }
 
+static void test_answer_render_acknowledgement_contract(void) {
+    static const char acknowledgement[] =
+        "{\"type\":\"answer_render_acknowledged\","
+        "\"id\":\"00000000-0000-0000-0000-000000000001\","
+        "\"interaction_id\":\"550e8400-e29b-41d4-a716-446655440000\","
+        "\"phase\":\"first_text\",\"sequence\":9}";
+    char type[48];
+    char id[40];
+    char interaction_id[40];
+    char phase[24];
+    double sequence = 0.0;
+
+    CHECK(json_extract_type(
+        acknowledgement,
+        sizeof(acknowledgement) - 1,
+        type,
+        sizeof(type)));
+    CHECK(strcmp(type, "answer_render_acknowledged") == 0);
+    CHECK(json_extract_string(
+        acknowledgement,
+        sizeof(acknowledgement) - 1,
+        "id",
+        id,
+        sizeof(id)));
+    CHECK(strcmp(id, "00000000-0000-0000-0000-000000000001") == 0);
+    CHECK(json_extract_string(
+        acknowledgement,
+        sizeof(acknowledgement) - 1,
+        "interaction_id",
+        interaction_id,
+        sizeof(interaction_id)));
+    CHECK(strcmp(interaction_id, "550e8400-e29b-41d4-a716-446655440000") == 0);
+    CHECK(json_extract_string(
+        acknowledgement,
+        sizeof(acknowledgement) - 1,
+        "phase",
+        phase,
+        sizeof(phase)));
+    CHECK(strcmp(phase, "first_text") == 0);
+    CHECK(json_extract_number(
+        acknowledgement,
+        sizeof(acknowledgement) - 1,
+        "sequence",
+        &sequence));
+    CHECK(sequence == 9.0);
+}
+
+typedef struct RenderAckPolicySlot {
+    bool active;
+    unsigned requested_sequence;
+    unsigned paint_sequence;
+} RenderAckPolicySlot;
+
+typedef struct RenderAckPolicyState {
+    char card_id[40];
+    char interaction_id[40];
+    unsigned current_sequence;
+    RenderAckPolicySlot first_text;
+    RenderAckPolicySlot final;
+} RenderAckPolicyState;
+
+static void apply_render_ack_policy_update(
+    RenderAckPolicyState *state,
+    const char *card_id,
+    const char *interaction_id,
+    const char *phase,
+    unsigned sequence
+) {
+    CHECK(state != NULL);
+    CHECK(card_id != NULL);
+    CHECK(interaction_id != NULL);
+    bool same_generation = state->card_id[0] != '\0'
+        && strcmp(state->card_id, card_id) == 0
+        && strcmp(state->interaction_id, interaction_id) == 0;
+    if (!same_generation) {
+        memset(state, 0, sizeof(*state));
+        CHECK(strlen(card_id) < sizeof(state->card_id));
+        CHECK(strlen(interaction_id) < sizeof(state->interaction_id));
+        strcpy(state->card_id, card_id);
+        strcpy(state->interaction_id, interaction_id);
+    } else if (sequence <= state->current_sequence) {
+        return;
+    }
+    state->current_sequence = sequence;
+
+    RenderAckPolicySlot *slots[] = {&state->first_text, &state->final};
+    for (size_t index = 0; index < sizeof(slots) / sizeof(slots[0]); index++) {
+        if (slots[index]->active) slots[index]->paint_sequence = sequence;
+    }
+
+    RenderAckPolicySlot *requested = NULL;
+    if (phase && strcmp(phase, "first_text") == 0) requested = &state->first_text;
+    else if (phase && strcmp(phase, "final") == 0) requested = &state->final;
+    if (requested) {
+        requested->active = true;
+        requested->requested_sequence = sequence;
+        requested->paint_sequence = sequence;
+    }
+}
+
+static void test_render_ack_survives_superseding_non_ack_updates(void) {
+    static const char card_id[] = "00000000-0000-0000-0000-000000000001";
+    static const char interaction_id[] = "550e8400-e29b-41d4-a716-446655440000";
+    RenderAckPolicyState state = {0};
+
+    apply_render_ack_policy_update(
+        &state, card_id, interaction_id, "first_text", 3);
+    apply_render_ack_policy_update(&state, card_id, interaction_id, NULL, 4);
+    CHECK(state.first_text.active);
+    CHECK(state.first_text.requested_sequence == 3);
+    CHECK(state.first_text.paint_sequence == 4);
+    CHECK(!state.final.active);
+
+    apply_render_ack_policy_update(&state, card_id, interaction_id, "final", 5);
+    CHECK(state.first_text.active);
+    CHECK(state.first_text.requested_sequence == 3);
+    CHECK(state.first_text.paint_sequence == 5);
+    CHECK(state.final.active);
+    CHECK(state.final.requested_sequence == 5);
+    CHECK(state.final.paint_sequence == 5);
+
+    apply_render_ack_policy_update(&state, card_id, interaction_id, NULL, 4);
+    CHECK(state.current_sequence == 5);
+    CHECK(state.first_text.paint_sequence == 5);
+    CHECK(state.final.paint_sequence == 5);
+
+    apply_render_ack_policy_update(
+        &state,
+        "00000000-0000-0000-0000-000000000002",
+        "550e8400-e29b-41d4-a716-446655440001",
+        NULL,
+        1);
+    CHECK(!state.first_text.active);
+    CHECK(!state.final.active);
+}
+
 static void test_meeting_banner_timeout_is_expired_not_dismissed(void) {
     CHECK(strcmp(bluey_meeting_banner_timeout_action(), "expired") == 0);
     CHECK(strcmp(bluey_meeting_banner_timeout_action(), "dismiss") != 0);
@@ -460,6 +634,8 @@ int main(void) {
     test_nested_artifact_and_optional_session_fields();
     test_answer_current_transcript_ask_field();
     test_fresh_state_answer_snapshot_contract();
+    test_answer_render_acknowledgement_contract();
+    test_render_ack_survives_superseding_non_ack_updates();
     test_meeting_banner_timeout_is_expired_not_dismissed();
     test_meeting_detection_enabled_command_requires_boolean();
     puts("overlay protocol tests passed");

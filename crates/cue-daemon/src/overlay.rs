@@ -70,19 +70,31 @@ impl OverlaySpawnOptions {
 /// overrides are ignored. In debug builds the override is accepted so local QA
 /// can point at an uninstalled helper.
 pub fn resolve_overlay_path(default: &Path) -> PathBuf {
-    let dev_mode = is_dev_mode();
-    if dev_mode {
+    if let Some(p) = dev_overlay_override_path() {
+        tracing::info!(path = %p.display(), "using overlay binary override (dev mode)");
+        return p;
+    }
+    if !is_dev_mode() {
         if let Some(p) = env_overlay_bin() {
-            tracing::info!(path = %p.display(), "using overlay binary override (dev mode)");
-            return p;
+            tracing::warn!(
+                path = %p.display(),
+                "overlay binary override set but ignored in production build"
+            );
         }
-    } else if let Some(p) = env_overlay_bin() {
-        tracing::warn!(
-            path = %p.display(),
-            "overlay binary override set but ignored in production build"
-        );
     }
     default.to_path_buf()
+}
+
+/// Return a configured helper override only in a debug build.
+///
+/// Callers use this before default helper discovery so an isolated test helper
+/// does not require an installed production overlay to already exist.
+pub fn dev_overlay_override_path() -> Option<PathBuf> {
+    if is_dev_mode() {
+        env_overlay_bin()
+    } else {
+        None
+    }
 }
 
 /// Public alias for the dev-overlay gate so the production daemon path
@@ -919,6 +931,21 @@ mod tests {
         let default = PathBuf::from("/usr/local/bin/cue-overlay");
         let result = resolve_overlay_path(&default);
         assert_eq!(result, default);
+    }
+
+    #[test]
+    fn debug_overlay_override_does_not_require_a_discoverable_default() {
+        let override_path = PathBuf::from("/tmp/bluey-test-overlay");
+        std::env::set_var("BLUEY_OVERLAY_BIN", &override_path);
+        std::env::remove_var("CUE_OVERLAY_BIN");
+        let result = dev_overlay_override_path();
+        std::env::remove_var("BLUEY_OVERLAY_BIN");
+
+        if cfg!(debug_assertions) {
+            assert_eq!(result, Some(override_path));
+        } else {
+            assert_eq!(result, None);
+        }
     }
 
     #[test]

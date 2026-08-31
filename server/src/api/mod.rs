@@ -33,6 +33,7 @@ pub mod middleware;
 pub mod pricing;
 pub mod router;
 pub mod stt;
+mod support_diagnostic_schema;
 pub mod sync;
 pub mod usage;
 
@@ -141,6 +142,15 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             axum::routing::post(billing::square_webhook),
         )
         .route("/pricing/tiers", get(pricing::get_tiers))
+        .route(
+            "/account/delete/status",
+            axum::routing::post(account::account_deletion_status).route_layer(
+                axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::rate_limit::limit_auth_refresh,
+                ),
+            ),
+        )
         .route(
             "/auth/verify-email/confirm",
             axum::routing::post(auth_routes::verify_email_confirm).route_layer(
@@ -300,6 +310,18 @@ pub fn build_router(pool: DbPool, config: Config) -> Router {
             "/sync/session-audit/:session_id/:bundle_id",
             axum::routing::post(sync::upload_session_audit_bundle)
                 .route_layer(DefaultBodyLimit::max(32 * 1024 * 1024)),
+        )
+        .route(
+            "/sync/support-diagnostics/consent",
+            get(sync::get_support_diagnostic_consent).put(sync::put_support_diagnostic_consent),
+        )
+        .route(
+            "/sync/support-diagnostics",
+            axum::routing::delete(sync::delete_all_support_diagnostics),
+        )
+        .route(
+            "/sync/support-diagnostics/:session_id",
+            axum::routing::delete(sync::delete_session_support_diagnostics),
         )
         .route("/sync/sessions", get(sync::list_sessions))
         .route(

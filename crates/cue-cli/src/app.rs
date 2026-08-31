@@ -13,7 +13,7 @@ use std::os::windows::process::CommandExt;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cue_core::app_paths::AppPaths;
-use cue_core::ipc::{DaemonRequest, DaemonResponse};
+use cue_core::ipc::{DaemonMutationFence, DaemonRequest, DaemonResponse};
 #[cfg(unix)]
 use cue_core::process_aliases::is_daemon_executable_path;
 #[cfg(target_os = "macos")]
@@ -1040,7 +1040,8 @@ async fn cue_on(args: OnArgs) -> Result<()> {
         lines: bluey_on_boot_lines(&auth_state),
     })
     .await;
-    let should_start_login = matches!(auth_state, BlueyOnAuthState::SignInAvailable { .. });
+    let skip_signin_open = truthy_env("BLUEY_SKIP_SIGNIN_OPEN");
+    let should_start_login = bluey_on_should_start_login(&auth_state, skip_signin_open);
 
     match boot {
         Ok(DaemonResponse::Ok) => {
@@ -1064,6 +1065,9 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             }
             match auth_state {
                 BlueyOnAuthState::Ready => println!("Bluey is on."),
+                BlueyOnAuthState::SignInAvailable { .. } if skip_signin_open => {
+                    println!("Bluey is on. Sign in when ready with `bluey login`.");
+                }
                 BlueyOnAuthState::SignInAvailable { .. } => {
                     println!(
                         "Bluey is on. Finish sign-in in the browser, or click the Bluey window to reopen the desktop sign-in link."
@@ -1078,6 +1082,10 @@ async fn cue_on(args: OnArgs) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn bluey_on_should_start_login(auth_state: &BlueyOnAuthState, skip_signin_open: bool) -> bool {
+    matches!(auth_state, BlueyOnAuthState::SignInAvailable { .. }) && !skip_signin_open
 }
 
 async fn ensure_bluey_on_permissions_ready() -> Result<()> {
@@ -1619,15 +1627,30 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         .or_else(|| env::var("BLUEY_API_TOKEN").ok())
         .or_else(|| env::var("CUE_CLOUD_TOKEN").ok())
         .or_else(|| env::var("CUE_API_TOKEN").ok());
+    let browser_login_requested =
+        !args.local && !args.no_browser && args.token.is_none() && env_token.is_none();
     let token = args.token.or(env_token);
     let refresh_token = args
         .refresh_token
         .or_else(|| env::var("BLUEY_CLOUD_REFRESH_TOKEN").ok())
         .or_else(|| env::var("CUE_CLOUD_REFRESH_TOKEN").ok());
 
-    if !args.local && !args.no_browser && token.is_none() {
+    if browser_login_requested {
         crate::update::maybe_update_before_login().await?;
     }
+
+    // Browser approval can remain pending for minutes. Capture the exact
+    // account generation after any pre-login update work so a newer login in
+    // another Bluey process always wins over this stale flow.
+    let browser_login_generation = if browser_login_requested {
+        Some(
+            load_account(&paths)?
+                .map(|account| account.credential_generation)
+                .unwrap_or_default(),
+        )
+    } else {
+        None
+    };
 
     let account = if args.local || args.no_browser || token.is_some() {
         let mut account = AccountConfig::local();
@@ -1643,9 +1666,10 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
     };
 
     let has_cloud_tokens = account.token_configured();
-    cue_cloud_client::save_account_profile_and_tokens(&paths, &account)?;
+    persist_cli_login_account(&paths, &account, browser_login_generation)?;
+    let owner_account_id = account.owner_account_id();
     let cloud_sync_enabled = load_settings(&paths)
-        .map(|settings| settings.cloud_sync_enabled && settings.cloud_sync_consent_granted)
+        .map(|settings| settings.cloud_sync_allowed_for_account(owner_account_id))
         .unwrap_or(false);
     if has_cloud_tokens {
         let _ = request(DaemonRequest::CloudStatus).await;
@@ -1668,6 +1692,31 @@ async fn cue_login(args: LoginArgs) -> Result<()> {
         println!("Local account linked. Run `bluey on` later to sign in when the Bluey cloud endpoint is ready.");
     }
     Ok(())
+}
+
+fn persist_cli_login_account(
+    paths: &AppPaths,
+    account: &AccountConfig,
+    browser_login_generation: Option<u64>,
+) -> Result<()> {
+    let Some(expected_generation) = browser_login_generation else {
+        // Explicit --token/--no-browser/local login is an intentional account
+        // replacement requested by the terminal user.
+        return cue_cloud_client::save_account_profile_and_tokens(paths, account)
+            .map_err(Into::into);
+    };
+
+    if cue_cloud_client::save_account_profile_and_tokens_if_generation(
+        paths,
+        expected_generation,
+        account,
+    )? {
+        return Ok(());
+    }
+    bail!(
+        "Another Bluey sign-in completed while browser approval was pending. \
+         The newer account was kept; run `bluey login` again only if you want to replace it."
+    )
 }
 
 async fn print_account() -> Result<()> {
@@ -1769,12 +1818,23 @@ fn print_sessions(args: SessionsArgs) -> Result<()> {
 
 fn cue_settings(args: SettingsArgs) -> Result<()> {
     let paths = AppPaths::discover()?;
-    let settings = update_settings(&paths, |settings| apply_cli_settings(settings, args))?;
-    print_settings(&settings);
+    let owner_account_id = load_account(&paths)?
+        .and_then(|account| account.owner_account_id().map(ToString::to_string));
+    if args.cloud_sync == Some(true) && owner_account_id.is_none() {
+        anyhow::bail!("Sign in before enabling saved-session cloud sync.");
+    }
+    let settings = update_settings(&paths, |settings| {
+        apply_cli_settings(settings, args, owner_account_id.as_deref())
+    })?;
+    print_settings(&settings, owner_account_id.as_deref());
     Ok(())
 }
 
-fn apply_cli_settings(settings: &mut CueSettings, args: SettingsArgs) {
+fn apply_cli_settings(
+    settings: &mut CueSettings,
+    args: SettingsArgs,
+    owner_account_id: Option<&str>,
+) {
     if args.reset {
         *settings = CueSettings::default();
     }
@@ -1795,8 +1855,17 @@ fn apply_cli_settings(settings: &mut CueSettings, args: SettingsArgs) {
         settings.overlay_opacity = normalize_opacity(opacity);
     }
     if let Some(cloud_sync) = args.cloud_sync {
-        settings.cloud_sync_consent_granted = cloud_sync;
-        settings.cloud_sync_enabled = cloud_sync;
+        if cloud_sync {
+            if let Some(owner_account_id) = owner_account_id {
+                settings.cloud_sync_consent_account_id = Some(owner_account_id.to_string());
+                settings.cloud_sync_consent_granted = true;
+                settings.cloud_sync_enabled = true;
+            }
+        } else if settings.cloud_sync_consent_scoped_to(owner_account_id) {
+            settings.cloud_sync_consent_account_id = None;
+            settings.cloud_sync_consent_granted = false;
+            settings.cloud_sync_enabled = false;
+        }
     }
     if let Some(days) = args.retention_days {
         settings.retention_days = days;
@@ -2203,7 +2272,7 @@ fn print_meeting_detail(meeting: &MeetingRecord) {
     }
 }
 
-fn print_settings(settings: &CueSettings) {
+fn print_settings(settings: &CueSettings, owner_account_id: Option<&str>) {
     println!("Bluey settings:");
     println!("Model: {}", settings.default_model);
     println!("Mode: {}", settings.default_mode);
@@ -2216,7 +2285,7 @@ fn print_settings(settings: &CueSettings) {
     println!("Microphone: {}", on_off(settings.audio_microphone_enabled));
     println!(
         "Cloud sync: {}",
-        if settings.cloud_sync_allowed() {
+        if settings.cloud_sync_allowed_for_account(owner_account_id) {
             "automatic"
         } else {
             "off"
@@ -3253,12 +3322,200 @@ fn daemon_executable_candidate_names() -> Vec<String> {
 async fn request(message: DaemonRequest) -> Result<DaemonResponse> {
     let compatibility_addr = env_value_any("BLUEY_DAEMON_ADDR", "CUE_DAEMON_ADDR");
     let paths = AppPaths::discover().context("daemon IPC path unavailable")?;
+    let trace_id = command_trace_id();
+    let message =
+        bind_cli_mutation(&paths, compatibility_addr.as_deref(), &trace_id, message).await?;
     cue_core::ipc_transport::request_daemon(
         &paths,
         compatibility_addr.as_deref(),
-        message.with_trace_id(command_trace_id()),
+        message.with_trace_id(trace_id),
     )
     .await
+}
+
+fn cli_mutation_fence(paths: &AppPaths) -> Result<DaemonMutationFence> {
+    let account = load_account(paths)?;
+    let owner_account_id = account
+        .as_ref()
+        .and_then(|account| account.owner_account_id().map(ToString::to_string));
+    let credential_generation = owner_account_id.as_ref().and_then(|_| {
+        account
+            .as_ref()
+            .map(|account| account.credential_generation)
+    });
+    let meeting_id = if paths.state_file.exists() {
+        let state: cue_core::DaemonState = serde_json::from_slice(
+            &std::fs::read(&paths.state_file).context("failed to read daemon state")?,
+        )
+        .context("failed to decode daemon state")?;
+        match state.meeting {
+            cue_core::MeetingState::InMeeting { id, .. } => Some(
+                id.parse()
+                    .context("daemon state contained an invalid active session id")?,
+            ),
+            cue_core::MeetingState::Idle | cue_core::MeetingState::Listening => None,
+        }
+    } else {
+        None
+    };
+    Ok(DaemonMutationFence {
+        owner_account_id,
+        credential_generation,
+        meeting_id,
+        audio_session_id: None,
+        capture_generation: None,
+    })
+}
+
+async fn bind_cli_mutation(
+    paths: &AppPaths,
+    compatibility_addr: Option<&str>,
+    trace_id: &str,
+    message: DaemonRequest,
+) -> Result<DaemonRequest> {
+    let needs_binding = matches!(
+        message,
+        DaemonRequest::PushCard { .. }
+            | DaemonRequest::MeetingStart { .. }
+            | DaemonRequest::MeetingEnd
+            | DaemonRequest::SessionCreate { .. }
+            | DaemonRequest::SessionActivate { .. }
+            | DaemonRequest::SessionContinue
+            | DaemonRequest::SessionDeactivate
+            | DaemonRequest::SessionRename { .. }
+            | DaemonRequest::SessionArchive { .. }
+            | DaemonRequest::SessionDelete { .. }
+            | DaemonRequest::TranscriptAdd { .. }
+            | DaemonRequest::Ask { .. }
+            | DaemonRequest::Answer { .. }
+            | DaemonRequest::ContextAdd { .. }
+            | DaemonRequest::ContextRoleSet { .. }
+            | DaemonRequest::ActivePageCapture
+            | DaemonRequest::ScreenCaptureStart { .. }
+            | DaemonRequest::ScreenCaptureStop
+            | DaemonRequest::InstructionsSet { .. }
+            | DaemonRequest::InstructionsClear
+            | DaemonRequest::AudioStart { .. }
+            | DaemonRequest::AudioStop
+            | DaemonRequest::CloudLogout
+            | DaemonRequest::SessionsMoveLocalToCurrentAccount { .. }
+    );
+    if !needs_binding {
+        return Ok(message);
+    }
+    let mut fence = cli_mutation_fence(paths)?;
+    let needs_audio_status = matches!(
+        message,
+        DaemonRequest::MeetingEnd | DaemonRequest::AudioStart { .. } | DaemonRequest::AudioStop
+    );
+    if needs_audio_status {
+        let response = cue_core::ipc_transport::request_daemon(
+            paths,
+            compatibility_addr,
+            DaemonRequest::AudioStatus.with_trace_id(trace_id.to_string()),
+        )
+        .await?;
+        fence.audio_session_id = match response {
+            DaemonResponse::AudioStatus { status } => status.session_id,
+            DaemonResponse::Error { message } => bail!("daemon rejected audio status: {message}"),
+            _ => bail!("daemon returned an unexpected audio status response"),
+        };
+    }
+    if matches!(
+        message,
+        DaemonRequest::ScreenCaptureStart { .. } | DaemonRequest::ScreenCaptureStop
+    ) {
+        let response = cue_core::ipc_transport::request_daemon(
+            paths,
+            compatibility_addr,
+            DaemonRequest::Status.with_trace_id(trace_id.to_string()),
+        )
+        .await?;
+        fence.capture_generation = match response {
+            DaemonResponse::Status { state } => Some(state.screen_capture_generation),
+            DaemonResponse::Error { message } => {
+                bail!("daemon rejected context status: {message}")
+            }
+            _ => bail!("daemon returned an unexpected context status response"),
+        };
+    }
+
+    Ok(match message {
+        DaemonRequest::PushCard { card } => DaemonRequest::PushCardBound { card, fence },
+        DaemonRequest::MeetingStart { title } => DaemonRequest::MeetingStartBound { title, fence },
+        DaemonRequest::MeetingEnd => DaemonRequest::MeetingEndBound { fence },
+        DaemonRequest::SessionCreate { title } => {
+            DaemonRequest::SessionCreateBound { title, fence }
+        }
+        DaemonRequest::SessionActivate { id } => DaemonRequest::SessionActivateBound { id, fence },
+        DaemonRequest::SessionContinue => DaemonRequest::SessionContinueBound { fence },
+        DaemonRequest::SessionDeactivate => DaemonRequest::SessionDeactivateBound { fence },
+        DaemonRequest::SessionRename { id, title } => {
+            DaemonRequest::SessionRenameBound { id, title, fence }
+        }
+        DaemonRequest::SessionArchive { id } => DaemonRequest::SessionArchiveBound { id, fence },
+        DaemonRequest::SessionDelete { id } => DaemonRequest::SessionDeleteBound { id, fence },
+        DaemonRequest::TranscriptAdd {
+            speaker,
+            text,
+            is_final,
+        } => DaemonRequest::TranscriptAddBound {
+            speaker,
+            text,
+            is_final,
+            fence,
+        },
+        DaemonRequest::Ask { question } => DaemonRequest::AskBound { question, fence },
+        DaemonRequest::Answer { request } => DaemonRequest::AnswerBound { request, fence },
+        DaemonRequest::ContextAdd {
+            path,
+            title,
+            note,
+            answer_context_role,
+        } => DaemonRequest::ContextAddBound {
+            path,
+            title,
+            note,
+            answer_context_role,
+            fence,
+        },
+        DaemonRequest::ContextRoleSet {
+            id,
+            answer_context_role,
+        } => DaemonRequest::ContextRoleSetBound {
+            id,
+            answer_context_role,
+            fence,
+        },
+        DaemonRequest::ActivePageCapture => DaemonRequest::ActivePageCaptureBound { fence },
+        DaemonRequest::ScreenCaptureStart { interval_secs } => {
+            DaemonRequest::ScreenCaptureStartBound {
+                interval_secs,
+                fence,
+            }
+        }
+        DaemonRequest::ScreenCaptureStop => DaemonRequest::ScreenCaptureStopBound { fence },
+        DaemonRequest::InstructionsSet { text } => {
+            DaemonRequest::InstructionsSetBound { text, fence }
+        }
+        DaemonRequest::InstructionsClear => DaemonRequest::InstructionsClearBound { fence },
+        DaemonRequest::AudioStart {
+            enable_system,
+            enable_microphone,
+            mic_device_id,
+        } => DaemonRequest::AudioStartBound {
+            enable_system,
+            enable_microphone,
+            mic_device_id,
+            fence,
+        },
+        DaemonRequest::AudioStop => DaemonRequest::AudioStopBound { fence },
+        DaemonRequest::CloudLogout => DaemonRequest::CloudLogoutBound { fence },
+        DaemonRequest::SessionsMoveLocalToCurrentAccount { confirmed } => {
+            DaemonRequest::SessionsMoveLocalToCurrentAccountBound { confirmed, fence }
+        }
+        other => other,
+    })
 }
 
 fn command_trace_id() -> String {
@@ -3351,6 +3608,9 @@ fn print_response(response: DaemonResponse) -> Result<()> {
             );
         }
         DaemonResponse::CloudStatus { status } => print_cloud_status(status),
+        DaemonResponse::AccountDeletionPrepared { .. } => {
+            println!("account deletion prepared");
+        }
         DaemonResponse::IpcAuthError { code } => {
             bail!("daemon IPC authentication failed: {code:?}");
         }
@@ -3968,45 +4228,141 @@ async fn bluey_credits_cmd() -> Result<()> {
 async fn bluey_logout_cmd() -> Result<()> {
     let paths = AppPaths::discover()?;
     let account_store = cue_cloud_client::SecureAccountStore::new(paths.clone());
-    let had_account_tokens = cue_cloud_client::TokenStore::load(&account_store)?.is_some();
-    cue_cloud_client::TokenStore::clear(&account_store)?;
-
-    let had_keyring_tokens = if legacy_keyring_fallback_enabled() {
-        match clear_keyring_tokens_with_timeout()? {
-            Some(had_tokens) => had_tokens,
+    let account_credentials = cue_cloud_client::TokenStore::load_snapshot(&account_store)?;
+    let (legacy_credentials, legacy_inspection_timed_out) = if legacy_keyring_fallback_enabled() {
+        match keyring_snapshot_with_timeout(std::time::Duration::from_secs(5))? {
+            Some(credentials) => (credentials, false),
             None => {
-                eprintln!(
-                    "bluey: legacy keyring cleanup timed out; local account config was still cleared"
-                );
-                false
+                eprintln!("bluey: legacy keyring inspection timed out; it was left unchanged");
+                (None, true)
             }
         }
     } else {
-        false
+        (None, false)
     };
 
-    if !had_account_tokens && !had_keyring_tokens {
+    if account_credentials.is_none() && legacy_credentials.is_none() {
+        if legacy_inspection_timed_out {
+            bail!(
+                "Bluey couldn't verify the opt-in legacy keyring state. \
+                 Nothing was changed; try `bluey logout` again."
+            );
+        }
         println!("Bluey is already logged out.");
         return Ok(());
     }
-    let _ = request(DaemonRequest::CloudLogout).await;
+
+    // Bind the daemon request to the same exact owner/profile generation that
+    // supplied the captured credentials. `request()` leaves pre-bound
+    // mutations untouched, so a concurrent login can never be signed out.
+    if let Some(credentials) = account_credentials.as_ref() {
+        let authority = credentials.authority();
+        let fence = DaemonMutationFence {
+            owner_account_id: Some(authority.owner_account_id().to_string()),
+            credential_generation: Some(authority.credential_generation()),
+            meeting_id: None,
+            audio_session_id: None,
+            capture_generation: None,
+        };
+        let _ = request(DaemonRequest::CloudLogoutBound { fence }).await;
+    }
+
+    // The daemon may be unavailable or its response may be lost. Reconcile
+    // using the originally captured snapshot only; never substitute whatever
+    // credentials happen to be current after the await.
+    let account_clear = clear_captured_credentials(&account_store, account_credentials.as_ref())?;
+    let legacy_clear = match legacy_credentials {
+        Some(credentials) => {
+            clear_keyring_snapshot_with_timeout(credentials, std::time::Duration::from_secs(5))?
+                .unwrap_or_else(|| {
+                    eprintln!("bluey: legacy keyring cleanup timed out; it was left unchanged");
+                    ConditionalCredentialClear::Replaced
+                })
+        }
+        None => ConditionalCredentialClear::NotCaptured,
+    };
+
+    if legacy_inspection_timed_out {
+        bail!(
+            "Bluey cleared the captured local account credentials, but couldn't verify the \
+             opt-in legacy keyring. It was left unchanged; run `bluey logout` again."
+        );
+    }
+    if account_clear == ConditionalCredentialClear::Replaced
+        || legacy_clear == ConditionalCredentialClear::Replaced
+    {
+        bail!(
+            "The signed-in credentials changed while sign-out was running. \
+             Bluey kept the newer credentials; run `bluey logout` again if you want to remove them."
+        );
+    }
     println!("Bluey account logged out.");
     Ok(())
 }
 
-fn clear_keyring_tokens_with_timeout() -> Result<Option<bool>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConditionalCredentialClear {
+    NotCaptured,
+    Cleared,
+    AlreadyAbsent,
+    Replaced,
+}
+
+fn clear_captured_credentials<S>(
+    store: &S,
+    expected: Option<&cue_cloud_client::CredentialSnapshot>,
+) -> Result<ConditionalCredentialClear>
+where
+    S: cue_cloud_client::TokenStore + ?Sized,
+{
+    let Some(expected) = expected else {
+        return Ok(ConditionalCredentialClear::NotCaptured);
+    };
+    if cue_cloud_client::TokenStore::clear_if_current(store, expected)? {
+        return Ok(ConditionalCredentialClear::Cleared);
+    }
+    if cue_cloud_client::TokenStore::load_snapshot(store)?.is_none() {
+        Ok(ConditionalCredentialClear::AlreadyAbsent)
+    } else {
+        Ok(ConditionalCredentialClear::Replaced)
+    }
+}
+
+fn keyring_snapshot_with_timeout(
+    timeout: std::time::Duration,
+) -> Result<Option<Option<cue_cloud_client::CredentialSnapshot>>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let result = (|| -> Result<bool> {
-            let client = cue_cloud_client::CloudClient::with_default_keyring()
-                .context("failed to open keyring token store")?;
-            let had_keyring_tokens = client.current_tokens().is_some();
-            client.clear_tokens()?;
-            Ok(had_keyring_tokens)
-        })();
+        let result = {
+            let store = cue_cloud_client::tokens::KeyringStore::new();
+            cue_cloud_client::TokenStore::load_snapshot(&store)
+                .context("failed to inspect legacy keyring token store")
+        };
         let _ = tx.send(result);
     });
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result.map(Some),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("keyring inspection task ended without returning"))
+        }
+    }
+}
+
+fn clear_keyring_snapshot_with_timeout(
+    expected: cue_cloud_client::CredentialSnapshot,
+    timeout: std::time::Duration,
+) -> Result<Option<ConditionalCredentialClear>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = {
+            let store = cue_cloud_client::tokens::KeyringStore::new();
+            clear_captured_credentials(&store, Some(&expected))
+                .context("failed to clear captured legacy keyring credentials")
+        };
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(timeout) {
         Ok(result) => result.map(Some),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(None),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
@@ -4052,18 +4408,70 @@ async fn bluey_delete_account_cmd(force: bool) -> Result<()> {
 mod tests {
     use super::{
         answer_request_from_args, apply_cli_settings, bluey_on_boot_lines, bluey_on_boot_title,
-        confirmed_context_role, default_bluey_signin_url, device_login_url, install_root_from_exe,
-        login_account_provider, resolve_daemon_bin_from_roots, resolve_login_api_url_from, AskArgs,
-        BlueyOnAuthState, Cli, Commands, ContextCommands, ContextRoleArg,
+        bluey_on_should_start_login, clear_captured_credentials, confirmed_context_role,
+        default_bluey_signin_url, device_login_url, install_root_from_exe, login_account_provider,
+        persist_cli_login_account, resolve_daemon_bin_from_roots, resolve_login_api_url_from,
+        AskArgs, BlueyOnAuthState, Cli, Commands, ConditionalCredentialClear, ContextCommands,
+        ContextRoleArg,
     };
-    use cue_core::{AiProviderKind, AnswerContextRole, CueSettings};
+    use cue_cloud_client::{tokens::MemoryStore, TokenStore, Tokens};
+    use cue_core::{
+        app_paths::AppPaths, load_account, save_account, AccountConfig, AiProviderKind,
+        AnswerContextRole, CueSettings,
+    };
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::Arc,
         time::{
             Duration as StdDuration, SystemTime as StdSystemTime, UNIX_EPOCH as STD_UNIX_EPOCH,
         },
     };
+
+    fn test_tokens(access: &str, owner: &str) -> Tokens {
+        Tokens {
+            access: access.to_string(),
+            refresh: format!("refresh-{access}"),
+            email: owner.to_string(),
+        }
+    }
+
+    #[test]
+    fn logout_fallback_clears_only_the_snapshot_captured_before_daemon_await() {
+        let store = Arc::new(MemoryStore::new());
+        TokenStore::save(store.as_ref(), &test_tokens("a1", "a@example.com")).unwrap();
+        let captured_a1 = TokenStore::load_snapshot(store.as_ref()).unwrap().unwrap();
+
+        let refreshed_a2 = test_tokens("a2", "a@example.com");
+        TokenStore::save(store.as_ref(), &refreshed_a2).unwrap();
+        assert_eq!(
+            clear_captured_credentials(store.as_ref(), Some(&captured_a1)).unwrap(),
+            ConditionalCredentialClear::Replaced
+        );
+        assert_eq!(
+            TokenStore::load(store.as_ref()).unwrap(),
+            Some(refreshed_a2)
+        );
+
+        let captured_a2 = TokenStore::load_snapshot(store.as_ref()).unwrap().unwrap();
+        let replacement_b = test_tokens("b1", "b@example.com");
+        TokenStore::save(store.as_ref(), &replacement_b).unwrap();
+        assert_eq!(
+            clear_captured_credentials(store.as_ref(), Some(&captured_a2)).unwrap(),
+            ConditionalCredentialClear::Replaced
+        );
+        assert_eq!(
+            TokenStore::load(store.as_ref()).unwrap(),
+            Some(replacement_b)
+        );
+
+        let captured_b = TokenStore::load_snapshot(store.as_ref()).unwrap().unwrap();
+        assert_eq!(
+            clear_captured_credentials(store.as_ref(), Some(&captured_b)).unwrap(),
+            ConditionalCredentialClear::Cleared
+        );
+        assert_eq!(TokenStore::load(store.as_ref()).unwrap(), None);
+    }
 
     #[test]
     fn legal_command_accepts_optional_json_flag() {
@@ -4153,7 +4561,7 @@ mod tests {
         };
 
         let mut settings = CueSettings::default();
-        apply_cli_settings(&mut settings, args);
+        apply_cli_settings(&mut settings, args, None);
         settings.touch();
 
         assert!(settings.context_watch.screenshot_fallback);
@@ -4175,6 +4583,31 @@ mod tests {
     }
 
     #[test]
+    fn terminal_cloud_sync_consent_is_account_scoped() {
+        let enable =
+            <Cli as clap::Parser>::try_parse_from(["bluey", "settings", "--cloud-sync", "true"])
+                .expect("parse cloud sync enable");
+        let Commands::Settings(enable) = enable.command else {
+            panic!("expected settings command");
+        };
+        let mut settings = CueSettings::default();
+        apply_cli_settings(&mut settings, enable, Some("account-a"));
+        settings.touch();
+        assert!(settings.cloud_sync_allowed_for_account(Some("account-a")));
+        assert!(!settings.cloud_sync_allowed_for_account(Some("account-b")));
+
+        let disable_b =
+            <Cli as clap::Parser>::try_parse_from(["bluey", "settings", "--cloud-sync", "false"])
+                .expect("parse cloud sync disable");
+        let Commands::Settings(disable_b) = disable_b.command else {
+            panic!("expected settings command");
+        };
+        apply_cli_settings(&mut settings, disable_b, Some("account-b"));
+        settings.touch();
+        assert!(settings.cloud_sync_allowed_for_account(Some("account-a")));
+    }
+
+    #[test]
     fn bluey_on_boot_lines_offer_browser_signin_when_unlinked() {
         let lines = bluey_on_boot_lines(&BlueyOnAuthState::SignInAvailable {
             url: "https://bluey.sh/login".to_string(),
@@ -4184,6 +4617,20 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("opens automatically")));
+    }
+
+    #[test]
+    fn bluey_on_test_gate_prevents_device_login_request() {
+        let signed_out = BlueyOnAuthState::SignInAvailable {
+            url: "https://bluey.sh/login".to_string(),
+        };
+
+        assert!(bluey_on_should_start_login(&signed_out, false));
+        assert!(!bluey_on_should_start_login(&signed_out, true));
+        assert!(!bluey_on_should_start_login(
+            &BlueyOnAuthState::Ready,
+            false
+        ));
     }
 
     #[test]
@@ -4266,6 +4713,61 @@ mod tests {
             ),
             "https://cloud.bluey.sh"
         );
+    }
+
+    #[test]
+    fn pending_browser_login_never_overwrites_a_newer_account() {
+        let base = std::env::temp_dir().join(format!(
+            "bluey-cli-browser-login-cas-{}-{}",
+            std::process::id(),
+            StdSystemTime::now()
+                .duration_since(STD_UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        ));
+        let paths = AppPaths {
+            data_dir: base.join("data"),
+            config_dir: base.join("config"),
+            runtime_dir: base.join("run"),
+            state_file: base.join("run/daemon-state.json"),
+            account_file: base.join("config/account.json"),
+            settings_file: base.join("config/settings.json"),
+        };
+
+        save_account(&paths, &AccountConfig::local()).expect("seed signed-out account");
+        let signed_out_generation = load_account(&paths)
+            .expect("load signed-out account")
+            .expect("signed-out account exists")
+            .credential_generation;
+
+        let mut account_b = AccountConfig::local();
+        account_b.provider = "bluey".to_string();
+        account_b.cloud_account_id = Some("account-b".to_string());
+        account_b.user_id = "b@example.com".to_string();
+        account_b.access_token = Some("access-b".to_string());
+        account_b.refresh_token = Some("refresh-b".to_string());
+        save_account(&paths, &account_b).expect("save newer account B");
+
+        let mut stale_account_a = AccountConfig::local();
+        stale_account_a.provider = "bluey".to_string();
+        stale_account_a.cloud_account_id = Some("account-a".to_string());
+        stale_account_a.user_id = "a@example.com".to_string();
+        stale_account_a.access_token = Some("access-a".to_string());
+        stale_account_a.refresh_token = Some("refresh-a".to_string());
+
+        let error =
+            persist_cli_login_account(&paths, &stale_account_a, Some(signed_out_generation))
+                .expect_err("stale browser login must lose to account B");
+        assert!(error.to_string().contains("newer account was kept"));
+
+        let current = load_account(&paths)
+            .expect("load current account")
+            .expect("account B remains");
+        assert_eq!(current.cloud_account_id.as_deref(), Some("account-b"));
+        assert_eq!(current.user_id, "b@example.com");
+        assert_eq!(current.access_token.as_deref(), Some("access-b"));
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

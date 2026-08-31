@@ -17,7 +17,7 @@ use crate::billing::policy::{
 };
 use crate::config::BillingProvider;
 use crate::db::devices::{DeviceRecord, DeviceRegistration};
-use crate::db::{account_data, diagnostic_logs};
+use crate::db::{account_data, diagnostic_logs, object_uploads};
 use crate::object_storage::ObjectStorage;
 
 const MIN_AUTO_RELOAD_CENTS: i64 = 1500;
@@ -788,31 +788,179 @@ pub async fn export_data(
 pub struct DeleteAck {
     pub deleted: bool,
     pub deleted_at: String,
+    pub deletion_pending: bool,
+    pub retry_after_ms: Option<i64>,
     pub object_count_deleted: usize,
     pub note: &'static str,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteAccountRequest {
     pub confirm_text: String,
     pub accept_data_loss: bool,
     pub accept_credit_loss: bool,
+    pub operation_id: String,
+    pub recovery_token: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccountDeletionStatusRequest {
+    pub operation_id: String,
+    pub recovery_token: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct AccountDeletionStatusAck {
+    pub deleted: bool,
+    pub deletion_pending: bool,
+    pub deleted_at: String,
+    pub expires_at_ms: i64,
+}
+
+fn validate_account_deletion_capability(
+    operation_id: &str,
+    recovery_token: &str,
+) -> Result<(), StatusCode> {
+    let operation = uuid::Uuid::parse_str(operation_id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let recovery = uuid::Uuid::parse_str(recovery_token).map_err(|_| StatusCode::BAD_REQUEST)?;
+    if operation.get_version_num() != 4
+        || recovery.get_version_num() != 4
+        || operation.to_string() != operation_id
+        || recovery.to_string() != recovery_token
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(())
+}
+
+pub async fn account_deletion_status(
+    State(state): State<AppState>,
+    Json(req): Json<AccountDeletionStatusRequest>,
+) -> Result<Response, StatusCode> {
+    validate_account_deletion_capability(&req.operation_id, &req.recovery_token)?;
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    match account_data::lookup_account_deletion_receipt(
+        &state.pool,
+        &req.operation_id,
+        &req.recovery_token,
+        now_ms,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        account_data::LookupAccountDeletionReceipt::Found(receipt) => {
+            let deleted = receipt.state == account_data::AccountDeletionReceiptState::Deleted;
+            let deleted_at = receipt
+                .completed_at_ms
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_default();
+            Ok(Json(AccountDeletionStatusAck {
+                deleted,
+                deletion_pending: !deleted,
+                deleted_at,
+                expires_at_ms: receipt.expires_at_ms,
+            })
+            .into_response())
+        }
+        account_data::LookupAccountDeletionReceipt::Expired => Err(StatusCode::GONE),
+        account_data::LookupAccountDeletionReceipt::NotFound => Err(StatusCode::NOT_FOUND),
+    }
 }
 
 pub async fn delete_account(
     State(state): State<AppState>,
     Extension(AuthedAccount(account)): Extension<AuthedAccount>,
     Json(req): Json<DeleteAccountRequest>,
-) -> Result<Json<DeleteAck>, axum::http::StatusCode> {
+) -> Result<Response, axum::http::StatusCode> {
     if req.confirm_text.trim() != "DELETE" || !req.accept_data_loss || !req.accept_credit_loss {
         return Err(axum::http::StatusCode::BAD_REQUEST);
     }
+    validate_account_deletion_capability(&req.operation_id, &req.recovery_token)?;
 
-    let object_refs =
-        account_data::artifact_object_refs(&state.pool, &account.id).map_err(|e| {
+    let delete_started_at_ms = chrono::Utc::now().timestamp_millis();
+    let receipt = account_data::prepare_account_deletion_receipt(
+        &state.pool,
+        &account.id,
+        &req.operation_id,
+        &req.recovery_token,
+        delete_started_at_ms,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    match receipt {
+        account_data::PrepareAccountDeletionReceipt::Conflict => {
+            return Err(StatusCode::CONFLICT);
+        }
+        account_data::PrepareAccountDeletionReceipt::Ready(receipt)
+            if receipt.state == account_data::AccountDeletionReceiptState::Deleted =>
+        {
+            let deleted_at = receipt
+                .completed_at_ms
+                .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+                .map(|value| value.to_rfc3339())
+                .unwrap_or_default();
+            return Ok(Json(DeleteAck {
+                deleted: true,
+                deleted_at,
+                deletion_pending: false,
+                retry_after_ms: None,
+                object_count_deleted: 0,
+                note: "All account data has been removed.",
+            })
+            .into_response());
+        }
+        account_data::PrepareAccountDeletionReceipt::Ready(_) => {}
+    }
+    if !account_data::begin_account_deletion(&state.pool, &account.id, delete_started_at_ms)
+        .map_err(|_| {
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                error = %e,
+                error_category = "deletion_fence_write",
+                "failed to publish account deletion fence"
+            );
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        })?
+    {
+        account_data::mark_account_deletion_receipt_deleted(
+            &state.pool,
+            &account.id,
+            &req.operation_id,
+            &req.recovery_token,
+            delete_started_at_ms,
+        )
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .then_some(())
+        .ok_or(StatusCode::CONFLICT)?;
+        return Ok(Json(DeleteAck {
+            deleted: true,
+            deleted_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                delete_started_at_ms,
+            )
+            .map(|value| value.to_rfc3339())
+            .unwrap_or_default(),
+            deletion_pending: false,
+            retry_after_ms: None,
+            object_count_deleted: 0,
+            note: "All account data has been removed.",
+        })
+        .into_response());
+    }
+    account_data::mark_account_deletion_receipt_pending(
+        &state.pool,
+        &account.id,
+        &req.operation_id,
+        &req.recovery_token,
+        delete_started_at_ms,
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .ok_or(StatusCode::CONFLICT)?;
+
+    let object_refs =
+        account_data::artifact_object_refs(&state.pool, &account.id).map_err(|_| {
+            tracing::warn!(
+                account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                error_category = "artifact_reference_query",
                 "failed to list account artifact objects before delete"
             );
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -829,19 +977,34 @@ pub async fn delete_account(
             if !storage.key_belongs_to_account(&object_ref.object_key, &account.id) {
                 tracing::error!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    artifact_id = %object_ref.artifact_id,
+                    artifact_id_hash = %cue_core::account_id_hash_prefix(&object_ref.artifact_id),
                     "refusing account delete because artifact object key is outside account scope"
                 );
                 return Err(axum::http::StatusCode::INTERNAL_SERVER_ERROR);
             }
         }
         for object_ref in &object_refs {
-            storage.delete(&object_ref.object_key).await.map_err(|e| {
+            storage.delete(&object_ref.object_key).await.map_err(|_| {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                    artifact_id = %object_ref.artifact_id,
-                    error = %e,
+                    artifact_id_hash = %cue_core::account_id_hash_prefix(&object_ref.artifact_id),
+                    error_category = "artifact_object_delete",
                     "failed to delete account artifact object"
+                );
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            object_uploads::mark_account_object_deleted(
+                &state.pool,
+                &account.id,
+                &object_ref.object_key,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|_| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    artifact_id_hash = %cue_core::account_id_hash_prefix(&object_ref.artifact_id),
+                    error_category = "artifact_cleanup_commit",
+                    "failed to commit account artifact cleanup"
                 );
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -850,10 +1013,10 @@ pub async fn delete_account(
     }
 
     let diagnostic_object_refs = diagnostic_logs::object_refs_for_account(&state.pool, &account.id)
-        .map_err(|e| {
+        .map_err(|_| {
             tracing::warn!(
                 account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
-                error = %e,
+                error_category = "diagnostic_reference_query",
                 "failed to list account diagnostic log objects before delete"
             );
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
@@ -877,14 +1040,28 @@ pub async fn delete_account(
             }
         }
         for object_ref in &diagnostic_object_refs {
-            storage.delete(&object_ref.object_key).await.map_err(|e| {
+            storage.delete(&object_ref.object_key).await.map_err(|_| {
                 tracing::warn!(
                     account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
                     diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
                     bytes = object_ref.bytes,
-                    sha256 = object_ref.sha256.as_deref().unwrap_or(""),
-                    error = %e,
+                    error_category = "diagnostic_object_delete",
                     "failed to delete account diagnostic log object"
+                );
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            object_uploads::mark_account_object_deleted(
+                &state.pool,
+                &account.id,
+                &object_ref.object_key,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|_| {
+                tracing::warn!(
+                    account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
+                    diagnostic_log_id_hash = %cue_core::account_id_hash_prefix(&object_ref.id),
+                    error_category = "diagnostic_cleanup_commit",
+                    "failed to commit account diagnostic cleanup"
                 );
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR
             })?;
@@ -892,14 +1069,46 @@ pub async fn delete_account(
         }
     }
 
-    // Hard delete. ON DELETE CASCADE on the foreign keys (accounts ->
-    // credit_batches, refresh_tokens, usage_events,
-    // email_verification_tokens, password_reset_tokens, request_idempotency)
-    // takes care of dependent rows.
-    let deleted = account_data::hard_delete_account(&state.pool, &account.id)
-        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?;
-    if !deleted {
-        return Err(axum::http::StatusCode::NOT_FOUND);
+    match account_data::complete_account_deletion(&state.pool, &account.id)
+        .map_err(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR)?
+    {
+        account_data::AccountDeletionCompletion::Pending => {
+            record_account_ops_event(
+                &state,
+                &account.id,
+                "account.delete",
+                "pending",
+                serde_json::json!({
+                    "object_count_deleted": object_count_deleted,
+                    "reason": "object_lifecycle_in_progress"
+                }),
+            );
+            return Ok((
+                StatusCode::ACCEPTED,
+                Json(DeleteAck {
+                    deleted: false,
+                    deleted_at: String::new(),
+                    deletion_pending: true,
+                    retry_after_ms: Some(object_uploads::PROCESSING_LEASE_MS),
+                    object_count_deleted,
+                    note: "Deletion is fenced and waiting for an in-flight object operation. Retry this request.",
+                }),
+            )
+                .into_response());
+        }
+        account_data::AccountDeletionCompletion::NotFound => {
+            account_data::mark_account_deletion_receipt_deleted(
+                &state.pool,
+                &account.id,
+                &req.operation_id,
+                &req.recovery_token,
+                chrono::Utc::now().timestamp_millis(),
+            )
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .then_some(())
+            .ok_or(StatusCode::CONFLICT)?;
+        }
+        account_data::AccountDeletionCompletion::Deleted => {}
     }
     tracing::info!(
         account_id_hash = %cue_core::account_id_hash_prefix(&account.id),
@@ -916,12 +1125,18 @@ pub async fn delete_account(
             "data_loss_accepted": true
         }),
     );
-    Ok(Json(DeleteAck {
-        deleted: true,
-        deleted_at: chrono::Utc::now().to_rfc3339(),
-        object_count_deleted,
-        note: "All account data has been removed. Re-signup is allowed with the same email.",
-    }))
+    Ok((
+        StatusCode::OK,
+        Json(DeleteAck {
+            deleted: true,
+            deleted_at: chrono::Utc::now().to_rfc3339(),
+            deletion_pending: false,
+            retry_after_ms: None,
+            object_count_deleted,
+            note: "All account data has been removed. Re-signup is allowed with the same email.",
+        }),
+    )
+        .into_response())
 }
 
 async fn export_zip(

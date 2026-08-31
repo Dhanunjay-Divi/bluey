@@ -2878,7 +2878,9 @@ async fn signup_after_account_delete_reuses_email_without_new_trial() {
             serde_json::to_vec(&json!({
                 "confirm_text": "DELETE",
                 "accept_data_loss": true,
-                "accept_credit_loss": true
+                "accept_credit_loss": true,
+                "operation_id": "550e8400-e29b-41d4-a716-446655440001",
+                "recovery_token": "550e8400-e29b-41d4-a716-446655440002"
             }))
             .unwrap(),
         ))
@@ -4474,7 +4476,9 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
             serde_json::to_vec(&json!({
                 "confirm_text": "DELETE",
                 "accept_data_loss": true,
-                "accept_credit_loss": false
+                "accept_credit_loss": false,
+                "operation_id": "550e8400-e29b-41d4-a716-446655440011",
+                "recovery_token": "550e8400-e29b-41d4-a716-446655440012"
             }))
             .unwrap(),
         ))
@@ -4490,7 +4494,9 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
             serde_json::to_vec(&json!({
                 "confirm_text": "DELETE",
                 "accept_data_loss": true,
-                "accept_credit_loss": true
+                "accept_credit_loss": true,
+                "operation_id": "550e8400-e29b-41d4-a716-446655440011",
+                "recovery_token": "550e8400-e29b-41d4-a716-446655440012"
             }))
             .unwrap(),
         ))
@@ -4498,6 +4504,161 @@ async fn account_delete_requires_typed_delete_and_credit_loss_consent() {
     let resp = h.router.clone().oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_lost_response_is_confirmed_only_by_exact_capability() {
+    let h = boot_harness().await;
+    let email = "delete-receipt@example.com";
+    let access = signup_and_login(&h, email, "longenoughpw").await;
+    let operation_id = "550e8400-e29b-41d4-a716-446655440041";
+    let recovery_token = "550e8400-e29b-41d4-a716-446655440042";
+    let delete_body = serde_json::to_vec(&json!({
+        "confirm_text": "DELETE",
+        "accept_data_loss": true,
+        "accept_credit_loss": true,
+        "operation_id": operation_id,
+        "recovery_token": recovery_token
+    }))
+    .unwrap();
+
+    // Simulate a committed hard delete whose HTTP response never reaches the
+    // desktop by intentionally discarding the successful response body.
+    let req = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(delete_body.clone()))
+        .unwrap();
+    let lost_response = h.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(lost_response.status(), StatusCode::OK);
+    drop(lost_response);
+    assert!(Account::fetch_by_email(&h.pool, email).unwrap().is_none());
+
+    let retry = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(delete_body))
+        .unwrap();
+    let retry = h.router.clone().oneshot(retry).await.unwrap();
+    assert_eq!(retry.status(), StatusCode::UNAUTHORIZED);
+
+    let status_body = |operation_id: &str, recovery_token: &str| {
+        Body::from(
+            serde_json::to_vec(&json!({
+                "operation_id": operation_id,
+                "recovery_token": recovery_token
+            }))
+            .unwrap(),
+        )
+    };
+    let status = Request::post("/account/delete/status")
+        .header("content-type", "application/json")
+        .body(status_body(operation_id, recovery_token))
+        .unwrap();
+    let status = h.router.clone().oneshot(status).await.unwrap();
+    assert_eq!(status.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(status.into_body(), 64 * 1024)
+        .await
+        .unwrap();
+    let receipt: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(receipt["deleted"], true);
+    assert_eq!(receipt["deletion_pending"], false);
+    assert!(receipt.get("account_id").is_none());
+
+    let wrong_operation = Request::post("/account/delete/status")
+        .header("content-type", "application/json")
+        .body(status_body(
+            "550e8400-e29b-41d4-a716-446655440043",
+            recovery_token,
+        ))
+        .unwrap();
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(wrong_operation)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let wrong_capability = Request::post("/account/delete/status")
+        .header("content-type", "application/json")
+        .body(status_body(
+            operation_id,
+            "550e8400-e29b-41d4-a716-446655440044",
+        ))
+        .unwrap();
+    assert_eq!(
+        h.router
+            .clone()
+            .oneshot(wrong_capability)
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+
+    h.pool
+        .get()
+        .unwrap()
+        .execute(
+            "UPDATE account_deletion_receipts
+                SET created_at_ms = 1, updated_at_ms = 1, expires_at_ms = 2
+              WHERE operation_id = ?1",
+            rusqlite::params![operation_id],
+        )
+        .unwrap();
+    let expired = Request::post("/account/delete/status")
+        .header("content-type", "application/json")
+        .body(status_body(operation_id, recovery_token))
+        .unwrap();
+    assert_eq!(
+        h.router.clone().oneshot(expired).await.unwrap().status(),
+        StatusCode::GONE
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn account_delete_operation_cannot_be_rebound_to_another_account() {
+    let h = boot_harness().await;
+    let first_access = signup_and_login(&h, "delete-first@example.com", "longenoughpw").await;
+    let second_access = signup_and_login(&h, "delete-second@example.com", "longenoughpw").await;
+    let operation_id = "550e8400-e29b-41d4-a716-446655440051";
+    let recovery_token = "550e8400-e29b-41d4-a716-446655440052";
+    let body = serde_json::to_vec(&json!({
+        "confirm_text": "DELETE",
+        "accept_data_loss": true,
+        "accept_credit_loss": true,
+        "operation_id": operation_id,
+        "recovery_token": recovery_token
+    }))
+    .unwrap();
+    let first = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {first_access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.clone()))
+        .unwrap();
+    assert_eq!(
+        h.router.clone().oneshot(first).await.unwrap().status(),
+        StatusCode::OK
+    );
+
+    let second = Request::post("/account/delete")
+        .header("authorization", format!("Bearer {second_access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    assert_eq!(
+        h.router.clone().oneshot(second).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    assert!(
+        Account::fetch_by_email(&h.pool, "delete-second@example.com")
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test]
@@ -4978,7 +5139,9 @@ async fn artifact_upload_retries_from_durable_outbox_and_is_idempotent() {
             serde_json::to_vec(&json!({
                 "confirm_text": "DELETE",
                 "accept_data_loss": true,
-                "accept_credit_loss": true
+                "accept_credit_loss": true,
+                "operation_id": "550e8400-e29b-41d4-a716-446655440021",
+                "recovery_token": "550e8400-e29b-41d4-a716-446655440022"
             }))
             .unwrap(),
         ))
@@ -5039,8 +5202,59 @@ async fn audit_upload_requires_owned_session_and_live_billing() {
     );
 
     let bundle_id = "audit-owned-bundle";
-    let bundle = br#"{"schema_version":1}"#;
-    let hash = bluey_server::object_storage::sha256_hex(bundle);
+    let session_code = cue_core::short_session_code(uuid::Uuid::parse_str(&session_id).unwrap());
+    let generated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let bundle = serde_json::to_vec(&json!({
+        "schema_version": 1,
+        "bundle_id": bundle_id,
+        "session_id": session_id,
+        "session_code": session_code,
+        "generated_at_ms": generated_at_ms,
+        "content_policy": "metadata_only",
+        "manifest": {
+            "schema_version": 1,
+            "bundle_id": bundle_id,
+            "session_id": session_id,
+            "session_code": session_code,
+            "generated_at_ms": generated_at_ms,
+            "updated_at_ms": generated_at_ms,
+            "content_policy": "metadata_only",
+            "record_counts": { "events": 1 },
+            "excluded_content": [
+                "questions", "answers", "transcripts", "prompts", "audio",
+                "screenshots", "files", "paths", "urls", "clipboard", "tokens",
+                "raw_errors"
+            ],
+            "local_retention": {
+                "uploaded_session_dirs_removed": true,
+                "failed_upload_dirs_retention_days": 7,
+                "failed_upload_root_max_bytes": 536870912
+            }
+        },
+        "events": [{
+            "schema_version": 1,
+            "sequence": 1,
+            "kind": "overlay_lifecycle",
+            "created_at_ms": generated_at_ms,
+            "source": "desktop_diagnostic",
+            "content_policy": "metadata_only",
+            "payload": {
+                "schema_version": 2,
+                "event_name": "overlay_lifecycle",
+                "component": "native_overlay",
+                "outcome": "succeeded",
+                "created_at_ms": generated_at_ms,
+                "monotonic_offset_ms": 1,
+                "action": "ready",
+                "content_policy": "metadata_only"
+            }
+        }]
+    }))
+    .unwrap();
+    let hash = bluey_server::object_storage::sha256_hex(&bundle);
     let key = format!(
         "prod/logs/accounts/{}/sessions/{session_id}/audit/{bundle_id}/sha256/{hash}.json",
         owner.id
@@ -5056,7 +5270,9 @@ async fn audit_upload_requires_owned_session_and_live_billing() {
         Request::post(format!("/sync/session-audit/{session_id}/{bundle_id}"))
             .header("authorization", format!("Bearer {token}"))
             .header("content-type", "application/json")
-            .body(Body::from(bundle.as_slice()))
+            .header("x-bluey-audit-schema-version", "1")
+            .header("x-bluey-content-policy", "metadata_only")
+            .body(Body::from(bundle.clone()))
             .unwrap()
     };
     let resp = h
@@ -5066,6 +5282,29 @@ async fn audit_upload_requires_owned_session_and_live_billing() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let resp = h
+        .router
+        .clone()
+        .oneshot(audit_request(&owner_access, bundle_id))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    let consent = Request::put("/sync/support-diagnostics/consent")
+        .header("authorization", format!("Bearer {owner_access}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "enabled": true,
+                "policy_version": "2026-08-30",
+                "content_policy": "metadata_only"
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let consent_response = h.router.clone().oneshot(consent).await.unwrap();
+    assert_eq!(consent_response.status(), StatusCode::OK);
 
     let resp = h
         .router
@@ -5181,7 +5420,9 @@ async fn delete_account_deletes_artifact_objects_before_account_rows() {
             serde_json::to_vec(&json!({
                 "confirm_text": "DELETE",
                 "accept_data_loss": true,
-                "accept_credit_loss": true
+                "accept_credit_loss": true,
+                "operation_id": "550e8400-e29b-41d4-a716-446655440031",
+                "recovery_token": "550e8400-e29b-41d4-a716-446655440032"
             }))
             .unwrap(),
         ))

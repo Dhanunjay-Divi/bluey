@@ -1127,6 +1127,7 @@ name = "cue-cloud-client"
 version = "0.1.104"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "cue-core",
  "keyring",
@@ -1137,6 +1138,7 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
  "wiremock",
 ]
 
@@ -1202,6 +1204,7 @@ dependencies = [
  "uuid",
  "webrtc-vad",
  "windows-sys 0.59.0",
+ "wiremock",
 ]
 
 [[package]]
