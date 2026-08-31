@@ -203,6 +203,48 @@ function testPortalBundleFreshnessWorkflowGuard() {
   }
 }
 
+function testDependencySecurityWorkflowGuard() {
+  for (const workflowPath of [
+    ".github/workflows/jobs-ci.yml",
+    ".github/workflows/release.yml",
+  ]) {
+    const workflow = fs.readFileSync(path.join(repoRoot, workflowPath), "utf8");
+    const installIndex = workflow.indexOf("npm ci --prefix jobs --no-audit --no-fund");
+    const auditIndex = workflow.indexOf("npm audit --prefix jobs --audit-level=moderate");
+    assert(installIndex >= 0, `${workflowPath} must install the locked Jobs dependencies`);
+    assert(
+      auditIndex > installIndex,
+      `${workflowPath} must audit the installed Jobs dependency graph before release checks`,
+    );
+  }
+  const browserRelease = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/jobs-browser-release.yml"),
+    "utf8",
+  );
+  assert.equal(
+    browserRelease.split("npm audit --prefix candidate-source/jobs --audit-level=moderate").length - 1,
+    2,
+    "Browser candidate preparation and isolated packaging must both audit candidate dependencies",
+  );
+  assert.equal(
+    browserRelease.split("npm audit --prefix trusted-release-tools/jobs --audit-level=moderate").length - 1,
+    1,
+    "Browser isolated packaging must audit trusted tooling before receiving credentials",
+  );
+  const managedRelease = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/jobs-managed-cloud-release.yml"),
+    "utf8",
+  );
+  const managedAuditIndex = managedRelease.indexOf("npm audit --audit-level=moderate");
+  const managedBuildIndex = managedRelease.indexOf("docker buildx build --platform");
+  assert(
+    managedAuditIndex >= 0 &&
+      managedBuildIndex > managedAuditIndex &&
+      managedRelease.includes("major===22&&minor<13"),
+    "Managed-cloud candidate must prove Node compatibility and audit before building artifacts",
+  );
+}
+
 function testBuiltPortalPublicBetaTruth() {
   const assetsDir = path.join(repoRoot, "web/jobs/assets");
   const bundle = fs
@@ -1641,6 +1683,7 @@ function testProvenance() {
 testPrivacyPaths();
 testSecretScanning();
 testPortalBundleFreshnessWorkflowGuard();
+testDependencySecurityWorkflowGuard();
 testBuiltPortalPublicBetaTruth();
 testIntegrationTestSupportContainmentGuard();
 testPublicBetaAdminMutationAuditBoundary();
@@ -1650,6 +1693,7 @@ testLicenseInventory();
 testProvenance();
 
 console.log(
-  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, " +
-  "integration and business-messaging simulator containment, lock inventory, and provenance).",
+  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, dependency security, " +
+  "schema parity, integration and business-messaging simulator containment, lock inventory, " +
+  "and provenance).",
 );

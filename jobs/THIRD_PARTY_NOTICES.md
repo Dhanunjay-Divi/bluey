@@ -20,7 +20,7 @@ contain font subsets; the OFL does not apply to the documents themselves.
 
 - `@pdf-lib/fontkit` 1.1.1, MIT. Author: Andrew Dillon. Contributor and original
   fontkit author: Devon Govett. The MIT terms below apply.
-- `pdfjs-dist` 5.7.284, Apache License 2.0. The dependency ships its complete
+- `pdfjs-dist` 6.2.108, Apache License 2.0. The dependency ships its complete
   `LICENSE` file; Bluey uses it only to validate and extract text from PDFs.
 
 ## MIT License

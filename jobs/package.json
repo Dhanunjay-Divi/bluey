@@ -10,14 +10,18 @@
     "workflows"
   ],
   "scripts": {
+    "audit:dependencies": "npm audit --audit-level=moderate",
     "build": "npm run build --workspace @bluey/jobs-automation && npm run build --workspace @bluey/jobs-browser && npm run build --workspace @bluey/jobs-runner && npm run build --workspace @bluey/jobs-workflows && npm run build --workspace @bluey/jobs-portal",
     "test:managed-cloud-release": "node --test scripts/managed-cloud-release-gate.test.mjs",
     "test": "npm run build --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-automation && npm run test --workspace @bluey/jobs-browser && npm run test --workspace @bluey/jobs-runner && npm run test --workspace @bluey/jobs-workflows && npm run test --workspace @bluey/jobs-portal",
     "typecheck": "npm run build --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-automation && npm run typecheck --workspace @bluey/jobs-browser && npm run typecheck --workspace @bluey/jobs-runner && npm run typecheck --workspace @bluey/jobs-workflows && npm run typecheck --workspace @bluey/jobs-portal"
   },
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "overrides": {
-    "dompurify": "3.4.12",
+    "dompurify": "3.4.14",
     "fast-uri": "3.1.5",
-    "postcss": "8.5.25"
+    "postcss": "8.5.26"
   }
 }

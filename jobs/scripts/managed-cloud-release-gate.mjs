@@ -6341,6 +6341,16 @@ export async function validateManagedCloudWorkflowContract(workflowFile) {
   if (containsForbiddenCommand(text.replace(candidateBuildSection, ""))) {
     fail("Artifact installation/build commands must be confined to candidate build");
   }
+  const dependencyAuditIndex = candidateBuildSection.indexOf("npm audit --audit-level=moderate");
+  const firstArtifactBuildIndex = candidateBuildSection.indexOf("docker buildx build --platform");
+  if (
+    dependencyAuditIndex < 0 ||
+    firstArtifactBuildIndex <= dependencyAuditIndex ||
+    !candidateBuildSection.includes('$GITHUB_WORKSPACE/jobs:/workspace:ro') ||
+    !candidateBuildSection.includes("major===22&&minor<13")
+  ) {
+    fail("Candidate build must audit the read-only exact Jobs dependency graph before artifacts");
+  }
   for (const marker of [
     "VERIFY-NO-REBUILD",
     "AUTHORIZE-NO-REBUILD",

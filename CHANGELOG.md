@@ -316,6 +316,12 @@ under `docs/release/`.
 
 ### Fixed
 
+- Removed the Bluey Jobs dependency-security release blocker by upgrading both résumé PDF
+  extractors to patched PDF.js 6.2.108, retaining text-only parsing with loading-task cleanup,
+  and refreshing vulnerable DOMPurify, PostCSS/Nano ID, brace-expansion, JS-YAML, and Undici
+  resolutions. Jobs pull requests and release checks now fail on any known moderate-or-higher
+  dependency advisory; no provider, application, mailbox, deployment, flag, or cohort effect was
+  enabled.
 - Closed the Phase 621/622 acceptance-review findings: deletion-pending
   accounts cannot enroll, receive an administrator grant, or acquire a new
   override; audit actors must be current real administrators; all beta

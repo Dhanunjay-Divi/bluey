@@ -527,9 +527,10 @@ async function assertUsablePdf(bytes: Uint8Array, label: string): Promise<void> 
   if (new TextDecoder("ascii").decode(bytes.subarray(0, 5)) !== "%PDF-") {
     throw new Error(`${label} file is not a PDF`);
   }
+  let loadingTask: ReturnType<typeof getDocument> | undefined;
   let document: Awaited<ReturnType<typeof getDocument>["promise"]> | undefined;
   try {
-    document = await getDocument({
+    loadingTask = getDocument({
       data: Uint8Array.from(bytes),
       disableFontFace: true,
       enableXfa: false,
@@ -538,7 +539,8 @@ async function assertUsablePdf(bytes: Uint8Array, label: string): Promise<void> 
       stopAtErrors: true,
       useSystemFonts: false,
       useWasm: false,
-    }).promise;
+    });
+    document = await loadingTask.promise;
     if (document.numPages < 1) throw new Error(`${label} PDF is blank`);
     if (document.numPages > MAX_PDF_PAGES) throw new Error(`${label} PDF has too many pages`);
     let extracted = "";
@@ -556,7 +558,7 @@ async function assertUsablePdf(bytes: Uint8Array, label: string): Promise<void> 
     if (error instanceof Error && error.message.startsWith(`${label} PDF`)) throw error;
     throw new Error(`${label} PDF is invalid`);
   } finally {
-    await document?.destroy();
+    await loadingTask?.destroy();
   }
 }
 
