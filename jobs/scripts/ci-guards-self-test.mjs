@@ -23,6 +23,8 @@ const repoRoot = path.resolve(
   "../..",
 );
 
+const JOBS_CI_TIMEOUT_MINUTES = 90;
+
 function runnerVolumeParitySchema(integerType) {
   const migrationPath =
     integerType === "INTEGER"
@@ -200,6 +202,53 @@ function testPortalBundleFreshnessWorkflowGuard() {
       `${workflowPath} must reject a stale checked-in Jobs portal bundle after the build`,
     );
   }
+}
+
+function validateJobsCiTimeBudget(workflow) {
+  const lines = workflow.split(/\r?\n/);
+  const jobStart = lines.findIndex((line) => line === "  jobs-ci:");
+  if (jobStart < 0) {
+    return ["Jobs CI workflow must define the jobs-ci job"];
+  }
+
+  const nextJobOffset = lines
+    .slice(jobStart + 1)
+    .findIndex((line) => /^  [^\s].*:$/.test(line));
+  const jobEnd =
+    nextJobOffset < 0 ? lines.length : jobStart + 1 + nextJobOffset;
+  const timeoutLines = lines
+    .slice(jobStart + 1, jobEnd)
+    .filter((line) => /^    timeout-minutes:\s*/.test(line));
+  if (timeoutLines.length !== 1) {
+    return ["Jobs CI jobs-ci job must define exactly one timeout-minutes value"];
+  }
+
+  const match = timeoutLines[0].match(/^    timeout-minutes:\s*(\d+)\s*$/);
+  if (!match || Number(match[1]) !== JOBS_CI_TIMEOUT_MINUTES) {
+    return [
+      `Jobs CI jobs-ci timeout must remain exactly ${JOBS_CI_TIMEOUT_MINUTES} minutes`,
+    ];
+  }
+  return [];
+}
+
+function testJobsCiTimeBudgetGuard() {
+  const workflow = fs.readFileSync(
+    path.join(repoRoot, ".github/workflows/jobs-ci.yml"),
+    "utf8",
+  );
+  assert.deepEqual(validateJobsCiTimeBudget(workflow), []);
+
+  const lowered = workflow.replace(
+    `    timeout-minutes: ${JOBS_CI_TIMEOUT_MINUTES}`,
+    "    timeout-minutes: 45",
+  );
+  assert(
+    validateJobsCiTimeBudget(lowered).some((issue) =>
+      issue.includes(`exactly ${JOBS_CI_TIMEOUT_MINUTES} minutes`),
+    ),
+    "Jobs CI guard must reject a regression to the exhausted 45-minute budget",
+  );
 }
 
 function testIntegrationTestSupportContainmentGuard() {
@@ -1496,6 +1545,7 @@ function testProvenance() {
 testPrivacyPaths();
 testSecretScanning();
 testPortalBundleFreshnessWorkflowGuard();
+testJobsCiTimeBudgetGuard();
 testIntegrationTestSupportContainmentGuard();
 checkBusinessMessagingSimulatorContainment();
 testSchemaParity();
@@ -1503,6 +1553,6 @@ testLicenseInventory();
 testProvenance();
 
 console.log(
-  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, schema parity, " +
+  "Jobs CI guard self-tests passed (privacy, portal bundle freshness, time budget, schema parity, " +
   "integration and business-messaging simulator containment, lock inventory, and provenance).",
 );
